@@ -183,7 +183,7 @@ export MONITOR_CONTEXT_PROBE_STALE_SECONDS=600
 # the probe is an async scheduler task, the renderer is compose-path
 # safe and only reads the probe's state file. Drive both.
 _probe_then_render() {
-    _context_rotate_probe        "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" "${1:-orchestrator}" 
+    _context_rotate_probe        "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" "${1:-orchestrator}"
     _context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" "${1:-orchestrator}"
 }
 
