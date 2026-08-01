@@ -471,6 +471,36 @@ monitor:
     # window changes. Env: MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS.
     limit_tokens: 1000000
 
+    # Worker threshold (issue #2). Two consumers, deliberately sharing
+    # one number: the worker floor (skills/nexus.worker-defaults, which
+    # monitor/spawn-worker.sh injects into every spawn prompt) tells a
+    # worker to file its report and stop at this size, and the watcher's
+    # `context_scan` task flags workers past it so the orchestrator can
+    # wrap-up + respawn the ones that didn't.
+    #
+    # A strong default, NOT a hard cap: some tasks genuinely need one
+    # long session (a stateful kernel, a long debug thread). Those opt
+    # out explicitly in the spawn prompt — see the worker floor text.
+    # 0 disables both halves. Env:
+    # MONITOR_CONTEXT_ROTATION_WORKER_TOKENS.
+    worker_tokens: 250000
+
+    # Cadence of the worker context scan, in seconds. Each fire costs
+    # one bounded `tail` + `jq` per worker window, so it runs as an
+    # async/expensive scheduler task well off the compose hot path.
+    # Worker context does not move fast enough to justify tightening
+    # this. 0 disables the scan entirely (the emit section then finds
+    # no state file and stays silent). Env:
+    # MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS.
+    scan_interval_seconds: 300
+
+    # How stale the scan's TSV may be before the `--- workers over
+    # context ---` section ignores it. Guards against nagging about a
+    # worker that has since rotated or been retired. Should be a few
+    # multiples of scan_interval_seconds. 0 disables the check. Env:
+    # MONITOR_CONTEXT_SCAN_STALE_SECONDS.
+    scan_stale_seconds: 1800
+
   # Claude Code update-detection (GATED self-update, detect→inform
   # half). The `cc_version_check` watcher task compares the
   # package.json `@anthropic-ai/claude-code` pin against the npm
