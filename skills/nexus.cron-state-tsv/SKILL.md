@@ -57,7 +57,7 @@ This is an upstream harness bug, not a nexus issue (see memory rule `[[upstream-
 
 ## Worked example — `watcher-health-cron`
 
-Operator on `settylab/<other-nexus>#9` ran a 24h monitoring window over `<other-nexus>` watcher health. State TSV at `monitor/.state/watcher-health-cron.state`:
+Operator on `<other-owner>/<other-nexus>#9` ran a 24h monitoring window over `<other-nexus>` watcher health. State TSV at `monitor/.state/watcher-health-cron.state`:
 
 ```
 created_at	fire_count	cron_id	target_fires

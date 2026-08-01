@@ -294,7 +294,7 @@ untouched. This **replaces the old "unpushed local `chore: bump` commit"
 divergence dance** entirely — there is no commit and no push, so the
 working tree stays clean and `git pull --ff-only origin dev` never
 conflicts on a phantom local bump. See `monitor/_cc-version.sh` and
-`jacob-greene/nexus#226`.
+`settylab/nexus-code#226`.
 
 ```bash
 # 1. write the operator-local pin to the candidate. This is the ONLY
@@ -520,7 +520,7 @@ The watchdog's mandate (the job list for its spawn prompt):
 The deterministic watch loop the watchdog runs is **shipped as a repo
 file** — `monitor/cc-restart-watchdog-loop.sh`. Run it, do not re-adapt
 an inline copy: a hand-adapted listing is exactly how the hard-coded
-`orchestrator` window name in `jacob-greene/nexus#459` survived, and how
+`orchestrator` window name in `settylab/nexus-code#459` survived, and how
 a stale `tmux list-panes -t watcher` baseline outlives the watcher going
 headless. The loop resolves the coordinator window itself (config
 `monitor.target_window`), reads the watcher pid from
