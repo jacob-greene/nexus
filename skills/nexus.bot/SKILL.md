@@ -33,7 +33,7 @@ and re-asserted to the FRONT per-command by
 `ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front
 is the load-bearing bit — `~/.zshenv` re-prepends linuxbrew (where
 the real `gh` lives) on every `zsh -c`, so the wrapper dir is pushed
-back to the front AFTER that, winning the race (<your-org>/nexus-code
+back to the front AFTER that, winning the race (jacob-greene/nexus
 PR #349, operator request comment 4795415597).
 
 A real **executable** — not the earlier zsh *function* — because a
@@ -151,7 +151,7 @@ trust the exit code. There's a documented friction request to add a
 `reacted <content> on comment <id>` confirmation; until then, scripts
 must check `$?` rather than parsing stdout.
 
-### Verbs landing soon (`<operator>/ng-omnibus`, not yet merged)
+### Verbs landing soon (`jacob-greene/ng-omnibus`, not yet merged)
 
 - `ng preflight <repo>` — hits `/installation/repositories` and prints
   whether the bot is installed on the target repo. Lets cross-repo
@@ -311,13 +311,13 @@ there. Surface it as a blocker:
 
 Before adding a workspace wrapper around a tool, check the
 tool's GitHub org. If it's lab-owned (`<your-org>/*` always) or
-operator-owned (`<operator>/*` when this nexus is operated by
-<operator>), open the upstream issue + PR there instead. Wrappers
+operator-owned (`jacob-greene/*` when this nexus is operated by
+jacob-greene), open the upstream issue + PR there instead. Wrappers
 ship fixes in disguise — the upstream stays broken for everyone
 else, and the workspace has to carry the wrapper forward forever.
 
 Identity follows the existing routing: `<your-org>/*` is bot;
-`<operator>/*` is user (the bot is not installed there). For
+`jacob-greene/*` is user (the bot is not installed there). For
 third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a
 stop-gap is acceptable when upstream is slow, but file the
 issue upstream too and document inside the wrapper which
@@ -391,7 +391,7 @@ foot-gun in the workspace report corpus.
   topic:nexus-fork`) and the cross-fork PR body convention. Loads
   only for nexus-internals work, not general project agents.
   (Post-cutover the canonical implementation is single-tenant
-  `<your-org>/nexus-code`; the topic-discovery path is legacy from
+  `jacob-greene/nexus`; the topic-discovery path is legacy from
   the pre-split era when each operator forked the code repo.)
 - `monitor/README.md` (in the nexus root) — full architecture, GitHub
   interaction model, the eligibility filter, env-var override table.
