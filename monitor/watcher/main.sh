@@ -3095,6 +3095,12 @@ _v2_task_deliveries_poll()   { _snapshot_deliveries_raw; }
 _v2_task_github_poll()       { _snapshot_github_raw; }
 _v2_task_full_state_snap()   { render_full_state_snapshot 2>/dev/null || true; }
 _v2_task_over_limit_scan()   { _over_limit_scan_panes "$TARGET"; }
+# Orchestrator context probe (issue #1). Async + expensive: one bounded
+# tail+jq over the orchestrator transcript — the LARGEST in the
+# workspace (0.63s bounded, 1.69s on the full-scan fallback at 59MB).
+# Far too slow for the synchronous compose path; the renderer reads
+# only the small state file this leaves behind.
+_v2_task_context_probe()     { _context_rotate_probe "$STATE_DIR" "$NEXUS_ROOT" "$TARGET"; }
 _v2_task_snapshot_local()    { snapshot_local; }
 _v2_task_detect_unstick()    { detect_and_unstick; }
 
@@ -4132,6 +4138,13 @@ _schedule_task detect_unstick          10           _v2_task_detect_unstick     
 _schedule_task snapshot_local          30           _v2_task_snapshot_local         --class medium    --async
 _schedule_task idle_section            30           _v2_task_idle_section           --class expensive --async
 _schedule_task over_limit_scan         60           _v2_task_over_limit_scan        --class expensive --async
+# Orchestrator context probe (issue #1). 0 disables it — the emit
+# section then finds no state file and stays silent.
+if [[ "$MONITOR_CONTEXT_ROTATION_ENABLED" == "true" ]] \
+   && (( MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS > 0 )); then
+    _schedule_task context_probe       "$MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS" \
+                                       _v2_task_context_probe          --class expensive --async
+fi
 # Event-fetch split (issue #181). Webhook (App-JWT bucket) is the
 # primary 15 s source; GraphQL backstop runs at 600 s on the
 # installation bucket. Compose_emit reads both staging files.
