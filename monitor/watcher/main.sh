@@ -1486,6 +1486,21 @@ source "$_script_dir/_resurface_cap.sh"
 # shellcheck source=_emit_dedup.sh
 source "$_script_dir/_emit_dedup.sh"
 
+# Context-budget rotation directive (issue #1). Functions only; no side
+# effects on source. Reads MONITOR_CONTEXT_ROTATION_* + TARGET at call
+# time. Render-only — never a gate trigger, so it can never cause an
+# emit of its own (a nag that generated wakes would spend tokens to
+# save tokens).
+# shellcheck source=_context_rotate.sh
+source "$_script_dir/_context_rotate.sh"
+
+# Worker context-budget scan (issue #2). Functions only. The SCAN runs
+# as a slow async scheduler task (context-usage.sh per worker window is
+# too expensive for the synchronous compose path); the RENDERER below
+# only reads the TSV it leaves behind.
+# shellcheck source=_context_scan.sh
+source "$_script_dir/_context_scan.sh"
+
 # Re-emit-until-acked registry for cross-repo bot-mention comments
 # (nexus-code#236). Functions only; no side effects on source. Required
 # globals (STATE_DIR, USER_LOGIN, MONITOR_REEMIT_*, MONITOR_EMIT_COOLDOWN_SECONDS,
@@ -1549,6 +1564,8 @@ _cap_emit_sections() {
             # Inherently small + the whole point of the emit. To keep a NEW
             # signal section un-capped, add its exact header here.
             exempt["--- watcher revived (was down) ---"]      = 1
+            exempt["--- rotate session ---"]                  = 1
+            exempt["--- workers over context ---"]            = 1
             exempt["--- resurface dropped ---"]               = 1
             exempt["--- arm watcher supervisor ---"]          = 1
             exempt["--- install failure ---"]                 = 1
@@ -1609,6 +1626,32 @@ _compose_report_body() {
     prelude=$(render_idle_prelude 2>/dev/null || true)
     if [[ -n "$prelude" ]]; then
         printf 'workspace: %s\n' "$prelude"
+    fi
+    # Context-budget rotation directive (issue #1). Pinned at the very
+    # top because it changes what the orchestrator should do with the
+    # REST of this emit: above the threshold the correct response is to
+    # hand off and respawn, not to process the sections below at a
+    # multiple of their fair price.
+    #
+    # Rendered inline rather than threaded through the (already 15-16
+    # slot) positional signature: it is a pure function of live state
+    # with no gate participation, so there is nothing for the caller to
+    # decide. Empty output — the normal case, below threshold — emits
+    # no header at all.
+    local context_rotate_lines=""
+    context_rotate_lines=$(_context_rotate_emit_section "$STATE_DIR" "$NEXUS_ROOT" "$TARGET" 2>/dev/null || true)
+    if [[ -n "$context_rotate_lines" ]]; then
+        echo '--- rotate session ---'
+        printf '%s\n' "$context_rotate_lines"
+    fi
+    # Workers past the context threshold (issue #2). Reads the TSV left
+    # by the `context_scan` scheduler task — no measurement on this
+    # synchronous path. Render-only, same as the rotate directive.
+    local context_over_lines=""
+    context_over_lines=$(_context_over_emit_section "$STATE_DIR" 2>/dev/null || true)
+    if [[ -n "$context_over_lines" ]]; then
+        echo '--- workers over context ---'
+        printf '%s\n' "$context_over_lines"
     fi
     # Comments the resurface cap gave up on (issue #3). One-shot: the
     # renderer consumes its queue, so each dropped id is announced
@@ -3097,6 +3140,16 @@ _v2_task_deliveries_poll()   { _snapshot_deliveries_raw; }
 _v2_task_github_poll()       { _snapshot_github_raw; }
 _v2_task_full_state_snap()   { render_full_state_snapshot 2>/dev/null || true; }
 _v2_task_over_limit_scan()   { _over_limit_scan_panes "$TARGET"; }
+# Orchestrator context probe (issue #1). Async + expensive: one bounded
+# tail+jq over the orchestrator transcript — the LARGEST in the
+# workspace (0.63s bounded, 1.69s on the full-scan fallback at 59MB).
+# Far too slow for the synchronous compose path; the renderer reads
+# only the small state file this leaves behind.
+_v2_task_context_probe()     { _context_rotate_probe "$STATE_DIR" "$NEXUS_ROOT" "$TARGET"; }
+# Worker context-budget scan (issue #2). Async + expensive: one
+# tail+jq per worker window. Its output is a TSV the compose path
+# reads for free.
+_v2_task_context_scan()      { _context_scan_workers "$STATE_DIR" "$NEXUS_ROOT"; }
 _v2_task_snapshot_local()    { snapshot_local; }
 _v2_task_detect_unstick()    { detect_and_unstick; }
 
@@ -4141,6 +4194,22 @@ _schedule_task detect_unstick          10           _v2_task_detect_unstick     
 _schedule_task snapshot_local          30           _v2_task_snapshot_local         --class medium    --async
 _schedule_task idle_section            30           _v2_task_idle_section           --class expensive --async
 _schedule_task over_limit_scan         60           _v2_task_over_limit_scan        --class expensive --async
+# Orchestrator context probe (issue #1). 0 disables it — the emit
+# section then finds no state file and stays silent.
+if [[ "$MONITOR_CONTEXT_ROTATION_ENABLED" == "true" ]] \
+   && (( MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS > 0 )); then
+    _schedule_task context_probe       "$MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS" \
+                                       _v2_task_context_probe          --class expensive --async
+fi
+# Worker context-budget scan (issue #2). Slow by design: worker context
+# does not move fast enough to warrant a tighter cadence, and every fire
+# costs one tail+jq per worker window. 0 disables the scan (the emit
+# section then finds no TSV and stays silent).
+if [[ "$MONITOR_CONTEXT_ROTATION_ENABLED" == "true" ]] \
+   && (( MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS > 0 )); then
+    _schedule_task context_scan        "$MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS" \
+                                       _v2_task_context_scan           --class expensive --async
+fi
 # Event-fetch split (issue #181). Webhook (App-JWT bucket) is the
 # primary 15 s source; GraphQL backstop runs at 600 s on the
 # installation bucket. Compose_emit reads both staging files.
