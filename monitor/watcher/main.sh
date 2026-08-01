@@ -2927,6 +2927,15 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         # failed startup paste leaves every request due for the
         # steady-state loop.
         requests_commit_emitted "$emit_body"
+        # Same for the resurface repeat-count (issue #3). The startup
+        # sweep runs the full `_gh_filter_dedup_pipeline` and pastes, so
+        # a comment genuinely IS delivered here — without this the
+        # delivery goes uncounted and every watcher restart grants one
+        # extra free repeat. Fail-safe in direction (over-surfacing,
+        # never data loss), but it silently loosens the cap. Both
+        # siblings above already commit here; this was the omission.
+        # (Skeptic req-002 finding 6.)
+        _resurface_commit_emitted "$emit_body"
         _respawn_loop_reset "$RESPAWN_HISTORY"
         rm -f "$RESPAWN_TRIPPED"
         # Successful paste = orchestrator reachable on both axes:
