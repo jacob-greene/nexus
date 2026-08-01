@@ -171,11 +171,27 @@ MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS="${MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS
 [[ "$MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS=120
 MONITOR_CONTEXT_PROBE_STALE_SECONDS="${MONITOR_CONTEXT_PROBE_STALE_SECONDS:-$("$_cfg" monitor.context_rotation.probe_stale_seconds 600)}"
 [[ "$MONITOR_CONTEXT_PROBE_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_STALE_SECONDS=600
+
+# Worker half (issue #2). `worker_tokens` is the threshold the worker
+# floor tells workers to self-rotate at AND the one the watcher's
+# `context_scan` task flags on. `scan_interval_seconds` is that scan's
+# cadence (0 disables it); `scan_stale_seconds` bounds how old the
+# resulting TSV may be before the emit section ignores it rather than
+# nagging on numbers that may predate a rotation that already happened.
+MONITOR_CONTEXT_ROTATION_WORKER_TOKENS="${MONITOR_CONTEXT_ROTATION_WORKER_TOKENS:-$("$_cfg" monitor.context_rotation.worker_tokens 250000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_WORKER_TOKENS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_ROTATION_WORKER_TOKENS=250000
+MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS="${MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS:-$("$_cfg" monitor.context_rotation.scan_interval_seconds 300)}"
+[[ "$MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS=300
+MONITOR_CONTEXT_SCAN_STALE_SECONDS="${MONITOR_CONTEXT_SCAN_STALE_SECONDS:-$("$_cfg" monitor.context_rotation.scan_stale_seconds 1800)}"
+[[ "$MONITOR_CONTEXT_SCAN_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_SCAN_STALE_SECONDS=1800
 export MONITOR_CONTEXT_ROTATION_ENABLED \
        MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS \
        MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS \
        MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS \
-       MONITOR_CONTEXT_PROBE_STALE_SECONDS
+       MONITOR_CONTEXT_PROBE_STALE_SECONDS \
+       MONITOR_CONTEXT_ROTATION_WORKER_TOKENS \
+       MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS \
+       MONITOR_CONTEXT_SCAN_STALE_SECONDS
 # Content-hash dedup gate. Computed AFTER compose_report renders the
 # body and BEFORE paste_to_target: when the stable-content hash of
 # the candidate body matches a recently-emitted hash (ring, below)
