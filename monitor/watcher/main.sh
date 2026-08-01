@@ -1476,6 +1476,13 @@ clear_bells() {
 # on source. Required globals (EMIT_DEDUP_HASH_FILE, EMIT_DEDUP_TS_FILE,
 # MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS, the `log` fn) are set above and
 # read at call time.
+# Bounded comment resurfacing (issue #3). MUST be sourced BEFORE
+# _emit_dedup.sh and used by _emit_filters.sh: both consult its
+# functions via `declare -F` guards and degrade to the pre-#3 behaviour
+# when absent, so load order is the only coupling.
+# shellcheck source=_resurface_cap.sh
+source "$_script_dir/_resurface_cap.sh"
+
 # shellcheck source=_emit_dedup.sh
 source "$_script_dir/_emit_dedup.sh"
 
@@ -1542,6 +1549,7 @@ _cap_emit_sections() {
             # Inherently small + the whole point of the emit. To keep a NEW
             # signal section un-capped, add its exact header here.
             exempt["--- watcher revived (was down) ---"]      = 1
+            exempt["--- resurface dropped ---"]               = 1
             exempt["--- arm watcher supervisor ---"]          = 1
             exempt["--- install failure ---"]                 = 1
             exempt["--- watcher hosting migration ---"]       = 1
@@ -1601,6 +1609,17 @@ _compose_report_body() {
     prelude=$(render_idle_prelude 2>/dev/null || true)
     if [[ -n "$prelude" ]]; then
         printf 'workspace: %s\n' "$prelude"
+    fi
+    # Comments the resurface cap gave up on (issue #3). One-shot: the
+    # renderer consumes its queue, so each dropped id is announced
+    # exactly once and the cap never becomes its own standing nag.
+    # Pinned high — a dropped item is unhandled operator input, which is
+    # strictly more important than anything below it.
+    local resurface_dropped_lines=""
+    resurface_dropped_lines=$(_resurface_dropped_emit_section "$STATE_DIR" 2>/dev/null || true)
+    if [[ -n "$resurface_dropped_lines" ]]; then
+        echo '--- resurface dropped ---'
+        printf '%s\n' "$resurface_dropped_lines"
     fi
     if [[ -n "$watcher_revived_lines" ]]; then
         # SELF-FAILURE REPORT (watcher-supervision). The watcher cannot

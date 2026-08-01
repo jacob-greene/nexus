@@ -147,6 +147,19 @@ MONITOR_EMIT_COOLDOWN_SECONDS="${MONITOR_EMIT_COOLDOWN_SECONDS:-$("$_cfg" monito
 # — far longer than any reasonable cooldown, but short enough that a
 # stale-but-rare comment-id never fills the directory.
 MONITOR_EMIT_HISTORY_RETENTION_SECONDS="${MONITOR_EMIT_HISTORY_RETENTION_SECONDS:-$("$_cfg" monitor.emit_history_retention_seconds 86400)}"
+# Bounded comment resurfacing (issue #3). The emit cooldown above is a
+# RATE, not a cap: an unprocessed comment re-emits once per cooldown
+# forever (54 times in one day on 2026-07-31 for a single id), and each
+# repeat bypasses the content-hash dedup gate because it carries an
+# `id=` row. `resurface_max_repeats` caps the repeats and
+# `resurface_backoff_max_seconds` makes the interval between them
+# double, so a stuck item costs a geometric rather than linear number
+# of full-price wakes before it is dropped and reported.
+MONITOR_RESURFACE_MAX_REPEATS="${MONITOR_RESURFACE_MAX_REPEATS:-$("$_cfg" monitor.resurface_max_repeats 4)}"
+[[ "$MONITOR_RESURFACE_MAX_REPEATS" =~ ^[0-9]+$ ]] || MONITOR_RESURFACE_MAX_REPEATS=4
+MONITOR_RESURFACE_BACKOFF_MAX_SECONDS="${MONITOR_RESURFACE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.resurface_backoff_max_seconds 3600)}"
+[[ "$MONITOR_RESURFACE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_RESURFACE_BACKOFF_MAX_SECONDS=3600
+export MONITOR_RESURFACE_MAX_REPEATS MONITOR_RESURFACE_BACKOFF_MAX_SECONDS
 # Content-hash dedup gate. Computed AFTER compose_report renders the
 # body and BEFORE paste_to_target: when the stable-content hash of
 # the candidate body matches a recently-emitted hash (ring, below)
