@@ -115,16 +115,23 @@ unaffected (git, not `gh`).
 **WHETHER — by repo tier.** Find the tier of the target repo, then
 follow its rule:
 
-- **Internal** (`settylab/*`, private `jacob-greene/*`): no fresh
-  approval per action.
+- **Internal** — the lab's and the operator's OWN projects:
+  `settylab/*` and `jacob-greene/*`. **Ownership decides here, not
+  visibility**: `jacob-greene/nexus` is public and is technically a
+  fork of `katosh/nexus`, but it is the operator's own implementation
+  repo and is therefore INTERNAL, exactly as the private repos are.
+  No fresh approval per action.
 - **User-public** (`katosh/labsh`, `katosh/agent_sandbox`, …):
   standing approval for ongoing work the user explicitly initiated;
   new directions need a fresh ack.
-- **External public** (`TrigosTeam/*`, `FredHutch/*`, third-party
-  repos, including `jacob-greene/<external-fork>` — GitHub visibility,
-  not ownership, decides): every push / PR / issue / comment needs
-  a fresh, specific user go-ahead. Worker prompts touching external
-  repos default to "draft + STOP for review", never auto-submit.
+- **External public** — someone ELSE'S project: `TrigosTeam/*`,
+  `FredHutch/*`, third-party repos, and `jacob-greene/<external-fork>`
+  (a fork we host of an upstream we don't own — contrast
+  `jacob-greene/nexus` above, which we do own). Among repos the
+  operator does not own, GitHub visibility decides. Every push / PR /
+  issue / comment needs a fresh, specific user go-ahead. Worker
+  prompts touching external repos default to "draft + STOP for
+  review", never auto-submit.
   Before any external-public write, grep the draft for internal
   identifiers (lab names, study names, sample IDs, treatment
   names, cell/clone counts, internal-repo refs) and redact.
