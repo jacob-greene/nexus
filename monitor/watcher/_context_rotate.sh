@@ -65,18 +65,48 @@ _context_rotate_emit_section() {
 
     local tokens pct limit
     tokens=$(sed -n 's/.*\btokens=\([0-9]*\).*/\1/p' <<<"$out")
-    pct=$(sed -n 's/.*\bpct=\([0-9]*\).*/\1/p' <<<"$out")
     limit=$(sed -n 's/.*\blimit=\([0-9]*\).*/\1/p' <<<"$out")
     [[ "$tokens" =~ ^[0-9]+$ ]] || return 0
-    [[ "$pct"    =~ ^[0-9]+$ ]] || pct=0
-    [[ "$limit"  =~ ^[0-9]+$ ]] || limit=0
+    [[ "$limit"  =~ ^[0-9]+$ ]] && (( limit > 0 )) || limit=1000000
 
+    # BUCKET THE RENDERED FIGURE. The exact live count drifts on every
+    # single wake, and this body is hashed by `_compose_emit_stable_hash`
+    # for the emit-dedup gate and the full-state canonical check. An
+    # exact figure here would make EVERY emit unique while the
+    # orchestrator sits over threshold — the gate could never collapse a
+    # repeat, so a feature meant to cut wakes would manufacture them.
+    # It would also disarm the resurface fix (issue #3), whose
+    # all-repeats bodies fall through to that same hash gate expecting a
+    # match.
+    #
+    # Rounding to the nearest 25k means the body changes only when the
+    # context has materially moved — which IS new information — a
+    # handful of times per session instead of every wake. `pct` is
+    # derived from the BUCKET, not the raw count, so the two can never
+    # disagree and drift independently. `monitor/ng context` is there
+    # when the exact number is wanted.
+    #
+    # Same rule `_emit_dedup.sh` states from the other direction ("ANY
+    # renderer change that adds a time-derived token to an emit row MUST
+    # extend this list") and that _context_scan.sh applies to its rows.
+    # Bucketing is preferred over extending the strip here because the
+    # strip lives in the most-diverged file in the tree.
+    local bucket=25000 bucketed
+    bucketed=$(( ( (tokens + bucket / 2) / bucket ) * bucket ))
+    (( bucketed > 0 )) || bucketed="$bucket"
+    pct=$(( bucketed * 100 / limit ))
+
+    # The LOG carries the exact figure — it is not hashed, so precision
+    # there is free and useful for post-hoc audit.
     if declare -F log >/dev/null 2>&1; then
-        log "context-rotation: orchestrator at ${tokens} tokens (${pct}% of ${limit}, threshold ${threshold}) — rendering rotate directive"
+        log "context-rotation: orchestrator at ${tokens} tokens (~${bucketed} bucketed, ${pct}% of ${limit}, threshold ${threshold}) — rendering rotate directive"
     fi
 
-    printf 'orchestrator context: %s tokens (%s%% of %s); rotation threshold %s.\n' \
-        "$tokens" "$pct" "$limit" "$threshold"
+    # Every figure below is the BUCKETED one — see the note above. No
+    # raw token count may appear in this body.
+    printf 'orchestrator context: ~%s tokens (~%s%% of %s); rotation threshold %s.\n' \
+        "$bucketed" "$pct" "$limit" "$threshold"
+    printf '(`monitor/ng context` for the exact figure.)\n'
     printf 'Every message re-reads the whole conversation, so this wake and\n'
     printf 'every wake after it is billed at this size. ROTATE NOW rather than\n'
     printf 'processing the rest of this emit at that price:\n'
@@ -84,9 +114,10 @@ _context_rotate_emit_section() {
     printf '  2. monitor/ng report-init orchestrator-rotation   # then fill it in\n'
     printf '     SUBSTANTIVELY — it is the entire state transfer\n'
     printf '  3. monitor/ng log-action monitor --event rotate-session \\\n'
-    printf '       --extra tokens=%s --extra threshold=%s\n' "$tokens" "$threshold"
+    printf '       --extra tokens=$(monitor/ng context --format json | jq .tokens) \\\n'
+    printf '       --extra threshold=%s\n' "$threshold"
     printf '  4. monitor/watcher/spawn-fresh-orchestrator.sh --target %s \\\n' "$target"
-    printf '       --rotation <report-path> --reason "context rotation at %s tokens"\n' "$tokens"
+    printf '       --rotation <report-path> --reason "context rotation"\n'
     printf 'NOT `ng respawn` — that RESUMES the session and carries this context\n'
     printf 'forward, rotating nothing. `--rotation` cold-spawns and refuses to\n'
     printf 'run without a readable report: a bare kill is not a rotation.\n'

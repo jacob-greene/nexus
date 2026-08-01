@@ -193,10 +193,16 @@ assert_contains "directive points at the rotate verb"   "$body" "--rotation"
 assert_contains "directive warns off ng respawn"        "$body" "NOT `ng respawn`"
 assert_contains "directive forbids a bare kill"         "$body" "bare kill is not a rotation"
 
-MONITOR_CONTEXT_ROTATION_ENABLED=false \
-    body=$(MONITOR_CONTEXT_ROTATION_ENABLED=false _context_rotate_emit_section \
-           "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+# NB: written as a plain command substitution with an inline env
+# prefix. `VAR=x \` on its own line ahead of `body=$(...)` would be an
+# assignments-ONLY command, which persists for the rest of the script
+# rather than scoping to the call — it silently disabled every
+# subsequent assertion in this file until caught.
+body=$(MONITOR_CONTEXT_ROTATION_ENABLED=false _context_rotate_emit_section \
+       "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
 assert_empty "disabled renders nothing" "$body"
+assert_eq "the disabled probe did not leak into the shell" \
+    "${MONITOR_CONTEXT_ROTATION_ENABLED}" "true"
 
 body=$(MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=0 _context_rotate_emit_section \
        "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
@@ -208,6 +214,40 @@ assert_empty "non-numeric threshold renders nothing" "$body"
 
 body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$WORK/no-such-root" orchestrator)
 assert_empty "missing helper renders nothing" "$body"
+
+# ---------------------------------------------------------------- 9
+# REGRESSION (skeptic req-001 finding 3): the rendered body must be
+# STABLE as the live figure drifts. This body is hashed by
+# `_compose_emit_stable_hash` for the emit-dedup gate and the
+# full-state canonical check — an exact token count here would make
+# every emit unique while the orchestrator sits over threshold, so the
+# gate could never collapse a repeat and a feature meant to CUT wakes
+# would manufacture them. It would also disarm issue #3's fix, whose
+# all-repeats bodies fall through to that same gate expecting a match.
+_ctx_body_for() {   # $1 = total tokens
+    local sid="$2"
+    _assistant_line 0 0 "$1" 0 > "$PROJECTS/$sid.jsonl"
+    printf '%s\n' "$sid" > "$NEXUS_STATE_DIR/orchestrator-session-id"
+    _context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator
+}
+SID_D="dddd0000-1111-2222-3333-444444444444"
+b1=$(_ctx_body_for 601000 "$SID_D")
+b2=$(_ctx_body_for 602300 "$SID_D")
+b3=$(_ctx_body_for 604900 "$SID_D")
+assert_eq "body stable across small drift (601k vs 602.3k)" "$b1" "$b2"
+assert_eq "body stable across small drift (601k vs 604.9k)" "$b1" "$b3"
+assert_not_contains "no raw token figure in the body" "$b1" "601000"
+assert_contains "renders the bucketed figure instead" "$b1" "~600000"
+
+# A material move DOES change the body — the bucket is a stabiliser,
+# not a mute button.
+b4=$(_ctx_body_for 660000 "$SID_D")
+[[ "$b1" != "$b4" ]] && r=changed || r=same
+assert_eq "a material move (600k→660k) still changes the body" "$r" "changed"
+
+# And the percentage must be derived from the bucket, so the two can
+# never drift independently.
+assert_contains "pct derived from the bucket" "$b1" "~60%"
 
 body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" no-such-window)
 assert_empty "unresolvable session renders nothing (never nags on a guess)" "$body"
