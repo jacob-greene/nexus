@@ -160,6 +160,18 @@ MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS="${MONITOR_CONTEXT_ROTATION_ORCHEST
 [[ "$MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=250000
 MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS="${MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS:-$("$_cfg" monitor.context_rotation.limit_tokens 1000000)}"
 [[ "$MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS" =~ ^[0-9]+$ ]] && (( MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS > 0 )) || MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS=1000000
+# Orchestrator context PROBE cadence + freshness. The measurement is an
+# async scheduler task (a bounded tail+jq over the largest transcript in
+# the workspace: 0.63s bounded, 1.69s on the full-scan fallback at
+# 59MB); the compose path only reads the small file it writes.
+# `probe_stale_seconds` bounds how old that reading may be before the
+# emit section ignores it, so a reading from before a rotation that
+# already happened cannot nag the fresh session into rotating again.
+MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS="${MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS:-$("$_cfg" monitor.context_rotation.probe_interval_seconds 120)}"
+[[ "$MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS=120
+MONITOR_CONTEXT_PROBE_STALE_SECONDS="${MONITOR_CONTEXT_PROBE_STALE_SECONDS:-$("$_cfg" monitor.context_rotation.probe_stale_seconds 600)}"
+[[ "$MONITOR_CONTEXT_PROBE_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_STALE_SECONDS=600
+
 # Worker half (issue #2). `worker_tokens` is the threshold the worker
 # floor tells workers to self-rotate at AND the one the watcher's
 # `context_scan` task flags on. `scan_interval_seconds` is that scan's
@@ -175,6 +187,8 @@ MONITOR_CONTEXT_SCAN_STALE_SECONDS="${MONITOR_CONTEXT_SCAN_STALE_SECONDS:-$("$_c
 export MONITOR_CONTEXT_ROTATION_ENABLED \
        MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS \
        MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS \
+       MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS \
+       MONITOR_CONTEXT_PROBE_STALE_SECONDS \
        MONITOR_CONTEXT_ROTATION_WORKER_TOKENS \
        MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS \
        MONITOR_CONTEXT_SCAN_STALE_SECONDS

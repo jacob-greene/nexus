@@ -177,14 +177,25 @@ chmod +x "$NEXUS_ROOT_FAKE/monitor/context-usage.sh"
 export MONITOR_CONTEXT_ROTATION_ENABLED=true
 export MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=250000
 export MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS=1000000
+export MONITOR_CONTEXT_PROBE_STALE_SECONDS=600
+
+# Measurement and rendering are SEPARATE (skeptic req-002 finding 4):
+# the probe is an async scheduler task, the renderer is compose-path
+# safe and only reads the probe's state file. Drive both.
+_probe_then_render() {
+    _context_rotate_probe        "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" "${1:-orchestrator}" 
+    _context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" "${1:-orchestrator}"
+}
 
 # orchestrator pin currently points at the 100000-token session.
-body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_probe_then_render orchestrator)
 assert_empty "below threshold renders nothing" "$body"
 
 # Repoint the pin at the 600000-token session.
 printf 'bbbbbbbb-1111-2222-3333-444444444444\n' > "$NEXUS_STATE_DIR/orchestrator-session-id"
-body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_probe_then_render orchestrator)
 assert_contains "at/over threshold renders a directive" "$body" "600000 tokens"
 assert_contains "directive names the threshold"         "$body" "250000"
 assert_contains "directive names the percentage"        "$body" "60%"
@@ -198,21 +209,19 @@ assert_contains "directive forbids a bare kill"         "$body" "bare kill is no
 # assignments-ONLY command, which persists for the rest of the script
 # rather than scoping to the call — it silently disabled every
 # subsequent assertion in this file until caught.
-body=$(MONITOR_CONTEXT_ROTATION_ENABLED=false _context_rotate_emit_section \
-       "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+body=$(MONITOR_CONTEXT_ROTATION_ENABLED=false _probe_then_render orchestrator)
 assert_empty "disabled renders nothing" "$body"
 assert_eq "the disabled probe did not leak into the shell" \
     "${MONITOR_CONTEXT_ROTATION_ENABLED}" "true"
 
-body=$(MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=0 _context_rotate_emit_section \
-       "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+body=$(MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=0 _probe_then_render orchestrator)
 assert_empty "threshold 0 renders nothing" "$body"
 
-body=$(MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=notanumber _context_rotate_emit_section \
-       "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+body=$(MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=notanumber _probe_then_render orchestrator)
 assert_empty "non-numeric threshold renders nothing" "$body"
 
-body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$WORK/no-such-root" orchestrator)
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_context_rotate_probe "$NEXUS_STATE_DIR" "$WORK/no-such-root" orchestrator; _context_rotate_emit_section "$NEXUS_STATE_DIR" "$WORK/no-such-root" orchestrator)
 assert_empty "missing helper renders nothing" "$body"
 
 # ---------------------------------------------------------------- 9
@@ -228,7 +237,7 @@ _ctx_body_for() {   # $1 = total tokens
     local sid="$2"
     _assistant_line 0 0 "$1" 0 > "$PROJECTS/$sid.jsonl"
     printf '%s\n' "$sid" > "$NEXUS_STATE_DIR/orchestrator-session-id"
-    _context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator
+    _probe_then_render orchestrator
 }
 SID_D="dddd0000-1111-2222-3333-444444444444"
 b1=$(_ctx_body_for 601000 "$SID_D")
@@ -249,7 +258,58 @@ assert_eq "a material move (600k→660k) still changes the body" "$r" "changed"
 # never drift independently.
 assert_contains "pct derived from the bucket" "$b1" "~60%"
 
-body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" no-such-window)
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_probe_then_render no-such-window)
 assert_empty "unresolvable session renders nothing (never nags on a guess)" "$body"
+
+# ---------------------------------------------------------------- 10
+# REGRESSION (skeptic req-002 finding 4): the RENDERER must do no
+# measurement. It runs from `_compose_report_body` on every compose
+# cycle — a path with a ~100 ms synchronous budget — while measuring
+# the orchestrator transcript (the largest in the workspace) costs
+# 0.63 s bounded and 1.69 s on the full-scan fallback.
+#
+# Proved structurally rather than by timing: make the measurement
+# helper unusable, then assert the renderer still works off the probe's
+# state file. If the renderer measured, this would render nothing.
+printf 'bbbbbbbb-1111-2222-3333-444444444444\n' > "$NEXUS_STATE_DIR/orchestrator-session-id"
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+_context_rotate_probe "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator
+assert_file_exists "probe writes its state file" "$NEXUS_STATE_DIR/orchestrator-context"
+
+chmod -x "$NEXUS_ROOT_FAKE/monitor/context-usage.sh"
+body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+chmod +x "$NEXUS_ROOT_FAKE/monitor/context-usage.sh"
+assert_contains "renderer works with the measurement helper unusable" "$body" "tokens"
+
+# ...and the probe, conversely, is the ONLY thing that measures: with
+# the helper unusable it must not write or refresh state.
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
+chmod -x "$NEXUS_ROOT_FAKE/monitor/context-usage.sh"
+_context_rotate_probe "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator
+chmod +x "$NEXUS_ROOT_FAKE/monitor/context-usage.sh"
+assert_no_file "probe writes nothing when it cannot measure" "$NEXUS_STATE_DIR/orchestrator-context"
+
+# A probe reading that is UNDER threshold must render nothing even
+# though the file exists.
+printf 'aaaaaaaa-1111-2222-3333-444444444444\n' > "$NEXUS_STATE_DIR/orchestrator-session-id"
+_context_rotate_probe "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator
+body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+assert_empty "under-threshold probe reading renders nothing" "$body"
+
+# STALENESS: a reading from before a rotation that already happened
+# must not nag the fresh session into rotating again.
+printf '900000\t1\t1000\n' > "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+assert_empty "stale probe reading renders nothing" "$body"
+body=$(MONITOR_CONTEXT_PROBE_STALE_SECONDS=0 _context_rotate_emit_section \
+       "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+assert_contains "staleness check disabled → renders again" "$body" "~900000"
+
+# A malformed probe file must render nothing, never a partial nag.
+printf 'garbage\n' > "$NEXUS_STATE_DIR/orchestrator-context"
+body=$(_context_rotate_emit_section "$NEXUS_STATE_DIR" "$NEXUS_ROOT_FAKE" orchestrator)
+assert_empty "malformed probe file renders nothing" "$body"
+rm -f "$NEXUS_STATE_DIR/orchestrator-context"
 
 th_summary_and_exit
