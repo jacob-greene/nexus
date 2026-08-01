@@ -125,18 +125,12 @@ a hook or your task prompt points you there.
   job in flight and no resume mechanism armed. A hook spells out
   the three acceptable mechanisms the moment you launch one; act
   on it then.
-- **Bound your session by context, not just by task.** Every
-  message you send re-reads the whole conversation, so a worker at
-  600k context pays ~6x per tool call what it paid at 100k — for
-  identical work. At **~250k** (`monitor/ng context` prints your
-  live figure; exit 10 means you are past it) stop taking new
-  ground: finish the step you are on, file your report, and wrap
-  up. Let the orchestrator respawn you from the report — you will
-  be faster and cheaper on the other side. This is the concrete
-  version of "context pressure" below; do not treat it as a
-  judgement call. Exception: if your task prompt explicitly says
-  it needs one long session (a stateful kernel, a long debug
-  thread), it overrides this — say so in your report.
+- **Stop at ~250k context** (`monitor/ng context`; exit 10 = past
+  it). Every message re-reads the whole conversation, so a worker
+  at 600k pays ~6x per tool call for identical work. Finish the
+  current step, then wrap up per the next bullet and let the
+  orchestrator respawn you. A number, not a judgement call —
+  unless your task prompt says it needs one long session.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures
