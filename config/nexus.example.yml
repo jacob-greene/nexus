@@ -429,6 +429,48 @@ monitor:
     idle_backoff_enabled: true
     idle_backoff_max_seconds: 3600
 
+  # Context-budget session rotation (issue #1). Every assistant message
+  # re-reads the whole conversation, so the price of an IDENTICAL action
+  # grows monotonically with session age: an orchestrator at 998k context
+  # pays ~10x per wake what the same orchestrator paid at 100k. The
+  # 2026-07-31 token audit measured one 36 h orchestrator session at
+  # ~1,540M cache-read tokens — ~40% of all spend in the workspace — with
+  # a single routine `poll-full-state` wake costing 31.7M tokens and
+  # producing no work.
+  #
+  # The fix is to ROTATE at a threshold instead of drifting to the
+  # ceiling: write the standard hand-off report, then `ng respawn` a
+  # fresh session seeded with it. Nothing is lost — the report is
+  # already the designed resumption surface — and per-wake cost drops
+  # roughly 4x at the default threshold.
+  #
+  # The watcher reads the orchestrator's live context each compose cycle
+  # (monitor/context-usage.sh, which reads the transcript's
+  # `message.usage`) and renders a `--- rotate session ---` directive
+  # once it is at or over `orchestrator_tokens`. The section is
+  # RENDER-ONLY: it never triggers an emit of its own, it rides the
+  # emits the orchestrator was already being woken by. Rotations are
+  # auditable via `ng log-action monitor --event rotate-session`.
+  context_rotation:
+    # Master switch. false → the watcher renders no rotate directive and
+    # `ng context` still works as a manual read. Env override:
+    # MONITOR_CONTEXT_ROTATION_ENABLED.
+    enabled: true
+
+    # Orchestrator rotation threshold, in context tokens. At or above
+    # this, the next wake is spent rotating instead of processing.
+    # Suggested 250000 (~4x cheaper per wake than the 1M ceiling).
+    # 0 disables the orchestrator directive. Nexuses with heavier
+    # per-wake work want this LOWER, not higher — the whole point is
+    # that late-session work is billed at a multiple. Env override:
+    # MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS.
+    orchestrator_tokens: 250000
+
+    # The model's context ceiling, used only to render the `pct=` figure
+    # (and the percentage in the emit). Bump when the pinned model's
+    # window changes. Env: MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS.
+    limit_tokens: 1000000
+
   # Claude Code update-detection (GATED self-update, detect→inform
   # half). The `cc_version_check` watcher task compares the
   # package.json `@anthropic-ai/claude-code` pin against the npm

@@ -1479,6 +1479,14 @@ clear_bells() {
 # shellcheck source=_emit_dedup.sh
 source "$_script_dir/_emit_dedup.sh"
 
+# Context-budget rotation directive (issue #1). Functions only; no side
+# effects on source. Reads MONITOR_CONTEXT_ROTATION_* + TARGET at call
+# time. Render-only — never a gate trigger, so it can never cause an
+# emit of its own (a nag that generated wakes would spend tokens to
+# save tokens).
+# shellcheck source=_context_rotate.sh
+source "$_script_dir/_context_rotate.sh"
+
 # Re-emit-until-acked registry for cross-repo bot-mention comments
 # (nexus-code#236). Functions only; no side effects on source. Required
 # globals (STATE_DIR, USER_LOGIN, MONITOR_REEMIT_*, MONITOR_EMIT_COOLDOWN_SECONDS,
@@ -1542,6 +1550,7 @@ _cap_emit_sections() {
             # Inherently small + the whole point of the emit. To keep a NEW
             # signal section un-capped, add its exact header here.
             exempt["--- watcher revived (was down) ---"]      = 1
+            exempt["--- rotate session ---"]                  = 1
             exempt["--- arm watcher supervisor ---"]          = 1
             exempt["--- install failure ---"]                 = 1
             exempt["--- watcher hosting migration ---"]       = 1
@@ -1601,6 +1610,23 @@ _compose_report_body() {
     prelude=$(render_idle_prelude 2>/dev/null || true)
     if [[ -n "$prelude" ]]; then
         printf 'workspace: %s\n' "$prelude"
+    fi
+    # Context-budget rotation directive (issue #1). Pinned at the very
+    # top because it changes what the orchestrator should do with the
+    # REST of this emit: above the threshold the correct response is to
+    # hand off and respawn, not to process the sections below at a
+    # multiple of their fair price.
+    #
+    # Rendered inline rather than threaded through the (already 15-16
+    # slot) positional signature: it is a pure function of live state
+    # with no gate participation, so there is nothing for the caller to
+    # decide. Empty output — the normal case, below threshold — emits
+    # no header at all.
+    local context_rotate_lines=""
+    context_rotate_lines=$(_context_rotate_emit_section "$STATE_DIR" "$NEXUS_ROOT" "$TARGET" 2>/dev/null || true)
+    if [[ -n "$context_rotate_lines" ]]; then
+        echo '--- rotate session ---'
+        printf '%s\n' "$context_rotate_lines"
     fi
     if [[ -n "$watcher_revived_lines" ]]; then
         # SELF-FAILURE REPORT (watcher-supervision). The watcher cannot

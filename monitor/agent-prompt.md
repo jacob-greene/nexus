@@ -711,3 +711,63 @@ Per `skills/nexus.report/SKILL.md`: write a report under
 `reports/nexus_*.md` if context pressure rises or you go idle for an
 extended period. Otherwise the GitHub overview issue body IS your
 running report.
+
+## Session rotation (context budget)
+
+Your session has no natural end. The watcher wakes you every few
+minutes for as long as you live, and **every message you send re-reads
+the entire conversation** — so the price of an identical wake grows
+monotonically with session age. This is not a small effect. Measured on
+this nexus (2026-07-31 audit): one orchestrator ran 36 h in a single
+session, reached the 998k context ceiling, and burned ~1,540M
+cache-read tokens — about 40% of all token spend in the workspace. Its
+single worst turn was a routine `poll-full-state` wake that produced no
+work and cost 31.7M tokens.
+
+So rotate on purpose, before the cost compounds.
+
+**Read your own context any time:**
+
+    monitor/ng context           # your session; exit 10 = at/over threshold
+
+**The trigger.** Above `monitor.context_rotation.orchestrator_tokens`
+(default 250k) the watcher pins a `--- rotate session ---` section at
+the TOP of every emit, carrying your live figure. When you see it, that
+emit's other sections are *not* your job — rotating is. Processing them
+at 4x price and rotating afterwards is the worst of both.
+
+**The procedure.** Rotation is a hand-off, never a bare kill:
+
+1. Finish or safely park any in-flight write. A half-written file or an
+   unpushed commit does not survive.
+2. Write the hand-off report — `monitor/ng report-init
+   orchestrator-rotation`, then fill it in **substantively**. This
+   report is the *entire* state transfer: in-flight worker windows and
+   what each is doing, decisions made but not yet acted on, threads
+   awaiting a reply, anything you were mid-way through. Your successor
+   knows nothing you do not write down.
+3. Log it so the cadence is auditable:
+
+        monitor/ng log-action monitor --event rotate-session \
+            --extra tokens=<n> --extra threshold=<n>
+
+4. Rotate:
+
+        monitor/watcher/spawn-fresh-orchestrator.sh \
+            --target <your window> --rotation <report-path> \
+            --reason "context rotation at <n> tokens"
+
+   `--rotation` implies a cold spawn (resuming would keep the very
+   context you are shedding), refuses to run if the report path does
+   not exist, and seeds your successor's first turn with a preamble
+   pointing at it.
+
+**Not `ng respawn`.** That verb routes to `spawn-worker.sh --resume`,
+which *resumes* the session — it carries the context forward and
+rotates nothing. It is the right tool for reviving a dead worker, and
+the wrong one here.
+
+**When not to rotate.** If you are mid-way through something genuinely
+atomic — a running migration, an in-flight external write — finish it
+first and rotate immediately after. The threshold is a strong default,
+not an interrupt.

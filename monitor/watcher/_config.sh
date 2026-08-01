@@ -147,6 +147,22 @@ MONITOR_EMIT_COOLDOWN_SECONDS="${MONITOR_EMIT_COOLDOWN_SECONDS:-$("$_cfg" monito
 # — far longer than any reasonable cooldown, but short enough that a
 # stale-but-rare comment-id never fills the directory.
 MONITOR_EMIT_HISTORY_RETENTION_SECONDS="${MONITOR_EMIT_HISTORY_RETENTION_SECONDS:-$("$_cfg" monitor.emit_history_retention_seconds 86400)}"
+# Context-budget session rotation (issue #1). Every assistant message
+# re-reads the whole conversation, so an orchestrator that drifts to the
+# 1M ceiling pays ~10x per wake what it paid at 100k. Above
+# `orchestrator_tokens` the watcher renders a `--- rotate session ---`
+# directive telling the orchestrator to hand off (report) and respawn
+# fresh. Render-only: it never triggers an emit of its own.
+# `limit_tokens` is presentation only (the `pct=` figure).
+MONITOR_CONTEXT_ROTATION_ENABLED="${MONITOR_CONTEXT_ROTATION_ENABLED:-$("$_cfg" monitor.context_rotation.enabled true)}"
+[[ "$MONITOR_CONTEXT_ROTATION_ENABLED" == "false" ]] || MONITOR_CONTEXT_ROTATION_ENABLED=true
+MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS="${MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS:-$("$_cfg" monitor.context_rotation.orchestrator_tokens 250000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=250000
+MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS="${MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS:-$("$_cfg" monitor.context_rotation.limit_tokens 1000000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS" =~ ^[0-9]+$ ]] && (( MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS > 0 )) || MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS=1000000
+export MONITOR_CONTEXT_ROTATION_ENABLED \
+       MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS \
+       MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS
 # Content-hash dedup gate. Computed AFTER compose_report renders the
 # body and BEFORE paste_to_target: when the stable-content hash of
 # the candidate body matches a recently-emitted hash (ring, below)
