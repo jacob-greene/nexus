@@ -172,6 +172,29 @@ _compose_emit_stable_hash() {
 _compose_emit_should_bypass_dedup() {
     local body_file="$1"
     [[ -f "$body_file" ]] || return 1
+    # RESURFACE NARROWING (issue #3). The gh-comment bypass above is
+    # justified by "deduped at the source ... so by the time one reaches
+    # here it is genuinely new". That invariant holds for a comment's
+    # FIRST emit and is false for every resurface, which by construction
+    # re-injects an already-seen id. The result was that the one gate
+    # capable of collapsing an identical repeat was switched off by the
+    # repeat itself — 54 full-price wakes for a single unprocessed
+    # comment on 2026-07-31.
+    #
+    # So: when EVERY comment row in the body is a repeat, do not bypass.
+    # The body falls through to the content-hash gate, which suppresses
+    # it only if nothing else in the emit changed either — i.e. exactly
+    # the issue's "an emit with no new information should not be sent at
+    # all". A body carrying any first-time id still bypasses, unchanged,
+    # so a genuinely new operator comment is never delayed.
+    #
+    # Conservative on doubt: the helper returns not-all-repeats whenever
+    # it cannot tell (no state dir, no history, no rows), and the guard
+    # is skipped entirely when _resurface_cap.sh isn't sourced.
+    if declare -F _resurface_body_is_all_repeats >/dev/null 2>&1 \
+       && _resurface_body_is_all_repeats "$body_file"; then
+        return 1
+    fi
     if awk '
         /^--- eligible github comments ---$/ { sec = "gh"; next }
         /^--- requests ---$/                 { sec = "req"; next }

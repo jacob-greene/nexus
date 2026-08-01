@@ -4496,6 +4496,11 @@ _facade() {
 cmd_retire_preflight() { _facade retire-preflight.sh "$@"; }
 # orchestrator: classify a worker pane (idle|busy|user-typing|…)
 cmd_pane_state()       { _facade pane-state.sh       "$@"; }
+# any agent: read a session's CURRENT context size in tokens (issue #1).
+# Exit 10 = at/over the rotation threshold, 0 = under, 1 = unresolved —
+# so a caller can branch without parsing. Bare `ng context` reads the
+# CALLER's own session.
+cmd_context()          { _facade context-usage.sh    "$@"; }
 # worker: pre-flight that a deliverable path is writable before compute
 cmd_write_probe()      { _facade write-probe.sh      "$@"; }
 # maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
@@ -4558,6 +4563,7 @@ Window & worker ops:
   spawn-decision <window>        spawn/skeptic decision read
   engaged-done                   mark an engaged worker done
   pane-state <window-index>      classify a worker pane
+  context [--window W]           context size in tokens (exit 10 = rotate)
   paste-followup <window>        canonical follow-up paste into a window
   retire-preflight <window>      synchronous go/no-go gate before kill
   skeptic <sub> …                worker↔skeptic comms channel + nudge
@@ -4626,6 +4632,7 @@ main() {
         remote)                cmd_remote                "$@" ;;
         retire-preflight)      cmd_retire_preflight      "$@" ;;
         pane-state)            cmd_pane_state            "$@" ;;
+        context)               cmd_context               "$@" ;;
         write-probe)           cmd_write_probe           "$@" ;;
         declare-wait)          cmd_declare_wait          "$@" ;;
         declare-no-wait)       cmd_declare_no_wait       "$@" ;;

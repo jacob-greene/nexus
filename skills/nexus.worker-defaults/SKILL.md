@@ -125,6 +125,12 @@ a hook or your task prompt points you there.
   job in flight and no resume mechanism armed. A hook spells out
   the three acceptable mechanisms the moment you launch one; act
   on it then.
+- **Stop at ~250k context** (`monitor/ng context`; exit 10 = past
+  it). Every message re-reads the whole conversation, so a worker
+  at 600k pays ~6x per tool call for identical work. Finish the
+  current step, then wrap up per the next bullet and let the
+  orchestrator respawn you. A number, not a judgement call —
+  unless your task prompt says it needs one long session.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures
