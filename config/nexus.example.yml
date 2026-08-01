@@ -429,6 +429,39 @@ monitor:
     idle_backoff_enabled: true
     idle_backoff_max_seconds: 3600
 
+  # Bounded comment resurfacing (issue #3). `emit_cooldown_seconds`
+  # above is a RATE, not a cap: an eligible-but-unprocessed comment
+  # re-emits once per cooldown forever. On 2026-07-31 one comment
+  # (id=5147150803) was re-emitted 54 times in a day, another 13; ~120
+  # of the day's 208 emits were `poll-resurface`. Each one landing on a
+  # live orchestrator is a full-price wake — 1-7M tokens at the
+  # contexts orchestrators actually reach — carrying nothing the
+  # orchestrator had not already seen.
+  #
+  # Worse, each repeat also BYPASSED the content-hash dedup gate: that
+  # bypass fires for any body with an `id=` row in the eligible-comments
+  # section, on the assumption such a row is always genuinely new. True
+  # for a first emit, false for every resurface — so the one gate that
+  # could have collapsed the repeat was switched off by the repeat.
+  #
+  # After this many emits of the SAME comment body without the comment
+  # being processed, the watcher stops re-emitting it, records it to
+  # `monitor/.state/resurface-dropped.tsv` + `watcher-unstick.log`, and
+  # surfaces it once in the next emit as `--- resurface dropped ---`.
+  # Editing the comment resets the count and revives it. 0 restores the
+  # unbounded pre-#3 behaviour. Env: MONITOR_RESURFACE_MAX_REPEATS.
+  resurface_max_repeats: 4
+
+  # Ceiling for the doubling backoff between repeats. The effective
+  # cooldown for the Nth repeat is
+  # `emit_cooldown_seconds * 2^(N-1)`, capped here — 300s, 600s,
+  # 1200s, 2400s, 3600s, … So a stuck item costs a geometric rather
+  # than linear number of wakes before the cap ends it. 0 disables the
+  # backoff (flat `emit_cooldown_seconds` between repeats, still
+  # capped by resurface_max_repeats). Env:
+  # MONITOR_RESURFACE_BACKOFF_MAX_SECONDS.
+  resurface_backoff_max_seconds: 3600
+
   # Context-budget session rotation (issue #1). Every assistant message
   # re-reads the whole conversation, so the price of an IDENTICAL action
   # grows monotonically with session age: an orchestrator at 998k context

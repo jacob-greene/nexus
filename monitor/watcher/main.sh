@@ -1476,6 +1476,13 @@ clear_bells() {
 # on source. Required globals (EMIT_DEDUP_HASH_FILE, EMIT_DEDUP_TS_FILE,
 # MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS, the `log` fn) are set above and
 # read at call time.
+# Bounded comment resurfacing (issue #3). MUST be sourced BEFORE
+# _emit_dedup.sh and used by _emit_filters.sh: both consult its
+# functions via `declare -F` guards and degrade to the pre-#3 behaviour
+# when absent, so load order is the only coupling.
+# shellcheck source=_resurface_cap.sh
+source "$_script_dir/_resurface_cap.sh"
+
 # shellcheck source=_emit_dedup.sh
 source "$_script_dir/_emit_dedup.sh"
 
@@ -1559,6 +1566,7 @@ _cap_emit_sections() {
             exempt["--- watcher revived (was down) ---"]      = 1
             exempt["--- rotate session ---"]                  = 1
             exempt["--- workers over context ---"]            = 1
+            exempt["--- resurface dropped ---"]               = 1
             exempt["--- arm watcher supervisor ---"]          = 1
             exempt["--- install failure ---"]                 = 1
             exempt["--- watcher hosting migration ---"]       = 1
@@ -1644,6 +1652,17 @@ _compose_report_body() {
     if [[ -n "$context_over_lines" ]]; then
         echo '--- workers over context ---'
         printf '%s\n' "$context_over_lines"
+    fi
+    # Comments the resurface cap gave up on (issue #3). One-shot: the
+    # renderer consumes its queue, so each dropped id is announced
+    # exactly once and the cap never becomes its own standing nag.
+    # Pinned high — a dropped item is unhandled operator input, which is
+    # strictly more important than anything below it.
+    local resurface_dropped_lines=""
+    resurface_dropped_lines=$(_resurface_dropped_emit_section "$STATE_DIR" 2>/dev/null || true)
+    if [[ -n "$resurface_dropped_lines" ]]; then
+        echo '--- resurface dropped ---'
+        printf '%s\n' "$resurface_dropped_lines"
     fi
     if [[ -n "$watcher_revived_lines" ]]; then
         # SELF-FAILURE REPORT (watcher-supervision). The watcher cannot
@@ -2951,6 +2970,15 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         # failed startup paste leaves every request due for the
         # steady-state loop.
         requests_commit_emitted "$emit_body"
+        # Same for the resurface repeat-count (issue #3). The startup
+        # sweep runs the full `_gh_filter_dedup_pipeline` and pastes, so
+        # a comment genuinely IS delivered here — without this the
+        # delivery goes uncounted and every watcher restart grants one
+        # extra free repeat. Fail-safe in direction (over-surfacing,
+        # never data loss), but it silently loosens the cap. Both
+        # siblings above already commit here; this was the omission.
+        # (Skeptic req-002 finding 6.)
+        _resurface_commit_emitted "$emit_body"
         _respawn_loop_reset "$RESPAWN_HISTORY"
         rm -f "$RESPAWN_TRIPPED"
         # Successful paste = orchestrator reachable on both axes:
@@ -4057,6 +4085,13 @@ _v2_task_compose_emit() {
                 log "pasted to ${TARGET}"
                 _emit_delivery_ok
                 _compose_emit_record_emit "$emit_body"
+                # Commit the resurface repeat-count for the comment ids
+                # this paste actually DELIVERED (issue #3). Same
+                # post-paste-only discipline as the record above, and
+                # for a stricter reason: a suppressed or held emit that
+                # burned a repeat would permanently drop a comment the
+                # operator never saw.
+                _resurface_commit_emitted "$emit_body"
                 # Delivery-stamp the request ids this paste actually
                 # carried (stamp-on-paste, your-org/nexus-code#483) —
                 # same post-paste-only discipline as the emit-dedup
