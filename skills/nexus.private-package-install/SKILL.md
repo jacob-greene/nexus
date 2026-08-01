@@ -114,7 +114,7 @@ This skill **does not** restate the general packaging conventions on <your-insti
 
 ## Documented field example
 
-`<your-org>/<other-nexus>#6` (ccflowR install audit, 2026-05-08) traced an opaque 404 in an R bootstrap script to a bot-installation-token fallback when `GITHUB_PAT` was unset. The fix landed as a fail-loud guard in `inst/bootstrap.R`, exactly the shape shown above. That incident is the canonical reproduction case for this skill's rule.
+`<other-owner>/<other-nexus>#6` (ccflowR install audit, 2026-05-08) traced an opaque 404 in an R bootstrap script to a bot-installation-token fallback when `GITHUB_PAT` was unset. The fix landed as a fail-loud guard in `inst/bootstrap.R`, exactly the shape shown above. That incident is the canonical reproduction case for this skill's rule.
 
 ## See Also
 

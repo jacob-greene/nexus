@@ -20,7 +20,7 @@ where a fast internal route to the owner exists.
 
 Each lab member runs a **nexus**: an agent workspace paired with a
 GitHub "asset + issue" repo (e.g. `jacob-greene/jacob-greene-nexus-assets` is
-jacob-greene's, `<your-org>/<other-nexus>` is otheruser's). Agents in these
+jacob-greene's, `<other-owner>/<other-nexus>` is otheruser's). Agents in these
 nexuses do real single-cell analysis every day, and that work
 leans on the lab's own software — kompot for differential
 abundance, Mellon for density inference, Palantir for trajectories,
@@ -96,7 +96,7 @@ alongside jacob-greene). `dpeerlab`, `broadinstitute`, and the like are
 
 For a bug in an external-upstream lab tool:
 - Prefer routing to the owner's **lab-side** surface first —
-  their nexus asset repo (`@otheruser` → `<your-org>/<other-nexus>`) —
+  their nexus asset repo (`@otheruser` → `<other-owner>/<other-nexus>`) —
   where you can post freely as the bot.
 - **Do NOT auto-post an issue or PR to the external upstream**
   (`dpeerlab/*`, etc.). Those are external-public: **draft the
@@ -127,13 +127,13 @@ Almost every member now runs a nexus — route a bug to the owner's
 nexus asset repo below.
 
 **Member → nexus asset repo (routing target):** `@jacob-greene` →
-`jacob-greene/jacob-greene-nexus-assets` · `@otheruser` → `<your-org>/<other-nexus>` ·
-`@otheruser` → `<your-org>/<other-nexus>` · `@otheruser` →
-`<your-org>/<other-nexus>` · `@otheruser` → `<your-org>/<other-nexus>` ·
-`@<other-nexus>` → `<your-org>/<other-nexus>` · `@otheruser` →
-`<your-org>/<other-nexus>` · `@otheruser` →
-`<your-org>/<other-nexus>` · `@otheruser` →
-`<your-org>/<other-nexus>`.
+`jacob-greene/jacob-greene-nexus-assets` · `@otheruser` → `<other-owner>/<other-nexus>` ·
+`@otheruser` → `<other-owner>/<other-nexus>` · `@otheruser` →
+`<other-owner>/<other-nexus>` · `@otheruser` → `<other-owner>/<other-nexus>` ·
+`@<other-nexus>` → `<other-owner>/<other-nexus>` · `@otheruser` →
+`<other-owner>/<other-nexus>` · `@otheruser` →
+`<other-owner>/<other-nexus>` · `@otheruser` →
+`<other-owner>/<other-nexus>`.
 
 ### Actively-maintained <your-org> packages & methods
 
@@ -156,21 +156,21 @@ nexus asset repo below.
 | **unprintable** | Find & remove hidden characters in text files | `<your-org>/unprintable` | operator (`@jacob-greene`) | `jacob-greene/jacob-greene-nexus-assets` |
 | **fh-hpc-skills** | Claude Code skills for <your-institution> HPC usage | `<your-org>/hpc-skills` | operator (`@jacob-greene`) | `jacob-greene/jacob-greene-nexus-assets` |
 | **agent_container** | Responsible-usage tooling for AI coding agents | `<your-org>/agent_container` | operator (`@jacob-greene`) | `jacob-greene/jacob-greene-nexus-assets` |
-| **otheruser_annotation** | Utilities to ease cell-type annotation | `<your-org>/otheruser_annotation` | **otheruser (`@<other-nexus>`)** — operator-confirmed owner (`@jacob-greene` committed on her behalf) | `<your-org>/<other-nexus>` |
-| **scEcho** (a.k.a. "echo") | Statistical framework for desynchronized cell states + driver genes/REs from paired scRNA + scATAC | `<your-org>/scEcho` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **Desync** | Desynchronization method (`scEcho` family) | `<your-org>/Desync` | otheruser (`@otheruser`) — *confirm: standalone tool vs. `scEcho` component* | `<your-org>/<other-nexus>` |
-| **Singlecept** | Quantify receptor downstream activity at single-cell resolution (scMultiome) | `<your-org>/Singlecept` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **ContextNet** | Infer context-specific TF-target relations from RNA + ATAC multiome | `<your-org>/ContextNet` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **ccflowR** / **ccflow** | Cell-cell communication flow analysis | `<your-org>/ccflowR`, `<your-org>/ccflow` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<your-org>/<other-nexus>` |
-| **context_specific_grn** | Context-specific GRN construction from paired RNA + ATAC | `<your-org>/context_specific_grn` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<your-org>/<other-nexus>` |
-| **trendsetter** | Plotting & utilities for single-cell trend analysis | `<your-org>/trendsetter` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **insilico-chip** | In-silico ChIP-seq in Python | `<your-org>/insilico-chip` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **atac_metacell_utilities** | Snakemake pipeline for scATAC metacell scores, chromVAR, in-silico ChIP | `<your-org>/atac_metacell_utilities` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **useful-plots** | Reusable plotting functions that don't fit a package | `<your-org>/useful-plots` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **multimodal-integration** | Multimodal single-cell integration | `<your-org>/multimodal-integration` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<your-org>/<other-nexus>` |
-| **proseg-workflow** | Proseg (spatial cell segmentation) Nextflow pipeline for Cirro | `<your-org>/proseg-workflow` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **check-strand** | Infer strandedness of RNA-Seq data | `otheruser/check-strand` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **TBmisc** | R package of utilities for biomedical data | `otheruser/TBmisc` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
+| **otheruser_annotation** | Utilities to ease cell-type annotation | `<your-org>/otheruser_annotation` | **otheruser (`@<other-nexus>`)** — operator-confirmed owner (`@jacob-greene` committed on her behalf) | `<other-owner>/<other-nexus>` |
+| **scEcho** (a.k.a. "echo") | Statistical framework for desynchronized cell states + driver genes/REs from paired scRNA + scATAC | `<your-org>/scEcho` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **Desync** | Desynchronization method (`scEcho` family) | `<your-org>/Desync` | otheruser (`@otheruser`) — *confirm: standalone tool vs. `scEcho` component* | `<other-owner>/<other-nexus>` |
+| **Singlecept** | Quantify receptor downstream activity at single-cell resolution (scMultiome) | `<your-org>/Singlecept` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **ContextNet** | Infer context-specific TF-target relations from RNA + ATAC multiome | `<your-org>/ContextNet` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **ccflowR** / **ccflow** | Cell-cell communication flow analysis | `<your-org>/ccflowR`, `<your-org>/ccflow` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<other-owner>/<other-nexus>` |
+| **context_specific_grn** | Context-specific GRN construction from paired RNA + ATAC | `<your-org>/context_specific_grn` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<other-owner>/<other-nexus>` |
+| **trendsetter** | Plotting & utilities for single-cell trend analysis | `<your-org>/trendsetter` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **insilico-chip** | In-silico ChIP-seq in Python | `<your-org>/insilico-chip` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **atac_metacell_utilities** | Snakemake pipeline for scATAC metacell scores, chromVAR, in-silico ChIP | `<your-org>/atac_metacell_utilities` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **useful-plots** | Reusable plotting functions that don't fit a package | `<your-org>/useful-plots` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **multimodal-integration** | Multimodal single-cell integration | `<your-org>/multimodal-integration` | otheruser (`@otheruser`) — *confirm tool vs. analysis* | `<other-owner>/<other-nexus>` |
+| **proseg-workflow** | Proseg (spatial cell segmentation) Nextflow pipeline for Cirro | `<your-org>/proseg-workflow` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **check-strand** | Infer strandedness of RNA-Seq data | `otheruser/check-strand` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **TBmisc** | R package of utilities for biomedical data | `otheruser/TBmisc` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
 | **getspan** | Gene-trend regression & span identification | `<your-org>/getspan` | otheruser (`handle?` — not in provided roster; recently GitHub-active, confirm owner) | `<your-org>/getspan` (operator to route) |
 | **CellDensities** | Single-cell density utilities | `<your-org>/CellDensities` | `otheruser` (`handle?` — not in provided roster; fallback maintainer `@jacob-greene`) | `<your-org>/CellDensities` |
 
@@ -180,17 +180,17 @@ Trajectory / metacell classics whose **canonical home is an external
 group** (`dpeerlab`, Pe'er lab) — these are **external-public**:
 never auto-post upstream; **draft + STOP for operator review** and
 redact internal identifiers first. Route the lab-side report to
-`@otheruser`'s nexus (`<your-org>/<other-nexus>`) as an interim.
+`@otheruser`'s nexus (`<other-owner>/<other-nexus>`) as an interim.
 
 | Tool | Purpose | Canonical repo | Owner (handle) | File a bug at |
 |---|---|---|---|---|
-| **Palantir** | Single-cell trajectory detection | `dpeerlab/Palantir` | otheruser (`@otheruser`, author) + operator (`@jacob-greene`, active maintainer) | `<your-org>/<other-nexus>`; external upstream → **draft + operator review** |
-| **Harmony** | Framework connecting scRNA-seq across discrete time points | `dpeerlab/Harmony` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>`; upstream → **draft + review** |
-| **wishbone** | Align cells along branching developmental trajectories | `dpeerlab/wishbone` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>`; upstream → **draft + review** |
-| **SEACells** | Infer metacell states from single-cell genomics | `dpeerlab/SEACells` | otheruser (`@otheruser`) + upstream Pe'er-lab maintainers | `<your-org>/<other-nexus>`; upstream → **draft + review** |
-| **ChIPKernels** | R package: string kernels for DNA-sequence analysis | `otheruser/ChIPKernels` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **SeqGL** | Group-lasso extraction of TF sequence signals from ChIP/DNase/ATAC | `otheruser/SeqGL` (mirror `<your-org>/SeqGL`) | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
-| **sc-dynamics-bench** | Benchmarking suite for non-splicing single-cell dynamics inference | `<your-org>/sc-dynamics-bench` | otheruser (`@otheruser`) — *confirm* | `<your-org>/<other-nexus>` |
+| **Palantir** | Single-cell trajectory detection | `dpeerlab/Palantir` | otheruser (`@otheruser`, author) + operator (`@jacob-greene`, active maintainer) | `<other-owner>/<other-nexus>`; external upstream → **draft + operator review** |
+| **Harmony** | Framework connecting scRNA-seq across discrete time points | `dpeerlab/Harmony` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>`; upstream → **draft + review** |
+| **wishbone** | Align cells along branching developmental trajectories | `dpeerlab/wishbone` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>`; upstream → **draft + review** |
+| **SEACells** | Infer metacell states from single-cell genomics | `dpeerlab/SEACells` | otheruser (`@otheruser`) + upstream Pe'er-lab maintainers | `<other-owner>/<other-nexus>`; upstream → **draft + review** |
+| **ChIPKernels** | R package: string kernels for DNA-sequence analysis | `otheruser/ChIPKernels` | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **SeqGL** | Group-lasso extraction of TF sequence signals from ChIP/DNase/ATAC | `otheruser/SeqGL` (mirror `<your-org>/SeqGL`) | otheruser (`@otheruser`) | `<other-owner>/<other-nexus>` |
+| **sc-dynamics-bench** | Benchmarking suite for non-splicing single-cell dynamics inference | `<your-org>/sc-dynamics-bench` | otheruser (`@otheruser`) — *confirm* | `<other-owner>/<other-nexus>` |
 
 > **Not lab-authored — file upstream normally:** `wot`
 > (Waddington-OT, Broad Institute), and third-party dependencies the

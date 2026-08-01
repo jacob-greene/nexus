@@ -33,7 +33,7 @@ and re-asserted to the FRONT per-command by
 `ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front
 is the load-bearing bit — `~/.zshenv` re-prepends linuxbrew (where
 the real `gh` lives) on every `zsh -c`, so the wrapper dir is pushed
-back to the front AFTER that, winning the race (jacob-greene/nexus
+back to the front AFTER that, winning the race (<your-org>/nexus-code
 PR #349, operator request comment 4795415597).
 
 A real **executable** — not the earlier zsh *function* — because a
@@ -290,15 +290,23 @@ Same for `gh issue create`, `gh issue comment`, `gh api ...`.
 ### Bot install scope caveat
 
 The bot is a GitHub App; it can only act on repos it's installed on.
-At time of writing it covers a subset of `<your-org>/*` (the nexus repo
-plus a handful of project repos that have been individually opted
-in). Cross-repo writes to **uninstalled** repos return:
+At time of writing that is exactly **two** repos, both under the
+operator's own account: `jacob-greene/jacob-greene-nexus-assets`
+(the asset+issue repo, `github.repo`) and `jacob-greene/nexus` (the
+implementation repo). Nothing under `<your-org>/*` is in scope. Scope
+can change — verify it in one call rather than trusting this line:
+
+>     GH_TOKEN=$(./monitor/mint-token.sh) gh api \
+>       installation/repositories --jq '.repositories[].full_name'
+
+Cross-repo writes to **uninstalled** repos — which is every other
+repo — return:
 
 - HTTP 403 `Resource not accessible by integration`, or
 - a misleading GraphQL error `Could not resolve to a Repository`.
 
-If you hit either on a <your-org> repo, the bot is not yet installed
-there. Surface it as a blocker:
+If you hit either, the bot is not installed there. Surface it as a
+blocker:
 
 1. Push your branch under the user's identity (`git push`) so the
    work isn't lost.
@@ -316,12 +324,18 @@ jacob-greene), open the upstream issue + PR there instead. Wrappers
 ship fixes in disguise — the upstream stays broken for everyone
 else, and the workspace has to carry the wrapper forward forever.
 
-Identity follows the existing routing: `<your-org>/*` is bot;
-`jacob-greene/*` is user (the bot is not installed there). For
-third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a
-stop-gap is acceptable when upstream is slow, but file the
-issue upstream too and document inside the wrapper which
-upstream issue would retire it.
+Identity follows the **install scope**, which is narrow: the bot
+can write to `jacob-greene/jacob-greene-nexus-assets` and
+`jacob-greene/nexus`, and nowhere else. Writes to those two go out
+as the bot. Everywhere else — including all of `<your-org>/*` and
+every third-party org (`TrigosTeam/*`, `<your-institution>/*`, others) —
+the bot has no install, so its token fails with the 403 / GraphQL
+errors above; treat that as the blocker it is (see "Bot install
+scope caveat"), never as a reason to silently fall back to the
+operator's identity. For third-party orgs a stop-gap wrapper is
+acceptable when upstream is slow, but file the issue upstream too
+and document inside the wrapper which upstream issue would retire
+it.
 
 `monitor/labsh-attach` was the cautionary tale (katosh/labsh#3
 — should have been an upstream subcommand from the start).

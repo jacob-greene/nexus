@@ -178,7 +178,7 @@ monitor:
 
 Six months from now a bespoke SSH forced-command protocol next to a
 standard one will look like nobody considered the standard one. It was
-considered, adversarially: full analysis in `jacob-greene/nexus#483`,
+considered, adversarially: full analysis in `<your-org>/nexus-code#483`,
 independently attacked by a skeptic pass (verdict `check` — the
 recommendation survived; three supporting claims were corrected in the
 issue's corrections comment, which supersedes the body). The argument

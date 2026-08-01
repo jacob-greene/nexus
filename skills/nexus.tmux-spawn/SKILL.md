@@ -694,12 +694,17 @@ spawn the worker against the upstream repo instead. Wrappers ship
 fixes in disguise — the upstream stays broken for everyone else,
 and the workspace has to carry the wrapper forward forever.
 
-Identity follows the existing routing: `<your-org>/*` is bot;
-`jacob-greene/*` is user (the bot is not installed there). For
-third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a stop-gap
-is acceptable when upstream is slow, but file the issue upstream
-too and document inside the wrapper which upstream issue would
-retire it.
+Identity follows the **install scope**, which is narrow: the bot
+can write to `jacob-greene/jacob-greene-nexus-assets` and
+`jacob-greene/nexus`, and nowhere else. Everywhere else —
+including all of `<your-org>/*` and every third-party org
+(`TrigosTeam/*`, `<your-institution>/*`, others) — the bot has no install
+and its token fails; that is a blocker to surface, never a reason
+to fall back to the operator's identity (see
+`skills/nexus.bot/SKILL.md` "Bot install scope caveat"). For
+third-party orgs a stop-gap is acceptable when upstream is slow,
+but file the issue upstream too and document inside the wrapper
+which upstream issue would retire it.
 
 `monitor/labsh-attach` was the cautionary tale (katosh/labsh#3 —
 should have been an upstream subcommand from the start).

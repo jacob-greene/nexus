@@ -113,7 +113,7 @@ a hook or your task prompt points you there.
   bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
   `download`, …). The sandbox's wrapped pip fork-storms without
   bound and took the node down twice in two days
-  (`jacob-greene/nexus#487`); a PATH-front shim now refuses bare
+  (`<your-org>/nexus-code#487`); a PATH-front shim now refuses bare
   `pip`/`pip3` and a worker RLIMIT_NPROC ceiling bounds the blast
   radius — this text is the explanation, those hooks are the
   enforcement. PyPI name trap: dandelion's package is
