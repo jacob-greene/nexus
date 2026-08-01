@@ -118,7 +118,10 @@ _resurface_record_dropped() {
         return 0
     fi
     local now; now=$(date +%s)
-    printf '%s\t%s\t%s\n' "$id" "$emits" "$now" >> "$tsv" 2>/dev/null || return 0
+    # Columns: id, emits, ts, announced. `announced` is what makes the
+    # emit section one-shot WITHOUT deleting the durable record — see
+    # `_resurface_dropped_emit_section`.
+    printf '%s\t%s\t%s\t0\n' "$id" "$emits" "$now" >> "$tsv" 2>/dev/null || return 0
 
     local msg="resurface-cap: comment id=${id} dropped after ${emits} emits without being processed — it will NOT be re-emitted; see ${tsv}"
     if declare -F log >/dev/null 2>&1; then
@@ -166,6 +169,74 @@ _resurface_clear_dropped() {
     return 0
 }
 
+# POST-PASTE commit of the repeat counter. Call this immediately after
+# a successful `paste_with_retry`, beside `_compose_emit_record_emit`.
+#
+# WHY THIS IS NOT DONE IN THE FILTER. The obvious place to count an
+# emit is `_emit_cooldown_flush`, where the block is let through — and
+# that is where the first cut of this counted. But that filter runs
+# inside `_gh_filter_dedup_pipeline`, which is upstream of
+# `_compose_emit_should_suppress`, upstream of
+# `_over_limit_orchestrator_paused`, and upstream of the paste itself.
+# Nothing rolls the count back when any of those drop the emit.
+#
+# The consequence was severe and silent: an orchestrator suspended by
+# the Anthropic rate limit for ~75 minutes would burn all four repeats
+# on emits that were composed and then HELD, and the comment would be
+# permanently dropped having been shown to the operator ZERO times.
+# (Skeptic req-001 finding 2.)
+#
+# main.sh already establishes exactly this discipline for
+# `_compose_emit_record_emit` and `requests_commit_emitted` —
+# "the decision/record split is deliberate: if the paste actually fails
+# ... the next compose tick must be allowed to retry the same body".
+# The cap must obey it too, and more strictly than they do: they lose a
+# cooldown, this loses the comment.
+#
+# Pre-paste stamping was harmless while the cooldown was only a RATE
+# (it always recovered on the next cycle). Turning it into a CAP is
+# what made it destructive.
+#
+#   $1  the emit body that was just pasted
+_resurface_commit_emitted() {
+    local body_file="${1:-}"
+    [[ -f "$body_file" ]] || return 0
+    local state="${STATE_DIR:-}"
+    [[ -n "$state" ]] || return 0
+    local hist="$state/emit-history"
+    [[ -d "$hist" ]] || return 0
+
+    local ids id meta emits
+    ids=$(awk '
+        /^--- eligible github comments ---$/ { sec = 1; next }
+        /^--- /                              { sec = 0 }
+        sec && match($0, /id=[0-9]+/) {
+            print substr($0, RSTART + 3, RLENGTH - 3)
+        }
+    ' "$body_file" 2>/dev/null)
+    [[ -n "$ids" ]] || return 0
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        meta="$hist/comment-$id.meta"
+        [[ -f "$meta" ]] || continue
+        emits=$(awk -F= '/^emits=/{print $2; exit}' "$meta" 2>/dev/null)
+        [[ "$emits" =~ ^[0-9]+$ ]] || emits=0
+        emits=$(( emits + 1 ))
+        # Rewrite in place, preserving ts/body_sha written by the filter.
+        if awk -F= -v n="$emits" '
+            /^emits=/ { next }
+            { print }
+            END { printf "emits=%s\n", n }
+        ' "$meta" > "$meta.tmp.$$" 2>/dev/null; then
+            mv -f "$meta.tmp.$$" "$meta" 2>/dev/null || rm -f "$meta.tmp.$$"
+        else
+            rm -f "$meta.tmp.$$"
+        fi
+    done <<<"$ids"
+    return 0
+}
+
 # Proposal 3 — "an emit with no new information should not be sent at
 # all". Returns 0 when the body's eligible-comments section contains at
 # least one row AND every one of those ids is a REPEAT (already emitted
@@ -202,35 +273,55 @@ _resurface_body_is_all_repeats() {
             emits=$(awk -F= '/^emits=/{print $2; exit}' "$meta" 2>/dev/null)
             [[ "$emits" =~ ^[0-9]+$ ]] || emits=0
         fi
-        # emits<=1 means this id is being emitted for the first time
-        # (the cooldown filter stamps emits=1 as it passes the block
-        # through, just upstream of this check). Any first-timer makes
-        # the body genuinely new.
-        (( emits > 1 )) || return 1
+        # `emits` is now a POST-PASTE delivered count (see
+        # `_resurface_commit_emitted`), so emits==0 means "never
+        # actually delivered" — this body is its first delivery, and
+        # the emit is genuinely new. Any first-timer makes the whole
+        # body new.
+        (( emits >= 1 )) || return 1
     done <<<"$ids"
     return 0
 }
 
 # One-shot `--- resurface dropped ---` body. The issue's note: "a
 # dropped item should also surface once in the next full-state emit so
-# it is not lost entirely." Consumed on read — the TSV is truncated, so
-# each dropped id is announced exactly once and the cap does not become
-# its own standing nag.
+# it is not lost entirely."
+#
+# ONE-SHOT VIA THE `announced` FLAG, NOT VIA TRUNCATION. The first cut
+# of this truncated the TSV to consume the queue — but the SAME file is
+# the durable dropped-record that `_resurface_is_dropped` reads. After
+# truncation the id was no longer "dropped", so the next
+# `_emit_cooldown_flush` re-hit `_resurface_is_capped` and re-recorded
+# it: the section re-rendered on EVERY subsequent cycle and
+# watcher-unstick.log grew a duplicate line each time. Exactly
+# backwards from one-shot. (Caught by skeptic req-001 finding 1; the
+# original test called the renderer twice with no intervening filter
+# run, so it could not see the interaction.)
+#
+# So: mark rows announced and rewrite, never delete. The record stays
+# durable, the announcement happens once.
 _resurface_dropped_emit_section() {
     local state="${1:-${STATE_DIR:-}}"
     [[ -n "$state" ]] || return 0
     local tsv="$state/$_RESURFACE_DROPPED_TSV"
     [[ -s "$tsv" ]] || return 0
 
+    # Only rows not yet announced. A missing 4th column (a TSV written
+    # by a pre-fix build) counts as unannounced, so an in-flight upgrade
+    # announces once and then settles.
     local rows
-    rows=$(awk -F'\t' '$1 != "" { printf "  comment id=%s — %s emits, never processed\n", $1, $2 }' "$tsv" 2>/dev/null)
+    rows=$(awk -F'\t' '$1 != "" && ($4 == "" || $4 == "0") {
+        printf "  comment id=%s — %s emits, never processed\n", $1, $2
+    }' "$tsv" 2>/dev/null)
     [[ -n "$rows" ]] || return 0
 
-    # Consume: truncate before returning, so a failed paste costs the
-    # announcement rather than turning it into a permanent nag. The TSV
-    # is an announcement queue; watcher-unstick.log is the durable
-    # record, and that one is append-only.
-    : > "$tsv" 2>/dev/null || true
+    # Mark announced, preserving every row.
+    local tmp="$tsv.tmp.$$"
+    if awk -F'\t' 'BEGIN{OFS="\t"} $1 != "" { $4 = 1; print }' "$tsv" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$tsv" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
 
     printf 'The watcher stopped re-emitting these comments after\n'
     printf '%s unacknowledged repeats each. They are NOT handled:\n' "${MONITOR_RESURFACE_MAX_REPEATS:-4}"

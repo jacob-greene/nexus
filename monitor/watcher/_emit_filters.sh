@@ -321,7 +321,16 @@ _emit_cooldown_flush() {
         printf '%s\n' "$header"
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         if [[ -n "$sha" ]]; then
-            printf 'ts=%s\nbody_sha=%s\nemits=%s\n' "$now" "$sha" "$(( meta_emits + 1 ))" > "$meta_path.tmp.$$" \
+            # `emits` is deliberately NOT incremented here. This filter
+            # runs upstream of the dedup gate, the over-limit hold, and
+            # the paste — counting here would burn the cap's budget on
+            # emits that were never delivered, permanently dropping a
+            # comment the operator never saw. `_resurface_commit_emitted`
+            # increments it AFTER a successful paste, matching the
+            # post-paste discipline main.sh already applies to
+            # `_compose_emit_record_emit`. Carry the current value
+            # through so it survives the rewrite.
+            printf 'ts=%s\nbody_sha=%s\nemits=%s\n' "$now" "$sha" "$meta_emits" > "$meta_path.tmp.$$" \
                 && mv "$meta_path.tmp.$$" "$meta_path" 2>/dev/null || true
         fi
     fi

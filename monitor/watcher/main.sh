@@ -4023,6 +4023,13 @@ _v2_task_compose_emit() {
                 log "pasted to ${TARGET}"
                 _emit_delivery_ok
                 _compose_emit_record_emit "$emit_body"
+                # Commit the resurface repeat-count for the comment ids
+                # this paste actually DELIVERED (issue #3). Same
+                # post-paste-only discipline as the record above, and
+                # for a stricter reason: a suppressed or held emit that
+                # burned a repeat would permanently drop a comment the
+                # operator never saw.
+                _resurface_commit_emitted "$emit_body"
                 # Delivery-stamp the request ids this paste actually
                 # carried (stamp-on-paste, your-org/nexus-code#483) —
                 # same post-paste-only discipline as the emit-dedup
