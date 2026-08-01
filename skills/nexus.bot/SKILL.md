@@ -33,7 +33,7 @@ and re-asserted to the FRONT per-command by
 `ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front
 is the load-bearing bit — `~/.zshenv` re-prepends linuxbrew (where
 the real `gh` lives) on every `zsh -c`, so the wrapper dir is pushed
-back to the front AFTER that, winning the race (<your-org>/nexus-code
+back to the front AFTER that, winning the race (jacob-greene/nexus
 PR #349, operator request comment 4795415597).
 
 A real **executable** — not the earlier zsh *function* — because a
@@ -88,7 +88,7 @@ neither a token nor `GH_IMPERSONATE`.
 ## Impersonating the operator — the loud opt-in
 
 For the one legitimate case — an **external** repo with NO bot
-install (`TrigosTeam/*`, `<your-institution>/*`, third-party), where the
+install (`TrigosTeam/*`, `FredHutch/*`, third-party), where the
 operator has explicitly authorised posting as themselves — opt in
 loudly:
 
@@ -151,7 +151,7 @@ trust the exit code. There's a documented friction request to add a
 `reacted <content> on comment <id>` confirmation; until then, scripts
 must check `$?` rather than parsing stdout.
 
-### Verbs landing soon (`<operator>/ng-omnibus`, not yet merged)
+### Verbs landing soon (`jacob-greene/ng-omnibus`, not yet merged)
 
 - `ng preflight <repo>` — hits `/installation/repositories` and prints
   whether the bot is installed on the target repo. Lets cross-repo
@@ -159,7 +159,7 @@ must check `$?` rather than parsing stdout.
 - `ng show <comment-id>` — read-only fetch that bypasses the eligibility
   filter, so an agent can quote a prior bot-authored comment.
 - `--repo OWNER/NAME` flag on `ng pr ...` and `ng issue ...` —
-  retargets the verb at a sibling <your-org> repo without falling back
+  retargets the verb at a sibling settylab repo without falling back
   to raw `gh api`.
 
 Until these merge, cross-repo writes use the `GH_TOKEN=…` escape
@@ -258,7 +258,7 @@ inline:
 
 ```bash
 GH_TOKEN=$(./monitor/mint-token.sh) gh pr create \
-  --repo <your-org>/<repo> \
+  --repo settylab/<repo> \
   --head <branch> --base main \
   --title "…" \
   --body-file body.md
@@ -276,10 +276,10 @@ Same for `gh issue create`, `gh issue comment`, `gh api ...`.
 > ```bash
 > # capital -F reads the file:
 > GH_TOKEN=$(./monitor/mint-token.sh) gh api \
->   repos/<your-org>/<repo>/issues/<n>/comments -F body=@note.md
+>   repos/settylab/<repo>/issues/<n>/comments -F body=@note.md
 > # or inline-expand and keep lowercase -f:
 > GH_TOKEN=$(./monitor/mint-token.sh) gh api \
->   repos/<your-org>/<repo>/issues/<n>/comments -f body="$(cat note.md)"
+>   repos/settylab/<repo>/issues/<n>/comments -f body="$(cat note.md)"
 > ```
 >
 > For the nexus repo, prefer `ng issue comment <n> --body-file note.md`,
@@ -290,14 +290,14 @@ Same for `gh issue create`, `gh issue comment`, `gh api ...`.
 ### Bot install scope caveat
 
 The bot is a GitHub App; it can only act on repos it's installed on.
-At time of writing it covers a subset of `<your-org>/*` (the nexus repo
+At time of writing it covers a subset of `settylab/*` (the nexus repo
 plus a handful of project repos that have been individually opted
 in). Cross-repo writes to **uninstalled** repos return:
 
 - HTTP 403 `Resource not accessible by integration`, or
 - a misleading GraphQL error `Could not resolve to a Repository`.
 
-If you hit either on a <your-org> repo, the bot is not yet installed
+If you hit either on a settylab repo, the bot is not yet installed
 there. Surface it as a blocker:
 
 1. Push your branch under the user's identity (`git push`) so the
@@ -310,15 +310,15 @@ there. Surface it as a blocker:
 ## Fix at the source — don't wrap upstreams the lab/operator owns
 
 Before adding a workspace wrapper around a tool, check the
-tool's GitHub org. If it's lab-owned (`<your-org>/*` always) or
-operator-owned (`<operator>/*` when this nexus is operated by
-<operator>), open the upstream issue + PR there instead. Wrappers
+tool's GitHub org. If it's lab-owned (`settylab/*` always) or
+operator-owned (`jacob-greene/*` when this nexus is operated by
+jacob-greene), open the upstream issue + PR there instead. Wrappers
 ship fixes in disguise — the upstream stays broken for everyone
 else, and the workspace has to carry the wrapper forward forever.
 
-Identity follows the existing routing: `<your-org>/*` is bot;
-`<operator>/*` is user (the bot is not installed there). For
-third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a
+Identity follows the existing routing: `settylab/*` is bot;
+`jacob-greene/*` is user (the bot is not installed there). For
+third-party orgs (`TrigosTeam/*`, `FredHutch/*`, others) a
 stop-gap is acceptable when upstream is slow, but file the
 issue upstream too and document inside the wrapper which
 upstream issue would retire it.
@@ -391,7 +391,7 @@ foot-gun in the workspace report corpus.
   topic:nexus-fork`) and the cross-fork PR body convention. Loads
   only for nexus-internals work, not general project agents.
   (Post-cutover the canonical implementation is single-tenant
-  `<your-org>/nexus-code`; the topic-discovery path is legacy from
+  `jacob-greene/nexus`; the topic-discovery path is legacy from
   the pre-split era when each operator forked the code repo.)
 - `monitor/README.md` (in the nexus root) — full architecture, GitHub
   interaction model, the eligibility filter, env-var override table.

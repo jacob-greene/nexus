@@ -688,15 +688,15 @@ rule for their target.
 
 Spawn-time decision rule. Before dispatching a worker to wrap a
 tool with workspace-side compensating logic, check the tool's
-GitHub org. If it's lab-owned (`<your-org>/*` always) or
-operator-owned (`<operator>/*` when this nexus is operated by <operator>),
+GitHub org. If it's lab-owned (`settylab/*` always) or
+operator-owned (`jacob-greene/*` when this nexus is operated by jacob-greene),
 spawn the worker against the upstream repo instead. Wrappers ship
 fixes in disguise — the upstream stays broken for everyone else,
 and the workspace has to carry the wrapper forward forever.
 
-Identity follows the existing routing: `<your-org>/*` is bot;
-`<operator>/*` is user (the bot is not installed there). For
-third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a stop-gap
+Identity follows the existing routing: `settylab/*` is bot;
+`jacob-greene/*` is user (the bot is not installed there). For
+third-party orgs (`TrigosTeam/*`, `FredHutch/*`, others) a stop-gap
 is acceptable when upstream is slow, but file the issue upstream
 too and document inside the wrapper which upstream issue would
 retire it.

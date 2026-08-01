@@ -30,7 +30,7 @@ pin). Choose along a breadth ladder:
 
 - **Broad subnet — recommended set-once default.** Pin your campus/LAN block once
   and any client on it can reach the auth stage; no per-client lookup. E.g.
-  `140.107.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
+  `140.107.0.0/16` (an EXAMPLE — the Fred Hutch campus block; substitute your own
   network).
 - **`/32` — max security.** Pin the single client host so only that machine can
   even reach the auth stage.

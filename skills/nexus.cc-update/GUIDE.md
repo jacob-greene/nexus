@@ -60,19 +60,19 @@ emit is an *advisory*; the gate is the *authority*.
 ## The routing invariant: surface to `nexus-code`, never the asset repo
 
 cc-update work is **implementation-repo** business. The operator's asset
-repo (`github.repo` — `<your-org>/<operator>-nexus`) is where scientific
-work lives; it must **NEVER** receive a cc-update notice, tracking issue,
+repo (`github.repo` — `jacob-greene/jacob-greene-nexus-assets`) is
+where scientific work lives; it must **NEVER** receive a cc-update notice, tracking issue,
 or eval comment — that is pure churn bothering the operator mid-science.
 The evaluation resolves to exactly two outcomes:
 
 1. **SAFE → apply silently.** No issue, no comment, anywhere. A clean
    gated bump bothers no one.
 2. **review / compat / block warranted → surface on the IMPLEMENTATION
-   repo `<your-org>/nexus-code` ONLY** — an issue or a `cc-compat` PR
+   repo `jacob-greene/nexus` ONLY** — an issue or a `cc-compat` PR
    there, never in the asset repo.
 
 Concretely: every `ng issue create` / `ng issue comment` / `ng wrap-up`
-in this flow MUST carry an explicit `--repo <your-org>/nexus-code`. A bare
+in this flow MUST carry an explicit `--repo jacob-greene/nexus`. A bare
 `ng` write defaults to `github.repo` (the asset repo) — that default is
 the exact footgun this routing rule exists to prevent. Do **not** open a
 tracking issue in the current (asset) repo, even though standard nexus
@@ -274,13 +274,13 @@ Combine the gate result with the changelog review:
 | Verdict | When | Action |
 |---|---|---|
 | **safe to bump** | gate GREEN **and** changelog shows nothing touching 2c/2d/2e | proceed to Step 5 |
-| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump | do the targeted manual check for the flagged surface; if it holds, bump; if uncertain, surface on `<your-org>/nexus-code` with the specifics (never the asset repo) |
-| **block** | gate RED, **or** a confirmed contract break you can't mitigate | do NOT bump. Fix the affected `_detect_*` / dialog signature / hook first (capture a fresh fixture), land that, re-gate. Surface the blocker on `<your-org>/nexus-code` (issue or `cc-compat` PR), never the asset repo. |
+| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump | do the targeted manual check for the flagged surface; if it holds, bump; if uncertain, surface on `jacob-greene/nexus` with the specifics (never the asset repo) |
+| **block** | gate RED, **or** a confirmed contract break you can't mitigate | do NOT bump. Fix the affected `_detect_*` / dialog signature / hook first (capture a fresh fixture), land that, re-gate. Surface the blocker on `jacob-greene/nexus` (issue or `cc-compat` PR), never the asset repo. |
 
 When a verdict needs surfacing (needs-review you can't clear, or block),
 report it with evidence (which scenarios passed, which changelog entries
-you cleared) on the **`<your-org>/nexus-code`** tracking issue — explicit
-`--repo <your-org>/nexus-code` — never the asset repo and never the
+you cleared) on the **`jacob-greene/nexus`** tracking issue — explicit
+`--repo jacob-greene/nexus` — never the asset repo and never the
 overview (routing-only). A **safe** verdict that you apply needs no issue
 at all (see the routing invariant above).
 
@@ -294,7 +294,7 @@ untouched. This **replaces the old "unpushed local `chore: bump` commit"
 divergence dance** entirely — there is no commit and no push, so the
 working tree stays clean and `git pull --ff-only origin dev` never
 conflicts on a phantom local bump. See `monitor/_cc-version.sh` and
-`<your-org>/nexus-code#226`.
+`jacob-greene/nexus#226`.
 
 ```bash
 # 1. write the operator-local pin to the candidate. This is the ONLY
@@ -520,7 +520,7 @@ The watchdog's mandate (the job list for its spawn prompt):
 The deterministic watch loop the watchdog runs is **shipped as a repo
 file** — `monitor/cc-restart-watchdog-loop.sh`. Run it, do not re-adapt
 an inline copy: a hand-adapted listing is exactly how the hard-coded
-`orchestrator` window name in `<your-org>/nexus-code#459` survived, and how
+`orchestrator` window name in `jacob-greene/nexus#459` survived, and how
 a stale `tmux list-panes -t watcher` baseline outlives the watcher going
 headless. The loop resolves the coordinator window itself (config
 `monitor.target_window`), reads the watcher pid from
@@ -581,11 +581,11 @@ inner mechanism, not a substitute for it.
   advances only the **operator-local pin**
   (`monitor/.state/cc-version-local`, gitignored); it never touches the
   floor. The maintainer raising the floor is a **separate, deliberate
-  PR** on `<your-org>/nexus-code`, out of scope for this routine.
+  PR** on `jacob-greene/nexus`, out of scope for this routine.
   `monitor/_cc-version.sh` is the single resolver
   (`effective = local-pin else floor`); both `install-claude-local.sh`
   and the watcher gate baseline read it.
-- **Tier:** `<your-org>/nexus-code` is INTERNAL — bot identity for GitHub
+- **Tier:** `jacob-greene/nexus` is INTERNAL — bot identity for GitHub
   writes, no per-action approval; PR `--base dev`.
 - **Idempotency / re-nag:** the watcher surfaces a given candidate
   exactly once (guarded by `monitor/.state/cc-update-surfaced`). If you

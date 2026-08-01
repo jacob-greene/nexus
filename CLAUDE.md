@@ -21,12 +21,12 @@ this is the index. One line per skill, "use when" framing:
 | Writing or reviewing a report under `reports/` (sections, infra-issue feedback loop) | `skills/nexus.report/SKILL.md` |
 | Doing scientific work that should be grounded in the literature — finding relevant papers by content (`ng lit search` over S2 + ASTA, deduped against the reference library), growing the library (`ng lit add`), and citing the references + their supporting statements in scientific reports | `skills/nexus.lit/SKILL.md` |
 | Running periodic infrastructure meta-review across reports | `skills/nexus.infra-review/SKILL.md` |
-| Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills; pre-flight gate (fresh pull + substantiated repro + scope check) before filing on `<your-org>/nexus-code` | `skills/nexus.self-fix/SKILL.md` |
+| Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills; pre-flight gate (fresh pull + substantiated repro + scope check) before filing on `jacob-greene/nexus` | `skills/nexus.self-fix/SKILL.md` |
 | Scheduling a multi-fire `CronCreate` whose state must survive an orchestrator respawn — TSV bookkeeping + recovery-marker pattern (workaround for the silently-ignored `durable: true` flag) | `skills/nexus.cron-state-tsv/SKILL.md` |
-| A user asks for a jupyter(lab)/notebook session, or a project needs a persistent kernel that survives reboots — one-command activation (`monitor/jupyter-up.sh`), supervised service via `services.registry`, kernel registration, foolproof default behavior (labsh primitives: `<yourlab>.labsh`) | `skills/nexus.jupyter/SKILL.md` |
+| A user asks for a jupyter(lab)/notebook session, or a project needs a persistent kernel that survives reboots — one-command activation (`monitor/jupyter-up.sh`), supervised service via `services.registry`, kernel registration, foolproof default behavior (labsh primitives: `setty.labsh`) | `skills/nexus.jupyter/SKILL.md` |
 | Seeding or maintaining the overview issue `#1` identity record + dashboard — the auto-generated **Nexus identity** block (`ng nexus-identity`, working-directory headline) and the formalized dashboard schema (six required sections, `ng dashboard scaffold`/`validate`); standard across all operator nexuses | `skills/nexus.dashboard/SKILL.md` |
 | Evaluating a candidate Claude Code release before bumping the pin (watcher emitted `--- claude code update available ---`) — changelog review, collision analysis against cc-version-sensitive surfaces, cc-harness gate, safe/review/block decision + bump procedure. Orchestrator-only; a path-referenced guide (`GUIDE.md`, deliberately NOT an auto-loaded `SKILL.md`) so it never distracts worker agents | `skills/nexus.cc-update/GUIDE.md` |
-| An agent hits a bug or rough edge in a <your-lab>-authored **software tool** (kompot, Mellon, Crowding, Palantir, SEACells, …) and must route it to the code owner instead of silently working around it — the first-line-tester rationale, the tool → owner → routing table, and the "file on the owner's nexus asset repo + `@`-ping the owner" protocol (with the `dpeerlab/Palantir` external-upstream draft-and-review nuance) | `skills/nexus.tool-ecosystem/SKILL.md` |
+| An agent hits a bug or rough edge in a Setty Lab-authored **software tool** (kompot, Mellon, Crowding, Palantir, SEACells, …) and must route it to the code owner instead of silently working around it — the first-line-tester rationale, the tool → owner → routing table, and the "file on the owner's nexus asset repo + `@`-ping the owner" protocol (with the `dpeerlab/Palantir` external-upstream draft-and-review nuance) | `skills/nexus.tool-ecosystem/SKILL.md` |
 
 Skills under `skills/` may not auto-discover when cwd is inside
 `work/<project>/...`. Reference them by path when delegating.
@@ -77,9 +77,9 @@ intertwine, so they live together.
 notifications for actions taken by the recipient's own account, so
 a PR/issue/comment posted as the user silently fails to wake them.
 Use `monitor/ng <verb>` for the nexus repo (`github.repo` — the
-asset+issue repo, e.g. `<your-org>/<your-nexus>` for this operator;
-**not** `<your-org>/nexus-code`, which is the canonical implementation
-repo every operator clones);
+asset+issue repo, e.g. `jacob-greene/jacob-greene-nexus-assets`
+for this operator; **not** `jacob-greene/nexus`, which is the
+canonical implementation repo every operator clones);
 `GH_TOKEN=$(./monitor/mint-token.sh) gh ...` for cross-repo or
 verbs `ng` doesn't cover. Local files referenced from a comment go
 through `ng upload` first — `reports/` is gitignored, so bare paths
@@ -115,13 +115,13 @@ unaffected (git, not `gh`).
 **WHETHER — by repo tier.** Find the tier of the target repo, then
 follow its rule:
 
-- **Internal** (`<your-org>/*`, private `<operator>/*`): no fresh
+- **Internal** (`settylab/*`, private `jacob-greene/*`): no fresh
   approval per action.
 - **User-public** (`katosh/labsh`, `katosh/agent_sandbox`, …):
   standing approval for ongoing work the user explicitly initiated;
   new directions need a fresh ack.
-- **External public** (`TrigosTeam/*`, `<your-institution>/*`, third-party
-  repos, including `<operator>/<external-fork>` — GitHub visibility,
+- **External public** (`TrigosTeam/*`, `FredHutch/*`, third-party
+  repos, including `jacob-greene/<external-fork>` — GitHub visibility,
   not ownership, decides): every push / PR / issue / comment needs
   a fresh, specific user go-ahead. Worker prompts touching external
   repos default to "draft + STOP for review", never auto-submit.
@@ -154,7 +154,7 @@ out a branch with diverged helper signatures silently breaks
 `snapshot_github` (functions in memory call functions on disk
 with mismatched arity, bash fails quietly, no eligible-comments
 get surfaced). Workers touching `monitor/watcher/*` MUST clone
-the nexus repo afresh into `work/<your-nexus>-<task>/` (or use a
+the nexus repo afresh into `work/nexus-<task>/` (or use a
 worktree as a lighter fallback) and operate there. After a
 watcher-affecting change lands on `main`, the orchestrator
 `git pull`s in the main clone — that's the whole step: the
@@ -202,7 +202,7 @@ Two ways to spin one up:
   tree; use when the task touches data the primary reads, or a
   clean remote checkout matters.
 - **Worktree** — `git -C work/<project> worktree add
-  ../<project>-<task> -b <operator>/<task>`. Lighter; shares `.git`,
+  ../<project>-<task> -b jacob-greene/<task>`. Lighter; shares `.git`,
   separate working tree and branch. Default for code-only edits.
 
 When the worker runs in a **secondary clone** — data-light,
@@ -243,7 +243,7 @@ once. Pull the relevant ones into worker prompts when delegating.
   memory call functions on disk with mismatched arity → bash
   fails quietly → eligible-comments stop surfacing without any
   log error. Always operate in a separate clone under
-  `work/<your-nexus>-<task>/` (or a worktree); see "Spawning
+  `work/nexus-<task>/` (or a worktree); see "Spawning
   workers" above for full recovery steps.
 - **Prefer `uv pip` over plain `pip`.** Inside `agent-sandbox`
   the wrapped `/app/bin/pip` can hang >5 min; `uv pip install`
