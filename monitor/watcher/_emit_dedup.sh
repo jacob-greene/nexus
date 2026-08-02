@@ -65,6 +65,7 @@ _emit_volatile_strip() {
         s/interrupted [0-9]+h[0-9]+m/interrupted/g
         s/interrupted [0-9]+s/interrupted/g
         s/[0-9]+ awaiting-input/awaiting-input/g
+        s/^\(full snapshot, rendered [0-9]+s ago/(full snapshot/
         /^--- nexus-emit-sig /d
     '
 }
