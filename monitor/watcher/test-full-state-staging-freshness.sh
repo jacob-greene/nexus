@@ -52,6 +52,11 @@ assert_contains() {
         printf '         in:\n%s\n' "$hay" | sed 's/^/           /' >&2
     fi
 }
+assert_ne() {
+    local label="$1" a="$2" b="$3"
+    if [[ "$a" != "$b" ]]; then pass "$label"
+    else fail "$label — values unexpectedly equal: $a"; fi
+}
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
     if [[ "$hay" != *"$needle"* ]]; then pass "$label"
@@ -92,14 +97,29 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/tmux"
 
-# pane-state.sh stub. MOCK_PANE_SLEEP > 0 makes every probe hang, which is
-# how the bounded-render-timeout (PARTIAL) case is exercised.
+# pane-state.sh stub.
+#   MOCK_PANE_SLEEP > 0        every probe hangs (render emits nothing).
+#   + MOCK_PANE_HANG_MARKER    hang only AFTER the first probe has answered,
+#                              so the render deterministically emits one row
+#                              and then deterministically blows its budget.
+#                              That makes the non-empty PARTIAL case a real
+#                              assertion instead of one that self-SKIPs on a
+#                              fast host — which is the exact path the empty
+#                              PARTIAL defect hid behind.
 cat > "$STUB_DIR/pane-state.sh" <<'STUB'
 #!/usr/bin/env bash
 win="${1:-}"
 while [[ "$win" == --* ]]; do shift 2 2>/dev/null || break; win="${1:-}"; done
 if [[ -n "${MOCK_PANE_SLEEP:-}" ]] && (( MOCK_PANE_SLEEP > 0 )); then
-    sleep "$MOCK_PANE_SLEEP"
+    if [[ -n "${MOCK_PANE_HANG_MARKER:-}" ]]; then
+        if [[ -e "$MOCK_PANE_HANG_MARKER" ]]; then
+            sleep "$MOCK_PANE_SLEEP"
+        else
+            : > "$MOCK_PANE_HANG_MARKER"
+        fi
+    else
+        sleep "$MOCK_PANE_SLEEP"
+    fi
 fi
 key="MOCK_PANE_STATE_${win//[^a-zA-Z0-9_]/_}"
 printf 'state=%s\n' "${!key:-busy}"
@@ -115,17 +135,21 @@ cp "$STUB_DIR/pane-state.sh" "$WORK/monitor/pane-state.sh"
 #   $4 render_budget  _run_bounded budget for the inline re-render
 #   $5 pane_sleep     per-pane probe delay (drives the timeout case)
 # stdout: the emit body. stderr: the watcher log lines, prefixed `LOG `.
+#   $6 hang_after_first  non-empty ⇒ probes answer once, then hang
 compose_cycle() {
     local windows="$1" stage_age="${2:-}" stage_body="${3:-}"
-    local budget="${4:-20}" pane_sleep="${5:-0}"
+    local budget="${4:-20}" pane_sleep="${5:-0}" hang_after_first="${6:-}"
 
-    rm -f "$STAGE_FILE"
+    rm -f "$STAGE_FILE" "$WORK/hang-marker"
     if [[ -n "$stage_age" ]]; then
         printf '%s' "$stage_body" > "$STAGE_FILE"
         touch -d "@$(( $(date +%s) - stage_age ))" "$STAGE_FILE"
     fi
+    local marker=''
+    [[ -n "$hang_after_first" ]] && marker="$WORK/hang-marker"
 
     PATH="$STUB_DIR:$PATH" MOCK_TMUX_WINDOWS="$windows" MOCK_PANE_SLEEP="$pane_sleep" \
+    MOCK_PANE_HANG_MARKER="$marker" \
     bash <<EOSH
 set -uo pipefail
 export STATE_DIR='$STATE_DIR' NEXUS_ROOT='$NEXUS_ROOT'
@@ -283,6 +307,81 @@ assert_contains "absent staging file re-renders" \
     "$(cat "$WORK/err.6")" "re-rendered inline"
 
 # ===========================================================================
+echo '=== row-count consistency (threshold-INDEPENDENT) ==='
+
+# The age gate alone is not enough, and this is the evidence for why: with the
+# producer at emit_interval/4, essentially all real staleness lands in
+# [0, 150] — below the 300s threshold. Replaying the ORIGINAL #14 scenario at
+# ages the gate does not catch reproduced the contradiction verbatim on the
+# age-gate-only revision. The row count fixes that at any age.
+for age in 100 290; do
+    out=$(compose_cycle "$RESERVED_ONLY" "$age" "$STALE_BODY" 2>"$WORK/err.rc.$age")
+    assert_not_contains "#14 at ${age}s (under the gate): killed window not served" \
+        "$out" "nuc-arm-scatter"
+    assert_contains "#14 at ${age}s: caught by the row count, not the age gate" \
+        "$(cat "$WORK/err.rc.$age")" "snapshot lists 1 window(s), 0 live"
+done
+
+# --- second production capture (issue #14 comment 5160492993) --------------
+# The stale-ABSENCE direction, which is the one that fails silently. Captured
+# live at 14:46:38: staged body 531s old listing one window; ground truth had
+# TWO workers — `nexus-fullstate-14-skeptic` spawned after the render (omitted
+# entirely) and `nexus-fullstate-14` had wrapped up, its pane reading `empty`
+# while the staged row still claimed `state=busy`. Three defects in one
+# fixture: omission, wrong state, and the counts/rows mismatch.
+CAPTURE2_WINDOWS='services|0|1
+orchestrator|0|2
+nexus-fullstate-14|0|3
+nexus-fullstate-14-skeptic|0|4'
+CAPTURE2_STAGED='  - nexus-fullstate-14 (active, state=busy)'
+export MOCK_PANE_STATE_3=empty MOCK_PANE_STATE_4=busy
+
+# At 531s (the age it actually had) the age gate catches it...
+out=$(compose_cycle "$CAPTURE2_WINDOWS" 531 "$CAPTURE2_STAGED" 2>/dev/null)
+assert_contains "capture2 @531s: omitted skeptic window now present" \
+    "$out" "nexus-fullstate-14-skeptic"
+assert_contains "capture2 @531s: wrapped worker's state corrected to empty" \
+    "$out" "state=empty"
+assert_not_contains "capture2 @531s: stale state=busy claim gone" \
+    "$out" "nexus-fullstate-14 (active, state=busy)"
+
+# ...and at 120s — the regime the 150s producer actually creates, and the one
+# the age gate does NOT catch — the row count still catches it. This is the
+# case that reproduced silently on the age-gate-only revision.
+out=$(compose_cycle "$CAPTURE2_WINDOWS" 120 "$CAPTURE2_STAGED" 2>"$WORK/err.c2")
+assert_contains "capture2 @120s (under the gate): skeptic window present" \
+    "$out" "nexus-fullstate-14-skeptic"
+assert_contains "capture2 @120s: state corrected" "$out" "state=empty"
+assert_contains "capture2 @120s: row count is what fired, not the age gate" \
+    "$(cat "$WORK/err.c2")" "snapshot lists 1 window(s), 2 live"
+assert_not_contains "capture2 @120s: age gate did not fire" \
+    "$(cat "$WORK/err.c2")" "old > 300s max"
+
+# Both rows present ⇒ counts line and body agree.
+rows=$(printf '%s\n' "$out" | grep -c '^  - ')
+assert_eq "capture2 @120s: body row count matches the 2 live workers" "$rows" "2"
+
+unset MOCK_PANE_STATE_3 MOCK_PANE_STATE_4
+
+# Fail-safe: rows == 0 with live workers must NOT trip the row-count branch
+# (a future row-suppressing class would otherwise re-render every emit — the
+# nexus-code#236 regression). That case is already covered by staging-empty.
+out=$(compose_cycle "$ONE_WORKER" 10 "" 2>"$WORK/err.rc0")
+assert_contains "empty body routes through staging-empty, not the row count" \
+    "$(cat "$WORK/err.rc0")" "staging empty"
+assert_not_contains "empty body does not trip the row-count branch" \
+    "$(cat "$WORK/err.rc0")" "snapshot lists"
+
+# Matching counts are left alone even for row classes the harness rarely sees
+# (the skeptic found this shape in the live staging file).
+PARKED_BODY='  - nuc-arm-scatter parked-awaiting-skeptic (state=empty; skeptic reviewing — exempt from idle/close)'
+out=$(compose_cycle "$ONE_WORKER" 10 "$PARKED_BODY" 2>"$WORK/err.parked")
+assert_contains "parked-awaiting-skeptic row counts as a row (1==1, served)" \
+    "$out" "parked-awaiting-skeptic"
+assert_not_contains "...and does not trigger a re-render" \
+    "$(cat "$WORK/err.parked")" "re-rendered inline"
+
+# ===========================================================================
 echo '=== provenance footer ==='
 
 # Age slack again (staged 120s can read back as 121s); the shape is what is
@@ -315,19 +414,51 @@ assert_contains "timeout logs the empty-render fallback" \
     "$(cat "$WORK/err.7")" "produced nothing; serving the"
 
 # A timed-out render that DID emit rows is served as a labelled PARTIAL.
-# MOCK_PANE_SLEEP=2 with a 3s budget lets the first window through before the
-# kill; the second window is lost.
-out=$(compose_cycle "$ONE_WORKER
-kompot-bench|0|5" 320 "$STALE_BODY" 3 2 2>"$WORK/err.8")
-if [[ "$out" == *"PARTIAL"* ]]; then
-    pass "partial (non-empty) timed-out render is labelled PARTIAL"
-    assert_contains "PARTIAL names the budget it blew" "$out" "3s budget"
-    assert_not_contains "a PARTIAL is not also labelled STALE" "$out" "STALE"
-else
-    # Machine was fast enough that the render completed inside the budget —
-    # a timing-dependent case we do not force. Say so rather than pass blind.
-    printf '  SKIP: partial-render labelling (render completed within budget on this host)\n'
-fi
+# DETERMINISTIC: the stub answers the first probe and hangs on every later
+# one, so the render always emits exactly one row and always blows its budget.
+# (An earlier revision used a plain sleep and self-SKIPped on a fast host —
+# and that skip is precisely where the empty-PARTIAL defect below hid.)
+TWO_WORKERS="$ONE_WORKER
+kompot-bench|0|5"
+out=$(compose_cycle "$TWO_WORKERS" 320 "$STALE_BODY" 2 30 hang-after-first 2>"$WORK/err.8")
+assert_contains "partial (non-empty) timed-out render is labelled PARTIAL" \
+    "$out" "PARTIAL"
+assert_contains "PARTIAL names the budget it blew" "$out" "2s budget"
+assert_not_contains "a PARTIAL is not also labelled STALE" "$out" "STALE"
+rows=$(printf '%s\n' "$out" | grep -c '^  - ')
+assert_eq "the partial carries the one row it managed to render" "$rows" "1"
+
+# THE EMPTY-STAGING + TIMEOUT HOLE (skeptic finding on PR #15).
+#
+# Nothing staged AND the bounded re-render killed before emitting a row.
+# Previously this set FULL_STATE_RENDER_PARTIAL=1, logged it, assigned an
+# empty body — and `_compose_report_body` then suppressed the entire section
+# INCLUDING the footer that carried the label. The operator saw a non-zero
+# counts line beside an absent section, which this change defines as "no
+# workers": the PR's own `absent must keep meaning absent` invariant, broken
+# in the same harm class as #14 itself. There is no body to label here, so
+# the label has to BE the body.
+out=$(compose_cycle "$ONE_WORKER" 0 "" 1 30 2>"$WORK/err.9")
+assert_contains "empty staging + timeout still emits the section" \
+    "$out" "--- workspace snapshot ---"
+assert_contains "...with an explicit UNKNOWN row" "$out" "workspace contents UNKNOWN, not empty"
+assert_contains "...labelled PARTIAL" "$out" "PARTIAL"
+assert_contains "...and the log says why" \
+    "$(cat "$WORK/err.9")" "nothing staged to fall back to"
+counts=$(printf '%s\n' "$out" | grep '^workspace:')
+assert_contains "counts line still reports the live worker" "$counts" "1 busy"
+
+# The UNKNOWN row must not be mistaken for a window row by the row counter.
+rows=$(printf '%s\n' "$out" | grep -c '^  - ')
+assert_eq "UNKNOWN row is not counted as a window row" "$rows" "0"
+
+# A genuinely empty workspace still yields an ABSENT section — that is what
+# makes `absent` a usable signal, and it is why the case above could not just
+# be left to vanish.
+out=$(compose_cycle "$RESERVED_ONLY" 0 "" 2>"$WORK/err.10")
+assert_not_contains "clean render of an empty workspace: section absent" \
+    "$out" "--- workspace snapshot ---"
+assert_not_contains "...and no UNKNOWN row" "$out" "UNKNOWN"
 
 # ===========================================================================
 echo '=== section-cap allowlist invariant ==='
@@ -362,9 +493,23 @@ b=$(printf '(full snapshot, rendered 287s ago; transitions only between snapshot
 assert_eq "differing ages normalise identically" "$a" "$b"
 assert_eq "normalised form is the legacy footer" \
     "$a" "(full snapshot; transitions only between snapshots)"
-# PARTIAL is genuinely different content and must NOT normalise away.
+# PARTIAL / STALE are genuinely different content and must NOT normalise away
+# — a degraded render must never dedup against a clean one.
+#
+# (The earlier form of this check, `assert_not_contains "$c" "$a"`, was
+# near-vacuous: it passes on the unpatched commit too, because the annotated
+# footer trivially does not contain the legacy footer as a substring. These
+# assert the two properties that actually matter.)
+clean=$(printf '(full snapshot, rendered 0s ago; transitions only between snapshots)\n' | _emit_volatile_strip)
 c=$(printf '(full snapshot, rendered 0s ago, PARTIAL (render hit its 20s budget; windows may be missing); transitions only between snapshots)\n' | _emit_volatile_strip)
-assert_not_contains "PARTIAL survives normalisation" "$c" "$a"
+s=$(printf '(full snapshot, rendered 400s ago, STALE (re-render hit its 20s budget and yielded nothing; windows listed here may have closed — verify with tmux before acting); transitions only between snapshots)\n' | _emit_volatile_strip)
+assert_contains "PARTIAL text survives normalisation intact" \
+    "$c" "PARTIAL (render hit its 20s budget; windows may be missing)"
+assert_contains "STALE text survives normalisation intact" \
+    "$s" "STALE (re-render hit its 20s budget and yielded nothing"
+assert_ne "a PARTIAL footer does not normalise onto a clean one" "$c" "$clean"
+assert_ne "a STALE footer does not normalise onto a clean one" "$s" "$clean"
+assert_ne "PARTIAL and STALE stay distinct from each other" "$c" "$s"
 
 # ===========================================================================
 echo '=== config derivation ==='

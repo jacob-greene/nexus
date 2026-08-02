@@ -124,11 +124,15 @@ MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_M
 # independent same-period schedules drift to an arbitrary phase, so the
 # expected age of the staged body at emit was ~half a period (~300s) and the
 # worst case a full period. Rendering at a QUARTER of the emit interval
-# bounds the age at ~1/4 period and makes the consumer gate below cold in
-# normal operation. Async and off the heartbeat path; at defaults this is
-# 4 renders per 600s against the 20 the existing `idle_section` task (30s,
-# same class, same per-pane probe) already performs, i.e. ~+15% on that
-# probe class.
+# bounds the age at ~1/4 period. This — not the gate below — is what
+# actually shrinks the everyday exposure window; see the gate's own comment
+# in main.sh for why. Async and off the heartbeat path; at defaults this is
+# 4 renders per 600s against the 20 `idle_section` (30s) and 10
+# `over_limit_scan` (60s) already perform with the same per-pane probe, so
+# ~31 -> ~34, about +10% on that probe class. Renders cannot stack — the
+# scheduler holds an in-flight guard per task. Note the async watchdog
+# budget tracks the interval, so it drops 2400s -> 600s with this change;
+# a render exceeding that is killed as a hung task, which is the intent.
 MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS="${MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS:-$("$_cfg" monitor.full_state.snap_interval_seconds 0)}"
 [[ "$MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=0
 if (( MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS == 0 )); then
@@ -142,8 +146,15 @@ fi
 # re-render instead. Derived default = emit_interval / 2 = TWO producer
 # beats: the gate fires only when the async path has demonstrably missed a
 # beat, not merely because it is mid-cycle — so the inline re-render stays
-# the exception, not the rule. 0 disables the gate (pre-#14 behaviour: a
-# staged body is served at any age).
+# the exception, not the rule.
+#
+# Corollary, stated plainly: because the producer runs at emit_interval/4,
+# essentially all NORMAL staleness falls below this threshold and this gate
+# does NOT fire. It is a producer-failure backstop, not the everyday catch.
+# The everyday catch is the row-count consistency check in compose_emit,
+# which is threshold-independent. Setting this to 0 disables the age gate
+# (pre-#14 behaviour: a staged body is served at any age) and logs a startup
+# line saying so; the row-count check and the footer annotation still apply.
 MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS="${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS:-$("$_cfg" monitor.full_state.stage_max_age_seconds -1)}"
 [[ "$MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS" =~ ^-?[0-9]+$ ]] || MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=-1
 if (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < 0 )); then
