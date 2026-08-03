@@ -102,6 +102,33 @@ a failure never fails the wrap-up (the pending marker + orphan backstop
 still cover it). The inbox is **on by default** as of #545
 (`monitor.requests.enabled: true`; reversible via `config/nexus.yml`).
 
+**One require resolution opens exactly ONE round per deliverable**
+(`jacob-greene/nexus` issue 16). Opening a round stamps the report path
+and the round depth into `monitor/.state/skeptic/<window>/.round`. A
+repeat `ng wrap-up` on the SAME, unchanged report path is recognised as a
+repeat and no-ops: it does not archive the live round's `DONE`, does not
+re-arm the pending marker, and does not file a second request. It prints
+`SKEPTIC: ROUND ALREADY OPEN` with the channel `status` and exits `0` —
+so if a wrap-up looks like it failed, **read the error and check
+`ng skeptic status <window>` before retrying**; the retry itself is now
+safe. Before this, a repeat destroyed the completed round's verdict
+(`total=0 done=0`), re-gated a worker whose skeptic had already reported,
+and filed a duplicate request stamped `deliberate: false` — which the
+"Draining the request inbox" contract declares auto-spawnable. It fired
+three times in one production round.
+
+A **new** round is anything the stamp does not match: a different report
+path, or a higher depth. Those take the unchanged path — archive the
+stale sentinels, re-arm, re-file. To force a new round on an UNCHANGED
+report path (you changed the deliverable after a verdict landed), say so
+explicitly, either way:
+
+```bash
+ng wrap-up <issue> <report> ... --skeptic-decision require --skeptic-reopen
+# or, operator-side, then re-run wrap-up normally:
+ng skeptic reopen <window>
+```
+
 The request `## Details` carries **pointers** (not inline copies): `issue`
 + `trigger-comment` (the operator's original ask), `report-path` +
 `report-asset-url` + `link-comment-url` (the deliverable), the worker's
@@ -356,7 +383,15 @@ ng skeptic close <task>           # drops the DONE sentinel
 # Status / list:
 ng skeptic status <task>      # open=N ack=A answered=M total=T done=0|1
 ng skeptic list <task>        # human-readable table
+
+# Round identity (issue 16) — which deliverable does the live round belong to?
+ng skeptic round <task>       # report-path / depth / opened; rc 2 + "none" if no round
+ng skeptic reopen <task>      # clear the stamp so the next `require` opens a NEW round
 ```
+
+`round` is also the fastest way to date a suspicious `DONE`: an `opened:`
+newer than the `DONE`'s mtime means that `DONE` belongs to the PRIOR
+round, which is the shape of the false-instant-`exit 10` hazard.
 
 `<req>` accepts a bare number (`1` / `003`), the stem (`req-003-foo`),
 or a full filename in any state. One answer per request; ask a follow-up

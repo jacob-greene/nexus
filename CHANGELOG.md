@@ -410,6 +410,48 @@ for the current release convention.
 
 ### Fixed
 
+- **`ng wrap-up` is idempotent per deliverable; a repeat no longer
+  strands a live worker (issue 16).** The `required` /
+  `required-escalated` branch ran three side effects unconditionally
+  whenever the skeptic decision resolved to `require`: it archived the
+  channel's terminal sentinels (`skeptic-channel.sh reset`), re-armed the
+  pending marker, and filed a `spawn-skeptic` request. Nothing keyed on
+  *whether a round had already been opened for this deliverable*, so a
+  second `ng wrap-up` on the same, unchanged report path destroyed the
+  live round's `DONE` (`total=0 done=0`), re-gated a worker whose skeptic
+  had already reported, and filed a duplicate request stamped
+  `deliberate: false` — which `monitor/agent-prompt.md` declares an
+  auto-spawnable rubber-stamp first pass. Observed three times in one
+  production round, across two worker windows; in the worst case a worker
+  mid-remediation with live background compute was parked on a verdict
+  that had already been declined. The pre-existing "already filed" guard
+  in the request-filing step did not catch it: that guard only globs
+  `*.new.md` / `*.claimed.md`, and an *acked* request is `*.done.md`.
+
+  The join key is the **report path**. Opening a round now stamps the
+  report path (canonicalized) + the round depth + a timestamp into
+  `monitor/.state/skeptic/<window>/.round`. A `require` whose report path
+  **and** depth match that stamp is a REPEAT: no reset, no re-arm, no
+  re-file. It prints `SKEPTIC: ROUND ALREADY OPEN` with the channel's
+  current `status` and exits **0**, so an honest wrap-up retry is safe
+  instead of destructive; the rest of the hand-off (upload, comment,
+  rocket, log, retain) still runs. The check sits **upstream of the
+  reset**, so the reset itself is untouched — a different report path, or
+  a higher depth, is still a genuine new round that archives the stale
+  `DONE` + `*.answered.md` exactly as issue `#469` /
+  `<your-org>/nexus-code#511` require. A terminal decision (operator
+  waive, spawn-deny, worker deny) drops the stamp, so a later legitimate
+  `require` still opens a real round.
+
+  New escape hatches for a genuine second round on an **unchanged**
+  report path (there was previously no way to reopen a channel on
+  purpose): `ng wrap-up … --skeptic-reopen`, and
+  `ng skeptic reopen <window>` (clears the stamp + archives stale
+  sentinels; deliberately does **not** write the pending marker — arming
+  the gate stays wrap-up's job). `ng skeptic round <window>` prints the
+  stamp, which also dates a suspicious `DONE` against the round that owns
+  it — an `opened:` newer than the `DONE` is the shape of the
+  false-instant-`exit 10` hazard.
 - **`ng` `STATE_DIR` resolver** now picks up `NEXUS_ROOT` /
   `nexus.root` config so worker wrap-ups from worktrees land
   in the primary clone's `.state/`, not the worktree's. (PR #11.)

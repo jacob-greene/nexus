@@ -71,6 +71,23 @@
 # only this mtime comparison closes it. Do not remove it on the grounds
 # that wrap-up "already handles" the reset.
 #
+# Round IDENTITY (jacob-greene/nexus issue 16). The two guards above answer
+# "is this DONE from the current round?"; neither answers "is this a new
+# round at all?". `ng wrap-up --skeptic-decision require` used to run its
+# three side effects (reset, re-arm the pending marker, file a
+# spawn-skeptic request) unconditionally, so a REPEAT wrap-up on the same,
+# unchanged deliverable destroyed the live round's DONE, re-armed the gate
+# and filed a duplicate `deliberate: false` request — stranding a worker on
+# a verdict that had already landed. The disambiguator is the report path:
+# when a round opens, wrap-up stamps <channel>/.round with the report path,
+# the round depth and the open timestamp. A require whose report path +
+# depth match the stamp is a REPEAT, and wrap-up no-ops instead of
+# reopening. `reopen` below is the explicit escape hatch: it clears the
+# stamp (and archives the prior round's sentinels) so the next require
+# opens a genuine new round on the SAME report path. `round` prints the
+# stamp, which is also the fastest way to date a stale DONE against the
+# round that owns it.
+#
 # Race-safety: every state-producing write (ask, answer, close) builds
 # into a temp file in the same directory and `mv -f`s it into place — an
 # atomic rename on one filesystem. A reader (await / await-answer /
@@ -112,6 +129,14 @@
 #   reset   <task-id>                         open a new round: archive the
 #                                             prior DONE + .answered.md into
 #                                             .stale-archive-<ts>/ (no-op rc 0)
+#   round   <task-id>                         print the current round stamp
+#                                             (report-path/depth/opened) or
+#                                             "none" (rc 2)
+#   reopen  <task-id>                         clear the round stamp + archive
+#                                             stale sentinels, so the next
+#                                             `ng wrap-up --skeptic-decision
+#                                             require` on the SAME report
+#                                             opens a genuine new round
 #   list    <task-id>                         human-readable status table
 #   status  <task-id>                         machine: "open=N ack=A answered=M total=T done=0|1"
 #   nudge   <worker-window> [--task <id>] [--force] [--min-interval S]
@@ -215,6 +240,12 @@ _channel_dir() {
 }
 
 _done_sentinel() { printf '%s/DONE' "$(_channel_dir "$1")"; }
+
+# Round-identity stamp (issue 16). Written by `ng wrap-up` when a require
+# round OPENS; read by the same branch on a repeat to recognise it as a
+# repeat. A dotfile so it never matches the `*.md` / `req-*` globs that
+# status, list, poll, reset and _next_req_num walk.
+_round_stamp() { printf '%s/.round' "$(_channel_dir "$1")"; }
 
 _pending_marker() { printf '%s/%s' "$PENDING_DIR" "$(_safe "$1")"; }
 
@@ -765,6 +796,55 @@ cmd_reset() {
         "$task" "${#stale[@]}" "$archive"
 }
 
+# round <task-id> — print the round-identity stamp `ng wrap-up` wrote when
+# the current round opened: which deliverable (report-path) the round is
+# for, at what depth, and when it opened. rc 2 (+ "none") when no round has
+# been opened through wrap-up for this channel.
+#
+# Diagnostic value beyond the idempotency check it backs: a DONE sentinel
+# on its own carries no round identity, so a stale `done=1` cannot be dated
+# against the round that owns it. `round` + `status` together answer that —
+# an `opened:` newer than the DONE's mtime means the DONE is the PRIOR
+# round's, which is exactly the false-instant-exit-10 hazard.
+cmd_round() {
+    local task="${1:-}"; [[ -n "$task" ]] || die "usage: round <task-id>"
+    local stamp; stamp=$(_round_stamp "$task")
+    if [[ ! -f "$stamp" ]]; then
+        printf 'none\n'
+        return 2
+    fi
+    cat -- "$stamp"
+}
+
+# reopen <task-id> — the explicit "yes, this really is a NEW round on the
+# same deliverable" escape hatch (issue 16). Clears the round stamp and
+# archives the prior round's terminal sentinels (`reset`), so the next
+# `ng wrap-up --skeptic-decision require` on the SAME report path opens a
+# genuine new round instead of no-op'ing as a repeat.
+#
+# Deliberately does NOT write the pending marker. `ng wrap-up` (the require
+# gate) and spawn-worker.sh (an orchestrator-spawned skeptic) are the only
+# two writers of that marker, and both stamp a depth with it; adding a
+# third writer here would be a second way to arm the retire gate with no
+# accompanying decision record. reopen only removes the thing that would
+# SUPPRESS the next round — arming it stays wrap-up's job.
+cmd_reopen() {
+    local task="${1:-}"; [[ -n "$task" ]] || die "usage: reopen <task-id>"
+    local stamp; stamp=$(_round_stamp "$task")
+    local had=0
+    [[ -f "$stamp" ]] && had=1
+    rm -f "$stamp" 2>/dev/null || true
+    # Archive any prior-round sentinels too, so the next round starts clean
+    # even if wrap-up's own reset is bypassed. Idempotent, rc 0 on a fresh
+    # channel; its stdout line (if any) is informative, so let it through.
+    cmd_reset "$task" || true
+    if (( had )); then
+        printf 'reopen %s: round stamp cleared — the next `ng wrap-up --skeptic-decision require` will open a new round\n' "$task"
+    else
+        printf 'reopen %s: no round stamp was present (nothing suppressing a new round)\n' "$task"
+    fi
+}
+
 # nudge: wake an idle worker that has pending requests. Reuses
 # paste-followup.sh (the only correct way to inject machine input into
 # a worker pane). Guards:
@@ -909,6 +989,8 @@ main() {
         reconcile)    cmd_reconcile    "$@" ;;
         close)        cmd_close        "$@" ;;
         reset)        cmd_reset        "$@" ;;
+        round)        cmd_round        "$@" ;;
+        reopen)       cmd_reopen       "$@" ;;
         nudge)        cmd_nudge        "$@" ;;
         -h|--help|"")
             awk '/^$/{exit} NR>1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
