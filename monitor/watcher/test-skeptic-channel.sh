@@ -802,9 +802,12 @@ _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infr
 rc=$?
 out=$(cat "$WORK/i16-retry0.out")
 assert_eq "done=0 retry -> rc 0 (an honest retry is SAFE, not an error)" "$rc" "0"
-assert_contains "done=0 retry -> ROUND ALREADY OPEN" "$out" "ROUND ALREADY OPEN"
-assert_contains "done=0 retry -> says no verdict has landed" "$out" "NO verdict has landed yet"
-assert_contains "done=0 retry -> states the gate is STILL ARMED" "$out" "STILL ARMED"
+assert_contains "gate-armed retry -> RETIRE GATE STILL ARMED" "$out" "RETIRE GATE STILL ARMED"
+# Round 2 (SK1): the guard now TESTS the marker rather than inferring the
+# gate from the DONE sentinel, so the message cites the file it checked.
+assert_contains "gate-armed retry -> cites the marker it tested" "$out" \
+    "skeptic-pending marker is STILL IN PLACE"
+assert_contains "gate-armed retry -> states the gate is STILL ARMED" "$out" "STILL ARMED"
 assert_file "done=0 retry -> retire gate still armed (not released)" "$PEND/$ITASK"
 assert_eq "done=0 retry -> no duplicate request signalled" "${_SK_SPAWN_REQ:-}" "0"
 assert_nofile "done=0 retry -> nothing archived" \
@@ -842,7 +845,13 @@ _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infr
 rc=$?
 out=$(cat "$WORK/i16-repeat.out")
 assert_eq "verdict -> remediate -> re-wrap: REFUSES (rc 1, fails CLOSED)" "$rc" "1"
-assert_contains "post-verdict re-wrap -> says the verdict already landed" "$out" "VERDICT ALREADY LANDED"
+assert_contains "post-verdict re-wrap -> says the retire gate is down" "$out" "RETIRE GATE IS DOWN"
+# This path closed, so DONE is present and the message must diagnose the
+# close specifically. The verdict-WITHOUT-close half of the split — the one
+# every close-driven assertion in this suite structurally cannot reach — is
+# covered in test-ng-wrap-up.sh's "issue 16 SK1" block.
+assert_contains "post-verdict re-wrap -> diagnoses the close" "$out" \
+    "a skeptic CLOSED this channel with a verdict"
 assert_contains "post-verdict re-wrap -> names the wrap-up escape hatch" "$out" "--skeptic-reopen"
 assert_contains "post-verdict re-wrap -> names the channel reopen verb" "$out" "skeptic-channel.sh reopen"
 assert_contains "post-verdict re-wrap -> says an UNCHANGED deliverable is done" "$out" "You are DONE"
@@ -866,6 +875,49 @@ rc4=$?
 assert_eq "3rd repeat -> still refuses (rc 1)" "$rc3" "1"
 assert_eq "4th repeat -> still refuses (rc 1)" "$rc4" "1"
 assert_eq "3rd + 4th repeat -> still destroy nothing" "$("$CHAN" status "$ITASK")" "$before_status"
+
+# --- constraint (ii): marker RELEASED with no verdict at all -> fail CLOSED ---
+# Round 2 re-keyed the guard from DONE to the pending marker, and this is
+# the state where that CHANGES behaviour rather than merely fixing it:
+# marker absent, DONE absent, and no verdict was ever returned (an operator
+# hand-`rm`ed the marker, or a round-opening write was lost). The old
+# DONE-keyed guard returned 0 here and completed the hand-off; the
+# gate-keyed guard refuses.
+#
+# That is deliberate, and it is the same call skeptic-channel.sh:752-758
+# already makes about this exact file pair ("a crash after the unlink would
+# leave no marker and no DONE — retire-preflight would see no pending gate
+# and let the worker retire unvalidated. Fail closed on a partial close,
+# not open."). A require-mode worker whose gate has vanished is in an
+# anomalous state whatever the cause, and refusing is RECOVERABLE — the
+# message names the two reopen verbs, both of which re-arm the gate —
+# whereas returning 0 silently retires it unvalidated.
+#
+# The SUPPORTED release paths are unaffected: waive / spawn-deny / worker-
+# deny all call _skeptic_round_clear, which drops the .round stamp, so this
+# guard never fires for them at all. That is asserted separately below.
+I16_R3="$I16DIR/nexus_2026-08-03_140000_released.md"; printf '# r3\n' > "$I16_R3"
+RTASK=w16-released
+mk_prov "$RTASK" require 0 false ""
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 0 >/dev/null 2>&1
+assert_file "released: round 1 armed the gate" "$PEND/$RTASK"
+rm -f "$PEND/$RTASK"          # the marker is released by hand; NO verdict, NO close
+assert_nofile "released: gate is down with no verdict on the channel" "$PEND/$RTASK"
+assert_nofile "released: and no DONE sentinel either" "$NEXUS_STATE_DIR/skeptic/$RTASK/DONE"
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 0 > "$WORK/i16-released.out" 2>&1
+rcrel0=$?
+outrel=$(cat "$WORK/i16-released.out")
+assert_eq "released marker, no verdict -> REFUSES (rc 1, fails CLOSED)" "$rcrel0" "1"
+assert_contains "released marker -> reports the GATE, not a verdict" "$outrel" "RETIRE GATE IS DOWN"
+# The message must not invent a close that never happened.
+assert_not_contains "released marker -> does NOT claim a skeptic closed the channel" \
+    "$outrel" "a skeptic CLOSED this channel with a verdict"
+assert_contains "released marker -> refusal is recoverable (names the reopen verb)" \
+    "$outrel" "--skeptic-reopen"
+# ...and the reopen genuinely restores the gate, so the refusal is a
+# speed bump rather than a dead end.
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 1 >/dev/null 2>&1
+assert_file "released marker -> --skeptic-reopen re-arms the gate" "$PEND/$RTASK"
 
 # --- cwd-relative vs absolute path is the SAME deliverable, not a new one ---
 # Canonicalization is a property of the KEY, so it must hold on the refuse

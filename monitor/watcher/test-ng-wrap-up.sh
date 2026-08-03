@@ -1387,11 +1387,16 @@ assert_eq       "retry require wrap-up exits 0"            "$rc" "0"
 assert_contains "retry reports the round already open"     "$stdout" \
                 "spawn-skeptic request: skipped (a round is already open for this report)"
 assert_eq       "still exactly one request after retry"    "$(count_spawn_reqs)" "1"
-# NO verdict has landed on this channel, so the retire gate is still up:
-# this is the HONEST-RETRY branch of the guard, the only one that may
-# exit 0, and it must still complete the hand-off.
+# The pending marker is still on this channel, so the retire gate is still
+# up: this is the GATE-ARMED branch of the guard, the only one that may
+# exit 0, and it must still complete the hand-off. Round 2 (SK1) re-keyed
+# the guard from the DONE sentinel to the marker, so the message now
+# reports the gate it actually tested rather than inferring it.
 assert_file     "retry leaves the retire gate ARMED"       "$STATE_DIR/skeptic/pending/sk-retry-worker"
-assert_contains "retry says no verdict has landed yet"     "$stdout" "NO verdict has landed yet"
+assert_contains "retry reports the gate is still armed"    "$stdout" \
+                "RETIRE GATE STILL ARMED"
+assert_contains "retry cites the marker it actually tested" "$stdout" \
+                "skeptic-pending marker is STILL IN PLACE"
 assert_contains "retry still uploads the report"           "$stdout" "uploaded: https://github.com/asset-org"
 assert_contains "retry still handles the link comment"     "$stdout" "posted comment"
 
@@ -1431,8 +1436,13 @@ assert_eq       "verdict landed and the channel closed"    "$sk_before" \
 run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
     --skeptic-decision require --skeptic-rationale "shared infra"
 assert_eq       "post-verdict repeat REFUSES (rc 1, fails closed)" "$rc" "1"
-assert_contains "post-verdict repeat says the verdict already landed" "$stdout" \
-                "VERDICT ALREADY LANDED"
+assert_contains "post-verdict repeat says the retire gate is down" "$stdout" \
+                "RETIRE GATE IS DOWN"
+# ...and diagnoses HOW it went down. On THIS path a `close` landed, so the
+# DONE sentinel is present and the message must say so — the other branch
+# (verdict without close) is asserted in the SK1 block below.
+assert_contains "post-verdict repeat diagnoses the close" "$stdout" \
+                "a skeptic CLOSED this channel with a verdict"
 assert_contains "post-verdict repeat names --skeptic-reopen" "$stdout" "--skeptic-reopen"
 assert_contains "post-verdict repeat says an UNCHANGED deliverable is done" \
                 "$stdout" "You are DONE"
@@ -1486,6 +1496,80 @@ assert_eq       "reopen with an UNACKED request files no duplicate" \
                 "$(count_spawn_reqs)" "1"
 assert_file     "reopen with an UNACKED request still re-arms the gate" \
                 "$STATE_DIR/skeptic/pending/sk-acked-worker"
+
+echo '=== issue 16 SK1: a verdict landed WITHOUT a close still refuses a re-wrap ==='
+# THE ROUND-2 REGRESSION TEST. Every other F1 assertion in this file and in
+# test-skeptic-channel.sh drives the verdict through `skeptic-channel.sh
+# close`, and that is exactly why a fully green suite missed SK1: `close` is
+# the ONLY writer of the DONE sentinel, so a DONE-keyed guard looked correct
+# everywhere it was tested.
+#
+# The PRODUCTION verdict path is `ng wrap-up --skeptic-role`, which clears
+# the pending marker for the reviewed window AND the chain-root worker but
+# NEVER writes DONE. That reaches `marker absent + DONE absent`, where the
+# DONE-keyed guard computed done=0, took the honest-retry branch, returned
+# 0, ran the whole hand-off and printed "the retire gate is STILL ARMED"
+# while the gate was DOWN — the F1 fail-open through the other door.
+#
+# It is not an ordering slip: skills/nexus.skeptic's "Channel-close
+# discipline across the chain" REQUIRES that only the final skeptic in a
+# chain closes the original worker's channel, so a mid-chain skeptic
+# returning a substantive verdict must land it exactly this way.
+reset_mocks
+SK1_REPORT="$FAKE_NEXUS/reports/sk1_2026-08-03_000000_x.md"
+cp "$REPORT" "$SK1_REPORT"
+
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk1-worker"
+run_ng stdout stderr rc wrap-up 77 "$SK1_REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+assert_eq       "SK1 round 1 wrap-up exits 0"              "$rc" "0"
+assert_file     "SK1 round 1 arms the retire gate"         "$STATE_DIR/skeptic/pending/sk1-worker"
+
+# The skeptic reports its verdict through the real verb, and does NOT close.
+export MOCK_TMUX_WINDOW="sk1-skeptic"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-role --skeptic-verdict check --skeptic-target sk1-worker \
+    --skeptic-depth 1 --skeptic-findings 1
+assert_eq       "SK1 skeptic verdict wrap-up exits 0"      "$rc" "0"
+# The two halves of the defect's precondition, asserted separately so a
+# future change to either writer fails HERE with a readable message.
+assert_not_file "SK1 verdict CLEARED the worker's retire gate" \
+                "$STATE_DIR/skeptic/pending/sk1-worker"
+assert_not_file "SK1 verdict wrote NO DONE sentinel" \
+                "$STATE_DIR/skeptic/sk1-worker/DONE"
+# Baseline for the duplicate-request check is taken HERE, after the verdict.
+# A substantive verdict (findings=1) legitimately files its own second-pass
+# spawn-skeptic request, so measuring from before it would charge that
+# request to the re-wrap and make the assertion lie about what it tests.
+sk1_reqs_before=$(count_spawn_reqs)
+
+# THE RE-WRAP. Worker remediated, appended to the same append-only report,
+# and wraps up again. The gate is down, so this must fail CLOSED exactly as
+# the close-driven path does.
+export MOCK_TMUX_WINDOW="sk1-worker"
+printf '\n<!-- remediation appended after the verdict -->\n' >> "$SK1_REPORT"
+run_ng stdout stderr rc wrap-up 77 "$SK1_REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "SK1 re-wrap REFUSES (rc 1, fails closed)" "$rc" "1"
+assert_contains "SK1 re-wrap says the retire gate is down" "$stdout" \
+                "RETIRE GATE IS DOWN"
+# The message must NOT make the false claim the DONE-keyed guard made.
+assert_not_contains "SK1 re-wrap does not claim the gate is still armed" \
+                    "$stdout" "RETIRE GATE STILL ARMED"
+# ...and must diagnose THIS cause (no close) rather than the close cause.
+assert_contains "SK1 re-wrap diagnoses a verdict without a close" "$stdout" \
+                "a verdict was returned WITHOUT closing the channel"
+assert_not_contains "SK1 re-wrap does not claim a close happened" "$stdout" \
+                    "a skeptic CLOSED this channel with a verdict"
+# Nothing downstream ran, and nothing was re-armed or re-filed.
+assert_not_contains "SK1 re-wrap does NOT upload"          "$stdout" "uploaded: https://github.com/asset-org"
+assert_not_contains "SK1 re-wrap does NOT comment"         "$stdout" "posted comment"
+assert_not_file "SK1 re-wrap does NOT re-arm the retire gate" \
+                "$STATE_DIR/skeptic/pending/sk1-worker"
+assert_eq       "SK1 re-wrap files no duplicate request"   "$(count_spawn_reqs)" "$sk1_reqs_before"
+assert_contains "SK1 re-wrap names the failed step on stderr" "$stderr" \
+                "REFUSED at the skeptic step"
 
 echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
 reset_mocks
