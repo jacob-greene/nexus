@@ -96,6 +96,15 @@ for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh; do
 done
 chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
 
+# The shared retire-gate predicate (jacob-greene/nexus#16) + the idle-probe
+# liveness primitives it combines. ng's re-wrap guard asks
+# skeptic_gate_state whether the window is still gated; without these two
+# files it degrades to `unclassified` (marker-presence only), which is a
+# real mode and is asserted separately at the end of the SK1-d block.
+cp "$_test_dir/../_skeptic_gate.sh" "$FAKE_NEXUS/monitor/_skeptic_gate.sh"
+mkdir -p "$FAKE_NEXUS/monitor/watcher"
+cp "$_test_dir/_idle_probe.sh" "$FAKE_NEXUS/monitor/watcher/_idle_probe.sh"
+
 # Stubbed config — same shape as test-ng-reply-repo.sh.
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -169,6 +178,14 @@ TMUX_CAPTURE="$WORK/tmux-calls.txt"
 cat > "$STUB_DIR/tmux" <<STUB
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$TMUX_CAPTURE"
+# list-windows drives _idle_skeptic_live_window, i.e. whether the shared
+# retire-gate predicate sees a LIVE reviewer. MOCK_LIVE_WINDOWS is the
+# newline-separated window set; unset/empty means "no windows alive",
+# which is what makes a re-armed marker ORPHANED rather than live.
+if [[ "\${1:-}" == "list-windows" ]]; then
+    [[ -n "\${MOCK_LIVE_WINDOWS:-}" ]] && printf '%s\\n' "\$MOCK_LIVE_WINDOWS"
+    exit 0
+fi
 if [[ "\${1:-}" == "display-message" ]]; then
     # Require -t to be present and to look like a pane id (\$TMUX_PANE
     # is set by tmux to %<digits>). Refuse the default (active-window)
@@ -1442,10 +1459,22 @@ assert_contains "post-verdict repeat says the retire gate is down" "$stdout" \
 # DONE sentinel is present and the message must say so — the other branch
 # (verdict without close) is asserted in the SK1 block below.
 assert_contains "post-verdict repeat diagnoses the close" "$stdout" \
-                "a skeptic CLOSED this channel with a verdict"
+                "\`close\` is"
+assert_contains "post-verdict repeat cites the DONE sentinel as the evidence" "$stdout" \
+                "The DONE sentinel is present"
 assert_contains "post-verdict repeat names --skeptic-reopen" "$stdout" "--skeptic-reopen"
 assert_contains "post-verdict repeat says an UNCHANGED deliverable is done" \
                 "$stdout" "You are DONE"
+# SK1-c: "you are done, retire" is safe HERE and only here — a verdict
+# provably landed (DONE present, and `close` is its only writer). The
+# message must say that is what corroborates it, so the same paragraph
+# cannot be read as a retire licence in the states where nothing does.
+assert_contains "post-verdict repeat states a verdict DID land" "$stdout" \
+                "A VERDICT DID LAND"
+assert_contains "post-verdict repeat corroborates (b) from the DONE sentinel" "$stdout" \
+                "The DONE sentinel above corroborates (b)"
+assert_not_contains "post-verdict repeat does NOT hedge (b) when DONE is present" \
+                    "$stdout" "NOTHING HERE CORROBORATES (b)"
 assert_eq       "repeat files NO duplicate request (was 3 in production)" \
                 "$(count_spawn_reqs)" "0"
 assert_eq       "repeat leaves the round-1 verdict + DONE intact" \
@@ -1558,10 +1587,36 @@ assert_contains "SK1 re-wrap says the retire gate is down" "$stdout" \
 assert_not_contains "SK1 re-wrap does not claim the gate is still armed" \
                     "$stdout" "RETIRE GATE STILL ARMED"
 # ...and must diagnose THIS cause (no close) rather than the close cause.
-assert_contains "SK1 re-wrap diagnoses a verdict without a close" "$stdout" \
-                "a verdict was returned WITHOUT closing the channel"
+assert_contains "SK1 re-wrap names the verdict-without-close history" "$stdout" \
+                "a verdict WAS returned without closing the channel"
 assert_not_contains "SK1 re-wrap does not claim a close happened" "$stdout" \
-                    "a skeptic CLOSED this channel with a verdict"
+                    "A VERDICT DID LAND"
+# SK1-c. `marker gone + no DONE` is reachable from TWO histories — a
+# mid-chain verdict that (correctly) did not close, and no validation at
+# all — and nothing on disk separates them. Round 2 asserted the first one
+# outright ("a verdict was returned WITHOUT closing the channel", "the
+# validation is over") and then offered "You are DONE ... retire", which is
+# a fail-open instruction inside a fail-closed exit code for a
+# require-mandated worker that was never validated. The message must state
+# the ambiguity and must not resolve it in the unsafe direction.
+assert_contains "SK1 re-wrap says validation is NOT established" "$stdout" \
+                "WHETHER YOU WERE VALIDATED AT ALL IS NOT ESTABLISHED"
+assert_contains "SK1 re-wrap names the never-validated history too" "$stdout" \
+                "NO validation ever happened"
+assert_not_contains "SK1 re-wrap does NOT declare the validation over" "$stdout" \
+                    "the validation is over"
+assert_contains "SK1 re-wrap flags that nothing corroborates the retire case" "$stdout" \
+                "NOTHING HERE CORROBORATES (b)"
+assert_contains "SK1 re-wrap offers the never-validated recovery (case c)" "$stdout" \
+                "NO verdict was ever returned to"
+assert_contains "SK1 re-wrap conditions retiring on a verdict the agent saw" "$stdout" \
+                "a verdict WAS returned on"
+# ...and stderr, which is where the worker floor sends agents on a
+# non-zero wrap-up, must not carry the unconditional retire licence either.
+assert_not_contains "stderr does NOT tell an unvalidated worker it is done" "$stderr" \
+                    "otherwise you are done — retire"
+assert_contains "stderr conditions retiring on a received verdict" "$stderr" \
+                "you received a verdict on it"
 # Nothing downstream ran, and nothing was re-armed or re-filed.
 assert_not_contains "SK1 re-wrap does NOT upload"          "$stdout" "uploaded: https://github.com/asset-org"
 assert_not_contains "SK1 re-wrap does NOT comment"         "$stdout" "posted comment"
@@ -1570,6 +1625,240 @@ assert_not_file "SK1 re-wrap does NOT re-arm the retire gate" \
 assert_eq       "SK1 re-wrap files no duplicate request"   "$(count_spawn_reqs)" "$sk1_reqs_before"
 assert_contains "SK1 re-wrap names the failed step on stderr" "$stderr" \
                 "REFUSED at the skeptic step"
+
+echo '=== issue 16 SK1-d: all four gate quadrants, live vs orphaned reviewer ==='
+# THE COVERAGE THE ROUND-2 COMMIT SHIPPED WITHOUT. Its own Infrastructure
+# Issues note said "a green suite is not evidence when every assertion
+# drives the same writer" — and then the one quadrant where behaviour moved
+# toward PROCEEDING (marker present + DONE present) shipped with no
+# assertion at all, so the branch that prints "a live reviewer holds this
+# window right now" was dead code as far as the suite was concerned.
+#
+# The grid, keyed on the shared predicate (monitor/_skeptic_gate.sh):
+#
+#   marker    DONE     reviewer     gate-state     rc
+#   ------------------------------------------------------
+#   present   absent   live         live           0
+#   present   absent   dead         orphaned       1   <- was 0 (pre-existing hole)
+#   present   present  live         live           0
+#   present   present  dead         orphaned       1   <- was 0 (SK1-b, opened by round 2)
+#   absent    present  --           absent         1
+#   absent    absent   --           absent         1
+#
+# The reviewer's liveness is driven ONLY through the tmux window set and
+# the action-log `skeptic-spawn` event — i.e. through writers that never
+# touch the marker file the guard keys on, which is the property round 2's
+# note asks for and round 2's tests did not have.
+CHAN_SH="$FAKE_NEXUS/monitor/skeptic-channel.sh"
+cp "$_test_dir/../skeptic-channel.sh" "$CHAN_SH"; chmod +x "$CHAN_SH"
+
+# Re-arm a marker exactly as spawn-worker.sh does at a real further-pass
+# spawn (a plain depth write to pending/<window>) — never via ng, so the
+# quadrant is reached by the production writer.
+q_rearm() { printf '%s' "${2:-2}" > "$STATE_DIR/skeptic/pending/$1"; }
+# Record a `skeptic-spawn` action-log event naming <reviewed> — the
+# authoritative live-reviewer signal spawn-worker.sh emits. Liveness then
+# depends on whether MOCK_LIVE_WINDOWS lists the skeptic window.
+q_log_spawn() {
+    printf '{"ts":"%s","event":"skeptic-spawn","window":"%s","target-window":"%s","orig-window":"%s"}\n' \
+        "$(date -Iseconds)" "$2" "$1" "$1" >> "$STATE_DIR/action-log.jsonl"
+}
+# Age the gate for <window> by <seconds>: backdate the marker mtime and
+# append a skeptic-request event with an older ts (the request epoch is the
+# LAST matching event, so appending wins). Deterministic — driving the
+# orphan state off a zero grace and real elapsed time would flake whenever
+# two wrap-ups land inside the same second.
+q_age_gate() {
+    local win="$1" secs="${2:-300}" then
+    then=$(( $(date +%s) - secs ))
+    printf '{"ts":"%s","event":"skeptic-request","target-window":"%s","depth":"1"}\n' \
+        "$(date -Iseconds -d "@$then")" "$win" >> "$STATE_DIR/action-log.jsonl"
+    touch -d "@$then" "$STATE_DIR/skeptic/pending/$win"
+}
+# Last skeptic-decision reason recorded for this window.
+q_last_reason() {
+    grep -F '"event":"skeptic-decision"' "$STATE_DIR/action-log.jsonl" 2>/dev/null \
+        | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | tail -1
+}
+q_last_gate_state() {
+    grep -F '"event":"skeptic-decision"' "$STATE_DIR/action-log.jsonl" 2>/dev/null \
+        | sed -n 's/.*"gate-state":"\([^"]*\)".*/\1/p' | tail -1
+}
+# Open a require round for <window> on its own copy of the report.
+q_open_round() {
+    export MOCK_TMUX=1 MOCK_TMUX_WINDOW="$1"
+    run_ng stdout stderr rc wrap-up 77 "$2" --repo override-org/override-repo \
+        --skeptic-decision require --skeptic-rationale "shared infra"
+}
+q_rewrap() {
+    export MOCK_TMUX=1 MOCK_TMUX_WINDOW="$1"
+    run_ng stdout stderr rc wrap-up 77 "$2" --repo override-org/override-repo \
+        --skeptic-decision require --skeptic-rationale "shared infra"
+}
+
+# ---- quadrant: marker present + DONE absent + LIVE reviewer -> exit 0 ----
+reset_mocks
+Q_REPORT="$FAKE_NEXUS/reports/q1_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q1-worker "$Q_REPORT"
+assert_eq "q1: round 1 exits 0" "$rc" "0"
+q_log_spawn q1-worker q1-worker-skeptic
+export MOCK_LIVE_WINDOWS="q1-worker-skeptic"
+q_rewrap q1-worker "$Q_REPORT"
+assert_eq       "q1 (marker+no DONE+live): exits 0"        "$rc" "0"
+assert_eq       "q1: gate-state is live"                   "$(q_last_gate_state)" "live"
+assert_eq       "q1: reason names the armed gate"          "$(q_last_reason)" \
+                "round-already-open-gate-armed"
+assert_contains "q1: claims a LIVE reviewer (it checked one)" "$stdout" \
+                "A reviewer is LIVE on this window right now"
+assert_contains "q1: completes the hand-off"               "$stdout" \
+                "uploaded: https://github.com/asset-org"
+
+# ---- quadrant: marker present + DONE absent + reviewer DEAD -> refuse ----
+# The PRE-EXISTING orphan hole (open in 45e11ae, round 1 and round 2
+# alike): a first-pass skeptic that was required, spawned, and then died
+# without a verdict leaves a marker nothing ever clears. Same state as q1
+# except the reviewer's window is gone.
+reset_mocks
+unset MOCK_LIVE_WINDOWS
+Q_REPORT="$FAKE_NEXUS/reports/q2_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q2-worker "$Q_REPORT"
+q_log_spawn q2-worker q2-worker-skeptic
+# Past the spawn grace: the orchestrator has had its window to dispatch,
+# and no reviewer is alive. (Inside the grace this is state `grace` and
+# the gate legitimately still holds — asserted below.)
+export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+q_age_gate q2-worker 300
+q_rewrap q2-worker "$Q_REPORT"
+assert_eq       "q2 (marker+no DONE+DEAD reviewer): REFUSES" "$rc" "1"
+assert_eq       "q2: gate-state is orphaned"               "$(q_last_gate_state)" "orphaned"
+assert_eq       "q2: reason names a gate that is down"     "$(q_last_reason)" \
+                "round-gate-down-no-close"
+assert_contains "q2: says the marker is ORPHANED, not gone" "$stdout" \
+                "skeptic-pending marker is ORPHANED"
+assert_not_contains "q2: does NOT claim a live reviewer"   "$stdout" \
+                    "A reviewer is LIVE on this window right now"
+assert_not_contains "q2: does NOT complete the hand-off"   "$stdout" \
+                    "uploaded: https://github.com/asset-org"
+assert_file     "q2: the marker itself is left alone"      "$STATE_DIR/skeptic/pending/q2-worker"
+
+# ---- same state, INSIDE the spawn grace -> still gated, exit 0 ----------
+# The grace is why an orphan refusal cannot fire on a worker whose skeptic
+# is merely still being dispatched. Identical to q2 but with the grace
+# restored, so the ONLY difference is elapsed time.
+unset MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
+q_rewrap q2-worker "$Q_REPORT"
+assert_eq       "q2-grace (same state, inside grace): exits 0" "$rc" "0"
+assert_eq       "q2-grace: gate-state is grace"            "$(q_last_gate_state)" "grace"
+assert_contains "q2-grace: says a reviewer is not visible YET" "$stdout" \
+                "No live skeptic window is visible yet"
+assert_not_contains "q2-grace: does NOT claim a live reviewer" "$stdout" \
+                    "A reviewer is LIVE on this window right now"
+
+# ---- quadrant: marker present + DONE present + LIVE reviewer -> exit 0 --
+# The legitimate case the round-2 change was FOR: a verdict landed, the
+# channel closed, a further pass was really spawned (re-arming the marker),
+# and that reviewer must see the remediated hand-off.
+reset_mocks
+unset MOCK_LIVE_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
+Q_REPORT="$FAKE_NEXUS/reports/q3_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q3-worker "$Q_REPORT"
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close q3-worker >/dev/null
+assert_file     "q3: close wrote the DONE sentinel"        "$STATE_DIR/skeptic/q3-worker/DONE"
+assert_not_file "q3: close cleared the marker"             "$STATE_DIR/skeptic/pending/q3-worker"
+q_rearm q3-worker 2                       # the further-pass spawn re-arms it
+q_log_spawn q3-worker q3-worker-skeptic2
+export MOCK_LIVE_WINDOWS="q3-worker-skeptic2"
+printf '\n<!-- remediation appended -->\n' >> "$Q_REPORT"
+q_rewrap q3-worker "$Q_REPORT"
+assert_eq       "q3 (marker+DONE+live): exits 0"           "$rc" "0"
+assert_eq       "q3: gate-state is live"                   "$(q_last_gate_state)" "live"
+assert_eq       "q3: reason names the armed gate"          "$(q_last_reason)" \
+                "round-already-open-gate-armed"
+assert_contains "q3: claims a LIVE reviewer (it checked one)" "$stdout" \
+                "A reviewer is LIVE on this window right now"
+assert_contains "q3: explains the re-armed gate"           "$stdout" "RE-ARMED"
+assert_contains "q3: completes the hand-off"               "$stdout" \
+                "uploaded: https://github.com/asset-org"
+
+# ---- quadrant: marker present + DONE present + reviewer DEAD -> refuse --
+# SK1-b. Byte-identical on-disk state to q3; the ONLY difference is that
+# the further-pass reviewer is no longer alive. Round 2 exited 0 here and
+# printed q3's live-reviewer claim verbatim, so the remediation shipped
+# with no reviewer, no replacement request, and retirement permitted.
+reset_mocks
+unset MOCK_LIVE_WINDOWS
+Q_REPORT="$FAKE_NEXUS/reports/q4_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q4-worker "$Q_REPORT"
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close q4-worker >/dev/null
+q_rearm q4-worker 2
+q_log_spawn q4-worker q4-worker-skeptic2
+export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60    # reviewer dead, past grace
+q_age_gate q4-worker 300
+printf '\n<!-- remediation appended -->\n' >> "$Q_REPORT"
+q4_reqs_before=$(count_spawn_reqs)
+q_rewrap q4-worker "$Q_REPORT"
+assert_eq       "q4 (marker+DONE+DEAD reviewer): REFUSES"  "$rc" "1"
+assert_eq       "q4: gate-state is orphaned"               "$(q_last_gate_state)" "orphaned"
+assert_eq       "q4: reason names a gate that is down, verdict closed" \
+                "$(q_last_reason)" "round-gate-down-verdict-closed"
+assert_not_contains "q4: does NOT claim a live reviewer"   "$stdout" \
+                    "A reviewer is LIVE on this window right now"
+assert_contains "q4: says the marker is ORPHANED, not gone" "$stdout" \
+                "skeptic-pending marker is ORPHANED"
+# A verdict DID land here (DONE present), so unlike q2 the message may say
+# so — and must, since that is what makes case (b) available.
+assert_contains "q4: still credits the verdict that landed" "$stdout" \
+                "A VERDICT DID LAND"
+assert_contains "q4: names the dead further-pass reviewer" "$stdout" \
+                "whose reviewer is no longer alive"
+assert_not_contains "q4: does NOT complete the hand-off"   "$stdout" \
+                    "uploaded: https://github.com/asset-org"
+assert_eq       "q4: files no duplicate request"           "$(count_spawn_reqs)" "$q4_reqs_before"
+assert_contains "q4: names the failed step on stderr"      "$stderr" \
+                "REFUSED at the skeptic step"
+assert_contains "q4: stderr carries the gate state"        "$stderr" "gate-state=orphaned"
+
+# ---- quadrant: marker absent + DONE present -> refuse (regression) -----
+# Covered end-to-end by the close-driven block above; asserted here on the
+# action-log reason, which had no assertion anywhere before this block.
+reset_mocks
+unset MOCK_LIVE_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
+Q_REPORT="$FAKE_NEXUS/reports/q5_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q5-worker "$Q_REPORT"
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close q5-worker >/dev/null
+q_rewrap q5-worker "$Q_REPORT"
+assert_eq       "q5 (no marker + DONE): REFUSES"           "$rc" "1"
+assert_eq       "q5: gate-state is absent"                 "$(q_last_gate_state)" "absent"
+assert_eq       "q5: reason names verdict-closed"          "$(q_last_reason)" \
+                "round-gate-down-verdict-closed"
+assert_contains "q5: says the marker is GONE"              "$stdout" \
+                "skeptic-pending marker is GONE"
+
+# ---- DEGRADED MODE: the gate lib is unreachable ------------------------
+# The predicate must not silently disagree with retire-preflight when the
+# shared lib cannot be loaded. Both fall back to "marker present -> gated",
+# so they stay in step; the message must then NOT claim a live reviewer.
+reset_mocks
+unset MOCK_LIVE_WINDOWS
+Q_REPORT="$FAKE_NEXUS/reports/q6_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+mv "$FAKE_NEXUS/monitor/_skeptic_gate.sh" "$WORK/_skeptic_gate.sh.hidden"
+mv "$FAKE_NEXUS/monitor/watcher/_idle_probe.sh" "$WORK/_idle_probe.sh.hidden"
+q_open_round q6-worker "$Q_REPORT"
+assert_eq "q6: round 1 exits 0 without the gate lib" "$rc" "0"
+q_rewrap q6-worker "$Q_REPORT"
+assert_eq       "q6 (degraded, marker present): exits 0"   "$rc" "0"
+assert_eq       "q6: gate-state is unclassified"           "$(q_last_gate_state)" "unclassified"
+assert_contains "q6: says liveness could not be determined" "$stdout" \
+                "could not be determined here"
+assert_not_contains "q6: does NOT claim a live reviewer"   "$stdout" \
+                    "A reviewer is LIVE on this window right now"
+rm -f "$STATE_DIR/skeptic/pending/q6-worker"
+q_rewrap q6-worker "$Q_REPORT"
+assert_eq       "q6 (degraded, marker gone): REFUSES"      "$rc" "1"
+assert_eq       "q6: gate-state is absent"                 "$(q_last_gate_state)" "absent"
+mv "$WORK/_skeptic_gate.sh.hidden" "$FAKE_NEXUS/monitor/_skeptic_gate.sh"
+mv "$WORK/_idle_probe.sh.hidden" "$FAKE_NEXUS/monitor/watcher/_idle_probe.sh"
+unset MOCK_TMUX MOCK_TMUX_WINDOW MOCK_LIVE_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
 reset_mocks

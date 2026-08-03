@@ -1523,14 +1523,29 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
     # really spawned, never on a merely-recommended pass the orchestrator
     # declined. The reviewed worker's marker is therefore never cleared "early"
     # here; it is cleared only at verdict time and reborn only at a real spawn.
-    SKEPTIC_PENDING_DIR="$NEXUS_ROOT/monitor/.state/skeptic/pending"
+    #
+    # The path comes from monitor/_skeptic_gate.sh — the same derivation the
+    # READERS use (retire-preflight check 1b, ng wrap-up's re-wrap guard, the
+    # idle probe). A writer with its own sanitizer can silently write a file
+    # no reader is looking at (jacob-greene/nexus#16 SK5), so there is one
+    # `skeptic_gate_safe` and one `skeptic_gate_pending_dir`, not four.
+    # shellcheck source=_skeptic_gate.sh
+    if ! declare -F skeptic_gate_marker >/dev/null 2>&1; then
+        [ -r "$NEXUS_ROOT/monitor/_skeptic_gate.sh" ] \
+            && . "$NEXUS_ROOT/monitor/_skeptic_gate.sh"
+    fi
+    if ! declare -F skeptic_gate_marker >/dev/null 2>&1; then
+        # Degraded (gate lib unreachable): the pre-#16 inline derivation.
+        skeptic_gate_pending_dir() { printf '%s' "$NEXUS_ROOT/monitor/.state/skeptic/pending"; }
+        skeptic_gate_marker() { printf '%s/%s' "$(skeptic_gate_pending_dir)" "${1//[^a-zA-Z0-9_-]/_}"; }
+    fi
+    SKEPTIC_PENDING_DIR="$(skeptic_gate_pending_dir)"
     mkdir -p "$SKEPTIC_PENDING_DIR" 2>/dev/null || true
-    _sk_safe() { printf '%s' "${1//[^a-zA-Z0-9_-]/_}"; }
     printf '%s' "$SKEPTIC_DEPTH" \
-        > "$SKEPTIC_PENDING_DIR/$(_sk_safe "$SKEPTIC_TARGET")" 2>/dev/null || true
+        > "$(skeptic_gate_marker "$SKEPTIC_TARGET")" 2>/dev/null || true
     if [ -n "$SKEPTIC_ORIG" ] && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]; then
         printf '%s' "$SKEPTIC_DEPTH" \
-            > "$SKEPTIC_PENDING_DIR/$(_sk_safe "$SKEPTIC_ORIG")" 2>/dev/null || true
+            > "$(skeptic_gate_marker "$SKEPTIC_ORIG")" 2>/dev/null || true
     fi
 fi
 

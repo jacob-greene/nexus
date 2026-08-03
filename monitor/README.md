@@ -825,15 +825,29 @@ whether this is the same deliverable, the marker says whether the window is
 still gated. The marker IS the retire gate (`retire-preflight.sh` check 1b
 keys on exactly it), so it is tested directly:
 
-- marker **present** (gate armed) — prints
+- gate **armed** (`live` / `grace` / `stale` / `unclassified`) — prints
   `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`, completing the rest of
-  the hand-off. A reviewer still holds the window, so nothing can fail
-  open. This is the honest retry.
-- marker **absent** (gate down) — prints `SKEPTIC: RETIRE GATE IS DOWN`
-  and **refuses, exit 1**, running nothing downstream. The validation was
-  released, so a silent success would let
-  `verdict → remediate → append → re-wrap` retire unvalidated. The agent
-  must state whether the deliverable changed (reopen) or not (retire).
+  the hand-off. `retire-preflight.sh` would refuse to retire this window,
+  so nothing can fail open. This is the honest retry.
+- gate **down** (`absent` / `orphaned`) — prints
+  `SKEPTIC: RETIRE GATE IS DOWN` and **refuses, exit 1**, running nothing
+  downstream. retire-preflight would let this window retire, so a silent
+  success would let `verdict → remediate → append → re-wrap` retire
+  unvalidated. The agent must state whether the deliverable changed
+  (reopen), was validated and unchanged (retire), or was never validated
+  at all (reopen).
+
+**One predicate, `monitor/_skeptic_gate.sh`.** `skeptic_gate_state
+<window>` prints the state and returns 0 when the gate blocks retirement.
+`ng wrap-up`, `retire-preflight.sh` check 1b, `monitor/spawn-worker.sh`
+(the marker WRITER) and `monitor/watcher/_idle_probe.sh`
+(`_idle_skeptic_parked` / `_idle_skeptic_orphaned`) all delegate to it.
+They used to derive it four separate ways and had already diverged — two
+sites testing `-e`, one `-f`, liveness in only one — which is how every
+round of issue 16 kept re-introducing the same defect: a branch asserting a
+gate state it had not checked. In particular a marker whose reviewer died
+(`orphaned`) is NOT live validation: check 1b lets that window retire, so
+`ng` must not tell the same worker that a reviewer is holding it.
 
 Do **not** key this on the channel's `done=`. The first fix for issue 16
 did, and shipped the fail-open it meant to close (skeptic finding SK1):
