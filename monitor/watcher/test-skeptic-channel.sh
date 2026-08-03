@@ -793,6 +793,23 @@ assert_contains "round stamp records the report path" \
     "$(cat "$NEXUS_STATE_DIR/skeptic/$ITASK/.round")" "report-path: $I16_R1"
 assert_contains "round stamp records the round depth" \
     "$(cat "$NEXUS_STATE_DIR/skeptic/$ITASK/.round")" "depth: 1"
+
+# --- done=0: the HONEST RETRY. No verdict yet, so the gate is still up ---
+# This is issue 16's actual complaint (a retry after e.g. a failed upload
+# must not be destructive) and it is the ONLY branch that may exit 0: the
+# pending marker is still on the channel, so nothing can fail open.
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-retry0.out" 2>&1
+rc=$?
+out=$(cat "$WORK/i16-retry0.out")
+assert_eq "done=0 retry -> rc 0 (an honest retry is SAFE, not an error)" "$rc" "0"
+assert_contains "done=0 retry -> ROUND ALREADY OPEN" "$out" "ROUND ALREADY OPEN"
+assert_contains "done=0 retry -> says no verdict has landed" "$out" "NO verdict has landed yet"
+assert_contains "done=0 retry -> states the gate is STILL ARMED" "$out" "STILL ARMED"
+assert_file "done=0 retry -> retire gate still armed (not released)" "$PEND/$ITASK"
+assert_eq "done=0 retry -> no duplicate request signalled" "${_SK_SPAWN_REQ:-}" "0"
+assert_nofile "done=0 retry -> nothing archived" \
+    "$(ls -d "$NEXUS_STATE_DIR/skeptic/$ITASK"/.stale-archive-* 2>/dev/null | head -1)"
+
 # The require path must ALSO signal the spawn-skeptic request filing.
 _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 1 >/dev/null 2>&1
 assert_eq "explicit --skeptic-reopen -> request signal set" "${_SK_SPAWN_REQ:-}" "1"
@@ -807,32 +824,60 @@ assert_eq "round 1 closed -> verdict + DONE on the channel" \
     "$before_status" "open=0 ack=0 answered=1 total=1 done=1"
 assert_nofile "round 1 closed -> close cleared the pending marker" "$PEND/$ITASK"
 
-# --- THE REPRO: repeat wrap-up, same unchanged report path ---
+# --- THE REPRO, done=1 half: the REMEDIATION LOOP MUST NOT FAIL OPEN ---
+# The regression this guards is `verdict -> remediate -> append -> re-wrap`
+# (the skeptic pass on PR #19, finding F1). Closing the round cleared the
+# pending marker — `monitor/ng` does that on EVERY verdict — while the
+# .round stamp is deliberately kept. So at this point the retire gate is
+# DOWN. If the guard treated this like the done=0 retry above and returned
+# 0, the worker would append its remediation, re-wrap, see a success, and
+# retire on a verdict that never saw the remediation: a fail-open on the
+# exact path #469 exists to protect, and `#20` makes it the COMMON exit
+# shape. Reports are append-only, so the path cannot say whether the
+# deliverable changed (and an mtime/content key would reopen on every
+# append — the destructive behaviour issue 16 removes). Only the agent
+# knows, so the verb REFUSES and makes it say which case it is in.
+printf '\n### remediation appended after the verdict\n' >> "$I16_R1"   # append-only: same path
 _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-repeat.out" 2>&1
 rc=$?
 out=$(cat "$WORK/i16-repeat.out")
-assert_eq "repeat wrap-up -> rc 0 (an honest retry is SAFE, not an error)" "$rc" "0"
-assert_contains "repeat wrap-up -> says the round already exists" "$out" "ROUND ALREADY OPEN"
-assert_contains "repeat wrap-up -> names the actionable escape hatch" "$out" "--skeptic-reopen"
-assert_not_contains "repeat wrap-up -> does NOT re-announce SKEPTIC REQUIRED" "$out" "SKEPTIC REQUIRED"
-assert_eq "repeat wrap-up -> round-1 verdict + DONE SURVIVE (was total=0 done=0)" \
+assert_eq "verdict -> remediate -> re-wrap: REFUSES (rc 1, fails CLOSED)" "$rc" "1"
+assert_contains "post-verdict re-wrap -> says the verdict already landed" "$out" "VERDICT ALREADY LANDED"
+assert_contains "post-verdict re-wrap -> names the wrap-up escape hatch" "$out" "--skeptic-reopen"
+assert_contains "post-verdict re-wrap -> names the channel reopen verb" "$out" "skeptic-channel.sh reopen"
+assert_contains "post-verdict re-wrap -> says an UNCHANGED deliverable is done" "$out" "You are DONE"
+# The pre-remediation message led with "this window may retire", which is
+# precisely the wrong instruction on this branch.
+assert_not_contains "post-verdict re-wrap -> does NOT tell the window it may retire" \
+    "$out" "this window may retire"
+assert_not_contains "post-verdict re-wrap -> does NOT re-announce SKEPTIC REQUIRED" "$out" "SKEPTIC REQUIRED"
+assert_eq "post-verdict re-wrap -> round-1 verdict + DONE SURVIVE (was total=0 done=0)" \
     "$("$CHAN" status "$ITASK")" "$before_status"
-assert_nofile "repeat wrap-up -> retire gate NOT re-armed" "$PEND/$ITASK"
-assert_eq "repeat wrap-up -> NO duplicate spawn-skeptic request signalled" "${_SK_SPAWN_REQ:-}" "0"
-assert_nofile "repeat wrap-up -> nothing archived (no .stale-archive dir)" \
+assert_nofile "post-verdict re-wrap -> retire gate NOT re-armed" "$PEND/$ITASK"
+assert_eq "post-verdict re-wrap -> NO duplicate spawn-skeptic request signalled" "${_SK_SPAWN_REQ:-}" "0"
+assert_nofile "post-verdict re-wrap -> nothing archived (no .stale-archive dir)" \
     "$(ls -d "$NEXUS_STATE_DIR/skeptic/$ITASK"/.stale-archive-* 2>/dev/null | head -1)"
 
-# --- and it stays a no-op however many times it fires (3x in production) ---
+# --- and it refuses however many times it fires (3x in production) ---
 _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+rc3=$?
 _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
-assert_eq "3rd + 4th repeat -> still a no-op" "$("$CHAN" status "$ITASK")" "$before_status"
+rc4=$?
+assert_eq "3rd repeat -> still refuses (rc 1)" "$rc3" "1"
+assert_eq "4th repeat -> still refuses (rc 1)" "$rc4" "1"
+assert_eq "3rd + 4th repeat -> still destroy nothing" "$("$CHAN" status "$ITASK")" "$before_status"
 
 # --- cwd-relative vs absolute path is the SAME deliverable, not a new one ---
+# Canonicalization is a property of the KEY, so it must hold on the refuse
+# branch too: the relative form must match the stamp and be refused, not
+# read as a new deliverable and open a round.
 ( cd "$I16DIR" && : )   # guard: the relative form must resolve from $PWD
 pushd "$I16DIR" >/dev/null
 _wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "./$(basename "$I16_R1")" 0 >/dev/null 2>&1
+rcrel=$?
 popd >/dev/null
-assert_eq "relative path for the same report -> still a repeat (canonicalized)" \
+assert_eq "relative path for the same report -> still keyed as a repeat (canonicalized)" "$rcrel" "1"
+assert_eq "relative path for the same report -> destroyed nothing" \
     "$("$CHAN" status "$ITASK")" "$before_status"
 
 # --- #469 NON-REGRESSION: a DIFFERENT report path is a GENUINE new round ---
@@ -868,6 +913,10 @@ RTASK16=w16-reopen-flag
 mk_prov "$RTASK16" require 0 false ""
 _wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
 "$CHAN" close "$RTASK16" >/dev/null
+# The refusal is not a dead end: this is the exact sequence the refusal
+# message prescribes for case (a) — refuse, then reopen explicitly.
+_wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+assert_eq "post-verdict re-wrap without the flag -> refused first" "$?" "1"
 _wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 1 > "$WORK/i16-reopen.out" 2>&1
 assert_contains "--skeptic-reopen -> forces a new round on the same path" \
     "$(cat "$WORK/i16-reopen.out")" "SKEPTIC REQUIRED"

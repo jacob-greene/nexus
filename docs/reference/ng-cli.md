@@ -638,15 +638,29 @@ ng wrap-up <issue> <report-path>
    16). When a `require` round opens, wrap-up stamps the report path and
    the round depth into `monitor/.state/skeptic/<window>/.round`. A later
    `require` whose report path + depth match that stamp is a REPEAT, not a
-   new round: it does **not** archive the live round's `DONE`, does
-   **not** re-arm the pending marker, and does **not** file a second
-   `spawn-skeptic` request. It prints `SKEPTIC: ROUND ALREADY OPEN` with
-   the channel's current `status` and exits `0`, so an honest wrap-up
-   retry is safe rather than destructive. Before this, a repeat wiped the
-   completed round's verdict (`total=0 done=0`), re-gated a worker whose
-   skeptic had already reported, and filed a duplicate request stamped
-   `deliberate: false` — which the orchestrator reads as an auto-spawnable
+   new round: it never archives the live round's `DONE`, never re-arms the
+   pending marker, and never files a second `spawn-skeptic` request.
+   Before this, a repeat did all three — wiping the completed round's
+   verdict (`total=0 done=0`), re-gating a worker whose skeptic had
+   already reported, and filing a duplicate request stamped
+   `deliberate: false`, which the orchestrator reads as an auto-spawnable
    clean first pass.
+
+   A repeat resolves on the channel's `done=`, because a verdict releases
+   the pending marker while a `close` keeps the stamp:
+
+   - **`done=0`** — no verdict yet, so the gate is still armed. Prints
+     `SKEPTIC: ROUND ALREADY OPEN` and exits `0`; the rest of the hand-off
+     (upload, comment, rocket, log) runs normally. An honest wrap-up retry
+     is safe rather than destructive.
+   - **`done=1`** — a verdict landed and released the gate. Prints
+     `SKEPTIC: VERDICT ALREADY LANDED` and **refuses with exit 1**,
+     running nothing downstream. Silently succeeding here would let the
+     ordinary `verdict → remediate → append → re-wrap` loop retire
+     unvalidated. Reports are append-only, so only the agent knows whether
+     the deliverable changed: reopen (below) if it did, retire if it did
+     not — round 1 already uploaded that exact report and posted its link
+     comment.
 
    A genuinely NEW round on an UNCHANGED report path (the deliverable
    changed after a verdict landed, so it needs re-validating) is available
@@ -655,6 +669,16 @@ ng wrap-up <issue> <report-path>
    report path, or a higher depth, is a new round with no flag needed —
    the `#469`/`#511` archive-the-stale-sentinels behaviour is untouched on
    that path.
+
+   One nuance on `--skeptic-reopen`: it forces a new *round*, but it does
+   not force a new *request*. The request-filing step's own idempotency
+   guard globs `*.new.md` / `*.claimed.md`, so a reopen files afresh only
+   when round 1's request was already **acked** (`*.done.md`, terminal). An
+   unacked request suppresses the new filing and the status line names it.
+   That is deliberate: two non-terminal `spawn-skeptic` requests for the
+   same window+depth are two spawn instructions. The gate does not depend
+   on the request, and the surviving one carries the same window, depth and
+   report path (append-only, so the path is the current deliverable).
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:

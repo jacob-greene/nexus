@@ -106,16 +106,42 @@ still cover it). The inbox is **on by default** as of #545
 (`jacob-greene/nexus` issue 16). Opening a round stamps the report path
 and the round depth into `monitor/.state/skeptic/<window>/.round`. A
 repeat `ng wrap-up` on the SAME, unchanged report path is recognised as a
-repeat and no-ops: it does not archive the live round's `DONE`, does not
-re-arm the pending marker, and does not file a second request. It prints
-`SKEPTIC: ROUND ALREADY OPEN` with the channel `status` and exits `0` —
-so if a wrap-up looks like it failed, **read the error and check
-`ng skeptic status <window>` before retrying**; the retry itself is now
-safe. Before this, a repeat destroyed the completed round's verdict
-(`total=0 done=0`), re-gated a worker whose skeptic had already reported,
-and filed a duplicate request stamped `deliberate: false` — which the
+repeat: it never archives the live round's `DONE`, never re-arms the
+pending marker, and never files a second request. Before this, a repeat
+did all three — destroying the completed round's verdict
+(`total=0 done=0`), re-gating a worker whose skeptic had already reported,
+and filing a duplicate request stamped `deliberate: false`, which the
 "Draining the request inbox" contract declares auto-spawnable. It fired
 three times in one production round.
+
+**Two markers, two questions — and a repeat resolves on the SECOND one.**
+The pending marker and the `.round` stamp encode overlapping but
+non-identical notions of "this round is finished", and they are released
+at different moments: **any** verdict clears the pending marker (so the
+retire gate goes down the instant a skeptic reports), while a round
+`close` deliberately KEEPS its stamp (that completed round is exactly
+what a repeat must not reopen). So the stamp alone cannot say whether the
+window is still gated — the channel's `done=` does. A repeat therefore
+splits:
+
+| stamp matches, and… | wrap-up does | why |
+|---|---|---|
+| `done=0` — no verdict yet | prints `SKEPTIC: ROUND ALREADY OPEN`, **exits 0**, and completes the rest of the hand-off (upload / comment / rocket / log) | the marker is still on the channel, so the gate is still ARMED; this is the honest retry issue 16 exists to make safe |
+| `done=1` — a verdict landed | prints `SKEPTIC: VERDICT ALREADY LANDED`, **refuses, exits 1**, and runs nothing downstream | the verdict already released the gate, so a silent success would let `verdict → remediate → append → re-wrap` retire UNVALIDATED — a fail-open on the exact path `#469` protects |
+
+The `done=1` refusal is deliberate and fails **closed**. Reports are
+append-only, so the report path cannot tell wrap-up whether the
+deliverable changed (and an mtime/content key would reopen on every
+append — the destructive behaviour issue 16 removes). Only you know. The
+refusal names both cases and you must say which you are in: **(a)** the
+deliverable changed after the verdict → reopen explicitly (below);
+**(b)** it did not change → you are **done**, do not re-run wrap-up,
+report in-window and retire. Round 1 already uploaded that exact report
+and posted its link comment, so nothing is lost by not repeating it.
+
+If a wrap-up looks like it failed, **read the message and check
+`ng skeptic status <window>` before retrying** — the two headers above
+tell you which situation you are in.
 
 A **new** round is anything the stamp does not match: a different report
 path, or a higher depth. Those take the unchanged path — archive the

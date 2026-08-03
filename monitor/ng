@@ -1931,15 +1931,40 @@ _wrapup_skeptic_step() {
             # Runs BEFORE the reset below, and is the only thing that
             # gates it. A round stamp whose report-path AND depth match
             # this invocation means a round was already opened for this
-            # exact deliverable: the caller is retrying an unchanged
-            # wrap-up, not asking for a second opinion. Re-running the
-            # side effects would archive the LIVE round's DONE, re-arm a
-            # gate the skeptic already satisfied, and file a duplicate
-            # `deliberate: false` request. So: no reset, no re-arm, no
-            # re-file — say so explicitly and exit SUCCESS, which makes
-            # an honest retry safe instead of destructive. The rest of
-            # wrap-up (upload / comment / rocket / log) still runs; only
-            # the round-opening side effects are suppressed.
+            # exact deliverable: the caller is NOT asking for a second
+            # opinion on something new. Re-running the side effects would
+            # archive the LIVE round's DONE, re-arm a gate the skeptic
+            # already satisfied, and file a duplicate `deliberate: false`
+            # request. So the round-opening side effects are suppressed
+            # on BOTH branches below — no reset, no re-arm, no re-file.
+            #
+            # But "stamp matches" covers two materially different
+            # situations, and they must NOT resolve the same way (the
+            # skeptic pass on PR #19 found the collapsed version fails
+            # OPEN — see the `done=1` branch):
+            #
+            #   done=0 — no verdict has landed. This is the honest retry
+            #     (an upload failed, a wrap-up was re-issued from another
+            #     cwd, ...). The pending marker is still on the channel,
+            #     so the retire gate is STILL ARMED and nothing can fail
+            #     open. Print, exit 0, and let the rest of wrap-up
+            #     (upload / comment / rocket / log) complete the hand-off.
+            #
+            #   done=1 — a verdict LANDED and closed the round, which
+            #     cleared the pending marker (`:1735-1738`, unconditional
+            #     on verdict) while deliberately KEEPING this stamp. So
+            #     the retire gate is DOWN. If we returned 0 here, the
+            #     ordinary `verdict -> remediate -> append -> re-wrap`
+            #     loop — the common exit shape once `#20` is accounted
+            #     for, and the very flow #469 exists to protect — would
+            #     silently proceed UNGATED: the worker retires on a
+            #     verdict that never saw the remediation. Reports are
+            #     append-only, so the path cannot tell us whether the
+            #     deliverable changed and an mtime/content discriminator
+            #     would reopen on every append (which is exactly the
+            #     destructive behaviour issue 16 removes). Only the agent
+            #     knows. So: REFUSE, rc 1, fail CLOSED, and make the
+            #     agent state which case it is in.
             #
             # Depth is part of the key on purpose: an escalated round at
             # a higher depth on the same report IS a new round.
@@ -1954,8 +1979,13 @@ _wrapup_skeptic_step() {
                 _prev_report=$(_skeptic_round_field "$_stamp" report-path)
                 _prev_depth=$(_skeptic_round_field "$_stamp" depth)
                 if [[ -f "$_stamp" && "$_prev_report" == "$report_key" && "$_prev_depth" == "$next" ]]; then
-                    local _opened _chan_status
+                    local _opened _chan_status _reason _verdict_landed=0
                     _opened=$(_skeptic_round_field "$_stamp" opened)
+                    # The DONE sentinel is the authority on "a verdict
+                    # landed" — `status`' own done= field is literally
+                    # `[[ -e $dir/DONE ]]` (skeptic-channel.sh:464), so
+                    # test the file rather than parse the readout.
+                    [[ -e "$(dirname "$_stamp")/DONE" ]] && _verdict_landed=1
                     # Pin NEXUS_STATE_DIR so the readout is guaranteed to
                     # describe the SAME channel this function keyed on,
                     # regardless of how skeptic-channel.sh would resolve
@@ -1964,43 +1994,74 @@ _wrapup_skeptic_step() {
                         "$_script_dir/skeptic-channel.sh" status "$source_window" 2>/dev/null) \
                         || _chan_status=""
                     [[ -n "$_chan_status" ]] || _chan_status="unavailable"
+                    _reason=round-already-open
+                    (( _verdict_landed == 1 )) && _reason=round-closed-verdict-landed
                     ( cmd_log_action monitor --event skeptic-decision \
                         "${winx[@]}" \
                         --extra "decision=$effective" \
-                        --extra "reason=round-already-open" \
+                        --extra "reason=$_reason" \
                         --extra "report-path=$report_key" \
                         --extra "depth=$next" \
                         --extra "issue=$issue" ) 2>/dev/null || true
-                    printf '\n=== SKEPTIC: ROUND ALREADY OPEN — NOT REOPENING ===\n'
-                    printf 'a skeptic round already exists for this deliverable (opened %s,\n' \
-                        "${_opened:-unknown}"
-                    printf 'status %s) — not reopening.\n' "$_chan_status"
+
+                    if (( _verdict_landed == 0 )); then
+                        # ---- the honest retry: gate still armed ----
+                        printf '\n=== SKEPTIC: ROUND ALREADY OPEN — NOT REOPENING ===\n'
+                        printf 'a skeptic round is already open for this deliverable (opened %s,\n' \
+                            "${_opened:-unknown}"
+                        printf 'status %s) and NO verdict has landed yet — not reopening.\n' "$_chan_status"
+                        printf 'report-path: %s\n' "$report_key"
+                        printf 'depth: %s\n' "$next"
+                        printf 'CONSEQUENCE: nothing was reset, re-armed or re-filed, and nothing\n'
+                        printf 'needed to be: the round keeps its sentinels AND its pending marker,\n'
+                        printf 'so the retire gate is STILL ARMED. You are still gated — re-enter\n'
+                        printf 'the wait:\n'
+                        printf '    monitor/skeptic-channel.sh await %s\n' "$source_window"
+                        printf 'The rest of this wrap-up (upload, link comment, rocket, log) ran\n'
+                        printf 'normally, so an honest retry is safe rather than destructive.\n'
+                        # Tell cmd_wrap_up's Step 2b WHY nothing is being
+                        # filed, so the status block stays informative
+                        # rather than silently dropping the
+                        # `spawn-skeptic request:` line on a repeat.
+                        _SK_SPAWN_NOOP=1
+                        # rc 0: the skeptic step SUCCEEDED (the requirement
+                        # is recorded and its round is live) — cmd_wrap_up
+                        # must go on to upload/comment/rocket/log.
+                        # _SK_SPAWN_REQ is still 0 from the top of this
+                        # function, so Step 2b files nothing. NB: `break`
+                        # would be wrong here — `case` is not a loop, so it
+                        # would fall THROUGH into the reset.
+                        return 0
+                    fi
+
+                    # ---- a verdict landed: the gate is DOWN. Refuse. ----
+                    printf '\n=== SKEPTIC: VERDICT ALREADY LANDED — REFUSING TO RE-WRAP ===\n'
+                    printf 'a skeptic round for this EXACT deliverable has already closed with a\n'
+                    printf 'verdict (round opened %s, status %s).\n' \
+                        "${_opened:-unknown}" "$_chan_status"
                     printf 'report-path: %s\n' "$report_key"
                     printf 'depth: %s\n' "$next"
-                    printf 'CONSEQUENCE: nothing was reset, re-armed or re-filed. The existing\n'
-                    printf 'round keeps its verdict/sentinels and its pending marker (if it is\n'
-                    printf 'still open); this repeat wrap-up is a safe no-op for the skeptic\n'
-                    printf 'gate. If `done=1` above, a skeptic already returned a verdict and\n'
-                    printf 'this window may retire; if `done=0`, you are still gated — re-enter\n'
-                    printf '    monitor/skeptic-channel.sh await %s\n' "$source_window"
-                    printf 'To open a genuinely NEW round on this SAME report (you changed the\n'
-                    printf 'deliverable after the verdict, so it needs re-validating), be\n'
-                    printf 'explicit — one of:\n'
-                    printf '    ng wrap-up ... --skeptic-decision require --skeptic-reopen\n'
-                    printf '    monitor/skeptic-channel.sh reopen %s   # then re-run wrap-up\n' "$source_window"
-                    # Tell cmd_wrap_up's Step 2b WHY nothing is being
-                    # filed, so the status block stays informative rather
-                    # than silently dropping the `spawn-skeptic request:`
-                    # line on a repeat.
-                    _SK_SPAWN_NOOP=1
-                    # rc 0: the skeptic step SUCCEEDED (the requirement is
-                    # recorded and its round is live) — cmd_wrap_up must go
-                    # on to upload/comment/rocket/log. _SK_SPAWN_REQ is
-                    # still 0 from the top of this function, so Step 2b
-                    # files nothing. NB: `break` would be wrong here —
-                    # `case` is not a loop, so it would fall THROUGH into
-                    # the reset.
-                    return 0
+                    printf 'CONSEQUENCE: this wrap-up did NOTHING — no reset, no re-arm, no\n'
+                    printf 're-file, and no upload/comment/rocket either. The verdict released\n'
+                    printf 'the retire gate, so silently repeating this wrap-up would leave any\n'
+                    printf 'post-verdict remediation UNVALIDATED: you would retire on a verdict\n'
+                    printf 'that never saw it. Reports are append-only, so only YOU know whether\n'
+                    printf 'the deliverable changed. State which case you are in, then act:\n'
+                    printf '  (a) THE DELIVERABLE CHANGED after the verdict (you remediated and\n'
+                    printf '      appended to this same report). It needs re-validating — open a\n'
+                    printf '      genuinely new round, explicitly, with ONE of:\n'
+                    printf '          ng wrap-up ... --skeptic-decision require --skeptic-reopen\n'
+                    printf '          monitor/skeptic-channel.sh reopen %s   # then re-run wrap-up\n' \
+                        "$source_window"
+                    printf '  (b) THE DELIVERABLE DID NOT CHANGE (this is a duplicate re-run).\n'
+                    printf '      You are DONE — the landed verdict already covers this exact\n'
+                    printf '      report, and round 1 already uploaded it and posted its link\n'
+                    printf '      comment. Do not re-run wrap-up; report in-window and retire.\n'
+                    printf 'This refusal is deliberate and fails CLOSED (issue 16 / #469).\n'
+                    # rc 1: cmd_wrap_up returns here (`|| return $?`), so
+                    # NOTHING downstream runs. That is the point — a
+                    # post-verdict re-wrap must not look like a success.
+                    return 1
                 fi
             fi
             # Open a NEW skeptic round: archive the previous round's terminal
@@ -2194,6 +2255,22 @@ _wrapup_file_spawn_skeptic_request() {
     # is avoidable noise. Skip when a non-terminal spawn-skeptic request for
     # this origin+depth already sits in the inbox. Targeted globs only —
     # never a broad rm/scan.
+    #
+    # This guard applies to an explicit `--skeptic-reopen` too, and that is
+    # deliberate (issue 16 skeptic pass, F3). A reopen with an UNACKED
+    # round-1 request in the inbox is skipped; only an ACKED one (*.done.md,
+    # terminal, invisible to these globs) lets a reopen file afresh. Forcing
+    # a second filing would put TWO non-terminal spawn-skeptic requests for
+    # the same window+depth in front of the orchestrator, and each one is a
+    # spawn instruction — reintroducing, on purpose, the duplicate-request
+    # harm issue 16 exists to remove. The surviving request is still
+    # serviceable: same window, same depth, same report-path (reports are
+    # append-only, so the path resolves to the CURRENT deliverable), and its
+    # link-comment-url is re-pointed in place rather than replaced
+    # (_wrapup_repoint_link_comment). Only report-asset-url goes stale, and
+    # the retire gate does not depend on the request at all. So the skip
+    # says WHICH request it deferred to instead of claiming a bare
+    # "already filed".
     local slug="skeptic-d${depth}"
     local reqdir="$STATE_DIR/requests"
     if [[ -d "$reqdir" ]]; then
@@ -2204,7 +2281,11 @@ _wrapup_file_spawn_skeptic_request() {
             existing="$g"; break
         done
         shopt -u nullglob
-        [[ -n "${existing:-}" ]] && { printf 'skipped (already filed)'; return 0; }
+        if [[ -n "${existing:-}" ]]; then
+            local _ex; _ex=$(basename -- "$existing")
+            printf 'skipped (already filed: %s is still pending for this window+depth)' "$_ex"
+            return 0
+        fi
     fi
 
     # Resolve prompt_file + session-id from the window provenance record.
