@@ -66,6 +66,16 @@ assert_file_exists() {
         FAIL=$(( FAIL + 1 ))
     fi
 }
+assert_file() { assert_file_exists "$@"; }
+assert_not_file() {
+    local label="$1" path="$2"
+    if [[ ! -e "$path" ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — unexpected file: %s\n' "$label" "$path" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
 
 # ---- harness ------------------------------------------------------------
 
@@ -1371,9 +1381,69 @@ run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
     --skeptic-decision require --skeptic-rationale "shared infra"
 unset MOCK_TMUX MOCK_TMUX_WINDOW
 assert_eq       "retry require wrap-up exits 0"            "$rc" "0"
-assert_contains "retry reports the request already filed"  "$stdout" \
-                "spawn-skeptic request: skipped (already filed)"
+# Issue 16: the retry is now caught EARLIER, by the round-identity guard,
+# so it never reaches the request-filing step's own "already filed" glob.
+# The status slot still reports, with the more specific reason.
+assert_contains "retry reports the round already open"     "$stdout" \
+                "spawn-skeptic request: skipped (a round is already open for this report)"
 assert_eq       "still exactly one request after retry"    "$(count_spawn_reqs)" "1"
+
+echo '=== issue 16: repeat wrap-up after the request was ACKED + the skeptic CLOSED ==='
+# The production failure (three duplicate requests in one round) slipped
+# past the pre-existing "already filed" guard because that guard only
+# globs *.new.md / *.claimed.md — an ACKED request is *.done.md, so a
+# repeat filed a FRESH duplicate stamped `deliberate: false`, i.e. a
+# rubber-stamp auto-spawnable first pass. End-to-end, through the real
+# verb: file → ack → close → repeat.
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-acked-worker"
+CHAN_SH="$FAKE_NEXUS/monitor/skeptic-channel.sh"
+cp "$_test_dir/../skeptic-channel.sh" "$CHAN_SH"; chmod +x "$CHAN_SH"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+assert_eq       "round 1 wrap-up exits 0"                  "$rc" "0"
+assert_eq       "round 1 files exactly one request"        "$(count_spawn_reqs)" "1"
+assert_file     "round 1 arms the retire gate"             "$STATE_DIR/skeptic/pending/sk-acked-worker"
+# The orchestrator acks it: .new.md -> .done.md (what request-channel ack does).
+for _f in "$STATE_DIR"/requests/*spawn-skeptic*.new.md "$STATE_DIR"/requests/*skeptic-d1.new.md; do
+    [[ -e "$_f" ]] && mv "$_f" "${_f%.new.md}.done.md"
+done
+# The skeptic runs, answers land, and it closes the channel.
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" ask sk-acked-worker why --message "why?" >/dev/null
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" await sk-acked-worker --once >/dev/null 2>&1
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" answer sk-acked-worker 1 --message "because" >/dev/null
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close sk-acked-worker >/dev/null
+sk_before=$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)
+assert_eq       "verdict landed and the channel closed"    "$sk_before" \
+                "open=0 ack=0 answered=1 total=1 done=1"
+# THE REPEAT. Same issue, same unchanged report path.
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+assert_eq       "repeat wrap-up still exits 0"             "$rc" "0"
+assert_contains "repeat wrap-up says the round already exists" "$stdout" \
+                "ROUND ALREADY OPEN"
+assert_eq       "repeat files NO duplicate request (was 3 in production)" \
+                "$(count_spawn_reqs)" "0"
+assert_eq       "repeat leaves the round-1 verdict + DONE intact" \
+                "$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)" "$sk_before"
+assert_not_file "repeat does NOT re-arm the retire gate" \
+                "$STATE_DIR/skeptic/pending/sk-acked-worker"
+# The hand-off itself still runs — this is a no-op for the SKEPTIC gate
+# only, not a short-circuit of the whole verb.
+assert_contains "repeat still uploads the report"          "$stdout" "uploaded: https://github.com/asset-org"
+assert_contains "repeat still handles the link comment"    "$stdout" "posted comment"
+
+echo '=== issue 16: --skeptic-reopen forces a genuine new round ==='
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra" --skeptic-reopen
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "reopen wrap-up exits 0"                   "$rc" "0"
+assert_contains "reopen announces a real require"          "$stdout" "SKEPTIC REQUIRED"
+assert_eq       "reopen files a fresh request"             "$(count_spawn_reqs)" "1"
+assert_file     "reopen re-arms the retire gate"           "$STATE_DIR/skeptic/pending/sk-acked-worker"
+assert_eq       "reopen archives the stale DONE (#469 path intact)" \
+                "$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)" \
+                "open=0 ack=0 answered=0 total=0 done=0"
 
 echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
 reset_mocks

@@ -598,7 +598,7 @@ ng wrap-up <issue> <report-path>
           [--allow-stub]
           [--retain <reason> | --no-retain]
           [--skeptic-decision require|deny] [--skeptic-rationale <text>]
-          [--skeptic-waive <reason>]
+          [--skeptic-waive <reason>] [--skeptic-reopen]
           [--skeptic-role] [--skeptic-verdict credible|check|suspect|refuted]
           [--skeptic-target <window>] [--skeptic-depth <n>]
           [--skeptic-findings <n>] [--skeptic-orig <window>]
@@ -633,6 +633,28 @@ ng wrap-up <issue> <report-path>
    bounded recursion (`--skeptic-depth` / `--skeptic-findings`, chain
    root via `--skeptic-orig`). `--skeptic-waive` is the operator override
    that releases a required skeptic.
+
+   The gate is **idempotent per deliverable** (`jacob-greene/nexus` issue
+   16). When a `require` round opens, wrap-up stamps the report path and
+   the round depth into `monitor/.state/skeptic/<window>/.round`. A later
+   `require` whose report path + depth match that stamp is a REPEAT, not a
+   new round: it does **not** archive the live round's `DONE`, does
+   **not** re-arm the pending marker, and does **not** file a second
+   `spawn-skeptic` request. It prints `SKEPTIC: ROUND ALREADY OPEN` with
+   the channel's current `status` and exits `0`, so an honest wrap-up
+   retry is safe rather than destructive. Before this, a repeat wiped the
+   completed round's verdict (`total=0 done=0`), re-gated a worker whose
+   skeptic had already reported, and filed a duplicate request stamped
+   `deliberate: false` — which the orchestrator reads as an auto-spawnable
+   clean first pass.
+
+   A genuinely NEW round on an UNCHANGED report path (the deliverable
+   changed after a verdict landed, so it needs re-validating) is available
+   two ways, both explicit: `--skeptic-reopen` on the wrap-up itself, or
+   `ng skeptic reopen <window>` followed by a normal wrap-up. A DIFFERENT
+   report path, or a higher depth, is a new round with no flag needed —
+   the `#469`/`#511` archive-the-stale-sentinels behaviour is untouched on
+   that path.
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:
@@ -752,7 +774,7 @@ codes are the channel's own.
 **Usage**
 
 ```
-ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge|init|dir> ...
+ng skeptic <ask|await|answer|await-answer|reconcile|close|reset|poll|status|list|round|reopen|nudge|init|dir> ...
 ```
 
 **Subcommands**
@@ -766,6 +788,9 @@ ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge
 | `reconcile <task> …` | skeptic | ensure every open request was acked |
 | `close <task>` | skeptic | drop the `DONE` sentinel that ends the worker's await loop |
 | `poll \| status \| list <task>` | either | inspect channel state (open/ack/answered) |
+| `reset <task>` | wrap-up | open a new round: archive the prior `DONE` + `*.answered.md` into `.stale-archive-<ts>/` |
+| `round <task>` | either | print the current round stamp (`report-path` / `depth` / `opened`); rc `2` + `none` when there is none |
+| `reopen <task>` | operator | clear the round stamp (+ `reset`) so the next `require` on the SAME report opens a genuine new round |
 | `nudge <window> …` | orchestrator/skeptic | wake an idle worker |
 | `init \| dir <task>` | either | create / print the channel directory |
 

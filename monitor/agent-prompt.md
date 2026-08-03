@@ -589,6 +589,17 @@ Protocol (the channel is the file; the rename is the signal):
    producer recovers by filing a fresh request. For `spawn-skeptic` the
    action is seconds and a double-spawn is independently caught by the
    `skeptic-pending` marker, so ack-after-act is fine.
+5. **A `spawn-skeptic` you already acked will not silently reappear**
+   (`jacob-greene/nexus` issue 16). This caveat protects against a
+   *watcher re-emit* double-acting; it did NOT protect against a repeated
+   `ng wrap-up`, which used to re-file a duplicate for the same
+   deliverable stamped `deliberate: false` — indistinguishable from a
+   clean first pass, and therefore auto-spawnable per the rule above. The
+   `require` branch is now idempotent per (report path, depth): a repeat
+   files nothing. So a **second** `spawn-skeptic` request naming the same
+   `report-path` as one you already acked is now a genuine signal
+   (a reopen, an escalation, or a real second deliverable) — not noise.
+   Cross-check with `ng skeptic round <window>` before spawning.
 
 A request whose `.claimed.md` you renamed simply no longer matches the
 watcher's glob, so it stops re-emitting on the next poll — self-clearing,

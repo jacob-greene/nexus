@@ -810,14 +810,28 @@ per the mode.
 `wrap-up` carries the full skeptic flag set:
 `--skeptic-decision`, `--skeptic-rationale`, `--skeptic-waive`,
 `--skeptic-role`, `--skeptic-verdict`, `--skeptic-target`,
-`--skeptic-depth`, `--skeptic-findings`.
+`--skeptic-depth`, `--skeptic-findings`, `--skeptic-reopen`.
+
+**The gate is idempotent per deliverable** (`jacob-greene/nexus` issue
+16). Opening a `require` round stamps the report path + round depth into
+`monitor/.state/skeptic/<window>/.round`. A later `require` matching that
+stamp is a REPEAT: it does not archive the live round's `DONE`, does not
+re-arm the pending marker, and does not file a second `spawn-skeptic`
+request — it prints `SKEPTIC: ROUND ALREADY OPEN` with the channel's
+`status` and exits `0`. A repeat used to do all three, wiping a completed
+round's verdict and re-gating a worker whose skeptic had already
+reported. A DIFFERENT report path (or a higher depth) is still a genuine
+new round and still archives the stale sentinels. To force a new round on
+an UNCHANGED path, be explicit: `--skeptic-reopen`, or
+`ng skeptic reopen <window>` before re-running wrap-up.
 
 ### Comms channel
 
 `monitor/skeptic-channel.sh` is the worker↔skeptic comms channel plus
 nudge engine (also reachable as `ng skeptic <sub>`). Subcommands:
 `init`, `ask`, `await`, `answer`, `await-answer`, `reconcile`, `close`,
-`poll`, `status`, `list`, `nudge`, `dir`, `reqfile`. Each review gets a
+`reset`, `poll`, `status`, `list`, `round`, `reopen`, `nudge`, `dir`,
+`reqfile`. Each review gets a
 per-task channel directory at `monitor/.state/skeptic/<task-id>/`, where
 the task-id is the reviewed worker's window name. The not-yet-validated
 gate is a marker at `monitor/.state/skeptic/pending/<window>`.
