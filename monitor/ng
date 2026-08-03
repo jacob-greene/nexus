@@ -2058,6 +2058,14 @@ _wrapup_skeptic_step() {
                     printf '      report, and round 1 already uploaded it and posted its link\n'
                     printf '      comment. Do not re-run wrap-up; report in-window and retire.\n'
                     printf 'This refusal is deliberate and fails CLOSED (issue 16 / #469).\n'
+                    # The worker floor tells agents that on a non-zero
+                    # wrap-up they should "retry only the failed step(s)
+                    # named on stderr". A blind retry is exactly the wrong
+                    # move here and would just refuse again, so name the
+                    # step on stderr AND say not to repeat it as-is.
+                    printf 'ng wrap-up: REFUSED at the skeptic step — a verdict already landed for this exact report.\n' >&2
+                    printf 'ng wrap-up: do NOT retry this command as-is. Re-run with --skeptic-reopen only if the\n' >&2
+                    printf 'ng wrap-up: deliverable changed after the verdict; otherwise you are done — retire.\n' >&2
                     # rc 1: cmd_wrap_up returns here (`|| return $?`), so
                     # NOTHING downstream runs. That is the point — a
                     # post-verdict re-wrap must not look like a success.
