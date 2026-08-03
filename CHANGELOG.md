@@ -432,16 +432,36 @@ for the current release convention.
   report path (canonicalized) + the round depth + a timestamp into
   `monitor/.state/skeptic/<window>/.round`. A `require` whose report path
   **and** depth match that stamp is a REPEAT: no reset, no re-arm, no
-  re-file. It prints `SKEPTIC: ROUND ALREADY OPEN` with the channel's
-  current `status` and exits **0**, so an honest wrap-up retry is safe
-  instead of destructive; the rest of the hand-off (upload, comment,
-  rocket, log, retain) still runs. The check sits **upstream of the
-  reset**, so the reset itself is untouched — a different report path, or
-  a higher depth, is still a genuine new round that archives the stale
-  `DONE` + `*.answered.md` exactly as issue `#469` /
+  re-file, ever. The check sits **upstream of the reset**, so the reset
+  itself is untouched — a different report path, or a higher depth, is
+  still a genuine new round that archives the stale `DONE` +
+  `*.answered.md` exactly as issue `#469` /
   `<your-org>/nexus-code#511` require. A terminal decision (operator
   waive, spawn-deny, worker deny) drops the stamp, so a later legitimate
   `require` still opens a real round.
+
+  A repeat then resolves on the channel's `done=`, because the two pieces
+  of round state are released at different moments: **any** verdict clears
+  the pending marker, while a `close` deliberately keeps the stamp.
+
+  - **`done=0`** (no verdict yet) — prints `SKEPTIC: ROUND ALREADY OPEN`
+    and exits **0**; the rest of the hand-off (upload, comment, rocket,
+    log, retain) still runs. The marker is still on the channel, so the
+    gate is armed and nothing can fail open. This is the honest retry, and
+    making it safe instead of destructive is issue 16's actual complaint.
+  - **`done=1`** (a verdict landed) — prints
+    `SKEPTIC: VERDICT ALREADY LANDED` and **refuses with exit 1**, running
+    nothing downstream. The verdict already released the gate, so a silent
+    success would let the ordinary `verdict → remediate → append →
+    re-wrap` loop — the common exit shape once issue 20 is accounted for —
+    retire **unvalidated**: a fail-open on the exact path `#469` exists to
+    protect. Reports are append-only, so the path cannot say whether the
+    deliverable changed and an mtime/content key would reopen on every
+    append (the destructive behaviour this fix removes). Only the agent
+    knows, so the refusal names both cases and requires it to pick:
+    reopen if the deliverable changed, retire if it did not — round 1
+    already uploaded that exact report and posted its link comment. Fails
+    **closed**.
 
   New escape hatches for a genuine second round on an **unchanged**
   report path (there was previously no way to reopen a channel on
@@ -452,6 +472,15 @@ for the current release convention.
   stamp, which also dates a suspicious `DONE` against the round that owns
   it — an `opened:` newer than the `DONE` is the shape of the
   false-instant-`exit 10` hazard.
+
+  `--skeptic-reopen` forces a new *round* but not a new *request*: the
+  request-filing step's own guard globs `*.new.md` / `*.claimed.md`, so a
+  reopen files afresh only when round 1's request was already **acked**
+  (`*.done.md`). An unacked one suppresses the filing, and the status line
+  now names the request it deferred to instead of a bare
+  `skipped (already filed)`. Deliberate — two non-terminal
+  `spawn-skeptic` requests for one window+depth are two spawn
+  instructions, and the gate does not depend on the request.
 - **`ng` `STATE_DIR` resolver** now picks up `NEXUS_ROOT` /
   `nexus.root` config so worker wrap-ups from worktrees land
   in the primary clone's `.state/`, not the worktree's. (PR #11.)

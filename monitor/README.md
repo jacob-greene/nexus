@@ -815,15 +815,27 @@ per the mode.
 **The gate is idempotent per deliverable** (`jacob-greene/nexus` issue
 16). Opening a `require` round stamps the report path + round depth into
 `monitor/.state/skeptic/<window>/.round`. A later `require` matching that
-stamp is a REPEAT: it does not archive the live round's `DONE`, does not
-re-arm the pending marker, and does not file a second `spawn-skeptic`
-request — it prints `SKEPTIC: ROUND ALREADY OPEN` with the channel's
-`status` and exits `0`. A repeat used to do all three, wiping a completed
-round's verdict and re-gating a worker whose skeptic had already
-reported. A DIFFERENT report path (or a higher depth) is still a genuine
-new round and still archives the stale sentinels. To force a new round on
-an UNCHANGED path, be explicit: `--skeptic-reopen`, or
-`ng skeptic reopen <window>` before re-running wrap-up.
+stamp is a REPEAT: it never archives the live round's `DONE`, never
+re-arms the pending marker, and never files a second `spawn-skeptic`
+request. A repeat used to do all three, wiping a completed round's
+verdict and re-gating a worker whose skeptic had already reported.
+
+How a repeat *resolves* depends on the channel's `done=`, because a
+verdict releases the pending marker while a `close` keeps the stamp:
+
+- `done=0` (no verdict yet) — prints `SKEPTIC: ROUND ALREADY OPEN` and
+  exits `0`, completing the rest of the hand-off. The gate is still
+  armed, so nothing can fail open. This is the honest retry.
+- `done=1` (a verdict landed) — prints `SKEPTIC: VERDICT ALREADY LANDED`
+  and **refuses, exit 1**, running nothing downstream. The verdict already
+  released the gate, so a silent success would let
+  `verdict → remediate → append → re-wrap` retire unvalidated. The agent
+  must state whether the deliverable changed (reopen) or not (retire).
+
+A DIFFERENT report path (or a higher depth) is still a genuine new round
+and still archives the stale sentinels. To force a new round on an
+UNCHANGED path, be explicit: `--skeptic-reopen`, or `ng skeptic reopen
+<window>` before re-running wrap-up.
 
 ### Comms channel
 

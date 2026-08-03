@@ -1387,6 +1387,13 @@ assert_eq       "retry require wrap-up exits 0"            "$rc" "0"
 assert_contains "retry reports the round already open"     "$stdout" \
                 "spawn-skeptic request: skipped (a round is already open for this report)"
 assert_eq       "still exactly one request after retry"    "$(count_spawn_reqs)" "1"
+# NO verdict has landed on this channel, so the retire gate is still up:
+# this is the HONEST-RETRY branch of the guard, the only one that may
+# exit 0, and it must still complete the hand-off.
+assert_file     "retry leaves the retire gate ARMED"       "$STATE_DIR/skeptic/pending/sk-retry-worker"
+assert_contains "retry says no verdict has landed yet"     "$stdout" "NO verdict has landed yet"
+assert_contains "retry still uploads the report"           "$stdout" "uploaded: https://github.com/asset-org"
+assert_contains "retry still handles the link comment"     "$stdout" "posted comment"
 
 echo '=== issue 16: repeat wrap-up after the request was ACKED + the skeptic CLOSED ==='
 # The production failure (three duplicate requests in one round) slipped
@@ -1416,22 +1423,30 @@ NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close sk-acked-worker >/dev/null
 sk_before=$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)
 assert_eq       "verdict landed and the channel closed"    "$sk_before" \
                 "open=0 ack=0 answered=1 total=1 done=1"
-# THE REPEAT. Same issue, same unchanged report path.
+# THE REPEAT. Same issue, same unchanged report path — but a verdict has
+# now LANDED, which cleared the pending marker. The retire gate is DOWN,
+# so a silent rc 0 here would let `verdict -> remediate -> append ->
+# re-wrap` (the ordinary remediation loop, and the common exit shape once
+# `#20` is accounted for) proceed UNGATED. It must refuse and fail closed.
 run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
     --skeptic-decision require --skeptic-rationale "shared infra"
-assert_eq       "repeat wrap-up still exits 0"             "$rc" "0"
-assert_contains "repeat wrap-up says the round already exists" "$stdout" \
-                "ROUND ALREADY OPEN"
+assert_eq       "post-verdict repeat REFUSES (rc 1, fails closed)" "$rc" "1"
+assert_contains "post-verdict repeat says the verdict already landed" "$stdout" \
+                "VERDICT ALREADY LANDED"
+assert_contains "post-verdict repeat names --skeptic-reopen" "$stdout" "--skeptic-reopen"
+assert_contains "post-verdict repeat says an UNCHANGED deliverable is done" \
+                "$stdout" "You are DONE"
 assert_eq       "repeat files NO duplicate request (was 3 in production)" \
                 "$(count_spawn_reqs)" "0"
 assert_eq       "repeat leaves the round-1 verdict + DONE intact" \
                 "$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)" "$sk_before"
 assert_not_file "repeat does NOT re-arm the retire gate" \
                 "$STATE_DIR/skeptic/pending/sk-acked-worker"
-# The hand-off itself still runs — this is a no-op for the SKEPTIC gate
-# only, not a short-circuit of the whole verb.
-assert_contains "repeat still uploads the report"          "$stdout" "uploaded: https://github.com/asset-org"
-assert_contains "repeat still handles the link comment"    "$stdout" "posted comment"
+# ...and NOTHING downstream of the skeptic step runs either. The refusal
+# is the whole verb refusing, not just the gate opting out — round 1
+# already uploaded this exact report and posted its link comment.
+assert_not_contains "post-verdict repeat does NOT upload"  "$stdout" "uploaded: https://github.com/asset-org"
+assert_not_contains "post-verdict repeat does NOT comment" "$stdout" "posted comment"
 
 echo '=== issue 16: --skeptic-reopen forces a genuine new round ==='
 run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
@@ -1444,6 +1459,26 @@ assert_file     "reopen re-arms the retire gate"           "$STATE_DIR/skeptic/p
 assert_eq       "reopen archives the stale DONE (#469 path intact)" \
                 "$(NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" status sk-acked-worker)" \
                 "open=0 ack=0 answered=0 total=0 done=0"
+# F3 (issue 16 skeptic pass): a reopen files a fresh request only when
+# round 1's request was ACKED (*.done.md — terminal, so the filing guard's
+# *.new.md / *.claimed.md globs cannot see it), which is the case above.
+# With an UNACKED request still in the inbox the guard DOES suppress it,
+# and that is deliberate: two non-terminal requests for the same
+# window+depth are two spawn instructions. The gate does not depend on the
+# request, and the surviving one names the same window/depth/report-path.
+# The status line must say which request it deferred to.
+NEXUS_STATE_DIR="$STATE_DIR" "$CHAN_SH" close sk-acked-worker >/dev/null
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-acked-worker"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra" --skeptic-reopen
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "reopen with an UNACKED request exits 0"   "$rc" "0"
+assert_contains "reopen with an UNACKED request defers to it, by name" "$stdout" \
+                "is still pending for this window+depth"
+assert_eq       "reopen with an UNACKED request files no duplicate" \
+                "$(count_spawn_reqs)" "1"
+assert_file     "reopen with an UNACKED request still re-arms the gate" \
+                "$STATE_DIR/skeptic/pending/sk-acked-worker"
 
 echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
 reset_mocks
