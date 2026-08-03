@@ -283,6 +283,12 @@ fi
 # retiring it. When the fidelity helper is unavailable (probe lib missing),
 # fall back to the original unconditional no-go (conservative: refuse).
 #
+# "ORPHANED" means CHECKED-absent, never merely unchecked: if tmux cannot
+# be asked at all, skeptic_gate_state answers `unclassified` and this
+# check refuses (jacob-greene/nexus#31). Before that, an unanswered tmux
+# read as an empty window list, which read as `orphaned` — so this check
+# would kill a worker whose reviewer was alive.
+#
 # THIS CHECK IS THE DEFINITION OF "gated" (jacob-greene/nexus#16). Nothing
 # else holds a window back, so every other site asking "is this window
 # still gated?" — `ng wrap-up`'s re-wrap guard, the idle probe's

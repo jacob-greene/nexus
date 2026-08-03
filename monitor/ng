@@ -2165,10 +2165,12 @@ _wrapup_skeptic_step() {
                                 printf 'still holds — retire-preflight treats a stale marker as a no-go —\n'
                                 printf 'but re-enter the wait below rather than assuming you are parked.\n' ;;
                             unclassified)
-                                printf 'NOTE: whether a reviewer is LIVE could not be determined here (the\n'
-                                printf 'idle-probe helpers were not loadable). retire-preflight applies the\n'
-                                printf 'same fallback and refuses to retire this window, so you are still\n'
-                                printf 'gated — but do not read this as "a reviewer is watching".\n' ;;
+                                printf 'NOTE: whether a reviewer is LIVE could not be DETERMINED here — either\n'
+                                printf 'the idle-probe helpers would not load, or tmux did not answer (no\n'
+                                printf 'server, unreachable socket, or no tmux on PATH). That is not the same\n'
+                                printf 'as "no reviewer": nothing was established either way. retire-preflight\n'
+                                printf 'applies the same fallback and refuses to retire this window, so you\n'
+                                printf 'are still gated — but do not read this as "a reviewer is watching".\n' ;;
                         esac
                         if (( _verdict_landed == 1 )); then
                             printf 'NOTE: a prior verdict IS on this channel (DONE present), and the gate\n'

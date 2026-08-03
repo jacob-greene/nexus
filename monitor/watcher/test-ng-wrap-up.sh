@@ -183,6 +183,14 @@ printf '%s\\n' "\$*" >> "$TMUX_CAPTURE"
 # newline-separated window set; unset/empty means "no windows alive",
 # which is what makes a re-armed marker ORPHANED rather than live.
 if [[ "\${1:-}" == "list-windows" ]]; then
+    # jacob-greene/nexus#31: MOCK_TMUX_LIST_RC scripts a tmux that CANNOT
+    # answer — no server (rc 1), unreachable socket, no binary (rc 127).
+    # Real tmux prints NOTHING on stdout in that case, which is exactly
+    # why an empty window list must never be read as "no reviewer alive".
+    if [[ -n "\${MOCK_TMUX_LIST_RC:-}" && "\${MOCK_TMUX_LIST_RC}" != "0" ]]; then
+        printf 'no server running on /tmp/tmux-0/default\\n' >&2
+        exit "\$MOCK_TMUX_LIST_RC"
+    fi
     [[ -n "\${MOCK_LIVE_WINDOWS:-}" ]] && printf '%s\\n' "\$MOCK_LIVE_WINDOWS"
     exit 0
 fi
@@ -318,7 +326,7 @@ run_ng() {
 
 reset_mocks() {
     unset MOCK_UPLOAD_FAIL MOCK_UPLOAD_SHA MOCK_COMMENT_FAIL MOCK_ROCKET_FAIL
-    unset MOCK_COMMENT_MOVING
+    unset MOCK_COMMENT_MOVING MOCK_TMUX_LIST_RC
     rm -rf "$STATE_DIR"
     rm -f "$COMMENT_STORE" "$COMMENT_SEQ"
 }
@@ -1849,7 +1857,9 @@ q_rewrap q6-worker "$Q_REPORT"
 assert_eq       "q6 (degraded, marker present): exits 0"   "$rc" "0"
 assert_eq       "q6: gate-state is unclassified"           "$(q_last_gate_state)" "unclassified"
 assert_contains "q6: says liveness could not be determined" "$stdout" \
-                "could not be determined here"
+                "could not be DETERMINED here"
+assert_contains "q6: names the unloadable helpers as a cause" "$stdout" \
+                "would not load"
 assert_not_contains "q6: does NOT claim a live reviewer"   "$stdout" \
                     "A reviewer is LIVE on this window right now"
 rm -f "$STATE_DIR/skeptic/pending/q6-worker"
@@ -1859,6 +1869,91 @@ assert_eq       "q6: gate-state is absent"                 "$(q_last_gate_state)
 mv "$WORK/_skeptic_gate.sh.hidden" "$FAKE_NEXUS/monitor/_skeptic_gate.sh"
 mv "$WORK/_idle_probe.sh.hidden" "$FAKE_NEXUS/monitor/watcher/_idle_probe.sh"
 unset MOCK_TMUX MOCK_TMUX_WINDOW MOCK_LIVE_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
+
+# ---- DEGRADED MODE 2: tmux cannot ANSWER (jacob-greene/nexus#31) --------
+# q6 above degrades by hiding the libs. This degrades the way that
+# actually happens in production: the libs load fine, and tmux does not
+# answer. The gate lib then had no way to tell "asked, none alive" from
+# "could not ask" — both were rc 1 from _idle_skeptic_live_window — so
+# this state read `orphaned` and `ng wrap-up` REFUSED the hand-off with
+# "A reviewer was required and is not there" while a reviewer was, in
+# fact, there.
+#
+# The on-disk state below is IDENTICAL to q1's (marker present, no DONE,
+# a skeptic-spawn event naming a reviewer that MOCK_LIVE_WINDOWS lists as
+# alive). Only tmux's answerability varies, and it varies across three
+# arms — that is the whole point of these assertions.
+q7_setup() {   # <window> <report>  — build q1's exact state
+    q_open_round "$1" "$2"
+    q_log_spawn "$1" "$1-skeptic"
+    export MOCK_LIVE_WINDOWS="$1-skeptic"
+    # Past the spawn grace but INSIDE the await-hang window, so a "no
+    # reviewer" reading lands on `orphaned` rather than being masked by
+    # `grace` or short-circuited by `stale`. This is what makes the arms
+    # discriminating: `orphaned` is the state the misread produced.
+    export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+    q_age_gate "$1" 300
+}
+
+# arm A: tmux ANSWERS. The control — must stay exactly as q1.
+reset_mocks
+Q_REPORT="$FAKE_NEXUS/reports/q7_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q7_setup q7-worker "$Q_REPORT"
+q_rewrap q7-worker "$Q_REPORT"
+assert_eq       "q7A (tmux answers): exits 0"              "$rc" "0"
+assert_eq       "q7A: gate-state is live"                  "$(q_last_gate_state)" "live"
+assert_contains "q7A: claims a LIVE reviewer (it checked)"  "$stdout" \
+                "A reviewer is LIVE on this window right now"
+
+# arm B: tmux EXITS 1 (no server). Same disk, same live reviewer.
+reset_mocks
+Q_REPORT="$FAKE_NEXUS/reports/q8_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q7_setup q8-worker "$Q_REPORT"
+export MOCK_TMUX_LIST_RC=1
+q_rewrap q8-worker "$Q_REPORT"
+assert_eq       "q7B (tmux rc 1): STILL GATED, exits 0"    "$rc" "0"
+assert_eq       "q7B: gate-state is unclassified"          "$(q_last_gate_state)" "unclassified"
+assert_eq       "q7B: reason names the armed gate"         "$(q_last_reason)" \
+                "round-already-open-gate-armed"
+assert_not_contains "q7B: does NOT refuse on a live reviewer" "$stdout" \
+                    "A reviewer was required and is not there"
+assert_not_contains "q7B: does NOT claim a checked reviewer"  "$stdout" \
+                    "A reviewer is LIVE on this window right now"
+assert_contains "q7B: says liveness was not DETERMINED"    "$stdout" \
+                "could not be DETERMINED here"
+assert_contains "q7B: names tmux as a possible cause"      "$stdout" \
+                "tmux did not answer"
+
+# arm C: tmux ABSENT (rc 127). Same conclusion — the rc value is not
+# special-cased, only "non-zero" is.
+reset_mocks
+Q_REPORT="$FAKE_NEXUS/reports/q9_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q7_setup q9-worker "$Q_REPORT"
+export MOCK_TMUX_LIST_RC=127
+q_rewrap q9-worker "$Q_REPORT"
+assert_eq       "q7C (tmux rc 127): STILL GATED, exits 0"  "$rc" "0"
+assert_eq       "q7C: gate-state is unclassified"          "$(q_last_gate_state)" "unclassified"
+assert_not_contains "q7C: does NOT refuse on a live reviewer" "$stdout" \
+                    "A reviewer was required and is not there"
+
+# arm D: the CONTROL that keeps the fix NARROW. tmux answers and the
+# reviewer really is gone -> `orphaned` must still be reachable, or the
+# fix has merely disabled the class rather than restricting it to checked
+# absences.
+reset_mocks
+Q_REPORT="$FAKE_NEXUS/reports/q10_2026-08-03_000000_x.md"; cp "$REPORT" "$Q_REPORT"
+q_open_round q10-worker "$Q_REPORT"
+q_log_spawn q10-worker q10-worker-skeptic
+unset MOCK_LIVE_WINDOWS            # the reviewer really died
+export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+q_age_gate q10-worker 300
+q_rewrap q10-worker "$Q_REPORT"
+assert_eq       "q7D (control, checked-absent): REFUSES"   "$rc" "1"
+assert_eq       "q7D: gate-state is orphaned"              "$(q_last_gate_state)" "orphaned"
+assert_contains "q7D: says the reviewer is not there"      "$stdout" \
+                "A reviewer was required and is not there"
+unset MOCK_TMUX MOCK_TMUX_WINDOW MOCK_LIVE_WINDOWS MOCK_TMUX_LIST_RC
+unset MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
 reset_mocks

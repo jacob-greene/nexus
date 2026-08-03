@@ -63,12 +63,20 @@
 #                       retire-preflight lets the window retire on
 #                       this (with a loud note), so nothing
 #                       effectively gates it.
-#   unclassified  rc 0  marker present but the idle-probe helpers are
-#                       unavailable, so liveness could not be
-#                       determined.  DEGRADED MODE: retire-preflight's
-#                       own probe-missing fallback is likewise "refuse
-#                       the kill", so both sites treat it as gated and
-#                       stay in agreement.
+#   unclassified  rc 0  marker present and liveness could not be
+#                       DETERMINED — either the idle-probe helpers would
+#                       not load, or they loaded and tmux did not answer
+#                       (no server / unreachable socket / no tmux binary;
+#                       jacob-greene/nexus#31).  DEGRADED MODE:
+#                       retire-preflight's own probe-missing fallback is
+#                       likewise "refuse the kill", so both sites treat
+#                       it as gated and stay in agreement.
+#
+#                       NB the two failures are one class on purpose.
+#                       `orphaned` is the only marker-present state that
+#                       lets a kill through, so it must be reachable ONLY
+#                       from a CHECKED absence of a reviewer.  Anything
+#                       that merely failed to check lands here.
 #
 # Callers that only need the boolean use skeptic_gate_blocks_retire.
 # Callers that print a message to an agent MUST use the state name and
@@ -182,9 +190,20 @@ skeptic_gate_state() {
         printf 'stale'; return 0
     fi
 
-    if _idle_skeptic_live_window "$name" "$live"; then
-        printf 'live'; return 0
-    fi
+    # Tri-state (jacob-greene/nexus#31). rc 1 and rc 2 are DIFFERENT
+    # answers and must not collapse: rc 1 is "I asked tmux and no skeptic
+    # is alive", which walks on to grace/orphaned; rc 2 is "I could not
+    # ask", which establishes nothing about liveness and therefore cannot
+    # be allowed to reach `orphaned` — the single marker-present state
+    # that takes the gate DOWN. It belongs in `unclassified`, the class
+    # this ladder already has for "marker present, liveness unknowable
+    # here", which both consumers already fail CLOSED on and already
+    # describe honestly to the agent.
+    _idle_skeptic_live_window "$name" "$live"
+    case $? in
+        0) printf 'live';         return 0 ;;
+        2) printf 'unclassified'; return 0 ;;
+    esac
 
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")

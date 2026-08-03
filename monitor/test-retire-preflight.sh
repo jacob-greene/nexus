@@ -62,11 +62,13 @@ assert_not_contains() {
 
 # ---- harness -------------------------------------------------------------
 # Pin the checkout under test to THIS one. retire-preflight.sh resolves its
-# helper lib as "$NEXUS_ROOT/monitor/watcher/_idle_probe.sh else
-# $self_dir/watcher/...", so an ambient NEXUS_ROOT (every nexus agent has
-# one, pointing at the primary clone) silently made this suite exercise
-# ANOTHER tree's _idle_probe.sh — green, and establishing nothing about
-# the file in this working tree.
+# helper libs as "$NEXUS_ROOT/monitor/... else $self_dir/...", so an
+# ambient NEXUS_ROOT (every nexus agent has one, pointing at the primary
+# clone) silently made this suite exercise ANOTHER tree's _idle_probe.sh
+# and _skeptic_gate.sh — a green run that established nothing about the
+# files in this working tree. run-tests.sh's canonical drive already uses
+# `env -u NEXUS_ROOT`; this makes a direct `bash monitor/test-retire-preflight.sh`
+# honest too.
 unset NEXUS_ROOT
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -303,13 +305,50 @@ printf '{"ts":"%s","event":"skeptic-spawn","window":"orphan-skeptic-win-skeptic"
     "$(date -Iseconds -d "@$(( NOW - 290 ))")" >> "$STATE_DIR/action-log.jsonl"
 touch -d "@$(( NOW - 300 ))" "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
 export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+# tmux ANSWERS, and the reviewer is genuinely not among the live windows.
+# `orphaned` may be claimed only from a CHECKED absence (nexus#31).
+export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win'
+unset MOCK_TMUX_LIST_RC
 run_preflight OUT RC orphan-skeptic-win --pane-state idle
 assert_eq      "orphaned marker -> exit 0 (go)" "$RC"  "0"
 assert_contains "orphaned marker -> safe=1"     "$OUT" "safe=1"
 gate_state=$(STATE_DIR="$STATE_DIR" \
     bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
 assert_eq      "shared predicate calls it orphaned" "$gate_state" "orphaned"
-unset MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
+
+# ── 9d. SAME STATE, tmux CANNOT ANSWER → NO-GO (jacob-greene/nexus#31) ───
+# The arm that was wrong. Identical on-disk state to 9c, except the
+# reviewer IS alive and tmux fails to say so. Liveness used to be inferred
+# from an empty window list, so an unanswered tmux read as "no reviewer"
+# and this check — the one that KILLS — allowed the kill on a window whose
+# reviewer was alive. `orphaned` is now reachable only from a checked
+# absence; an unanswerable tmux is `unclassified`, which refuses.
+echo "## 9d. same state + tmux cannot answer → NO-GO (gate-state=unclassified)"
+# The reviewer really is alive — that is exactly why allowing the kill was
+# a defect and not merely a conservative call.
+export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win\norphan-skeptic-win-skeptic'
+for _rc in 1 127; do
+    export MOCK_TMUX_LIST_RC="$_rc"
+    run_preflight OUT RC orphan-skeptic-win --pane-state idle
+    assert_eq      "tmux rc $_rc -> exit 1 (refuse the kill)" "$RC"  "1"
+    assert_contains "tmux rc $_rc -> gate-state unclassified" "$OUT" \
+                    "skeptic-pending gate: unclassified"
+    assert_not_contains "tmux rc $_rc -> does NOT call it orphaned" "$OUT" \
+                    "skeptic-pending gate: orphaned"
+    gate_state=$(STATE_DIR="$STATE_DIR" MOCK_TMUX_LIST_RC="$_rc" \
+        bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+    assert_eq      "tmux rc $_rc -> shared predicate says unclassified" \
+                    "$gate_state" "unclassified"
+done
+unset MOCK_TMUX_LIST_RC _rc
+# And with tmux answering again on that SAME live reviewer: `live`, still
+# a refusal — the control proving the arms differ only in answerability.
+gate_state=$(STATE_DIR="$STATE_DIR" MOCK_TMUX_WINDOWS="$MOCK_TMUX_WINDOWS" \
+    bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+assert_eq      "tmux answering on the same live reviewer -> live" "$gate_state" "live"
+run_preflight OUT RC orphan-skeptic-win --pane-state idle
+assert_eq      "live reviewer -> exit 1 (refuse the kill)" "$RC" "1"
+unset MOCK_TMUX_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 # ── 10. machine-attributed submit within slack (clock-skew absorption) ────
 echo "## 10. submit within attribution slack of machine input → GO"
