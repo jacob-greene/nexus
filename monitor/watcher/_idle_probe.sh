@@ -2005,10 +2005,35 @@ _idle_skeptic_orphan_grace() {
 # live tmux window named `<$1>-skeptic` (the _skeptic_spawn_cmd template
 # name), covering an action-log gap. Parsed with awk/sed (no jq dependency
 # in the idle path). $2 = live tmux window names (newline-sep; queried if
-# empty). Returns 0 (live skeptic present) / 1 (none).
+# empty).
+#
+# TRI-STATE (jacob-greene/nexus#31):
+#     0  a live skeptic is reviewing $1        — established
+#     1  ASKED tmux, and none is alive         — established
+#     2  COULD NOT ASK tmux                    — nothing established
+#
+# rc 2 is not a detail. Until it existed this function answered rc 1 —
+# "no skeptic is alive" — whenever tmux merely failed to answer, because
+# liveness was inferred from an EMPTY window list and `2>/dev/null` threw
+# the exit status away. An empty list is not evidence: `tmux list-windows`
+# prints nothing and exits non-zero when there is no server (rc 1), when
+# the socket is unreachable, and when the binary is missing entirely
+# (rc 127). Every caller of this predicate feeds the retire gate, and
+# "no reviewer is alive" is the answer that takes the gate DOWN — so a
+# tmux misread let retire-preflight kill a worker whose reviewer was
+# alive, and made `ng wrap-up` refuse a hand-off on a live reviewer.
+# Callers must route rc 2 to a fail-CLOSED class and must not fold it
+# into rc 1.
 _idle_skeptic_live_window() {
     local name="$1" live="${2:-}"
-    [[ -n "$live" ]] || live=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+    if [[ -z "$live" ]]; then
+        # Ask tmux and KEEP its exit status. A caller-supplied $live is
+        # by construction an answer tmux already gave successfully, so
+        # only the self-query arm can fail to establish anything.
+        local _lrc=0
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null) || _lrc=$?
+        (( _lrc == 0 )) || return 2
+    fi
     local log="${STATE_DIR:-}/action-log.jsonl" sw=""
     if [[ -n "$log" && -r "$log" ]]; then
         sw=$(grep -F '"event":"skeptic-spawn"' "$log" 2>/dev/null \
