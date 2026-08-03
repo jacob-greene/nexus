@@ -131,8 +131,32 @@ to do about it:
 
 | stamp matches, and… | wrap-up does | why |
 |---|---|---|
-| marker **present** — gate ARMED | prints `SKEPTIC: RETIRE GATE STILL ARMED`, **exits 0**, and completes the rest of the hand-off (upload / comment / rocket / log) | a reviewer still holds this window, so nothing can fail open; this is the honest retry issue 16 exists to make safe |
-| marker **absent** — gate DOWN | prints `SKEPTIC: RETIRE GATE IS DOWN`, **refuses, exits 1**, and runs nothing downstream | the validation was released, so a silent success would let `verdict → remediate → append → re-wrap` retire UNVALIDATED — a fail-open on the exact path `#469` protects |
+| gate **ARMED** (`live` / `grace` / `stale`) | prints `SKEPTIC: RETIRE GATE STILL ARMED`, **exits 0**, and completes the rest of the hand-off (upload / comment / rocket / log) | retire-preflight would refuse to retire this window, so nothing can fail open; this is the honest retry issue 16 exists to make safe |
+| gate **DOWN** (`absent` / `orphaned`) | prints `SKEPTIC: RETIRE GATE IS DOWN`, **refuses, exits 1**, and runs nothing downstream | retire-preflight would let this window retire, so a silent success would let `verdict → remediate → append → re-wrap` retire UNVALIDATED — a fail-open on the exact path `#469` protects |
+
+**"Armed" is one predicate, defined once, in `monitor/_skeptic_gate.sh`.**
+`skeptic_gate_state <window>` prints the state and returns 0 when the gate
+BLOCKS retirement; `ng wrap-up`, `retire-preflight.sh` and the idle probe
+all call it rather than each testing the marker their own way. That is not
+tidiness — four hand-copied derivations had already drifted (`-e` here,
+`-f` there, liveness in only one of them), and every round of issue 16 so
+far re-introduced the same defect class by re-deriving it:
+
+| state | meaning | gated? |
+|---|---|---|
+| `live` | a `skeptic-spawn` event names this window and that skeptic window is alive in tmux | yes |
+| `grace` | marker fresh, no reviewer yet, still inside the spawn grace | yes |
+| `stale` | marker no longer refreshed (the await loop died) | yes |
+| `unclassified` | marker present, liveness undeterminable (probe helpers unloadable) | yes — and retire-preflight degrades the same way, so the two stay in step |
+| `orphaned` | marker fresh, NO live reviewer, past the grace | **no** — check 1b lets the kill through |
+| `absent` | no marker file | **no** |
+
+**A marker file is not a reviewer.** Nothing clears a marker when a skeptic
+is killed or retires without a verdict, so `marker present` alone cannot
+support "a reviewer is holding this window" — round 2 printed exactly that
+claim on an orphaned marker and shipped the remediation un-revalidated
+(SK1-b). Only `live` licenses that sentence, and each branch of the message
+now says only what its state establishes.
 
 **`done=` cannot answer the gating question — do not key on it.** Worth
 stating flatly, because the first fix for issue 16 keyed on it and thereby
@@ -156,12 +180,29 @@ down (closed-with-verdict vs verdict-without-close); it decides nothing.
 The refusal is deliberate and fails **closed**. Reports are append-only,
 so the report path cannot tell wrap-up whether the deliverable changed
 (and an mtime/content key would reopen on every append — the destructive
-behaviour issue 16 removes). Only you know. The refusal names both cases
-and you must say which you are in: **(a)** the deliverable changed after
-the validation → reopen explicitly (below); **(b)** it did not change →
-you are **done**, do not re-run wrap-up, report in-window and retire.
-Round 1 already uploaded that exact report and posted its link comment, so
-nothing is lost by not repeating it.
+behaviour issue 16 removes). Only you know. The refusal names three cases
+and you must say which you are in:
+
+- **(a)** the deliverable **changed** after the validation → reopen
+  explicitly (below);
+- **(b)** it did not change **and a verdict was returned on it** — you saw
+  it, on the channel or in your window → you are **done**: do not re-run
+  wrap-up, report in-window and retire. Round 1 already uploaded that exact
+  report and posted its link comment, so nothing is lost by not repeating
+  it;
+- **(c)** it did not change and **no verdict was ever returned to you** →
+  you have **not** been validated. Do not retire; reopen so a reviewer is
+  actually dispatched, and say in-window why.
+
+**Case (c) exists because the gate going down does not prove a validation
+happened.** `marker gone + no DONE` is reachable from a correct mid-chain
+verdict *and* from a round whose marker was released or lost with no
+skeptic ever spawned, and nothing on disk separates them. Round 2's message
+resolved that ambiguity in the fail-open direction — it asserted a verdict,
+declared the validation over, and told a never-validated `require` worker to
+retire, inside a refusal whose exit code was fail-closed (SK1-c). Wrap-up
+now states the ambiguity and routes on the one fact only the agent has:
+whether a verdict actually reached it.
 
 Two consequences of gate-keying, both deliberate:
 
@@ -176,10 +217,13 @@ Two consequences of gate-keying, both deliberate:
   closed on a partial close, not open". The **supported** release paths are
   untouched: waive, spawn-deny and worker-deny all clear the `.round`
   stamp, so this guard never fires for them.
-- **Marker present with a verdict already on the channel** now **exits 0**,
-  where it used to refuse. That state means a further pass was really
-  spawned — `spawn-worker.sh` re-arms the markers at an actual spawn — so a
-  live reviewer is holding the window and must SEE the hand-off.
+- **Marker present with a verdict already on the channel** exits 0 where
+  round 1 refused — **but only when the reviewer is checked live**. That
+  state normally means a further pass was really spawned
+  (`spawn-worker.sh` re-arms the markers at an actual spawn), and that
+  reviewer must SEE the hand-off. If the reviewer is gone the same state
+  reads `orphaned` and wrap-up refuses, because nothing would then hold
+  the window and the remediation would ship un-revalidated.
 
 If a wrap-up looks like it failed, **read the message and check
 `ng skeptic status <window>` before retrying** — the two headers above

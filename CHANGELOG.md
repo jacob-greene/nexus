@@ -502,13 +502,70 @@ for the current release convention.
     (`spawn-worker.sh` re-arms the markers at an actual spawn), so a live
     reviewer holds the window and must SEE the hand-off; refusing there
     blocked a correctly-gated worker from delivering its remediated
-    report.
+    report. (Round 3 narrows this: only when that reviewer is checked
+    live — see below.)
 
   Regression cover: the verdict-without-close path is now asserted
   end-to-end in `test-ng-wrap-up.sh` ("issue 16 SK1"), and the
   released-marker decision in `test-skeptic-channel.sh`. Every pre-existing
   F1 assertion drove its verdict through `close`, which is structurally
   why a fully green suite missed this.
+
+  **Round 3 — the retire-gate predicate is derived ONCE**
+  (`monitor/_skeptic_gate.sh`; skeptic findings SK1-b/SK1-c/SK1-d, and
+  round 1's SK5). Rounds 1 and 2 both shipped a branch asserting a gate
+  state it had never checked, and the reason was structural: FOUR sites
+  independently decided "is this window gated?" and had already drifted —
+  `ng` tested `-e marker`, `retire-preflight.sh` check 1b tested
+  `-f marker && ! orphaned`, `_idle_probe.sh` tested `-e` with its own
+  copy of the freshness ladder, and `spawn-worker.sh` sanitized the path
+  its own way for the WRITE. `skeptic_gate_state <window>` is now the
+  single derivation and all four delegate to it. It prints the state and
+  returns 0 when the gate BLOCKS retirement: `live` (a `skeptic-spawn`
+  event names the window and that skeptic window is alive in tmux),
+  `grace` (no reviewer yet, inside the spawn grace), `stale` (marker no
+  longer refreshed), `unclassified` (probe helpers unloadable — degraded,
+  and retire-preflight degrades identically so the two stay in step),
+  versus `orphaned` and `absent`, which do not.
+
+  What that fixes, beyond the duplication:
+
+  - **SK1-b — an orphaned marker no longer reads as a live reviewer.**
+    Nothing clears a marker when a skeptic is killed or retires without a
+    verdict, so `-e marker` could not tell a re-armed live gate from a
+    dead one. Round 2 exited 0 on both and printed *"a live reviewer holds
+    this window right now"* on both; the remediation then shipped with no
+    reviewer, no replacement request, and (via check 1b's own orphan
+    branch) retirement permitted. `orphaned` now refuses, which also
+    closes the same hole in the `DONE`-absent row, where it predates
+    round 2. Only the `live` state licenses a live-reviewer claim, and
+    each branch of the message now says only what its state establishes.
+  - **SK1-c — the refusal no longer tells a never-validated worker to
+    retire.** `marker gone + no DONE` is equally consistent with a correct
+    mid-chain verdict and with a round nothing ever validated, and nothing
+    on disk separates them. Round 2's message resolved that in the
+    fail-open direction — asserting a verdict, declaring *"the validation
+    is over"*, and offering *"You are DONE … report in-window and
+    retire"* — inside a refusal whose exit code was fail-closed. It now
+    states the ambiguity and routes on the one fact only the agent has:
+    **(a)** the deliverable changed → reopen; **(b)** unchanged **and** a
+    verdict was returned to you → retire; **(c)** unchanged and no verdict
+    ever reached you → reopen, because nothing has validated it. The
+    stderr summary carries the same three-way split.
+  - **SK1-d — the permissive quadrant is asserted.** All four
+    marker/`DONE` quadrants are now driven end-to-end × live vs orphaned
+    reviewer, plus the spawn-grace boundary, the degraded (no-gate-lib)
+    mode, and the three `skeptic-decision` action-log reason strings —
+    none of which had a single assertion before. Reviewer liveness is
+    driven only through the tmux window set and the action log, i.e.
+    writers that never touch the marker file the guard keys on.
+
+  Two nits from the same review: the guard's `-e` becomes `-f` (subsumed
+  by the shared predicate, which tests what check 1b tests), and the
+  comment justifying the marker-before-stamp write order is corrected —
+  it holds for a **crash** between the two writes, but not for a
+  **swallowed write failure**, where execution continues and the stamp is
+  written anyway.
 
   New escape hatches for a genuine second round on an **unchanged**
   report path (there was previously no way to reopen a channel on

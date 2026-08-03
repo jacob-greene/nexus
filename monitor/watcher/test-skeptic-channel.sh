@@ -851,7 +851,9 @@ assert_contains "post-verdict re-wrap -> says the retire gate is down" "$out" "R
 # every close-driven assertion in this suite structurally cannot reach — is
 # covered in test-ng-wrap-up.sh's "issue 16 SK1" block.
 assert_contains "post-verdict re-wrap -> diagnoses the close" "$out" \
-    "a skeptic CLOSED this channel with a verdict"
+    "A VERDICT DID LAND"
+assert_contains "post-verdict re-wrap -> cites the DONE sentinel as its evidence" "$out" \
+    "The DONE sentinel is present"
 assert_contains "post-verdict re-wrap -> names the wrap-up escape hatch" "$out" "--skeptic-reopen"
 assert_contains "post-verdict re-wrap -> names the channel reopen verb" "$out" "skeptic-channel.sh reopen"
 assert_contains "post-verdict re-wrap -> says an UNCHANGED deliverable is done" "$out" "You are DONE"
@@ -911,7 +913,31 @@ assert_eq "released marker, no verdict -> REFUSES (rc 1, fails CLOSED)" "$rcrel0
 assert_contains "released marker -> reports the GATE, not a verdict" "$outrel" "RETIRE GATE IS DOWN"
 # The message must not invent a close that never happened.
 assert_not_contains "released marker -> does NOT claim a skeptic closed the channel" \
-    "$outrel" "a skeptic CLOSED this channel with a verdict"
+    "$outrel" "A VERDICT DID LAND"
+# SK1-c. The round-2 assertion stopped here — it checked that the message
+# does not claim a CLOSE, while the message went on to claim a VERDICT
+# ("a verdict was returned WITHOUT closing the channel"), declare the
+# validation over, and offer "You are DONE ... retire". Every one of those
+# is false in THIS state: no skeptic was ever spawned and no verdict of any
+# kind was ever returned. A test that asserts only what a message must not
+# claim, in one of the several states that reach it, lets the false claim
+# ship green. Assert the positive content too, in the state that reaches it.
+assert_not_contains "released marker -> does NOT assert a verdict was returned" \
+    "$outrel" "a verdict was returned WITHOUT closing the channel"
+assert_not_contains "released marker -> does NOT declare the validation complete" \
+    "$outrel" "the validation is over"
+assert_contains "released marker -> states that validation is NOT established" \
+    "$outrel" "WHETHER YOU WERE VALIDATED AT ALL IS NOT ESTABLISHED"
+assert_contains "released marker -> names the never-validated history explicitly" \
+    "$outrel" "NO validation ever happened"
+# ...and therefore must NOT hand a never-validated require-worker a retire
+# instruction. Case (b) survives, conditioned on a verdict the AGENT saw
+# (the one fact this command cannot check), and case (c) is the branch for
+# the worker that saw none.
+assert_contains "released marker -> flags that nothing corroborates retiring" \
+    "$outrel" "NOTHING HERE CORROBORATES (b)"
+assert_contains "released marker -> offers the never-validated recovery (case c)" \
+    "$outrel" "NO verdict was ever returned to"
 assert_contains "released marker -> refusal is recoverable (names the reopen verb)" \
     "$outrel" "--skeptic-reopen"
 # ...and the reopen genuinely restores the gate, so the refusal is a

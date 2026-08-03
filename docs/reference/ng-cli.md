@@ -652,18 +652,29 @@ ng wrap-up <issue> <report-path>
    check 1b keys on exactly it), so it is tested directly rather than
    inferred:
 
-   - **marker present** — the gate is still armed. Prints
+   - **gate armed** (`live` / `grace` / `stale` / `unclassified`) — prints
      `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`; the rest of the
      hand-off (upload, comment, rocket, log) runs normally. An honest
      wrap-up retry is safe rather than destructive.
-   - **marker absent** — the gate is down. Prints
+   - **gate down** (`absent` / `orphaned`) — prints
      `SKEPTIC: RETIRE GATE IS DOWN` and **refuses with exit 1**, running
      nothing downstream. Silently succeeding here would let the ordinary
      `verdict → remediate → append → re-wrap` loop retire unvalidated.
      Reports are append-only, so only the agent knows whether the
-     deliverable changed: reopen (below) if it did, retire if it did not
-     — round 1 already uploaded that exact report and posted its link
-     comment.
+     deliverable changed — and only the agent knows whether a verdict ever
+     reached it. The refusal names three cases: reopen if the deliverable
+     changed; retire if it did not change **and** a verdict was returned
+     (round 1 already uploaded that exact report and posted its link
+     comment); reopen if it did not change and **no** verdict was ever
+     returned, because then nothing has validated it.
+
+   "Armed" is `skeptic_gate_state` from `monitor/_skeptic_gate.sh` — the
+   single derivation `retire-preflight.sh` check 1b, `spawn-worker.sh` and
+   the idle probe also use. It is not a bare file test: a marker whose
+   reviewer was killed or retired without a verdict is `orphaned`, check 1b
+   lets that window retire, and so wrap-up refuses there too. Round 2
+   tested `-e marker` and printed "a live reviewer holds this window right
+   now" on exactly that state (skeptic finding SK1-b).
 
    This is **not** keyed on the channel's `done=`. The first fix for
    issue 16 was, and shipped the fail-open it meant to close (skeptic
@@ -672,10 +683,16 @@ ng wrap-up <issue> <report-path>
    marker for the reviewed window and the chain-root worker — without
    writing `DONE`, and the chain protocol *requires* mid-chain skeptics
    to report exactly that way. `DONE` is still read, but only to tell the
-   agent HOW the gate went down. Note the two deliberate consequences: a
-   marker released with no verdict at all now refuses (recoverably —
-   both reopen verbs re-arm the gate), and a marker re-armed by a real
-   further-pass spawn now exits `0` even with a verdict on the channel.
+   agent HOW the gate went down — and it can only ever narrow that down,
+   never settle it: `no marker + no DONE` is equally consistent with a
+   correct mid-chain verdict and with a round that was never validated at
+   all, so the message says so instead of picking one.
+
+   Note the deliberate consequences: a marker released with no verdict at
+   all refuses (recoverably — both reopen verbs re-arm the gate); a marker
+   re-armed by a real further-pass spawn exits `0` even with a verdict on
+   the channel, **provided that reviewer is still alive**; and the same
+   state with a dead reviewer (`orphaned`) refuses.
 
    A genuinely NEW round on an UNCHANGED report path (the deliverable
    changed after a verdict landed, so it needs re-validating) is available

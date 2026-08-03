@@ -2043,35 +2043,31 @@ _idle_skeptic_request_epoch() {
     date -d "$ts" +%s 2>/dev/null || printf '0'
 }
 
+# == The classification itself lives in monitor/_skeptic_gate.sh ==
+#
+# The four primitives above (hang, grace, liveness, request epoch) stay
+# here — the watcher owns them. What they COMBINE into ("is this window
+# gated?") is shared, because ng, retire-preflight and this file all ask
+# that question and three hand-copied derivations had already drifted
+# apart (jacob-greene/nexus#16 SK1/SK1-b/SK5). The two predicates below
+# are now thin names over skeptic_gate_state; the marker path and the
+# freshness/liveness/grace ladder are defined exactly once.
+#
+# shellcheck source=../_skeptic_gate.sh
+if ! declare -F skeptic_gate_state >/dev/null 2>&1; then
+    _idle_probe_gate_lib="$(dirname "${BASH_SOURCE[0]}")/../_skeptic_gate.sh"
+    # shellcheck disable=SC1090
+    [[ -r "$_idle_probe_gate_lib" ]] && source "$_idle_probe_gate_lib"
+    unset _idle_probe_gate_lib
+fi
+
 # Returns 0 (parked → exempt) / 1 (not parked → classify normally).
 # Exempt only when the marker is FRESH *and* (a live skeptic is reviewing
-# OR we are still within the orphan grace since the skeptic was required).
+# OR we are still within the orphan grace since the skeptic was required)
+# — i.e. gate state `live` or `grace`.
 # $3 = live tmux window names (optional; queried if empty).
 _idle_skeptic_parked() {
-    local name="$1" now="$2" live="${3:-}"
-    local safe="${name//[^a-zA-Z0-9_-]/_}"
-    local state_dir="${STATE_DIR:-}"
-    [[ -n "$state_dir" ]] || return 1
-    local marker="${state_dir}/skeptic/pending/${safe}"
-    [[ -e "$marker" ]] || return 1
-    local hang mtime age
-    hang=$(_idle_skeptic_hang_seconds)
-    mtime=$(date +%s -r "$marker" 2>/dev/null || echo 0)
-    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
-    age=$(( now - mtime ))
-    (( age <= hang )) || return 1
-    # Fresh marker — but require a live skeptic, else stay exempt only
-    # within the grace window (orchestrator may still be spawning).
-    if _idle_skeptic_live_window "$name" "$live"; then
-        return 0
-    fi
-    local req grace
-    req=$(_idle_skeptic_request_epoch "$name")
-    [[ "$req" =~ ^[0-9]+$ ]] || req=0
-    (( req == 0 )) && req="$mtime"
-    grace=$(_idle_skeptic_orphan_grace)
-    (( now - req <= grace )) && return 0
-    return 1
+    skeptic_gate_parked "$@"
 }
 
 # Returns 0 (ORPHANED: fresh marker, NO live skeptic, past grace) / 1 (not
@@ -2081,25 +2077,7 @@ _idle_skeptic_parked() {
 # orphaned here — it lapses via the hang check and resurfaces through
 # normal idle classification (the genuine-hang path). $3 = live windows.
 _idle_skeptic_orphaned() {
-    local name="$1" now="$2" live="${3:-}"
-    local safe="${name//[^a-zA-Z0-9_-]/_}"
-    local state_dir="${STATE_DIR:-}"
-    [[ -n "$state_dir" ]] || return 1
-    local marker="${state_dir}/skeptic/pending/${safe}"
-    [[ -e "$marker" ]] || return 1
-    local hang mtime age
-    hang=$(_idle_skeptic_hang_seconds)
-    mtime=$(date +%s -r "$marker" 2>/dev/null || echo 0)
-    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
-    age=$(( now - mtime ))
-    (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live" && return 1
-    local req grace
-    req=$(_idle_skeptic_request_epoch "$name")
-    [[ "$req" =~ ^[0-9]+$ ]] || req=0
-    (( req == 0 )) && req="$mtime"
-    grace=$(_idle_skeptic_orphan_grace)
-    (( now - req > grace ))
+    skeptic_gate_orphaned "$@"
 }
 
 # ---- background-compute orphan-grace (your-org/nexus-code#445) -----------
