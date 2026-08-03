@@ -2087,9 +2087,16 @@ _idle_skeptic_parked() {
     (( age <= hang )) || return 1
     # Fresh marker — but require a live skeptic, else stay exempt only
     # within the grace window (orchestrator may still be spawning).
-    if _idle_skeptic_live_window "$name" "$live"; then
-        return 0
-    fi
+    # rc 2 = tmux could not be asked, so liveness is UNKNOWN: do not
+    # confer the exemption on an unchecked claim, and do not fall through
+    # to the grace ladder either (that would age into `orphaned`, the one
+    # marker-present state that lets a kill through). Not parked, not
+    # orphaned — the window classifies normally, which at worst emits.
+    _idle_skeptic_live_window "$name" "$live"
+    case $? in
+        0) return 0 ;;
+        2) return 1 ;;
+    esac
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
@@ -2105,6 +2112,13 @@ _idle_skeptic_parked() {
 # the skeptic or clearing the marker. A STALE marker (await died) is NOT
 # orphaned here — it lapses via the hang check and resurfaces through
 # normal idle classification (the genuine-hang path). $3 = live windows.
+#
+# Neither is a marker whose liveness could not be CHECKED (tmux
+# unreachable, jacob-greene/nexus#31). `orphaned` is the one
+# marker-present state retire-preflight.sh check 1b does not block on, so
+# claiming it on an unanswered tmux would retire a worker whose reviewer
+# is alive. Fail closed: rc 2 -> not orphaned -> the marker keeps
+# blocking the kill, exactly as an unloadable probe lib already does.
 _idle_skeptic_orphaned() {
     local name="$1" now="$2" live="${3:-}"
     local safe="${name//[^a-zA-Z0-9_-]/_}"
@@ -2118,7 +2132,11 @@ _idle_skeptic_orphaned() {
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
     (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live" && return 1
+    _idle_skeptic_live_window "$name" "$live"
+    case $? in
+        0) return 1 ;;   # a reviewer IS live -> not orphaned
+        2) return 1 ;;   # could not ask -> unknown, so not ASSERTED orphaned
+    esac
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
