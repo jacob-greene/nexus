@@ -598,7 +598,7 @@ ng wrap-up <issue> <report-path>
           [--allow-stub]
           [--retain <reason> | --no-retain]
           [--skeptic-decision require|deny] [--skeptic-rationale <text>]
-          [--skeptic-waive <reason>]
+          [--skeptic-waive <reason>] [--skeptic-reopen]
           [--skeptic-role] [--skeptic-verdict credible|check|suspect|refuted]
           [--skeptic-target <window>] [--skeptic-depth <n>]
           [--skeptic-findings <n>] [--skeptic-orig <window>]
@@ -633,6 +633,84 @@ ng wrap-up <issue> <report-path>
    bounded recursion (`--skeptic-depth` / `--skeptic-findings`, chain
    root via `--skeptic-orig`). `--skeptic-waive` is the operator override
    that releases a required skeptic.
+
+   The gate is **idempotent per deliverable** (`jacob-greene/nexus` issue
+   16). When a `require` round opens, wrap-up stamps the report path and
+   the round depth into `monitor/.state/skeptic/<window>/.round`. A later
+   `require` whose report path + depth match that stamp is a REPEAT, not a
+   new round: it never archives the live round's `DONE`, never re-arms the
+   pending marker, and never files a second `spawn-skeptic` request.
+   Before this, a repeat did all three — wiping the completed round's
+   verdict (`total=0 done=0`), re-gating a worker whose skeptic had
+   already reported, and filing a duplicate request stamped
+   `deliberate: false`, which the orchestrator reads as an auto-spawnable
+   clean first pass.
+
+   A repeat resolves on the **pending marker**: the stamp says whether
+   this is the same deliverable, the marker says whether the window is
+   still gated. The marker IS the retire gate (`retire-preflight.sh`
+   check 1b keys on exactly it), so it is tested directly rather than
+   inferred:
+
+   - **gate armed** (`live` / `grace` / `stale` / `unclassified`) — prints
+     `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`; the rest of the
+     hand-off (upload, comment, rocket, log) runs normally. An honest
+     wrap-up retry is safe rather than destructive.
+   - **gate down** (`absent` / `orphaned`) — prints
+     `SKEPTIC: RETIRE GATE IS DOWN` and **refuses with exit 1**, running
+     nothing downstream. Silently succeeding here would let the ordinary
+     `verdict → remediate → append → re-wrap` loop retire unvalidated.
+     Reports are append-only, so only the agent knows whether the
+     deliverable changed — and only the agent knows whether a verdict ever
+     reached it. The refusal names three cases: reopen if the deliverable
+     changed; retire if it did not change **and** a verdict was returned
+     (round 1 already uploaded that exact report and posted its link
+     comment); reopen if it did not change and **no** verdict was ever
+     returned, because then nothing has validated it.
+
+   "Armed" is `skeptic_gate_state` from `monitor/_skeptic_gate.sh` — the
+   single derivation `retire-preflight.sh` check 1b, `spawn-worker.sh` and
+   the idle probe also use. It is not a bare file test: a marker whose
+   reviewer was killed or retired without a verdict is `orphaned`, check 1b
+   lets that window retire, and so wrap-up refuses there too. Round 2
+   tested `-e marker` and printed "a live reviewer holds this window right
+   now" on exactly that state (skeptic finding SK1-b).
+
+   This is **not** keyed on the channel's `done=`. The first fix for
+   issue 16 was, and shipped the fail-open it meant to close (skeptic
+   finding SK1): `close` is the only writer of `DONE`, but
+   `ng wrap-up --skeptic-role` also releases the gate — clearing the
+   marker for the reviewed window and the chain-root worker — without
+   writing `DONE`, and the chain protocol *requires* mid-chain skeptics
+   to report exactly that way. `DONE` is still read, but only to tell the
+   agent HOW the gate went down — and it can only ever narrow that down,
+   never settle it: `no marker + no DONE` is equally consistent with a
+   correct mid-chain verdict and with a round that was never validated at
+   all, so the message says so instead of picking one.
+
+   Note the deliberate consequences: a marker released with no verdict at
+   all refuses (recoverably — both reopen verbs re-arm the gate); a marker
+   re-armed by a real further-pass spawn exits `0` even with a verdict on
+   the channel, **provided that reviewer is still alive**; and the same
+   state with a dead reviewer (`orphaned`) refuses.
+
+   A genuinely NEW round on an UNCHANGED report path (the deliverable
+   changed after a verdict landed, so it needs re-validating) is available
+   two ways, both explicit: `--skeptic-reopen` on the wrap-up itself, or
+   `ng skeptic reopen <window>` followed by a normal wrap-up. A DIFFERENT
+   report path, or a higher depth, is a new round with no flag needed —
+   the `#469`/`#511` archive-the-stale-sentinels behaviour is untouched on
+   that path.
+
+   One nuance on `--skeptic-reopen`: it forces a new *round*, but it does
+   not force a new *request*. The request-filing step's own idempotency
+   guard globs `*.new.md` / `*.claimed.md`, so a reopen files afresh only
+   when round 1's request was already **acked** (`*.done.md`, terminal). An
+   unacked request suppresses the new filing and the status line names it.
+   That is deliberate: two non-terminal `spawn-skeptic` requests for the
+   same window+depth are two spawn instructions. The gate does not depend
+   on the request, and the surviving one carries the same window, depth and
+   report path (append-only, so the path is the current deliverable).
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:
@@ -752,7 +830,7 @@ codes are the channel's own.
 **Usage**
 
 ```
-ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge|init|dir> ...
+ng skeptic <ask|await|answer|await-answer|reconcile|close|reset|poll|status|list|round|reopen|nudge|init|dir> ...
 ```
 
 **Subcommands**
@@ -766,6 +844,9 @@ ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge
 | `reconcile <task> …` | skeptic | ensure every open request was acked |
 | `close <task>` | skeptic | drop the `DONE` sentinel that ends the worker's await loop |
 | `poll \| status \| list <task>` | either | inspect channel state (open/ack/answered) |
+| `reset <task>` | wrap-up | open a new round: archive the prior `DONE` + `*.answered.md` into `.stale-archive-<ts>/` |
+| `round <task>` | either | print the current round stamp (`report-path` / `depth` / `opened`); rc `2` + `none` when there is none |
+| `reopen <task>` | operator | clear the round stamp (+ `reset`) so the next `require` on the SAME report opens a genuine new round |
 | `nudge <window> …` | orchestrator/skeptic | wake an idle worker |
 | `init \| dir <task>` | either | create / print the channel directory |
 

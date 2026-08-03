@@ -50,6 +50,15 @@ assert_contains() {
         FAIL=$(( FAIL + 1 ))
     fi
 }
+assert_not_contains() {
+    local label="$1" hay="$2" needle="$3"
+    if grep -qF -- "$needle" <<<"$hay"; then
+        printf '  FAIL: %s — unexpectedly found %q\n' "$label" "$needle" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    fi
+}
 
 # ---- harness -------------------------------------------------------------
 WORK=$(mktemp -d)
@@ -219,13 +228,50 @@ echo 1 > "$STATE_DIR/skeptic/pending/pending-skeptic-win"
 run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "exit 1 (no-go)"     "$RC"  "1"
 assert_contains "safe=0"            "$OUT" "safe=0"
-assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending marker live"
+assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending gate:"
+# The reason names the GATE STATE the shared predicate returned, and does
+# not claim a live skeptic it never checked (jacob-greene/nexus#16 SK1-b).
+# A freshly-required marker with no spawned reviewer is `grace`: the
+# orchestrator still has its dispatch window, and the gate holds.
+assert_contains "reason names the gate state, not a claimed reviewer" "$OUT" \
+                "skeptic-pending gate: grace"
+assert_not_contains "reason does NOT assert the marker is live" "$OUT" \
+                    "skeptic-pending marker live"
 # Once the skeptic returns a verdict (marker cleared) the same window is
 # retire-eligible again.
 rm -f "$STATE_DIR/skeptic/pending/pending-skeptic-win"
 run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "marker cleared -> exit 0 (go)" "$RC"  "0"
 assert_contains "marker cleared -> safe=1"     "$OUT" "safe=1"
+
+# ── 9c. ORPHANED marker → GO, and ng's re-wrap guard must AGREE ──────────
+# jacob-greene/nexus#16 SK1-b: a marker whose reviewer died is not live
+# validation. This check lets the kill through with a note — so `ng
+# wrap-up`'s re-wrap guard must NOT be telling the same worker that a
+# reviewer is holding its window. Both now call skeptic_gate_state, and
+# this asserts the shared predicate answers `orphaned` on exactly the state
+# this check allows through, which is what keeps them in step.
+echo "## 9c. orphaned skeptic-pending marker → GO (and gate-state=orphaned)"
+reset_state
+mkdir -p "$STATE_DIR/skeptic/pending"
+echo 1 > "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
+# The skeptic was REQUIRED 300 s ago and dispatched; no such tmux window is
+# alive now, and the grace is 60 s. Ages are driven off explicit stamps
+# rather than a zero grace so the state cannot depend on how long the test
+# itself took.
+printf '{"ts":"%s","event":"skeptic-request","target-window":"orphan-skeptic-win","depth":"1"}\n' \
+    "$(date -Iseconds -d "@$(( NOW - 300 ))")" >> "$STATE_DIR/action-log.jsonl"
+printf '{"ts":"%s","event":"skeptic-spawn","window":"orphan-skeptic-win-skeptic","target-window":"orphan-skeptic-win","orig-window":"orphan-skeptic-win"}\n' \
+    "$(date -Iseconds -d "@$(( NOW - 290 ))")" >> "$STATE_DIR/action-log.jsonl"
+touch -d "@$(( NOW - 300 ))" "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
+export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+run_preflight OUT RC orphan-skeptic-win --pane-state idle
+assert_eq      "orphaned marker -> exit 0 (go)" "$RC"  "0"
+assert_contains "orphaned marker -> safe=1"     "$OUT" "safe=1"
+gate_state=$(STATE_DIR="$STATE_DIR" \
+    bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+assert_eq      "shared predicate calls it orphaned" "$gate_state" "orphaned"
+unset MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 # ── 10. machine-attributed submit within slack (clock-skew absorption) ────
 echo "## 10. submit within attribution slack of machine input → GO"
