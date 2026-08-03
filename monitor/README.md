@@ -820,17 +820,28 @@ re-arms the pending marker, and never files a second `spawn-skeptic`
 request. A repeat used to do all three, wiping a completed round's
 verdict and re-gating a worker whose skeptic had already reported.
 
-How a repeat *resolves* depends on the channel's `done=`, because a
-verdict releases the pending marker while a `close` keeps the stamp:
+How a repeat *resolves* depends on the **pending marker** — the stamp says
+whether this is the same deliverable, the marker says whether the window is
+still gated. The marker IS the retire gate (`retire-preflight.sh` check 1b
+keys on exactly it), so it is tested directly:
 
-- `done=0` (no verdict yet) — prints `SKEPTIC: ROUND ALREADY OPEN` and
-  exits `0`, completing the rest of the hand-off. The gate is still
-  armed, so nothing can fail open. This is the honest retry.
-- `done=1` (a verdict landed) — prints `SKEPTIC: VERDICT ALREADY LANDED`
-  and **refuses, exit 1**, running nothing downstream. The verdict already
-  released the gate, so a silent success would let
+- marker **present** (gate armed) — prints
+  `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`, completing the rest of
+  the hand-off. A reviewer still holds the window, so nothing can fail
+  open. This is the honest retry.
+- marker **absent** (gate down) — prints `SKEPTIC: RETIRE GATE IS DOWN`
+  and **refuses, exit 1**, running nothing downstream. The validation was
+  released, so a silent success would let
   `verdict → remediate → append → re-wrap` retire unvalidated. The agent
   must state whether the deliverable changed (reopen) or not (retire).
+
+Do **not** key this on the channel's `done=`. The first fix for issue 16
+did, and shipped the fail-open it meant to close (skeptic finding SK1):
+`close` is the only writer of `DONE`, but `ng wrap-up --skeptic-role`
+also releases the gate — clearing the marker for the reviewed window and
+the chain-root worker — without ever writing `DONE`, and the chain
+protocol *requires* mid-chain skeptics to report that way. `DONE` is now
+read only to tell the agent HOW the gate went down.
 
 A DIFFERENT report path (or a higher depth) is still a genuine new round
 and still archives the stale sentinels. To force a new round on an

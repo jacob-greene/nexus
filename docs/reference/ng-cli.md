@@ -646,21 +646,36 @@ ng wrap-up <issue> <report-path>
    `deliberate: false`, which the orchestrator reads as an auto-spawnable
    clean first pass.
 
-   A repeat resolves on the channel's `done=`, because a verdict releases
-   the pending marker while a `close` keeps the stamp:
+   A repeat resolves on the **pending marker**: the stamp says whether
+   this is the same deliverable, the marker says whether the window is
+   still gated. The marker IS the retire gate (`retire-preflight.sh`
+   check 1b keys on exactly it), so it is tested directly rather than
+   inferred:
 
-   - **`done=0`** — no verdict yet, so the gate is still armed. Prints
-     `SKEPTIC: ROUND ALREADY OPEN` and exits `0`; the rest of the hand-off
-     (upload, comment, rocket, log) runs normally. An honest wrap-up retry
-     is safe rather than destructive.
-   - **`done=1`** — a verdict landed and released the gate. Prints
-     `SKEPTIC: VERDICT ALREADY LANDED` and **refuses with exit 1**,
-     running nothing downstream. Silently succeeding here would let the
-     ordinary `verdict → remediate → append → re-wrap` loop retire
-     unvalidated. Reports are append-only, so only the agent knows whether
-     the deliverable changed: reopen (below) if it did, retire if it did
-     not — round 1 already uploaded that exact report and posted its link
+   - **marker present** — the gate is still armed. Prints
+     `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`; the rest of the
+     hand-off (upload, comment, rocket, log) runs normally. An honest
+     wrap-up retry is safe rather than destructive.
+   - **marker absent** — the gate is down. Prints
+     `SKEPTIC: RETIRE GATE IS DOWN` and **refuses with exit 1**, running
+     nothing downstream. Silently succeeding here would let the ordinary
+     `verdict → remediate → append → re-wrap` loop retire unvalidated.
+     Reports are append-only, so only the agent knows whether the
+     deliverable changed: reopen (below) if it did, retire if it did not
+     — round 1 already uploaded that exact report and posted its link
      comment.
+
+   This is **not** keyed on the channel's `done=`. The first fix for
+   issue 16 was, and shipped the fail-open it meant to close (skeptic
+   finding SK1): `close` is the only writer of `DONE`, but
+   `ng wrap-up --skeptic-role` also releases the gate — clearing the
+   marker for the reviewed window and the chain-root worker — without
+   writing `DONE`, and the chain protocol *requires* mid-chain skeptics
+   to report exactly that way. `DONE` is still read, but only to tell the
+   agent HOW the gate went down. Note the two deliberate consequences: a
+   marker released with no verdict at all now refuses (recoverably —
+   both reopen verbs re-arm the gate), and a marker re-armed by a real
+   further-pass spawn now exits `0` even with a verdict on the channel.
 
    A genuinely NEW round on an UNCHANGED report path (the deliverable
    changed after a verdict landed, so it needs re-validating) is available

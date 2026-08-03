@@ -440,21 +440,22 @@ for the current release convention.
   waive, spawn-deny, worker deny) drops the stamp, so a later legitimate
   `require` still opens a real round.
 
-  A repeat then resolves on the channel's `done=`, because the two pieces
-  of round state are released at different moments: **any** verdict clears
-  the pending marker, while a `close` deliberately keeps the stamp.
+  A repeat then resolves on the **pending marker**, which IS the retire
+  gate (`retire-preflight.sh` check 1b keys on exactly that path). The
+  stamp answers "same deliverable?"; the marker answers "still gated?".
 
-  - **`done=0`** (no verdict yet) — prints `SKEPTIC: ROUND ALREADY OPEN`
-    and exits **0**; the rest of the hand-off (upload, comment, rocket,
-    log, retain) still runs. The marker is still on the channel, so the
-    gate is armed and nothing can fail open. This is the honest retry, and
-    making it safe instead of destructive is issue 16's actual complaint.
-  - **`done=1`** (a verdict landed) — prints
-    `SKEPTIC: VERDICT ALREADY LANDED` and **refuses with exit 1**, running
-    nothing downstream. The verdict already released the gate, so a silent
-    success would let the ordinary `verdict → remediate → append →
-    re-wrap` loop — the common exit shape once issue 20 is accounted for —
-    retire **unvalidated**: a fail-open on the exact path `#469` exists to
+  - **marker present** (gate armed) — prints
+    `SKEPTIC: RETIRE GATE STILL ARMED` and exits **0**; the rest of the
+    hand-off (upload, comment, rocket, log, retain) still runs. A reviewer
+    still holds the window, so nothing can fail open. This is the honest
+    retry, and making it safe instead of destructive is issue 16's actual
+    complaint.
+  - **marker absent** (gate down) — prints
+    `SKEPTIC: RETIRE GATE IS DOWN` and **refuses with exit 1**, running
+    nothing downstream. The validation was released, so a silent success
+    would let the ordinary `verdict → remediate → append → re-wrap` loop —
+    the common exit shape once issue 20 is accounted for — retire
+    **unvalidated**: a fail-open on the exact path `#469` exists to
     protect. Reports are append-only, so the path cannot say whether the
     deliverable changed and an mtime/content key would reopen on every
     append (the destructive behaviour this fix removes). Only the agent
@@ -462,6 +463,52 @@ for the current release convention.
     reopen if the deliverable changed, retire if it did not — round 1
     already uploaded that exact report and posted its link comment. Fails
     **closed**.
+
+  **Round 2 — the split above is keyed on the MARKER, not on `DONE`**
+  (skeptic finding SK1 on this same issue). The first cut of this fix
+  tested the `DONE` sentinel as a proxy for "has the gate been released",
+  and that proxy is wrong in a state the chain protocol *prescribes*.
+  `skeptic-channel.sh close` writes `DONE` and clears the marker, but
+  `ng wrap-up --skeptic-role` clears the marker — for the reviewed window
+  AND the chain-root worker — and never writes `DONE`; since only the
+  FINAL skeptic in a chain may close the original worker's channel, every
+  mid-chain verdict lands exactly that way. In that state the `DONE`-keyed
+  guard computed `done=0`, took the honest-retry branch, returned **0**,
+  ran the whole hand-off and printed *"the retire gate is STILL ARMED"*
+  while the gate was **down** — the original fail-open, reached through a
+  second door, and a regression against pre-fix (whose unconditional reset
+  at least re-armed the gate, destructively but safely). Keying on the
+  marker closes it; `DONE` is still read, but only to explain to the agent
+  HOW the gate went down. Both branch headers now name the **gate** rather
+  than the verdict, since neither "verdict already landed" nor "still
+  armed" is true in every state its branch now covers.
+
+  Two deliberate behaviour changes come with it, neither previously
+  documented:
+
+  - A marker **released with no verdict at all** (an operator hand-`rm`s
+    it, or a round-opening write is lost) now **refuses** where it used to
+    exit 0. A `require` worker whose gate has vanished is anomalous
+    whatever the cause, and the refusal is recoverable — it names both
+    reopen verbs, either of which re-arms the gate — whereas exiting 0
+    retires it unvalidated. This is the same call `skeptic-channel.sh`
+    already makes about this exact file pair when it orders `close` to
+    publish `DONE` *before* unlinking the marker ("fail closed on a
+    partial close, not open"). The supported release paths — waive,
+    spawn-deny, worker-deny — all clear the `.round` stamp, so the guard
+    never fires for them.
+  - A marker **present alongside a verdict** now **exits 0** where it used
+    to refuse. That state means a further pass was really spawned
+    (`spawn-worker.sh` re-arms the markers at an actual spawn), so a live
+    reviewer holds the window and must SEE the hand-off; refusing there
+    blocked a correctly-gated worker from delivering its remediated
+    report.
+
+  Regression cover: the verdict-without-close path is now asserted
+  end-to-end in `test-ng-wrap-up.sh` ("issue 16 SK1"), and the
+  released-marker decision in `test-skeptic-channel.sh`. Every pre-existing
+  F1 assertion drove its verdict through `close`, which is structurally
+  why a fully green suite missed this.
 
   New escape hatches for a genuine second round on an **unchanged**
   report path (there was previously no way to reopen a channel on

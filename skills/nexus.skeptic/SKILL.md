@@ -114,30 +114,72 @@ and filing a duplicate request stamped `deliberate: false`, which the
 "Draining the request inbox" contract declares auto-spawnable. It fired
 three times in one production round.
 
-**Two markers, two questions — and a repeat resolves on the SECOND one.**
-The pending marker and the `.round` stamp encode overlapping but
-non-identical notions of "this round is finished", and they are released
-at different moments: **any** verdict clears the pending marker (so the
-retire gate goes down the instant a skeptic reports), while a round
-`close` deliberately KEEPS its stamp (that completed round is exactly
-what a repeat must not reopen). So the stamp alone cannot say whether the
-window is still gated — the channel's `done=` does. A repeat therefore
-splits:
+**Two files, two questions — and they are different questions.** The
+`.round` stamp and the pending marker are often conflated because both
+sound like "is this round finished". They are not interchangeable:
+
+| file | answers | released by |
+|---|---|---|
+| `<channel>/.round` stamp | *is this the SAME deliverable?* (report path + depth) | never by a verdict — a `close` deliberately KEEPS it; only waive/deny clear it |
+| `skeptic/pending/<window>` marker | *is this window still GATED?* | **any** verdict, and `close` |
+
+The marker is not merely *a signal about* gating, it **is** the gate:
+`retire-preflight.sh` check 1b keys on exactly that path, and nothing else
+holds a window back. So a repeat wrap-up resolves in two steps — the stamp
+decides whether this is a repeat at all, then the **marker** decides what
+to do about it:
 
 | stamp matches, and… | wrap-up does | why |
 |---|---|---|
-| `done=0` — no verdict yet | prints `SKEPTIC: ROUND ALREADY OPEN`, **exits 0**, and completes the rest of the hand-off (upload / comment / rocket / log) | the marker is still on the channel, so the gate is still ARMED; this is the honest retry issue 16 exists to make safe |
-| `done=1` — a verdict landed | prints `SKEPTIC: VERDICT ALREADY LANDED`, **refuses, exits 1**, and runs nothing downstream | the verdict already released the gate, so a silent success would let `verdict → remediate → append → re-wrap` retire UNVALIDATED — a fail-open on the exact path `#469` protects |
+| marker **present** — gate ARMED | prints `SKEPTIC: RETIRE GATE STILL ARMED`, **exits 0**, and completes the rest of the hand-off (upload / comment / rocket / log) | a reviewer still holds this window, so nothing can fail open; this is the honest retry issue 16 exists to make safe |
+| marker **absent** — gate DOWN | prints `SKEPTIC: RETIRE GATE IS DOWN`, **refuses, exits 1**, and runs nothing downstream | the validation was released, so a silent success would let `verdict → remediate → append → re-wrap` retire UNVALIDATED — a fail-open on the exact path `#469` protects |
 
-The `done=1` refusal is deliberate and fails **closed**. Reports are
-append-only, so the report path cannot tell wrap-up whether the
-deliverable changed (and an mtime/content key would reopen on every
-append — the destructive behaviour issue 16 removes). Only you know. The
-refusal names both cases and you must say which you are in: **(a)** the
-deliverable changed after the verdict → reopen explicitly (below);
-**(b)** it did not change → you are **done**, do not re-run wrap-up,
-report in-window and retire. Round 1 already uploaded that exact report
-and posted its link comment, so nothing is lost by not repeating it.
+**`done=` cannot answer the gating question — do not key on it.** Worth
+stating flatly, because the first fix for issue 16 keyed on it and thereby
+shipped the very fail-open it was meant to close (skeptic finding SK1).
+`close` is the **only** writer of `DONE`, but it is **not** the only thing
+that releases the gate:
+
+    skeptic-channel.sh close ....... writes DONE, clears the marker
+    ng wrap-up --skeptic-role ...... clears the marker, writes NO DONE
+                                     (reviewed window AND chain-root worker)
+
+So `marker absent + DONE absent` is a real state — and "Channel-close
+discipline across the chain" (below) **prescribes** it: only the final
+skeptic closes the original worker's channel, so every mid-chain skeptic
+returns a verdict that releases the gate without writing `DONE`. Keyed on
+`done=`, wrap-up read that as "no verdict yet", exited 0, ran the whole
+hand-off, and told the worker *"the retire gate is STILL ARMED"* while it
+was down. `DONE` is still read, but only to explain **how** the gate went
+down (closed-with-verdict vs verdict-without-close); it decides nothing.
+
+The refusal is deliberate and fails **closed**. Reports are append-only,
+so the report path cannot tell wrap-up whether the deliverable changed
+(and an mtime/content key would reopen on every append — the destructive
+behaviour issue 16 removes). Only you know. The refusal names both cases
+and you must say which you are in: **(a)** the deliverable changed after
+the validation → reopen explicitly (below); **(b)** it did not change →
+you are **done**, do not re-run wrap-up, report in-window and retire.
+Round 1 already uploaded that exact report and posted its link comment, so
+nothing is lost by not repeating it.
+
+Two consequences of gate-keying, both deliberate:
+
+- **Marker released with no verdict at all** — an operator hand-`rm`s it,
+  or a round-opening write is lost — now **refuses**, where the
+  `done=`-keyed version returned 0. A `require` worker whose gate has
+  vanished is in an anomalous state whatever the cause; refusing is
+  recoverable (the message names both reopen verbs, and either re-arms the
+  gate), while a silent success retires it unvalidated. It is the same call
+  `skeptic-channel.sh` already makes about this exact file pair when it
+  orders `close` to publish `DONE` *before* unlinking the marker — "fail
+  closed on a partial close, not open". The **supported** release paths are
+  untouched: waive, spawn-deny and worker-deny all clear the `.round`
+  stamp, so this guard never fires for them.
+- **Marker present with a verdict already on the channel** now **exits 0**,
+  where it used to refuse. That state means a further pass was really
+  spawned — `spawn-worker.sh` re-arms the markers at an actual spawn — so a
+  live reviewer is holding the window and must SEE the hand-off.
 
 If a wrap-up looks like it failed, **read the message and check
 `ng skeptic status <window>` before retrying** — the two headers above
@@ -591,6 +633,15 @@ channel open** — closing it early would retire the worker before the next
 skeptic can question it. At chain termination (`credible`/no-new-issues,
 or escalation at the cap), `ng wrap-up` clears the original worker's
 marker for you; each skeptic still `close`s every channel **it** opened.
+
+Note what this does **not** buy the original worker. Leaving its channel
+open leaves its `DONE` unwritten, but your verdict has already cleared its
+**pending marker** — so its retire gate is down from the moment you
+report, whether or not you closed. That is why the guard above keys on the
+marker: if that worker re-wraps its remediated report before the next
+skeptic is actually spawned, wrap-up must refuse rather than wave it
+through on a `DONE` that was never going to exist. `spawn-worker.sh`
+re-arms the marker when the next pass is really spawned.
 
 ---
 
