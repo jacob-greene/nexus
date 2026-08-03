@@ -1447,6 +1447,13 @@ assert_not_file "repeat does NOT re-arm the retire gate" \
 # already uploaded this exact report and posted its link comment.
 assert_not_contains "post-verdict repeat does NOT upload"  "$stdout" "uploaded: https://github.com/asset-org"
 assert_not_contains "post-verdict repeat does NOT comment" "$stdout" "posted comment"
+# The worker floor sends agents to STDERR on a non-zero wrap-up ("retry
+# only the failed step(s) named on stderr"). A blind retry here just
+# refuses again, so stderr must name the step AND say not to repeat it.
+assert_contains "post-verdict repeat names the failed step on stderr" "$stderr" \
+                "REFUSED at the skeptic step"
+assert_contains "post-verdict repeat tells stderr readers not to blind-retry" "$stderr" \
+                "do NOT retry this command as-is"
 
 echo '=== issue 16: --skeptic-reopen forces a genuine new round ==='
 run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
