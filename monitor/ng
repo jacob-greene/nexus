@@ -2090,6 +2090,25 @@ _wrapup_skeptic_step() {
                         else
                             _gate_down=1
                         fi
+                        # A failure OF the derivation is not an answer FROM
+                        # it. `$(…)` contains an abort inside the ladder
+                        # (unbound var under `set -u`, half-written probe
+                        # lib), leaving an EMPTY state and a non-zero rc —
+                        # which lands here as `_gate_down=1`, "not gated".
+                        # retire-preflight's matching site would read the
+                        # same failure as "not gated" too and ALLOW the
+                        # kill, so the two would not merely be wrong, they
+                        # would be wrong in opposite directions on the same
+                        # worker: this refuses the hand-off while the
+                        # preflight retires the window under it. Both sites
+                        # normalise an unrecognised state to
+                        # `unclassified` so the degraded case stays a case
+                        # they AGREE on — the property _skeptic_gate.sh
+                        # says matters more than either local default.
+                        case "$_gate_state" in
+                            live|grace|stale|unclassified|orphaned|absent) : ;;
+                            *) _gate_state=unclassified; _gate_down=0 ;;
+                        esac
                     else
                         # Degraded (gate lib unreachable): marker-presence
                         # only, `-f` to match check 1b's own test. Named

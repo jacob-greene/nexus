@@ -302,6 +302,36 @@ _sk_now=$(date +%s)
 if declare -F skeptic_gate_state >/dev/null 2>&1; then
     sk_state=$(skeptic_gate_state "$win_name" "$_sk_now"); sk_blocks=$?
     sk_pending=$(skeptic_gate_marker "$win_name" 2>/dev/null || true)
+    # A failure OF the derivation is not an answer FROM it.
+    #
+    # skeptic_gate_state's own invariant — "`orphaned` must be reachable
+    # ONLY from a CHECKED absence; anything that merely failed to check
+    # lands in `unclassified`" (_skeptic_gate.sh) — is enforced INSIDE that
+    # function. It cannot police the function aborting. And this call site
+    # is a command substitution, which CONTAINS an abort: an unbound
+    # variable under `set -u`, a half-written probe lib, a helper that dies
+    # mid-ladder — any of them leave this shell alive with an empty state
+    # and a non-zero rc. Empty is neither `0` nor `orphaned`, so it would
+    # fall past both branches below, past checks 2/3, and out as `safe=1`:
+    # the kill authorized on a window whose reviewer may be alive.
+    #
+    # This is not hypothetical structure-worship, it is a REGRESSION guard.
+    # Before the shared gate, check 1b called `_idle_skeptic_orphaned` in
+    # THIS shell, so an abort inside it took the preflight down with it —
+    # rc 1, no verdict line, no kill. Moving the derivation behind `$(…)`
+    # traded that fail-CLOSED default for a fail-OPEN one. Measured both
+    # ways, reviewer genuinely alive, abort injected into the ladder:
+    # pre-gate `rc=1` and no `safe=` line; post-gate `rc=0 safe=1 … safe to
+    # retire`. Test arm 9e in test-retire-preflight.sh, with a negative
+    # control that strips this guard and asserts `safe=1` comes back.
+    #
+    # So: only a state this file recognises may be acted on. Anything else
+    # — empty, truncated, a name a future gate version adds — is exactly
+    # the "failed to check" class, and takes the class that blocks.
+    case "$sk_state" in
+        live|grace|stale|unclassified|orphaned|absent) : ;;
+        *) sk_state=unclassified; sk_blocks=0 ;;
+    esac
 else
     # Degraded (gate lib unreachable): the original unconditional no-go.
     sk_pending="$STATE_DIR/skeptic/pending/${win_name//[^a-zA-Z0-9_-]/_}"

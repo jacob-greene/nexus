@@ -348,6 +348,66 @@ gate_state=$(STATE_DIR="$STATE_DIR" MOCK_TMUX_WINDOWS="$MOCK_TMUX_WINDOWS" \
 assert_eq      "tmux answering on the same live reviewer -> live" "$gate_state" "live"
 run_preflight OUT RC orphan-skeptic-win --pane-state idle
 assert_eq      "live reviewer -> exit 1 (refuse the kill)" "$RC" "1"
+
+# ── 9e. the DERIVATION ITSELF fails → NO-GO (not `safe=1`) ───────────────
+# Distinct from 9d. There the gate answered and the answer was "I could not
+# determine liveness". Here skeptic_gate_state does not answer at all — it
+# aborts mid-ladder — and the call site is a command substitution, which
+# CONTAINS the abort: the preflight survives with an empty state and a
+# non-zero rc.
+#
+# That is a fail-OPEN default unless something stops it, and it is a
+# regression this refactor could reintroduce silently. Before the shared
+# gate, check 1b called `_idle_skeptic_orphaned` in the preflight's OWN
+# shell, so an abort took the preflight down with it: rc 1, no verdict
+# line, no kill. Moving the derivation behind `$(…)` removes that.
+#
+# Driven against DECOY TREES, with the same on-disk state as 9d and the
+# reviewer GENUINELY ALIVE, so a regression shows up as the real-world
+# outcome — the kill authorized on a live reviewer — and not as a
+# string mismatch.
+echo "## 9e. skeptic_gate_state ABORTS → NO-GO (fail closed, not safe=1)"
+mk_abort_tree() {   # <dir> <strip-guard:0|1>
+    local d="$1" strip="$2"
+    mkdir -p "$d/watcher"
+    cp "$_test_dir/retire-preflight.sh" "$_test_dir/_skeptic_gate.sh" "$d/"
+    cp "$_test_dir/watcher/_idle_probe.sh" "$d/watcher/"
+    # Abort mid-ladder the way a half-written helper does: an unbound
+    # variable under the `set -u` the preflight already runs with.
+    sed -i 's|^skeptic_gate_state() {|skeptic_gate_state() { : "$__NEXUS_ABORT_TRIPWIRE";|' \
+        "$d/_skeptic_gate.sh"
+    (( strip )) && sed -i '/^        live|grace|stale|unclassified|orphaned|absent) : ;;$/,+1d' \
+        "$d/retire-preflight.sh"
+    bash -n "$d/retire-preflight.sh" && bash -n "$d/_skeptic_gate.sh"
+}
+run_decoy() {       # <dir> → echoes "<rc>|<stdout>"
+    local d="$1" o r
+    o=$(bash "$d/retire-preflight.sh" orphan-skeptic-win --pane-state idle \
+            --state-dir "$STATE_DIR" --now "$NOW" 2>/dev/null); r=$?
+    printf '%s|%s' "$r" "$o"
+}
+
+ABORT_TREE="$WORK/abort-guarded"
+mk_abort_tree "$ABORT_TREE" 0 >/dev/null 2>&1 && _mk=parses || _mk=broken
+assert_eq "9e fixture: decoy tree with an aborting gate still parses" "$_mk" "parses"
+res=$(run_decoy "$ABORT_TREE")
+assert_eq       "aborting derivation -> exit 1 (refuse the kill)" "${res%%|*}" "1"
+assert_contains "aborting derivation -> safe=0"                   "${res#*|}" "safe=0"
+assert_not_contains "aborting derivation -> NEVER authorizes the kill" "${res#*|}" "safe=1"
+
+# NEGATIVE CONTROL — the same abort against a tree with the guard REMOVED
+# must go the other way. Without this the two assertions above would pass
+# on any tree where the abort simply never happened, and would certify
+# nothing about the guard.
+ABORT_UNGUARDED="$WORK/abort-unguarded"
+mk_abort_tree "$ABORT_UNGUARDED" 1 >/dev/null 2>&1
+diff -q "$ABORT_TREE/retire-preflight.sh" "$ABORT_UNGUARDED/retire-preflight.sh" >/dev/null \
+    && _strip=INERT || _strip=stripped
+assert_eq "9e fixture: stripping the guard really changed the decoy" "$_strip" "stripped"
+res=$(run_decoy "$ABORT_UNGUARDED")
+assert_contains "NEGATIVE: same abort WITHOUT the guard -> safe=1 (arm discriminates)" \
+                "${res#*|}" "safe=1"
+
 unset MOCK_TMUX_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 # ── 10. machine-attributed submit within slack (clock-skew absorption) ────
