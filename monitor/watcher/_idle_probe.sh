@@ -2005,10 +2005,35 @@ _idle_skeptic_orphan_grace() {
 # live tmux window named `<$1>-skeptic` (the _skeptic_spawn_cmd template
 # name), covering an action-log gap. Parsed with awk/sed (no jq dependency
 # in the idle path). $2 = live tmux window names (newline-sep; queried if
-# empty). Returns 0 (live skeptic present) / 1 (none).
+# empty).
+#
+# TRI-STATE (jacob-greene/nexus#31):
+#     0  a live skeptic is reviewing $1        — established
+#     1  ASKED tmux, and none is alive         — established
+#     2  COULD NOT ASK tmux                    — nothing established
+#
+# rc 2 is not a detail. Until it existed this function answered rc 1 —
+# "no skeptic is alive" — whenever tmux merely failed to answer, because
+# liveness was inferred from an EMPTY window list and `2>/dev/null` threw
+# the exit status away. An empty list is not evidence: `tmux list-windows`
+# prints nothing and exits non-zero when there is no server (rc 1), when
+# the socket is unreachable, and when the binary is missing entirely
+# (rc 127). Every caller of this predicate feeds the retire gate, and
+# "no reviewer is alive" is the answer that takes the gate DOWN — so a
+# tmux misread let retire-preflight kill a worker whose reviewer was
+# alive, and made `ng wrap-up` refuse a hand-off on a live reviewer.
+# Callers must route rc 2 to a fail-CLOSED class and must not fold it
+# into rc 1.
 _idle_skeptic_live_window() {
     local name="$1" live="${2:-}"
-    [[ -n "$live" ]] || live=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+    if [[ -z "$live" ]]; then
+        # Ask tmux and KEEP its exit status. A caller-supplied $live is
+        # by construction an answer tmux already gave successfully, so
+        # only the self-query arm can fail to establish anything.
+        local _lrc=0
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null) || _lrc=$?
+        (( _lrc == 0 )) || return 2
+    fi
     local log="${STATE_DIR:-}/action-log.jsonl" sw=""
     if [[ -n "$log" && -r "$log" ]]; then
         sw=$(grep -F '"event":"skeptic-spawn"' "$log" 2>/dev/null \
@@ -2062,9 +2087,23 @@ _idle_skeptic_parked() {
     (( age <= hang )) || return 1
     # Fresh marker — but require a live skeptic, else stay exempt only
     # within the grace window (orchestrator may still be spawning).
-    if _idle_skeptic_live_window "$name" "$live"; then
-        return 0
-    fi
+    # rc 2 = tmux could not be asked, so liveness is UNKNOWN: do not
+    # confer the exemption on an unchecked claim, and do not fall through
+    # to the grace ladder either (that would age into `orphaned`, the one
+    # marker-present state that lets a kill through). Not parked, not
+    # orphaned — the window classifies normally, which at worst emits.
+    #
+    # `|| _lrc=$?`, not a bare call: rc 1 here is the ORDINARY answer
+    # ("asked tmux, no skeptic alive"), and a bare simple command that
+    # returns non-zero kills a `set -e` caller outright. The `if` this
+    # replaced was errexit-exempt by construction; an `||` list is the
+    # exemption that survives capturing the status.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" || _lrc=$?
+    case $_lrc in
+        0) return 0 ;;
+        2) return 1 ;;
+    esac
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
@@ -2080,6 +2119,13 @@ _idle_skeptic_parked() {
 # the skeptic or clearing the marker. A STALE marker (await died) is NOT
 # orphaned here — it lapses via the hang check and resurfaces through
 # normal idle classification (the genuine-hang path). $3 = live windows.
+#
+# Neither is a marker whose liveness could not be CHECKED (tmux
+# unreachable, jacob-greene/nexus#31). `orphaned` is the one
+# marker-present state retire-preflight.sh check 1b does not block on, so
+# claiming it on an unanswered tmux would retire a worker whose reviewer
+# is alive. Fail closed: rc 2 -> not orphaned -> the marker keeps
+# blocking the kill, exactly as an unloadable probe lib already does.
 _idle_skeptic_orphaned() {
     local name="$1" now="$2" live="${3:-}"
     local safe="${name//[^a-zA-Z0-9_-]/_}"
@@ -2093,7 +2139,14 @@ _idle_skeptic_orphaned() {
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
     (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live" && return 1
+    # `|| _lrc=$?` — see _idle_skeptic_parked. rc 1 is the ordinary answer
+    # here too, and the `&& return 1` this replaced was errexit-exempt.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" || _lrc=$?
+    case $_lrc in
+        0) return 1 ;;   # a reviewer IS live -> not orphaned
+        2) return 1 ;;   # could not ask -> unknown, so not ASSERTED orphaned
+    esac
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
