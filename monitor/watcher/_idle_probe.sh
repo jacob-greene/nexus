@@ -2092,8 +2092,15 @@ _idle_skeptic_parked() {
     # to the grace ladder either (that would age into `orphaned`, the one
     # marker-present state that lets a kill through). Not parked, not
     # orphaned — the window classifies normally, which at worst emits.
-    _idle_skeptic_live_window "$name" "$live"
-    case $? in
+    #
+    # `|| _lrc=$?`, not a bare call: rc 1 here is the ORDINARY answer
+    # ("asked tmux, no skeptic alive"), and a bare simple command that
+    # returns non-zero kills a `set -e` caller outright. The `if` this
+    # replaced was errexit-exempt by construction; an `||` list is the
+    # exemption that survives capturing the status.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" || _lrc=$?
+    case $_lrc in
         0) return 0 ;;
         2) return 1 ;;
     esac
@@ -2132,8 +2139,11 @@ _idle_skeptic_orphaned() {
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
     (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live"
-    case $? in
+    # `|| _lrc=$?` — see _idle_skeptic_parked. rc 1 is the ordinary answer
+    # here too, and the `&& return 1` this replaced was errexit-exempt.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" || _lrc=$?
+    case $_lrc in
         0) return 1 ;;   # a reviewer IS live -> not orphaned
         2) return 1 ;;   # could not ask -> unknown, so not ASSERTED orphaned
     esac
