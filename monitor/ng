@@ -290,10 +290,34 @@ DASH_REQUIRED_SECTIONS=(
 # operator it exists for, and it blows out the context of any agent that
 # reads it.
 #
-# Calibration: a healthy dashboard for this nexus is ~4.5 KB / 74 lines
-# (the hand-restored body, all six sections populated). The limits sit
-# ~2.5x above that, so ordinary variation never fires and genuine runaway
-# growth fires early — long before the surface is unusable.
+# Calibration: a healthy dashboard for this nexus is ~4.5-7 KB / 74-90
+# lines (the hand-restored body, all six sections populated). The limits
+# sit ~2x above that, so ordinary variation never fires and genuine
+# runaway growth fires early — long before the surface is unusable.
+#
+# DASH_MAX_ENTRY_BYTES is calibrated against BOTH observed distributions,
+# not just a healthy snapshot — an entry budget set from healthy content
+# alone will false-positive on the one section whose entries are supposed
+# to carry prose. Measured:
+#   legitimate entries, live dashboard   — max 907 (`## Awaiting operator`,
+#                                          a decision item with its context),
+#                                          then 609, 565, 536, 461 …
+#   runaway entries, the 213 KB body     — MIN 1710 (`## Recent landings`),
+#                                          then 1908, up to 9363 (`## In-flight`)
+# 1500 sits in that gap: legitimate content clears it with ~65% headroom,
+# and the smallest genuinely-runaway entry still trips it with ~12% margin.
+#
+# The two failure directions are not symmetric, which is why the value sits
+# nearer the runaway floor than the midpoint:
+#   too tight — 800 was the first cut, and it red-lights a NORMAL
+#     operator-decision item. A budget that fires on healthy content teaches
+#     every reader to route around it, and a check nobody trusts is exactly
+#     how the dashboard reached 213 KB unnoticed. This is the expensive error.
+#   too loose — 2000 would clear the observed 1710 and 1908 runaway entries
+#     entirely. Cheaper, because three other axes (section bytes, entries per
+#     section, total bytes) still catch the accumulation those entries cause,
+#     but it makes this axis decorative.
+# Hence the low end of the 1500-2000 band rather than its middle.
 #
 # Enforcement is deliberately asymmetric (see `cmd_dashboard_put`):
 #   `ng dashboard validate` — HARD failure (exit 1). The strict gate.
@@ -302,7 +326,7 @@ DASH_REQUIRED_SECTIONS=(
 DASH_MAX_BYTES=12000            # whole dashboard middle
 DASH_MAX_SECTION_BYTES=4000     # any single `## ` section
 DASH_MAX_SECTION_ENTRIES=24     # top-level list items in one section
-DASH_MAX_ENTRY_BYTES=800        # one list item incl. its continuation lines
+DASH_MAX_ENTRY_BYTES=1500       # one list item incl. its continuation lines
 
 die() { echo "ng: $*" >&2; exit 1; }
 
@@ -3340,6 +3364,23 @@ _dashboard_missing_sections() {
     done
 }
 
+# Report any `## ` heading appearing MORE THAN ONCE in the body in file $1,
+# as `<heading> (xN)`. Empty output == every heading unique.
+#
+# This is a schema check, not a size one, but it is what stops the
+# per-section budget being evaded: `_dashboard_stats_tsv` measures each
+# heading occurrence independently, so two `## In-flight` headings with 20
+# entries apiece are 40 rows to a reader and 20-each to the checker, which
+# passes. The mirror case — a heading accidentally DELETED, orphaning its
+# content into the section above — is already caught, because
+# `_dashboard_missing_sections` fires on the absent heading. This closes
+# the other half. (Found by the skeptic pass on jacob-greene/nexus#36.)
+_dashboard_duplicate_sections() {
+    grep -E '^## ' "$1" \
+        | sort | uniq -c \
+        | awk '$1 > 1 { n = $1; $1 = ""; sub(/^ /, ""); printf "%s (x%d)\n", $0, n }'
+}
+
 # Per-section size measurements for the dashboard body in file $1.
 # Emits one TSV row per section, in document order:
 #
@@ -3348,6 +3389,10 @@ _dashboard_missing_sections() {
 # Content before the first `## ` heading is reported as `(preamble)` so
 # nothing escapes accounting. Bytes include the heading line itself and
 # each line's newline, so the section byte totals sum to the file size.
+# (Exactly, for a file with a trailing newline — which markdown bodies from
+# the GitHub API have. On a file whose last line is unterminated the sum
+# reads one high, since awk still charges that line a newline. Cosmetic:
+# the total-bytes rule uses `wc -c`, not this sum.)
 #
 # "Entry" = one row of the section's list of things. Two shapes count,
 # because the dashboard uses both:
@@ -3439,12 +3484,18 @@ _dashboard_oversize_report() {
 # is not obvious from the numbers alone.
 _dashboard_oversize_advice() {
     cat >&2 <<'ADVICE_EOF'
-  The dashboard is a glanceable status surface, not a log. To bring it back:
-    - `## In-flight` mirrors LIVE worker windows only — reconcile against
-      `tmux list-windows` and DELETE rows for windows that no longer exist.
-    - Narrative history belongs in a report (`ng report-init <slug>`), not
-      in the dashboard. Replace prose blocks with a one-line link.
-    - `## Recent landings` keeps the most recent handful; trim the tail.
+  The dashboard is a glanceable status surface, not a log. Match the remedy
+  to the rule that fired above:
+    - too many entries in `## In-flight` — it mirrors LIVE worker windows
+      only; reconcile against `tmux list-windows` and DELETE rows for
+      windows that no longer exist.
+    - one entry too large — that item has grown into an essay. Move the
+      detail to the issue or report it belongs to and leave a one-line ask
+      with a link. This is the usual shape in `## Awaiting operator`, where
+      the fix is a shorter statement of the decision, NOT dropping the item.
+    - a section or the whole body too large — narrative history belongs in
+      a report (`ng report-init <slug>`), not here; `## Recent landings`
+      keeps the most recent handful, so trim the tail.
   Archive the current body before pruning, so nothing is lost:
     ng dashboard get > /tmp/dashboard-archive.md
     ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive.md
@@ -3508,8 +3559,9 @@ cmd_dashboard_validate() {
     trap "rm -f '$tmp'" RETURN
     _read_body "$body_file" > "$tmp"
     [[ -s "$tmp" ]] || die "empty dashboard body"
-    local missing oversize total rc=0
+    local missing dupes oversize total rc=0
     missing=$(_dashboard_missing_sections "$tmp")
+    dupes=$(_dashboard_duplicate_sections "$tmp")
     oversize=$(_dashboard_oversize_report "$tmp")
     if [[ -n "$missing" ]]; then
         rc=1
@@ -3517,6 +3569,16 @@ cmd_dashboard_validate() {
             printf 'ng dashboard validate: missing required section(s):\n'
             while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$missing"
             printf 'scaffold the full skeleton with: ng dashboard scaffold\n'
+        } >&2
+    fi
+    if [[ -n "$dupes" ]]; then
+        rc=1
+        {
+            printf 'ng dashboard validate: duplicated section heading(s):\n'
+            while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$dupes"
+            printf 'Merge them into one section. Each heading is measured\n'
+            printf 'separately, so a split section can slip past the per-section\n'
+            printf 'budget while reading as one oversized section.\n'
         } >&2
     fi
     if [[ -n "$oversize" ]]; then
@@ -3615,6 +3677,16 @@ cmd_dashboard_put() {
         } >&2
     fi
 
+    local _dupes; _dupes=$(_dashboard_duplicate_sections "$tmp_new")
+    if [[ -n "$_dupes" ]]; then
+        {
+            printf 'ng dashboard put: WARNING — duplicated section heading(s):\n'
+            while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$_dupes"
+            printf '  (each heading is measured separately, so a split section can\n'
+            printf '   slip past the per-section budget; merge them into one)\n'
+        } >&2
+    fi
+
     # Size budget, WARN-only for the same reason and deliberately so.
     # This is the write-time check that the 213 KB runaway needed and did
     # not have: every `put` now states the growth out loud. It stays
@@ -3641,6 +3713,34 @@ cmd_dashboard_put() {
         || die "overview #$num: dashboard markers missing"
 
     _splice_body "$tmp_new" < "$tmp_full" > "$tmp_merged"
+
+    # The budget check above measured the body you AUTHORED ($tmp_new), which
+    # is deliberate: it is the thing you can act on, and the merged body also
+    # carries the prose outside the markers (identity block and so on) that is
+    # not part of the dashboard budget. But that leaves one blind spot worth
+    # closing — if the overview body somehow carries more than one
+    # NEXUS_DASHBOARD_START, `_splice_body` emits the new middle at EVERY one,
+    # so what lands is a multiple of what was measured and the check stays
+    # silent about it. Compare the middle that will actually land against the
+    # one we measured; a mismatch is that signature. Warn only: `put` never
+    # blocks, and the repair is to the marker pair in the issue body, not to
+    # anything the caller passed in.
+    local _in_bytes _out_bytes
+    _in_bytes=$(wc -c < "$tmp_new");                       _in_bytes=${_in_bytes//[[:space:]]/}
+    _out_bytes=$(_extract_middle < "$tmp_merged" | wc -c); _out_bytes=${_out_bytes//[[:space:]]/}
+    if (( _out_bytes > _in_bytes )); then
+        {
+            printf 'ng dashboard put: WARNING — spliced body is LARGER than what you passed\n'
+            printf '  (%s bytes in, %s bytes landing). The overview body almost certainly\n' \
+                "$_in_bytes" "$_out_bytes"
+            printf '  carries more than one `%s` marker, and the new\n' "$DASH_START"
+            printf '  middle is emitted at each of them — so the dashboard multiplies on\n'
+            printf '  every put and the size budget above measured only one copy.\n'
+            printf '  Fix the issue body so exactly ONE marker pair remains:\n'
+            printf '    gh api /repos/%s/issues/%s --jq .body | grep -c NEXUS_DASHBOARD_START\n' \
+                "$REPO" "$num"
+        } >&2
+    fi
 
     local url
     url=$(jq -Rs '{body: .}' < "$tmp_merged" \
