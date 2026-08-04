@@ -199,8 +199,17 @@ skeptic_gate_state() {
     # this ladder already has for "marker present, liveness unknowable
     # here", which both consumers already fail CLOSED on and already
     # describe honestly to the agent.
-    _idle_skeptic_live_window "$name" "$live"
-    case $? in
+    #
+    # `|| _lrc=$?`, not a bare call: rc 1 is the ORDINARY answer on this
+    # line ("asked tmux, no skeptic alive"), and a bare simple command
+    # that returns non-zero kills a `set -e` caller outright — this
+    # function would die before printing ANY state, so the caller would
+    # read an empty string where it expects one of the six names. The
+    # `if` this replaced was errexit-exempt by construction; an `||`
+    # list is the exemption that survives capturing the status.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" || _lrc=$?
+    case $_lrc in
         0) printf 'live';         return 0 ;;
         2) printf 'unclassified'; return 0 ;;
     esac

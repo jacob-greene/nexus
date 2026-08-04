@@ -231,6 +231,183 @@ rc5b=$?
 (( rc5b == 1 )) && ok "supplied snapshot without the skeptic → rc 1 (asked, none alive)" \
                 || bad "supplied snapshot: expected rc 1, got $rc5b"
 
+# ---- arm 6: the ladder must not kill a `set -e` caller -----------------
+# rc 1 — "asked tmux, no skeptic alive" — is the ORDINARY answer on this
+# path, not a failure. A bare `_idle_skeptic_live_window …; case $?` would
+# make it one: a simple command returning non-zero terminates a `set -e`
+# caller outright, so skeptic_gate_state would die BEFORE printing any
+# state at all, and its caller would read an EMPTY string where it
+# expects one of the six names — an unknown state that matches no arm of
+# any consumer's dispatch. The `if` this tri-state rewrite replaced was
+# errexit-exempt by construction; the replacement has to keep that
+# property. `monitor/spawn-worker.sh` already runs `set -euo pipefail`
+# and already sources this lib.
+#
+# BEHAVIOURAL, not textual: each arm runs the derivation as a BARE simple
+# command inside a genuinely errexit-armed shell (an `if`/`&&`/`$(…)`
+# wrapper here would suppress errexit for its whole dynamic extent and
+# the test would pass on the broken code), drives the rc-1 path, and
+# checks that execution REACHED the line after the call.
+echo "=== arm 6 (regression): rc 1 must not abort a set -e caller ==="
+
+GRACE_WIN=wkr-in-grace
+mk_marker   "$GRACE_WIN" "$NOW"                  # fresh marker
+log_request "$GRACE_WIN" "$(( NOW - 60 ))"       # required 1 min ago → INSIDE grace
+# No skeptic-spawn event, and tmux lists no `-skeptic` window, so the
+# liveness probe answers rc 1 and the grace ladder decides.
+
+ARM6_OUT="$WORK/arm6.out"
+
+# The tree under test is resolved from THIS FILE's location and from
+# nothing else. Every nexus agent runs with an ambient NEXUS_ROOT pointing
+# at the primary clone, and these libs prefer `$NEXUS_ROOT/monitor/…` over
+# their own directory when they resolve each other (see
+# `_skeptic_gate_load_probe` and retire-preflight.sh's gate_lib pick) — so
+# a suite that does not pin the root can green up against a tree it never
+# edited. The driver re-sources from $OWN_TREE explicitly, defeats the
+# libs' idempotent load guards so the re-source actually takes, re-exports
+# NEXUS_ROOT to match, and pins the two tunables the ladder reads so no
+# tree's config/load.sh can move the grace boundary under the fixture.
+OWN_TREE=$(cd "$_test_dir/../.." && pwd)
+
+# Rewrite <src> to <dst> with the errexit-safe status capture UNDONE —
+# the shape this fix replaced: a bare `_idle_skeptic_live_window …`
+# followed by `case $? in`. Keyed on the OPERATION (a guarded call whose
+# status is captured into a variable, and the `case` that reads it), not
+# on that variable's spelling. Writes its edit count to <cntfile> so an
+# inert transform is caught instead of silently producing a decoy that is
+# identical to the real thing.
+revert_fix() {
+    awk -v cnt="$3" '
+        {
+            line = $0
+            if (line ~ /_idle_skeptic_live_window/ &&
+                match(line, /[ \t]*\|\|[ \t]*[A-Za-z_][A-Za-z0-9_]*=\$\?[ \t]*$/)) {
+                var = substr(line, RSTART, RLENGTH)
+                sub(/^[ \t]*\|\|[ \t]*/, "", var); sub(/=\$\?[ \t]*$/, "", var)
+                line = substr(line, 1, RSTART - 1)
+                captured[var] = 1
+                n++
+            } else if (match(line, /^[ \t]*case[ \t]+\$[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]*$/)) {
+                v = line
+                sub(/^[ \t]*case[ \t]+\$/, "", v); sub(/[ \t]+in[ \t]*$/, "", v)
+                if (v in captured) { sub(/\$[A-Za-z_][A-Za-z0-9_]*/, "$?", line); n++ }
+            }
+            print line
+        }
+        END { print n + 0 > cnt }
+    ' "$1" > "$2"
+}
+
+DECOY="$WORK/decoy-tree"
+mkdir -p "$DECOY/monitor/watcher"
+cp "$OWN_TREE/monitor/watcher/_idle_probe.sh" "$DECOY/monitor/watcher/_idle_probe.sh"
+revert_fix "$OWN_TREE/monitor/_skeptic_gate.sh" \
+           "$DECOY/monitor/_skeptic_gate.sh" "$WORK/decoy.count"
+DECOY_EDITS=$(cat "$WORK/decoy.count")
+
+# Run <fn> <args…> as a BARE simple command under `set -euo pipefail`,
+# against the libs in <tree>. Echoes "reached <rc>" iff control returned
+# from the call; nothing if errexit killed the shell mid-derivation.
+# Anything the callee printed lands in $ARM6_OUT, so the state NAME stays
+# assertable even when the call itself legitimately returns non-zero.
+under_errexit_in() {
+    local tree="$1"; shift
+    : > "$ARM6_OUT"
+    (
+        set -uo pipefail
+        PATH="$STUB_DIR"
+        export MOCK_TMUX_WINDOWS=$'orchestrator\nwkr\nwkr-in-grace'
+        export NEXUS_ROOT="$tree"
+        export MONITOR_SKEPTIC_AWAIT_HANG_SECONDS=600
+        export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=600
+        # shellcheck disable=SC1090
+        source "$tree/monitor/watcher/_idle_probe.sh" >/dev/null 2>&1
+        # The gate lib is idempotent-guarded and _idle_probe.sh only pulls
+        # it in when it is not already defined; clear the guard and source
+        # it directly so <tree>'s copy is genuinely the one under test.
+        unset _SKEPTIC_GATE_SH_LOADED
+        # shellcheck disable=SC1090
+        source "$tree/monitor/_skeptic_gate.sh" >/dev/null 2>&1
+        set -euo pipefail
+        "$@" > "$ARM6_OUT"         # <- bare. errexit is live on this line.
+        printf 'reached %s\n' "$?"
+    ) 2>/dev/null
+}
+
+# 6a CONTROL — proves errexit is actually armed in the driver. A window
+# with NO marker returns rc 1 from the marker check, a path that never
+# reaches the liveness call. That bare rc 1 MUST kill the subshell. If
+# this reports "reached", the harness tests nothing and every assertion
+# below is vacuous.
+ctl=$(under_errexit_in "$OWN_TREE" skeptic_gate_state no-such-window "$NOW" "")
+[[ -z "$ctl" ]] \
+    && ok "control: errexit IS armed (a bare rc 1 kills the caller)" \
+    || bad "control: harness is not errexit-armed — got '$ctl'; every arm-6 assertion is vacuous"
+
+# 6b THE derivation both consumers call, on the rc-1 path, inside the
+# grace window: must print `grace`, return 0, and leave the caller alive.
+got=$(under_errexit_in "$OWN_TREE" skeptic_gate_state "$GRACE_WIN" "$NOW" "")
+printed=$(cat "$ARM6_OUT")
+[[ "$got" == "reached 0" ]] \
+    && ok "skeptic_gate_state: rc-1 liveness → caller survives" \
+    || bad "skeptic_gate_state: caller did not survive the rc-1 path (got '${got:-<killed>}', want 'reached 0')"
+[[ "$printed" == grace ]] \
+    && ok "skeptic_gate_state: rc-1 liveness → printed 'grace'" \
+    || bad "skeptic_gate_state: printed '${printed:-<nothing>}', want 'grace' (an empty state matches no consumer's dispatch)"
+
+# 6c …and past the grace, where the answer is `orphaned` — the one state
+# that takes the gate DOWN, and the one state that is rc 1. Survival is
+# NOT the observable here: `orphaned` returns 1 by contract, so a bare
+# call under `set -e` is killed by the function's own honest verdict no
+# matter what this file does. What must differ is whether the verdict was
+# REACHED — i.e. whether anything was printed before control left.
+under_errexit_in "$OWN_TREE" skeptic_gate_state "$WIN" "$NOW" "" >/dev/null
+printed=$(cat "$ARM6_OUT")
+[[ "$printed" == orphaned ]] \
+    && ok "skeptic_gate_state: rc-1 liveness past grace → printed 'orphaned'" \
+    || bad "skeptic_gate_state past grace: printed '${printed:-<nothing>}', want 'orphaned' (killed before it could classify)"
+
+# 6d the two probe wrappers, same property. They reach the ladder through
+# a command substitution today, which is errexit-exempt on its own — so
+# these are a guard against a future rewrite that drops that, not a
+# restatement of 6b.
+got=$(under_errexit_in "$OWN_TREE" _idle_skeptic_parked "$GRACE_WIN" "$NOW" "")
+[[ "$got" == "reached 0" ]] \
+    && ok "_idle_skeptic_parked: rc-1 liveness → grace, caller survives" \
+    || bad "_idle_skeptic_parked: caller did not survive the rc-1 path (got '${got:-<killed>}', want 'reached 0')"
+
+got=$(under_errexit_in "$OWN_TREE" _idle_skeptic_orphaned "$WIN" "$NOW" "")
+[[ "$got" == "reached 0" ]] \
+    && ok "_idle_skeptic_orphaned: rc-1 liveness → orphaned, caller survives" \
+    || bad "_idle_skeptic_orphaned: caller did not survive the rc-1 path (got '${got:-<killed>}', want 'reached 0')"
+
+# ---- 6e the NEGATIVE arm: the same assertions must FAIL on a tree
+# without the fix. Without this, 6b/6c pass on any tree whose libs merely
+# load — including the primary clone's — and the arm certifies nothing
+# about the file in THIS working tree.
+(( DECOY_EDITS >= 2 )) \
+    && ok "decoy fixture: reverted $DECOY_EDITS guarded-capture sites" \
+    || bad "decoy fixture is INERT ($DECOY_EDITS edits, want >= 2) — 6e proves nothing; the transform no longer matches the code"
+
+# The decoy must still be a WORKING lib, or 6e would pass for the wrong
+# reason (a syntax error aborts just as an errexit trip does).
+bash -n "$DECOY/monitor/_skeptic_gate.sh" 2>/dev/null \
+    && ok "decoy fixture: still parses" \
+    || bad "decoy fixture: does not parse — 6e cannot distinguish errexit from a broken copy"
+
+under_errexit_in "$DECOY" skeptic_gate_state "$GRACE_WIN" "$NOW" "" >/dev/null
+printed=$(cat "$ARM6_OUT")
+[[ -z "$printed" ]] \
+    && ok "NEGATIVE: same arm against a tree WITHOUT the fix → no state printed (guard discriminates)" \
+    || bad "NEGATIVE: unfixed tree still printed '$printed' — this guard passes regardless of the code it reads"
+
+under_errexit_in "$DECOY" skeptic_gate_state "$WIN" "$NOW" "" >/dev/null
+printed=$(cat "$ARM6_OUT")
+[[ -z "$printed" ]] \
+    && ok "NEGATIVE: unfixed tree past grace → killed before it could classify" \
+    || bad "NEGATIVE: unfixed tree still printed '$printed' — this guard passes regardless of the code it reads"
+
 PATH="$ORIG_PATH"
 
 printf '\n%s\n' "-------------------------------------------"
