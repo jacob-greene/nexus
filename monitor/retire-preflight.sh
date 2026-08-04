@@ -268,6 +268,12 @@ fi
 # `orphaned-skeptic-pending` signal from the poll and is consciously
 # retiring it. When the fidelity helper is unavailable (probe lib missing),
 # fall back to the original unconditional no-go (conservative: refuse).
+#
+# "ORPHANED" means CHECKED-absent, never merely unchecked: if tmux cannot
+# be asked at all, _idle_skeptic_live_window answers rc 2 and this check
+# refuses (jacob-greene/nexus#31). Before that, an unanswered tmux read as
+# an empty window list, which read as `orphaned` — so this check would
+# kill a worker whose reviewer was alive.
 sk_pending="$STATE_DIR/skeptic/pending/${win_name//[^a-zA-Z0-9_-]/_}"
 if [[ -f "$sk_pending" ]]; then
     _sk_now=$(date +%s)
@@ -280,7 +286,11 @@ if [[ -f "$sk_pending" ]]; then
         printf 'retire-preflight: skeptic-pending marker for %q is ORPHANED (no live skeptic past grace) — not blocking retirement\n' \
             "$win_name" >&2
     else
-        emit 0 "$pane_state" "required skeptic has not returned a verdict (skeptic-pending marker live) — task not done, refusing kill"
+        # Name what is KNOWN. This branch is reached whenever the marker is
+        # not CHECKED-orphaned — including when liveness could not be
+        # determined at all (tmux unreachable, nexus#31) — so asserting a
+        # live reviewer here would claim more than was established.
+        emit 0 "$pane_state" "required skeptic has not returned a verdict (skeptic-pending marker unresolved) — task not done, refusing kill"
         exit 1
     fi
 fi
