@@ -396,6 +396,23 @@ bash -n "$DECOY/monitor/_skeptic_gate.sh" 2>/dev/null \
     && ok "decoy fixture: still parses" \
     || bad "decoy fixture: does not parse — 6e cannot distinguish errexit from a broken copy"
 
+# …and it must differ from the real tree by NO MORE than the fix. Parsing
+# is not enough: if the decoy's liveness primitive stopped answering rc 1
+# — the ordinary answer this whole arm is built on — the negative
+# assertions below would pass because the fixture never reaches the
+# ladder, not because the missing capture killed the caller. The decoy's
+# `_idle_probe.sh` is a verbatim copy (only `_skeptic_gate.sh` was
+# transformed), so its primitive must still behave exactly as the real
+# one does.
+decoy_live=$(
+    PATH="$STUB_DIR"; export MOCK_TMUX_WINDOWS=$'orchestrator\nwkr\nwkr-in-grace'
+    bash -c 'source "$1" >/dev/null 2>&1; _idle_skeptic_live_window wkr-in-grace ""; echo $?' \
+        _ "$DECOY/monitor/watcher/_idle_probe.sh" 2>/dev/null
+)
+[[ "$decoy_live" == 1 ]] \
+    && ok "decoy fixture: liveness primitive still answers rc 1 (only the capture was undone)" \
+    || bad "decoy fixture: liveness rc '$decoy_live', want 1 — the decoy differs by more than the fix"
+
 under_errexit_in "$DECOY" skeptic_gate_state "$GRACE_WIN" "$NOW" "" >/dev/null
 printed=$(cat "$ARM6_OUT")
 [[ -z "$printed" ]] \
@@ -407,6 +424,21 @@ printed=$(cat "$ARM6_OUT")
 [[ -z "$printed" ]] \
     && ok "NEGATIVE: unfixed tree past grace → killed before it could classify" \
     || bad "NEGATIVE: unfixed tree still printed '$printed' — this guard passes regardless of the code it reads"
+
+# There is deliberately NO negative arm through the two probe wrappers.
+# While the errexit-sensitive ladder lived inside `_idle_skeptic_parked`
+# itself, an unfixed tree killed the wrapper's caller and that was
+# assertable. It no longer is, and the reason is not an oversight: the
+# wrappers now reach the ladder through `$(skeptic_gate_state …)`, and
+# bash does not propagate errexit into a command substitution unless
+# `inherit_errexit` is set (off by default, and unset everywhere here).
+# So on the decoy the derivation runs to completion inside the
+# substitution and the wrapper answers normally — the same "reached 0" as
+# the fixed tree, for both trees, proving nothing. The property itself
+# did not disappear; it moved to skeptic_gate_state, where 6e asserts it
+# and DOES discriminate. Asserting it here too would be a guard that
+# passes regardless of the code it reads, which is the failure mode this
+# whole arm exists to prevent.
 
 PATH="$ORIG_PATH"
 
