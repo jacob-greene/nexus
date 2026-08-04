@@ -297,27 +297,34 @@ DASH_REQUIRED_SECTIONS=(
 #
 # DASH_MAX_ENTRY_BYTES is calibrated against BOTH observed distributions,
 # not just a healthy snapshot — an entry budget set from healthy content
-# alone will false-positive on the one section whose entries are supposed
-# to carry prose. Measured:
-#   legitimate entries, live dashboard   — max 907 (`## Awaiting operator`,
-#                                          a decision item with its context),
-#                                          then 609, 565, 536, 461 …
-#   runaway entries, the 213 KB body     — MIN 1710 (`## Recent landings`),
-#                                          then 1908, up to 9363 (`## In-flight`)
-# 1500 sits in that gap: legitimate content clears it with ~65% headroom,
-# and the smallest genuinely-runaway entry still trips it with ~12% margin.
+# alone false-positives on the one section whose entries are supposed to
+# carry prose (800 was the first cut, and it red-lighted a NORMAL
+# `## Awaiting operator` decision item at 907 bytes).
 #
-# The two failure directions are not symmetric, which is why the value sits
-# nearer the runaway floor than the midpoint:
-#   too tight — 800 was the first cut, and it red-lights a NORMAL
-#     operator-decision item. A budget that fires on healthy content teaches
-#     every reader to route around it, and a check nobody trusts is exactly
-#     how the dashboard reached 213 KB unnoticed. This is the expensive error.
-#   too loose — 2000 would clear the observed 1710 and 1908 runaway entries
-#     entirely. Cheaper, because three other axes (section bytes, entries per
-#     section, total bytes) still catch the accumulation those entries cause,
-#     but it makes this axis decorative.
-# Hence the low end of the 1500-2000 band rather than its middle.
+# There is NO clean gap between the two populations. Measured per entry:
+#   legitimate, live dashboard   n=30   max 907, then 609, 565, 536, 461 …
+#   runaway, the 213 KB body     n=168  min 99, median 1058, max 9363
+#                                       >800: 111   >1500: 41   >2000: 19
+# The runaway body's entries are continuous across the whole range — 61 of
+# them sit between 907 and 1500 — so no threshold separates "healthy" from
+# "runaway" by inspection. Anyone retuning this needs to know that; picking
+# a number here is a sensitivity choice, not the discovery of a cliff.
+#
+# 1500 is therefore set from the LEGITIMATE side and sanity-checked against
+# the runaway side:
+#   floor  — must clear the observed legitimate maximum (907) with real
+#            margin, because a budget that fires on healthy content teaches
+#            every reader to route around it, and a check nobody trusts is
+#            exactly how the dashboard reached 213 KB unnoticed. This is the
+#            expensive error direction. 1500 gives ~65% headroom.
+#   bite   — at 1500 the rule still fires on 41 of the archive's 168 entries
+#            (24%), so the axis is not decorative. (Nor would 2000 be: 19
+#            entries still breach there. The 1500-vs-2000 choice is
+#            sensitivity, not on/off.)
+# The other direction is cheaper here because this axis targets one shape —
+# a single item that grew into an essay. Bulk accumulation is caught by
+# DASH_MAX_SECTION_BYTES and DASH_MAX_BYTES, which is why this one can
+# afford to sit on the no-false-positive side.
 #
 # Enforcement is deliberately asymmetric (see `cmd_dashboard_put`):
 #   `ng dashboard validate` — HARD failure (exit 1). The strict gate.
@@ -3712,35 +3719,44 @@ cmd_dashboard_put() {
     grep -qF -- "$DASH_START" "$tmp_full" && grep -qF -- "$DASH_END" "$tmp_full" \
         || die "overview #$num: dashboard markers missing"
 
-    _splice_body "$tmp_new" < "$tmp_full" > "$tmp_merged"
-
     # The budget check above measured the body you AUTHORED ($tmp_new), which
     # is deliberate: it is the thing you can act on, and the merged body also
     # carries the prose outside the markers (identity block and so on) that is
-    # not part of the dashboard budget. But that leaves one blind spot worth
-    # closing — if the overview body somehow carries more than one
-    # NEXUS_DASHBOARD_START, `_splice_body` emits the new middle at EVERY one,
-    # so what lands is a multiple of what was measured and the check stays
-    # silent about it. Compare the middle that will actually land against the
-    # one we measured; a mismatch is that signature. Warn only: `put` never
-    # blocks, and the repair is to the marker pair in the issue body, not to
-    # anything the caller passed in.
-    local _in_bytes _out_bytes
-    _in_bytes=$(wc -c < "$tmp_new");                       _in_bytes=${_in_bytes//[[:space:]]/}
-    _out_bytes=$(_extract_middle < "$tmp_merged" | wc -c); _out_bytes=${_out_bytes//[[:space:]]/}
-    if (( _out_bytes > _in_bytes )); then
+    # not part of the dashboard budget. That leaves one blind spot worth
+    # closing — `_splice_body` emits the new middle at EVERY DASH_START line,
+    # so a body carrying a duplicate marker multiplies the dashboard on every
+    # put while the budget check, having seen one copy, stays silent.
+    #
+    # Detect it by COUNTING THE MARKERS, not by comparing byte sizes. An
+    # earlier version of this check compared the spliced middle against the
+    # input and warned when it grew — which false-positived on any
+    # `--body-file` whose last line lacks a trailing newline, because
+    # `_splice_body`'s `print` re-terminates that line and the middle comes
+    # out one byte longer (116 in, 117 out) on a perfectly correct
+    # single-marker write. A detector that cries wolf on healthy input is the
+    # exact failure this whole change set exists to prevent — and the marker
+    # count is the condition being inferred anyway: k markers => k copies,
+    # exactly, with no arithmetic edge cases.
+    #
+    # Warn only, and BEFORE the PATCH: `put` never blocks, and the repair is
+    # to the marker pair in the issue body, not to anything the caller passed.
+    local _n_start _n_end
+    _n_start=$(grep -cF -- "$DASH_START" "$tmp_full")
+    _n_end=$(grep -cF -- "$DASH_END" "$tmp_full")
+    if (( _n_start > 1 || _n_end > 1 )); then
         {
-            printf 'ng dashboard put: WARNING — spliced body is LARGER than what you passed\n'
-            printf '  (%s bytes in, %s bytes landing). The overview body almost certainly\n' \
-                "$_in_bytes" "$_out_bytes"
-            printf '  carries more than one `%s` marker, and the new\n' "$DASH_START"
-            printf '  middle is emitted at each of them — so the dashboard multiplies on\n'
-            printf '  every put and the size budget above measured only one copy.\n'
-            printf '  Fix the issue body so exactly ONE marker pair remains:\n'
-            printf '    gh api /repos/%s/issues/%s --jq .body | grep -c NEXUS_DASHBOARD_START\n' \
+            printf 'ng dashboard put: WARNING — overview #%s carries %s START and %s END marker(s)\n' \
+                "$num" "$_n_start" "$_n_end"
+            printf '  (expected exactly 1 of each). The new middle is spliced in at EVERY\n'
+            printf '  START marker, so the dashboard MULTIPLIES on every put and the size\n'
+            printf '  budget above measured only one copy of it.\n'
+            printf '  Fix the issue body so exactly ONE marker pair remains, then re-put:\n'
+            printf '    gh api /repos/%s/issues/%s --jq .body | grep -n NEXUS_DASHBOARD\n' \
                 "$REPO" "$num"
         } >&2
     fi
+
+    _splice_body "$tmp_new" < "$tmp_full" > "$tmp_merged"
 
     local url
     url=$(jq -Rs '{body: .}' < "$tmp_merged" \

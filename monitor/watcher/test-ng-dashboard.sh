@@ -529,11 +529,13 @@ assert_eq        "a live-windows-sized table passes" "$rc" "0"
 # legitimate content trains the reader to ignore the warning, which is the
 # exact failure that let the dashboard reach 213 KB.
 #
-# It now sits at 1500, inside the measured gap between legitimate (max 907)
-# and runaway (MIN 1710, not the headline 9363). Both edges are pinned
-# below, because the fix for a false positive is to raise the number and
-# the next person raising it needs to be told where the ceiling is: past
-# ~1700 this axis stops catching anything that was actually observed.
+# It now sits at 1500. There is NO clean gap between the two populations:
+# the 213 KB body's 168 entries run continuously from 99 to 9363 (median
+# 1058), with 61 of them between 907 and 1500. So the value is set from the
+# legitimate side — clear the observed max (907) with margin — and
+# sanity-checked from the runaway side, where it still fires on 41 of 168.
+# Both edges are pinned below, because the fix for a false positive is to
+# raise the number and the next person raising it should see both effects.
 
 echo '=== realistic operator-decision entry (~900 B) → NO breach ==='
 realistic_dash="$WORK/realistic-dash.md"
@@ -561,10 +563,12 @@ run_ng out err rc dashboard validate --body-file "$realistic_dash"
 assert_eq        "legitimate entry does NOT breach"  "$rc" "0"
 assert_not_contains "no entry-bytes false positive"  "$err" "single entry of"
 
-# The other edge: the SMALLEST entry observed in the 213 KB runaway body
-# (1710 bytes, `## Recent landings`) must still trip the rule. This is what
-# stops a future false-positive fix from raising the number until the axis
-# is decorative.
+# The other edge: an entry the size of the largest in `## Recent landings`
+# (1710 bytes) must still trip the rule. That figure is the biggest entry in
+# that section of the runaway body, NOT a floor over runaway entries — the
+# archive's entries go down to 99 bytes. It is pinned here as a
+# representative case so a future false-positive fix cannot raise the
+# threshold past the range where real bloat lives.
 echo '=== smallest observed runaway entry (~1710 B) → still breaches ==='
 runaway_floor_dash="$WORK/runaway-floor-dash.md"
 {
@@ -621,30 +625,60 @@ run_ng out err rc dashboard validate --body-file "$complete_dash"
 assert_eq        "exit 0"                            "$rc" "0"
 assert_not_contains "no spurious duplicate report"   "$err" "duplicated section heading"
 
-# ---- Test 20d: put warns when the SPLICED body is larger than the input -
+# ---- Test 20d: put warns on a DUPLICATE marker in the overview body ----
 #
 # The budget check measures what you authored, not the merged body (which
 # also carries prose outside the markers). That leaves one bypass: with a
 # duplicate NEXUS_DASHBOARD_START, `_splice_body` emits the middle at every
 # marker, so what lands is a multiple of what was measured. `put` must say
 # so rather than silently pushing a doubled dashboard.
+#
+# Detection is by MARKER COUNT, not by comparing input vs spliced bytes.
+# The byte comparison was the first implementation and it false-positived
+# on a body-file with no trailing newline — see the regression test below.
 
-echo '=== duplicate START marker → put warns the spliced body grew ==='
+echo '=== duplicate START marker → put warns before the PATCH ==='
 dup_marker_body="$WORK/dup-marker.body"
 printf 'prefix line\n<!-- NEXUS_DASHBOARD_START -->\nold middle\n<!-- NEXUS_DASHBOARD_START -->\nold middle again\n<!-- NEXUS_DASHBOARD_END -->\nsuffix line\n' \
     > "$dup_marker_body"
 MOCK_BODY_FILE="$dup_marker_body" run_ng out err rc dashboard put --body-file "$complete_dash"
 assert_eq        "exit 0 — warn, never block"        "$rc" "0"
-assert_contains  "warns the spliced body is larger"  "$err" "LARGER than what you passed"
-assert_contains  "names the duplicate-marker cause"  "$err" "NEXUS_DASHBOARD_START"
-assert_contains  "gives a way to confirm it"         "$err" "grep -c NEXUS_DASHBOARD_START"
+assert_contains  "warns about the marker count"      "$err" "2 START and 1 END marker"
+assert_contains  "explains the multiplication"       "$err" "MULTIPLIES on every put"
+assert_contains  "gives a way to confirm it"         "$err" "grep -n NEXUS_DASHBOARD"
 calls=$(<"$CAPTURE")
 assert_contains  "PATCH still issued despite warn"   "$calls" "-X PATCH"
 
-echo '=== single START marker → no spliced-size warning ==='
+echo '=== single marker pair → no duplicate-marker warning ==='
 run_ng out err rc dashboard put --body-file "$complete_dash"
 assert_eq        "exit 0"                            "$rc" "0"
-assert_not_contains "no spurious splice warning"     "$err" "LARGER than what you passed"
+assert_not_contains "no spurious marker warning"     "$err" "MULTIPLIES on every put"
+
+# Regression: a --body-file whose last line has NO trailing newline.
+# `_splice_body`'s `print` re-terminates it, so the spliced middle comes
+# out exactly one byte longer than the input. The original size-comparison
+# detector fired here (116 in, 117 out) on a single-marker body that
+# spliced perfectly — a detector crying wolf on healthy input, which is
+# the failure mode this whole change set exists to prevent. Found by the
+# round-2 skeptic pass on jacob-greene/nexus#36.
+echo '=== body-file with no trailing newline → NO false warning ==='
+no_trailing_nl="$WORK/no-trailing-newline.md"
+printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\nx\n## Awaiting operator\nx\n## Recent landings\nlast line without a newline' \
+    > "$no_trailing_nl"
+# Confirm the fixture really is unterminated, else it tests nothing.
+if [[ $(tail -c1 "$no_trailing_nl" | wc -l) -eq 0 ]]; then
+    printf '  PASS: fixture last line is unterminated\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture ends with a newline — regression not exercised\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+run_ng out err rc dashboard put --body-file "$no_trailing_nl"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_not_contains "no false duplicate-marker warn" "$err" "MULTIPLIES on every put"
+assert_not_contains "no stale size-comparison warn"  "$err" "LARGER than what you passed"
+calls=$(<"$CAPTURE")
+assert_contains  "PATCH issued normally"             "$calls" "-X PATCH"
 
 # ---- Test 21: validate — in-budget body still passes, reports size -----
 
