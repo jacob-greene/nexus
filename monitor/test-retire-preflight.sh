@@ -51,13 +51,61 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local label="$1" hay="$2" needle="$3"
+    if grep -qF -- "$needle" <<<"$hay"; then
+        printf '  FAIL: %s — unexpectedly found %q\n' "$label" "$needle" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    fi
+}
+
 # ---- harness -------------------------------------------------------------
+# Pin the checkout under test to THIS one. retire-preflight.sh resolves its
+# helper lib as "$NEXUS_ROOT/monitor/watcher/_idle_probe.sh else
+# $self_dir/watcher/...", so an ambient NEXUS_ROOT (every nexus agent has
+# one, pointing at the primary clone) silently made this suite exercise
+# ANOTHER tree's _idle_probe.sh — green, and establishing nothing about
+# the file in this working tree.
+unset NEXUS_ROOT
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 STATE_DIR="$WORK/.state"
 mkdir -p "$STATE_DIR/user-prompt" "$STATE_DIR/pane-change"
 
 NOW=$(date +%s)
+
+# ---- scriptable tmux for the skeptic arms (jacob-greene/nexus#31) --------
+# The skeptic gate is the ONE part of this preflight that queries tmux
+# (liveness of a reviewer window), and its answer decides whether a worker
+# gets killed. Leaving that to whatever tmux happens to be on PATH made
+# these arms depend on the host: on a box with no tmux server the gate now
+# — correctly — refuses instead of allowing the kill, so "does tmux
+# answer?" has to be part of the fixture rather than part of the weather.
+#
+#   MOCK_TMUX_WINDOWS   newline-separated live window names
+#   MOCK_TMUX_LIST_RC   non-zero => tmux CANNOT answer (no server -> 1,
+#                       no binary -> 127); stdout stays empty, as real
+#                       tmux leaves it
+#
+# Every other tmux subcommand is delegated to the real binary untouched.
+SK_STUB_DIR="$WORK/bin"; mkdir -p "$SK_STUB_DIR"
+REAL_TMUX=$(command -v tmux 2>/dev/null || true)
+cat > "$SK_STUB_DIR/tmux" <<STUB
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "list-windows" ]]; then
+    if [[ -n "\${MOCK_TMUX_LIST_RC:-}" && "\${MOCK_TMUX_LIST_RC}" != "0" ]]; then
+        printf 'no server running on /tmp/tmux-0/default\n' >&2
+        exit "\$MOCK_TMUX_LIST_RC"
+    fi
+    [[ -n "\${MOCK_TMUX_WINDOWS:-}" ]] && printf '%s\n' "\$MOCK_TMUX_WINDOWS"
+    exit 0
+fi
+exec ${REAL_TMUX:-/bin/false} "\$@"
+STUB
+chmod +x "$SK_STUB_DIR/tmux"
+export PATH="$SK_STUB_DIR:$PATH"
 
 # Run the preflight; capture stdout + rc into named vars.
 run_preflight() {
@@ -219,13 +267,63 @@ echo 1 > "$STATE_DIR/skeptic/pending/pending-skeptic-win"
 run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "exit 1 (no-go)"     "$RC"  "1"
 assert_contains "safe=0"            "$OUT" "safe=0"
-assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending marker live"
+assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending marker unresolved"
+# The refusal fires in several states (live reviewer / inside the spawn
+# grace / liveness undeterminable), so it must not claim a live reviewer
+# it did not check.
+assert_not_contains "reason does NOT assert the marker is live" "$OUT" \
+                    "skeptic-pending marker live"
 # Once the skeptic returns a verdict (marker cleared) the same window is
 # retire-eligible again.
 rm -f "$STATE_DIR/skeptic/pending/pending-skeptic-win"
 run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "marker cleared -> exit 0 (go)" "$RC"  "0"
 assert_contains "marker cleared -> safe=1"     "$OUT" "safe=1"
+
+# ── 9c. ORPHANED marker → GO, but only from a CHECKED absence ────────────
+# The fidelity rule: a marker whose reviewer really died is a stuck state,
+# not live validation, so the kill is allowed with a loud note. Driven off
+# explicit stamps and a scripted tmux, so the state cannot depend on how
+# long the test itself took or on the host's tmux.
+echo "## 9c. orphaned skeptic-pending marker (tmux ANSWERS) → GO"
+reset_state
+mkdir -p "$STATE_DIR/skeptic/pending"
+echo 1 > "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
+SK_NOW=$(date +%s)
+printf '{"ts":"%s","event":"skeptic-request","target-window":"orphan-skeptic-win","depth":"1"}\n' \
+    "$(date -Iseconds -d "@$(( SK_NOW - 300 ))")" >> "$STATE_DIR/action-log.jsonl"
+printf '{"ts":"%s","event":"skeptic-spawn","window":"orphan-skeptic-win-skeptic","target-window":"orphan-skeptic-win","orig-window":"orphan-skeptic-win"}\n' \
+    "$(date -Iseconds -d "@$(( SK_NOW - 290 ))")" >> "$STATE_DIR/action-log.jsonl"
+touch -d "@$(( SK_NOW - 300 ))" "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
+export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
+export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win'   # reviewer really gone
+unset MOCK_TMUX_LIST_RC
+run_preflight OUT RC orphan-skeptic-win --pane-state idle
+assert_eq      "orphaned marker -> exit 0 (go)" "$RC"  "0"
+assert_contains "orphaned marker -> safe=1"     "$OUT" "safe=1"
+
+# ── 9d. SAME STATE, tmux CANNOT ANSWER → NO-GO (jacob-greene/nexus#31) ───
+# The arm that was wrong. Identical on-disk state to 9c, except the
+# reviewer IS alive and tmux fails to say so. Liveness used to be inferred
+# from an empty window list, so an unanswered tmux read as "no reviewer"
+# and this check — the one that KILLS — allowed the kill on a window whose
+# reviewer was alive.
+echo "## 9d. same state + tmux cannot answer → NO-GO"
+export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win\norphan-skeptic-win-skeptic'
+for _rc in 1 127; do
+    export MOCK_TMUX_LIST_RC="$_rc"
+    run_preflight OUT RC orphan-skeptic-win --pane-state idle
+    assert_eq      "tmux rc $_rc -> exit 1 (refuse the kill)" "$RC"  "1"
+    assert_contains "tmux rc $_rc -> safe=0"                  "$OUT" "safe=0"
+    assert_contains "tmux rc $_rc -> refusal names an unresolved marker" "$OUT" \
+                    "skeptic-pending marker unresolved"
+done
+unset MOCK_TMUX_LIST_RC _rc
+# CONTROL: tmux answering on that SAME live reviewer must also refuse —
+# the arms differ only in answerability, so both must gate.
+run_preflight OUT RC orphan-skeptic-win --pane-state idle
+assert_eq      "tmux answers + live reviewer -> exit 1 (refuse)" "$RC" "1"
+unset MOCK_TMUX_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 # ── 10. machine-attributed submit within slack (clock-skew absorption) ────
 echo "## 10. submit within attribution slack of machine input → GO"
