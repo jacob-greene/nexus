@@ -569,8 +569,8 @@ assert_not_contains "no entry-bytes false positive"  "$err" "single entry of"
 # archive's entries go down to 99 bytes. It is pinned here as a
 # representative case so a future false-positive fix cannot raise the
 # threshold past the range where real bloat lives.
-echo '=== smallest observed runaway entry (~1710 B) → still breaches ==='
-runaway_floor_dash="$WORK/runaway-floor-dash.md"
+echo '=== bloated entry (~1710 B, `## Recent landings` max) → still breaches ==='
+bloated_entry_dash="$WORK/bloated-entry-dash.md"
 {
     printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\nx\n'
     printf '## Awaiting operator\nx\n'
@@ -579,18 +579,18 @@ runaway_floor_dash="$WORK/runaway-floor-dash.md"
     for _i in $(seq 1 27); do
         printf '  have gone in a report instead of the dashboard, line %02d pad\n' "$_i"
     done
-} > "$runaway_floor_dash"
-floor_bytes=$(awk '/^- \*\*PR #123/{f=1} f' "$runaway_floor_dash" | wc -c)
+} > "$bloated_entry_dash"
+floor_bytes=$(awk '/^- \*\*PR #123/{f=1} f' "$bloated_entry_dash" | wc -c)
 if (( floor_bytes >= 1650 && floor_bytes <= 1900 )); then
-    printf '  PASS: fixture entry is %s bytes (models the observed 1710)\n' "$floor_bytes"
+    printf '  PASS: fixture entry is %s bytes (models the 1710-byte case)\n' "$floor_bytes"
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: fixture entry %s bytes, outside the 1650-1900 band it models\n' \
         "$floor_bytes" >&2
     FAIL=$(( FAIL + 1 ))
 fi
-run_ng out err rc dashboard validate --body-file "$runaway_floor_dash"
-assert_eq        "runaway-floor entry still breaches" "$rc" "1"
+run_ng out err rc dashboard validate --body-file "$bloated_entry_dash"
+assert_eq        "bloated entry still breaches"        "$rc" "1"
 assert_contains  "names the entry-bytes rule"        "$err" "single entry of"
 
 # ---- Test 20c2: duplicated heading cannot split a section past the budget

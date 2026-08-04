@@ -1092,11 +1092,18 @@ An "entry" is a top-level list item **or** a markdown table row
 (`## In-flight` is written as a table), separator rows excluded; a
 multi-line entry is charged its continuation lines.
 
-The thresholds are calibrated against both observed distributions —
-legitimate entries top out around 900 bytes, and the smallest entry in
-the 213 KB runaway body was 1710 — so the budget catches real growth
-without red-lighting a healthy dashboard. That matters: a budget that
-fires on normal content is one everybody learns to ignore.
+The thresholds are calibrated against both observed distributions, which
+**do not separate cleanly**: legitimate entries top out around 900 bytes,
+while the 213 KB runaway body's 168 entries run continuously from 99 to
+9,363 (median 1,058), 61 of them between those two figures. No threshold
+divides the two populations by inspection, so each value is a sensitivity
+choice rather than a discovered cliff. They are set from the legitimate
+side — clear the observed healthy maximum with margin — and sanity-checked
+against the runaway side, where `DASH_MAX_ENTRY_BYTES = 1500` still fires
+on 41 of those 168 entries. That direction matters most: a budget that
+fires on normal content is one everybody learns to ignore. The full
+reasoning lives beside `DASH_MAX_*` in `monitor/ng`; read it before
+retuning.
 
 ---
 

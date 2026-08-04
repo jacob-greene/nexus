@@ -114,7 +114,7 @@ The dashboard is a **glanceable status surface**, not a log, and every update is
   monitor/ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive-$(date +%Y%m%d).md
   ```
 
-Thresholds are calibrated against both real distributions — legitimate entries top out around 900 bytes; the smallest entry in the runaway body was 1,710 — so a healthy dashboard passes cleanly. That is the point: a budget that red-lights normal content is one everybody learns to route around, which is how the dashboard grew unnoticed in the first place.
+Thresholds are calibrated against both real distributions, and the honest summary is that they **do not separate cleanly**: legitimate entries top out around 900 bytes, while the runaway body's 168 entries run continuously from 99 to 9,363 (median 1,058) — 61 of them land between those two figures. No threshold cleanly divides "healthy" from "runaway", so each value is a sensitivity choice. They are set from the legitimate side, with enough margin that a healthy dashboard passes cleanly. That is the point: a budget that red-lights normal content is one everybody learns to route around, which is how the dashboard grew unnoticed in the first place. If you retune one, read the reasoning next to `DASH_MAX_*` in `monitor/ng` first.
 
 **Agents: use `get --stat` first.** Plain `get` prints the whole body; on a sick dashboard that is a context blowout. (The "`ng dashboard get` times out at 120 s" once filed as an infra bug was exactly this — 213 KB streaming into a tool result, not a slow API. `get` returns in ~2.5 s.) `--stat` reports the shape and writes the body to the cache, so you can read it deliberately if you need it.
 
