@@ -219,11 +219,34 @@
 #      from exit 2 so callers can tell "argv shape was wrong" from
 #      "argv shape was fine but the index isn't a live window".
 #
-# The dim-cursor regex `\x1b\[7m.\x1b\[0;2m` and the bright-text marker
-# `\x1b\[38;5;231m` are centralized in this file. If a future Claude
-# Code release changes them (e.g. emits `\x1b[2m` alone or 256-colour
-# grey instead of `\x1b[0;2m`), update _detect_autosuggest /
-# _detect_user_typing here — every caller picks up the fix.
+# The autosuggest (dim-ghost) regexes and the bright-text marker
+# `\x1b\[38;5;231m` are centralized in this file. `_detect_autosuggest`
+# now accepts TWO shapes, because Claude Code's renderer drifted between
+# them (issue `#50`):
+#
+#   A. `\x1b\[7m.\x1b\[0;2m`  — reverse-video cursor on the suggestion's
+#      first char, immediately followed by faint on the rest. Emitted by
+#      cc ~2.1.147; the shape all pre-#50 fixtures carry.
+#   B. `\x1b\[2m` + content   — a BARE dim run after the chevron, with no
+#      reverse-video prefix anywhere on the row. Emitted by cc 2.1.220.
+#
+# Shape B is the exact drift the pre-#50 version of this note predicted
+# ("e.g. emits `\x1b[2m` alone"), and it cost real safety: with only
+# shape A, a ghost-bearing row matched NO detector, fell through to the
+# `else emit empty` default at the bottom of this file, and so skipped
+# `_finalize_idle_verdict` — a worker holding a live background child
+# read `empty` instead of `working-background`, and `retire-preflight.sh`
+# lost its veto on the irreversible kill path.
+#
+# ON THE NEXT DRIFT: add a third alternative here rather than replacing
+# either existing one (older renderers still appear in captured fixtures
+# and inherited panes), AND capture a fixture from the new renderer into
+# `monitor/watcher/fixtures/autosuggest-*.ansi` — `test-pane-state.sh`
+# auto-discovers it by filename prefix, so the next drift fails a test
+# instead of silently disabling this safety check. Same instruction for
+# `_detect_user_typing` (`\x1b\[38;5;231m`) if the bright marker moves;
+# note the decision order below MUST keep bright text ahead of the dim
+# test so a widened dim pattern can never trample real operator input.
 #
 # Manual sanity check — when the helper's verdict looks wrong, dump
 # the same bytes it parses and inspect the input row by eye:
@@ -233,7 +256,8 @@
 # `cat -v` renders ESC as `^[`. On the line containing `❯<NBSP>`
 # (the input row) look for:
 #
-#   ^[[7m<char>^[[0;2m...      autosuggest (dim ghost)  → ignore
+#   ^[[7m<char>^[[0;2m...      autosuggest, shape A     → ignore
+#   ^[[2m<text>^[[0m...        autosuggest, shape B     → ignore
 #   ^[[38;5;231m...            bright user-typed text   → respect
 #   ^[[7m ^[[0m  (just a space) empty input box
 #
@@ -482,10 +506,30 @@ _find_input_row() {
 }
 
 _detect_autosuggest() {
-    # Dim-cursor signature on the input row: reverse-video first char of
-    # the suggestion, immediately followed by faint/dim on the rest.
+    # Two accepted shapes — see the "autosuggest (dim-ghost) regexes"
+    # note at the top of this file before touching either.
     local input_row="$1"
-    grep -qP $'\x1b\\[7m.\x1b\\[0;2m' <<<"$input_row"
+    # Shape A (cc ~2.1.147): reverse-video first char of the suggestion,
+    # immediately followed by faint/dim on the rest.
+    grep -qP $'\x1b\\[7m.\x1b\\[0;2m' <<<"$input_row" && return 0
+    # Shape B (cc 2.1.220, issue `#50`): a BARE dim run — `\x1b[2m` with
+    # no reverse-video cursor anywhere on the row. Observed live as
+    # `\x1b[39m❯<NBSP>\x1b[2mfix the …\x1b[0m\x1b[39m\x1b[49m`, and
+    # per-word (`\x1b[2mpost\x1b[0m…\x1b[2mthe\x1b[0m…`) on longer ghosts.
+    #
+    # The `(?:\x1b\[[0-9;]*m)*[^\x1b]` tail requires the dim run to have
+    # actual CONTENT (tolerating further SGR sequences layered on top,
+    # e.g. dim+italic), so a content-free `\x1b[2m\x1b[0m` — a dim span
+    # that paints nothing — does not read as a ghost.
+    #
+    # Scope note: this is deliberately NOT anchored to the chevron. The
+    # detector only ever receives `_find_input_row`'s single row, so
+    # ordinary dim chrome elsewhere in the pane (the `+19 lines (ctrl+o
+    # to expand)` hint, tool-result gutters) is already out of reach.
+    # Re-anchoring here would duplicate `_find_input_row`'s job and add
+    # a second chevron-shaped way for this detector to go dark on the
+    # next renderer drift. Do NOT widen the CAPTURE to compensate.
+    grep -qP $'\x1b\\[2m(?:\x1b\\[[0-9;]*m)*[^\x1b]' <<<"$input_row"
 }
 
 _detect_user_typing() {
