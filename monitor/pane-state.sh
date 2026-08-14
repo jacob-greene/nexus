@@ -340,7 +340,38 @@ _has_blocked_overlay() {
     if _has_askuq_overlay "$plain"; then
         return 0
     fi
+    if _has_trust_overlay "$plain"; then
+        return 0
+    fi
     return 1
+}
+
+# Folder-trust overlay (cc 2.1.232). Claude Code 2.1.232 ended trust
+# INHERITANCE for nested git repos — "each repository now requires its
+# own trust confirmation" — so a worker spawned into work/<project>/ (a
+# nested repo under the nexus root repo) now stops PRE-REPL on:
+#
+#     Accessing workspace:
+#     /path/to/work/<project>
+#     Quick safety check: Is this a project you created or one you trust?
+#     ❯ 1. Yes, I trust this folder
+#       2. No, exit
+#     Enter to confirm · Esc to cancel
+#
+# `--dangerously-skip-permissions` does NOT bypass it. Before this
+# detector the frame carried no known signature, so the classifier fell
+# through to `empty` — the state retire-preflight reads as SAFE TO KILL.
+# A stranded worker awaiting a trust confirmation must classify
+# `blocked` so `_unstick.sh`'s Case T can answer it.
+#
+# Two greps AND-ed: the option literal (`Yes, I trust this folder`) is
+# the shape, the chevron is the live-ness — an agent quoting this
+# comment or a report describing the dialog carries the prose but not a
+# chevron-selected option row, so it does not false-trigger.
+_has_trust_overlay() {
+    local plain="$1"
+    grep -qF 'Yes, I trust this folder' <<<"$plain" \
+        && grep -qE $'❯[[:space:]]+[0-9]+\\.[[:space:]]*Yes, I trust this folder' <<<"$plain"
 }
 
 # AskUserQuestion chip-bar overlay (Case D — dialog-guard). Claude
