@@ -3527,14 +3527,33 @@ render_idle_prelude() {
     # rather than a parallel notion of "parked": one source of truth is the
     # property being restored. `orphaned` markers still fail the predicate,
     # so a stuck park keeps its own actionable class and is NOT swept in here.
-    local parked_live_windows already_parked pname
+    #
+    # De-duplicate against EVERY idle-set row, not only the
+    # `parked-awaiting-skeptic` ones. `_idle_skeptic_parked` can be true for a
+    # window the classifier already emitted under an EARLIER class:
+    # `over-limit` (:2893), `pane-absent` (:2964), `idle-orphan-async` (:2982)
+    # and `interrupted` (:3086) all short-circuit above the park check at
+    # :3104, and the comment at :3068-3076 documents the `interrupted` overlap
+    # as deliberate (a crashed await loop is recoverable, not parked). Because
+    # n_busy is the residue `total - sum(buckets)`, counting such a window in
+    # two buckets DEFLATES busy and hides a genuinely-working worker — the same
+    # wrong-busy-count this block exists to fix, in the opposite direction.
+    # Keying the dedup on window NAME alone makes every window contribute to
+    # exactly one bucket, and leaves the actionable scalar (`interrupted`,
+    # `over-limit`, …) visible instead of relabelling it `parked`.
+    # One epoch for the whole sweep, resolved once: per-iteration `date +%s`
+    # lets the second tick over mid-loop, so two windows with the same marker
+    # mtime could land on opposite sides of the hang/grace boundary within a
+    # single render. The sweep is a snapshot; it gets a snapshot's clock.
+    local parked_live_windows already_parked pname parked_now
+    parked_now=$(date +%s)
     parked_live_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
     already_parked=$(printf '%s\n' "$idle_set" \
-        | awk -F'\t' '$2=="parked-awaiting-skeptic" && $1!="" {print $1}')
+        | awk -F'\t' 'NF>0 && $1!="" {print $1}')
     while IFS=$'\t' read -r pname _ _; do
         [[ -n "$pname" ]] || continue
         grep -qxF -- "$pname" <<<"$already_parked" && continue
-        if _idle_skeptic_parked "$pname" "$(date +%s)" "$parked_live_windows"; then
+        if _idle_skeptic_parked "$pname" "$parked_now" "$parked_live_windows"; then
             n_parked=$(( n_parked + 1 ))
         fi
     done < <(_idle_list_worker_windows)
