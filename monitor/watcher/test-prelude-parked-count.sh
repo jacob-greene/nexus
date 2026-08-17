@@ -130,6 +130,81 @@ else
     bad "orphaned marker counted as parked — the exemption was widened, not fixed: $prelude"
 fi
 
+# ---------------------------------------------------------------------------
+# Skeptic addendum: ONE WINDOW, ONE BUCKET.
+#
+# The counts line publishes `busy` as a RESIDUE:
+#   n_busy = total_workers - (idle + retained + too-long + pane-absent
+#            + over-limit + orphan-async + interrupted + parked + idle-children)
+# so a window counted in two buckets does not merely look odd — it SUBTRACTS
+# from busy and hides a genuinely-working worker.
+#
+# Counting the park from the predicate is right, but list_really_idle_workers
+# can class a window under a DIFFERENT class and still leave the predicate
+# true for it: over-limit (:2893), pane-absent (:2964), idle-orphan-async
+# (:2982) and interrupted (:3086) all short-circuit BEFORE the park check at
+# :3104. The interrupted overlap is documented on purpose at :3068-3076.
+# These four cases are why the dedup must be on PRESENCE in the idle set, not
+# on the row's class.
+# ---------------------------------------------------------------------------
+echo '=== one window, one bucket (parked AND another class) ==='
+# Restore the healthy park: live skeptic again, no stale orphan request.
+printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n" "%s" "%s"\n' "$W" "$SK" > "$WORK/bin/tmux"
+printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"%s","target-window":"%s","orig-window":"%s","depth":"1"}\n' \
+    "$(date -Is)" "$SK" "$W" "$W" > "$STATE_DIR/action-log.jsonl"
+mkdir -p "$STATE_DIR/turn-failure"
+
+overlap_case() {
+    local label="$1" other="$2" pane="$3"
+    _idle_pane_state_line() { printf '%s\n' "$pane"; }
+    # Re-anchor the idle age. Earlier sections drove `state=busy`, and
+    # list_really_idle_workers stamps the engagement log on busy — which would
+    # hold this window under the 60s idle threshold and make it skip
+    # classification entirely, masking the very overlap under test.
+    printf '%s\t%s\n' "$W" "$(( NOW - 3000 ))" > "$STATE_DIR/engagement-log.tsv"
+    local p np no nb total
+    p=$(render_idle_prelude)
+    np=$(printf '%s' "$p" | sed -n 's/.*| \([0-9]*\) parked-skeptic |.*/\1/p')
+    no=$(printf '%s' "$p" | sed -n "s/.*| \([0-9]*\) $other |.*/\1/p")
+    nb=$(printf '%s' "$p" | sed -n 's/^\([0-9]*\) busy |.*/\1/p')
+    total=$(( np + no + nb ))
+    if (( total == 1 )); then
+        ok "$label: exactly one bucket owns the single worker"
+    else
+        bad "$label: DOUBLE COUNT — parked=$np $other=$no busy=$nb sums to $total for 1 worker"
+        printf '         %s\n' "$p" >&2
+    fi
+}
+
+overlap_case "parked+over-limit"   over-limit    'state=over-limit active=0 reset_at=1970-01-01T00:00'
+overlap_case "parked+pane-absent"  pane-absent   'state=absent active=0'
+overlap_case "parked+orphan-async" orphan-async  'state=idle-orphan-async active=0 orphan_kinds=slurm:1'
+
+printf '{"ts":%s,"category":"transient","recovery":"paste"}\n' "$NOW" \
+    > "$STATE_DIR/turn-failure/$W.json"
+overlap_case "parked+interrupted"  interrupted   'state=idle active=0'
+rm -f "$STATE_DIR/turn-failure/$W.json"
+
+# A parked worker must not eat a genuinely-busy worker's slot either.
+echo '=== a parked worker does not deflate a genuinely-busy peer ==='
+B=busy-peer
+printf '%s\t%s\n%s\t%s\n' "$W" "$(( NOW - 3000 ))" "$B" "$(( NOW - 3000 ))" \
+    > "$STATE_DIR/engagement-log.tsv"
+printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n%%s\n" "%s" "%s" "%s" \n' "$W" "$SK" "$B" > "$WORK/bin/tmux"
+_idle_list_worker_windows() {
+    printf '%s\t%s\t%s\n' "$W" "$(( NOW - 3000 ))" "3"
+    printf '%s\t%s\t%s\n' "$B" "$(( NOW - 3000 ))" "4"
+}
+_idle_pane_state_line() { printf 'state=busy active=0\n'; }
+prelude=$(render_idle_prelude)
+n_parked=$(printf '%s' "$prelude" | sed -n 's/.*| \([0-9]*\) parked-skeptic |.*/\1/p')
+n_busy=$(printf '%s' "$prelude" | sed -n 's/^\([0-9]*\) busy |.*/\1/p')
+if [[ "$n_parked" == "1" && "$n_busy" == "1" ]]; then
+    ok "1 parked + 1 busy reports parked=1 busy=1"
+else
+    bad "1 parked + 1 busy misreported: $prelude"
+fi
+
 echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d/%d)\n' "$PASS" "$(( PASS + FAIL ))"

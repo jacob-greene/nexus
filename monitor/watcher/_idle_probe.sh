@@ -3529,8 +3529,19 @@ render_idle_prelude() {
     # so a stuck park keeps its own actionable class and is NOT swept in here.
     local parked_live_windows already_parked pname
     parked_live_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    # Dedup against EVERY row the idle set already accounted for, not just
+    # the rows it classed `parked-awaiting-skeptic`. Four classes short-circuit
+    # BEFORE the park check at :3104 — over-limit (:2893), pane-absent (:2964),
+    # idle-orphan-async (:2982) and interrupted (:3086, whose comment at
+    # :3068-3076 documents the overlap deliberately) — and _idle_skeptic_parked
+    # can still be true for those windows. Deduping on the class alone put them
+    # in TWO buckets, and since n_busy is the residue `total - sum(buckets)`,
+    # the second count silently DEFLATED busy and hid a genuinely-working
+    # worker. Deduping on presence keeps the idle set authoritative wherever it
+    # has an opinion, and lets the predicate supply the count only for windows
+    # it skipped entirely — which is exactly the #7 item 2 gap.
     already_parked=$(printf '%s\n' "$idle_set" \
-        | awk -F'\t' '$2=="parked-awaiting-skeptic" && $1!="" {print $1}')
+        | awk -F'\t' 'NF>0 && $1!="" {print $1}')
     while IFS=$'\t' read -r pname _ _; do
         [[ -n "$pname" ]] || continue
         grep -qxF -- "$pname" <<<"$already_parked" && continue
