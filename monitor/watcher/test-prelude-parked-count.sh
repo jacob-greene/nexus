@@ -130,52 +130,79 @@ else
     bad "orphaned marker counted as parked — the exemption was widened, not fixed: $prelude"
 fi
 
-# A window can be skeptic-parked AND emitted by the classifier under an
-# EARLIER class: over-limit (:2893), pane-absent (:2964), idle-orphan-async
-# (:2982) and interrupted (:3086) all short-circuit above the park check at
-# :3104 — the comment at :3068-3076 documents the `interrupted` overlap as
-# deliberate. Counting such a window twice deflates the `busy` residue and
-# hides a genuinely-working worker: the same defect this file pins, inverted.
-# (Skeptic req-001 on PR #57.)
-echo '=== overlapping class is not double-counted (busy residue stays honest) ==='
-OWORK=$(mktemp -d); trap 'rm -rf "$WORK" "$OWORK"' EXIT
-(
-    export STATE_DIR="$OWORK/state"
-    mkdir -p "$STATE_DIR/skeptic/pending" "$STATE_DIR/turn-failure"
-    OW=parked-and-interrupted; OSK="$OW-skeptic"
-    touch "$STATE_DIR/skeptic/pending/$OW"
-    printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"%s","target-window":"%s","orig-window":"%s","depth":"1"}\n' \
-        "$(date -Is)" "$OSK" "$OW" "$OW" > "$STATE_DIR/action-log.jsonl"
-    # Fresh turn-failure marker -> classed `interrupted`, above the park check.
-    printf '{"ts":%s,"category":"transient","recovery":"paste"}\n' "$(( NOW - 60 ))" \
-        > "$STATE_DIR/turn-failure/$OW.json"
-    for w in "$OW" busy-one busy-two; do
-        printf '%s\t%s\n' "$w" "$(( NOW - 3000 ))" >> "$STATE_DIR/engagement-log.tsv"
-    done
-    printf '#!/usr/bin/env bash\nprintf "%%s\\n%%s\\n%%s\\n%%s\\n" "%s" "%s" "busy-one" "busy-two"\n' \
-        "$OW" "$OSK" > "$WORK/bin/tmux"
-    _idle_list_worker_windows() {
-        printf '%s\t%s\t3\n' "$OW" "$(( NOW - 3000 ))"
-        printf 'busy-one\t%s\t4\n' "$(( NOW - 3000 ))"
-        printf 'busy-two\t%s\t5\n' "$(( NOW - 3000 ))"
-    }
-    _idle_pane_state_line() {
-        case "$1" in 3) printf 'state=empty active=0\n' ;; *) printf 'state=busy active=1\n' ;; esac
-    }
-    prelude=$(render_idle_prelude)
-    n_busy=$(printf '%s' "$prelude" | sed -n 's/^\([0-9]*\) busy |.*/\1/p')
-    n_int=$(printf '%s' "$prelude" | sed -n 's/.*| \([0-9]*\) interrupted |.*/\1/p')
-    n_parked=$(printf '%s' "$prelude" | sed -n 's/.*| \([0-9]*\) parked-skeptic |.*/\1/p')
-    rc=0
-    [[ "$n_busy" == "2" ]] || { printf '  FAIL: overlap deflates busy: got %s busy, want 2 (two genuinely-busy workers hidden)\n         %s\n' "$n_busy" "$prelude" >&2; rc=1; }
-    [[ "$n_int"  == "1" ]] || { printf '  FAIL: the actionable `interrupted` scalar was lost: got %s, want 1\n' "$n_int" >&2; rc=1; }
-    [[ "$n_parked" == "0" ]] || { printf '  FAIL: window counted in two buckets: parked-skeptic=%s, want 0 (it is already `interrupted`)\n' "$n_parked" >&2; rc=1; }
-    exit $rc
-)
-if (( $? == 0 )); then
-    ok "overlapping class counted once; busy residue and actionable scalar intact"
+# ---------------------------------------------------------------------------
+# Skeptic addendum: ONE WINDOW, ONE BUCKET.
+#
+# The counts line publishes `busy` as a RESIDUE:
+#   n_busy = total_workers - (idle + retained + too-long + pane-absent
+#            + over-limit + orphan-async + interrupted + parked + idle-children)
+# so a window counted in two buckets does not merely look odd — it SUBTRACTS
+# from busy and hides a genuinely-working worker.
+#
+# Counting the park from the predicate is right, but list_really_idle_workers
+# can class a window under a DIFFERENT class and still leave the predicate
+# true for it: over-limit (:2893), pane-absent (:2964), idle-orphan-async
+# (:2982) and interrupted (:3086) all short-circuit BEFORE the park check at
+# :3104. The interrupted overlap is documented on purpose at :3068-3076.
+# These four cases are why the dedup must be on PRESENCE in the idle set, not
+# on the row's class.
+# ---------------------------------------------------------------------------
+echo '=== one window, one bucket (parked AND another class) ==='
+# Restore the healthy park: live skeptic again, no stale orphan request.
+printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n" "%s" "%s"\n' "$W" "$SK" > "$WORK/bin/tmux"
+printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"%s","target-window":"%s","orig-window":"%s","depth":"1"}\n' \
+    "$(date -Is)" "$SK" "$W" "$W" > "$STATE_DIR/action-log.jsonl"
+mkdir -p "$STATE_DIR/turn-failure"
+
+overlap_case() {
+    local label="$1" other="$2" pane="$3"
+    _idle_pane_state_line() { printf '%s\n' "$pane"; }
+    # Re-anchor the idle age. Earlier sections drove `state=busy`, and
+    # list_really_idle_workers stamps the engagement log on busy — which would
+    # hold this window under the 60s idle threshold and make it skip
+    # classification entirely, masking the very overlap under test.
+    printf '%s\t%s\n' "$W" "$(( NOW - 3000 ))" > "$STATE_DIR/engagement-log.tsv"
+    local p np no nb total
+    p=$(render_idle_prelude)
+    np=$(printf '%s' "$p" | sed -n 's/.*| \([0-9]*\) parked-skeptic |.*/\1/p')
+    no=$(printf '%s' "$p" | sed -n "s/.*| \([0-9]*\) $other |.*/\1/p")
+    nb=$(printf '%s' "$p" | sed -n 's/^\([0-9]*\) busy |.*/\1/p')
+    total=$(( np + no + nb ))
+    if (( total == 1 )); then
+        ok "$label: exactly one bucket owns the single worker"
+    else
+        bad "$label: DOUBLE COUNT — parked=$np $other=$no busy=$nb sums to $total for 1 worker"
+        printf '         %s\n' "$p" >&2
+    fi
+}
+
+overlap_case "parked+over-limit"   over-limit    'state=over-limit active=0 reset_at=1970-01-01T00:00'
+overlap_case "parked+pane-absent"  pane-absent   'state=absent active=0'
+overlap_case "parked+orphan-async" orphan-async  'state=idle-orphan-async active=0 orphan_kinds=slurm:1'
+
+printf '{"ts":%s,"category":"transient","recovery":"paste"}\n' "$NOW" \
+    > "$STATE_DIR/turn-failure/$W.json"
+overlap_case "parked+interrupted"  interrupted   'state=idle active=0'
+rm -f "$STATE_DIR/turn-failure/$W.json"
+
+# A parked worker must not eat a genuinely-busy worker's slot either.
+echo '=== a parked worker does not deflate a genuinely-busy peer ==='
+B=busy-peer
+printf '%s\t%s\n%s\t%s\n' "$W" "$(( NOW - 3000 ))" "$B" "$(( NOW - 3000 ))" \
+    > "$STATE_DIR/engagement-log.tsv"
+printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n%%s\n" "%s" "%s" "%s" \n' "$W" "$SK" "$B" > "$WORK/bin/tmux"
+_idle_list_worker_windows() {
+    printf '%s\t%s\t%s\n' "$W" "$(( NOW - 3000 ))" "3"
+    printf '%s\t%s\t%s\n' "$B" "$(( NOW - 3000 ))" "4"
+}
+_idle_pane_state_line() { printf 'state=busy active=0\n'; }
+prelude=$(render_idle_prelude)
+n_parked=$(printf '%s' "$prelude" | sed -n 's/.*| \([0-9]*\) parked-skeptic |.*/\1/p')
+n_busy=$(printf '%s' "$prelude" | sed -n 's/^\([0-9]*\) busy |.*/\1/p')
+if [[ "$n_parked" == "1" && "$n_busy" == "1" ]]; then
+    ok "1 parked + 1 busy reports parked=1 busy=1"
 else
-    bad "skeptic-parked window overlapping an earlier class is double-counted"
+    bad "1 parked + 1 busy misreported: $prelude"
 fi
 
 echo
