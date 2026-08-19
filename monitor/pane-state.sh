@@ -586,16 +586,18 @@ _input_row_text() {
     # Everything after the chevron; no chevron ⇒ nothing to report.
     [[ "$txt" == *"❯${NBSP}"* ]] || { printf ''; return 0; }
     txt=${txt#*"❯${NBSP}"}
-    # Sanitize to one safe line. Tab/CR/LF become spaces (word boundaries
-    # survive), EVERY other control byte is deleted outright, then runs of
-    # whitespace — including the NBSP padding tmux paints — collapse and
-    # the ends are trimmed. No control byte may survive: the encoder would
-    # faithfully round-trip it to a real newline in a consumer's decoded
-    # output, where it could forge an extra line or an extra field.
+    # Sanitize to one safe line: control bytes become spaces (a word
+    # boundary, never a silent join), then runs of whitespace — including
+    # the NBSP padding tmux paints — collapse, and the ends are trimmed.
+    # No control byte may survive: the encoder would faithfully round-trip
+    # one into a real newline in a consumer's decoded output, where it
+    # could forge an extra line or an extra field.
+    #
+    # One sed, not tr|tr|sed. This runs on every pane-state emit that has
+    # a capture — i.e. every worker pane on every watcher poll — so the
+    # fork count is worth minimising.
     txt=$(printf '%s' "$txt" \
-        | tr '\011\012\015' '   ' \
-        | tr -d '\000-\037\177' \
-        | sed -E "s/(${NBSP}|[[:space:]])+/ /g; s/^ +//; s/ +\$//")
+        | sed -E "s/[[:cntrl:]]+/ /g; s/(${NBSP}|[[:space:]])+/ /g; s/^ +//; s/ +\$//")
     [[ -n "$txt" ]] || { printf ''; return 0; }
     # Cap length so one emit line stays bounded regardless of pane width.
     if (( ${#txt} > 200 )); then
@@ -1254,7 +1256,11 @@ emit() {
     # existing consumers see a byte-identical line for an empty box.
     if [[ -n "${pane_ansi:-}" ]]; then
         local _row _txt
-        _row=$(_find_input_row "$pane_ansi")
+        # Reuse the row the classifier already found where one exists
+        # (renderer path sets `input_row`, heartbeat refinement sets
+        # `hb_input_row`); only grep the capture again when neither did.
+        _row="${input_row:-${hb_input_row:-}}"
+        [[ -n "$_row" ]] || _row=$(_find_input_row "$pane_ansi")
         if [[ -n "$_row" ]]; then
             _txt=$(_input_row_text "$_row")
             [[ -n "$_txt" ]] && extra+=" input_text=$_txt"

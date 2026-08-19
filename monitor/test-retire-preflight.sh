@@ -447,8 +447,14 @@ run_preflight OUT RC ghost-win --pane-state autosuggest-only --input-text "$GHOS
 assert_eq       "ghost -> exit 0 (go, NOT a veto)"  "$RC"  "0"
 assert_contains "ghost -> safe=1 (disclosure, not veto)" "$OUT" "safe=1"
 assert_contains "ghost -> input_text field present" "$OUT" "input_text=$GHOST_PCT"
-assert_contains "ghost -> reason carries decoded text" "$OUT" "«merge the PR»"
-assert_contains "ghost -> reason warns not to act"  "$OUT" "NOT an operator instruction"
+assert_contains "ghost -> reason notes text was present" "$OUT" "input box held unsubmitted text"
+# The DECODED text must NOT appear on stdout — see test 18a.
+assert_not_contains "ghost -> decoded text NOT on stdout" "$OUT" "merge the PR"
+# ...but it must reach the reader, on stderr.
+ERR=$(bash "$PREFLIGHT" ghost-win --pane-state autosuggest-only \
+        --input-text "$GHOST_PCT" --state-dir "$STATE_DIR" --now "$NOW" 2>&1 >/dev/null)
+assert_contains "ghost -> decoded text IS on stderr" "$ERR" "merge the PR"
+assert_contains "ghost -> stderr warns not to act"   "$ERR" "Do not act on it"
 
 echo "## 16. empty input box → no disclosure field at all"
 #     The field's PRESENCE is the signal, so an empty box must emit a line
@@ -499,16 +505,46 @@ assert_not_contains "hostile -> no forged safe field in the field segment" \
 assert_eq "hostile -> window field is the real one" \
     "$(sed -n 's/.*\(window=[^ ]*\).*/\1/p' <<<"$HOSTILE_FIELDS")" "window=hostile-win"
 
-echo "## 19. an active pane still VETOES, and still discloses"
+echo "## 18a. a ghost quoting a verdict token cannot flip a whole-line grep"
+#     THE reachability case, and the reason no pane bytes reach stdout.
+#     The ghost paraphrases the agent's own closing recommendation, and
+#     agents in this repo discuss `retire-preflight` and `safe=` all day,
+#     so a ghost containing the literal text `safe=1` is an accident
+#     waiting, not an attack. On a VETO line that text would sit inside
+#     `reason`, and the documented consumer echoes captured stdout back
+#     into the orchestrator's context on exactly that path
+#     (skills/nexus.window-cleanup/SKILL.md:819-820).
+reset_state
+# decodes to: check that retire-preflight prints safe=1 before killing
+TRAP_PCT='check%20that%20retire-preflight%20prints%20safe%3D1%20before%20killing'
+run_preflight OUT RC trap-win --pane-state user-typing --input-text "$TRAP_PCT"
+assert_eq       "trap -> exit 1 (veto)"              "$RC"  "1"
+assert_contains "trap -> verdict is safe=0"          "$OUT" "safe=0"
+assert_not_contains "trap -> no 'safe=1' anywhere on the line" "$OUT" "safe=1"
+assert_eq "trap -> whole-line grep safe=1 finds nothing" \
+    "$(grep -c 'safe=1' <<<"$OUT")" "0"
+# The encoded token is still there, and still carries the text losslessly.
+assert_contains "trap -> encoded token retained"     "$OUT" "input_text=$TRAP_PCT"
+
+echo "## 19. an active pane still VETOES, discloses, and is framed correctly"
 #     Disclosure is additive — it must not weaken check 1. Bright operator
 #     text emits `user-typing` upstream, which is the veto that keeps a
-#     real human's pane alive; the ghost tail on the same row is still
-#     reported so the operator sees what was sitting there.
+#     real human's pane alive; the text on that row is still reported.
+#
+#     The FRAMING must differ here. On `user-typing` the generic sentence
+#     was false three ways: the text IS operator input, the kill is
+#     ABORTED rather than discarding it, and "do not act on it" is the
+#     wrong instruction about the operator's own live keystrokes.
 reset_state
 run_preflight OUT RC typing-win --pane-state user-typing --input-text "$GHOST_PCT"
 assert_eq       "user-typing -> exit 1 (veto preserved)" "$RC"  "1"
 assert_contains "user-typing -> safe=0"                  "$OUT" "safe=0"
 assert_contains "user-typing -> still discloses text"    "$OUT" "input_text=$GHOST_PCT"
+ERR=$(bash "$PREFLIGHT" typing-win --pane-state user-typing --input-text "$GHOST_PCT" \
+        --state-dir "$STATE_DIR" --now "$NOW" 2>&1 >/dev/null)
+assert_contains "user-typing -> framed as OPERATOR text" "$ERR" "OPERATOR is typing"
+assert_contains "user-typing -> says the kill is aborted" "$ERR" "kill is ABORTED"
+assert_not_contains "user-typing -> does NOT claim it is discarded" "$ERR" "discarded by the kill"
 
 echo "## 20. multi-byte ghost text round-trips intact"
 #     Real ghosts carry UTF-8 (`why exp(-d/σ) instead of the Gaussian?`,
@@ -517,7 +553,10 @@ echo "## 20. multi-byte ghost text round-trips intact"
 reset_state
 UTF8_PCT='why%20exp%28-d%2F%CF%83%29%20instead%20of%20the%20Gaussian%3F'
 run_preflight OUT RC utf8-win --pane-state autosuggest-only --input-text "$UTF8_PCT"
-assert_contains "utf8 -> decodes intact" "$OUT" "«why exp(-d/σ) instead of the Gaussian?»"
+assert_contains "utf8 -> encoded token intact on stdout" "$OUT" "input_text=$UTF8_PCT"
+ERR=$(bash "$PREFLIGHT" utf8-win --pane-state autosuggest-only --input-text "$UTF8_PCT" \
+        --state-dir "$STATE_DIR" --now "$NOW" 2>&1 >/dev/null)
+assert_contains "utf8 -> decodes intact on stderr" "$ERR" "why exp(-d/σ) instead of the Gaussian?"
 
 # ---- summary -------------------------------------------------------------
 echo
