@@ -370,6 +370,20 @@ if [[ -n "$probe_lib" ]]; then
     source "$probe_lib" 2>/dev/null && have_probe=1
 fi
 
+# The shared retire-gate predicate (jacob-greene/nexus#16). _idle_probe.sh
+# already pulls it in, but source it independently so check 1b still has
+# the ONE derivation even when the probe lib is absent.
+gate_lib=""
+if [[ -n "${NEXUS_ROOT:-}" && -r "$NEXUS_ROOT/monitor/_skeptic_gate.sh" ]]; then
+    gate_lib="$NEXUS_ROOT/monitor/_skeptic_gate.sh"
+elif [[ -r "$self_dir/_skeptic_gate.sh" ]]; then
+    gate_lib="$self_dir/_skeptic_gate.sh"
+fi
+if [[ -n "$gate_lib" ]] && ! declare -F skeptic_gate_state >/dev/null 2>&1; then
+    # shellcheck disable=SC1090
+    source "$gate_lib" 2>/dev/null || true
+fi
+
 # ---- check 1b: unresolved required-skeptic marker -------------------------
 # The skeptic protocol (skills/nexus.skeptic) writes a pending marker at
 # $STATE_DIR/skeptic/pending/<window> when a wrap-up REQUIRES an
@@ -391,29 +405,75 @@ fi
 # fall back to the original unconditional no-go (conservative: refuse).
 #
 # "ORPHANED" means CHECKED-absent, never merely unchecked: if tmux cannot
-# be asked at all, _idle_skeptic_live_window answers rc 2 and this check
-# refuses (jacob-greene/nexus#31). Before that, an unanswered tmux read as
-# an empty window list, which read as `orphaned` — so this check would
-# kill a worker whose reviewer was alive.
-sk_pending="$STATE_DIR/skeptic/pending/${win_name//[^a-zA-Z0-9_-]/_}"
-if [[ -f "$sk_pending" ]]; then
-    _sk_now=$(date +%s)
-    if (( have_probe )) && declare -F _idle_skeptic_orphaned >/dev/null 2>&1 \
-       && _idle_skeptic_orphaned "$win_name" "$_sk_now"; then
-        # Orphaned marker: NOT live validation. Note it (stderr, so the single
-        # stdout verdict stays authoritative) and fall through — the marker no
-        # longer blocks retirement. Checks 2/3 below still guard operator
-        # engagement, so a genuinely-in-use window is still refused.
-        printf 'retire-preflight: skeptic-pending marker for %q is ORPHANED (no live skeptic past grace) — not blocking retirement\n' \
-            "$win_name" >&2
-    else
-        # Name what is KNOWN. This branch is reached whenever the marker is
-        # not CHECKED-orphaned — including when liveness could not be
-        # determined at all (tmux unreachable, nexus#31) — so asserting a
-        # live reviewer here would claim more than was established.
-        emit 0 "$pane_state" "required skeptic has not returned a verdict (skeptic-pending marker unresolved) — task not done, refusing kill"
-        exit 1
-    fi
+# be asked at all, skeptic_gate_state answers `unclassified` and this
+# check refuses (jacob-greene/nexus#31). Before that, an unanswered tmux
+# read as an empty window list, which read as `orphaned` — so this check
+# would kill a worker whose reviewer was alive.
+#
+# THIS CHECK IS THE DEFINITION OF "gated" (jacob-greene/nexus#16). Nothing
+# else holds a window back, so every other site asking "is this window
+# still gated?" — `ng wrap-up`'s re-wrap guard, the idle probe's
+# exemption — must get the same answer. It does, because they all call
+# skeptic_gate_state (monitor/_skeptic_gate.sh) rather than re-deriving
+# the marker path and the freshness/liveness/grace ladder by hand, which
+# is how ng and this file drifted apart in the first place. Whatever
+# reaches the `else` below IS the gate; that is what the other callers
+# are told.
+_sk_now=$(date +%s)
+if declare -F skeptic_gate_state >/dev/null 2>&1; then
+    sk_state=$(skeptic_gate_state "$win_name" "$_sk_now"); sk_blocks=$?
+    sk_pending=$(skeptic_gate_marker "$win_name" 2>/dev/null || true)
+    # A failure OF the derivation is not an answer FROM it.
+    #
+    # skeptic_gate_state's own invariant — "`orphaned` must be reachable
+    # ONLY from a CHECKED absence; anything that merely failed to check
+    # lands in `unclassified`" (_skeptic_gate.sh) — is enforced INSIDE that
+    # function. It cannot police the function aborting. And this call site
+    # is a command substitution, which CONTAINS an abort: an unbound
+    # variable under `set -u`, a half-written probe lib, a helper that dies
+    # mid-ladder — any of them leave this shell alive with an empty state
+    # and a non-zero rc. Empty is neither `0` nor `orphaned`, so it would
+    # fall past both branches below, past checks 2/3, and out as `safe=1`:
+    # the kill authorized on a window whose reviewer may be alive.
+    #
+    # This is not hypothetical structure-worship, it is a REGRESSION guard.
+    # Before the shared gate, check 1b called `_idle_skeptic_orphaned` in
+    # THIS shell, so an abort inside it took the preflight down with it —
+    # rc 1, no verdict line, no kill. Moving the derivation behind `$(…)`
+    # traded that fail-CLOSED default for a fail-OPEN one. Measured both
+    # ways, reviewer genuinely alive, abort injected into the ladder:
+    # pre-gate `rc=1` and no `safe=` line; post-gate `rc=0 safe=1 … safe to
+    # retire`. Test arm 9e in test-retire-preflight.sh, with a negative
+    # control that strips this guard and asserts `safe=1` comes back.
+    #
+    # So: only a state this file recognises may be acted on. Anything else
+    # — empty, truncated, a name a future gate version adds — is exactly
+    # the "failed to check" class, and takes the class that blocks.
+    case "$sk_state" in
+        live|grace|stale|unclassified|orphaned|absent) : ;;
+        *) sk_state=unclassified; sk_blocks=0 ;;
+    esac
+else
+    # Degraded (gate lib unreachable): the original unconditional no-go.
+    sk_pending="$STATE_DIR/skeptic/pending/${win_name//[^a-zA-Z0-9_-]/_}"
+    if [[ -f "$sk_pending" ]]; then sk_state=unclassified; sk_blocks=0
+    else sk_state=absent; sk_blocks=1; fi
+fi
+if (( sk_blocks == 0 )); then
+    # Name the gate STATE rather than asserting a live skeptic. `live` is
+    # one of several blocking states (grace / stale / unclassified also
+    # block) and the old wording claimed it in all of them — the same
+    # unchecked-claim shape as jacob-greene/nexus#16 SK1-b, in the file that
+    # defines the gate.
+    emit 0 "$pane_state" "required skeptic has not returned a verdict (skeptic-pending gate: $sk_state) — task not done, refusing kill"
+    exit 1
+elif [[ "$sk_state" == orphaned ]]; then
+    # Orphaned marker: NOT live validation. Note it (stderr, so the single
+    # stdout verdict stays authoritative) and fall through — the marker no
+    # longer blocks retirement. Checks 2/3 below still guard operator
+    # engagement, so a genuinely-in-use window is still refused.
+    printf 'retire-preflight: skeptic-pending marker for %q is ORPHANED (no live skeptic past grace) — not blocking retirement\n' \
+        "$win_name" >&2
 fi
 
 # ---- check 2: FRESH, operator-attributed user-prompt submit ---------------

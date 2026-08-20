@@ -2456,6 +2456,14 @@ prune_archive() {
 # shellcheck source=_unstick.sh
 source "$_script_dir/_unstick.sh"
 
+# Shared retire-gate predicate (jacob-greene/nexus#16). Sourced HERE, from
+# main.sh, and not only transitively via _idle_probe.sh, so the
+# version-aware self-restart tracks it: _version_watcher_source_set parses
+# main.sh's own `source "$_script_dir/..."` lines, so a module reached only
+# through another module would drift without triggering a restart.
+# shellcheck source=../_skeptic_gate.sh
+source "$_script_dir/../_skeptic_gate.sh"
+
 # Idle-worker probe (tmux window_activity + pane-state.sh). See
 # _idle_probe.sh for the state machine and dedupe contract.
 # shellcheck source=_idle_probe.sh

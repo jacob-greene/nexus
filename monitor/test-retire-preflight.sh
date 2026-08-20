@@ -50,7 +50,6 @@ assert_contains() {
         FAIL=$(( FAIL + 1 ))
     fi
 }
-
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
     if grep -qF -- "$needle" <<<"$hay"; then
@@ -63,11 +62,13 @@ assert_not_contains() {
 
 # ---- harness -------------------------------------------------------------
 # Pin the checkout under test to THIS one. retire-preflight.sh resolves its
-# helper lib as "$NEXUS_ROOT/monitor/watcher/_idle_probe.sh else
-# $self_dir/watcher/...", so an ambient NEXUS_ROOT (every nexus agent has
-# one, pointing at the primary clone) silently made this suite exercise
-# ANOTHER tree's _idle_probe.sh — green, and establishing nothing about
-# the file in this working tree.
+# helper libs as "$NEXUS_ROOT/monitor/... else $self_dir/...", so an
+# ambient NEXUS_ROOT (every nexus agent has one, pointing at the primary
+# clone) silently made this suite exercise ANOTHER tree's _idle_probe.sh
+# and _skeptic_gate.sh — a green run that established nothing about the
+# files in this working tree. run-tests.sh's canonical drive already uses
+# `env -u NEXUS_ROOT`; this makes a direct `bash monitor/test-retire-preflight.sh`
+# honest too.
 unset NEXUS_ROOT
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -267,10 +268,13 @@ echo 1 > "$STATE_DIR/skeptic/pending/pending-skeptic-win"
 run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "exit 1 (no-go)"     "$RC"  "1"
 assert_contains "safe=0"            "$OUT" "safe=0"
-assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending marker unresolved"
-# The refusal fires in several states (live reviewer / inside the spawn
-# grace / liveness undeterminable), so it must not claim a live reviewer
-# it did not check.
+assert_contains "reason cites pending skeptic" "$OUT" "skeptic-pending gate:"
+# The reason names the GATE STATE the shared predicate returned, and does
+# not claim a live skeptic it never checked (jacob-greene/nexus#16 SK1-b).
+# A freshly-required marker with no spawned reviewer is `grace`: the
+# orchestrator still has its dispatch window, and the gate holds.
+assert_contains "reason names the gate state, not a claimed reviewer" "$OUT" \
+                "skeptic-pending gate: grace"
 assert_not_contains "reason does NOT assert the marker is live" "$OUT" \
                     "skeptic-pending marker live"
 # Once the skeptic returns a verdict (marker cleared) the same window is
@@ -280,49 +284,130 @@ run_preflight OUT RC pending-skeptic-win --pane-state idle
 assert_eq      "marker cleared -> exit 0 (go)" "$RC"  "0"
 assert_contains "marker cleared -> safe=1"     "$OUT" "safe=1"
 
-# ── 9c. ORPHANED marker → GO, but only from a CHECKED absence ────────────
-# The fidelity rule: a marker whose reviewer really died is a stuck state,
-# not live validation, so the kill is allowed with a loud note. Driven off
-# explicit stamps and a scripted tmux, so the state cannot depend on how
-# long the test itself took or on the host's tmux.
-echo "## 9c. orphaned skeptic-pending marker (tmux ANSWERS) → GO"
+# ── 9c. ORPHANED marker → GO, and ng's re-wrap guard must AGREE ──────────
+# jacob-greene/nexus#16 SK1-b: a marker whose reviewer died is not live
+# validation. This check lets the kill through with a note — so `ng
+# wrap-up`'s re-wrap guard must NOT be telling the same worker that a
+# reviewer is holding its window. Both now call skeptic_gate_state, and
+# this asserts the shared predicate answers `orphaned` on exactly the state
+# this check allows through, which is what keeps them in step.
+echo "## 9c. orphaned skeptic-pending marker → GO (and gate-state=orphaned)"
 reset_state
 mkdir -p "$STATE_DIR/skeptic/pending"
 echo 1 > "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
-SK_NOW=$(date +%s)
+# The skeptic was REQUIRED 300 s ago and dispatched; no such tmux window is
+# alive now, and the grace is 60 s. Ages are driven off explicit stamps
+# rather than a zero grace so the state cannot depend on how long the test
+# itself took.
 printf '{"ts":"%s","event":"skeptic-request","target-window":"orphan-skeptic-win","depth":"1"}\n' \
-    "$(date -Iseconds -d "@$(( SK_NOW - 300 ))")" >> "$STATE_DIR/action-log.jsonl"
+    "$(date -Iseconds -d "@$(( NOW - 300 ))")" >> "$STATE_DIR/action-log.jsonl"
 printf '{"ts":"%s","event":"skeptic-spawn","window":"orphan-skeptic-win-skeptic","target-window":"orphan-skeptic-win","orig-window":"orphan-skeptic-win"}\n' \
-    "$(date -Iseconds -d "@$(( SK_NOW - 290 ))")" >> "$STATE_DIR/action-log.jsonl"
-touch -d "@$(( SK_NOW - 300 ))" "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
+    "$(date -Iseconds -d "@$(( NOW - 290 ))")" >> "$STATE_DIR/action-log.jsonl"
+touch -d "@$(( NOW - 300 ))" "$STATE_DIR/skeptic/pending/orphan-skeptic-win"
 export MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS=60
-export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win'   # reviewer really gone
+# tmux ANSWERS, and the reviewer is genuinely not among the live windows.
+# `orphaned` may be claimed only from a CHECKED absence (nexus#31).
+export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win'
 unset MOCK_TMUX_LIST_RC
 run_preflight OUT RC orphan-skeptic-win --pane-state idle
 assert_eq      "orphaned marker -> exit 0 (go)" "$RC"  "0"
 assert_contains "orphaned marker -> safe=1"     "$OUT" "safe=1"
+gate_state=$(STATE_DIR="$STATE_DIR" \
+    bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+assert_eq      "shared predicate calls it orphaned" "$gate_state" "orphaned"
 
 # ── 9d. SAME STATE, tmux CANNOT ANSWER → NO-GO (jacob-greene/nexus#31) ───
 # The arm that was wrong. Identical on-disk state to 9c, except the
 # reviewer IS alive and tmux fails to say so. Liveness used to be inferred
 # from an empty window list, so an unanswered tmux read as "no reviewer"
 # and this check — the one that KILLS — allowed the kill on a window whose
-# reviewer was alive.
-echo "## 9d. same state + tmux cannot answer → NO-GO"
+# reviewer was alive. `orphaned` is now reachable only from a checked
+# absence; an unanswerable tmux is `unclassified`, which refuses.
+echo "## 9d. same state + tmux cannot answer → NO-GO (gate-state=unclassified)"
+# The reviewer really is alive — that is exactly why allowing the kill was
+# a defect and not merely a conservative call.
 export MOCK_TMUX_WINDOWS=$'orchestrator\norphan-skeptic-win\norphan-skeptic-win-skeptic'
 for _rc in 1 127; do
     export MOCK_TMUX_LIST_RC="$_rc"
     run_preflight OUT RC orphan-skeptic-win --pane-state idle
     assert_eq      "tmux rc $_rc -> exit 1 (refuse the kill)" "$RC"  "1"
-    assert_contains "tmux rc $_rc -> safe=0"                  "$OUT" "safe=0"
-    assert_contains "tmux rc $_rc -> refusal names an unresolved marker" "$OUT" \
-                    "skeptic-pending marker unresolved"
+    assert_contains "tmux rc $_rc -> gate-state unclassified" "$OUT" \
+                    "skeptic-pending gate: unclassified"
+    assert_not_contains "tmux rc $_rc -> does NOT call it orphaned" "$OUT" \
+                    "skeptic-pending gate: orphaned"
+    gate_state=$(STATE_DIR="$STATE_DIR" MOCK_TMUX_LIST_RC="$_rc" \
+        bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+    assert_eq      "tmux rc $_rc -> shared predicate says unclassified" \
+                    "$gate_state" "unclassified"
 done
 unset MOCK_TMUX_LIST_RC _rc
-# CONTROL: tmux answering on that SAME live reviewer must also refuse —
-# the arms differ only in answerability, so both must gate.
+# And with tmux answering again on that SAME live reviewer: `live`, still
+# a refusal — the control proving the arms differ only in answerability.
+gate_state=$(STATE_DIR="$STATE_DIR" MOCK_TMUX_WINDOWS="$MOCK_TMUX_WINDOWS" \
+    bash -c 'source "$1/_skeptic_gate.sh"; skeptic_gate_state orphan-skeptic-win' _ "$_test_dir")
+assert_eq      "tmux answering on the same live reviewer -> live" "$gate_state" "live"
 run_preflight OUT RC orphan-skeptic-win --pane-state idle
-assert_eq      "tmux answers + live reviewer -> exit 1 (refuse)" "$RC" "1"
+assert_eq      "live reviewer -> exit 1 (refuse the kill)" "$RC" "1"
+
+# ── 9e. the DERIVATION ITSELF fails → NO-GO (not `safe=1`) ───────────────
+# Distinct from 9d. There the gate answered and the answer was "I could not
+# determine liveness". Here skeptic_gate_state does not answer at all — it
+# aborts mid-ladder — and the call site is a command substitution, which
+# CONTAINS the abort: the preflight survives with an empty state and a
+# non-zero rc.
+#
+# That is a fail-OPEN default unless something stops it, and it is a
+# regression this refactor could reintroduce silently. Before the shared
+# gate, check 1b called `_idle_skeptic_orphaned` in the preflight's OWN
+# shell, so an abort took the preflight down with it: rc 1, no verdict
+# line, no kill. Moving the derivation behind `$(…)` removes that.
+#
+# Driven against DECOY TREES, with the same on-disk state as 9d and the
+# reviewer GENUINELY ALIVE, so a regression shows up as the real-world
+# outcome — the kill authorized on a live reviewer — and not as a
+# string mismatch.
+echo "## 9e. skeptic_gate_state ABORTS → NO-GO (fail closed, not safe=1)"
+mk_abort_tree() {   # <dir> <strip-guard:0|1>
+    local d="$1" strip="$2"
+    mkdir -p "$d/watcher"
+    cp "$_test_dir/retire-preflight.sh" "$_test_dir/_skeptic_gate.sh" "$d/"
+    cp "$_test_dir/watcher/_idle_probe.sh" "$d/watcher/"
+    # Abort mid-ladder the way a half-written helper does: an unbound
+    # variable under the `set -u` the preflight already runs with.
+    sed -i 's|^skeptic_gate_state() {|skeptic_gate_state() { : "$__NEXUS_ABORT_TRIPWIRE";|' \
+        "$d/_skeptic_gate.sh"
+    (( strip )) && sed -i '/^        live|grace|stale|unclassified|orphaned|absent) : ;;$/,+1d' \
+        "$d/retire-preflight.sh"
+    bash -n "$d/retire-preflight.sh" && bash -n "$d/_skeptic_gate.sh"
+}
+run_decoy() {       # <dir> → echoes "<rc>|<stdout>"
+    local d="$1" o r
+    o=$(bash "$d/retire-preflight.sh" orphan-skeptic-win --pane-state idle \
+            --state-dir "$STATE_DIR" --now "$NOW" 2>/dev/null); r=$?
+    printf '%s|%s' "$r" "$o"
+}
+
+ABORT_TREE="$WORK/abort-guarded"
+mk_abort_tree "$ABORT_TREE" 0 >/dev/null 2>&1 && _mk=parses || _mk=broken
+assert_eq "9e fixture: decoy tree with an aborting gate still parses" "$_mk" "parses"
+res=$(run_decoy "$ABORT_TREE")
+assert_eq       "aborting derivation -> exit 1 (refuse the kill)" "${res%%|*}" "1"
+assert_contains "aborting derivation -> safe=0"                   "${res#*|}" "safe=0"
+assert_not_contains "aborting derivation -> NEVER authorizes the kill" "${res#*|}" "safe=1"
+
+# NEGATIVE CONTROL — the same abort against a tree with the guard REMOVED
+# must go the other way. Without this the two assertions above would pass
+# on any tree where the abort simply never happened, and would certify
+# nothing about the guard.
+ABORT_UNGUARDED="$WORK/abort-unguarded"
+mk_abort_tree "$ABORT_UNGUARDED" 1 >/dev/null 2>&1
+diff -q "$ABORT_TREE/retire-preflight.sh" "$ABORT_UNGUARDED/retire-preflight.sh" >/dev/null \
+    && _strip=INERT || _strip=stripped
+assert_eq "9e fixture: stripping the guard really changed the decoy" "$_strip" "stripped"
+res=$(run_decoy "$ABORT_UNGUARDED")
+assert_contains "NEGATIVE: same abort WITHOUT the guard -> safe=1 (arm discriminates)" \
+                "${res#*|}" "safe=1"
+
 unset MOCK_TMUX_WINDOWS MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS
 
 # ── 10. machine-attributed submit within slack (clock-skew absorption) ────

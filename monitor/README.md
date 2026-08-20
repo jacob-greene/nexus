@@ -810,14 +810,65 @@ per the mode.
 `wrap-up` carries the full skeptic flag set:
 `--skeptic-decision`, `--skeptic-rationale`, `--skeptic-waive`,
 `--skeptic-role`, `--skeptic-verdict`, `--skeptic-target`,
-`--skeptic-depth`, `--skeptic-findings`.
+`--skeptic-depth`, `--skeptic-findings`, `--skeptic-reopen`.
+
+**The gate is idempotent per deliverable** (`jacob-greene/nexus` issue
+16). Opening a `require` round stamps the report path + round depth into
+`monitor/.state/skeptic/<window>/.round`. A later `require` matching that
+stamp is a REPEAT: it never archives the live round's `DONE`, never
+re-arms the pending marker, and never files a second `spawn-skeptic`
+request. A repeat used to do all three, wiping a completed round's
+verdict and re-gating a worker whose skeptic had already reported.
+
+How a repeat *resolves* depends on the **pending marker** — the stamp says
+whether this is the same deliverable, the marker says whether the window is
+still gated. The marker IS the retire gate (`retire-preflight.sh` check 1b
+keys on exactly it), so it is tested directly:
+
+- gate **armed** (`live` / `grace` / `stale` / `unclassified`) — prints
+  `SKEPTIC: RETIRE GATE STILL ARMED` and exits `0`, completing the rest of
+  the hand-off. `retire-preflight.sh` would refuse to retire this window,
+  so nothing can fail open. This is the honest retry.
+- gate **down** (`absent` / `orphaned`) — prints
+  `SKEPTIC: RETIRE GATE IS DOWN` and **refuses, exit 1**, running nothing
+  downstream. retire-preflight would let this window retire, so a silent
+  success would let `verdict → remediate → append → re-wrap` retire
+  unvalidated. The agent must state whether the deliverable changed
+  (reopen), was validated and unchanged (retire), or was never validated
+  at all (reopen).
+
+**One predicate, `monitor/_skeptic_gate.sh`.** `skeptic_gate_state
+<window>` prints the state and returns 0 when the gate blocks retirement.
+`ng wrap-up`, `retire-preflight.sh` check 1b, `monitor/spawn-worker.sh`
+(the marker WRITER) and `monitor/watcher/_idle_probe.sh`
+(`_idle_skeptic_parked` / `_idle_skeptic_orphaned`) all delegate to it.
+They used to derive it four separate ways and had already diverged — two
+sites testing `-e`, one `-f`, liveness in only one — which is how every
+round of issue 16 kept re-introducing the same defect: a branch asserting a
+gate state it had not checked. In particular a marker whose reviewer died
+(`orphaned`) is NOT live validation: check 1b lets that window retire, so
+`ng` must not tell the same worker that a reviewer is holding it.
+
+Do **not** key this on the channel's `done=`. The first fix for issue 16
+did, and shipped the fail-open it meant to close (skeptic finding SK1):
+`close` is the only writer of `DONE`, but `ng wrap-up --skeptic-role`
+also releases the gate — clearing the marker for the reviewed window and
+the chain-root worker — without ever writing `DONE`, and the chain
+protocol *requires* mid-chain skeptics to report that way. `DONE` is now
+read only to tell the agent HOW the gate went down.
+
+A DIFFERENT report path (or a higher depth) is still a genuine new round
+and still archives the stale sentinels. To force a new round on an
+UNCHANGED path, be explicit: `--skeptic-reopen`, or `ng skeptic reopen
+<window>` before re-running wrap-up.
 
 ### Comms channel
 
 `monitor/skeptic-channel.sh` is the worker↔skeptic comms channel plus
 nudge engine (also reachable as `ng skeptic <sub>`). Subcommands:
 `init`, `ask`, `await`, `answer`, `await-answer`, `reconcile`, `close`,
-`poll`, `status`, `list`, `nudge`, `dir`, `reqfile`. Each review gets a
+`reset`, `poll`, `status`, `list`, `round`, `reopen`, `nudge`, `dir`,
+`reqfile`. Each review gets a
 per-task channel directory at `monitor/.state/skeptic/<task-id>/`, where
 the task-id is the reviewed worker's window name. The not-yet-validated
 gate is a marker at `monitor/.state/skeptic/pending/<window>`.

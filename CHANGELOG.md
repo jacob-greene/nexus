@@ -410,6 +410,181 @@ for the current release convention.
 
 ### Fixed
 
+- **`ng wrap-up` is idempotent per deliverable; a repeat no longer
+  strands a live worker (issue 16).** The `required` /
+  `required-escalated` branch ran three side effects unconditionally
+  whenever the skeptic decision resolved to `require`: it archived the
+  channel's terminal sentinels (`skeptic-channel.sh reset`), re-armed the
+  pending marker, and filed a `spawn-skeptic` request. Nothing keyed on
+  *whether a round had already been opened for this deliverable*, so a
+  second `ng wrap-up` on the same, unchanged report path destroyed the
+  live round's `DONE` (`total=0 done=0`), re-gated a worker whose skeptic
+  had already reported, and filed a duplicate request stamped
+  `deliberate: false` — which `monitor/agent-prompt.md` declares an
+  auto-spawnable rubber-stamp first pass. Observed three times in one
+  production round, across two worker windows; in the worst case a worker
+  mid-remediation with live background compute was parked on a verdict
+  that had already been declined. The pre-existing "already filed" guard
+  in the request-filing step did not catch it: that guard only globs
+  `*.new.md` / `*.claimed.md`, and an *acked* request is `*.done.md`.
+
+  The join key is the **report path**. Opening a round now stamps the
+  report path (canonicalized) + the round depth + a timestamp into
+  `monitor/.state/skeptic/<window>/.round`. A `require` whose report path
+  **and** depth match that stamp is a REPEAT: no reset, no re-arm, no
+  re-file, ever. The check sits **upstream of the reset**, so the reset
+  itself is untouched — a different report path, or a higher depth, is
+  still a genuine new round that archives the stale `DONE` +
+  `*.answered.md` exactly as issue `#469` /
+  `<your-org>/nexus-code#511` require. A terminal decision (operator
+  waive, spawn-deny, worker deny) drops the stamp, so a later legitimate
+  `require` still opens a real round.
+
+  A repeat then resolves on the **pending marker**, which IS the retire
+  gate (`retire-preflight.sh` check 1b keys on exactly that path). The
+  stamp answers "same deliverable?"; the marker answers "still gated?".
+
+  - **marker present** (gate armed) — prints
+    `SKEPTIC: RETIRE GATE STILL ARMED` and exits **0**; the rest of the
+    hand-off (upload, comment, rocket, log, retain) still runs. A reviewer
+    still holds the window, so nothing can fail open. This is the honest
+    retry, and making it safe instead of destructive is issue 16's actual
+    complaint.
+  - **marker absent** (gate down) — prints
+    `SKEPTIC: RETIRE GATE IS DOWN` and **refuses with exit 1**, running
+    nothing downstream. The validation was released, so a silent success
+    would let the ordinary `verdict → remediate → append → re-wrap` loop —
+    the common exit shape once issue 20 is accounted for — retire
+    **unvalidated**: a fail-open on the exact path `#469` exists to
+    protect. Reports are append-only, so the path cannot say whether the
+    deliverable changed and an mtime/content key would reopen on every
+    append (the destructive behaviour this fix removes). Only the agent
+    knows, so the refusal names both cases and requires it to pick:
+    reopen if the deliverable changed, retire if it did not — round 1
+    already uploaded that exact report and posted its link comment. Fails
+    **closed**.
+
+  **Round 2 — the split above is keyed on the MARKER, not on `DONE`**
+  (skeptic finding SK1 on this same issue). The first cut of this fix
+  tested the `DONE` sentinel as a proxy for "has the gate been released",
+  and that proxy is wrong in a state the chain protocol *prescribes*.
+  `skeptic-channel.sh close` writes `DONE` and clears the marker, but
+  `ng wrap-up --skeptic-role` clears the marker — for the reviewed window
+  AND the chain-root worker — and never writes `DONE`; since only the
+  FINAL skeptic in a chain may close the original worker's channel, every
+  mid-chain verdict lands exactly that way. In that state the `DONE`-keyed
+  guard computed `done=0`, took the honest-retry branch, returned **0**,
+  ran the whole hand-off and printed *"the retire gate is STILL ARMED"*
+  while the gate was **down** — the original fail-open, reached through a
+  second door, and a regression against pre-fix (whose unconditional reset
+  at least re-armed the gate, destructively but safely). Keying on the
+  marker closes it; `DONE` is still read, but only to explain to the agent
+  HOW the gate went down. Both branch headers now name the **gate** rather
+  than the verdict, since neither "verdict already landed" nor "still
+  armed" is true in every state its branch now covers.
+
+  Two deliberate behaviour changes come with it, neither previously
+  documented:
+
+  - A marker **released with no verdict at all** (an operator hand-`rm`s
+    it, or a round-opening write is lost) now **refuses** where it used to
+    exit 0. A `require` worker whose gate has vanished is anomalous
+    whatever the cause, and the refusal is recoverable — it names both
+    reopen verbs, either of which re-arms the gate — whereas exiting 0
+    retires it unvalidated. This is the same call `skeptic-channel.sh`
+    already makes about this exact file pair when it orders `close` to
+    publish `DONE` *before* unlinking the marker ("fail closed on a
+    partial close, not open"). The supported release paths — waive,
+    spawn-deny, worker-deny — all clear the `.round` stamp, so the guard
+    never fires for them.
+  - A marker **present alongside a verdict** now **exits 0** where it used
+    to refuse. That state means a further pass was really spawned
+    (`spawn-worker.sh` re-arms the markers at an actual spawn), so a live
+    reviewer holds the window and must SEE the hand-off; refusing there
+    blocked a correctly-gated worker from delivering its remediated
+    report. (Round 3 narrows this: only when that reviewer is checked
+    live — see below.)
+
+  Regression cover: the verdict-without-close path is now asserted
+  end-to-end in `test-ng-wrap-up.sh` ("issue 16 SK1"), and the
+  released-marker decision in `test-skeptic-channel.sh`. Every pre-existing
+  F1 assertion drove its verdict through `close`, which is structurally
+  why a fully green suite missed this.
+
+  **Round 3 — the retire-gate predicate is derived ONCE**
+  (`monitor/_skeptic_gate.sh`; skeptic findings SK1-b/SK1-c/SK1-d, and
+  round 1's SK5). Rounds 1 and 2 both shipped a branch asserting a gate
+  state it had never checked, and the reason was structural: FOUR sites
+  independently decided "is this window gated?" and had already drifted —
+  `ng` tested `-e marker`, `retire-preflight.sh` check 1b tested
+  `-f marker && ! orphaned`, `_idle_probe.sh` tested `-e` with its own
+  copy of the freshness ladder, and `spawn-worker.sh` sanitized the path
+  its own way for the WRITE. `skeptic_gate_state <window>` is now the
+  single derivation and all four delegate to it. It prints the state and
+  returns 0 when the gate BLOCKS retirement: `live` (a `skeptic-spawn`
+  event names the window and that skeptic window is alive in tmux),
+  `grace` (no reviewer yet, inside the spawn grace), `stale` (marker no
+  longer refreshed), `unclassified` (probe helpers unloadable — degraded,
+  and retire-preflight degrades identically so the two stay in step),
+  versus `orphaned` and `absent`, which do not.
+
+  What that fixes, beyond the duplication:
+
+  - **SK1-b — an orphaned marker no longer reads as a live reviewer.**
+    Nothing clears a marker when a skeptic is killed or retires without a
+    verdict, so `-e marker` could not tell a re-armed live gate from a
+    dead one. Round 2 exited 0 on both and printed *"a live reviewer holds
+    this window right now"* on both; the remediation then shipped with no
+    reviewer, no replacement request, and (via check 1b's own orphan
+    branch) retirement permitted. `orphaned` now refuses, which also
+    closes the same hole in the `DONE`-absent row, where it predates
+    round 2. Only the `live` state licenses a live-reviewer claim, and
+    each branch of the message now says only what its state establishes.
+  - **SK1-c — the refusal no longer tells a never-validated worker to
+    retire.** `marker gone + no DONE` is equally consistent with a correct
+    mid-chain verdict and with a round nothing ever validated, and nothing
+    on disk separates them. Round 2's message resolved that in the
+    fail-open direction — asserting a verdict, declaring *"the validation
+    is over"*, and offering *"You are DONE … report in-window and
+    retire"* — inside a refusal whose exit code was fail-closed. It now
+    states the ambiguity and routes on the one fact only the agent has:
+    **(a)** the deliverable changed → reopen; **(b)** unchanged **and** a
+    verdict was returned to you → retire; **(c)** unchanged and no verdict
+    ever reached you → reopen, because nothing has validated it. The
+    stderr summary carries the same three-way split.
+  - **SK1-d — the permissive quadrant is asserted.** All four
+    marker/`DONE` quadrants are now driven end-to-end × live vs orphaned
+    reviewer, plus the spawn-grace boundary, the degraded (no-gate-lib)
+    mode, and the three `skeptic-decision` action-log reason strings —
+    none of which had a single assertion before. Reviewer liveness is
+    driven only through the tmux window set and the action log, i.e.
+    writers that never touch the marker file the guard keys on.
+
+  Two nits from the same review: the guard's `-e` becomes `-f` (subsumed
+  by the shared predicate, which tests what check 1b tests), and the
+  comment justifying the marker-before-stamp write order is corrected —
+  it holds for a **crash** between the two writes, but not for a
+  **swallowed write failure**, where execution continues and the stamp is
+  written anyway.
+
+  New escape hatches for a genuine second round on an **unchanged**
+  report path (there was previously no way to reopen a channel on
+  purpose): `ng wrap-up … --skeptic-reopen`, and
+  `ng skeptic reopen <window>` (clears the stamp + archives stale
+  sentinels; deliberately does **not** write the pending marker — arming
+  the gate stays wrap-up's job). `ng skeptic round <window>` prints the
+  stamp, which also dates a suspicious `DONE` against the round that owns
+  it — an `opened:` newer than the `DONE` is the shape of the
+  false-instant-`exit 10` hazard.
+
+  `--skeptic-reopen` forces a new *round* but not a new *request*: the
+  request-filing step's own guard globs `*.new.md` / `*.claimed.md`, so a
+  reopen files afresh only when round 1's request was already **acked**
+  (`*.done.md`). An unacked one suppresses the filing, and the status line
+  now names the request it deferred to instead of a bare
+  `skipped (already filed)`. Deliberate — two non-terminal
+  `spawn-skeptic` requests for one window+depth are two spawn
+  instructions, and the gate does not depend on the request.
 - **`ng` `STATE_DIR` resolver** now picks up `NEXUS_ROOT` /
   `nexus.root` config so worker wrap-ups from worktrees land
   in the primary clone's `.state/`, not the worktree's. (PR #11.)

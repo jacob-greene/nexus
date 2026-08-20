@@ -756,6 +756,307 @@ assert_file "wrap-up require -> fresh pending marker set" "$PEND/$ATASK"
 
 # ============================================================
 echo
+echo '=== issue 16: wrap-up require is IDEMPOTENT per (report-path, depth) ==='
+# ============================================================
+# The two #469/#511 guards above answer "is this DONE from the current
+# round?". Neither answers "is this a NEW round at all?" — so a REPEAT
+# wrap-up on an unchanged deliverable re-ran all three round-opening side
+# effects: it archived the LIVE round's DONE (total=0 done=0), re-armed
+# the retire gate, and filed a duplicate spawn-skeptic request stamped
+# `deliberate: false` (which agent-prompt.md declares auto-spawnable). It
+# fired three times in one production round and parked a worker on a
+# verdict that had already been declined.
+#
+# The disambiguator is the REPORT PATH, threaded in as arg 14 and stamped
+# into <channel>/.round when a round opens. Every assertion in this block
+# FAILS on pre-issue-16 source. Reproduce with:
+#   git stash push monitor/ng monitor/skeptic-channel.sh \
+#     && bash monitor/watcher/test-skeptic-channel.sh; git stash pop
+#
+# NB the arg positions: ... f_orig f_contradicted REPORT_PATH REOPEN.
+# The pre-issue-16 calls above pass 11 args (no report path) and MUST
+# keep the unconditional behaviour — that is asserted at the end.
+
+I16DIR="$WORK/i16-reports"; mkdir -p "$I16DIR"
+I16_R1="$I16DIR/nexus_2026-08-03_120000_deliverable.md"; printf '# r1\n' > "$I16_R1"
+I16_R2="$I16DIR/nexus_2026-08-03_133000_other.md";       printf '# r2\n' > "$I16_R2"
+
+ITASK=w16-idem
+mk_prov "$ITASK" require 0 false ""
+
+# --- round 1 opens on report R1 ---
+out=$(_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0)
+assert_contains "round 1 -> SKEPTIC REQUIRED" "$out" "SKEPTIC REQUIRED"
+assert_file "round 1 -> pending marker armed" "$PEND/$ITASK"
+assert_file "round 1 -> round stamp written"  "$NEXUS_STATE_DIR/skeptic/$ITASK/.round"
+assert_contains "round stamp records the report path" \
+    "$(cat "$NEXUS_STATE_DIR/skeptic/$ITASK/.round")" "report-path: $I16_R1"
+assert_contains "round stamp records the round depth" \
+    "$(cat "$NEXUS_STATE_DIR/skeptic/$ITASK/.round")" "depth: 1"
+
+# --- done=0: the HONEST RETRY. No verdict yet, so the gate is still up ---
+# This is issue 16's actual complaint (a retry after e.g. a failed upload
+# must not be destructive) and it is the ONLY branch that may exit 0: the
+# pending marker is still on the channel, so nothing can fail open.
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-retry0.out" 2>&1
+rc=$?
+out=$(cat "$WORK/i16-retry0.out")
+assert_eq "done=0 retry -> rc 0 (an honest retry is SAFE, not an error)" "$rc" "0"
+assert_contains "gate-armed retry -> RETIRE GATE STILL ARMED" "$out" "RETIRE GATE STILL ARMED"
+# Round 2 (SK1): the guard now TESTS the marker rather than inferring the
+# gate from the DONE sentinel, so the message cites the file it checked.
+assert_contains "gate-armed retry -> cites the marker it tested" "$out" \
+    "skeptic-pending marker is STILL IN PLACE"
+assert_contains "gate-armed retry -> states the gate is STILL ARMED" "$out" "STILL ARMED"
+assert_file "done=0 retry -> retire gate still armed (not released)" "$PEND/$ITASK"
+assert_eq "done=0 retry -> no duplicate request signalled" "${_SK_SPAWN_REQ:-}" "0"
+assert_nofile "done=0 retry -> nothing archived" \
+    "$(ls -d "$NEXUS_STATE_DIR/skeptic/$ITASK"/.stale-archive-* 2>/dev/null | head -1)"
+
+# The require path must ALSO signal the spawn-skeptic request filing.
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 1 >/dev/null 2>&1
+assert_eq "explicit --skeptic-reopen -> request signal set" "${_SK_SPAWN_REQ:-}" "1"
+
+# --- a skeptic runs and closes the channel (a verdict exists) ---
+"$CHAN" ask "$ITASK" why --message "why?" >/dev/null
+"$CHAN" await "$ITASK" --once >/dev/null 2>&1
+"$CHAN" answer "$ITASK" 1 --message "because" >/dev/null
+"$CHAN" close "$ITASK" >/dev/null
+before_status=$("$CHAN" status "$ITASK")
+assert_eq "round 1 closed -> verdict + DONE on the channel" \
+    "$before_status" "open=0 ack=0 answered=1 total=1 done=1"
+assert_nofile "round 1 closed -> close cleared the pending marker" "$PEND/$ITASK"
+
+# --- THE REPRO, done=1 half: the REMEDIATION LOOP MUST NOT FAIL OPEN ---
+# The regression this guards is `verdict -> remediate -> append -> re-wrap`
+# (the skeptic pass on PR #19, finding F1). Closing the round cleared the
+# pending marker — `monitor/ng` does that on EVERY verdict — while the
+# .round stamp is deliberately kept. So at this point the retire gate is
+# DOWN. If the guard treated this like the done=0 retry above and returned
+# 0, the worker would append its remediation, re-wrap, see a success, and
+# retire on a verdict that never saw the remediation: a fail-open on the
+# exact path #469 exists to protect, and `#20` makes it the COMMON exit
+# shape. Reports are append-only, so the path cannot say whether the
+# deliverable changed (and an mtime/content key would reopen on every
+# append — the destructive behaviour issue 16 removes). Only the agent
+# knows, so the verb REFUSES and makes it say which case it is in.
+printf '\n### remediation appended after the verdict\n' >> "$I16_R1"   # append-only: same path
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-repeat.out" 2>&1
+rc=$?
+out=$(cat "$WORK/i16-repeat.out")
+assert_eq "verdict -> remediate -> re-wrap: REFUSES (rc 1, fails CLOSED)" "$rc" "1"
+assert_contains "post-verdict re-wrap -> says the retire gate is down" "$out" "RETIRE GATE IS DOWN"
+# This path closed, so DONE is present and the message must diagnose the
+# close specifically. The verdict-WITHOUT-close half of the split — the one
+# every close-driven assertion in this suite structurally cannot reach — is
+# covered in test-ng-wrap-up.sh's "issue 16 SK1" block.
+assert_contains "post-verdict re-wrap -> diagnoses the close" "$out" \
+    "A VERDICT DID LAND"
+assert_contains "post-verdict re-wrap -> cites the DONE sentinel as its evidence" "$out" \
+    "The DONE sentinel is present"
+assert_contains "post-verdict re-wrap -> names the wrap-up escape hatch" "$out" "--skeptic-reopen"
+assert_contains "post-verdict re-wrap -> names the channel reopen verb" "$out" "skeptic-channel.sh reopen"
+assert_contains "post-verdict re-wrap -> says an UNCHANGED deliverable is done" "$out" "You are DONE"
+# The pre-remediation message led with "this window may retire", which is
+# precisely the wrong instruction on this branch.
+assert_not_contains "post-verdict re-wrap -> does NOT tell the window it may retire" \
+    "$out" "this window may retire"
+assert_not_contains "post-verdict re-wrap -> does NOT re-announce SKEPTIC REQUIRED" "$out" "SKEPTIC REQUIRED"
+assert_eq "post-verdict re-wrap -> round-1 verdict + DONE SURVIVE (was total=0 done=0)" \
+    "$("$CHAN" status "$ITASK")" "$before_status"
+assert_nofile "post-verdict re-wrap -> retire gate NOT re-armed" "$PEND/$ITASK"
+assert_eq "post-verdict re-wrap -> NO duplicate spawn-skeptic request signalled" "${_SK_SPAWN_REQ:-}" "0"
+assert_nofile "post-verdict re-wrap -> nothing archived (no .stale-archive dir)" \
+    "$(ls -d "$NEXUS_STATE_DIR/skeptic/$ITASK"/.stale-archive-* 2>/dev/null | head -1)"
+
+# --- and it refuses however many times it fires (3x in production) ---
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+rc3=$?
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+rc4=$?
+assert_eq "3rd repeat -> still refuses (rc 1)" "$rc3" "1"
+assert_eq "4th repeat -> still refuses (rc 1)" "$rc4" "1"
+assert_eq "3rd + 4th repeat -> still destroy nothing" "$("$CHAN" status "$ITASK")" "$before_status"
+
+# --- constraint (ii): marker RELEASED with no verdict at all -> fail CLOSED ---
+# Round 2 re-keyed the guard from DONE to the pending marker, and this is
+# the state where that CHANGES behaviour rather than merely fixing it:
+# marker absent, DONE absent, and no verdict was ever returned (an operator
+# hand-`rm`ed the marker, or a round-opening write was lost). The old
+# DONE-keyed guard returned 0 here and completed the hand-off; the
+# gate-keyed guard refuses.
+#
+# That is deliberate, and it is the same call skeptic-channel.sh:752-758
+# already makes about this exact file pair ("a crash after the unlink would
+# leave no marker and no DONE — retire-preflight would see no pending gate
+# and let the worker retire unvalidated. Fail closed on a partial close,
+# not open."). A require-mode worker whose gate has vanished is in an
+# anomalous state whatever the cause, and refusing is RECOVERABLE — the
+# message names the two reopen verbs, both of which re-arm the gate —
+# whereas returning 0 silently retires it unvalidated.
+#
+# The SUPPORTED release paths are unaffected: waive / spawn-deny / worker-
+# deny all call _skeptic_round_clear, which drops the .round stamp, so this
+# guard never fires for them at all. That is asserted separately below.
+I16_R3="$I16DIR/nexus_2026-08-03_140000_released.md"; printf '# r3\n' > "$I16_R3"
+RTASK=w16-released
+mk_prov "$RTASK" require 0 false ""
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 0 >/dev/null 2>&1
+assert_file "released: round 1 armed the gate" "$PEND/$RTASK"
+rm -f "$PEND/$RTASK"          # the marker is released by hand; NO verdict, NO close
+assert_nofile "released: gate is down with no verdict on the channel" "$PEND/$RTASK"
+assert_nofile "released: and no DONE sentinel either" "$NEXUS_STATE_DIR/skeptic/$RTASK/DONE"
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 0 > "$WORK/i16-released.out" 2>&1
+rcrel0=$?
+outrel=$(cat "$WORK/i16-released.out")
+assert_eq "released marker, no verdict -> REFUSES (rc 1, fails CLOSED)" "$rcrel0" "1"
+assert_contains "released marker -> reports the GATE, not a verdict" "$outrel" "RETIRE GATE IS DOWN"
+# The message must not invent a close that never happened.
+assert_not_contains "released marker -> does NOT claim a skeptic closed the channel" \
+    "$outrel" "A VERDICT DID LAND"
+# SK1-c. The round-2 assertion stopped here — it checked that the message
+# does not claim a CLOSE, while the message went on to claim a VERDICT
+# ("a verdict was returned WITHOUT closing the channel"), declare the
+# validation over, and offer "You are DONE ... retire". Every one of those
+# is false in THIS state: no skeptic was ever spawned and no verdict of any
+# kind was ever returned. A test that asserts only what a message must not
+# claim, in one of the several states that reach it, lets the false claim
+# ship green. Assert the positive content too, in the state that reaches it.
+assert_not_contains "released marker -> does NOT assert a verdict was returned" \
+    "$outrel" "a verdict was returned WITHOUT closing the channel"
+assert_not_contains "released marker -> does NOT declare the validation complete" \
+    "$outrel" "the validation is over"
+assert_contains "released marker -> states that validation is NOT established" \
+    "$outrel" "WHETHER YOU WERE VALIDATED AT ALL IS NOT ESTABLISHED"
+assert_contains "released marker -> names the never-validated history explicitly" \
+    "$outrel" "NO validation ever happened"
+# ...and therefore must NOT hand a never-validated require-worker a retire
+# instruction. Case (b) survives, conditioned on a verdict the AGENT saw
+# (the one fact this command cannot check), and case (c) is the branch for
+# the worker that saw none.
+assert_contains "released marker -> flags that nothing corroborates retiring" \
+    "$outrel" "NOTHING HERE CORROBORATES (b)"
+assert_contains "released marker -> offers the never-validated recovery (case c)" \
+    "$outrel" "NO verdict was ever returned to"
+assert_contains "released marker -> refusal is recoverable (names the reopen verb)" \
+    "$outrel" "--skeptic-reopen"
+# ...and the reopen genuinely restores the gate, so the refusal is a
+# speed bump rather than a dead end.
+_wrapup_skeptic_step 16 "$RTASK" your-org/your-nexus 0 require "high-impact infra" "" "" "" "" "" "" "" "$I16_R3" 1 >/dev/null 2>&1
+assert_file "released marker -> --skeptic-reopen re-arms the gate" "$PEND/$RTASK"
+
+# --- cwd-relative vs absolute path is the SAME deliverable, not a new one ---
+# Canonicalization is a property of the KEY, so it must hold on the refuse
+# branch too: the relative form must match the stamp and be refused, not
+# read as a new deliverable and open a round.
+( cd "$I16DIR" && : )   # guard: the relative form must resolve from $PWD
+pushd "$I16DIR" >/dev/null
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "./$(basename "$I16_R1")" 0 >/dev/null 2>&1
+rcrel=$?
+popd >/dev/null
+assert_eq "relative path for the same report -> still keyed as a repeat (canonicalized)" "$rcrel" "1"
+assert_eq "relative path for the same report -> destroyed nothing" \
+    "$("$CHAN" status "$ITASK")" "$before_status"
+
+# --- #469 NON-REGRESSION: a DIFFERENT report path is a GENUINE new round ---
+# The stale DONE + verdict must still be ARCHIVED (not left to fail the
+# gate OPEN, not bare-rm'd), the marker re-armed, the request re-filed.
+_wrapup_skeptic_step 16 "$ITASK" your-org/your-nexus 0 require "remediated: new deliverable" "" "" "" "" "" "" "" "$I16_R2" 0 > "$WORK/i16-new.out" 2>&1
+out=$(cat "$WORK/i16-new.out")
+assert_contains "different report path -> genuine new round (SKEPTIC REQUIRED)" "$out" "SKEPTIC REQUIRED"
+assert_eq "different report path -> stale DONE + verdict archived (done=0)" \
+    "$("$CHAN" status "$ITASK")" "open=0 ack=0 answered=0 total=0 done=0"
+assert_nofile "different report path -> DONE gone from the channel root" \
+    "$NEXUS_STATE_DIR/skeptic/$ITASK/DONE"
+i16arch=$(ls -d "$NEXUS_STATE_DIR/skeptic/$ITASK"/.stale-archive-* 2>/dev/null | head -1)
+assert_file "different report path -> prior DONE ARCHIVED, not rm'd (#511)" "$i16arch/DONE"
+assert_file "different report path -> prior verdict ARCHIVED too (#511)" "$i16arch/req-001-why.answered.md"
+assert_file "different report path -> retire gate re-armed" "$PEND/$ITASK"
+assert_eq "different report path -> spawn-skeptic request re-signalled" "${_SK_SPAWN_REQ:-}" "1"
+assert_contains "round stamp re-pointed at the new deliverable" \
+    "$(cat "$NEXUS_STATE_DIR/skeptic/$ITASK/.round")" "report-path: $I16_R2"
+
+# --- a DIFFERENT depth on the same path is also a genuine new round ---
+DTASK=w16-depth
+mk_prov "$DTASK" require 0 false ""
+_wrapup_skeptic_step 16 "$DTASK" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+_wrapup_skeptic_step 16 "$DTASK" your-org/your-nexus 0 require "escalated" "" "" "" 1 "" "" "" "$I16_R1" 0 > "$WORK/i16-depth.out" 2>&1
+assert_contains "same path at a HIGHER depth -> genuine new round" \
+    "$(cat "$WORK/i16-depth.out")" "SKEPTIC REQUIRED"
+assert_contains "higher-depth round stamps depth 2" \
+    "$(cat "$NEXUS_STATE_DIR/skeptic/$DTASK/.round")" "depth: 2"
+
+# --- explicit --skeptic-reopen forces a new round on an UNCHANGED path ---
+RTASK16=w16-reopen-flag
+mk_prov "$RTASK16" require 0 false ""
+_wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+"$CHAN" close "$RTASK16" >/dev/null
+# The refusal is not a dead end: this is the exact sequence the refusal
+# message prescribes for case (a) — refuse, then reopen explicitly.
+_wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+assert_eq "post-verdict re-wrap without the flag -> refused first" "$?" "1"
+_wrapup_skeptic_step 16 "$RTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 1 > "$WORK/i16-reopen.out" 2>&1
+assert_contains "--skeptic-reopen -> forces a new round on the same path" \
+    "$(cat "$WORK/i16-reopen.out")" "SKEPTIC REQUIRED"
+assert_file "--skeptic-reopen -> retire gate re-armed" "$PEND/$RTASK16"
+assert_eq "--skeptic-reopen -> stale DONE archived (#469 path still taken)" \
+    "$("$CHAN" status "$RTASK16")" "open=0 ack=0 answered=0 total=0 done=0"
+
+# --- `skeptic-channel.sh reopen` is the operator-side equivalent ---
+VTASK16=w16-reopen-verb
+mk_prov "$VTASK16" require 0 false ""
+_wrapup_skeptic_step 16 "$VTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+"$CHAN" close "$VTASK16" >/dev/null
+out=$("$CHAN" round "$VTASK16"); rc=$?
+assert_eq "round -> rc 0 when a round exists" "$rc" "0"
+assert_contains "round -> prints the report path" "$out" "report-path: $I16_R1"
+out=$("$CHAN" reopen "$VTASK16")
+assert_contains "reopen -> reports that it cleared the stamp" "$out" "round stamp cleared"
+assert_nofile "reopen -> round stamp gone" "$NEXUS_STATE_DIR/skeptic/$VTASK16/.round"
+assert_nofile "reopen -> archives the stale DONE too" "$NEXUS_STATE_DIR/skeptic/$VTASK16/DONE"
+out=$("$CHAN" round "$VTASK16" 2>&1); rc=$?
+assert_eq "round -> rc 2 + 'none' when no round stamp" "$rc" "2"
+assert_eq "round -> prints 'none'" "$out" "none"
+# reopen is NOT allowed to arm the gate itself — wrap-up stays the writer.
+assert_nofile "reopen -> does NOT write the pending marker" "$PEND/$VTASK16"
+_wrapup_skeptic_step 16 "$VTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-afterreopen.out" 2>&1
+assert_contains "after reopen -> the next require opens a genuine new round" \
+    "$(cat "$WORK/i16-afterreopen.out")" "SKEPTIC REQUIRED"
+assert_file "after reopen -> gate armed by wrap-up" "$PEND/$VTASK16"
+"$CHAN" reopen w16-never-seen >/dev/null 2>&1; rc=$?
+assert_eq "reopen on an unknown channel -> clean rc 0" "$rc" "0"
+
+# --- a TERMINATED requirement drops the stamp, so a later require works ---
+# waive / deny already `rm` the pending marker; leaving the stamp behind
+# would make a later legitimate require look like a repeat and silently
+# decline to re-arm the gate.
+WTASK16=w16-waive
+mk_prov "$WTASK16" auto 0 false ""
+_wrapup_skeptic_step 16 "$WTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+assert_file "waive setup -> round stamp present" "$NEXUS_STATE_DIR/skeptic/$WTASK16/.round"
+_wrapup_skeptic_step 16 "$WTASK16" your-org/your-nexus 0 "" "" "operator override" "" "" "" "" "" "$I16_R1" 0 >/dev/null 2>&1
+assert_nofile "operator waive -> round stamp cleared" "$NEXUS_STATE_DIR/skeptic/$WTASK16/.round"
+_wrapup_skeptic_step 16 "$WTASK16" your-org/your-nexus 0 require "x" "" "" "" "" "" "" "" "$I16_R1" 0 > "$WORK/i16-afterwaive.out" 2>&1
+assert_contains "after a waive -> a later require opens a real round again" \
+    "$(cat "$WORK/i16-afterwaive.out")" "SKEPTIC REQUIRED"
+assert_file "after a waive -> gate re-armed" "$PEND/$WTASK16"
+
+# --- BACK-COMPAT: no report path (11-arg call) keeps the old behaviour ---
+# Every pre-issue-16 caller — and the direct calls earlier in this suite —
+# pass no report path. With nothing to key idempotency on, the branch MUST
+# degrade to the unconditional reset+re-arm, never to a skipped gate.
+BTASK16=w16-noreport
+mk_prov "$BTASK16" require 0 false ""
+_wrapup_skeptic_step 16 "$BTASK16" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+"$CHAN" close "$BTASK16" >/dev/null
+_wrapup_skeptic_step 16 "$BTASK16" your-org/your-nexus 0 "" "" "" "" "" "" "" > "$WORK/i16-noreport.out" 2>&1
+assert_contains "no report path -> unconditional require (pre-fix behaviour)" \
+    "$(cat "$WORK/i16-noreport.out")" "SKEPTIC REQUIRED"
+assert_file "no report path -> gate re-armed" "$PEND/$BTASK16"
+assert_nofile "no report path -> no round stamp conjured" "$NEXUS_STATE_DIR/skeptic/$BTASK16/.round"
+
+# ============================================================
+echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
     exit 0
