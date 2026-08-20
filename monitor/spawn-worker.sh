@@ -854,6 +854,71 @@ _resume_session_id() {
     return 1
 }
 
+# Claude Code home, most specific first — mirrors paste-followup.sh's
+# _cc_homes(). NEXUS_CC_HOME, when set, is the ONLY root consulted
+# (hermetic-test seam).
+_cc_home() {
+    if [ -n "${NEXUS_CC_HOME:-}" ]; then printf '%s' "$NEXUS_CC_HOME"; return 0; fi
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then printf '%s' "$CLAUDE_CONFIG_DIR"; return 0; fi
+    printf '%s' "$HOME/.claude"
+}
+
+# Pre-accept the Claude Code folder-trust dialog for a workdir we are
+# about to spawn into (cc 2.1.232 compat).
+#
+# Claude Code 2.1.232 ended trust INHERITANCE for nested git repos:
+# "each repository now requires its own trust confirmation". Every nexus
+# worker is spawned into a nested git repo — work/<project>/, a fresh
+# clone or worktree beneath the nexus root, which is itself a repo — so
+# from 2.1.232 on, each such spawn parks pre-REPL on
+#
+#     ❯ 1. Yes, I trust this folder
+#       2. No, exit
+#
+# waiting for an Enter that never comes. `--dangerously-skip-permissions`
+# does NOT bypass it; pane-state classifies the frame `empty` (not
+# `blocked`), and none of _unstick.sh's four cases match its text — so
+# the worker hangs silently and reads as safe-to-retire. See the
+# _detect_trust_dialog / Case T halves of this fix for the recovery
+# layer; this function is the prevention layer.
+#
+# The nexus CREATES these worktrees itself, so their trustworthiness is
+# not a decision a dialog should be asking about. We therefore mark the
+# workdir accepted in <cc-home>/.claude.json before the window opens,
+# which is exactly what monitor/cc-harness/_lib.sh already does for its
+# own workdir.
+#
+# Deliberately conservative: no jq → skip (the pre-seed is an
+# optimisation, never a spawn blocker); an unreadable/absent config is
+# created; a malformed one is left alone; the write is atomic
+# (tmp + mv) so a concurrent spawn can never observe a half-file. Any
+# failure is a silent no-op — a worker that then hits the dialog is no
+# worse off than without this function.
+_pre_accept_workspace_trust() {
+    local workdir="$1" home cfg tmp
+    [ -n "$workdir" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    home=$(_cc_home)
+    [ -n "$home" ] || return 0
+    mkdir -p "$home" 2>/dev/null || return 0
+    cfg="$home/.claude.json"
+    if [ ! -s "$cfg" ]; then
+        printf '{}\n' > "$cfg" 2>/dev/null || return 0
+    fi
+    jq -e . "$cfg" >/dev/null 2>&1 || return 0   # malformed: hands off
+    tmp="$cfg.trust.$$"
+    if jq --arg wd "$workdir" '
+            .projects //= {}
+          | .projects[$wd] //= {}
+          | .projects[$wd].hasTrustDialogAccepted = true
+        ' "$cfg" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        mv -f "$tmp" "$cfg" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+    return 0
+}
+
 if [ -n "$RESUME_TARGET" ]; then
     # Coordinator-exclusion inputs (your-nexus#206): resolved once,
     # consumed by _resume_sid_allowed at every resolution source and
@@ -905,6 +970,9 @@ MSG
         fi
     fi
     WORKDIR=$(cd "$WORKDIR" && pwd)
+    # cc 2.1.232: a nested git repo no longer inherits trust — pre-accept
+    # before the window opens or the resume parks on the trust dialog.
+    _pre_accept_workspace_trust "$WORKDIR"
 
     if [ -z "$SESSION_ID" ]; then
         if ! SESSION_ID=$(_resume_session_id "$SOURCE_WINDOW" "$WORKDIR"); then
@@ -1074,6 +1142,9 @@ fi
 # any worktree or fresh clone underneath. Deeper "is this a
 # worktree" heuristics would be brittle.
 WORKDIR_REAL=$(cd "$WORKDIR" && pwd)
+# cc 2.1.232: a nested git repo no longer inherits trust — pre-accept
+# before the window opens or the spawn parks on the trust dialog.
+_pre_accept_workspace_trust "$WORKDIR_REAL"
 ROOT_CWD_WARNING=""
 if [ "$WORKDIR_REAL" = "$NEXUS_ROOT" ]; then
     cat >&2 <<WARN

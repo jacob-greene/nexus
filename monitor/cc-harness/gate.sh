@@ -149,6 +149,13 @@ else
         # last_assistant_message) and the notice-text detection a CC bump
         # can silently break — both broke unnoticed before this gate entry.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-overlimit.sh"
+        # Nested-repo folder trust (cc 2.1.232). Every other scenario
+        # boots in a cwd _lib.sh has already marked trusted, so none of
+        # them can see a release that stops letting a nested git repo
+        # inherit trust from its parent — which is exactly what 2.1.232
+        # did, stranding every work/<project> worker spawn pre-REPL on a
+        # dialog that classified `empty` and matched no unstick case.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-nested-trust.sh"
     )
 fi
 

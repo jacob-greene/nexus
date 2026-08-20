@@ -361,6 +361,65 @@ _act_permission() {
     fi
 }
 
+# Case T — the folder-trust dialog (cc 2.1.232).
+#
+# 2.1.232 ended trust INHERITANCE for nested git repos ("each repository
+# now requires its own trust confirmation"). Every nexus worker spawns
+# into a nested repo (work/<project>/ under the nexus root repo), so from
+# 2.1.232 on such a spawn can stop PRE-REPL on the trust dialog, with
+# `❯ 1. Yes, I trust this folder` pre-selected. It is not bypassed by
+# `--dangerously-skip-permissions`, it matches none of Cases A/C/D/
+# ratelimit (it carries the `❯ N.` chevron but not `Do you want to
+# proceed?`), and pane-state used to classify it `empty` — so the worker
+# waited forever while reading as safe-to-retire.
+#
+# `monitor/spawn-worker.sh::_pre_accept_workspace_trust` is the
+# prevention layer and should mean this case never fires for a
+# nexus-created workdir. Case T is the recovery layer for the ones it
+# cannot pre-seed: an operator-made clone, an agent that `cd`s
+# elsewhere, a spawn whose config write lost a race, or a jq-less host.
+#
+# The action is the same shape as Case A: Enter accepts the
+# chevron-selected option, which is always option 1 ("Yes, I trust this
+# folder") on a freshly-rendered dialog. Answering it is the correct
+# call and not a judgement we are usurping: the nexus is confirming
+# trust for a directory it is itself spawning an agent into, which the
+# orchestrator already decided when it chose the workdir. Backoff is
+# per-(window, fingerprint) with the same 2-try ceiling, so a dialog
+# that somehow does not clear is logged and left alone rather than
+# hammered.
+_act_trust() {
+    local window="$1" pane="$2"
+    local case_key="trust"
+    local fp_file="$UNSTICK_DIR/${window}.${case_key}.fp"
+    local tries_file="$UNSTICK_DIR/${window}.${case_key}.tries"
+    local fp prev_fp tries
+    fp=$(printf '%s\n' "$pane" | _unstick_fingerprint)
+    prev_fp=""
+    [[ -f "$fp_file" ]] && prev_fp=$(<"$fp_file")
+    tries=0
+    [[ -f "$tries_file" ]] && tries=$(<"$tries_file")
+    if [[ "$fp" != "$prev_fp" ]]; then
+        tries=0
+    fi
+    if (( tries >= 2 )); then
+        unstick_log "window=$window case=T action=skip-backoff fp=$fp tries=$tries"
+        return 0
+    fi
+    local audit="$UNSTICK_DIR/${window}.${case_key}.${fp}.audit"
+    [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
+    if tmux send-keys -t "$window" Enter 2>/dev/null; then
+        printf '%s' "$fp" > "$fp_file"
+        printf '%d' "$(( tries + 1 ))" > "$tries_file"
+        _unstick_stamp_machine_input "$window" "unstick-trust"
+        local action_label="sent-Enter"
+        (( tries >= 1 )) && action_label="sent-Enter-retry"
+        unstick_log "window=$window case=T action=$action_label fp=$fp audit=$(basename "$audit")"
+    else
+        unstick_log "window=$window case=T action=send-keys-failed fp=$fp"
+    fi
+}
+
 # Send Enter to a window wedged on a transient API-error chip. The
 # chip indicates the previous turn's request returned an error rather
 # than a completion; pressing Enter on the idle prompt prompts Claude
@@ -705,6 +764,18 @@ _handle_unstick_window() {
        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$pane"; then
         _act_permission "$window" "$pane"
         printf 'permission'
+        return 0
+    fi
+    # Case T (folder-trust, cc 2.1.232). Disjoint from every case above
+    # — it carries none of their question text — so its position here is
+    # incidental; it sits last because it is the rarest (the spawn-time
+    # pre-seed should mean it never fires). Shape = the option literal,
+    # live-ness = that literal being the chevron-selected row, so a pane
+    # merely quoting the dialog (a report, this comment) never matches.
+    if grep -qF 'Yes, I trust this folder' <<<"$pane" \
+       && grep -qE '❯[[:space:]]+[0-9]+\.[[:space:]]*Yes, I trust this folder' <<<"$pane"; then
+        _act_trust "$window" "$pane"
+        printf 'trust'
         return 0
     fi
     return 0
