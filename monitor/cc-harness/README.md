@@ -177,6 +177,32 @@ If **red**: do not promote; inspect which scenario failed — a renderer
 regression means `pane-state.sh` needs a matching detector update (and a
 new fixture captured from the candidate) before the bump is safe.
 
+### The trusted-cwd blind spot (closed 2026-08-14)
+
+`cch_setup` pre-seeds `projects.<CCH_WORKDIR>.hasTrustDialogAccepted =
+true` for the exact cwd every scenario then boots in — a deliberate
+first-run-gate skip, but it also means no scenario could observe a
+release changing **which** directories are trusted. cc **2.1.232** did
+exactly that ("each repository now requires its own trust
+confirmation", ending trust inheritance for nested git repos), which
+strands every nexus worker: they all spawn into `work/<project>/`, a
+nested repo under the nexus root repo. The gate ran GREEN 4/4 on a
+candidate that could not start a single worker.
+
+`test-realmodel-nested-trust.sh` closes it by building the production
+topology instead — a trusted parent repo with an **untrusted** nested
+repo beneath it — and asserting the dialog classifies `blocked` (not
+the retire-safe `empty`), that `_unstick.sh` case T clears it, and that
+`spawn-worker.sh::_pre_accept_workspace_trust` prevents it. It is
+meaningful on both sides of the behaviour change: on a release that
+still inherits trust it asserts the inherited-idle boot rather than
+skipping.
+
+The general lesson for future scenarios: **anything the harness
+pre-seeds to skip a first-run gate is a surface the harness cannot
+regress-test.** When a changelog entry touches one of those gates,
+un-seed it in a purpose-built scenario.
+
 ## What's NOT here yet (follow-ups)
 
 - **Sticky-state → unstick / respawn** end-to-end: the `hang` mode is the
