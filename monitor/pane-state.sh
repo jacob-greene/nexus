@@ -340,7 +340,38 @@ _has_blocked_overlay() {
     if _has_askuq_overlay "$plain"; then
         return 0
     fi
+    if _has_trust_overlay "$plain"; then
+        return 0
+    fi
     return 1
+}
+
+# Folder-trust overlay (cc 2.1.232). Claude Code 2.1.232 ended trust
+# INHERITANCE for nested git repos — "each repository now requires its
+# own trust confirmation" — so a worker spawned into work/<project>/ (a
+# nested repo under the nexus root repo) now stops PRE-REPL on:
+#
+#     Accessing workspace:
+#     /path/to/work/<project>
+#     Quick safety check: Is this a project you created or one you trust?
+#     ❯ 1. Yes, I trust this folder
+#       2. No, exit
+#     Enter to confirm · Esc to cancel
+#
+# `--dangerously-skip-permissions` does NOT bypass it. Before this
+# detector the frame carried no known signature, so the classifier fell
+# through to `empty` — the state retire-preflight reads as SAFE TO KILL.
+# A stranded worker awaiting a trust confirmation must classify
+# `blocked` so `_unstick.sh`'s Case T can answer it.
+#
+# Two greps AND-ed: the option literal (`Yes, I trust this folder`) is
+# the shape, the chevron is the live-ness — an agent quoting this
+# comment or a report describing the dialog carries the prose but not a
+# chevron-selected option row, so it does not false-trigger.
+_has_trust_overlay() {
+    local plain="$1"
+    grep -qF 'Yes, I trust this folder' <<<"$plain" \
+        && grep -qE $'❯[[:space:]]+[0-9]+\\.[[:space:]]*Yes, I trust this folder' <<<"$plain"
 }
 
 # AskUserQuestion chip-bar overlay (Case D — dialog-guard). Claude
@@ -534,6 +565,76 @@ _detect_empty_input() {
     # out the bright-text and dim-autosuggest cases, so a bare trailing
     # `\x1b[7m ` is unambiguously the empty cursor.
     grep -qP $'\x1b\\[7m $' <<<"$input_row"
+}
+
+_pct_encode() {
+    # Percent-encode to a single space-free token. Byte-wise (LC_ALL=C)
+    # so multi-byte UTF-8 survives a round trip intact.
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+        {
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                if (c ~ /^[a-zA-Z0-9._~-]$/) printf "%s", c
+                else printf "%%%02X", ord[c]
+            }
+        }'
+}
+
+# The residual text sitting in the input box, as a percent-encoded token.
+#
+# WHY THIS EXISTS. Every detector above answers "what SHAPE is the input
+# row?" — none answers "what does it SAY?". So a pane whose box holds a
+# dim autosuggest ghost and a pane whose box is genuinely empty emit
+# verdicts that differ by one token and disclose nothing about the text.
+# Downstream that gap is load-bearing: `retire-preflight.sh` authorizes an
+# irreversible `tmux kill-window` off this line, and the ghost — reliably a
+# paraphrase of the agent's own closing recommendation, so it always reads
+# like the correct next step — is discarded by that kill unlogged and
+# unseen. Ten of them were caught only by an orchestrator's manual
+# `capture-pane … | cat -v`, several mutation-class (`merge the PR`,
+# `land #56`, `fix the METHODS §9 prose now while you have context`).
+# `content_hash` cannot close the gap: it digests only the region ABOVE the
+# input row, deliberately, so a ghost animating in place never counts as
+# change — an empty box and a ghost-bearing box hash identically.
+#
+# SHAPE-AGNOSTIC BY DESIGN, and that is the point. It takes everything
+# after the `❯<NBSP>` chevron and parses no dim/bright markers at all, so
+# unlike `_detect_autosuggest` it CANNOT drift when the renderer changes
+# its escape codes (#50). It is a strictly weaker predicate — "is there
+# text in the box?" — and answering it needs no knowledge of how Claude
+# Code paints dim.
+#
+# It does NOT classify. Callers must not read a non-empty value as "ghost":
+# the caller's own decision order establishes what the text is. In
+# `retire-preflight.sh` bright operator text has already vetoed at check 1
+# (`user-typing`), so any text still visible downstream is by elimination
+# not a submitted operator instruction.
+_input_row_text() {
+    local input_row="$1" txt
+    txt=$(printf '%s' "$input_row" | _strip_ansi)
+    # Everything after the chevron; no chevron ⇒ nothing to report.
+    [[ "$txt" == *"❯${NBSP}"* ]] || { printf ''; return 0; }
+    txt=${txt#*"❯${NBSP}"}
+    # Sanitize to one safe line: control bytes become spaces (a word
+    # boundary, never a silent join), then runs of whitespace — including
+    # the NBSP padding tmux paints — collapse, and the ends are trimmed.
+    # No control byte may survive: the encoder would faithfully round-trip
+    # one into a real newline in a consumer's decoded output, where it
+    # could forge an extra line or an extra field.
+    #
+    # One sed, not tr|tr|sed. This runs on every pane-state emit that has
+    # a capture — i.e. every worker pane on every watcher poll — so the
+    # fork count is worth minimising.
+    txt=$(printf '%s' "$txt" \
+        | sed -E "s/[[:cntrl:]]+/ /g; s/(${NBSP}|[[:space:]])+/ /g; s/^ +//; s/ +\$//")
+    [[ -n "$txt" ]] || { printf ''; return 0; }
+    # Cap length so one emit line stays bounded regardless of pane width.
+    if (( ${#txt} > 200 )); then
+        txt="${txt:0:200}…"
+    fi
+    _pct_encode "$txt"
 }
 
 # Walk the pane's process tree for a live `claude` (or `claude-code`)
@@ -1176,6 +1277,26 @@ emit() {
         extra=" $*"
     fi
     [[ -n "$pane_content_hash" ]] && extra+=" content_hash=$pane_content_hash"
+    # input_text: what the input box SAYS (see _input_row_text). Computed
+    # lazily here, from whatever bytes this path happens to have loaded, so
+    # every emit that HAS a capture carries it — the renderer path and the
+    # heartbeat idle-refinement path alike — and paths with no capture
+    # (heartbeat busy/blocked fast path, `absent`) simply omit it rather
+    # than paying a tmux call to invent one. Emitted ONLY when non-empty,
+    # so the field's mere presence means "there is text in the box" and
+    # existing consumers see a byte-identical line for an empty box.
+    if [[ -n "${pane_ansi:-}" ]]; then
+        local _row _txt
+        # Reuse the row the classifier already found where one exists
+        # (renderer path sets `input_row`, heartbeat refinement sets
+        # `hb_input_row`); only grep the capture again when neither did.
+        _row="${input_row:-${hb_input_row:-}}"
+        [[ -n "$_row" ]] || _row=$(_find_input_row "$pane_ansi")
+        if [[ -n "$_row" ]]; then
+            _txt=$(_input_row_text "$_row")
+            [[ -n "$_txt" ]] && extra+=" input_text=$_txt"
+        fi
+    fi
     printf 'state=%s active=%s window=%s name=%s%s\n' \
         "$state" "$win_active" "$win_index" "$win_name" "$extra"
 }

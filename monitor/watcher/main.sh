@@ -1102,6 +1102,36 @@ _run_bounded() {
     return $?
 }
 
+# _full_state_stage_age_seconds <file> [now_epoch] → age in seconds on
+# stdout, or `-1` when the file is missing or its mtime is unreadable.
+#
+# The freshness half of the staging hand-off gate (issue #14). The staged
+# `full_state_snap.out` is written by `_scheduler_fire_async` via tmp+rename,
+# so its mtime is the moment the async render FINISHED — i.e. the age this
+# returns is a LOWER BOUND on the age of the data inside (a render that took
+# 8s to walk its panes observed its first window 8s before the mtime). That
+# bias is in the safe direction for a staleness gate: it never makes a stale
+# body look fresher than it is.
+#
+# A future-dated mtime (NFS clock skew between the render's writer and this
+# reader — `.state/` lives on the shared filesystem) clamps to 0 rather than
+# going negative. Clamping to "fresh" is deliberate: a future mtime means the
+# file was written at essentially this instant, and treating skew as
+# permanent staleness would fire the inline re-render on every emit, which is
+# the one regression this fix must not introduce (nexus-code#236).
+#
+# Pure apart from the filesystem stat + clock. Extractable for unit test.
+_full_state_stage_age_seconds() {
+    local f="$1" now="${2:-}" mt age
+    [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+    [[ -f "$f" ]] || { printf '%s\n' -1; return 0; }
+    mt=$(date +%s -r "$f" 2>/dev/null || true)
+    [[ "$mt" =~ ^[0-9]+$ ]] || { printf '%s\n' -1; return 0; }
+    age=$(( now - mt ))
+    (( age < 0 )) && age=0
+    printf '%s\n' "$age"
+}
+
 # ---- snapshot helpers ----------------------------------------------------
 
 # Local state: reports filenames+mtimes, tmux windows+bell, work/* git HEAD + clean/dirty.
@@ -1524,6 +1554,16 @@ source "$_script_dir/_requests.sh"
 # `--- workspace snapshot ---` section after the transition-only
 # idle-workers section, giving the operator a complete view at the
 # configured cadence (default every 10 min; see issue #72 D4).
+#
+# That body is usually produced ASYNCHRONOUSLY (the `full_state_snap`
+# scheduler task) and therefore is NOT necessarily as fresh as the
+# `workspace:` counts line, which this function renders inline on every
+# emit. compose_emit bounds the gap (staleness gate) and publishes the
+# body's age via `FULL_STATE_RENDER_AGE_S`, plus
+# `FULL_STATE_RENDER_PARTIAL` / `FULL_STATE_RENDER_STALE` when the
+# bounded re-render degraded; the section footer states all three so a
+# reader who sees the snapshot disagree with the counts line can tell
+# which to trust (issue #14).
 # Per-section emit guard — answers the operator design ask: "prevent
 # emitting too-long messages WITHOUT risking dropping important signals."
 #
@@ -1810,7 +1850,27 @@ _compose_report_body() {
         # stay narrow.
         echo '--- workspace snapshot ---'
         printf '%s\n' "$full_state_lines"
-        echo '(full snapshot; transitions only between snapshots)'
+        # Provenance (issue #14). The body comes from the async
+        # `full_state_snap` staging file, so it is NOT necessarily as fresh as
+        # the `workspace:` counts line above (which is rendered inline every
+        # emit). compose_emit's staleness gate bounds that age; this footer
+        # states it, so a reader who sees the two disagree can tell which one
+        # to trust — and a bounded render that timed out is labelled PARTIAL
+        # rather than presented as a complete view.
+        #
+        # NOTE: this annotation lives in the FOOTER, not the header, on
+        # purpose. `--- workspace snapshot ---` is matched verbatim by
+        # `_cap_emit_sections`'s exempt allowlist; annotating the header (as
+        # #14 suggested) would silently drop the section off that allowlist
+        # and make it truncatable at 50 lines.
+        local _fs_note=''
+        [[ "${FULL_STATE_RENDER_AGE_S:-}" =~ ^[0-9]+$ ]] \
+            && _fs_note=", rendered ${FULL_STATE_RENDER_AGE_S}s ago"
+        [[ -n "${FULL_STATE_RENDER_PARTIAL:-}" ]] \
+            && _fs_note="${_fs_note}, PARTIAL (render hit its ${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS:-20}s budget; windows may be missing)"
+        [[ -n "${FULL_STATE_RENDER_STALE:-}" ]] \
+            && _fs_note="${_fs_note}, STALE (re-render hit its ${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS:-20}s budget and yielded nothing; windows listed here may have closed — verify with tmux before acting)"
+        echo "(full snapshot${_fs_note}; transitions only between snapshots)"
     fi
     # Every emit already implies "state has shifted since", so the only
     # useful gate on the refresh prompt is age: suppress it when the
@@ -2799,10 +2859,16 @@ else
     requests_now=$(cat "$_sb_tmp" 2>/dev/null || true)
     log "WARN startup-sweep: requests_poll_emit exceeded ${_startup_to}s budget; using partial render (loop entry NOT blocked)"
 fi
+# The startup sweep renders inline, so its snapshot is fresh by construction
+# — but it can still time out and yield a partial, so it carries the same
+# provenance the periodic path does (issue #14).
+FULL_STATE_RENDER_AGE_S=0
+FULL_STATE_RENDER_PARTIAL=""
 if _run_bounded "$_startup_to" "$_sb_tmp" render_full_state_snapshot; then
     startup_full_state=$(cat "$_sb_tmp" 2>/dev/null || true)
 else
     startup_full_state=$(cat "$_sb_tmp" 2>/dev/null || true)
+    FULL_STATE_RENDER_PARTIAL=1
     log "WARN startup-sweep: render_full_state_snapshot exceeded ${_startup_to}s budget; using partial render (loop entry NOT blocked)"
 fi
 rm -f "$_sb_tmp" 2>/dev/null || true
@@ -3043,7 +3109,10 @@ bump_heartbeat
 #   idle_section           @ 30s   async  expensive render_idle_section
 #   deliveries_poll        @ 15s   async  medium    snapshot_deliveries (webhook)
 #   github_poll            @ 600s  async  expensive snapshot_github + mentions (GraphQL)
-#   full_state_snap        @ 600s  async  expensive render_full_state_snapshot
+#   full_state_snap        @ 150s  async  expensive render_full_state_snapshot
+#                                  (emit_interval/4 — must out-pace the
+#                                   full-state EMIT cadence or compose_emit
+#                                   serves a stale snapshot; see #14)
 #   version_check          @ 60s   async  medium    _version_check_tick (issue 186)
 #   prune_archive          @ 600s  sync   cheap     prune_archive
 #   compose_emit           @ INT   async  medium    reads staging, emits
@@ -3827,25 +3896,151 @@ _v2_task_compose_emit() {
         now_ts=$(date +%s)
         if (( now_ts - last_full_ts >= MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS )); then
             full_state_due=1
-            full_state_lines=$(cat "$stage_dir/full_state_snap.out" 2>/dev/null || true)
-            # Re-render inline if staging is empty (e.g. very first
-            # compose_emit before full_state_snap async completed). These
-            # renders probe every worker pane (O(workers)) and can stall under
-            # load — and they run INSIDE the compose cycle whose completion
-            # bumps the proof-of-working-loop heartbeat. So they are WALL-CLOCK
-            # BOUNDED (nexus-code#236): past the budget the cycle continues with
-            # a partial render rather than letting a slow render stale the
+            local _fs_stage="$stage_dir/full_state_snap.out"
+            full_state_lines=$(cat "$_fs_stage" 2>/dev/null || true)
+            # STAGING FRESHNESS GATE (issue #14). The `workspace:` counts line
+            # below is rendered INLINE every full-state emit, so it is always
+            # current; the snapshot body used to be served from staging at ANY
+            # age. When a window closed between the async render and the emit,
+            # one message carried two contradictory views — `0 busy` in the
+            # preamble and a `state=busy` window in the snapshot body, naming a
+            # window deleted minutes earlier.
+            #
+            # BE PRECISE ABOUT WHAT THIS GATE DOES. It is an AGE gate, and the
+            # tightened producer cadence (emit_interval/4) puts essentially all
+            # real staleness BELOW its emit_interval/2 threshold. So in normal
+            # operation this branch does not fire, and the contradiction is not
+            # ELIMINATED by it — it is bounded to the exposure window and
+            # DISCLOSED by the footer age. What this gate actually buys is a
+            # backstop for the case where the async producer has FAILED (missed
+            # two beats, died, or never ran). The everyday catch is the
+            # row-count consistency check below, which is threshold-independent.
+            # Re-render inline when the staged body is EMPTY (as before: first
+            # compose_emit, or a failed async task) or STALE (new).
+            #
+            # Cost discipline — the inline render probes every worker pane
+            # (O(workers)) and runs INSIDE the compose cycle whose completion
+            # bumps the proof-of-working-loop heartbeat, so it is WALL-CLOCK
+            # BOUNDED (nexus-code#236): past the budget the cycle continues
+            # with a partial render rather than letting a slow render stale the
             # heartbeat and trip a false supervisor restart. _run_bounded kills
-            # the render's pane-probe subtree on overrun.
+            # the render's pane-probe subtree on overrun. It must also stay
+            # RARE: the async producer now runs at emit_interval/4 while this
+            # gate trips at emit_interval/2, i.e. only after the producer has
+            # missed two beats' worth of freshness. In normal operation staging
+            # is ~1/4-period old and this branch does not run at all — the
+            # async path stays the fast path.
+            #
+            # Fail toward FRESHNESS: an unreadable mtime counts as stale
+            # (re-render) rather than as fresh (serve a body of unknown age).
             _ensure_watcher_tmp_dir
             local _ce_to="${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS:-20}"
             local _ce_tmp="${tmp_dir}/compose-render.$$"
+            local _fs_age _fs_rerender=""
+            _fs_age=$(_full_state_stage_age_seconds "$_fs_stage" "$now_ts")
             if [[ -z "$full_state_lines" ]]; then
-                if ! _run_bounded "$_ce_to" "$_ce_tmp" render_full_state_snapshot; then
-                    log "WARN compose_emit: inline full-state render exceeded ${_ce_to}s; using partial (cycle NOT blocked)"
-                fi
-                full_state_lines=$(cat "$_ce_tmp" 2>/dev/null || true)
+                _fs_rerender="staging empty"
+            elif (( _fs_age < 0 )); then
+                _fs_rerender="staging mtime unreadable"
+            elif (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS > 0 )) \
+                 && (( _fs_age > MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS )); then
+                _fs_rerender="staging ${_fs_age}s old > ${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS}s max"
             fi
+            # ROW-COUNT CONSISTENCY CHECK — the threshold-INDEPENDENT half.
+            #
+            # The age gate above only catches staleness older than its
+            # threshold, and the tightened producer cadence puts essentially
+            # all real staleness BELOW that threshold. So the gate is a
+            # backstop for producer failure; this check is what actually
+            # catches the everyday case.
+            #
+            # `render_full_state_snapshot` iterates `_idle_list_worker_windows`
+            # and every branch of its loop prints exactly one `  - ` row per
+            # window (parked-awaiting-skeptic, orphaned-skeptic-pending,
+            # wrapped-with-children, idle-awaiting-job, pane-absent,
+            # OVER-LIMIT, and the plain `(active, state=…)` default); the only
+            # `continue` without a print is the empty-name guard, which the
+            # enumerator excludes from the count too. Retain-suppression lives
+            # in the idle SECTION, not here. So `rows == live` holds in ANY
+            # fresh render, and a mismatch is pure staleness signal — at any
+            # age, in BOTH directions:
+            #   rows < live  a window opened since the render and is missing
+            #                (the silent direction: nothing in the emit hints
+            #                 the window was omitted rather than absent)
+            #   rows > live  a window closed since the render and is still
+            #                listed (the original #14 capture)
+            #
+            # Cheap: `_idle_list_worker_windows` is one `tmux list-windows`
+            # plus an awk filter — NO pane probes, so this is not the
+            # O(workers) cost that must stay off the compose cycle.
+            #
+            # FAIL-SAFE: `rows < live` acts only when `rows > 0`. If a future
+            # row class ever does suppress its row, this degrades to "miss it"
+            # rather than "re-render on every emit" — the nexus-code#236
+            # regression. `rows == 0` with live workers is already covered by
+            # the staging-empty branch above.
+            if [[ -z "$_fs_rerender" && -n "$full_state_lines" ]]; then
+                local _fs_rows _fs_live
+                _fs_rows=$(printf '%s\n' "$full_state_lines" | grep -c '^  - ' || true)
+                _fs_live=$(_idle_list_worker_windows 2>/dev/null \
+                    | awk -F'\t' 'NF>0 && $1!="" {n++} END {print n+0}')
+                [[ "$_fs_rows" =~ ^[0-9]+$ ]] || _fs_rows=0
+                [[ "$_fs_live" =~ ^[0-9]+$ ]] || _fs_live=0
+                if (( _fs_rows > _fs_live )) \
+                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_live )) ); then
+                    _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live (age ${_fs_age}s)"
+                fi
+            fi
+            # Provenance carried to _compose_report_body's section footer.
+            # Globals (not `local`) on purpose — compose_report reads them.
+            FULL_STATE_RENDER_AGE_S=""
+            FULL_STATE_RENDER_PARTIAL=""
+            FULL_STATE_RENDER_STALE=""
+            if [[ -n "$_fs_rerender" ]]; then
+                local _fs_rc=0 _fs_fresh
+                _run_bounded "$_ce_to" "$_ce_tmp" render_full_state_snapshot || _fs_rc=$?
+                _fs_fresh=$(cat "$_ce_tmp" 2>/dev/null || true)
+                if (( _fs_rc != 0 )) && [[ -z "$_fs_fresh" ]]; then
+                    # The bounded render was killed before it emitted a single
+                    # row. Taking its empty output would DELETE the section —
+                    # and an absent section legitimately means "no workers"
+                    # (that is what the correct re-render produces on an empty
+                    # workspace), so dropping it here would swap one silent
+                    # falsehood for another. Two sub-cases, and BOTH must stay
+                    # visible; an earlier revision handled only the first and
+                    # silently dropped the second, label and all.
+                    if [[ -n "$full_state_lines" ]]; then
+                        # Something staged to fall back to. Keep it and label
+                        # it STALE with its true age; the reader can discount
+                        # it, and `absent` keeps meaning `absent`.
+                        FULL_STATE_RENDER_STALE=1
+                        log "WARN compose_emit: inline full-state render exceeded ${_ce_to}s and produced nothing; serving the ${_fs_age}s-old staged snapshot LABELLED STALE (cycle NOT blocked)"
+                    else
+                        # Nothing staged AND nothing rendered (mainly startup).
+                        # There is no body to label, so the label has to BE the
+                        # body — otherwise the section vanishes and reads as
+                        # "no workers" beside a non-zero counts line. Say
+                        # UNKNOWN explicitly. This row also keeps the degraded
+                        # cycle distinct in `full_state_canonical`, so it can
+                        # never dedup against a genuinely empty workspace.
+                        FULL_STATE_RENDER_PARTIAL=1
+                        full_state_lines='  (render timed out before listing any window — workspace contents UNKNOWN, not empty; check `tmux list-windows`)'
+                        _fs_age=0
+                        log "WARN compose_emit: inline full-state render exceeded ${_ce_to}s with nothing staged to fall back to; emitting an explicit UNKNOWN row (cycle NOT blocked)"
+                    fi
+                else
+                    if (( _fs_rc != 0 )); then
+                        # A partial is still better than a confident lie —
+                        # emit it, but LABEL it so the reader discounts it.
+                        FULL_STATE_RENDER_PARTIAL=1
+                        log "WARN compose_emit: inline full-state render exceeded ${_ce_to}s; using partial (cycle NOT blocked)"
+                    fi
+                    full_state_lines="$_fs_fresh"
+                    _fs_age=0
+                fi
+                log "compose_emit: full-state snapshot re-rendered inline (${_fs_rerender})"
+            fi
+            (( _fs_age >= 0 )) && FULL_STATE_RENDER_AGE_S="$_fs_age"
             if MONITOR_PRELUDE_DRY_RUN=1 _run_bounded "$_ce_to" "$_ce_tmp" render_idle_prelude; then
                 canonical_prelude=$(cat "$_ce_tmp" 2>/dev/null || true)
             else
@@ -4215,7 +4410,31 @@ fi
 # installation bucket. Compose_emit reads both staging files.
 _schedule_task deliveries_poll         15           _v2_task_deliveries_poll        --class medium    --async
 _schedule_task github_poll             600          _v2_task_github_poll            --class expensive --async
-_schedule_task full_state_snap         600          _v2_task_full_state_snap        --class expensive --async
+# full_state_snap cadence is DELIBERATELY tighter than the full-state EMIT
+# interval (issue #14). When the two were equal (both 600s) their phase was
+# arbitrary, so the staged body was ~half a period old at emit time on
+# average and a full period old at worst — the staleness the emit then
+# presented as current. Rendering at emit_interval/4 bounds the staged age to
+# ~1/4 period, which keeps compose_emit's emit_interval/2 staleness gate cold
+# and so keeps the inline re-render the exception rather than the rule.
+_schedule_task full_state_snap         "$MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS" \
+                                       _v2_task_full_state_snap        --class expensive --async
+if (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS <= 0 )); then
+    # A silent switch that restores pre-#14 behaviour is exactly the
+    # silent-by-construction class #14 is about. Say so, once, at startup.
+    log "full-state: staleness gate DISABLED (monitor.full_state.stage_max_age_seconds=${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS}) — a staged workspace snapshot will be served at ANY age, restoring the pre-#14 behaviour where the snapshot section could contradict the counts line in its own emit. The row-count consistency check and the footer age annotation still apply."
+elif (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS )); then
+    log "WARN full-state: stage_max_age_seconds (${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS}s) is BELOW the full_state_snap render cadence (${MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS}s) — staging will read stale on essentially every full-state emit, so the O(workers) inline re-render will run every time inside the heartbeat-bumping compose cycle (the nexus-code#236 failure mode; it is _run_bounded so it degrades to a partial rather than stalling, but the async fast path is defeated). Raise monitor.full_state.stage_max_age_seconds to >= 2x the render cadence, or lower monitor.full_state.snap_interval_seconds."
+fi
+# Known operating limit, stated rather than carried silently: the WARN above
+# only catches a MISCONFIGURED threshold. On a large enough nexus a render can
+# legitimately exceed stage_max_age with an entirely VALID config — staging
+# then always reads stale and the inline re-render runs every emit, reaching
+# the nexus-code#236 mode. It is _run_bounded, so it degrades to a labelled
+# partial rather than stalling the heartbeat, but the async fast path is lost.
+# There is no startup-time check for it; the signal is a sustained stream of
+# "re-rendered inline" plus "exceeded ${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS}s"
+# lines in this log.
 # Automatic reports-archive roll (your-org/nexus-code#447). Fires on the
 # first tick (next_fire seeds to 0 → startup migration/self-heal) and then
 # hourly by default; the day-stamp gate inside the task makes every tick but

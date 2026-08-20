@@ -22,6 +22,56 @@ The only GitHub interactions that may still use the user's identity
 are `git commit` and `git push` (commit authorship stays the user's
 on the commit graph).
 
+### Sandbox exception — push transport when there is no user credential
+
+Inside `agent-sandbox` there is frequently **no user git credential at
+all**: `gh auth status` reports not logged in and no credential helper
+is configured, so a plain `git push` to an HTTPS remote dies with
+
+```
+fatal: could not read Username for 'https://github.com'
+```
+
+Push through the bot's installation token in the URL form instead:
+
+```bash
+TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+git -C <clone> push \
+  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+```
+
+This does **not** violate the rule above, because it separates two
+things that are easy to conflate:
+
+- **Commit authorship** — what `%an`/`%ae` record on the commit graph,
+  set by `user.name`/`user.email` at `git commit` time.
+- **Push transport** — the credential authenticating the network push.
+
+The token is *only* the transport. It does not touch authorship, so an
+agent that sees a token in a push command and reports a bot-identity
+violation has misread which of the two is in play.
+
+Authorship is a separate question, and on a sandboxed clone it may also
+land on the bot — not by policy but by **absence of config**. Check
+before you commit:
+
+```bash
+git config --get user.email || echo "NO IDENTITY CONFIGURED"
+```
+
+If nothing is configured, `git commit` either fails outright or invents
+an implicit `user@host` identity. Don't invent an operator identity you
+cannot verify: set the worktree-local identity to whatever the repo's
+recent history already uses (`git log -5 --format='%an <%ae>'`) and say
+so in your report. Configuring an operator git identity in the sandbox
+is the real fix; until then, bot-authored self-fix commits are the
+expected state, not a violation to be corrected in passing.
+
+Keep the token inline — never `git remote set-url` it into `.git/config`,
+and filter it out of any captured output. The URL form itself is
+documented in `<yourlab>.sandbox-gotchas` rule 3; this note only records
+which identity it carries and why it is legitimate here.
+
 ## The bot is the DEFAULT — the `gh` wrapper
 
 You do not have to remember the rule for the common case: a bare
@@ -308,8 +358,8 @@ repo — return:
 If you hit either, the bot is not installed there. Surface it as a
 blocker:
 
-1. Push your branch under the user's identity (`git push`) so the
-   work isn't lost.
+1. Push your branch so the work isn't lost (`git push`; in the
+   sandbox, via the token URL form — see "Sandbox exception" above).
 2. Record it in your final report's `## Infrastructure Issues`
    section with the repo name and command that failed.
 3. The user / org admin expands the App's repo scope (one click in

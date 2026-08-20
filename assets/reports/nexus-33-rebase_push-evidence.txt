@@ -1,0 +1,29 @@
+push evidence for jacob-greene/fix-16-skeptic-liveness-gate (#33)
+written 2026-08-03T21:27:23-07:00 by the nexus-33-rebase worker
+
+== PUSH 1 (the rebase force-push) ==
+command, verbatim:
+  git -C /fh/fast/henikoff_s/user/jgreene/projects/nexus/nexus-code/work/nexus-33-rebase push --force-with-lease origin jacob-greene/fix-16-skeptic-liveness-gate
+lease baseline printed immediately before the push:
+  7ea2ca29c59939db6558283eae0512a02c21935b
+output, verbatim:
+  To https://github.com/jacob-greene/nexus.git
+   + 7ea2ca2...ed8ba41 jacob-greene/fix-16-skeptic-liveness-gate -> jacob-greene/fix-16-skeptic-liveness-gate (forced update)
+
+== PUSH 2 (the SK-Q1 fix; fast-forward, no force) ==
+  git -C <worktree> push --force-with-lease origin jacob-greene/fix-16-skeptic-liveness-gate
+  To https://github.com/jacob-greene/nexus.git
+     ed8ba41..5cdac7e jacob-greene/fix-16-skeptic-liveness-gate -> jacob-greene/fix-16-skeptic-liveness-gate
+
+== independent corroboration: remote-tracking reflog ==
+5cdac7e refs/remotes/origin/jacob-greene/fix-16-skeptic-liveness-gate@{0}: update by push
+ed8ba41 refs/remotes/origin/jacob-greene/fix-16-skeptic-liveness-gate@{1}: update by push
+7ea2ca2 refs/remotes/origin/jacob-greene/fix-16-skeptic-liveness-gate@{2}: fetch origin --quiet: storing head
+
+== ancestry check ==
+7ea2ca2 is ancestor of HEAD: no (expected: history was rewritten)
+7ea2ca2 object still present: commit
+
+== bare --force never used ==
+Both pushes used --force-with-lease. Push 2 was a fast-forward, so the
+lease was not even exercised. There is no other push from this worktree.

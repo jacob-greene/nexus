@@ -167,6 +167,9 @@ ng react <comment-id> rocket                 # mark fully-processed (prints conf
 ng show <comment-id>                         # read-only fetch by id (bypasses eligibility)
 ng close <issue> [--comment <text>]
 ng dashboard get                             # fetch dashboard middle (cached to .state)
+ng dashboard get --stat                      # size breakdown, NEVER the body — use
+                                             #   this first; a bloated dashboard read
+                                             #   in full will blow out your context
 ng dashboard put --body-file <path>          # splice + PATCH
 ng issue <n> [--with-body] [--with-comments] # default = one-line; flags expand
 ng issue create --title <t> --body-file <f> [--label <l>]...
@@ -270,7 +273,16 @@ the full rules.
    live body, splices your new middle in between the markers, and
    PATCHes (so any human-written intro outside the markers is
    preserved). `ng dashboard get` returns the current middle if you
-   need to diff before overwriting.
+   need to diff before overwriting; prefer `ng dashboard get --stat`
+   to size it up first.
+
+   **Every update is a REPLACE, not an append.** The dashboard is a
+   glanceable status surface: `## In-flight` mirrors LIVE windows only
+   (reconcile against `tmux list-windows` and delete rows for windows
+   that are gone), and narrative history goes in `reports/`, not here.
+   Append-and-never-prune is how it once reached 213 KB. `put` now
+   warns when the body is over its size budget — act on that warning
+   rather than pushing past it. See `skills/nexus.dashboard/SKILL.md`.
 
 5. Launch the watcher if it isn't already running. `monitor/ng
    watcher-status` summarises heartbeat age, target window, and tmux
