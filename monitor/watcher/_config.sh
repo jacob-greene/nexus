@@ -112,6 +112,55 @@ MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED="${MONITOR_FULL_STATE_IDLE_BACKOFF_ENABL
 case "$MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED" in true|false) ;; *) MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED=true ;; esac
 MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.full_state.idle_backoff_max_seconds 3600)}"
 [[ "$MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3600
+# ---- full-state snapshot STAGING freshness (issue #14) -------------------
+#
+# The `--- workspace snapshot ---` body is produced by the ASYNC
+# `full_state_snap` task (it probes every worker pane, O(workers), so it
+# must not run in the heartbeat-bumping compose cycle — nexus-code#236) and
+# read from staging by compose_emit. Two knobs keep that hand-off honest.
+#
+# PRODUCER cadence. Was hard-coded equal to the emit interval (600s), which
+# is precisely why staging could be arbitrarily stale at emit time: two
+# independent same-period schedules drift to an arbitrary phase, so the
+# expected age of the staged body at emit was ~half a period (~300s) and the
+# worst case a full period. Rendering at a QUARTER of the emit interval
+# bounds the age at ~1/4 period. This — not the gate below — is what
+# actually shrinks the everyday exposure window; see the gate's own comment
+# in main.sh for why. Async and off the heartbeat path; at defaults this is
+# 4 renders per 600s against the 20 `idle_section` (30s) and 10
+# `over_limit_scan` (60s) already perform with the same per-pane probe, so
+# ~31 -> ~34, about +10% on that probe class. Renders cannot stack — the
+# scheduler holds an in-flight guard per task. Note the async watchdog
+# budget tracks the interval, so it drops 2400s -> 600s with this change;
+# a render exceeding that is killed as a hung task, which is the intent.
+MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS="${MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS:-$("$_cfg" monitor.full_state.snap_interval_seconds 0)}"
+[[ "$MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=0
+if (( MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS == 0 )); then
+    # Derived default: emit_interval / 4, never tighter than 30s (the
+    # existing expensive-class floor set by `idle_section`).
+    MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=$(( MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS / 4 ))
+    (( MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS < 30 )) && MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=30
+fi
+# CONSUMER staleness gate. compose_emit refuses to serve a staged body older
+# than this and falls through to the (already wall-clock bounded) inline
+# re-render instead. Derived default = emit_interval / 2 = TWO producer
+# beats: the gate fires only when the async path has demonstrably missed a
+# beat, not merely because it is mid-cycle — so the inline re-render stays
+# the exception, not the rule.
+#
+# Corollary, stated plainly: because the producer runs at emit_interval/4,
+# essentially all NORMAL staleness falls below this threshold and this gate
+# does NOT fire. It is a producer-failure backstop, not the everyday catch.
+# The everyday catch is the row-count consistency check in compose_emit,
+# which is threshold-independent. Setting this to 0 disables the age gate
+# (pre-#14 behaviour: a staged body is served at any age) and logs a startup
+# line saying so; the row-count check and the footer annotation still apply.
+MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS="${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS:-$("$_cfg" monitor.full_state.stage_max_age_seconds -1)}"
+[[ "$MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS" =~ ^-?[0-9]+$ ]] || MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=-1
+if (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < 0 )); then
+    MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=$(( MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS / 2 ))
+    (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < 60 )) && MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=60
+fi
 # Worker-side heartbeat staleness window (issue #74). The per-spawn
 # Claude Code hooks write `monitor/.state/heartbeat/<window>.json`
 # on every tool call / notification / user-prompt submission;
@@ -735,6 +784,7 @@ export MONITOR_REQUESTS_ENABLED MONITOR_REQUESTS_REEMIT_COOLDOWN_SECONDS \
        MONITOR_REQUESTS_MAX_PER_EMIT MONITOR_REQUESTS_FAIRNESS \
        MONITOR_REQUESTS_MAX_AGE_SECONDS MONITOR_REQUESTS_RETENTION_SECONDS
 export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL_SPAWN_GRACE_SECONDS MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS MONITOR_HEARTBEAT_STALENESS_SECONDS MONITOR_NOTIFICATIONS_LOG_MAX_BYTES \
+       MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS \
        MONITOR_EMIT_COOLDOWN_SECONDS MONITOR_EMIT_HISTORY_RETENTION_SECONDS \
        MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS MONITOR_EMIT_DEDUP_RING_SIZE \
        MONITOR_REEMIT_ENABLED MONITOR_REEMIT_MAX_AGE_SECONDS MONITOR_REEMIT_LIVE_RECHECK \
