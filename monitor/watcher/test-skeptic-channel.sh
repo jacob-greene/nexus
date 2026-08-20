@@ -756,6 +756,112 @@ assert_file "wrap-up require -> fresh pending marker set" "$PEND/$ATASK"
 
 # ============================================================
 echo
+echo '=== re-wrap-up guard: a completed pass is NOT re-opened ==='
+# ============================================================
+# A `require` worker whose skeptic pass ALREADY returned a verdict wakes
+# (the verdict cleared its marker) and re-runs wrap-up on the same result.
+# The require branch used to be unconditional, so the re-wrap filed a
+# duplicate spawn-skeptic request, RE-ARMED the skeptic-pending marker
+# (a hard retire gate -> retire-preflight safe=0 on a validated worker),
+# and `reset` archived the completed round's channel (`total=5` -> `1`,
+# reading as UNSTARTED). The guard keys on the last round-lifecycle event
+# in the action log: a verdict newest means there is no round to open.
+GTASK=rewrap-guard
+GSK=rewrap-guard-skeptic
+mk_prov "$GTASK" require 0 false ""
+mk_prov "$GSK"   require 1 true "$GTASK" "$GTASK"
+
+# Round 1: worker wrap-up arms the gate and logs skeptic-request.
+_wrapup_skeptic_step 900 "$GTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+assert_file "round 1 -> pending marker armed" "$PEND/$GTASK"
+assert_eq "round 1 -> request intent signalled" "${_SK_SPAWN_REQ:-0}" "1"
+
+# The channel carries the round's traffic: 2 asked, 1 answered.
+"$CHAN" init "$GTASK" >/dev/null 2>&1
+"$CHAN" ask "$GTASK" q1 --message "why?"  >/dev/null
+"$CHAN" ask "$GTASK" q2 --message "how?"  >/dev/null
+"$CHAN" answer "$GTASK" 1 --message "because" >/dev/null
+g_before=$("$CHAN" status "$GTASK")
+assert_eq "channel carries the round's traffic" "$g_before" "open=1 ack=0 answered=1 total=2 done=0"
+
+# The skeptic returns a verdict — clears the worker's marker (existing
+# behaviour) and logs skeptic-verdict, which is what the guard reads.
+_wrapup_skeptic_step 900 "$GSK" your-org/your-nexus 1 "" "" "" credible "$GTASK" 1 0 "$GTASK" >/dev/null 2>&1
+assert_nofile "verdict -> worker's marker cleared" "$PEND/$GTASK"
+
+# THE RE-WRAP-UP. Not in a command substitution: cmd_wrap_up calls the
+# step directly and the _SK_SPAWN_* request-intent globals must survive.
+_wrapup_skeptic_step 900 "$GTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" > "$WORK/rewrap.out" 2>&1
+rc=$?
+g_out=$(cat "$WORK/rewrap.out")
+assert_eq "re-wrap -> rc 0 (wrap-up still completes)" "$rc" "0"
+assert_contains "re-wrap -> announces ALREADY VALIDATED" "$g_out" "SKEPTIC: ALREADY VALIDATED"
+assert_contains "re-wrap -> reports the prior verdict"   "$g_out" "verdict : credible"
+assert_contains "re-wrap -> names the escape hatch"      "$g_out" "--skeptic-new-round"
+assert_not_contains "re-wrap -> does NOT claim a skeptic is required" "$g_out" "SKEPTIC REQUIRED"
+assert_nofile "re-wrap -> pending marker NOT re-armed (no bogus retire gate)" "$PEND/$GTASK"
+assert_eq "re-wrap -> no duplicate request intent" "${_SK_SPAWN_REQ:-0}" "0"
+assert_eq "re-wrap -> channel left intact (counters unchanged)" "$("$CHAN" status "$GTASK")" "$g_before"
+assert_eq "re-wrap -> channel NOT archived" \
+    "$(ls -d "$NEXUS_STATE_DIR/skeptic/$GTASK"/.stale-archive-* 2>/dev/null | wc -l)" "0"
+
+# --- escape hatch: --skeptic-new-round opens a genuine second round ---
+# positionals: issue window repo | role decision rationale waive verdict
+#              target depth findings orig contradicted NEW_ROUND
+_wrapup_skeptic_step 900 "$GTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" "" "" 1 \
+    > "$WORK/newround.out" 2>&1
+n_out=$(cat "$WORK/newround.out")
+assert_contains "--skeptic-new-round -> SKEPTIC REQUIRED (round re-opened)" "$n_out" "SKEPTIC REQUIRED"
+assert_file "--skeptic-new-round -> pending marker re-armed" "$PEND/$GTASK"
+assert_eq "--skeptic-new-round -> request intent signalled" "${_SK_SPAWN_REQ:-0}" "1"
+assert_eq "--skeptic-new-round -> completed round's channel archived" \
+    "$(ls -d "$NEXUS_STATE_DIR/skeptic/$GTASK"/.stale-archive-* 2>/dev/null | wc -l)" "1"
+
+# --- after a forced new round, the NEXT re-wrap is a normal require ---
+# The last round-lifecycle event is now skeptic-request (that round is
+# still open), so the guard must NOT fire — it keys on a verdict being
+# newest, not on a verdict merely existing.
+rm -f "$PEND/$GTASK"
+_wrapup_skeptic_step 900 "$GTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" > "$WORK/open.out" 2>&1
+assert_contains "open round -> guard does not fire (still SKEPTIC REQUIRED)" \
+    "$(cat "$WORK/open.out")" "SKEPTIC REQUIRED"
+assert_file "open round -> marker re-armed as before" "$PEND/$GTASK"
+
+# --- the guard is reversible via config/env ---
+DTASK=rewrap-guard-off
+DSK=rewrap-guard-off-skeptic
+mk_prov "$DTASK" require 0 false ""
+mk_prov "$DSK"   require 1 true "$DTASK" "$DTASK"
+_wrapup_skeptic_step 901 "$DTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 901 "$DSK" your-org/your-nexus 1 "" "" "" credible "$DTASK" 1 0 "$DTASK" >/dev/null 2>&1
+MONITOR_SKEPTIC_REWRAP_GUARD=0 \
+    _wrapup_skeptic_step 901 "$DTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/guardoff.out" 2>&1
+assert_contains "MONITOR_SKEPTIC_REWRAP_GUARD=0 -> pre-fix behaviour restored" \
+    "$(cat "$WORK/guardoff.out")" "SKEPTIC REQUIRED"
+assert_file "guard off -> marker re-armed (the old, buggy path)" "$PEND/$DTASK"
+
+# --- a window with no skeptic history is untouched by the guard ---
+FTASK=rewrap-guard-virgin
+mk_prov "$FTASK" require 0 false ""
+_wrapup_skeptic_step 902 "$FTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" > "$WORK/virgin.out" 2>&1
+assert_contains "no skeptic history -> first-round require unaffected" \
+    "$(cat "$WORK/virgin.out")" "SKEPTIC REQUIRED"
+assert_file "no skeptic history -> pending marker set" "$PEND/$FTASK"
+
+# --- deny / auto-deny paths are untouched (guard is require-only) ---
+NTASK=rewrap-guard-deny
+NSK=rewrap-guard-deny-skeptic
+mk_prov "$NTASK" auto 0 false ""
+mk_prov "$NSK"   require 1 true "$NTASK" "$NTASK"
+_wrapup_skeptic_step 903 "$NTASK" your-org/your-nexus 0 require "infra" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 903 "$NSK" your-org/your-nexus 1 "" "" "" credible "$NTASK" 1 0 "$NTASK" >/dev/null 2>&1
+out=$(_wrapup_skeptic_step 903 "$NTASK" your-org/your-nexus 0 deny "trivial follow-up" "" "" "" "" "" 2>&1)
+assert_contains "deny after a verdict -> still takes the deny path" "$out" "SKEPTIC: NOT WARRANTED"
+assert_nofile "deny after a verdict -> no marker" "$PEND/$NTASK"
+
+# ============================================================
+echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
     exit 0

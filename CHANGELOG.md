@@ -410,6 +410,27 @@ for the current release convention.
 
 ### Fixed
 
+- **A re-wrap-up no longer re-opens a skeptic round that already
+  closed.** `ng wrap-up`'s `require` branch was unconditional, so a
+  worker whose skeptic pass had ALREADY returned a verdict (which clears
+  its pending marker) could wake, re-run wrap-up on the same result, and
+  re-open the finished round: a duplicate `spawn-skeptic` d1 request (the
+  inbox dedup only skips a `.new`/`.claimed` sibling, and the first
+  request is `.done` by then), a re-armed `skeptic-pending` marker — a
+  **hard retire gate**, so `retire-preflight.sh` returned `safe=0
+  skeptic-pending marker unresolved` and refused a legitimate retirement
+  — and a `reset` that archived the completed round's verdicts, dropping
+  `ng skeptic status` from `total=5` to `total=1`, i.e. reading as
+  *unstarted*. Third confirmed occurrence, 2026-08-20. The gate now keys
+  on the last round-lifecycle event for the window in the action log
+  (`skeptic-request` / `skeptic-spawn` / `skeptic-verdict`): a verdict
+  newest means the round is closed, so it emits `SKEPTIC: ALREADY
+  VALIDATED` and skips all three side effects while the wrap-up otherwise
+  proceeds. `--skeptic-new-round` opens a genuine second round when the
+  worker really did new work; `monitor.skeptic.rewrap_guard` /
+  `MONITOR_SKEPTIC_REWRAP_GUARD=0` restores the old behaviour. The guard
+  only ever declines to arm the gate — it never clears a live marker, so
+  a mid-chain parked worker stays parked. (`monitor/ng`.)
 - **`ng` `STATE_DIR` resolver** now picks up `NEXUS_ROOT` /
   `nexus.root` config so worker wrap-ups from worktrees land
   in the primary clone's `.state/`, not the worktree's. (PR #11.)
