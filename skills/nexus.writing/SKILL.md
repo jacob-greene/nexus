@@ -1,0 +1,160 @@
+---
+description: "How every nexus agent writes: Simplified Technical English (ASD-STE100) writing rules, sentences under 20 words, one idea per sentence, stats and results in tables, internal terms defined on first use from the shared GLOSSARY.md. Use when writing a report, an issue or PR comment, a dashboard section, or a figure caption."
+---
+
+# nexus.writing — how every agent writes
+
+TRIGGER when: you are writing a report, a GitHub issue or PR
+comment, a PR body, a dashboard section, a figure caption, or any
+other prose a human will read.
+
+The `## Worker floor` in `nexus.worker-defaults` carries the four
+rules you can apply without reading anything. This skill is the
+rest: what standard those rules come from, where the standard
+stops, and the glossary that keeps definitions stable.
+
+## The six rules
+
+| # | Rule | Where it is enforced |
+|---|---|---|
+| 1 | Follow the ASD-STE100 writing rules | this skill, `## Simplified Technical English` |
+| 2 | Sentences under 20 words | floor bullet |
+| 3 | One idea per sentence | floor bullet |
+| 4 | Define internal terms on first use | floor bullet + `GLOSSARY.md` |
+| 5 | Report stats and results in a table | floor bullet + `## Tables` |
+| 6 | Keep definitions and tables stable across turns | `GLOSSARY.md` + `## Tables` |
+
+The rules apply to new writing only. The nexus does not rewrite
+its existing reports, issues, or skills to match.
+
+## Simplified Technical English
+
+ASD-STE100 is a controlled language. The AeroSpace and Defence
+Industries Association of Europe maintains it. Its origin is
+civil aviation maintenance documentation. It has two parts.
+
+| Part | Content | Adopted here? |
+|---|---|---|
+| Part 1 — writing rules | ~65 rules on words, verbs, sentences, procedures, punctuation | **Yes** |
+| Part 2 — dictionary | ~900 approved words, each with one approved meaning | **No** |
+
+**The dictionary is not adopted, and this is deliberate.** The
+approved-word list was built for aircraft maintenance. It does
+not contain `chromatin`, `eigenvector`, `deflation`, or
+`insulation score`. A literal reading would forbid the vocabulary
+this workspace exists to use.
+
+STE itself supplies the escape. Its Technical Name and Technical
+Verb rules let a writer use a word that is absent from the
+dictionary when the word names a real part, material, process, or
+measurement in the subject domain. Every domain term below is a
+Technical Name or a Technical Verb under that exemption. Use them
+freely, and define them per rule 4.
+
+### The Part 1 rules that bind here
+
+| Rule | Applied form |
+|---|---|
+| Sentence length | Under 20 words. STE allows 25 for descriptive text; the nexus uses 20 everywhere, which is stricter and simpler to check. |
+| One idea per sentence | Split on `and`, `but`, and semicolons when each half stands alone. |
+| Active voice | Name the actor. Write "the watcher emits", not "an emit is produced". |
+| Paragraph length | Six sentences or fewer. |
+| Noun clusters | Three words maximum. "watcher snapshot staleness bound" becomes "the staleness bound on the watcher snapshot". |
+| Articles | Keep `a`, `an`, `the`. Do not write telegraphic prose. |
+| One word, one meaning | See the caveat below. |
+
+**Caveat on "one word, one meaning".** The nexus already breaks
+this rule. `emit` is a verb in STE and a noun here ("a watcher
+emit"). `floor` is a noun in STE and names a section here. These
+uses are entrenched, and renaming them would cost more than it
+returns. Treat them as Technical Names, list them in
+`GLOSSARY.md`, and do not coin new dual-role words.
+
+## Defining internal terms
+
+Rule 4 says "no jargon". Taken literally the nexus cannot obey
+it: `emit`, `floor`, `wrap-up`, `parked`, `ghost`, and
+`preflight` are load-bearing internal terms with no plain-English
+equivalent. Project work adds its own: gene names, assay names,
+and metric names are all Technical Names.
+
+The achievable rule is narrower and is the one that binds:
+
+> Define every internal term on first use, in **every artefact
+> that travels on its own.**
+
+A report, an issue comment, a PR body, and a figure caption each
+circulate separately. A reader may see one and never the others.
+So each one carries its own first-use definition. Repeating a
+definition across artefacts is correct, not redundant.
+
+The definition is one clause, inline, in parentheses or after an
+em dash:
+
+> The watcher emitted a service-health line (an *emit* — one
+> block the watcher prints for the orchestrator to act on).
+
+## The glossary makes definitions stable
+
+Rule 6 asks for consistency across turns. No agent can honour
+that from memory. A fresh session does not know what wording the
+last session used, so definitions drift.
+
+`skills/nexus.writing/GLOSSARY.md` is the mechanism. It holds one
+approved definition per internal term. Read it, then copy the
+definition rather than inventing one.
+
+| Action | How |
+|---|---|
+| Define a term | Copy its line from `GLOSSARY.md` verbatim. |
+| Term is missing | Add a row in the same PR that first uses the term. |
+| Definition is wrong | Change `GLOSSARY.md`. Do not write a local variant. |
+
+The glossary is repo-tracked, so it survives every session
+restart. That is the whole point: the consistency lives in the
+file, not in an agent's context.
+
+## Tables
+
+Rule 5: put every stat and every result in a table. Prose hides
+numbers; a table lines them up for comparison.
+
+A table is required when you report counts, sizes, durations,
+rates, pass/fail outcomes, or per-item results. A single number
+in a sentence is fine.
+
+Fixed columns keep tables comparable across turns:
+
+| Table kind | Required columns, in order |
+|---|---|
+| Measurements | `Metric` \| `Value` \| `Unit` \| `Source` |
+| Per-item results | `Item` \| `Result` \| `Evidence` |
+| Comparisons | `Item` \| `Before` \| `After` \| `Delta` |
+| Findings | `Finding` \| `Where` \| `Severity` \| `Action` |
+
+Add columns when a table needs them. Do not rename or reorder
+the required ones. `Source` and `Evidence` mean a file path, a
+command, a log line, or a URL — something a reader can check.
+
+## What this does not cover
+
+- **Code and commit messages.** Follow the surrounding
+  conventions in the repo you are editing.
+- **Machine-read output.** JSON, TSV, and log lines follow their
+  own formats.
+- **Enforcement.** Nothing checks these rules today.
+  `ng report-check` validates report structure, not style. A
+  style check in `report-init` or `report-check` is the obvious
+  next step; it is not built.
+
+## See Also
+
+- `nexus.worker-defaults` — the `## Worker floor` bullet that
+  carries rules 2 to 5 into every worker spawn prompt.
+- `nexus.report` — report structure. Structure is that skill;
+  style is this one.
+- `nexus.dashboard` — dashboard size budgets. Tables over
+  narrative there is the same instinct as rule 5 here.
+- `nexus.self-fix` — the cross-fork PR body template. Its
+  "1-2 plain-English sentences" plus "terse table" is this
+  skill applied to one artefact.

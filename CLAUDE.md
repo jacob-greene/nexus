@@ -19,6 +19,7 @@ this is the index. One line per skill, "use when" framing:
 | Editing the always-applies worker safety floor (auto-injected into every spawn prompt by `monitor/spawn-worker.sh` from the `## Worker floor` section) | `skills/nexus.worker-defaults/SKILL.md` |
 | Making any GitHub write — PR, issue, comment, reaction, wiki upload (`ng` verbs, install scope, push-author verify, fail-loud token guard) | `skills/nexus.bot/SKILL.md` |
 | Writing or reviewing a report under `reports/` (sections, infra-issue feedback loop) | `skills/nexus.report/SKILL.md` |
+| Writing anything a human reads — a report, an issue or PR comment, a dashboard section, a figure caption. The house style: ASD-STE100 writing rules (dictionary deliberately NOT adopted), sentences under 20 words, one idea each, stats and results in tables with fixed columns, internal terms defined on first use from the shared `GLOSSARY.md` | `skills/nexus.writing/SKILL.md` |
 | Doing scientific work that should be grounded in the literature — finding relevant papers by content (`ng lit search` over S2 + ASTA, deduped against the reference library), growing the library (`ng lit add`), and citing the references + their supporting statements in scientific reports | `skills/nexus.lit/SKILL.md` |
 | Running periodic infrastructure meta-review across reports | `skills/nexus.infra-review/SKILL.md` |
 | Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills; pre-flight gate (fresh pull + substantiated repro + scope check) before filing on `<your-org>/nexus-code` | `skills/nexus.self-fix/SKILL.md` |
