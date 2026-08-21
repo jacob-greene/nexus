@@ -43,6 +43,7 @@ A skill's audience is the second column in the table below.
 | [`nexus.worker-defaults`](#nexusworker-defaults) | injected | The always-applies safety floor for every spawned worker |
 | [`nexus.bot`](#nexusbot) | worker + orchestrator | Bot identity for all GitHub writes; the `ng` / `mint-token.sh` channels |
 | [`nexus.report`](#nexusreport) | worker + orchestrator | Report schema, filename convention, the Infrastructure Issues feedback loop |
+| [`nexus.writing`](#nexuswriting) | worker + orchestrator | House writing style: ASD-STE100 Part 1 rules, sentences under 20 words, one idea each, stats in tables, terms defined from a shared `GLOSSARY.md` |
 | [`nexus.lit`](#nexuslit) | worker | Literature research for scientific work: `ng lit` content-relevance discovery (S2 + ASTA) deduped against the reference library, library growth, and citing references in scientific reports |
 | [`nexus.infra-review`](#nexusinfra-review) | orchestrator | Periodic meta-review of `## Infrastructure Issues` across the report corpus |
 | [`nexus.self-fix`](#nexusself-fix) | orchestrator + maintainers | Editing the nexus itself — watcher, monitor scripts, skills, CLAUDE.md |
@@ -194,6 +195,38 @@ encountered during the task — broken script, missing capability,
 ambiguous skill, unexpected sandbox limitation — gets recorded in
 the optional section. `nexus.infra-review` aggregates these across
 the corpus into a ranked backlog.
+
+## `nexus.writing`
+
+→ [`skills/nexus.writing/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.writing/SKILL.md)
+
+**Audience:** every agent that writes prose a human will read —
+workers and the orchestrator alike. Rules 3 to 5b reach workers
+through the injected [Worker floor](#nexusworker-defaults); this
+skill carries the standard behind them.
+
+**Trigger:** writing a report, a GitHub issue or PR comment, a PR
+body, a dashboard section, or a figure caption.
+
+**What it covers:** the six writing stipulations in the operator's
+own numbering; which half of **ASD-STE100** the nexus adopts (Part 1,
+53 writing rules — the ~900-word approved dictionary is deliberately
+**not** adopted) and the Technical Name / Technical Verb exemption
+that legitimises domain vocabulary; the define-on-first-use rule and
+why it repeats per artefact; and four table kinds with fixed columns.
+
+**Ships a companion file.**
+[`GLOSSARY.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.writing/GLOSSARY.md)
+holds one approved definition per internal term, repo-tracked, so
+definitions stay stable across sessions instead of drifting. Agents
+copy a definition rather than inventing one; a missing term is added
+in the PR that first uses it.
+
+**Not enforced.** `ng report-check` validates report structure, not
+style. These are conventions today.
+
+**Pairs with:** [`nexus.report`](#nexusreport) — structure lives
+there, style lives here.
 
 ## `nexus.lit`
 

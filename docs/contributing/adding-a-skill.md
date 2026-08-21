@@ -7,8 +7,9 @@ how the nexus extends the agent's behaviour without bloating
 `CLAUDE.md`: a skill loads only when it's relevant, leaving the
 default context lean.
 
-See the [Skills catalog](../reference/skills.md) for the fourteen
-skills that ship today.
+See the [Skills catalog](../reference/skills.md) for the skills
+that ship today. The catalog is the count; do not restate a number
+here, because it goes stale on the next skill that lands.
 
 ## When to add a skill vs editing prose
 
