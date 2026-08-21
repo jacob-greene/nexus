@@ -31,9 +31,14 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | eligible comment | a GitHub comment the watcher judges as new work for the orchestrator |
 | floor | the `## Worker floor` section injected verbatim into every worker spawn prompt |
 | spawn | to launch a worker in a new tmux window via `monitor/spawn-worker.sh` |
+| resume | to relaunch a worker into its own window, so it continues the same task |
+| lifecycle anchor | the `spawn` action-log event that marks when a window's current life began |
 | wrap-up | the hand-off step that checks a report, uploads it, and comments the link on the issue |
+| re-wrap-up | a second wrap-up that the same worker runs on the same result |
 | report | the file under `reports/` an agent writes before finishing, so the work can resume without the session |
 | skeptic | an independent agent that adversarially rechecks another worker's result |
+| skeptic round | one validation pass, from the request that opens it to the verdict that closes it |
+| verdict | the skeptic's ruling on a worker's result, which closes the skeptic round |
 | parked | idle on purpose and exempt from window cleanup, usually while waiting for a skeptic |
 | ghost | Claude Code's dim autosuggest text in a pane, which looks like typed input but is not |
 | preflight | a check that runs before an action and blocks it when a condition fails |
