@@ -8,21 +8,31 @@ TRIGGER when: you are writing a report, a GitHub issue or PR
 comment, a PR body, a dashboard section, a figure caption, or any
 other prose a human will read.
 
-The `## Worker floor` in `nexus.worker-defaults` carries the four
-rules you can apply without reading anything. This skill is the
-rest: what standard those rules come from, where the standard
-stops, and the glossary that keeps definitions stable.
+The `## Worker floor` in `nexus.worker-defaults` carries rules 3
+to 5b — the ones you can apply without reading anything. This
+skill is the rest: what standard those rules come from, where the
+standard stops, and the glossary that keeps definitions stable.
 
 ## The six rules
 
-| # | Rule | Where it is enforced |
+| # | Rule | Where it lives |
 |---|---|---|
-| 1 | Follow the ASD-STE100 writing rules | this skill, `## Simplified Technical English` |
-| 2 | Sentences under 20 words | floor bullet |
-| 3 | One idea per sentence | floor bullet |
-| 4 | Define internal terms on first use | floor bullet + `GLOSSARY.md` |
-| 5 | Report stats and results in a table | floor bullet + `## Tables` |
+| 1 | A memory about how agents must write | orchestrator memory — see below |
+| 2 | Follow the ASD-STE100 writing rules | this skill, `## Simplified Technical English` |
+| 3 | Sentences under 20 words | floor bullet |
+| 4 | One idea per sentence | floor bullet |
+| 5a | No undefined jargon — define words | floor bullet + `GLOSSARY.md` |
+| 5b | Report stats and results in a table | floor bullet + `## Tables` |
 | 6 | Keep definitions and tables stable across turns | `GLOSSARY.md` + `## Tables` |
+
+**The numbering is the operator's, from the request that created
+this skill.** Keep it. Every other artefact discussing these rules
+uses it, and renumbering breaks cross-references.
+
+Rule 1 is not itself a writing rule, and it has no agent-facing
+form here. Agent memory is scoped per project directory, so a
+memory reaches the orchestrator only. Workers are reached by the
+floor bullet and by this skill.
 
 The rules apply to new writing only. The nexus does not rewrite
 its existing reports, issues, or skills to match.
@@ -49,7 +59,7 @@ Verb rules let a writer use a word that is absent from the
 dictionary when the word names a real part, material, process, or
 measurement in the subject domain. Every domain term below is a
 Technical Name or a Technical Verb under that exemption. Use them
-freely, and define them per rule 4.
+freely, and define them per rule 5a.
 
 ### The Part 1 rules that bind here
 
@@ -72,7 +82,7 @@ returns. Treat them as Technical Names, list them in
 
 ## Defining internal terms
 
-Rule 4 says "no jargon". Taken literally the nexus cannot obey
+Rule 5a says "no jargon". Taken literally the nexus cannot obey
 it: `emit`, `floor`, `wrap-up`, `parked`, `ghost`, and
 `preflight` are load-bearing internal terms with no plain-English
 equivalent. Project work adds its own: gene names, assay names,
@@ -116,7 +126,7 @@ file, not in an agent's context.
 
 ## Tables
 
-Rule 5: put every stat and every result in a table. Prose hides
+Rule 5b: put every stat and every result in a table. Prose hides
 numbers; a table lines them up for comparison.
 
 A table is required when you report counts, sizes, durations,
@@ -150,11 +160,11 @@ command, a log line, or a URL — something a reader can check.
 ## See Also
 
 - `nexus.worker-defaults` — the `## Worker floor` bullet that
-  carries rules 2 to 5 into every worker spawn prompt.
+  carries rules 3 to 5b into every worker spawn prompt.
 - `nexus.report` — report structure. Structure is that skill;
   style is this one.
 - `nexus.dashboard` — dashboard size budgets. Tables over
-  narrative there is the same instinct as rule 5 here.
+  narrative there is the same instinct as rule 5b here.
 - `nexus.self-fix` — the cross-fork PR body template. Its
   "1-2 plain-English sentences" plus "terse table" is this
   skill applied to one artefact.
