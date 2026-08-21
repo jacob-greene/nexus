@@ -598,6 +598,54 @@ skeptic's `reconcile`) wakes you. You physically cannot retire until the
 skeptic returns a verdict (clearing your pending marker) — the
 `retire-preflight.sh` gate enforces it.
 
+### Re-wrapping up after a verdict has already landed
+
+A `require` resolution **opens a new round**: it archives the previous
+round's channel sentinels (`reset`, the `#469`/`#511` guard), arms the
+`skeptic-pending` marker, and files a `spawn-skeptic` request. So a
+worker whose pass has ALREADY completed — the verdict cleared its marker,
+it woke, and it re-ran `ng wrap-up` on the *same* result — used to
+re-open a round that was closed: a duplicate `d1` request for a finished
+pass, a re-armed marker (which is a **hard retire gate**, so
+`retire-preflight.sh` refused a legitimate retirement with `safe=0
+skeptic-pending marker unresolved`), and a channel whose counters reset
+(`total=5` → `total=1`, reading as *unstarted* when it was complete).
+
+`ng wrap-up` now checks the **last round-lifecycle event** for the window
+in the action log (`skeptic-request` / `skeptic-spawn` /
+`skeptic-verdict`). When a **verdict is newest**, the round is closed and
+there is nothing to open:
+
+```
+=== SKEPTIC: ALREADY VALIDATED (re-wrap-up, no new round) ===
+```
+
+All three side effects are skipped, the wrap-up otherwise proceeds
+normally, and the window stays retirable. The guard only ever *declines*
+to arm the gate — it never clears one that is live, so a mid-chain worker
+parked awaiting a second-pass skeptic keeps its marker and stays parked.
+
+**"For the window" means for its CURRENT LIFE.** Window names get
+recycled for unrelated tasks once a window retires, so the lookup is
+floored at the window's most recent *fresh* `spawn` event — the
+lifecycle-birth anchor `spawn-worker.sh` writes on every birth. If you
+are a new task that inherited a name someone else used, the previous
+task's verdict does not speak for you and your `require` is enforced
+normally. A `--resume` respawn is **not** a new life: it continues the
+same task, so if your pass already returned a verdict before you were
+resumed, the guard still fires and you should not expect a second
+skeptic without `--skeptic-new-round`.
+
+**If you genuinely did new work since that verdict** and it needs
+re-validation, say so explicitly:
+
+```bash
+ng wrap-up <issue> <report> --repo <owner>/<repo> --skeptic-new-round
+```
+
+That takes the full path — archive the closed round, re-arm the gate,
+file a fresh request — exactly as before.
+
 ---
 
 ## Config knobs
@@ -607,6 +655,7 @@ skeptic returns a verdict (clearing your pending marker) — the
 | `monitor.skeptic.max_depth` | `MONITOR_SKEPTIC_MAX_DEPTH` | `3` | Recursion cap. |
 | `monitor.skeptic.findings_threshold` | `MONITOR_SKEPTIC_FINDINGS_THRESHOLD` | `1` | New-findings count that (absent suspect/refuted) triggers a second pass. Floored at 1. |
 | `monitor.skeptic.enforce_auto_decision` | `MONITOR_SKEPTIC_ENFORCE_AUTO_DECISION` | `true` | When on (the default), an `auto`-mode wrap-up *fails* until the worker records a decision. Set false for advisory-only. |
+| `monitor.skeptic.rewrap_guard` | `MONITOR_SKEPTIC_REWRAP_GUARD` | `true` | When on (the default), a `require` wrap-up whose pass has ALREADY returned a verdict does not re-open the round (see "Re-wrapping up after a verdict" below). Set false to restore the unconditional pre-guard behaviour. |
 | `monitor.skeptic.await_timeout_seconds` | `MONITOR_SKEPTIC_AWAIT_TIMEOUT_SECONDS` | `900` | Per-call `await` timeout. On timeout `await` exits 4 and the worker re-enters; it bounds a single blocking call (the loop heartbeats throughout). |
 | `monitor.skeptic.await_interval_seconds` | `MONITOR_SKEPTIC_AWAIT_INTERVAL_SECONDS` | `5` | `await` poll interval (also the heartbeat cadence). |
 | `monitor.skeptic.await_hang_seconds` | `MONITOR_SKEPTIC_AWAIT_HANG_SECONDS` | `600` | Hang-vs-wait threshold. A parked worker is exempt from idle flagging only while its pending-marker mtime is within this window; a marker stale beyond it lets a genuine hang resurface. |

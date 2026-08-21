@@ -50,6 +50,7 @@
 #                                [--allow-stub]
 #                                [--skeptic-decision require|deny --skeptic-rationale "<why>"]
 #                                [--skeptic-waive "<reason>"]
+#                                [--skeptic-new-round]
 #                                [--skeptic-role --skeptic-target <window>
 #                                 --skeptic-verdict credible|check|suspect|refuted
 #                                 --skeptic-depth N --skeptic-findings N
@@ -1540,6 +1541,84 @@ _skeptic_cfg_int() {
     printf '%s' "$val"
 }
 
+# The LAST round-lifecycle event for a window, from the append-only
+# action log. Emits TSV `event<TAB>verdict<TAB>depth<TAB>ts` for the most
+# recent of:
+#   spawn            (window, fresh only) — a NEW TASK was born in this
+#                    window NAME, so any older skeptic history belongs to
+#                    a different task and must not speak for this one
+#   skeptic-request  (target-window) — a round was OPENED for this window
+#   skeptic-spawn    (target-window) — a reviewer was DISPATCHED at it
+#   skeptic-verdict  (target-window | orig-window) — a verdict RETURNED
+# Nothing on stdout (rc 1) when the window has no lifecycle history.
+#
+# The log is append-only and chronological, so the last matching line IS
+# the newest — no slurp, no sort (the live log grows without bound and
+# `jq -s` over it would be a needless read of the whole file). The `grep
+# -F` prefilter keeps jq off the ~99% of lines that can never match; it
+# anchors on the `event` field, so it must name every event jq selects.
+#
+# This is the discriminator `_wrapup_skeptic_step` needs to tell a
+# LEGITIMATE new round (last event opened one, or began a new task) from
+# a RE-WRAP-UP of an already-validated result (last event returned a
+# verdict).
+#
+# WHY `spawn` IS A ROUND-LIFECYCLE EVENT (#69 review).  The key here is
+# the tmux WINDOW NAME, and window names are RECYCLED for unrelated tasks
+# after a retire. Without a lifecycle floor, a brand-new task spawned
+# into a recycled name reads the PREVIOUS task's verdict as "newest", the
+# re-wrap-up guard fires, and its `require` gate is never armed — no
+# marker, no spawn-skeptic request, no skeptic, no error. That is a
+# SILENT `require` -> `deny` downgrade, strictly worse than the
+# re-wrap-up bug the guard exists to fix (which at least fails closed and
+# loudly). It is not hypothetical: on the live log, 21 fresh spawns
+# landed on a name that already carried a verdict, and six of them went
+# on to open a REAL round (`skeptic-request decision=required` really was
+# logged) that the unfloored guard would have suppressed — five under
+# `bmmc-k27me3-int` / `nucleation-sites`, one under `mouse-bm` whose
+# skeptic came back `check`. All six were `auto` workers that DECIDED
+# `require`, so it overrides the responsible-default heuristic too.
+#
+# A `spawn` event is exactly the right floor, and is already the
+# codebase's idiom for this: `spawn-worker.sh` documents it as the
+# window's lifecycle-birth anchor and `_idle_probe.sh`
+# (`_idle_window_spawn_ts`) already uses it to keep a PRIOR life's
+# wrap-up from speaking for the current one.
+#
+# RESUMES ARE DELIBERATELY EXCLUDED. `spawn-worker.sh --resume` seeds the
+# same anchor tagged `mode=resume`, but a resume continues the SAME task
+# — and `verdict -> resume -> re-wrap-up` is a live shape of the very bug
+# `#68` reported, so a resume must NOT reset the discriminator. Only a
+# fresh spawn (no `mode`) is a new-task boundary.
+#
+# Residual, deliberate: a fresh respawn MID-ROUND (round open, skeptic
+# not yet back) also clears the floor, so a re-wrap-up there re-opens the
+# round. That is the pre-#69 behaviour — noisy and fail-CLOSED — and it
+# is the safe direction to err in.
+_skeptic_last_round_event() {
+    local win="$1"
+    local log="$STATE_DIR/action-log.jsonl"
+    [[ -n "$win" && -f "$log" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    local line
+    line=$(grep -F -e '"event":"skeptic-' -e '"event":"spawn"' "$log" 2>/dev/null \
+        | jq -r --arg w "$win" '
+        select(
+          (.event == "skeptic-verdict"
+            and (((.["target-window"] // "") == $w)
+                 or ((.["orig-window"] // "") == $w)))
+          or ((.event == "skeptic-request" or .event == "skeptic-spawn")
+               and ((.["target-window"] // "") == $w))
+          or (.event == "spawn"
+               and ((.window // "") == $w)
+               and ((.mode // "") != "resume"))
+        )
+        | [.event, (.verdict // "-"), (.depth // "-"), (.ts // "-")] | @tsv
+    ' 2>/dev/null | tail -1)
+    [[ -n "$line" ]] || return 1
+    printf '%s' "$line"
+}
+
 # The responsible-default heuristic, printed when an `auto`-mode worker
 # must decide. Single source of truth; mirrored in
 # skills/nexus.skeptic/SKILL.md and skills/nexus.report.
@@ -1595,11 +1674,13 @@ _skeptic_spawn_cmd() {
 # config monitor.skeptic.enforce_auto_decision is truthy.
 # Args: issue source_window repo
 #       role decision rationale waive verdict target depth findings orig
+#       contradicted new_round
 _wrapup_skeptic_step() {
     local issue="$1" source_window="$2" repo="$3"
     local f_role="$4" f_decision="$5" f_rationale="$6" f_waive="$7"
     local f_verdict="$8" f_target="$9" f_depth="${10}" f_findings="${11}"
-    local f_orig="${12:-}" f_contradicted="${13:-}"
+    local f_orig="${12:-}" f_contradicted="${13:-}" f_new_round="${14:-0}"
+    [[ "$f_new_round" == "1" ]] || f_new_round=0
 
     # Request-intent signal for cmd_wrap_up's "Step 2b" (spawn-skeptic
     # request filing, your-org/nexus-code#545). Default cleared here so a
@@ -1876,6 +1957,72 @@ _wrapup_skeptic_step() {
     local next=$((depth + 1))
     case "$effective" in
         required|required-escalated)
+            # ---- RE-WRAP-UP GUARD -------------------------------------
+            # Everything below this guard OPENS A NEW ROUND. That is right
+            # for a first wrap-up and for a deliberate re-validation, and
+            # WRONG for the common case that put it here: a worker whose
+            # skeptic pass ALREADY COMPLETED wakes (its marker was cleared
+            # by the verdict) and re-runs wrap-up on the same result. The
+            # branch was unconditional, so a re-wrap-up (a) filed a
+            # duplicate spawn-skeptic request — the inbox dedup at
+            # `_wrapup_file_spawn_skeptic_request` only skips a
+            # `.new`/`.claimed` sibling, and the first request is `.done`
+            # by then — (b) re-armed the skeptic-pending marker, turning a
+            # bookkeeping artefact into a HARD RETIRE GATE that blocks a
+            # legitimate retirement (`retire-preflight.sh` check 1b →
+            # `safe=0 … skeptic-pending marker unresolved`), and (c) reset
+            # the comms channel, archiving the completed round's verdicts
+            # so `ng skeptic status` read `total=1`, i.e. UNSTARTED, for a
+            # pass that was complete.
+            #
+            # The discriminator is the last round-lifecycle event for this
+            # window: a verdict newest means the round CLOSED, so there is
+            # no round to open. Skip the three side effects, say so
+            # loudly, and name the escape hatch — a worker that really did
+            # new work needing re-validation passes --skeptic-new-round
+            # and gets the full path below. Fail-safe by construction: the
+            # guard only ever DECLINES to arm the gate, never clears one
+            # that is already live (a mid-chain parked worker keeps its
+            # marker and stays parked).
+            #
+            # "For this window" means for the CURRENT LIFE of the window
+            # NAME, not for all of history: names are recycled across
+            # unrelated tasks, so `_skeptic_last_round_event` floors the
+            # scan at the window's most recent FRESH spawn. Without that
+            # floor this guard silently downgrades a new task's `require`
+            # to `deny` — see the long note on that function for the live
+            # evidence and for why a resume is deliberately not a floor.
+            local _rr_guard _rr_last _rr_ev _rr_verdict _rr_depth _rr_ts
+            _rr_guard=$("$_cfg" monitor.skeptic.rewrap_guard true 2>/dev/null || echo true)
+            [[ -n "${MONITOR_SKEPTIC_REWRAP_GUARD:-}" ]] && _rr_guard="$MONITOR_SKEPTIC_REWRAP_GUARD"
+            case "$_rr_guard" in 1|true|yes|on) _rr_guard=1 ;; *) _rr_guard=0 ;; esac
+            if (( _rr_guard == 1 )) && (( f_new_round == 0 )) \
+               && _rr_last=$(_skeptic_last_round_event "$source_window"); then
+                IFS=$'\t' read -r _rr_ev _rr_verdict _rr_depth _rr_ts <<<"$_rr_last"
+                if [[ "$_rr_ev" == "skeptic-verdict" ]]; then
+                    ( cmd_log_action monitor --event skeptic-decision \
+                        "${winx[@]}" \
+                        --extra "decision=already-validated" \
+                        --extra "prior-verdict=$_rr_verdict" \
+                        --extra "prior-depth=$_rr_depth" \
+                        --extra "prior-verdict-ts=$_rr_ts" \
+                        --extra "issue=$issue" ) 2>/dev/null || true
+                    printf '\n=== SKEPTIC: ALREADY VALIDATED (re-wrap-up, no new round) ===\n'
+                    printf 'A skeptic verdict for this window has ALREADY returned:\n'
+                    printf '  verdict : %s\n' "$_rr_verdict"
+                    printf '  depth   : %s\n' "$_rr_depth"
+                    printf '  when    : %s\n' "$_rr_ts"
+                    printf 'CONSEQUENCE: the require gate is SATISFIED. No duplicate\n'
+                    printf 'spawn-skeptic request is filed, no skeptic-pending marker is\n'
+                    printf 'armed, and the comms channel is left intact — so this window\n'
+                    printf 'can retire normally. The wrap-up otherwise proceeds.\n'
+                    printf 'If you did NEW work since that verdict and it needs\n'
+                    printf 're-validation, re-run wrap-up with --skeptic-new-round to open\n'
+                    printf 'a genuine second round (archives the closed round, re-arms the\n'
+                    printf 'gate, files a fresh request).\n'
+                    return 0
+                fi
+            fi
             # Open a NEW skeptic round: archive the previous round's terminal
             # sentinels BEFORE writing the pending marker. A completed round
             # leaves $STATE_DIR/skeptic/<task>/DONE (and its .answered.md
@@ -2180,6 +2327,7 @@ cmd_wrap_up() {
     # the worker's spawn-stamped mode (provenance record) or `auto`.
     local sk_decision="" sk_rationale="" sk_waive="" sk_contradicted=""
     local sk_role=0 sk_verdict="" sk_target="" sk_depth="" sk_findings="" sk_orig=""
+    local sk_new_round=0
     while (( $# > 0 )); do
         case "$1" in
             --trigger-comment)  trigger_comment="${2:-}";   shift 2 ;;
@@ -2198,6 +2346,13 @@ cmd_wrap_up() {
             # spawn-skeptic request `deliberate=true` so the orchestrator
             # arbitrates rather than rubber-stamps (your-org/nexus-code#545).
             --skeptic-contradicted) sk_contradicted="${2:-}"; shift 2 ;;
+            # --skeptic-new-round: this wrap-up deliberately opens a NEW
+            # skeptic round on a window whose previous round already
+            # returned a verdict. Without it, the re-wrap-up guard in
+            # `_wrapup_skeptic_step` declines to re-arm the gate (it would
+            # otherwise duplicate the request, block retirement, and
+            # archive the completed round's channel).
+            --skeptic-new-round) sk_new_round=1;            shift   ;;
             --skeptic-role)      sk_role=1;                 shift   ;;
             --skeptic-verdict)   sk_verdict="${2:-}";       shift 2 ;;
             --skeptic-target)    sk_target="${2:-}";        shift 2 ;;
@@ -2302,7 +2457,7 @@ cmd_wrap_up() {
         "$issue" "$source_window" "$target" \
         "$sk_role" "$sk_decision" "$sk_rationale" "$sk_waive" \
         "$sk_verdict" "$sk_target" "$sk_depth" "$sk_findings" "$sk_orig" \
-        "$sk_contradicted" \
+        "$sk_contradicted" "$sk_new_round" \
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
