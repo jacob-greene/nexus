@@ -650,6 +650,19 @@ ng wrap-up <issue> <report-path>
    via `monitor.skeptic.rewrap_guard` /
    `MONITOR_SKEPTIC_REWRAP_GUARD=0`, which restores the unconditional
    pre-guard behaviour.
+
+   The scan is **scoped to the current life of the window name**, not to
+   all of history. Window names are recycled for unrelated tasks after a
+   retire, so the lookup is floored at the window's most recent **fresh**
+   `spawn` event (the lifecycle-birth anchor `spawn-worker.sh` writes;
+   `_idle_probe.sh` already scopes wrap-up matching the same way). Without
+   that floor, a brand-new task in a recycled name would read the previous
+   task's verdict as newest and have its `require` gate silently
+   downgraded to no-skeptic. A `--resume` respawn is deliberately **not** a
+   new life — it continues the same task, and `verdict → resume →
+   re-wrap-up` is exactly the shape this guard exists to catch. A window
+   with no `spawn` event at all (operator-opened by hand) is unfloored and
+   falls back to scanning all history.
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:

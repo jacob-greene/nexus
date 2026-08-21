@@ -430,7 +430,20 @@ for the current release convention.
   worker really did new work; `monitor.skeptic.rewrap_guard` /
   `MONITOR_SKEPTIC_REWRAP_GUARD=0` restores the old behaviour. The guard
   only ever declines to arm the gate — it never clears a live marker, so
-  a mid-chain parked worker stays parked. (`monitor/ng`.)
+  a mid-chain parked worker stays parked.
+
+  The lifecycle scan is floored at the window's most recent **fresh**
+  `spawn` event, so it sees only the CURRENT life of the window name.
+  Window names are recycled for unrelated tasks after a retire; unfloored,
+  a brand-new task in a recycled name read the previous task's verdict as
+  newest and had its `require` gate silently downgraded to no-skeptic — no
+  marker, no request, no skeptic, no error, and the window retired clean
+  announcing `ALREADY VALIDATED`. On the live action log, 21 fresh spawns
+  landed on a name that already carried a verdict, and six of them went on
+  to open a real round (`skeptic-request decision=required`) that the
+  unfloored guard would have suppressed; all six were `auto` workers that
+  had *decided* `require`. A `--resume` respawn is deliberately not a new
+  life, so `verdict → resume → re-wrap-up` stays guarded. (`monitor/ng`.)
 - **`ng` `STATE_DIR` resolver** now picks up `NEXUS_ROOT` /
   `nexus.root` config so worker wrap-ups from worktrees land
   in the primary clone's `.state/`, not the worktree's. (PR #11.)

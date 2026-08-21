@@ -625,6 +625,17 @@ normally, and the window stays retirable. The guard only ever *declines*
 to arm the gate — it never clears one that is live, so a mid-chain worker
 parked awaiting a second-pass skeptic keeps its marker and stays parked.
 
+**"For the window" means for its CURRENT LIFE.** Window names get
+recycled for unrelated tasks once a window retires, so the lookup is
+floored at the window's most recent *fresh* `spawn` event — the
+lifecycle-birth anchor `spawn-worker.sh` writes on every birth. If you
+are a new task that inherited a name someone else used, the previous
+task's verdict does not speak for you and your `require` is enforced
+normally. A `--resume` respawn is **not** a new life: it continues the
+same task, so if your pass already returned a verdict before you were
+resumed, the guard still fires and you should not expect a second
+skeptic without `--skeptic-new-round`.
+
 **If you genuinely did new work since that verdict** and it needs
 re-validation, say so explicitly:
 

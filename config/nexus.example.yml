@@ -1464,7 +1464,10 @@ monitor:
     # spawn-skeptic request, re-arming the skeptic-pending marker (which
     # would block a legitimate retirement) and archiving the completed
     # round's comms channel. `ng wrap-up --skeptic-new-round` opens a
-    # genuine second round anyway. Set false to restore the
+    # genuine second round anyway. The lifecycle scan is scoped to the
+    # CURRENT life of the window name — floored at its most recent fresh
+    # `spawn` event — because names are recycled for unrelated tasks; a
+    # `--resume` respawn is not a new life. Set false to restore the
     # unconditional pre-guard behaviour. Default true. Env:
     # MONITOR_SKEPTIC_REWRAP_GUARD.
     rewrap_guard: true

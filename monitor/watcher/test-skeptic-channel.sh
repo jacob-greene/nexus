@@ -862,6 +862,202 @@ assert_nofile "deny after a verdict -> no marker" "$PEND/$NTASK"
 
 # ============================================================
 echo
+echo '=== re-wrap-up guard: scoped to the CURRENT LIFE of a window name ==='
+# ============================================================
+# The guard keys on a tmux WINDOW NAME, and window names are RECYCLED for
+# unrelated tasks after a retire. Unfloored, a brand-new task spawned into
+# a recycled name reads the PREVIOUS task's verdict as "newest", the guard
+# fires, and its `require` gate is never armed: no marker, no
+# spawn-skeptic request, no skeptic, no error — a SILENT require -> deny
+# downgrade, strictly worse than the fail-closed bug the guard fixes.
+#
+# The floor is the window's most recent FRESH `spawn` action-log event
+# (`spawn-worker.sh` writes it as the lifecycle-birth anchor). These cases
+# are modelled on the live log shapes: `mouse-bm` (one verdict, then a
+# fresh spawn whose worker DID need a skeptic) and `cc-auto-update` (one
+# verdict, then a daily cron re-spawning the same name for weeks).
+
+# Helper: the fresh-spawn anchor spawn-worker.sh seeds on a real birth.
+# `mode` absent == fresh; `mode=resume` == same task continued.
+spawn_ev() { # window [mode]
+    local -a x=( --extra "window=$1" --extra "workdir=/tmp/$1"
+                 --extra "kind=task" --extra "skeptic-mode=require" )
+    [[ -n "${2:-}" ]] && x+=( --extra "mode=$2" )
+    ( cmd_log_action monitor --event spawn "${x[@]}" ) >/dev/null 2>&1
+}
+
+# --- CASE 1: mouse-bm — verdict, then a FRESH spawn into the same name ---
+RTASK=recycled-name
+RSK=recycled-name-skeptic
+mk_prov "$RTASK" require 0 false ""
+mk_prov "$RSK"   require 1 true "$RTASK" "$RTASK"
+
+# Task A: born, wraps up require, skeptic returns a verdict. Round closed.
+spawn_ev "$RTASK"
+_wrapup_skeptic_step 910 "$RTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 910 "$RSK" your-org/your-nexus 1 "" "" "" credible "$RTASK" 1 0 "$RTASK" >/dev/null 2>&1
+assert_nofile "task A: verdict cleared the marker (round closed)" "$PEND/$RTASK"
+
+# Sanity: with only task A's history, the newest lifecycle event IS the
+# verdict — i.e. the guard is correctly armed right up to the respawn.
+assert_contains "task A: newest lifecycle event is the verdict" \
+    "$(_skeptic_last_round_event "$RTASK")" "skeptic-verdict"
+
+# The window retires; the NAME is recycled for an unrelated task B.
+rm -rf "$NEXUS_STATE_DIR/skeptic/$RTASK"
+spawn_ev "$RTASK"
+assert_contains "task B: a fresh spawn resets the discriminator" \
+    "$(_skeptic_last_round_event "$RTASK")" "spawn"
+
+# Task B's FIRST-EVER wrap-up. It has never been validated by anyone.
+_wrapup_skeptic_step 911 "$RTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/recycled.out" 2>&1
+r_out=$(cat "$WORK/recycled.out")
+assert_contains "recycled name: task B still gets SKEPTIC REQUIRED" "$r_out" "SKEPTIC REQUIRED"
+assert_not_contains "recycled name: task B NOT waved through as validated" \
+    "$r_out" "ALREADY VALIDATED"
+assert_file "recycled name: task B's require gate IS armed" "$PEND/$RTASK"
+assert_eq "recycled name: task B's spawn-skeptic request IS filed" "${_SK_SPAWN_REQ:-0}" "1"
+
+# --- CASE 2: auto -> require is downgraded too, not just spawn-mode require ---
+# Every one of the six real suppressions on the live log was an `auto`
+# worker that DECIDED require, so this is the dominant exposure.
+ATASK2=recycled-auto
+ASK2=recycled-auto-skeptic
+mk_prov "$ATASK2" auto 0 false ""
+mk_prov "$ASK2"   require 1 true "$ATASK2" "$ATASK2"
+spawn_ev "$ATASK2"
+_wrapup_skeptic_step 912 "$ATASK2" your-org/your-nexus 0 require "infra" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 912 "$ASK2" your-org/your-nexus 1 "" "" "" check "$ATASK2" 1 0 "$ATASK2" >/dev/null 2>&1
+rm -rf "$NEXUS_STATE_DIR/skeptic/$ATASK2"
+spawn_ev "$ATASK2"
+_wrapup_skeptic_step 913 "$ATASK2" your-org/your-nexus 0 require "new task, touched infra" "" "" "" "" "" \
+    > "$WORK/recycled-auto.out" 2>&1
+a2_out=$(cat "$WORK/recycled-auto.out")
+assert_contains "recycled name: auto->require decision is HONOURED" "$a2_out" "SKEPTIC REQUIRED"
+assert_not_contains "recycled name: auto->require not silently downgraded" \
+    "$a2_out" "ALREADY VALIDATED"
+assert_file "recycled name: auto->require gate armed" "$PEND/$ATASK2"
+
+# --- CASE 3: cc-auto-update — ONE verdict must not suppress N later runs ---
+# The live shape: a daily cron re-spawns the same window name. One verdict
+# on day 1 suppressed 13 consecutive daily runs.
+CTASK=cron-recycled
+CSK=cron-recycled-skeptic
+mk_prov "$CTASK" require 0 false ""
+mk_prov "$CSK"   require 1 true "$CTASK" "$CTASK"
+spawn_ev "$CTASK"
+_wrapup_skeptic_step 914 "$CTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 914 "$CSK" your-org/your-nexus 1 "" "" "" credible "$CTASK" 1 0 "$CTASK" >/dev/null 2>&1
+c_armed=0
+for c_day in 1 2 3; do
+    rm -rf "$NEXUS_STATE_DIR/skeptic/$CTASK" "$PEND/$CTASK"
+    spawn_ev "$CTASK"
+    _wrapup_skeptic_step "91$c_day" "$CTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+    [[ -f "$PEND/$CTASK" ]] && c_armed=$(( c_armed + 1 ))
+done
+assert_eq "daily cron re-spawn: every run arms its own gate (3/3)" "$c_armed" "3"
+
+# --- CASE 4: the #68 fix still holds — a re-wrap-up in the SAME life ---
+# No fresh spawn between the verdict and the re-wrap-up, so the verdict is
+# still newest and the guard must fire exactly as #69 intends.
+STASK=samelife-rewrap
+SSK=samelife-rewrap-skeptic
+mk_prov "$STASK" require 0 false ""
+mk_prov "$SSK"   require 1 true "$STASK" "$STASK"
+spawn_ev "$STASK"
+_wrapup_skeptic_step 920 "$STASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 920 "$SSK" your-org/your-nexus 1 "" "" "" credible "$STASK" 1 0 "$STASK" >/dev/null 2>&1
+_wrapup_skeptic_step 920 "$STASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/samelife.out" 2>&1
+assert_contains "same life: re-wrap-up still guarded (#68 fix intact)" \
+    "$(cat "$WORK/samelife.out")" "SKEPTIC: ALREADY VALIDATED"
+assert_nofile "same life: marker NOT re-armed" "$PEND/$STASK"
+assert_eq "same life: no duplicate request intent" "${_SK_SPAWN_REQ:-0}" "0"
+
+# --- CASE 5: a RESUME is not a new life — the guard must still fire ---
+# `verdict -> resume -> re-wrap-up` is a live shape of the #68 bug: the
+# worker is the SAME task, woken by --resume. Excluding resumes from the
+# floor is what keeps #69 working across a respawn.
+UTASK=resume-rewrap
+USK=resume-rewrap-skeptic
+mk_prov "$UTASK" require 0 false ""
+mk_prov "$USK"   require 1 true "$UTASK" "$UTASK"
+spawn_ev "$UTASK"
+_wrapup_skeptic_step 921 "$UTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 921 "$USK" your-org/your-nexus 1 "" "" "" credible "$UTASK" 1 0 "$UTASK" >/dev/null 2>&1
+spawn_ev "$UTASK" resume
+assert_contains "resume does NOT reset the discriminator" \
+    "$(_skeptic_last_round_event "$UTASK")" "skeptic-verdict"
+_wrapup_skeptic_step 921 "$UTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/resumed.out" 2>&1
+assert_contains "resumed worker: re-wrap-up still guarded (#68 fix intact)" \
+    "$(cat "$WORK/resumed.out")" "SKEPTIC: ALREADY VALIDATED"
+assert_nofile "resumed worker: marker NOT re-armed" "$PEND/$UTASK"
+
+# --- CASE 6: an OPEN round survives a fresh spawn without being re-closed ---
+# Round open (request logged, no verdict yet) and the window is respawned
+# fresh. The discriminator is a spawn, not a verdict, so the guard does
+# not fire and the re-wrap-up re-opens — the pre-#69, fail-CLOSED
+# direction. Asserted so the choice is pinned, not accidental.
+OTASK=openround-respawn
+mk_prov "$OTASK" require 0 false ""
+spawn_ev "$OTASK"
+_wrapup_skeptic_step 922 "$OTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+spawn_ev "$OTASK"
+rm -f "$PEND/$OTASK"
+_wrapup_skeptic_step 922 "$OTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/openround.out" 2>&1
+assert_contains "open round + fresh respawn -> fails CLOSED (re-opens)" \
+    "$(cat "$WORK/openround.out")" "SKEPTIC REQUIRED"
+assert_file "open round + fresh respawn -> gate armed" "$PEND/$OTASK"
+
+# --- CASE 7: window names that are prefixes of one another don't collide ---
+# `<name>` and `<name>-skeptic` run concurrently by construction, and the
+# spawn clause matches `.window`, a field the skeptic's own spawn also
+# carries. Exact `==` only.
+PTASK=prefixcol
+mk_prov "$PTASK" require 0 false ""
+mk_prov "$PTASK-skeptic" require 1 true "$PTASK" "$PTASK"
+spawn_ev "$PTASK"
+_wrapup_skeptic_step 923 "$PTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+_wrapup_skeptic_step 923 "$PTASK-skeptic" your-org/your-nexus 1 "" "" "" credible "$PTASK" 1 0 "$PTASK" >/dev/null 2>&1
+# The skeptic's OWN fresh spawn must not clear the reviewed worker's floor.
+spawn_ev "$PTASK-skeptic"
+assert_contains "sibling window's spawn does not reset the target's floor" \
+    "$(_skeptic_last_round_event "$PTASK")" "skeptic-verdict"
+_wrapup_skeptic_step 923 "$PTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" \
+    > "$WORK/prefix.out" 2>&1
+assert_contains "prefix sibling: reviewed worker still guarded" \
+    "$(cat "$WORK/prefix.out")" "SKEPTIC: ALREADY VALIDATED"
+
+# --- CASE 8: the prefilter must not drop events jq needs ---
+# `_skeptic_last_round_event` greps before it parses. A fresh `spawn`
+# happens to carry a `skeptic-mode` extra today, so the OLD prefilter
+# (`"skeptic-`) would let it through by accident; a resume carries no
+# such field. Pin the prefilter to the `event` field so neither the
+# match nor the exclusion depends on an unrelated script's extras.
+XTASK=prefilter-probe
+mk_prov "$XTASK" require 0 false ""
+( cmd_log_action monitor --event spawn --extra "window=$XTASK" --extra "kind=task" ) >/dev/null 2>&1
+assert_contains "spawn with NO skeptic-* extras is still seen" \
+    "$(_skeptic_last_round_event "$XTASK")" "spawn"
+( cmd_log_action monitor --event spawn --extra "window=$XTASK" --extra "mode=resume" \
+    --extra "skeptic-mode=require" ) >/dev/null 2>&1
+assert_contains "resume carrying a skeptic-* extra is still excluded" \
+    "$(_skeptic_last_round_event "$XTASK")" $'spawn\t-\t-'
+assert_eq "resume did not become the newest lifecycle event" \
+    "$(_skeptic_last_round_event "$XTASK" | cut -f4)" \
+    "$(grep -F '"event":"spawn"' "$NEXUS_STATE_DIR/action-log.jsonl" \
+       | jq -r --arg w "$XTASK" 'select(.window==$w and ((.mode//"")!="resume")) | .ts' | tail -1)"
+
+# --- CASE 9: a window with no lifecycle history at all ---
+# rc 1 / empty, and the guard leaves a first-round require alone.
+assert_eq "no lifecycle history -> rc 1" \
+    "$(_skeptic_last_round_event no-such-window-anywhere >/dev/null 2>&1; echo $?)" "1"
+
+# ============================================================
+echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
     exit 0
