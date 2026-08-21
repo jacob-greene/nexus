@@ -270,6 +270,10 @@ its verdict and the evidence backing it.
 - `nexus.worker-defaults` — every-worker safety floor that points
   at this skill for the report convention. Workers land here from
   there at task end.
+- `nexus.writing` — how the report is written, as opposed to how
+  it is structured. Sentences under 20 words, one idea each,
+  stats and results in tables, internal terms defined on first
+  use from the shared `GLOSSARY.md`.
 - `nexus.bot` — the GitHub-write rules; needed when uploading the
   report to the wiki or referencing it from a PR/issue.
 - `nexus.skeptic` — the full skeptic protocol the wrap-up decision
