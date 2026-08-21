@@ -1458,6 +1458,19 @@ monitor:
     # hand-off until the worker has recorded a skeptic decision (the
     # wrap-up gate). Default true. Env: MONITOR_SKEPTIC_ENFORCE_AUTO_DECISION.
     enforce_auto_decision: true
+    # When truthy, a `require` wrap-up whose LAST round-lifecycle event
+    # is a returned verdict does NOT re-open the round: it emits
+    # `SKEPTIC: ALREADY VALIDATED` instead of filing a duplicate
+    # spawn-skeptic request, re-arming the skeptic-pending marker (which
+    # would block a legitimate retirement) and archiving the completed
+    # round's comms channel. `ng wrap-up --skeptic-new-round` opens a
+    # genuine second round anyway. The lifecycle scan is scoped to the
+    # CURRENT life of the window name — floored at its most recent fresh
+    # `spawn` event — because names are recycled for unrelated tasks; a
+    # `--resume` respawn is not a new life. Set false to restore the
+    # unconditional pre-guard behaviour. Default true. Env:
+    # MONITOR_SKEPTIC_REWRAP_GUARD.
+    rewrap_guard: true
     # Minimum substantive NEW findings in a skeptic pass to warrant a
     # further recursive pass. Floored at 1 — a 0 would recommend a
     # second pass even on a clean run, defeating the diminishing-returns

@@ -602,6 +602,7 @@ ng wrap-up <issue> <report-path>
           [--skeptic-role] [--skeptic-verdict credible|check|suspect|refuted]
           [--skeptic-target <window>] [--skeptic-depth <n>]
           [--skeptic-findings <n>] [--skeptic-orig <window>]
+          [--skeptic-new-round]
 ```
 
 **Steps**
@@ -633,6 +634,35 @@ ng wrap-up <issue> <report-path>
    bounded recursion (`--skeptic-depth` / `--skeptic-findings`, chain
    root via `--skeptic-orig`). `--skeptic-waive` is the operator override
    that releases a required skeptic.
+
+   **Re-wrap-up guard.** A `require` resolution OPENS A NEW ROUND — it
+   archives the previous round's channel sentinels, arms the pending
+   marker, and files a `spawn-skeptic` request. That is wrong for the
+   common case of a worker whose pass already completed re-running
+   wrap-up on the same result, so the gate first checks the last
+   round-lifecycle event for the window in the action log
+   (`skeptic-request` / `skeptic-spawn` / `skeptic-verdict`). When a
+   **verdict is newest** the round is closed: the gate emits `SKEPTIC:
+   ALREADY VALIDATED`, skips all three side effects, and lets the
+   wrap-up proceed — so the window stays retirable. Pass
+   `--skeptic-new-round` to open a genuine second round anyway (you did
+   new work since that verdict and it needs re-validation). Reversible
+   via `monitor.skeptic.rewrap_guard` /
+   `MONITOR_SKEPTIC_REWRAP_GUARD=0`, which restores the unconditional
+   pre-guard behaviour.
+
+   The scan is **scoped to the current life of the window name**, not to
+   all of history. Window names are recycled for unrelated tasks after a
+   retire, so the lookup is floored at the window's most recent **fresh**
+   `spawn` event (the lifecycle-birth anchor `spawn-worker.sh` writes;
+   `_idle_probe.sh` already scopes wrap-up matching the same way). Without
+   that floor, a brand-new task in a recycled name would read the previous
+   task's verdict as newest and have its `require` gate silently
+   downgraded to no-skeptic. A `--resume` respawn is deliberately **not** a
+   new life — it continues the same task, and `verdict → resume →
+   re-wrap-up` is exactly the shape this guard exists to catch. A window
+   with no `spawn` event at all (operator-opened by hand) is unfloored and
+   falls back to scanning all history.
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:
