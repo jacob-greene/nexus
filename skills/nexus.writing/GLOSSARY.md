@@ -37,11 +37,11 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | parked | idle on purpose and exempt from window cleanup, usually while waiting for a skeptic |
 | ghost | Claude Code's dim autosuggest text in a pane, which looks like typed input but is not |
 | preflight | a check that runs before an action and blocks it when a condition fails |
-| unstick | the watcher's routine that answers a dialog blocking an agent's pane |
-| rocket | the reaction the bot adds to a comment to mark it fully processed |
+| unstick | the watcher's routine that clears a blocked agent pane, by answering a dialog or re-submitting |
+| rocket | the reaction added to a comment to mark it fully processed, by the bot or by the operator |
 | dashboard | the structured body of the overview issue that reports current nexus state |
 | overview issue | the routing-only issue tagged `nexus:overview`, normally issue 1 |
-| secondary clone | a clone or worktree a worker edits freely, landing canonical changes by PR |
+| secondary clone | a clone or worktree a worker edits freely, landing canonical changes by PR or via the primary clone |
 | bot | the GitHub App identity that makes every write, so the operator gets notified |
 
 ## Project terms

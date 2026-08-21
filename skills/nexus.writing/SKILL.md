@@ -4,14 +4,15 @@ description: "How every nexus agent writes: Simplified Technical English (ASD-ST
 
 # nexus.writing — how every agent writes
 
-TRIGGER when: you are writing a report, a GitHub issue or PR
-comment, a PR body, a dashboard section, a figure caption, or any
-other prose a human will read.
+TRIGGER when: you are writing prose a human will read. That covers
+a report, an issue or PR comment, a PR body, a dashboard section,
+and a figure caption.
 
 The `## Worker floor` in `nexus.worker-defaults` carries rules 3
-to 5b — the ones you can apply without reading anything. This
-skill is the rest: what standard those rules come from, where the
-standard stops, and the glossary that keeps definitions stable.
+to 5b. Those are the ones you can apply without reading anything.
+This skill is the rest. It gives the standard behind them, the
+point where that standard stops, and the glossary that keeps
+definitions stable.
 
 ## The six rules
 
@@ -45,8 +46,11 @@ civil aviation maintenance documentation. It has two parts.
 
 | Part | Content | Adopted here? |
 |---|---|---|
-| Part 1 — writing rules | ~65 rules on words, verbs, sentences, procedures, punctuation | **Yes** |
+| Part 1 — writing rules | 53 rules in 9 sections, covering words, verbs, sentences, procedures, punctuation | **Yes** |
 | Part 2 — dictionary | ~900 approved words, each with one approved meaning | **No** |
+
+Counts are from Issue 7 and still hold at Issue 9 (January 2025).
+Issue 7 consolidated the rule set from 65 down to 53. Cite 53.
 
 **The dictionary is not adopted, and this is deliberate.** The
 approved-word list was built for aircraft maintenance. It does
@@ -55,10 +59,9 @@ not contain `chromatin`, `eigenvector`, `deflation`, or
 this workspace exists to use.
 
 STE itself supplies the escape. Its Technical Name and Technical
-Verb rules let a writer use a word that is absent from the
-dictionary when the word names a real part, material, process, or
-measurement in the subject domain. Every domain term below is a
-Technical Name or a Technical Verb under that exemption. Use them
+Verb rules cover words the dictionary omits. A word qualifies when
+it names a real part, material, process, or measurement in the
+subject domain. Every domain term below qualifies. Use them
 freely, and define them per rule 5a.
 
 ### The Part 1 rules that bind here
@@ -73,19 +76,33 @@ freely, and define them per rule 5a.
 | Articles | Keep `a`, `an`, `the`. Do not write telegraphic prose. |
 | One word, one meaning | See the caveat below. |
 
-**Caveat on "one word, one meaning".** The nexus already breaks
-this rule. `emit` is a verb in STE and a noun here ("a watcher
-emit"). `floor` is a noun in STE and names a section here. These
-uses are entrenched, and renaming them would cost more than it
-returns. Treat them as Technical Names, list them in
-`GLOSSARY.md`, and do not coin new dual-role words.
+**Caveat on "one word, one meaning".** One nexus term departs from
+this rule, and one only looks like it does.
+
+| Term | Status in the dictionary | Verdict |
+|---|---|---|
+| `emit` | unapproved, with an alternative given | no breach — rule 1.6 permits it as a Technical Name |
+| `floor` | approved, and used in dictionary examples | a real departure from rule 1.3 |
+
+So `floor` is the honest example, not `emit`. The nexus reuses an
+approved word in a second sense.
+
+STE also supplies the remedy. Rule 1.8 says to use technical names
+that agree with approved nomenclature. `GLOSSARY.md` **is** that
+nomenclature. Listing a term there is the sanctioned fix, not a
+confession.
+
+The specification also permits one word in both roles. It must fit a
+Technical Name category and a Technical Verb category. Its own example
+is "rivet". So dual-role words are not banned outright. Still, do not
+coin new ones. Each costs a glossary row and a reader's second guess.
 
 ## Defining internal terms
 
 Rule 5a says "no jargon". Taken literally the nexus cannot obey
-it: `emit`, `floor`, `wrap-up`, `parked`, `ghost`, and
-`preflight` are load-bearing internal terms with no plain-English
-equivalent. Project work adds its own: gene names, assay names,
+it. `emit`, `floor`, `wrap-up`, `parked`, `ghost`, and `preflight`
+are load-bearing internal terms. None has a plain-English
+equivalent. Project work adds its own. Gene names, assay names,
 and metric names are all Technical Names.
 
 The achievable rule is narrower and is the one that binds:
@@ -144,7 +161,7 @@ Fixed columns keep tables comparable across turns:
 
 Add columns when a table needs them. Do not rename or reorder
 the required ones. `Source` and `Evidence` mean a file path, a
-command, a log line, or a URL — something a reader can check.
+command, a log line, or a URL. Give something a reader can check.
 
 ## What this does not cover
 

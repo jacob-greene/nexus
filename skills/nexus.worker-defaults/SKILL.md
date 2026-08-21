@@ -133,10 +133,11 @@ a hook or your task prompt points you there.
   unless your task prompt says it needs one long session.
 - **Write so a reader outside your task can follow.** Sentences
   under 20 words, one idea each, active voice. Put every stat or
-  result in a table, not in prose. Define each internal term
-  (`emit`, `floor`, `wrap-up`, `parked`) on first use in EVERY
-  artefact — a report, an issue comment and a figure caption each
-  circulate alone, so each carries its own definition.
+  result in a table, not in prose. Define each internal term on
+  first use in every artefact. Copy the definition from
+  `$NEXUS_ROOT/skills/nexus.writing/GLOSSARY.md`. Add a row there
+  if your term is missing. A report, an issue comment and a
+  caption each circulate alone, so each needs its own definition.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures
