@@ -50,6 +50,18 @@ Add domain terms here when they recur across reports. A term used
 once in one report does not belong in this file; define it inline
 and move on.
 
+These recur across the `mouse_BM` single-cell chromatin reports.
+
 | Term | Approved definition |
 |---|---|
-| _(none yet)_ | |
+| iterative LSI | ArchR's latent semantic indexing over a genome-tile matrix, refined over repeated feature-selection rounds |
+| proportional variance | the share of variance in the computed reduction that a dimension holds, not the share of variance in the data |
+| corCutOff | ArchR's ceiling on how strongly a retained dimension may correlate with sequencing depth |
+| kNN purity | the mean fraction of a cell's k nearest neighbours in an embedding that share its label |
+| mixed baseline | the kNN purity expected if labels were shuffled at the observed group proportions |
+| kNN overlap | the mean fraction of k nearest neighbours two embeddings share for the same cell |
+| depth quintile | a cell's fifth of the sequencing-depth ranking, used as a label to test whether depth drives an embedding |
+| minFrags | the ArchR floor on fragments per cell, applied when an Arrow file is built |
+| paper cell set | the cells listed in the published GEO metadata for a mark, excluding every barcode the authors dropped |
+| Old batch | the cells from the deposited GSE164779 BAMs, the mature-cell half of the merged object |
+| New batch | the SRA runs realigned to UCSC mm10, the LSK/progenitor-enriched half of the merged object |
