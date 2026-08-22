@@ -65,3 +65,7 @@ These recur across the `mouse_BM` single-cell chromatin reports.
 | paper cell set | the cells listed in the published GEO metadata for a mark, excluding every barcode the authors dropped |
 | Old batch | the cells from the deposited GSE164779 BAMs, the mature-cell half of the merged object |
 | New batch | the SRA runs realigned to UCSC mm10, the LSK/progenitor-enriched half of the merged object |
+| tile size | the genomic bin width of an ArchR TileMatrix, fixed when the Arrow file is built and not changeable afterwards |
+| variance cutoff | the smallest number of leading reduction dimensions whose cumulative proportional variance reaches a stated target |
+| FACS gate | the sorted population a cell came from, one of LSK, LinNeg, IL7RLinNeg or AllCells in this dataset |
+| gate class | the FACS gate, or an explicit ungated class naming the batch, so cells without a gate label are drawn rather than dropped |
