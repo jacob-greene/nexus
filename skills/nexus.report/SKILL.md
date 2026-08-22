@@ -131,7 +131,7 @@ ranked backlog of fixes the workspace shipped or queued. Themes
 surfaced (each cited 6+ times) included:
 
 - `monitor/ng react` exits silently on success — 11 reports.
-- The bot's GitHub App was installed on a subset of `<your-org>/*`,
+- The bot's GitHub App was installed on a subset of `settylab/*`,
   blocking cross-repo writes — 16 reports.
 - `ng pr create` and `ng issue create` were repo-locked to the nexus
   with no `--repo` flag — 8 reports.

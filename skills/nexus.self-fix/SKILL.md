@@ -1,11 +1,11 @@
 ---
-description: "Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills, BOT_ADMIN_GUIDE. Pre-flight gate (freshness + substantiation + scope) before filing on <your-org>/nexus-code. Covers cross-fork ping discovery and (future) `ng propagate` for fork-fan-out."
+description: "Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills, BOT_ADMIN_GUIDE. Pre-flight gate (freshness + substantiation + scope) before filing on jacob-greene/nexus. Covers cross-fork ping discovery and (future) `ng propagate` for fork-fan-out."
 ---
 
 # nexus.self-fix — bug-fixing the nexus and propagating across forks
 
 TRIGGER when: agent is about to file an issue on
-`<your-org>/nexus-code` or propose a nexus-self fix; agent is editing
+`jacob-greene/nexus` or propose a nexus-self fix; agent is editing
 files under `monitor/`, `skills/`, or the workspace `CLAUDE.md`;
 agent is investigating a nexus-infra bug (watcher silently dropping
 deliveries, eligibility filter misclassifying, `ng` verb
@@ -23,7 +23,7 @@ GitHub-write concerns.
 Self-improvement is high-leverage but easy to misfire — a
 mis-scoped issue or a stale-checkout repro burns the operator's
 triage budget and pollutes the tracker. Run these four checks
-before opening an issue on `<your-org>/nexus-code` or authoring a
+before opening an issue on `jacob-greene/nexus` or authoring a
 self-fix PR.
 
 1. **Pull before you claim.** Sync the clone you're diagnosing
@@ -141,10 +141,10 @@ pulls the trigger.
 ## Cross-fork pings (`nexus-fork` topic) — legacy
 
 > **Heads-up — partly obsolete after the asset-repo cutover.** With
-> the canonical implementation living at `<your-org>/nexus-code` (every
+> the canonical implementation living at `jacob-greene/nexus` (every
 > operator clones the same repo; `git pull` fans out updates), most
 > "propagate this fix to sibling forks" cases now collapse to a
-> single PR on `<your-org>/nexus-code`. The topic-discovery path below
+> single PR on `jacob-greene/nexus`. The topic-discovery path below
 > applies to legacy forks that still hold their own copy of the
 > implementation, and to per-operator asset+issue repos when an
 > operator-specific fix needs sibling-operator awareness.
@@ -155,7 +155,7 @@ skill), enumerate live forks via the `nexus-fork` GitHub topic that
 each fork maintainer tags their repo with:
 
 ```bash
-gh search repos topic:nexus-fork org:<your-org> --json fullName,description
+gh search repos topic:nexus-fork org:settylab --json fullName,description
 ```
 
 This uses **bare `gh`** under the caller's user PAT, not the bot
@@ -173,7 +173,7 @@ cc @<maintainer> (`<owner>/<repo>`)
 Listing the repo in backticks alongside the mention disambiguates
 multi-fork pings and avoids GitHub's `#N` auto-link surprises if a
 number ever creeps in. New forks must run
-`gh repo edit <your-org>/<user>-nexus --add-topic nexus-fork` once to
+`gh repo edit settylab/<user>-nexus --add-topic nexus-fork` once to
 appear in the lookup; see `monitor/BOT_ADMIN_GUIDE.md` step 14.
 
 ## Cross-fork PR body convention (for the future `ng propagate` verb)
