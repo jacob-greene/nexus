@@ -52,4 +52,10 @@ and move on.
 
 | Term | Approved definition |
 |---|---|
-| _(none yet)_ | |
+| arrow | one ArchR HDF5 file holding the fragments of a single sequencing library |
+| arrow row | one cell as named inside one arrow, before any cross-arrow merge |
+| canonical cell | one physical cell, named identically across every arrow and assay that measured it |
+| pooling | summing the arrow rows that name one canonical cell into a single matrix column |
+| pooling guard | the check that a pooled column equals the sum of its arrow columns, feature by feature |
+| Bivalent | the co-CUT&Tag assay of reads carrying both an H3K27me3 and an H3K4 antibody |
+| minFrags | the createArrowFiles argument setting the fewest fragments a cell needs to be kept |
