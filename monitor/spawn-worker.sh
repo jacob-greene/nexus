@@ -510,8 +510,18 @@ HOOKS_PATH_ARG="--settings $SETTINGS_FILE"
 # Resume mode seeds the same anchors (a resumed window IS a new
 # lifecycle of the window-name) with `--extra mode=resume` plus the
 # session-id, so the action log distinguishes respawns from births
-# while every `"event":"spawn"` consumer (wrap-up-check, idle-probe)
-# keeps anchoring correctly.
+# while the window-lifecycle consumers (wrap-up-check, idle-probe)
+# keep anchoring correctly.
+#
+# `mode=resume` IS READ, and one consumer inverts the rule above.
+# `_skeptic_last_round_event` (`monitor/ng`) scopes a skeptic round —
+# one independent validation pass over a worker's result — to a TASK,
+# not to a window-name. A resume continues the same task, so it floors
+# its scan on FRESH spawns only and SKIPS `mode=resume`. Keep emitting
+# this extra: it is that consumer's only discriminator. Dropping it
+# reintroduces `jacob-greene/nexus` issue 68 silently. See issues 68
+# and 69 there, plus `_idle_window_spawn_ts` in
+# `monitor/watcher/_idle_probe.sh`.
 #
 # Both writes are advisory — failures degrade gracefully (the probe
 # falls back to its first-observation backfill), so we don't fail the

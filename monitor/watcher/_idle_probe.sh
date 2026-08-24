@@ -277,6 +277,35 @@ _idle_basename_matches() {
 # Prints the ISO ts of the most recent spawn event on stdout (the same
 # `ts` field jq emits); empty stdout when no spawn event exists for
 # the window (legacy worker spawned before this anchor was added).
+#
+# DELIBERATELY UNFILTERED ON `mode` — ONE CONSUMER NEEDS THE OPPOSITE.
+# Do not "unify" the two by adding a resume filter here, and do not
+# remove the one there to match this. Read this first.
+#
+# This anchor answers "when did this WINDOW's current life begin?".
+# `spawn-worker.sh --resume` seeds a `spawn` event tagged
+# `mode=resume`, on the stated grounds that a resumed window IS a new
+# lifecycle of the window-name. Every consumer in this file wants
+# exactly that, so this scan matches resumes too.
+#
+# `_skeptic_last_round_event` (`monitor/ng`) asks a DIFFERENT
+# question: "when did this window's current TASK begin?". A skeptic
+# round — one independent validation pass over a worker's result —
+# belongs to a task, not to a window. A resume continues the same
+# task, so that consumer floors its scan on FRESH spawns only
+# (`(.mode // "") != "resume"`). Its own definition states why.
+#
+# The inversion is load-bearing. Filtering resumes here would break
+# lifecycle scoping for wrap-up matching. Dropping the filter there
+# would reintroduce `jacob-greene/nexus` issue 68: the shape
+# `verdict -> resume -> re-wrap-up` would re-open a CLOSED skeptic
+# round, re-arm the `skeptic-pending` retire gate, and archive a
+# completed comms channel.
+#
+# That regression is invisible by construction. It raises no error
+# and fails no test in this file. It surfaces only as skeptic rounds
+# quietly not happening. See `jacob-greene/nexus` issues 68 and 69
+# (merged as 42ece9d) before you touch the `mode` handling here.
 _idle_window_spawn_ts() {
     local window="$1" log_file="${2:-${STATE_DIR}/action-log.jsonl}"
     [[ -f "$log_file" ]] || return 1
