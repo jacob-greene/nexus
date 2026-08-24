@@ -3508,6 +3508,55 @@ render_idle_prelude() {
     # it from busy so "busy" means genuinely-working.
     local n_parked
     n_parked=$(printf '%s\n' "$idle_set" | awk -F'\t' '$2=="parked-awaiting-skeptic" {n++} END {print n+0}')
+    # …but the idle set only sees windows that pass list_really_idle_workers'
+    # pane gate, and a parked worker fails it by construction: `busy` hits the
+    # `*)` arm and `empty` the `empty)` arm, both `continue`ing BEFORE the
+    # parked-awaiting-skeptic short-circuit further down. monitor/README.md is
+    # explicit that this is the normal shape — "A worker parked in `await`
+    # reads `busy` (the await tool's spinner)" — so the tally above is 0 in the
+    # two states a park actually occupies, and the worker falls into the
+    # `n_busy` residue: exactly the inflation this axis was added to remove.
+    # It also made the counts line contradict `--- workspace snapshot ---`
+    # INSIDE ONE EMIT (issue #7 item 2; distinct from the #14 stage-file
+    # staleness — this diverges at zero skew).
+    #
+    # Fix: count the park the way the snapshot renderer already does —
+    # `_idle_skeptic_parked` directly, over every worker window, with no
+    # idle-candidate precondition — and de-duplicate against the rows the
+    # idle set already contributed. Deliberately reuses the same predicate
+    # rather than a parallel notion of "parked": one source of truth is the
+    # property being restored. `orphaned` markers still fail the predicate,
+    # so a stuck park keeps its own actionable class and is NOT swept in here.
+    #
+    # De-duplicate against EVERY idle-set row, not only the
+    # `parked-awaiting-skeptic` ones. `_idle_skeptic_parked` can be true for a
+    # window the classifier already emitted under an EARLIER class:
+    # `over-limit` (:2893), `pane-absent` (:2964), `idle-orphan-async` (:2982)
+    # and `interrupted` (:3086) all short-circuit above the park check at
+    # :3104, and the comment at :3068-3076 documents the `interrupted` overlap
+    # as deliberate (a crashed await loop is recoverable, not parked). Because
+    # n_busy is the residue `total - sum(buckets)`, counting such a window in
+    # two buckets DEFLATES busy and hides a genuinely-working worker — the same
+    # wrong-busy-count this block exists to fix, in the opposite direction.
+    # Keying the dedup on window NAME alone makes every window contribute to
+    # exactly one bucket, and leaves the actionable scalar (`interrupted`,
+    # `over-limit`, …) visible instead of relabelling it `parked`.
+    # One epoch for the whole sweep, resolved once: per-iteration `date +%s`
+    # lets the second tick over mid-loop, so two windows with the same marker
+    # mtime could land on opposite sides of the hang/grace boundary within a
+    # single render. The sweep is a snapshot; it gets a snapshot's clock.
+    local parked_live_windows already_parked pname parked_now
+    parked_now=$(date +%s)
+    parked_live_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    already_parked=$(printf '%s\n' "$idle_set" \
+        | awk -F'\t' 'NF>0 && $1!="" {print $1}')
+    while IFS=$'\t' read -r pname _ _; do
+        [[ -n "$pname" ]] || continue
+        grep -qxF -- "$pname" <<<"$already_parked" && continue
+        if _idle_skeptic_parked "$pname" "$parked_now" "$parked_live_windows"; then
+            n_parked=$(( n_parked + 1 ))
+        fi
+    done < <(_idle_list_worker_windows)
     # idle-with-children (your-org/nexus-code#455 refine): workers idle but
     # holding ≥1 live background child. `idle-awaiting-job` is the exempt
     # long-timeout state; `idle-children-clarify` and `wrapped-with-children`
