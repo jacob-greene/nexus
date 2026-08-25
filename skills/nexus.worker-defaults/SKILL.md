@@ -138,6 +138,16 @@ a hook or your task prompt points you there.
   `$NEXUS_ROOT/skills/nexus.writing/GLOSSARY.md`. Add a row there
   if your term is missing. A report, an issue comment and a
   caption each circulate alone, so each needs its own definition.
+- **This style binds every artefact that LEAVES your session,
+  and it overrides any terser conversational mode.** A
+  compressed-prose plugin (e.g. `caveman`) may be active in your
+  session. It governs your working chatter only. The moment you
+  write something a human reads elsewhere — a `reports/` file, a
+  GitHub issue or PR comment, a dashboard section, a figure
+  caption, a commit message — the rule above wins: full
+  sentences, articles intact, stats in tables. Operator ruling,
+  2026-08-25. `ng report-check` validates sections, NOT style, so
+  it will not catch a violation for you — this is on you.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures

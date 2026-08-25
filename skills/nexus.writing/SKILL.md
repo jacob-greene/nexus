@@ -8,6 +8,14 @@ TRIGGER when: you are writing prose a human will read. That covers
 a report, an issue or PR comment, a PR body, a dashboard section,
 and a figure caption.
 
+**Precedence — this skill beats any compressed-prose mode.** A
+plugin such as `caveman` can be active in your session. It governs
+working chatter inside the session only. Every artefact that leaves
+the session follows the rules below instead: full sentences,
+articles intact, statistics in tables. Operator ruling, 2026-08-25.
+`ng report-check` validates sections, not style, so nothing
+enforces this automatically.
+
 The `## Worker floor` in `nexus.worker-defaults` carries rules 3
 to 5b. Those are the ones you can apply without reading anything.
 This skill is the rest. It gives the standard behind them, the
