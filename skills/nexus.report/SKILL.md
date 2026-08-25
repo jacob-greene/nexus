@@ -71,7 +71,7 @@ project: <slug>          # required — `work/` subdir, or `nexus` for workspace
 date: <YYYY-MM-DD>       # required — ISO date
 session-id: <uuid>       # required — Claude Code session id; must NOT be the literal "unknown"
 window: <tmux-window>    # required when spawned via spawn-worker.sh; else "<unset>"
-trigger: <issue#> [comment-id]   # required — what kicked this off
+trigger: <issue#> [comment-id]   # key always present; value may be empty when nothing external kicked this off
 status: completed | partial | blocked   # required — canonical value
 ---
 
@@ -104,6 +104,22 @@ status: completed | partial | blocked   # required — canonical value
   what you expected.
 - Omit the section entirely if nothing came up. No placeholders.
 ```
+
+**The `trigger` field — use `--issue`.** Pass `--issue <n>` (and
+`--comment-id <id>` when a comment started the work) to `ng
+report-init`. It fills the field for you:
+
+```bash
+monitor/ng report-init <slug> --issue 83 --comment-id 5403194620
+```
+
+Nothing in a worker's environment carries the issue number, so
+`report-init` cannot infer it. Pass the flag and you never touch
+the field by hand. When you do not pass it, `report-init` writes
+the key with an EMPTY value. That is the correct encoding of "no
+external trigger" — a context rotation or an operator side-quest
+has none. `report-check` does not read this field, so an empty
+value blocks nothing.
 
 The five content sections (`Summary`, `What Was Done`, `Current
 State`, `What Remains`, `How to Resume`) are mandatory.

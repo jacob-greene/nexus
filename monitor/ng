@@ -48,6 +48,7 @@
 #                                [--trigger-repo OWNER/REPO]
 #                                [--comment-body-file <path> | --no-comment]
 #                                [--allow-stub]
+#                                [--shape pin|latest]   # default latest
 #                                [--skeptic-decision require|deny --skeptic-rationale "<why>"]
 #                                [--skeptic-waive "<reason>"]
 #                                [--skeptic-new-round]
@@ -354,7 +355,7 @@ _usage_for() {
         cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>] [--meta]" ;;
         cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
         cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
-        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain]" ;;
+        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain] [--shape pin|latest]" ;;
         cmd_report_init)    echo "usage: ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>]" ;;
         cmd_report_check)   echo "usage: ng report-check <path> [--allow-todo]" ;;
         cmd_fetch_asset)    echo "usage: ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]" ;;
@@ -1157,13 +1158,28 @@ EOF
         die "report-init: --project must start with a letter and contain only [A-Za-z0-9._-] (got: '$project_arg') — pass a project name, not an issue number"
     fi
 
-    local project reports_dir session_id window trigger
+    local project reports_dir session_id window trigger trigger_line
     project=$(_report_project_slug "$project_arg")
     reports_dir=$(_report_reports_dir "$reports_dir_arg")
     session_id=$(_report_session_id)
     [[ -n "$session_id" ]] || session_id="unknown"
     window=$(_report_tmux_window)
     [[ -n "$window" ]] || window="<unset>"
+    # `trigger` has no capture heuristic. session-id and window come from
+    # the environment; nothing in a worker's environment carries the
+    # issue or comment that started it (spawn-worker.sh exports
+    # NEXUS_ROOT + NEXUS_WORKER_WINDOW and nothing else), so an
+    # unsupplied trigger is genuinely unknown at init time. Pass
+    # `--issue` (and `--comment-id`) and it is filled correctly.
+    #
+    # When it IS unknown, emit the key with an EMPTY VALUE rather than
+    # the `<unset>` placeholder this used to write. Nothing rejected
+    # `<unset>` — `report-check` does not read this field at all, and
+    # 149 of the 670 reports on disk carry it — but it reads as an
+    # unfilled slot, so workers hand-edit it before wrap-up for no
+    # reason. An empty value is the honest encoding of "not supplied",
+    # and it asks nothing of the worker. This is a papercut fix, not a
+    # bug fix.
     if [[ -n "$issue_arg" ]]; then
         if [[ -n "$comment_id_arg" ]]; then
             trigger="#${issue_arg} (comment ${comment_id_arg})"
@@ -1171,7 +1187,14 @@ EOF
             trigger="#${issue_arg}"
         fi
     else
-        trigger="<unset>"
+        trigger=""
+    fi
+    # Built as a whole line so the unknown case emits a bare `trigger:`
+    # rather than `trigger: ` with a trailing space.
+    if [[ -n "$trigger" ]]; then
+        trigger_line="trigger: ${trigger}"
+    else
+        trigger_line="trigger:"
     fi
 
     mkdir -p "$reports_dir" || die "report-init: could not create reports dir: $reports_dir"
@@ -1192,7 +1215,7 @@ project: ${project}
 date: ${date_part}
 session-id: ${session_id}
 window: ${window}
-trigger: ${trigger}
+${trigger_line}
 status: partial
 ---
 
@@ -2275,7 +2298,8 @@ EOF
 # `ng wrap-up <issue> <report-path> [--trigger-comment <id>]
 #                                  [--repo OWNER/REPO]
 #                                  [--trigger-repo OWNER/REPO]
-#                                  [--retain <reason>|--no-retain]`
+#                                  [--retain <reason>|--no-retain]
+#                                  [--shape pin|latest]`
 #
 # The universal end-of-task hand-off, folded into one verb:
 #   1. upload the report to the asset repo (via upload-asset.sh)
@@ -2303,6 +2327,62 @@ EOF
 # The asset repo is always taken from config (github.asset_repo) by
 # upload-asset.sh.
 #
+# Link shape (jacob-greene/nexus#83). Step 1 passes `--shape latest`,
+# so the published link is `blob/main/<path>` and always serves the
+# CURRENT report. `ng upload`'s own default stays `pin` — the two verbs
+# publish different classes of artefact and want opposite shapes:
+#
+#   figure/notebook posted as inline evidence  → pin
+#       The comment describes those exact bytes. A later revision gets
+#       its own comment and its own pin.
+#   report linked at wrap-up                   → latest
+#       Reports are append-only living documents by convention, and
+#       skeptic rounds correct them IN PLACE. The link must follow.
+#
+# A pinned wrap-up link cannot be repaired once posted.
+#
+# Figures below are read from the CORRECTED audit at `main`:
+# asset-repo `assets/48/stale-pinned-links_2026-08-24_164546_
+# pinned-link-audit.md`, sections `## Correction` and `## Correction 2`.
+# Do NOT take them from issue #83's body, which still carries the
+# pre-correction 29/28 and was never updated.
+#
+# Mind the denominators — the audit uses two, and they are easy to
+# conflate (25 + 4 = 29, not 30, and that is not an error):
+#   - P1 links serving superseded content:        30
+#   - carrying comments matched against the log:  29, split 25 posted
+#     by `ng wrap-up` / 4 posted by hand. The 30th P1 item was added by
+#     the same correction (req-002) and is not in that split.
+#   - "29 of the 30 P1 items are reports; the 30th is a figure."
+#
+# A later `ng wrap-up` does NOT reliably repair such a link. Three
+# distinct paths leave it stale, and only the first involves `ng
+# upload` — the earlier claim that ALL of them did was wrong:
+#   - the correction arrives via `ng upload`, which cannot reach a
+#     comment it never wrote;
+#   - a later wrap-up REUSED the prior comment without re-pointing it
+#     (`comment=reused`, 27 events 2026-07-09..2026-07-29 in
+#     monitor/.state/action-log.jsonl). That build predates the
+#     re-point path, which landed 2026-07-31 — already fixed, not a
+#     live defect;
+#   - a later wrap-up ran `--no-comment` (`comment=skipped`, 17).
+# An independent depth-1 classification split 28 wrap-up-carried links
+# 18 / 7 / 3 across those three paths. Its 28 is that reviewer's own
+# audit, not the 25 above; the two audits do not share a method, so the
+# denominators are not interchangeable.
+#
+# KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 25
+# wrap-up cases and not the 4 posted by hand — 3 of which link a `.md`
+# report, the class this rationale says wants `latest`. The corrected
+# audit's proposal is to key on the ARTEFACT inside upload-asset.sh
+# (`.md` -> latest, everything else -> pin, holding `.ipynb` at pin
+# because every stale notebook pin was republished in-thread). That
+# moves coverage from 25 of 30 to 29 of 30. Deliberately NOT
+# pre-empted here — it is a separate design decision on #83.
+#
+# `--shape pin` opts a single wrap-up back into the frozen shape, for
+# the rare report that must stay quotable verbatim.
+#
 # Retain-by-default (step 5): a successful wrap-up auto-logs a
 # `window-retain` event for the source tmux window so the watcher's
 # idle-worker probe suppresses the wrapped row into a footer for the
@@ -2318,10 +2398,13 @@ cmd_wrap_up() {
     _help_check "$@"
     local issue="${1:-}" report_path="${2:-}"
     [[ -n "$issue" && -n "$report_path" ]] \
-        || die "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>]"
+        || die "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--shape pin|latest]"
     shift 2 || true
     local trigger_comment="" repo_arg="" trigger_repo_arg="" body_file="" no_comment=0 allow_stub=0
     local retain_reason="" no_retain=0
+    # Asset-link shape for the report upload. `latest` here, unlike
+    # `ng upload`'s `pin` — see the "Link shape" block above.
+    local shape="latest"
     # Skeptic-protocol flags (skills/nexus.skeptic). All optional and
     # backward-compatible: a wrap-up with none of these falls back to
     # the worker's spawn-stamped mode (provenance record) or `auto`.
@@ -2338,6 +2421,11 @@ cmd_wrap_up() {
             --allow-stub)       allow_stub=1;               shift   ;;
             --retain)           retain_reason="${2:-}";     shift 2 ;;
             --no-retain)        no_retain=1;                shift   ;;
+            # --shape pin: freeze THIS wrap-up's link at the upload-time
+            # SHA. For the rare report that must stay quotable verbatim —
+            # a decision record, or a report cited as evidence for the
+            # exact bytes it contained at hand-off.
+            --shape)            shape="${2:-}";             shift 2 ;;
             --skeptic-decision)  sk_decision="${2:-}";      shift 2 ;;
             --skeptic-rationale) sk_rationale="${2:-}";     shift 2 ;;
             --skeptic-waive)     sk_waive="${2:-}";         shift 2 ;;
@@ -2365,6 +2453,10 @@ cmd_wrap_up() {
     if (( no_retain == 1 )) && [[ -n "$retain_reason" ]]; then
         die "wrap-up: --no-retain and --retain are mutually exclusive"
     fi
+    case "$shape" in
+        pin|latest) ;;
+        *) die "wrap-up: --shape must be pin|latest, got: $shape" ;;
+    esac
     [[ -f "$report_path" ]] || die "wrap-up: report not found: $report_path"
     # --no-comment and --comment-body-file are mutually exclusive: one
     # asks to skip step 2 entirely, the other supplies a custom body
@@ -2461,7 +2553,8 @@ cmd_wrap_up() {
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
-    if asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" 2>"$err_buf"); then
+    if asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" \
+                       --shape "$shape" 2>"$err_buf"); then
         # Trim trailing newline (`$()` already strips it, but be explicit).
         asset_url="${asset_url%$'\n'}"
         if [[ -n "$asset_url" ]]; then
