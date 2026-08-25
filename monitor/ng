@@ -2339,12 +2339,26 @@ EOF
 #       Reports are append-only living documents by convention, and
 #       skeptic rounds correct them IN PLACE. The link must follow.
 #
-# A pinned wrap-up link cannot be repaired once posted: an audit found
-# 29 published links serving superseded content across 17 issues, and
-# 28 of the 29 came from this verb. Step 2's re-point path only fixes
-# links when the correction arrives through another `ng wrap-up`; all
-# 28 were corrected through `ng upload` instead, which cannot reach a
-# comment it never wrote.
+# A pinned wrap-up link cannot be repaired once posted. The audit
+# (asset-repo issue #48, as CORRECTED) found 30 published links serving
+# superseded content; 25 of the 30 came from this verb and 4 were
+# posted by hand.
+#
+# Step 2's re-point path does not save them, for two separate reasons:
+#   - it only landed 2026-07-31. Before that a later wrap-up REUSED the
+#     prior comment without re-pointing it (27 `comment=reused` events,
+#     2026-07-09 to 2026-07-29, in monitor/.state/action-log.jsonl).
+#   - `--no-comment` skips step 2 entirely (17 `comment=skipped`).
+# and for the rest the correction arrived through `ng upload`, which
+# cannot reach a comment it never wrote. So a later `ng wrap-up` DID
+# run for some of these and still left the link stale — the mechanism
+# is not one path but three.
+#
+# KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 25
+# wrap-up cases and not the 4 posted by hand. Keying on the ARTEFACT
+# instead (a report gets `latest` whichever verb uploads it) would
+# reach 29 of the 30. Issue #83 is being amended to specify that; it is
+# deliberately not pre-empted here.
 #
 # `--shape pin` opts a single wrap-up back into the frozen shape, for
 # the rare report that must stay quotable verbatim.
