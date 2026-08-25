@@ -1157,13 +1157,28 @@ EOF
         die "report-init: --project must start with a letter and contain only [A-Za-z0-9._-] (got: '$project_arg') — pass a project name, not an issue number"
     fi
 
-    local project reports_dir session_id window trigger
+    local project reports_dir session_id window trigger trigger_line
     project=$(_report_project_slug "$project_arg")
     reports_dir=$(_report_reports_dir "$reports_dir_arg")
     session_id=$(_report_session_id)
     [[ -n "$session_id" ]] || session_id="unknown"
     window=$(_report_tmux_window)
     [[ -n "$window" ]] || window="<unset>"
+    # `trigger` has no capture heuristic. session-id and window come from
+    # the environment; nothing in a worker's environment carries the
+    # issue or comment that started it (spawn-worker.sh exports
+    # NEXUS_ROOT + NEXUS_WORKER_WINDOW and nothing else), so an
+    # unsupplied trigger is genuinely unknown at init time. Pass
+    # `--issue` (and `--comment-id`) and it is filled correctly.
+    #
+    # When it IS unknown, emit the key with an EMPTY VALUE rather than
+    # the `<unset>` placeholder this used to write. Nothing rejected
+    # `<unset>` — `report-check` does not read this field at all, and
+    # 149 of the 670 reports on disk carry it — but it reads as an
+    # unfilled slot, so workers hand-edit it before wrap-up for no
+    # reason. An empty value is the honest encoding of "not supplied",
+    # and it asks nothing of the worker. This is a papercut fix, not a
+    # bug fix.
     if [[ -n "$issue_arg" ]]; then
         if [[ -n "$comment_id_arg" ]]; then
             trigger="#${issue_arg} (comment ${comment_id_arg})"
@@ -1171,7 +1186,14 @@ EOF
             trigger="#${issue_arg}"
         fi
     else
-        trigger="<unset>"
+        trigger=""
+    fi
+    # Built as a whole line so the unknown case emits a bare `trigger:`
+    # rather than `trigger: ` with a trailing space.
+    if [[ -n "$trigger" ]]; then
+        trigger_line="trigger: ${trigger}"
+    else
+        trigger_line="trigger:"
     fi
 
     mkdir -p "$reports_dir" || die "report-init: could not create reports dir: $reports_dir"
@@ -1192,7 +1214,7 @@ project: ${project}
 date: ${date_part}
 session-id: ${session_id}
 window: ${window}
-trigger: ${trigger}
+${trigger_line}
 status: partial
 ---
 
