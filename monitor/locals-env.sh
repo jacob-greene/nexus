@@ -27,6 +27,36 @@ _le_locals="${NEXUS_LOCALS:-$_le_root/locals}"
 
 export NEXUS_LOCALS="$_le_locals"
 
+# ---------------------------------------------------------------------
+# OPERATOR-LOCAL MITIGATION — committed 2026-08-25 on the operator's
+# explicit instruction (assets #54). It was held back from 3a8d11e because
+# this banner previously read "DO NOT COMMIT"; the operator was asked
+# directly about this file and answered "commit and close".
+#
+# It is still operator-local in INTENT: it restores behaviour the public
+# template disables. Do not assume it is correct for a fresh clone.
+# DO NOT PUSH `main` — the push is a separate decision, gated on #78.
+# Same class as the config/load.sh pyyaml patch, committed alongside it.
+#
+# The public template ships DISABLED (monitor/_public-guard.sh): every
+# guarded entry point refuses unless NEXUS_PUBLIC_ENABLED=1. That flag is
+# set NOWHERE in this operator's environment — only in CI (pages.yml) and
+# in the watcher test helpers. This is a REAL, DELIBERATELY OPERATED nexus,
+# so the guard should be satisfied here.
+#
+# Why it matters: the guard blocks monitor/bootstrap-recover.sh — the
+# idempotent full-stack COLD-BOOT RECOVERY path. Without this export it
+# exits 1 ("nexus is disabled") both when the orchestrator runs it directly
+# after a restart AND when watcher/bootstrap.sh calls it on the dead-watcher
+# path (where the nonzero rc is only logged, never surfaced). Net effect: a
+# machine/tmux restart would silently recover nothing — exactly the
+# 2026-06-07 incident the recovery path exists to prevent.
+#
+# Note the guard is applied inconsistently upstream: it gates recovery but
+# NOT launcher.sh -> main.sh, which is the path that actually spawns
+# autonomous workers. Filed upstream; this export is the local restore.
+export NEXUS_PUBLIC_ENABLED=1
+
 # Prepend locals/bin to PATH, but only once (idempotent re-source).
 case ":${PATH:-}:" in
     *":$_le_locals/bin:"*) : ;;                       # already present

@@ -58,9 +58,28 @@ for c in "${CFG_CANDIDATES[@]}"; do
 done
 [[ -n "$pick" ]] || { echo "load.sh: no config found; tried: ${CFG_CANDIDATES[*]}" >&2; exit 1; }
 
-command -v python3 >/dev/null || { echo "load.sh: python3 required" >&2; exit 3; }
+# Resolve a pyyaml-CAPABLE python3. This loader needs only stdlib + pyyaml
+# (no science packages), so prefer the stable system interpreter over whatever
+# `python3` happens to resolve to on PATH: a conda/uv/nodejs env mid-churn can
+# leave the ambient python3 unable to `import yaml`, which — because the block
+# below exits 3 (empty stdout) rather than honoring a caller default — makes
+# every defaulted read return empty and can crash the watcher with an empty
+# INTERVAL. Local operator mitigation; see
+# reports/nexus_2026-07-06_234732_watcher-crash-pyyaml-default-swallow.md.
+# NEXUS_LOAD_PY overrides the choice explicitly if ever needed.
+_PY=""
+for _cand in "${NEXUS_LOAD_PY:-}" /usr/bin/python3 "$(command -v python3 2>/dev/null)" \
+             /usr/bin/python3.12 /usr/bin/python3.11 /usr/bin/python3.10; do
+    [[ -n "$_cand" && -x "$_cand" ]] || continue
+    if "$_cand" -c 'import yaml' 2>/dev/null; then _PY="$_cand"; break; fi
+done
+# No pyyaml-capable interpreter anywhere: fall back to ambient python3 so the
+# block below still emits its explicit "pyyaml required" error (fail loud, not
+# a silent empty).
+[[ -n "$_PY" ]] || _PY="$(command -v python3 2>/dev/null)"
+[[ -n "$_PY" ]] || { echo "load.sh: python3 required" >&2; exit 3; }
 
-NEXUS_CFG_PATH="$pick" NEXUS_EXAMPLE_PATH="$nexus_root/config/nexus.example.yml" KEY="$KEY" DEFAULT="$DEFAULT" python3 - <<'PY'
+NEXUS_CFG_PATH="$pick" NEXUS_EXAMPLE_PATH="$nexus_root/config/nexus.example.yml" KEY="$KEY" DEFAULT="$DEFAULT" "$_PY" - <<'PY'
 import os, sys
 try:
     import yaml
