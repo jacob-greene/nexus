@@ -597,6 +597,7 @@ ng wrap-up <issue> <report-path>
           [--comment-body-file <path> | --no-comment]
           [--allow-stub]
           [--retain <reason> | --no-retain]
+          [--shape pin|latest]
           [--skeptic-decision require|deny] [--skeptic-rationale <text>]
           [--skeptic-waive <reason>]
           [--skeptic-role] [--skeptic-verdict credible|check|suspect|refuted]
@@ -664,11 +665,21 @@ ng wrap-up <issue> <report-path>
    with no `spawn` event at all (operator-opened by hand) is unfloored and
    falls back to scanning all history.
 1. **Upload the report** via `monitor/upload-asset.sh` →
-   `assets/<issue>/<basename>` on the asset repo.
+   `assets/<issue>/<basename>` on the asset repo. Passes `--shape
+   latest`, so the published link is `blob/main/<path>` and serves the
+   current report rather than the bytes uploaded at hand-off time. `ng
+   upload`'s own default stays `pin` — see the shape table below.
+   `--shape pin` freezes a single wrap-up's link.
+
+   | Artefact | Shape | Why |
+   |---|---|---|
+   | Figure or notebook posted inline as evidence (`ng upload`) | `pin` | The comment describes those exact bytes. A revision gets its own comment and its own pin. |
+   | Report linked at hand-off (`ng wrap-up`) | `latest` | Reports are corrected in place. The link must follow the correction. |
+
 2. **Post the link comment** on `<issue>` in `--repo`:
    - `--comment-body-file <path>` supplies the prose. `{{REPORT_URL}}`
-     is substituted with the SHA-pinned asset URL; if no token is
-     present, a `Full report: <URL>` footer is appended.
+     is substituted with the asset URL; if no token is present, a
+     `Full report: <URL>` footer is appended.
    - `--no-comment` skips this step (caller will `ng reply` later).
    - Default: a templated body built from the report's H1 + Summary.
 3. **Rocket-react the trigger comment** on `--trigger-repo` (defaults

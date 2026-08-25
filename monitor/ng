@@ -48,6 +48,7 @@
 #                                [--trigger-repo OWNER/REPO]
 #                                [--comment-body-file <path> | --no-comment]
 #                                [--allow-stub]
+#                                [--shape pin|latest]   # default latest
 #                                [--skeptic-decision require|deny --skeptic-rationale "<why>"]
 #                                [--skeptic-waive "<reason>"]
 #                                [--skeptic-new-round]
@@ -354,7 +355,7 @@ _usage_for() {
         cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>] [--meta]" ;;
         cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
         cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
-        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain]" ;;
+        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain] [--shape pin|latest]" ;;
         cmd_report_init)    echo "usage: ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>]" ;;
         cmd_report_check)   echo "usage: ng report-check <path> [--allow-todo]" ;;
         cmd_fetch_asset)    echo "usage: ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]" ;;
@@ -2297,7 +2298,8 @@ EOF
 # `ng wrap-up <issue> <report-path> [--trigger-comment <id>]
 #                                  [--repo OWNER/REPO]
 #                                  [--trigger-repo OWNER/REPO]
-#                                  [--retain <reason>|--no-retain]`
+#                                  [--retain <reason>|--no-retain]
+#                                  [--shape pin|latest]`
 #
 # The universal end-of-task hand-off, folded into one verb:
 #   1. upload the report to the asset repo (via upload-asset.sh)
@@ -2325,6 +2327,28 @@ EOF
 # The asset repo is always taken from config (github.asset_repo) by
 # upload-asset.sh.
 #
+# Link shape (jacob-greene/nexus#83). Step 1 passes `--shape latest`,
+# so the published link is `blob/main/<path>` and always serves the
+# CURRENT report. `ng upload`'s own default stays `pin` — the two verbs
+# publish different classes of artefact and want opposite shapes:
+#
+#   figure/notebook posted as inline evidence  → pin
+#       The comment describes those exact bytes. A later revision gets
+#       its own comment and its own pin.
+#   report linked at wrap-up                   → latest
+#       Reports are append-only living documents by convention, and
+#       skeptic rounds correct them IN PLACE. The link must follow.
+#
+# A pinned wrap-up link cannot be repaired once posted: an audit found
+# 29 published links serving superseded content across 17 issues, and
+# 28 of the 29 came from this verb. Step 2's re-point path only fixes
+# links when the correction arrives through another `ng wrap-up`; all
+# 28 were corrected through `ng upload` instead, which cannot reach a
+# comment it never wrote.
+#
+# `--shape pin` opts a single wrap-up back into the frozen shape, for
+# the rare report that must stay quotable verbatim.
+#
 # Retain-by-default (step 5): a successful wrap-up auto-logs a
 # `window-retain` event for the source tmux window so the watcher's
 # idle-worker probe suppresses the wrapped row into a footer for the
@@ -2340,10 +2364,13 @@ cmd_wrap_up() {
     _help_check "$@"
     local issue="${1:-}" report_path="${2:-}"
     [[ -n "$issue" && -n "$report_path" ]] \
-        || die "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>]"
+        || die "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--shape pin|latest]"
     shift 2 || true
     local trigger_comment="" repo_arg="" trigger_repo_arg="" body_file="" no_comment=0 allow_stub=0
     local retain_reason="" no_retain=0
+    # Asset-link shape for the report upload. `latest` here, unlike
+    # `ng upload`'s `pin` — see the "Link shape" block above.
+    local shape="latest"
     # Skeptic-protocol flags (skills/nexus.skeptic). All optional and
     # backward-compatible: a wrap-up with none of these falls back to
     # the worker's spawn-stamped mode (provenance record) or `auto`.
@@ -2360,6 +2387,11 @@ cmd_wrap_up() {
             --allow-stub)       allow_stub=1;               shift   ;;
             --retain)           retain_reason="${2:-}";     shift 2 ;;
             --no-retain)        no_retain=1;                shift   ;;
+            # --shape pin: freeze THIS wrap-up's link at the upload-time
+            # SHA. For the rare report that must stay quotable verbatim —
+            # a decision record, or a report cited as evidence for the
+            # exact bytes it contained at hand-off.
+            --shape)            shape="${2:-}";             shift 2 ;;
             --skeptic-decision)  sk_decision="${2:-}";      shift 2 ;;
             --skeptic-rationale) sk_rationale="${2:-}";     shift 2 ;;
             --skeptic-waive)     sk_waive="${2:-}";         shift 2 ;;
@@ -2387,6 +2419,10 @@ cmd_wrap_up() {
     if (( no_retain == 1 )) && [[ -n "$retain_reason" ]]; then
         die "wrap-up: --no-retain and --retain are mutually exclusive"
     fi
+    case "$shape" in
+        pin|latest) ;;
+        *) die "wrap-up: --shape must be pin|latest, got: $shape" ;;
+    esac
     [[ -f "$report_path" ]] || die "wrap-up: report not found: $report_path"
     # --no-comment and --comment-body-file are mutually exclusive: one
     # asks to skip step 2 entirely, the other supplies a custom body
@@ -2483,7 +2519,8 @@ cmd_wrap_up() {
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
-    if asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" 2>"$err_buf"); then
+    if asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" \
+                       --shape "$shape" 2>"$err_buf"); then
         # Trim trailing newline (`$()` already strips it, but be explicit).
         asset_url="${asset_url%$'\n'}"
         if [[ -n "$asset_url" ]]; then
