@@ -2339,26 +2339,46 @@ EOF
 #       Reports are append-only living documents by convention, and
 #       skeptic rounds correct them IN PLACE. The link must follow.
 #
-# A pinned wrap-up link cannot be repaired once posted. The audit
-# (asset-repo issue #48, as CORRECTED) found 30 published links serving
-# superseded content; 25 of the 30 came from this verb and 4 were
-# posted by hand.
+# A pinned wrap-up link cannot be repaired once posted.
 #
-# Step 2's re-point path does not save them, for two separate reasons:
-#   - it only landed 2026-07-31. Before that a later wrap-up REUSED the
-#     prior comment without re-pointing it (27 `comment=reused` events,
-#     2026-07-09 to 2026-07-29, in monitor/.state/action-log.jsonl).
-#   - `--no-comment` skips step 2 entirely (17 `comment=skipped`).
-# and for the rest the correction arrived through `ng upload`, which
-# cannot reach a comment it never wrote. So a later `ng wrap-up` DID
-# run for some of these and still left the link stale — the mechanism
-# is not one path but three.
+# Figures below are read from the CORRECTED audit at `main`:
+# asset-repo `assets/48/stale-pinned-links_2026-08-24_164546_
+# pinned-link-audit.md`, sections `## Correction` and `## Correction 2`.
+# Do NOT take them from issue #83's body, which still carries the
+# pre-correction 29/28 and was never updated.
+#
+# Mind the denominators — the audit uses two, and they are easy to
+# conflate (25 + 4 = 29, not 30, and that is not an error):
+#   - P1 links serving superseded content:        30
+#   - carrying comments matched against the log:  29, split 25 posted
+#     by `ng wrap-up` / 4 posted by hand. The 30th P1 item was added by
+#     the same correction (req-002) and is not in that split.
+#   - "29 of the 30 P1 items are reports; the 30th is a figure."
+#
+# A later `ng wrap-up` does NOT reliably repair such a link. Three
+# distinct paths leave it stale, and only the first involves `ng
+# upload` — the earlier claim that ALL of them did was wrong:
+#   - the correction arrives via `ng upload`, which cannot reach a
+#     comment it never wrote;
+#   - a later wrap-up REUSED the prior comment without re-pointing it
+#     (`comment=reused`, 27 events 2026-07-09..2026-07-29 in
+#     monitor/.state/action-log.jsonl). That build predates the
+#     re-point path, which landed 2026-07-31 — already fixed, not a
+#     live defect;
+#   - a later wrap-up ran `--no-comment` (`comment=skipped`, 17).
+# An independent depth-1 classification split 28 wrap-up-carried links
+# 18 / 7 / 3 across those three paths. Its 28 is that reviewer's own
+# audit, not the 25 above; the two audits do not share a method, so the
+# denominators are not interchangeable.
 #
 # KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 25
-# wrap-up cases and not the 4 posted by hand. Keying on the ARTEFACT
-# instead (a report gets `latest` whichever verb uploads it) would
-# reach 29 of the 30. Issue #83 is being amended to specify that; it is
-# deliberately not pre-empted here.
+# wrap-up cases and not the 4 posted by hand — 3 of which link a `.md`
+# report, the class this rationale says wants `latest`. The corrected
+# audit's proposal is to key on the ARTEFACT inside upload-asset.sh
+# (`.md` -> latest, everything else -> pin, holding `.ipynb` at pin
+# because every stale notebook pin was republished in-thread). That
+# moves coverage from 25 of 30 to 29 of 30. Deliberately NOT
+# pre-empted here — it is a separate design decision on #83.
 #
 # `--shape pin` opts a single wrap-up back into the frozen shape, for
 # the rare report that must stay quotable verbatim.
