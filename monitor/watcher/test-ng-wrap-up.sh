@@ -371,6 +371,12 @@ assert_contains "upload-asset.sh called with --issue 42" "$upload_args" \
                 "--issue 42"
 assert_contains "upload-asset.sh called with the report" "$upload_args" \
                 "$(basename "$REPORT")"
+# jacob-greene/nexus#83: the report link must be latest-shape, so a
+# later in-place correction reaches every reader who follows it. This
+# is the ONLY thing that distinguishes wrap-up's upload from `ng
+# upload`'s, whose default stays `pin` for inline figure evidence.
+assert_contains "upload-asset.sh called with --shape latest" "$upload_args" \
+                "--shape latest"
 
 # Side-effect: gh POSTed the comment to the right repo.
 gh_calls=$(<"$GH_CAPTURE")
@@ -1381,6 +1387,33 @@ run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
     --skeptic-decision require --skeptic-rationale "shared infra"
 assert_eq       "off-tmux require wrap-up exits 0"         "$rc" "0"
 assert_eq       "NO request filed without a source window" "$(count_spawn_reqs)" "0"
+
+# ---- link shape (jacob-greene/nexus#83) ---------------------------------
+#
+# Terms. PINNED LINK — an asset URL of the form `.../blob/<sha>/<path>`,
+# whose commit SHA is fixed at upload time. LATEST-SHAPE LINK — an asset
+# URL of the form `.../blob/main/<path>`, which always serves the current
+# bytes. A report is corrected in place, so its link must be latest-shape.
+
+echo '=== --shape pin opts a single wrap-up back into the frozen link ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" \
+       --repo override-org/override-repo --shape pin
+assert_eq       "exit 0 with --shape pin"            "$rc" "0"
+upload_args=$(<"$UPLOAD_CAPTURE")
+assert_contains "upload-asset.sh got --shape pin"    "$upload_args" \
+                "--shape pin"
+assert_not_contains "and NOT --shape latest"         "$upload_args" \
+                "--shape latest"
+
+echo '=== --shape with a bogus value → exit 1, no upload attempted ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" \
+       --repo override-org/override-repo --shape sideways
+assert_eq       "exit 1 on a bogus --shape"          "$rc" "1"
+assert_contains "stderr names the legal values"      "$stderr" \
+                "--shape must be pin|latest"
+assert_eq       "no upload attempted"                "$(wc -c < "$UPLOAD_CAPTURE")" "0"
 
 # ---- summary ------------------------------------------------------------
 
