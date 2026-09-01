@@ -95,3 +95,7 @@ and move on.
 | interior onset | an onset that is not censored, so the trend turned inside the observed pseudotime range |
 | marginal median | a per-panel median taken over the rows that are interior IN THAT PANEL, so each panel is summarised over its own row subset and the panels are not directly comparable |
 | paired lag | the median, over rows interior in BOTH panels of a pair, of the per-row onset difference between them; the same rows enter both terms, so a panel-dependent selection cancels |
+| CUTAC object | the top-level CUTAC object of the project's analysis tree, the source of every downstream subset |
+| generated notebook | a notebook written by a `build_*` or `copy_*` script, so a hand edit is reverted the next time that script runs |
+| colour alias | a drawn celltype that takes another celltype's colour on purpose |
+| colour fallback | a fixed colour for a drawn celltype that the reference object does not carry |
