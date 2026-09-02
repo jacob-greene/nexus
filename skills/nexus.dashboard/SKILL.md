@@ -47,7 +47,7 @@ duplicate) — exactly the precedent set by `ng interactive-sessions`.
 Repeated runs converge; it can't drift. The bot identity (installation
 token, REST PATCH) is used for the write.
 
-Fields, all **derived** (nothing hardcodes `<operator>`):
+Fields, all **derived** (nothing hardcodes `jacob-greene`):
 
 | Field | Source |
 |-------|--------|

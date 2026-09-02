@@ -688,18 +688,23 @@ rule for their target.
 
 Spawn-time decision rule. Before dispatching a worker to wrap a
 tool with workspace-side compensating logic, check the tool's
-GitHub org. If it's lab-owned (`<your-org>/*` always) or
-operator-owned (`<operator>/*` when this nexus is operated by <operator>),
+GitHub org. If it's lab-owned (`settylab/*` always) or
+operator-owned (`jacob-greene/*` when this nexus is operated by jacob-greene),
 spawn the worker against the upstream repo instead. Wrappers ship
 fixes in disguise — the upstream stays broken for everyone else,
 and the workspace has to carry the wrapper forward forever.
 
-Identity follows the existing routing: `<your-org>/*` is bot;
-`<operator>/*` is user (the bot is not installed there). For
-third-party orgs (`TrigosTeam/*`, `<your-institution>/*`, others) a stop-gap
-is acceptable when upstream is slow, but file the issue upstream
-too and document inside the wrapper which upstream issue would
-retire it.
+Identity follows the **install scope**, which is narrow: the bot
+can write to `jacob-greene/jacob-greene-nexus-assets` and
+`jacob-greene/nexus`, and nowhere else. Everywhere else —
+including all of `settylab/*` and every third-party org
+(`TrigosTeam/*`, `FredHutch/*`, others) — the bot has no install
+and its token fails; that is a blocker to surface, never a reason
+to fall back to the operator's identity (see
+`skills/nexus.bot/SKILL.md` "Bot install scope caveat"). For
+third-party orgs a stop-gap is acceptable when upstream is slow,
+but file the issue upstream too and document inside the wrapper
+which upstream issue would retire it.
 
 `monitor/labsh-attach` was the cautionary tale (katosh/labsh#3 —
 should have been an upstream subcommand from the start).
