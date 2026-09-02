@@ -2353,7 +2353,12 @@ EOF
 #   - carrying comments matched against the log:  29, split 25 posted
 #     by `ng wrap-up` / 4 posted by hand. The 30th P1 item was added by
 #     the same correction (req-002) and is not in that split.
-#   - "29 of the 30 P1 items are reports; the 30th is a figure."
+#   - over all 30, the split is 26 wrap-up / 4 hand. The item req-002
+#     added is wrap-up-posted, so it joins the 25, not the 4. Use THIS
+#     split for any claim about what a verb-keyed fix reaches.
+#   - 29 of the 30 P1 items are reports; the remaining one is a figure.
+#     That figure is inside the 29-row table, and is one of the 4 posted
+#     by hand. It is NOT the item req-002 added, which is a report.
 #
 # A later `ng wrap-up` does NOT reliably repair such a link. Three
 # distinct paths leave it stale, and only the first involves `ng
@@ -2368,16 +2373,16 @@ EOF
 #   - a later wrap-up ran `--no-comment` (`comment=skipped`, 17).
 # An independent depth-1 classification split 28 wrap-up-carried links
 # 18 / 7 / 3 across those three paths. Its 28 is that reviewer's own
-# audit, not the 25 above; the two audits do not share a method, so the
-# denominators are not interchangeable.
+# audit, not the 29-row 25 above; the two audits do not share a
+# method, so the denominators are not interchangeable.
 #
-# KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 25
+# KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 26
 # wrap-up cases and not the 4 posted by hand — 3 of which link a `.md`
 # report, the class this rationale says wants `latest`. The corrected
 # audit's proposal is to key on the ARTEFACT inside upload-asset.sh
 # (`.md` -> latest, everything else -> pin, holding `.ipynb` at pin
 # because every stale notebook pin was republished in-thread). That
-# moves coverage from 25 of 30 to 29 of 30. Deliberately NOT
+# moves coverage from 26 of 30 to 29 of 30. Deliberately NOT
 # pre-empted here — it is a separate design decision on #83.
 #
 # `--shape pin` opts a single wrap-up back into the frozen shape, for
