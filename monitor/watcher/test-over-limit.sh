@@ -918,6 +918,21 @@ seq=$(MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS=300 \
       MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS=300 \
       MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 _over_limit_wake_sequence_seconds)
 assert_eq "wake sequence at max_attempts=8 reaches the cap" "$seq" "1920"
+# With NO knobs set at all, the sequence must still be 720. This pins the
+# four in-code defaults (margin 300, initial 60, cap 300, attempts 4)
+# that monitor/README.md now quotes, so the doc figures cannot drift from
+# the code unnoticed (skeptic round 2 addendum).
+seq=$( unset MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS \
+             MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS \
+             MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS \
+             MONITOR_OVER_LIMIT_MAX_ATTEMPTS
+       _over_limit_wake_sequence_seconds )
+assert_eq "wake sequence with no knobs set is 720 (defaults 300/60/300/4)" "$seq" "720"
+# The 300s cap first BINDS at max_attempts=5: the fourth interval would
+# be 480. 1020 = 300 + 60 + 120 + 240 + 300; an uncapped fourth interval
+# would give 1200. The README states this, so a test holds it.
+seq=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=5 _over_limit_wake_sequence_seconds)
+assert_eq "the 300s cap first binds at max_attempts=5" "$seq" "1020"
 # The grace default must never be shorter than that sequence, at ANY
 # config. A fixed 1800 was shorter at max_attempts=8.
 g=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 _over_limit_grace_default)
