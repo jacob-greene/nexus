@@ -898,6 +898,159 @@ _out=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR NEXUS_ROOT=/opt/n
 assert_eq "held-log path uses the same resolver" \
     "$_out" "/opt/nx/monitor/.state/over-limit-held.log"
 
+# ---- SKEPTIC ROUND 1 (PR #116) -------------------------------------------
+#
+# Four findings from the skeptic pass. Each one had no assertion behind it
+# when the branch was first pushed.
+
+echo '=== SKEPTIC: the wake sequence is measured, not assumed ==='
+# The shipped comment justified the grace against "300 + 4x300 = 1500s".
+# Both the interval COUNT and their values were wrong: only
+# max_attempts-1 intervals elapse, because _over_limit_bump_or_failopen
+# fails open when the NEXT attempt count reaches the cap.
+seq=$(MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS=300 \
+      MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS=60 \
+      MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS=300 \
+      MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 _over_limit_wake_sequence_seconds)
+assert_eq "wake sequence at defaults is margin + 60 + 120 + 240" "$seq" "720"
+seq=$(MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS=300 \
+      MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS=60 \
+      MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS=300 \
+      MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 _over_limit_wake_sequence_seconds)
+assert_eq "wake sequence at max_attempts=8 reaches the cap" "$seq" "1920"
+# The grace default must never be shorter than that sequence, at ANY
+# config. A fixed 1800 was shorter at max_attempts=8.
+g=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 _over_limit_grace_default)
+assert_eq "grace default holds the 1800s floor at defaults" "$g" "1800"
+g=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 _over_limit_grace_default)
+assert_eq "grace default rises with max_attempts" "$g" "1920"
+# The invariant that matters, stated directly.
+for ma in 4 6 8 12; do
+    s=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=$ma _over_limit_wake_sequence_seconds)
+    d=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=$ma _over_limit_grace_default)
+    if (( d >= s )); then
+        printf '  PASS: grace default (%s) >= wake sequence (%s) at max_attempts=%s\n' "$d" "$s" "$ma"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: grace default %s is SHORTER than the wake sequence %s at max_attempts=%s\n' \
+            "$d" "$s" "$ma" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+# An explicit value still wins over the derivation.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW - 900 )) $(( NOW - 1200 )) $(( NOW + 86400 )) 0
+if MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS=60 _over_limit_orchestrator_paused; then
+    printf '  FAIL: an explicit short grace was ignored\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: an explicit grace overrides the derived default\n'
+    PASS=$(( PASS + 1 ))
+fi
+
+echo '=== SKEPTIC: malformed row fields must not reach bash arithmetic ==='
+# Bash evaluates array subscripts inside (( )), so a non-numeric field is
+# a code path, not a syntax error:
+#   fs='a[$(echo INJECTED >&2)]'; (( now - fs > 5 ))   -> prints INJECTED
+# Every field the wake path does arithmetic on needs a numeric guard, and
+# each guard needs an assertion or the next refactor deletes it silently.
+#
+# TWO failure modes, so the assertions check TWO things. Under `set -u`
+# (which main.sh:251 sets, and this file sets too) the unguarded compare
+# aborts the shell before the substitution runs; without it, the
+# substitution EXECUTES. So a canary check alone would pass vacuously on
+# the abort. Each case therefore runs in a SUBSHELL and asserts both that
+# the canary is absent AND that the call completed — otherwise removing a
+# guard would kill this suite mid-file instead of failing an assertion.
+_probe_malformed() {   # <label> <first_seen> <next_attempt>
+    local label="$1" fs="$2" na="$3" rc
+    rm -f "$_canary"
+    reset_state
+    rm -f "$STATE_DIR/machine-input.tsv"
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+        "$(( NOW - 60 ))" "$fs" "$na" 0
+    ( _over_limit_process_wakes "orchestrator" ) >/dev/null 2>&1
+    rc=$?
+    if [[ -e "$_canary" ]]; then
+        printf '  FAIL: %s — malformed field was EXECUTED as arithmetic\n' "$label" >&2
+        FAIL=$(( FAIL + 1 ))
+    elif (( rc != 0 )); then
+        printf '  FAIL: %s — wake path aborted (rc=%s) on a malformed field\n' "$label" "$rc" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: %s — malformed field neither executed nor aborted the wake\n' "$label"
+        PASS=$(( PASS + 1 ))
+    fi
+}
+_canary="$WORK/canary"
+rm -f "$_canary"
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='5:30pm'
+_evil="a[\$(touch $_canary)]"
+# The ceiling compare must not evaluate a malformed first_seen.
+_probe_malformed "first_seen"   "$_evil"           "$(( NOW - 1 ))"
+# The due-gate must not evaluate a malformed next_attempt.
+export MOCK_PANE_STATE_2=idle
+_probe_malformed "next_attempt" "$(( NOW - 600 ))" "$_evil"
+# ...and that row must still be serviced, not parked forever.
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: a row with a malformed next_attempt parked the gate closed\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: a malformed next_attempt reads as due and the row is serviced\n'
+    PASS=$(( PASS + 1 ))
+fi
+# The predicate does arithmetic on both fields too. Same two checks.
+rm -f "$_canary"
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    "$_evil" "$_evil" $(( NOW + 3600 )) 0
+( _over_limit_orchestrator_paused ) >/dev/null 2>&1
+_pred_rc=$?
+if [[ -e "$_canary" ]]; then
+    printf '  FAIL: the pause predicate EXECUTED a malformed field\n' >&2
+    FAIL=$(( FAIL + 1 ))
+elif (( _pred_rc > 1 )); then
+    printf '  FAIL: the pause predicate aborted (rc=%s) on a malformed field\n' "$_pred_rc" >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: the pause predicate guards both fields it compares\n'
+    PASS=$(( PASS + 1 ))
+fi
+rm -f "$_canary"
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2
+
+echo '=== SKEPTIC: the three bounds are PER-ROW, not per-incident ==='
+# Documented so the guarantee is not overread. After a fail-open drop the
+# next scan re-stamps a still-over-limit pane with a FRESH first_seen, so
+# the ceiling restarts. With a token whose clock time has passed, the new
+# deadline lands ~24h out and the gate closes again. This asserts the
+# ACTUAL behaviour; it is not a claim that the behaviour is ideal.
+reset_state
+_past=$(date -d "@$(( $(date +%s) - 60 ))" +%H:%M:%S 2>/dev/null)
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "$_past"
+_re_first=$(awk -F'\t' '{print $6}' "$(_over_limit_state_path)")
+_re_reset=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+_ahead=$(( _re_reset - _re_first ))
+if (( _ahead > 82800 )); then
+    printf '  PASS: a re-stamp on a passed token lands ~24h out (%ss) — per-row, not per-incident\n' "$_ahead"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: expected a ~24h re-stamp horizon, got %ss\n' "$_ahead" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: the fresh row pauses again (the documented per-row scope)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fresh row did not pause — scan/record contract changed\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 # ---- off-time log (operator ask, your-nexus#275) ------------------------
 echo '=== off-time log: fresh orchestrator hold starts it; record appends ==='
 reset_state

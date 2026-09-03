@@ -377,7 +377,12 @@ MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS="${MONITOR_OVER_LIMIT_INITIAL_BACKOFF
 MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS="${MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS:-$("$_cfg" monitor.over_limit.max_backoff_seconds 300)}"
 MONITOR_OVER_LIMIT_MAX_ATTEMPTS="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-$("$_cfg" monitor.over_limit.max_attempts 4)}"
 MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-$("$_cfg" monitor.over_limit.max_hold_seconds 90000)}"
-MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-$("$_cfg" monitor.over_limit.stale_grace_seconds 1800)}"
+# Deliberately defaulted to EMPTY, not to a number. An empty value lets
+# _over_limit_grace_default derive the grace from the live wake-sequence
+# knobs, so raising max_attempts cannot leave the grace shorter than the
+# sequence it must not cut short (skeptic finding, PR #116). An explicit
+# config value or env value still wins.
+MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-$("$_cfg" monitor.over_limit.stale_grace_seconds "")}"
 # Orchestrator-liveness fresh-spawn fallback. Layered on top of the
 # PR #147 session-id pin: the pin fixed *who* gets resumed; this fallback
 # ensures the orchestrator's absence is *detectable* and *recoverable*

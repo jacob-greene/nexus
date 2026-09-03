@@ -147,15 +147,19 @@
 #                             cycle (see _over_limit.sh header).
 #   MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS
 #                          -> monitor.over_limit.max_hold_seconds
-#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS
-#                          -> monitor.over_limit.stale_grace_seconds
-#                             How far past a row's own stored reset
-#                             epoch the emit gate may keep suppressing.
 #                             (default 90000 = 25h) — absolute per-row
 #                             hold ceiling; a row older than this fails
 #                             OPEN regardless of pane state or probe
 #                             outcome. Bounds EVERY wake path (incl. a
 #                             persistently-failing pane-state probe).
+#                             Evaluated BEFORE the due-gate, so it does
+#                             not depend on the wake it protects.
+#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS
+#                          -> monitor.over_limit.stale_grace_seconds
+#                             (default: the larger of 1800 and the full
+#                             wake sequence) — how far past a row's own
+#                             stored reset epoch the emit gate may keep
+#                             suppressing.
 #   MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S
 #                          -> monitor.orchestrator_unresponsive_threshold_seconds
 #                             DEPRECATED (#164). When set, seeds the

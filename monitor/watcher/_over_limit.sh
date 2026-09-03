@@ -118,12 +118,29 @@
 #       Must exceed the longest legitimate reset horizon (24h).
 #       Evaluated BEFORE the due-gate, so it does not depend on the
 #       wake schedule it protects. Also clamps a recomputed deadline.
-#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS    (default 1800 = 30 min)
+#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS    (default: see below)
 #       How far past a row's own stored reset_epoch the hold may keep
 #       suppressing. Past it the pause predicate reports NOT paused
-#       even while the row lives. Must exceed the wake margin plus the
-#       whole backoff budget (300 + 4x300 = 1500s at defaults), so a
-#       normally-progressing wake sequence is never cut short.
+#       even while the row lives.
+#
+#       It must exceed the whole wake sequence, or the predicate would
+#       cut short a wake that is still legitimately retrying. The
+#       sequence is the wake margin plus every backoff interval that
+#       actually elapses. Only MAX_ATTEMPTS-1 intervals elapse, because
+#       _over_limit_bump_or_failopen fails open when the NEXT attempt
+#       count reaches the cap. At defaults that is 3 intervals, not 4,
+#       and the cap is never reached:
+#
+#           margin 300 + (60 + 120 + 240) = 720s
+#
+#       An earlier revision of this comment claimed 300 + 4x300 = 1500s.
+#       That was wrong on both the interval count and their values
+#       (skeptic finding, PR #116). The conclusion survived but the
+#       derivation did not, and the relationship was not config-robust:
+#       at max_attempts=8 the sequence is 300 + 1620 = 1920s, which
+#       exceeds a fixed 1800s grace. So the default is now DERIVED —
+#       _over_limit_grace_default returns the larger of 1800 and the
+#       measured sequence, and any explicit value still wins.
 #
 # Logger contract: callers may set `_OVER_LIMIT_LOG_FN` to the name of
 # a function that takes one string arg. Default is a noop. Tests pin a
@@ -277,12 +294,46 @@ _over_limit_keys() {
 # malformed or non-numeric field is treated as "not expired by that
 # bound" — the other bound still applies, and the wake loop's fail-open
 # remains the terminal backstop.
+# Total seconds a wake sequence can legitimately occupy past the stored
+# deadline: the wake margin plus every backoff interval that actually
+# elapses. _over_limit_bump_or_failopen fails open when the NEXT attempt
+# count reaches max_attempts, so only max_attempts-1 intervals run. The
+# n-th elapsed interval is `initial << (n-1)`, capped at `cap`.
+_over_limit_wake_sequence_seconds() {
+    local margin="${MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS:-300}"
+    local initial="${MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS:-60}"
+    local cap="${MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS:-300}"
+    local max_attempts="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-4}"
+    [[ "$margin"       =~ ^[0-9]+$ ]] || margin=300
+    [[ "$initial"      =~ ^[0-9]+$ ]] || initial=60
+    [[ "$cap"          =~ ^[0-9]+$ ]] || cap=300
+    [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=4
+    local total="$margin" n shift_n delay
+    for (( n = 1; n < max_attempts; n++ )); do
+        shift_n=$(( n - 1 ))
+        (( shift_n > 16 )) && shift_n=16
+        delay=$(( initial << shift_n ))
+        (( delay > cap )) && delay=$cap
+        total=$(( total + delay ))
+    done
+    printf '%d' "$total"
+}
+
+# Default stale grace: never shorter than the wake sequence it must not
+# cut short, and never below the 1800s floor the module shipped with.
+_over_limit_grace_default() {
+    local seq floor=1800
+    seq=$(_over_limit_wake_sequence_seconds)
+    (( seq > floor )) && floor="$seq"
+    printf '%d' "$floor"
+}
+
 _over_limit_hold_expired() {
     local first_seen="$1" reset_epoch="$2" now="$3"
     local max_hold="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-90000}"
     [[ "$max_hold" =~ ^[0-9]+$ ]] || max_hold=90000
-    local grace="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-1800}"
-    [[ "$grace" =~ ^[0-9]+$ ]] || grace=1800
+    local grace="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=$(_over_limit_grace_default)
     if [[ "$first_seen" =~ ^[0-9]+$ ]] && (( now - first_seen > max_hold )); then
         return 0
     fi
@@ -672,8 +723,18 @@ _over_limit_evaluate_row() {
         return 0
     fi
 
-    # Not due yet — leave the row alone.
-    (( now >= next_attempt )) || return 0
+    # Not due yet — leave the row alone. `next_attempt` is guarded the
+    # same way `first_seen` is above: bash arithmetic evaluates array
+    # subscripts, so a non-numeric field is a code path, not a syntax
+    # error (skeptic finding, PR #116). A malformed field reads as DUE,
+    # which routes the row through the probe and the bounded state
+    # machine rather than parking it forever on an unusable schedule.
+    if [[ ! "$next_attempt" =~ ^[0-9]+$ ]]; then
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: '${window}' (key=${key}) has a malformed next_attempt; treating the row as due"
+    elif (( now < next_attempt )); then
+        return 0
+    fi
 
     local probe_target
     if [[ "$role" == "orchestrator" ]]; then
