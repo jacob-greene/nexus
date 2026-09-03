@@ -36,12 +36,12 @@
 #     Always prints an integer epoch on stdout (return 0).
 #
 #   _over_limit_record <key> <window> <role> <reset_at_token>
-#     Insert-or-refresh a stamp. Preserves first_seen_epoch and
-#     attempts across refreshes (so repeated observations of an
-#     unchanged suspension don't reset progress through backoff).
-#     Recomputes reset_epoch + next_attempt_epoch each time, in case
-#     the renderer's reset_at changes mid-suspension (theoretical
-#     edge — clock-rollover during the wait).
+#     Insert-or-refresh a stamp. Preserves first_seen_epoch, attempts
+#     AND reset_epoch across refreshes of an unchanged token (so
+#     repeated observations of one suspension neither reset progress
+#     through backoff nor move the deadline). reset_epoch is recomputed
+#     only when the renderer reports a DIFFERENT token, and the result
+#     is clamped to first_seen + MAX_HOLD. See "DEADLINE FREEZE" below.
 #
 #   _over_limit_drop <key>
 #     Remove the row, atomically. Silent no-op when row absent.
@@ -50,9 +50,20 @@
 #     Tab-separated row for <key>, or empty on miss. Use IFS=$'\t' read.
 #
 #   _over_limit_orchestrator_paused
-#     Exit 0 when an `_orchestrator` row exists, 1 otherwise. Used by
-#     main.sh's paste-gate to suppress routine emits to a suspended
-#     orchestrator (would pile up unread). Archive still runs.
+#     Exit 0 when an `_orchestrator` row exists AND is not expired, 1
+#     otherwise. Used by main.sh's paste-gate to suppress routine emits
+#     to a suspended orchestrator (would pile up unread). Archive still
+#     runs. "Expired" is _over_limit_hold_expired: past the absolute
+#     ceiling, or past the row's own stored deadline plus the stale
+#     grace. The predicate deliberately does NOT depend on the wake loop
+#     having run — that dependency is what latched on 2026-09-02.
+#
+#   _over_limit_hold_expired <first_seen> <reset_epoch> <now>
+#     Shared staleness rule. Exit 0 when the hold must stop suppressing.
+#
+#   _over_limit_state_dir
+#     Resolve the state directory, or fail LOUDLY. Never returns a
+#     relative path.
 #
 #   _over_limit_keys
 #     One key per line. Caller iterates to dispatch wake checks.
@@ -105,6 +116,31 @@
 #       probe outcome — the belt-and-suspenders that bounds EVERY
 #       wake path, including a persistently-failing pane-state probe.
 #       Must exceed the longest legitimate reset horizon (24h).
+#       Evaluated BEFORE the due-gate, so it does not depend on the
+#       wake schedule it protects. Also clamps a recomputed deadline.
+#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS    (default: see below)
+#       How far past a row's own stored reset_epoch the hold may keep
+#       suppressing. Past it the pause predicate reports NOT paused
+#       even while the row lives.
+#
+#       It must exceed the whole wake sequence, or the predicate would
+#       cut short a wake that is still legitimately retrying. The
+#       sequence is the wake margin plus every backoff interval that
+#       actually elapses. Only MAX_ATTEMPTS-1 intervals elapse, because
+#       _over_limit_bump_or_failopen fails open when the NEXT attempt
+#       count reaches the cap. At defaults that is 3 intervals, not 4,
+#       and the cap is never reached:
+#
+#           margin 300 + (60 + 120 + 240) = 720s
+#
+#       An earlier revision of this comment claimed 300 + 4x300 = 1500s.
+#       That was wrong on both the interval count and their values
+#       (skeptic finding, PR #116). The conclusion survived but the
+#       derivation did not, and the relationship was not config-robust:
+#       at max_attempts=8 the sequence is 300 + 1620 = 1920s, which
+#       exceeds a fixed 1800s grace. So the default is now DERIVED —
+#       _over_limit_grace_default returns the larger of 1800 and the
+#       measured sequence, and any explicit value still wins.
 #
 # Logger contract: callers may set `_OVER_LIMIT_LOG_FN` to the name of
 # a function that takes one string arg. Default is a noop. Tests pin a
@@ -120,8 +156,44 @@ _OVER_LIMIT_PASTE_FN="${_OVER_LIMIT_PASTE_FN:-_over_limit_paste_noop}"
 _over_limit_log_noop() { :; }
 _over_limit_paste_noop() { return 0; }
 
+# Resolve the state directory. NEVER falls back to a relative path.
+#
+# A `${STATE_DIR:-.}` fallback silently redirected every read and write
+# into the CALLER's working directory: `_over_limit_drop` then reported
+# success having removed a file that was not the real state file, and
+# `_over_limit_orchestrator_paused` read a stranger's row (issue #500).
+# Resolution order mirrors bootstrap.sh:
+#   STATE_DIR → NEXUS_STATE_DIR → NEXUS_ROOT/monitor/.state → repo layout
+# The repo-layout rung only accepts a directory that really is
+# `monitor/watcher/` (its sibling `main.sh` must exist), so a stray copy
+# of this helper cannot invent a plausible-looking absolute path. When
+# nothing resolves the function fails LOUDLY on stderr and returns 1;
+# every caller propagates that rather than touching the cwd.
+_over_limit_state_dir() {
+    if [[ -n "${STATE_DIR:-}" ]]; then
+        printf '%s' "$STATE_DIR"; return 0
+    fi
+    if [[ -n "${NEXUS_STATE_DIR:-}" ]]; then
+        printf '%s' "$NEXUS_STATE_DIR"; return 0
+    fi
+    if [[ -n "${NEXUS_ROOT:-}" ]]; then
+        printf '%s/monitor/.state' "$NEXUS_ROOT"; return 0
+    fi
+    local helper_dir
+    helper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || helper_dir=""
+    if [[ -n "$helper_dir" && -f "$helper_dir/main.sh" ]]; then
+        printf '%s/.state' "$(cd "$helper_dir/.." && pwd)"
+        return 0
+    fi
+    printf 'over-limit: cannot resolve a state directory (STATE_DIR, NEXUS_STATE_DIR and NEXUS_ROOT are unset, and %s is not a monitor/watcher checkout); refusing to use a relative path\n' \
+        "${helper_dir:-<unknown>}" >&2
+    return 1
+}
+
 _over_limit_state_path() {
-    printf '%s/over-limit-state.tsv' "${STATE_DIR:-.}"
+    local dir
+    dir=$(_over_limit_state_dir) || return 1
+    printf '%s/over-limit-state.tsv' "$dir"
 }
 
 # Off-time log (operator ask, your-nexus#275): a human-readable,
@@ -133,14 +205,16 @@ _over_limit_state_path() {
 # always describes the most-recent incident; the per-emit full bodies stay
 # archived under monitor/.state/diffs/ as the permanent record.
 _over_limit_held_log_path() {
-    printf '%s/over-limit-held.log' "${STATE_DIR:-.}"
+    local dir
+    dir=$(_over_limit_state_dir) || return 1
+    printf '%s/over-limit-held.log' "$dir"
 }
 
 # Start (truncate + header) the off-time log for a new orchestrator hold.
 # Called from _over_limit_record when a fresh `_orchestrator` row appears.
 _over_limit_held_log_start() {
     local t0="$1" path pretty
-    path=$(_over_limit_held_log_path)
+    path=$(_over_limit_held_log_path) || return 1
     mkdir -p "$(dirname "$path")" 2>/dev/null || true
     pretty=$(date -d "@$t0" -Is 2>/dev/null || printf '%s' "$t0")
     printf '# over-limit off-time log — orchestrator hold began %s (epoch %s)\n# one line per emit the watcher held while the pane was over-limit; full bodies under monitor/.state/diffs/\n' \
@@ -151,7 +225,7 @@ _over_limit_held_log_start() {
 # over-limit-suppressed emit branch. Best-effort; never fails the caller.
 _over_limit_record_held() {
     local archive="$1" reason="$2" path ts
-    path=$(_over_limit_held_log_path)
+    path=$(_over_limit_held_log_path) || return 1
     mkdir -p "$(dirname "$path")" 2>/dev/null || true
     ts=$(date -Is 2>/dev/null || date 2>/dev/null || printf '?')
     printf '%s\theld\tarchive=%s\treason=%s\n' "$ts" "$archive" "$reason" \
@@ -196,23 +270,95 @@ _over_limit_reset_at_to_epoch() {
 # (truthy use: `row=$(_over_limit_load k); [[ -n $row ]]`).
 _over_limit_load() {
     local key="$1" path
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 1
     awk -F'\t' -v k="$key" '$1 == k { print; found=1; exit } END { exit !found }' "$path"
 }
 
 _over_limit_keys() {
     local path
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 0
     awk -F'\t' 'NF>=1 && $1 != "" { print $1 }' "$path"
 }
 
+# Shared staleness rule for a stamped hold. Exit 0 when the hold is
+# EXPIRED and must no longer suppress anything. Two independent bounds:
+#
+#   (a) absolute ceiling  — now - first_seen  > MAX_HOLD  (default 25h)
+#   (b) deadline + grace  — now > reset_epoch + STALE_GRACE (default 30m)
+#
+# (b) is the bound the pause predicate was missing (issue #500): the
+# predicate tested only that a row EXISTED, so a row whose own stored
+# deadline had passed hours earlier still suppressed every emit. A
+# malformed or non-numeric field is treated as "not expired by that
+# bound" — the other bound still applies, and the wake loop's fail-open
+# remains the terminal backstop.
+# Total seconds a wake sequence can legitimately occupy past the stored
+# deadline: the wake margin plus every backoff interval that actually
+# elapses. _over_limit_bump_or_failopen fails open when the NEXT attempt
+# count reaches max_attempts, so only max_attempts-1 intervals run. The
+# n-th elapsed interval is `initial << (n-1)`, capped at `cap`.
+_over_limit_wake_sequence_seconds() {
+    local margin="${MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS:-300}"
+    local initial="${MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS:-60}"
+    local cap="${MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS:-300}"
+    local max_attempts="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-4}"
+    [[ "$margin"       =~ ^[0-9]+$ ]] || margin=300
+    [[ "$initial"      =~ ^[0-9]+$ ]] || initial=60
+    [[ "$cap"          =~ ^[0-9]+$ ]] || cap=300
+    [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=4
+    local total="$margin" n shift_n delay
+    for (( n = 1; n < max_attempts; n++ )); do
+        shift_n=$(( n - 1 ))
+        (( shift_n > 16 )) && shift_n=16
+        delay=$(( initial << shift_n ))
+        (( delay > cap )) && delay=$cap
+        total=$(( total + delay ))
+    done
+    printf '%d' "$total"
+}
+
+# Default stale grace: never shorter than the wake sequence it must not
+# cut short, and never below the 1800s floor the module shipped with.
+_over_limit_grace_default() {
+    local seq floor=1800
+    seq=$(_over_limit_wake_sequence_seconds)
+    (( seq > floor )) && floor="$seq"
+    printf '%d' "$floor"
+}
+
+_over_limit_hold_expired() {
+    local first_seen="$1" reset_epoch="$2" now="$3"
+    local max_hold="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-90000}"
+    [[ "$max_hold" =~ ^[0-9]+$ ]] || max_hold=90000
+    local grace="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=$(_over_limit_grace_default)
+    if [[ "$first_seen" =~ ^[0-9]+$ ]] && (( now - first_seen > max_hold )); then
+        return 0
+    fi
+    if [[ "$reset_epoch" =~ ^[0-9]+$ ]] && (( now > reset_epoch + grace )); then
+        return 0
+    fi
+    return 1
+}
+
+# Exit 0 when the orchestrator is held. A row that exists but is EXPIRED
+# by _over_limit_hold_expired does NOT hold the gate: the wake loop is
+# the mechanism that clears such a row, and this predicate must not
+# depend on the wake loop having run. On 2026-09-02 that dependency
+# suppressed 889 emits over 6h36m while the pane itself probed
+# `state=busy active=1`.
 _over_limit_orchestrator_paused() {
-    local path
-    path=$(_over_limit_state_path)
+    local path row now reset_epoch first_seen
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 1
-    awk -F'\t' '$1 == "_orchestrator" { found=1; exit } END { exit !found }' "$path"
+    row=$(awk -F'\t' '$1 == "_orchestrator" { print; found=1; exit } END { exit !found }' "$path") \
+        || return 1
+    IFS=$'\t' read -r _ _ _ _ reset_epoch first_seen _ _ <<<"$row"
+    now=$(date +%s)
+    _over_limit_hold_expired "$first_seen" "$reset_epoch" "$now" && return 1
+    return 0
 }
 
 # Atomic rewrite: read all rows, replace any with matching key, append
@@ -221,7 +367,7 @@ _over_limit_write_row() {
     local key="$1" window="$2" role="$3" token="$4"
     local reset_epoch="$5" first_seen="$6" next_attempt="$7" attempts="$8"
     local path tmp dir
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     dir=$(dirname "$path")
     mkdir -p "$dir" 2>/dev/null || true
     tmp=$(mktemp "${path}.XXXXXX")
@@ -249,16 +395,39 @@ _over_limit_record() {
     attempts=0
     local existing
     if existing=$(_over_limit_load "$key"); then
-        local _ _ _ _ _ existing_first existing_attempts _
-        IFS=$'\t' read -r _ _ _ _ _ existing_first _ existing_attempts <<<"$existing"
+        local existing_token existing_reset existing_first existing_attempts
+        IFS=$'\t' read -r _ _ _ existing_token existing_reset existing_first _ existing_attempts \
+            <<<"$existing"
         [[ "$existing_first" =~ ^[0-9]+$ ]] && first_seen="$existing_first"
         [[ "$existing_attempts" =~ ^[0-9]+$ ]] && attempts="$existing_attempts"
+        # DEADLINE FREEZE (issue #500). A reset_at token is a bare
+        # wall-clock string with no date ("5:30pm_America/Los_Angeles").
+        # _over_limit_reset_at_to_epoch resolves it against TODAY and
+        # adds 24h when that instant has already passed. So recomputing
+        # it on every 60s refresh moved the deadline — and next_attempt
+        # with it — one day further out the moment the wall-clock time
+        # passed. The wake never came due, the attempt counter never
+        # advanced, and the hold latched. Measured on 2026-09-02: a
+        # reset_epoch 19.0h in the future on a row whose first_seen was
+        # 6.6h old. Keep the epoch computed at FIRST sight; recompute
+        # only when the renderer reports a genuinely different token.
+        if [[ "$existing_token" == "$token" && "$existing_reset" =~ ^[0-9]+$ ]]; then
+            reset_epoch="$existing_reset"
+        fi
     elif [[ "$key" == "_orchestrator" ]]; then
         # Fresh orchestrator hold (no prior row) → start the off-time log
         # so it describes THIS incident from the moment emits begin to be
         # held. Refreshes of an existing hold leave it untouched.
         _over_limit_held_log_start "$now"
     fi
+    # Hard upper bound on the deadline. A token change is the one path
+    # that still recomputes reset_epoch, so clamp the result to the
+    # absolute ceiling: no stored deadline may sit beyond
+    # first_seen + MAX_HOLD, which guarantees the wake comes due inside
+    # the ceiling instead of being pushed past it.
+    local max_hold="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-90000}"
+    [[ "$max_hold" =~ ^[0-9]+$ ]] || max_hold=90000
+    (( reset_epoch <= first_seen + max_hold )) || reset_epoch=$(( first_seen + max_hold ))
     local next_attempt=$(( reset_epoch + wake_margin ))
     # Don't push next_attempt into the past if we've been sitting on a
     # stamp longer than the reset window suggested. Lower bound is now.
@@ -272,7 +441,7 @@ _over_limit_drop() {
     [[ -n "$key_raw" ]] || return 1
     local key path tmp
     key=$(_over_limit_sanitize_key "$key_raw")
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 0
     tmp=$(mktemp "${path}.XXXXXX")
     awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
@@ -447,7 +616,7 @@ _over_limit_compose_worker_brief() {
 # the orchestrator brief. Empty stdout when no worker rows exist.
 _over_limit_worker_summary() {
     local path
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 0
     awk -F'\t' '$3 == "worker" { print $2 }' "$path" \
         | sort -u \
@@ -524,8 +693,6 @@ _over_limit_evaluate_row() {
     IFS=$'\t' read -r key window role token reset_epoch first_seen next_attempt attempts \
         <<<"$row"
     [[ -n "$key" ]] || return 0
-    # Not due yet — leave the row alone.
-    (( now >= next_attempt )) || return 0
 
     # ABSOLUTE anti-latch ceiling — the belt over every per-state
     # suspenders. No hold may outlive first_seen + MAX_HOLD regardless of
@@ -538,12 +705,34 @@ _over_limit_evaluate_row() {
     # longest legitimate reset horizon is 24h ("resets <clock-time>"); the
     # default ceiling adds an hour of margin. A negative delta (bogus
     # future first_seen) never trips it.
+    #
+    # IT MUST BE EVALUATED BEFORE THE DUE-GATE (issue #500). It used to
+    # sit below `(( now >= next_attempt )) || return 0` — inside the very
+    # wake it exists to protect. next_attempt is derived from
+    # reset_epoch, so when reset_epoch was the corrupted value the wake
+    # never arrived and the ceiling was never reached: no ceiling line
+    # was logged between 2026-08-26 and the 2026-09-02 incident. A
+    # backstop gated on the value it backstops is not a backstop. The
+    # cost of running it first is one integer compare per row per tick.
     local max_hold="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-90000}"  # 25h
     [[ "$max_hold" =~ ^[0-9]+$ ]] || max_hold=90000
-    if (( now - first_seen > max_hold )); then
+    if [[ "$first_seen" =~ ^[0-9]+$ ]] && (( now - first_seen > max_hold )); then
         "$_OVER_LIMIT_LOG_FN" \
             "over-limit: '${window}' (key=${key}) hold exceeded absolute ceiling (${max_hold}s since first_seen); failing OPEN"
         _over_limit_failopen "$key" "$window" "$role" "$token" "$first_seen" "$now"
+        return 0
+    fi
+
+    # Not due yet — leave the row alone. `next_attempt` is guarded the
+    # same way `first_seen` is above: bash arithmetic evaluates array
+    # subscripts, so a non-numeric field is a code path, not a syntax
+    # error (skeptic finding, PR #116). A malformed field reads as DUE,
+    # which routes the row through the probe and the bounded state
+    # machine rather than parking it forever on an unusable schedule.
+    if [[ ! "$next_attempt" =~ ^[0-9]+$ ]]; then
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: '${window}' (key=${key}) has a malformed next_attempt; treating the row as due"
+    elif (( now < next_attempt )); then
         return 0
     fi
 
@@ -683,7 +872,7 @@ _over_limit_load_next_attempt() {
 _over_limit_process_wakes() {
     local target="${1:?target window required}"
     local path now
-    path=$(_over_limit_state_path)
+    path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 0
     now=$(date +%s)
     # Snapshot the rows up front so a mid-loop _over_limit_drop /
