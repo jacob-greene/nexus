@@ -147,6 +147,10 @@
 #                             cycle (see _over_limit.sh header).
 #   MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS
 #                          -> monitor.over_limit.max_hold_seconds
+#   MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS
+#                          -> monitor.over_limit.stale_grace_seconds
+#                             How far past a row's own stored reset
+#                             epoch the emit gate may keep suppressing.
 #                             (default 90000 = 25h) — absolute per-row
 #                             hold ceiling; a row older than this fails
 #                             OPEN regardless of pane state or probe
