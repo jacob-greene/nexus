@@ -949,6 +949,69 @@ else
     PASS=$(( PASS + 1 ))
 fi
 
+echo '=== SKEPTIC r2: the PREDICATE must use the derived grace, not a constant ==='
+# Round-one added assertions for _over_limit_wake_sequence_seconds and
+# _over_limit_grace_default, but both test the helpers in ISOLATION. They
+# assert the derived NUMBER; none asserted that anything CONSUMES it. So
+# reverting _over_limit_hold_expired to a hardcoded 1800 floor left the
+# suite at 115 passed, 0 failed (skeptic round 2). The fix to round-one
+# finding 1 was untested at the only integration point that matters.
+#
+# The discriminating case is a deadline that passed by a value BETWEEN
+# the two grace figures. At max_attempts=8 the sequence is 1920s, so a
+# deadline 1860s past must NOT expire under the derivation and MUST
+# expire under a hardcoded 1800. Both sides of the boundary are pinned.
+#
+# `now` is re-read immediately before each row is written, not taken from
+# the suite-wide NOW: the margin here is 60s and suite runtime would
+# otherwise drift the row across the boundary under test.
+_grace_boundary() {   # <label> <seconds-past-deadline> <want: paused|open>
+    local label="$1" past="$2" want="$3" rt
+    reset_state
+    rt=$(date +%s)
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+        "$(( rt - past ))" "$(( rt - 7200 ))" "$(( rt + 3600 ))" 0
+    local got=open
+    MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 \
+        _over_limit_orchestrator_paused && got=paused
+    if [[ "$got" == "$want" ]]; then
+        printf '  PASS: deadline %ss past, max_attempts=8 → %s (derived grace 1920s)\n' \
+            "$past" "$got"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: deadline %ss past, max_attempts=8 → %s, want %s (predicate ignoring the derived grace?)\n' \
+            "$past" "$got" "$want" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+# Inside the derived grace (1800 < 1860 < 1920): the wake sequence is
+# still legitimately retrying, so the hold must STAND. A hardcoded 1800
+# would open the gate here and cut that wake short.
+_grace_boundary "inside" 1860 paused
+# Past the derived grace: the hold must go.
+_grace_boundary "beyond" 2000 open
+# Same boundary asserted directly on the shared rule, so a future change
+# that keeps the predicate but rewires the rule is also caught.
+_rt=$(date +%s)
+if MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 \
+    _over_limit_hold_expired "$(( _rt - 7200 ))" "$(( _rt - 1860 ))" "$_rt"; then
+    printf '  FAIL: hold_expired used a constant, not the derived grace\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: hold_expired consumes the derived grace at max_attempts=8\n'
+    PASS=$(( PASS + 1 ))
+fi
+# ...and the same row IS expired at the shipped default, which proves the
+# two settings genuinely differ rather than both being permissive.
+if MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 \
+    _over_limit_hold_expired "$(( _rt - 7200 ))" "$(( _rt - 1860 ))" "$_rt"; then
+    printf '  PASS: the same row expires at max_attempts=4 (grace 1800s) — the settings differ\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: row not expired at max_attempts=4 — the boundary case is vacuous\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 echo '=== SKEPTIC: malformed row fields must not reach bash arithmetic ==='
 # Bash evaluates array subscripts inside (( )), so a non-numeric field is
 # a code path, not a syntax error:
