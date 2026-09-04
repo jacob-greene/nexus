@@ -474,20 +474,33 @@ OVER_LIMIT_SCAN_ROWS=15
 # typed into the input box is excluded outright because the window stops
 # above it.
 #
-# When the pane carries no `❯<NBSP>` input row at all — the shape issue
-# #87 described, where the notice replaces the input row — the window
-# degrades to the last OVER_LIMIT_SCAN_ROWS non-blank rows of the whole
-# pane rather than returning nothing.
+# Three cases, and the last two must not be conflated:
+#
+#   NO `❯<NBSP>` row at all — the shape issue #87 described, where the
+#     notice replaces the input row. The window degrades to the last
+#     OVER_LIMIT_SCAN_ROWS non-blank rows of the whole pane rather than
+#     returning nothing.
+#   Input row BELOW row 1 — the ordinary case. The window is the rows
+#     above it.
+#   Input row IS row 1 — no row sits above it, so the window is EMPTY.
+#     Falling back to the whole pane here would re-admit the input row
+#     and classify text TYPED into the input box as a painted notice.
+#     The shape is not reachable on a real Claude Code pane (the box
+#     always carries chrome above it), but the guard must not depend on
+#     that: an unreachable branch that contradicts the paragraph above
+#     is a defect waiting for a renderer change to expose it.
 _over_limit_window() {
     local plain="$1" input_ln body
     # Last `❯<NBSP>` row = the Claude input box. Same anchor as
     # `_find_input_row`; the NBSP distinguishes it from a numbered menu
     # option row, which uses `❯ <digit>` with an ASCII space.
     input_ln=$(grep -nF "❯${NBSP}" <<<"$plain" | tail -1 | cut -d: -f1)
-    if [[ -n "$input_ln" ]] && (( input_ln > 1 )); then
+    if [[ -z "$input_ln" ]]; then
+        body="$plain"
+    elif (( input_ln > 1 )); then
         body=$(head -n "$(( input_ln - 1 ))" <<<"$plain")
     else
-        body="$plain"
+        return 0
     fi
     printf '%s\n' "$body" \
         | grep -v '^[[:space:]]*$' \

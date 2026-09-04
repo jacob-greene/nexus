@@ -676,6 +676,63 @@ if [[ -f "$terse_fixture" ]]; then
     fi
 fi
 
+# cc 2.1.260 bottom-pinned layout: the notice sits 29 rows above the
+# input row, behind blank padding. Asserts the state AND the reset token
+# together, on purpose. `_detect_over_limit` and
+# `_extract_over_limit_reset` read the same window through
+# `_over_limit_window`, and only this assertion pins the EXTRACTOR's
+# half. Without the reset_at check the extractor could silently revert
+# to a fixed `tail -n 15` — the state would still read `over-limit`
+# while reset_at degraded to `unknown`, which drops the watcher's hold
+# from the parsed reset time to its blind 6h fallback.
+pinned_fixture="$FIX_DIR/over-limit-bottom-pinned-input-cc2.1.260.ansi"
+if [[ -f "$pinned_fixture" ]]; then
+    out=$("$HELPER" --fixture "$pinned_fixture" --window 9 --name overw --active 0)
+    if grep -q 'state=over-limit' <<<"$out" \
+       && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
+        printf '  PASS: bottom-pinned over-limit emits reset_at=3am_America/Los_Angeles\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: bottom-pinned over-limit emit (got: %s)\n' "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# The input box is row 1 of the capture, so NO row sits above it. The
+# window must be empty, not the whole pane: text typed into the input
+# box is not a painted notice. Without the explicit branch this shape
+# falls back to the whole pane and the typed text classifies
+# `over-limit`.
+inputrow_first_tmp=$(mktemp)
+printf '\xe2\x9d\xaf\xc2\xa0 You'"'"'ve hit your weekly limit \xc2\xb7 resets 3am (America/Los_Angeles)\n' \
+    > "$inputrow_first_tmp"
+printf '\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n  status\n' >> "$inputrow_first_tmp"
+out=$("$HELPER" --fixture "$inputrow_first_tmp" --window 9 --name overw --active 0)
+if ! grep -q 'state=over-limit' <<<"$out"; then
+    printf '  PASS: notice typed into a row-1 input box does not false-trigger\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: row-1 input box false-triggered over-limit (got: %s)\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+rm -f "$inputrow_first_tmp"
+
+# The same notice typed into an input box that is NOT row 1 — the
+# ordinary shape of the same false positive.
+inputrow_typed_tmp=$(mktemp)
+printf 'idle transcript\n\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n' > "$inputrow_typed_tmp"
+printf '\xe2\x9d\xaf\xc2\xa0 You'"'"'ve hit your weekly limit \xc2\xb7 resets 3am\n' >> "$inputrow_typed_tmp"
+printf '\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n  status\n' >> "$inputrow_typed_tmp"
+out=$("$HELPER" --fixture "$inputrow_typed_tmp" --window 9 --name overw --active 0)
+if ! grep -q 'state=over-limit' <<<"$out"; then
+    printf '  PASS: notice typed into the input box does not false-trigger\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: typed input box false-triggered over-limit (got: %s)\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+rm -f "$inputrow_typed_tmp"
+
 # False-positive guard: idle pane whose scrollback contains the canonical
 # text. Detection is anchored to the bottom 15 rows so this MUST emit idle.
 fp_fixture="$FIX_DIR/idle-overlimit-text-in-scrollback-synthetic.ansi"
