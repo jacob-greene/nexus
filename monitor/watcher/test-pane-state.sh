@@ -4,7 +4,33 @@
 # Each fixture under monitor/watcher/fixtures/*.ansi is a real or
 # synthesized tmux capture-pane -e -p output. The expected state for
 # each fixture is encoded in its filename prefix (`autosuggest-`,
-# `busy-`, `idle-`, `user-typing-`, `blocked-`, `absent-`).
+# `busy-`, `idle-`, `user-typing-`, `blocked-`, `absent-`,
+# `over-limit-`).
+#
+# Three fixtures carry a cc version in their name. They are REAL frames
+# painted by that binary, and they pin the two renderer shapes that
+# blocked the 2.1.258 / 2.1.259 / 2.1.260 evaluations:
+#
+#   blocked-trust-numbered-cc2.1.220.ansi
+#       the folder-trust dialog with numbered options and the chevron
+#       on the accept option.
+#   blocked-trust-unnumbered-cc2.1.260.ansi
+#       the same dialog after 2.1.260 dropped the numbering and moved
+#       the chevron to `No, exit`.
+#   over-limit-bottom-pinned-input-cc2.1.260.ansi
+#       an over-limit pane from 2.1.260, which pins the input box to the
+#       BOTTOM of the pane. The notice sits 29 rows above the input row,
+#       behind blank padding that grows with the terminal.
+#
+# The first two are `capture-pane -e -p` frames. The third is
+# `capture-pane -p` (no `-e`); the over-limit branch reads only the
+# ANSI-stripped text, so the missing attributes change nothing it
+# asserts. Only workspace paths were rewritten, to keep a per-run
+# temporary directory out of the repository.
+#
+# `idle-overlimit-text-in-scrollback-synthetic.ansi` is the paired
+# false-positive guard: the same notice quoted far above the input box
+# must still classify `idle`.
 #
 # Run: bash monitor/watcher/test-pane-state.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.

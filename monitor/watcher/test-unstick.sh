@@ -1033,6 +1033,173 @@ W_FP=$(_test_w_fp)
     || { echo "  FAIL: relay record written for orchestrator" >&2; FAIL=$((FAIL+1)); }
 teardown_test
 
+# ---- Case T: folder-trust dialog, BOTH rendered shapes -------------------
+#
+# cc 2.1.232 introduced the dialog. cc 2.1.260 changed its shape twice
+# over: the options lost their numbering, and the chevron moved from the
+# accept option to the exit option. Both shapes are reproduced verbatim
+# from captures taken against the real binaries.
+#
+# The load-bearing assertion is that Case T never sends a bare Enter
+# while the chevron sits on `No, exit`. That keystroke would close the
+# worker's pane, which is worse than the hang Case T repairs.
+
+# cc 2.1.220 shape: numbered, chevron already on the accept option.
+trust_pane_numbered() {
+    cat <<'EOF'
+ Accessing workspace:
+ /tmp/work/child
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm · Esc to cancel
+EOF
+}
+
+# cc 2.1.260 shape: unnumbered, chevron on the EXIT option.
+trust_pane_unnumbered() {
+    cat <<'EOF'
+ Accessing workspace:
+ /tmp/work/child
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+EOF
+}
+
+# The same 2.1.260 dialog after one Down: chevron on the accept option.
+trust_pane_unnumbered_moved() {
+    cat <<'EOF'
+ Accessing workspace:
+ /tmp/work/child
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+   No, exit
+ ❯ Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+EOF
+}
+
+# A pane that only QUOTES the dialog: both literals present, no chevron
+# on an option row. Case T must not touch it.
+trust_prose_pane() {
+    cat <<'EOF'
+⏺ The worker parked on the folder-trust dialog.
+  ⎿  It offered "Yes, I trust this folder" and "No, exit".
+❯ what should I do about it?
+EOF
+}
+
+# Make the mock pane RESPOND to arrow keys, so the re-read _act_trust
+# performs sees a moved chevron. Without this the mock returns a frozen
+# frame and no dialog could ever be confirmed.
+enable_responsive_pane() {
+    local win="$1" moved_fixture="$2"
+    RESPONSIVE_WIN="$win"
+    RESPONSIVE_FIXTURE="$moved_fixture"
+    _orig_tmux_body=$(declare -f tmux)
+    eval "_orig_tmux() ${_orig_tmux_body#tmux ()}"
+    tmux() {
+        if [[ "$1" == "send-keys" ]]; then
+            local a target=""
+            for a in "$@"; do
+                [[ -n "${_next_is_target:-}" ]] && { target="$a"; _next_is_target=""; }
+                [[ "$a" == "-t" ]] && _next_is_target=1
+            done
+            if [[ "$target" == "$RESPONSIVE_WIN" ]] \
+               && printf '%s\n' "$@" | grep -qx 'Down'; then
+                "$RESPONSIVE_FIXTURE" > "$PANES_DIR/$RESPONSIVE_WIN"
+            fi
+        fi
+        _orig_tmux "$@"
+    }
+}
+disable_responsive_pane() {
+    eval "tmux() ${_orig_tmux_body#tmux ()}"
+}
+
+echo '=== Case T: cc 2.1.220 numbered dialog, chevron already on accept ==='
+setup_test
+trust_pane_numbered > "$PANES_DIR/trust-win"
+quiet_pane          > "$PANES_DIR/watcher"
+WINDOWS_LIST=$'trust-win\nwatcher'
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+actions_content=$(<"$ACTIONS")
+assert_contains "numbered dialog logs sent-Enter with steps=0" \
+    "$log_content" "window=trust-win case=T action=sent-Enter steps=0"
+assert_contains "numbered dialog receives Enter" "$actions_content" "send-keys win=trust-win args=Enter"
+assert_not_contains "numbered dialog receives NO arrow key" "$actions_content" "args=Down"
+send_count=$(grep -cE '^send-keys win=trust-win' <<<"$actions_content" || true)
+assert_eq "numbered dialog receives exactly one key" "$send_count" "1"
+assert_contains "case T stamps machine-input ledger" \
+    "$(cat "$WORK/machine-input.tsv" 2>/dev/null)" $'trust-win\t'
+teardown_test
+
+echo '=== Case T: cc 2.1.260 unnumbered dialog, chevron on "No, exit" ==='
+setup_test
+trust_pane_unnumbered > "$PANES_DIR/trust-win"
+quiet_pane            > "$PANES_DIR/watcher"
+WINDOWS_LIST=$'trust-win\nwatcher'
+enable_responsive_pane trust-win trust_pane_unnumbered_moved
+detect_and_unstick
+disable_responsive_pane
+log_content=$(<"$UNSTICK_LOG")
+actions_content=$(<"$ACTIONS")
+assert_contains "unnumbered dialog is recognised as case T" "$log_content" "window=trust-win case=T"
+assert_contains "unnumbered dialog moves the selection down one option" \
+    "$log_content" "action=moved-selection steps=1 key=Down"
+assert_contains "unnumbered dialog receives Down" "$actions_content" "send-keys win=trust-win args=Down"
+assert_contains "unnumbered dialog then receives Enter" "$actions_content" "send-keys win=trust-win args=Enter"
+# Order matters: Enter before Down would confirm `No, exit`.
+first_key=$(grep -E '^send-keys win=trust-win' <<<"$actions_content" | head -1 | sed 's/.*args=//')
+assert_eq "the FIRST key sent is Down, never Enter" "$first_key" "Down"
+teardown_test
+
+echo '=== Case T: unnumbered dialog whose selection does NOT move gets no Enter ==='
+setup_test
+trust_pane_unnumbered > "$PANES_DIR/trust-win"
+quiet_pane            > "$PANES_DIR/watcher"
+WINDOWS_LIST=$'trust-win\nwatcher'
+# No responsive pane: the re-read still shows the chevron on `No, exit`.
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+actions_content=$(<"$ACTIONS")
+assert_contains "unconfirmed move is logged" "$log_content" "action=abort-selection-unconfirmed"
+assert_not_contains "NO Enter is sent when the move is unconfirmed" \
+    "$actions_content" "send-keys win=trust-win args=Enter"
+teardown_test
+
+echo '=== Case T FP: a pane that only quotes the dialog is never touched ==='
+setup_test
+trust_prose_pane > "$PANES_DIR/prose-win"
+quiet_pane       > "$PANES_DIR/watcher"
+WINDOWS_LIST=$'prose-win\nwatcher'
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+actions_content=$(<"$ACTIONS")
+assert_not_contains "quoted dialog does not trigger case T" "$log_content" "case=T"
+assert_not_contains "quoted dialog receives no keys" "$actions_content" "send-keys win=prose-win"
+teardown_test
+
+echo '=== Case T: the two dialog shapes fingerprint differently ==='
+setup_test
+FP_NUM=$(trust_pane_numbered   | _unstick_fingerprint)
+FP_UNN=$(trust_pane_unnumbered | _unstick_fingerprint)
+FP_EMPTY=$(printf '' | _unstick_fingerprint)
+assert_not_contains "the unnumbered dialog does NOT hash the empty string" "$FP_UNN" "$FP_EMPTY"
+if [[ "$FP_NUM" != "$FP_UNN" ]]; then
+    printf '  PASS: the two shapes yield distinct fingerprints (%s vs %s)\n' "$FP_NUM" "$FP_UNN"
+    PASS=$((PASS+1))
+else
+    printf '  FAIL: both shapes fingerprint as %s\n' "$FP_NUM" >&2
+    FAIL=$((FAIL+1))
+fi
+teardown_test
+
 # ---- Summary -----------------------------------------------------------
 
 echo
