@@ -410,6 +410,35 @@ for the current release convention.
 
 ### Fixed
 
+- **The folder-trust dialog and the over-limit notice are read
+  correctly on cc 2.1.260, and still on cc 2.1.220 (issue 100).** Three
+  Claude Code releases — 2.1.258, 2.1.259 and 2.1.260 — were blocked by
+  the same three defects, all of them ours. cc 2.1.260 changed two
+  renderer shapes with no changelog entry of its own. (1) The trust
+  dialog lost its option numbering and moved the chevron from `Yes, I
+  trust this folder` to `No, exit`. `pane-state.sh::_has_trust_overlay`
+  required the numbered form, so a stranded worker fell through to
+  `empty` and `retire-preflight.sh` reported `safe=1` on a pane that was
+  in fact hung. The detector now accepts both shapes, and its twin in
+  `_unstick.sh` moves with it. (2) `_unstick.sh::_act_trust` answered
+  the dialog with a bare `Enter`, which on 2.1.260 confirms `No, exit`
+  and closes the pane — a worse outcome than the hang. Case T now reads
+  the option rows, moves the selection onto the accept option, re-reads
+  the pane to confirm the chevron landed there, and only then confirms.
+  On 2.1.220 the distance is zero, no arrow key is sent, and the
+  behaviour is unchanged. (3) 2.1.260 pins the input box to the BOTTOM
+  of the pane, so the blank gap above it is `pane_height` minus
+  `content_rows` and grows with the terminal. The over-limit scrape read
+  a fixed `tail -n 15`, which on a 40-row pane held neither the headline
+  nor its `resets` companion. It now reads the last 15 NON-BLANK rows
+  strictly above the input box, which is height-independent; the notice
+  regexes are untouched, because the notice text is intact on both
+  releases. `_extract_over_limit_reset` reads the same window, so a
+  detected notice no longer degrades to `reset_at=unknown`. New
+  regression coverage: three real-binary fixtures under
+  `monitor/watcher/fixtures/`, and 16 Case T assertions in
+  `test-unstick.sh`, a case the suite did not cover at all before.
+
 - **A re-wrap-up no longer re-opens a skeptic round that already
   closed.** `ng wrap-up`'s `require` branch was unconditional, so a
   worker whose skeptic pass had ALREADY returned a verdict (which clears

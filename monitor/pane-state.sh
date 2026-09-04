@@ -388,14 +388,37 @@ _has_blocked_overlay() {
 # A stranded worker awaiting a trust confirmation must classify
 # `blocked` so `_unstick.sh`'s Case T can answer it.
 #
-# Two greps AND-ed: the option literal (`Yes, I trust this folder`) is
-# the shape, the chevron is the live-ness — an agent quoting this
-# comment or a report describing the dialog carries the prose but not a
-# chevron-selected option row, so it does not false-trigger.
+# TWO DIALOG SHAPES, both measured against the real binary. cc 2.1.260
+# dropped the option numbering AND inverted the default selection:
+#
+#     2.1.220:  ❯ 1. Yes, I trust this folder
+#                 2. No, exit
+#
+#     2.1.260:  ❯ No, exit
+#                 Yes, I trust this folder
+#
+# The pre-2.1.260 detector required the numbered form (`❯ N. Yes, …`),
+# so on 2.1.260 it did not match, the pane fell through to `empty`, and
+# `retire-preflight.sh` reported `safe=1` on a worker that was in fact
+# hung. The chevron may now sit on EITHER option, so the numbering is
+# optional and the chevron-selected row may be either option literal.
+#
+# Three greps AND-ed. The two option literals (`Yes, I trust this
+# folder` AND `No, exit`) are the SHAPE — both are present in both
+# releases. The chevron sitting on one of those option rows is the
+# LIVE-NESS: an agent quoting this comment, or a report describing the
+# dialog, carries the prose but not a chevron-selected option row, so it
+# does not false-trigger.
+#
+# `monitor/watcher/_unstick.sh::_handle_unstick_window` carries the same
+# three-grep test for Case T. The two MUST stay in step: pane-state
+# saying `blocked` while `_unstick` recognises nothing is a worker with
+# no recovery path, which is the exact failure this pair fixes.
 _has_trust_overlay() {
     local plain="$1"
     grep -qF 'Yes, I trust this folder' <<<"$plain" \
-        && grep -qE $'❯[[:space:]]+[0-9]+\\.[[:space:]]*Yes, I trust this folder' <<<"$plain"
+        && grep -qF 'No, exit' <<<"$plain" \
+        && grep -qE $'❯[[:space:]]+([0-9]+\\.[[:space:]]*)?(Yes, I trust this folder|No, exit)' <<<"$plain"
 }
 
 # AskUserQuestion chip-bar overlay (Case D — dialog-guard). Claude
@@ -417,7 +440,75 @@ _has_askuq_overlay() {
         && grep -qF 'Chat about this' <<<"$plain"
 }
 
-# Anchor the over-limit notice on the bottom 15 rows of the pane. The
+# How many NON-BLANK rows above the input box the over-limit scrape
+# reads. See `_over_limit_window` for why the unit is non-blank rows and
+# not raw rows.
+OVER_LIMIT_SCAN_ROWS=15
+
+# The slice of the pane the over-limit scrape reads.
+#
+# ANCHOR: strictly above the input box, never at or below it. NOT "the
+# last non-blank row at or above the input row" — the input row carries
+# the `❯` chevron and is itself non-blank, so that anchor resolves to
+# the input row and skips no padding at all.
+#
+# UNIT: non-blank rows, not raw rows. cc 2.1.260 PINS the input box to
+# the BOTTOM of the pane; cc 2.1.220 floats it immediately after the
+# content. So on 2.1.260 the blank gap between the transcript and the
+# input box is `pane_height - content_rows`, and it grows one-for-one
+# with the terminal. Measured input-row positions, same trusted workdir,
+# two pane heights:
+#
+#     binary   | 120x40 pane | 120x60 pane
+#     2.1.260  | row 38      | row 58
+#     2.1.220  | row  7      | row  7
+#
+# A fixed RAW-row window therefore fails on a tall enough pane, at any
+# size chosen: the old `tail -n 15` already missed the notice on a
+# 40-row 2.1.260 pane, where the headline sat 31 rows from the bottom
+# behind 30 blank rows. A non-blank-row window is height-independent.
+#
+# The positional false-positive defence of the old window is kept in a
+# height-independent form. A transcript that quotes or paraphrases the
+# notice higher up the pane still falls outside the window, and text
+# typed into the input box is excluded outright because the window stops
+# above it.
+#
+# Three cases, and the last two must not be conflated:
+#
+#   NO `❯<NBSP>` row at all — the shape issue #87 described, where the
+#     notice replaces the input row. The window degrades to the last
+#     OVER_LIMIT_SCAN_ROWS non-blank rows of the whole pane rather than
+#     returning nothing.
+#   Input row BELOW row 1 — the ordinary case. The window is the rows
+#     above it.
+#   Input row IS row 1 — no row sits above it, so the window is EMPTY.
+#     Falling back to the whole pane here would re-admit the input row
+#     and classify text TYPED into the input box as a painted notice.
+#     The shape is not reachable on a real Claude Code pane (the box
+#     always carries chrome above it), but the guard must not depend on
+#     that: an unreachable branch that contradicts the paragraph above
+#     is a defect waiting for a renderer change to expose it.
+_over_limit_window() {
+    local plain="$1" input_ln body
+    # Last `❯<NBSP>` row = the Claude input box. Same anchor as
+    # `_find_input_row`; the NBSP distinguishes it from a numbered menu
+    # option row, which uses `❯ <digit>` with an ASCII space.
+    input_ln=$(grep -nF "❯${NBSP}" <<<"$plain" | tail -1 | cut -d: -f1)
+    if [[ -z "$input_ln" ]]; then
+        body="$plain"
+    elif (( input_ln > 1 )); then
+        body=$(head -n "$(( input_ln - 1 ))" <<<"$plain")
+    else
+        return 0
+    fi
+    printf '%s\n' "$body" \
+        | grep -v '^[[:space:]]*$' \
+        | tail -n "$OVER_LIMIT_SCAN_ROWS"
+}
+
+# Anchor the over-limit notice on the last OVER_LIMIT_SCAN_ROWS
+# non-blank rows above the input box. The
 # canonical text Claude Code renders is:
 #
 #     You've hit your limit · resets 3am (America/Los_Angeles)
@@ -436,19 +527,22 @@ _has_askuq_overlay() {
 # the pattern anchors on "ve" and skips the apostrophe entirely).
 #
 # Detection still requires BOTH the headline AND a "resets <time>"
-# companion within the bottom 15 rows. The position anchor is
+# companion inside `_over_limit_window`. The position anchor is
 # load-bearing: a transcript scrollback that paraphrases or quotes
 # the notice elsewhere in the pane would otherwise false-trigger
 # (issue #87 edge case). The companion-line requirement defends
 # against a half-rendered notice (e.g. only the headline visible
 # mid-redraw) and matches the canonical two-line shape. A quoted
-# verbatim notice inside the bottom 15 rows CAN still false-trigger
+# verbatim notice inside the window CAN still false-trigger
 # (positional defense only); the consequence is bounded by design —
 # the watcher's hold is capped by the parsed reset time (6h fallback)
 # and fails open with a paste, never latching (_over_limit.sh).
+#
+# The REGEXES below are unchanged from the fixed-`tail -n 15` version.
+# The notice text is intact on cc 2.1.260; only its position moved.
 _detect_over_limit() {
     local plain="$1" bottom
-    bottom=$(tail -n 15 <<<"$plain")
+    bottom=$(_over_limit_window "$plain")
     grep -qE "You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit" <<<"$bottom" || return 1
     grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$bottom" || return 1
     return 0
@@ -462,9 +556,16 @@ _detect_over_limit() {
 # Strips parens, collapses internal whitespace to `_`, caps at 40 chars.
 # Returns empty stdout (rc=1) when the suffix isn't on a recognised
 # shape — caller substitutes `unknown`.
+#
+# Reads the SAME window as `_detect_over_limit`. The two must not
+# diverge: a detector that fires on a window the extractor cannot read
+# emits `reset_at=unknown`, which drops the watcher's hold from the
+# parsed reset time to its blind 6h fallback. On cc 2.1.260 the fixed
+# `tail -n 15` window contained neither the headline nor the `resets`
+# companion, so both halves failed together.
 _extract_over_limit_reset() {
     local plain="$1" bottom raw
-    bottom=$(tail -n 15 <<<"$plain")
+    bottom=$(_over_limit_window "$plain")
     # Grab the suffix on the "resets " line, CUT at the next `·`
     # separator — the renderer appends live decoration after the reset
     # time ("… resets 3am (America/Los_Angeles) · Retrying in 8s"

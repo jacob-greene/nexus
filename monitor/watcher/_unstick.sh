@@ -260,12 +260,19 @@ unstick_log() {
 }
 
 # Stable fingerprint of the prompt instance: pulls out the lines that
-# define the prompt (title + numbered options + highlight arrow) and
-# hashes them. Spinner / cursor / status-line characters that change
-# every capture are excluded so the same prompt yields the same
-# fingerprint across poll cycles.
+# define the prompt (title + options + highlight arrow) and hashes
+# them. Spinner / cursor / status-line characters that change every
+# capture are excluded so the same prompt yields the same fingerprint
+# across poll cycles.
+#
+# The two folder-trust option literals are included because cc 2.1.260
+# renders that dialog WITHOUT numbering. Matching only the numbered
+# shapes made every 2.1.260 trust dialog hash the empty string, so the
+# per-(window, fingerprint) backoff could not tell two different
+# dialogs in one window apart. Adding the literals is additive: a pane
+# carrying none of them fingerprints exactly as before.
 _unstick_fingerprint() {
-    grep -E '(Do you want to proceed\?|What do you want to do\?|❯[[:space:]]+[0-9]+\.|^[[:space:]]*[0-9]+\.[[:space:]]|Stop and wait for limit)' \
+    grep -E '(Do you want to proceed\?|What do you want to do\?|❯[[:space:]]+[0-9]+\.|^[[:space:]]*[0-9]+\.[[:space:]]|Stop and wait for limit|Yes, I trust this folder|No, exit)' \
         | sha1sum | cut -c1-12
 }
 
@@ -366,8 +373,9 @@ _act_permission() {
 # 2.1.232 ended trust INHERITANCE for nested git repos ("each repository
 # now requires its own trust confirmation"). Every nexus worker spawns
 # into a nested repo (work/<project>/ under the nexus root repo), so from
-# 2.1.232 on such a spawn can stop PRE-REPL on the trust dialog, with
-# `❯ 1. Yes, I trust this folder` pre-selected. It is not bypassed by
+# 2.1.232 on such a spawn can stop PRE-REPL on the trust dialog. On
+# 2.1.232 through 2.1.259 `❯ 1. Yes, I trust this folder` is
+# pre-selected; from 2.1.260 `❯ No, exit` is. It is not bypassed by
 # `--dangerously-skip-permissions`, it matches none of Cases A/C/D/
 # ratelimit (it carries the `❯ N.` chevron but not `Do you want to
 # proceed?`), and pane-state used to classify it `empty` — so the worker
@@ -379,15 +387,57 @@ _act_permission() {
 # cannot pre-seed: an operator-made clone, an agent that `cd`s
 # elsewhere, a spawn whose config write lost a race, or a jq-less host.
 #
-# The action is the same shape as Case A: Enter accepts the
-# chevron-selected option, which is always option 1 ("Yes, I trust this
-# folder") on a freshly-rendered dialog. Answering it is the correct
-# call and not a judgement we are usurping: the nexus is confirming
-# trust for a directory it is itself spawning an agent into, which the
-# orchestrator already decided when it chose the workdir. Backoff is
-# per-(window, fingerprint) with the same 2-try ceiling, so a dialog
-# that somehow does not clear is logged and left alone rather than
-# hammered.
+# Answering the dialog is the correct call and not a judgement we are
+# usurping: the nexus is confirming trust for a directory it is itself
+# spawning an agent into, which the orchestrator already decided when it
+# chose the workdir. Backoff is per-(window, fingerprint) with the same
+# 2-try ceiling, so a dialog that somehow does not clear is logged and
+# left alone rather than hammered.
+#
+# THE ACTION IS NOT A BARE `Enter`. Enter confirms whichever option
+# carries the chevron, and cc 2.1.260 inverted the default:
+#
+#     2.1.220:  ❯ 1. Yes, I trust this folder      Enter accepts
+#                 2. No, exit
+#
+#     2.1.260:  ❯ No, exit                         Enter EXITS
+#                 Yes, I trust this folder
+#
+# A bare Enter on 2.1.260 selects `No, exit` and closes the pane — a
+# worse outcome than the hang it is meant to repair. So Case T now reads
+# the option rows, computes how far the chevron is from the accept
+# option, moves the selection with Up/Down, and RE-READS the pane to
+# confirm the chevron landed on `Yes, I trust this folder` before it
+# sends Enter. If the move cannot be confirmed, no Enter is sent.
+#
+# On 2.1.220 the chevron already sits on the accept option, so the
+# distance is 0, no arrow key is sent, and the behaviour is the bare
+# Enter this function has always performed.
+
+# Distance in option rows from the chevron-selected option to the accept
+# option (`Yes, I trust this folder`). Positive = the accept option is
+# BELOW the chevron, negative = above, 0 = already selected.
+#
+# Only rows whose WHOLE text is an option — an optional chevron, an
+# optional `N.` number, then the option literal and nothing else — are
+# counted. Prose that merely mentions a literal inside a sentence is
+# skipped, so a pane quoting the dialog yields no pair and no keystroke.
+#
+# rc=1 (no stdout) when the pane does not expose a resolvable pair: no
+# chevron on an option row, no accept row, or fewer than two options.
+_trust_nav_steps() {
+    local pane="$1" line sel=-1 acc=-1 n=0
+    local opt_re='^[[:space:]]*(❯[[:space:]]+)?([0-9]+\.[[:space:]]*)?(Yes, I trust this folder|No, exit)[[:space:]]*$'
+    while IFS= read -r line; do
+        grep -qE "$opt_re" <<<"$line" || continue
+        [[ "$line" == *"❯"* ]] && sel=$n
+        [[ "$line" == *"Yes, I trust this folder"* ]] && acc=$n
+        n=$(( n + 1 ))
+    done <<<"$pane"
+    (( sel >= 0 && acc >= 0 && n >= 2 )) || return 1
+    printf '%d' "$(( acc - sel ))"
+}
+
 _act_trust() {
     local window="$1" pane="$2"
     local case_key="trust"
@@ -408,13 +458,45 @@ _act_trust() {
     fi
     local audit="$UNSTICK_DIR/${window}.${case_key}.${fp}.audit"
     [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
+
+    local steps
+    if ! steps=$(_trust_nav_steps "$pane"); then
+        # The pane matched the Case T shape but exposes no
+        # chevron/accept pair. Never guess with an Enter.
+        unstick_log "window=$window case=T action=skip-unresolved-selection fp=$fp"
+        return 0
+    fi
+
+    # Move the selection onto the accept option, then VERIFY it landed.
+    if (( steps != 0 )); then
+        printf '%s' "$fp" > "$fp_file"
+        printf '%d' "$(( tries + 1 ))" > "$tries_file"
+        local key="Down" moves="$steps" i
+        if (( steps < 0 )); then key="Up"; moves=$(( -steps )); fi
+        for (( i = 0; i < moves; i++ )); do
+            if ! tmux send-keys -t "$window" "$key" 2>/dev/null; then
+                unstick_log "window=$window case=T action=send-keys-failed key=$key fp=$fp"
+                return 0
+            fi
+            sleep 0.2
+        done
+        _unstick_stamp_machine_input "$window" "unstick-trust"
+        local recap conf
+        recap=$(tmux capture-pane -t "$window" -p -S -25 2>/dev/null) || recap=""
+        if ! conf=$(_trust_nav_steps "$recap") || [[ "$conf" != "0" ]]; then
+            unstick_log "window=$window case=T action=abort-selection-unconfirmed steps=$steps key=$key conf=${conf:-none} fp=$fp"
+            return 0
+        fi
+        unstick_log "window=$window case=T action=moved-selection steps=$steps key=$key fp=$fp"
+    fi
+
     if tmux send-keys -t "$window" Enter 2>/dev/null; then
         printf '%s' "$fp" > "$fp_file"
         printf '%d' "$(( tries + 1 ))" > "$tries_file"
         _unstick_stamp_machine_input "$window" "unstick-trust"
         local action_label="sent-Enter"
         (( tries >= 1 )) && action_label="sent-Enter-retry"
-        unstick_log "window=$window case=T action=$action_label fp=$fp audit=$(basename "$audit")"
+        unstick_log "window=$window case=T action=$action_label steps=$steps fp=$fp audit=$(basename "$audit")"
     else
         unstick_log "window=$window case=T action=send-keys-failed fp=$fp"
     fi
@@ -769,11 +851,21 @@ _handle_unstick_window() {
     # Case T (folder-trust, cc 2.1.232). Disjoint from every case above
     # — it carries none of their question text — so its position here is
     # incidental; it sits last because it is the rarest (the spawn-time
-    # pre-seed should mean it never fires). Shape = the option literal,
-    # live-ness = that literal being the chevron-selected row, so a pane
-    # merely quoting the dialog (a report, this comment) never matches.
+    # pre-seed should mean it never fires). Shape = the two option
+    # literals, live-ness = one of them being the chevron-selected row,
+    # so a pane merely quoting the dialog (a report, this comment) never
+    # matches.
+    #
+    # The numbering is OPTIONAL and the chevron may sit on EITHER
+    # option: cc 2.1.260 renders `❯ No, exit` above an unnumbered
+    # `Yes, I trust this folder`, cc 2.1.220 renders `❯ 1. Yes, I trust
+    # this folder` above `2. No, exit`. This test is the twin of
+    # `monitor/pane-state.sh::_has_trust_overlay` and MUST stay in step
+    # with it — pane-state saying `blocked` while this returns nothing
+    # leaves the worker with no recovery path.
     if grep -qF 'Yes, I trust this folder' <<<"$pane" \
-       && grep -qE '❯[[:space:]]+[0-9]+\.[[:space:]]*Yes, I trust this folder' <<<"$pane"; then
+       && grep -qF 'No, exit' <<<"$pane" \
+       && grep -qE '❯[[:space:]]+([0-9]+\.[[:space:]]*)?(Yes, I trust this folder|No, exit)' <<<"$pane"; then
         _act_trust "$window" "$pane"
         printf 'trust'
         return 0
