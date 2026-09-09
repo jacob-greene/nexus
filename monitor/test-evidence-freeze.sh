@@ -16,11 +16,11 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body). Seventeen
+# it was trusted (see the mutation table in the PR body). Twenty-one
 # mutations are on record and every one turns at least one case RED.
 #
 # A SUITE WITH NO SURVIVING MUTANT IS A CLAIM, NOT A FACT, and on this
-# file the claim has failed twice. Read that before adding a case.
+# file the claim has failed three times. Read that before adding a case.
 #
 #   Round 1. The first version claimed no survivors. A skeptic found
 #   three: the evidence directory's mode, the failed-copy path, and the
@@ -31,12 +31,25 @@
 #   binary name form `<hash> *name`, the dotfile case, and the
 #   "no name is exempt" rule. Cases 17 and 18 exist because of that.
 #
-# The pattern in both rounds is the same. Each author wrote the
+#   Round 3. Case 19 was added for path-qualified manifest rows, and
+#   its basename fallback then MASKED an existing mutation: deleting the
+#   `./` normalisation from `_manifest_records` no longer turned case 10
+#   RED, because the fallback quietly covered for it. A new assertion
+#   can subtract coverage. Cases 11b and 11c pin the two paths apart.
+#
+# The pattern in the first two rounds is the same. Each author wrote the
 # mutations that matched what they had just been thinking about, then
 # read a green suite as coverage. The four in round 2 all sat on
 # behaviour the script header states as a PROMISE, and none of the
-# promises had an assertion behind them. If you add a promise to the
-# header, add the case that fails when it stops being true.
+# promises had an assertion behind them.
+#
+# Two rules follow, and round 3 is why the second one is here:
+#
+#   1. If you add a promise to the script header, add the case that
+#      fails when it stops being true.
+#   2. If you add a fallback, re-run the WHOLE mutation set, not just
+#      the mutations for the code you added. A fallback that makes a
+#      failing path succeed also makes a deleted check invisible.
 #
 # Hermetic: everything happens under a fresh mktemp -d. No tmux, no
 # network, no state outside the temp dir.
@@ -356,8 +369,23 @@ W="$TMP/w11b"; mkdir -p "$W/ev"
 printf 'BASELINE\n' > "$W/ev/nb.txt"
 ( cd "$W/ev" && md5sum ./*.txt > MANIFEST.md5 )
 chmod 0440 "$W/ev/nb.txt" "$W/ev/MANIFEST.md5"
-"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
 assert_eq "a ./-prefixed manifest name counts as recorded" "$rc" "0"
+
+# `./name` is a BARE name, so `_manifest_records` must read it directly.
+# Without these two, the basename fallback added for path-qualified rows
+# silently covers for it and the `./` normalisation can be deleted with
+# the suite still green. Both assertions distinguish the two paths.
+assert_not_contains "a ./ name is read as bare, not as path-qualified" \
+    "$out" "path-qualified"
+
+W="$TMP/w11c"; mkdir -p "$W/code" "$W/ev"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+cp "$W/code/nb.txt" "$W/ev/nb.txt"
+( cd "$W/ev" && md5sum ./*.txt > MANIFEST.md5 )
+rm -f "$W/ev/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.txt >/dev/null 2>&1; rc=$?
+assert_eq "a ./-recorded name still blocks a re-freeze with exit 4" "$rc" "4"
 
 # ---------------------------------------------------------------------------
 echo "=== 12. the evidence directory is created mode 0770, whatever the umask"
@@ -573,6 +601,75 @@ rm -f "$W/ev/.hidden.txt"
 
 "$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
 assert_eq "the dir is clean again once both are gone" "$rc" "0"
+
+# ---------------------------------------------------------------------------
+echo "=== 19. a path-qualified manifest row still accounts for the file"
+# ---------------------------------------------------------------------------
+# Real manifests here predate this script and record
+# `monitor/.state/evidence/<task>/<name>`, not a bare name. Exit 6 once
+# called those files unrecorded: on the live store its only three
+# findings were all files the manifest DID name, and the remedy it
+# printed — freeze the file — is refused with exit 3.
+#
+# The rule is basename AND hash, never either alone.
+W="$TMP/w19"; mkdir -p "$W/ev"
+printf 'a note\n' > "$W/ev/EVIDENCE.md"
+( cd "$W" && md5sum ev/EVIDENCE.md > ev/MANIFEST.md5 )
+assert_contains "the fixture really is path-qualified" \
+    "$(cat "$W/ev/MANIFEST.md5")" " ev/EVIDENCE.md"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_not_contains "a path-qualified row is not called unrecorded" \
+    "$out" "UNRECORDED file: EVIDENCE.md"
+assert_contains "the name form is reported as a note" \
+    "$out" "NOTE: EVIDENCE.md is recorded under a path-qualified name"
+if (( rc == 6 )); then
+    assert_eq "a path-qualified row does not trip exit 6" "6" "not 6"
+else
+    assert_eq "a path-qualified row does not trip exit 6" "not 6" "not 6"
+fi
+
+# The remedy the header prints must be reachable for the case it names.
+# Freezing a file that is already there is refused with exit 3, which is
+# why the note must NOT tell the reader to freeze it.
+"$FREEZE_BIN" "$W/ev/EVIDENCE.md" --dir "$W/ev" --as EVIDENCE.md >/dev/null 2>&1; rc=$?
+assert_eq "freezing an already-present file is refused" "$rc" "3"
+assert_not_contains "the note does not prescribe the refused remedy" \
+    "$out" "freeze them, or they are not evidence"
+
+# Basename matches, hash does not: the bytes changed under a recorded
+# name. That is exit 5, and md5sum -c cannot reach it, because the
+# path-qualified row does not resolve from inside the directory.
+W="$TMP/w19b"; mkdir -p "$W/ev"
+printf 'original\n' > "$W/ev/EVIDENCE.md"
+( cd "$W" && md5sum ev/EVIDENCE.md > ev/MANIFEST.md5 )
+printf 'SUBSTITUTED\n' > "$W/ev/EVIDENCE.md"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a path-qualified row with changed bytes exits 5" "$rc" "5"
+assert_contains "the content mismatch is named" \
+    "$out" "CONTENT MISMATCH: EVIDENCE.md"
+assert_not_contains "changed bytes are not reported as unrecorded" \
+    "$out" "UNRECORDED file: EVIDENCE.md"
+
+# A genuinely unrecorded file alongside a path-qualified one must still
+# trip exit 6. The looser read must not swallow the real case.
+W="$TMP/w19c"; mkdir -p "$W/ev"
+printf 'a note\n' > "$W/ev/EVIDENCE.md"
+( cd "$W" && md5sum ev/EVIDENCE.md > ev/MANIFEST.md5 )
+printf 'nobody recorded me\n' > "$W/ev/rogue.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_contains "a truly unrecorded file is still named" \
+    "$out" "UNRECORDED file: rogue.txt"
+assert_not_contains "the path-qualified file is still not named" \
+    "$out" "UNRECORDED file: EVIDENCE.md"
+
+# A basename match must be a real match, not a substring or a suffix.
+W="$TMP/w19d"; mkdir -p "$W/ev"
+printf 'a note\n' > "$W/ev/EVIDENCE.md"
+printf 'x  sub/dir/NOT-EVIDENCE.md\n' > "$W/ev/MANIFEST.md5"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_contains "a different basename does not account for the file" \
+    "$out" "UNRECORDED file: EVIDENCE.md"
 
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"

@@ -93,11 +93,46 @@
 # recorded even in principle. The rule is deliberately name-blind. A
 # README exemption would be a hole any file could enter through, and
 # an unrecorded note is exactly the thing a reader should be told
-# about. Evidence directories do legitimately carry notes — the
-# incident night's own additive note is one — so expect exit 6 on a
-# directory that was never fully frozen. The remedy is to freeze the
-# file, which records it. Exit 5 wins if both fire, because a broken
-# invariant is the graver finding.
+# about. Exit 5 wins if both fire, because a broken invariant is the
+# graver finding.
+#
+# "RECORDED" IS NOT THE SAME AS "RECORDED UNDER A BARE NAME", and the
+# difference is not hypothetical. Manifests in this repo were written by
+# hand before this script existed, and they use five name forms:
+#
+#     nb.txt                                      bare
+#     ./nb.txt                                    from `md5sum ./*.txt`
+#     *nb.txt                                     from `md5sum -b`
+#     monitor/.state/evidence/<task>/nb.txt       repo-root-relative
+#     ./harness/nb.txt                            sub-directory path
+#
+# The first three are the same bare name and are read as such. The last
+# two name this very file by a longer path. A row like that ACCOUNTS FOR
+# the bytes, so `--verify` must not call the file unrecorded. It once
+# did: on the live store its only three findings were all files recorded
+# by a repo-root-relative path, and the remedy printed with them — freeze
+# the file — is refused with exit 3, because the file is already there.
+# A message that is false and a remedy the tool itself rejects.
+#
+# So `--verify` now asks a second question before it calls anything
+# unrecorded. If a manifest row's BASENAME matches the file AND the
+# recorded hash matches the bytes on disk, the file is accounted for:
+# a NOTE is printed and exit 6 does not fire. Both conditions, never
+# either. If the basename matches and the hash does NOT, the bytes
+# changed under a recorded name — that is exit 5, and it is a case
+# `md5sum -c` cannot reach, because a path-qualified row does not
+# resolve from inside the directory. That same non-resolution is why
+# such a directory also reports a checksum mismatch.
+#
+# WHAT THIS DELIBERATELY DOES NOT DECIDE. `_manifest_records`, which
+# guards the FREEZE side, is unchanged: it still keys on the three bare
+# forms only. So a path-qualified row does not block a name from being
+# frozen. Whether it should is a genuine design question with a
+# defensible answer either way, and it is the operator's to settle.
+#
+# The remedy for a genuinely unrecorded file is to freeze it, which
+# records it. That remedy is correct only for the case above, where no
+# manifest row names the file at all.
 #
 # MODE CHECKS. A `chmod` can fail. This script therefore reads the mode
 # back with `stat` after setting it, and exits 7 rather than printing
@@ -132,13 +167,18 @@ MANIFEST_NAME="MANIFEST.md5"
 # and --verify ask this, so it is defined once, before either runs.
 #
 # Match the name field EXACTLY — a substring test would refuse
-# `nb.ipynb.bak` because `nb.ipynb` is already recorded. Three name
+# `nb.ipynb.bak` because `nb.ipynb` is already recorded. Three BARE name
 # forms reach us, and all three mean the same file in this directory:
 #   `<hash>  nb.txt`    GNU md5sum, text mode
 #   `<hash> *nb.txt`    GNU md5sum, binary mode
 #   `<hash>  ./nb.txt`  a manifest built by `md5sum ./*.txt`
-# The third form is what a hand-rolled regeneration writes, so a
-# manifest this script did not write is still read correctly.
+#
+# Those three are all this function reads. It does NOT read the two
+# PATH-QUALIFIED forms the live store also holds. An earlier version of
+# this comment said "a manifest this script did not write is still read
+# correctly"; two live manifests falsify that, and the claim is
+# withdrawn. Only `--verify` handles the longer forms, through
+# `_manifest_hash_for_basename` below — see the header.
 _manifest_records() {
     local m="$1" n="$2"
     [[ -f "$m" ]] || return 1
@@ -154,6 +194,26 @@ _manifest_records() {
 # must never print a property it did not check.
 _mode_is() {
     [[ "$(stat -c '%a' -- "$1" 2>/dev/null)" == "$2" ]]
+}
+
+# Print the recorded hash of the first manifest row whose name, reduced
+# to a bare basename, equals $2. Empty when no row matches.
+#
+# This is DELIBERATELY looser than `_manifest_records`, and only
+# `--verify` uses it. Real manifests in this repo record
+# `monitor/.state/evidence/<task>/<name>` and `./harness/<name>`, not
+# just bare names. Such a row names this very file, so treating the file
+# as unrecorded is a false statement about the directory. See "EXIT 6"
+# in the header for the exact rule and what it does NOT decide.
+_manifest_hash_for_basename() {
+    local m="$1" n="$2"
+    [[ -f "$m" ]] || return 1
+    awk -v want="$n" '{ hash = $0; sub(/[ ].*$/, "", hash)
+                        line = $0
+                        sub(/^[^ ]+[ ]+/, "", line)
+                        sub(/^\*/, "", line)
+                        sub(/^.*\//, "", line)
+                        if (line == want) { print hash; exit } }' "$m"
 }
 
 src=""
@@ -224,10 +284,31 @@ if [[ "$mode" == verify ]]; then
     while IFS= read -r path; do
         base="${path##*/}"
         [[ "$base" == "$MANIFEST_NAME" ]] && continue
-        if ! _manifest_records "$manifest" "$base"; then
-            echo "evidence-freeze: UNRECORDED file: $base ($MANIFEST_NAME does not list it)" >&2
-            unrecorded=$(( unrecorded + 1 ))
+        _manifest_records "$manifest" "$base" && continue
+
+        # Not recorded under a bare name. Before calling it unrecorded,
+        # ask whether the manifest names this exact file some other way.
+        # A path-qualified row does, and md5sum -c cannot check it from
+        # inside this directory, which is why such a directory ALSO
+        # reports a checksum mismatch.
+        rec_hash=$(_manifest_hash_for_basename "$manifest" "$base")
+        if [[ -n "$rec_hash" ]]; then
+            live_hash=$(md5sum < "$dir/$base" 2>/dev/null | cut -d' ' -f1)
+            if [[ "$rec_hash" == "$live_hash" ]]; then
+                echo "evidence-freeze: NOTE: $base is recorded under a path-qualified name, not a bare name" >&2
+                echo "  the hash matches, so these bytes ARE accounted for" >&2
+                echo "  md5sum -c cannot check that row from inside this directory" >&2
+            else
+                echo "evidence-freeze: CONTENT MISMATCH: $base is recorded under a path-qualified name" >&2
+                echo "  recorded: ${rec_hash}" >&2
+                echo "  on disk:  ${live_hash:-unreadable}" >&2
+                rc=5
+            fi
+            continue
         fi
+
+        echo "evidence-freeze: UNRECORDED file: $base ($MANIFEST_NAME does not list it)" >&2
+        unrecorded=$(( unrecorded + 1 ))
     done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null)
     if (( unrecorded > 0 )); then
         echo "evidence-freeze: $unrecorded unrecorded file(s) in $dir — freeze them, or they are not evidence" >&2
