@@ -5199,6 +5199,7 @@ State queries & infra:
   user-pat                       print the user PAT for private reads
   write-probe <path>             pre-flight a deliverable path is writable
   evidence-freeze <src> --task <slug>   write-once freeze into durable evidence
+  evidence-freeze --verify --task <slug>   check one evidence dir, write nothing
   declare-wait <kind> <id> <desc>   self-declare an async external wait
   declare-no-wait <kind> <id>    mark an async launch fire-and-forget
 

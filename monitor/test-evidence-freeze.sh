@@ -16,16 +16,31 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body): dropping the
-# `chmod 0440`, dropping the clobber refusal, and swapping `>>` for `>`
-# each turn at least one case RED.
+# it was trusted (see the mutation table in the PR body). Thirteen
+# mutations are on record and every one turns at least one case RED:
+# dropping the `chmod 0440`, dropping the clobber refusal, swapping
+# `>>` for `>`, widening the evidence directory to 0777, dropping the
+# rollback after a failed copy, dropping either mode read-back, and
+# dropping the `./` normalisation in `_manifest_records`.
+#
+# A suite with no surviving mutant is a claim, not a fact. The first
+# version of this file claimed it and a skeptic found three survivors:
+# the evidence directory's mode, the failed-copy path, and the
+# append-failure path. Cases 12, 13 and 14 exist because of that.
 #
 # Hermetic: everything happens under a fresh mktemp -d. No tmux, no
 # network, no state outside the temp dir.
 #
 # Root note: three cases assert that the KERNEL refuses a write to a
 # mode-0440 file. Root bypasses that check, so those cases self-skip
-# under EUID 0 rather than reporting a false PASS.
+# under EUID 0 rather than reporting a false PASS. Cases 15 and 16 skip
+# under root for the same reason.
+#
+# Two cases need a write to fail. `ulimit -f 0` lets a file be created
+# and then fails the first byte written, which is how cases 13 and 14
+# reach the failure paths. RLIMIT_FSIZE is not enforced on every
+# filesystem, so those cases self-skip rather than pass when the limit
+# does not bite.
 
 set -uo pipefail
 
@@ -52,6 +67,16 @@ assert_contains() {
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — %q not found in %q\n' "$label" "$needle" "$haystack" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+assert_not_contains() {
+    local label="$1" haystack="$2" needle="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — %q was present in %q\n' "$label" "$needle" "$haystack" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 }
@@ -280,6 +305,197 @@ chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
 assert_eq "verify still reports clean after remove-and-recreate" "$rc" "0"
 assert_eq "the substituted bytes are what is stored" \
     "$(md5of "$W/ev/nb.PRE.txt")" "$REPL_MD5"
+
+# ---------------------------------------------------------------------------
+echo "=== 11. --verify refuses a file the manifest does not record"
+# ---------------------------------------------------------------------------
+# `md5sum -c` walks the manifest, so it is blind in the other direction:
+# bytes present under an unrecorded name passed every check. Top-level
+# regular files only, and no name is exempt.
+W="$TMP/w11"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+
+printf 'NOBODY RECORDED ME\n' > "$W/ev/rogue.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "verify with an unrecorded file exits 6" "$rc" "6"
+assert_contains "verify names the unrecorded file" "$out" "UNRECORDED file: rogue.txt"
+assert_contains "verify does not call the dir clean" "$out" "unrecorded file(s)"
+
+# Freezing it records it, and the directory is clean again.
+"$FREEZE_BIN" "$W/ev/rogue.txt" --dir "$W/ev" --as rogue.FROZEN.txt >/dev/null 2>&1
+rm -f "$W/ev/rogue.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "verify is clean once every file is recorded" "$rc" "0"
+
+# A sub-directory is NOT walked: a bare name in a manifest cannot
+# address one, so it could not be recorded even in principle.
+mkdir -p "$W/ev/notes" && printf 'a note\n' > "$W/ev/notes/README.md"
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "a file inside a sub-directory does not trip exit 6" "$rc" "0"
+
+# Exit 5 wins over exit 6: a broken invariant is the graver finding.
+chmod u+w "$W/ev/MANIFEST.md5"
+printf 'ROGUE AGAIN\n' > "$W/ev/rogue2.txt"
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "a broken invariant outranks an unrecorded file" "$rc" "5"
+
+# A manifest written by hand as `md5sum ./*.txt` records `./nb.txt`.
+# That is the same file, so it must not read as unrecorded.
+W="$TMP/w11b"; mkdir -p "$W/ev"
+printf 'BASELINE\n' > "$W/ev/nb.txt"
+( cd "$W/ev" && md5sum ./*.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.txt" "$W/ev/MANIFEST.md5"
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "a ./-prefixed manifest name counts as recorded" "$rc" "0"
+
+# ---------------------------------------------------------------------------
+echo "=== 12. the evidence directory is created mode 0770, whatever the umask"
+# ---------------------------------------------------------------------------
+# The bypass in case 10 walks through the DIRECTORY's mode, and nothing
+# asserted it. `mkdir -m` also makes the mode independent of the
+# caller's umask, so this is a fact about the script, not the caller.
+W="$TMP/w12"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+( umask 000; "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1 )
+assert_eq "a created evidence dir is mode 0770 under umask 000" \
+    "$(stat -c '%a' "$W/ev")" "770"
+
+W="$TMP/w12b"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+( umask 022; "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1 )
+assert_eq "a created evidence dir is mode 0770 under umask 022" \
+    "$(stat -c '%a' "$W/ev")" "770"
+
+# An EXISTING directory keeps its own mode: `mkdir -m` applies only to
+# directories it creates. Freezing must not re-permission a live dir.
+W="$TMP/w12c"; mkdir -p "$W/code"; mkdir -m 0700 "$W/ev"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+assert_eq "an existing evidence dir keeps its mode" "$(stat -c '%a' "$W/ev")" "700"
+
+# ---------------------------------------------------------------------------
+echo "=== 13. a failed copy leaves nothing behind"
+# ---------------------------------------------------------------------------
+# `ulimit -f 0` lets cp CREATE the target and then fail on the first
+# byte written. Without the rollback, that empty file survives,
+# unrecorded, and then blocks its own name with exit 3 forever.
+W="$TMP/w13"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+out=$( ( ulimit -f 0; "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt ) 2>&1 ); rc=$?
+if (( rc == 2 )); then
+    assert_eq "a failed copy exits 2" "$rc" "2"
+    assert_contains "the failure names the copy" "$out" "copy failed"
+    if [[ -e "$W/ev/nb.PRE.txt" ]]; then
+        assert_eq "a failed copy leaves no partial target" "left behind" "removed"
+    else
+        assert_eq "a failed copy leaves no partial target" "removed" "removed"
+    fi
+    # The name is free afterwards, because nothing was written.
+    "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1; rc=$?
+    assert_eq "the name is still freezable after a failed copy" "$rc" "0"
+else
+    # RLIMIT_FSIZE is not enforced everywhere. Skip rather than pass.
+    skip "a failed copy leaves no partial target (RLIMIT_FSIZE not enforced here)"
+    skip "the name is still freezable after a failed copy (same)"
+    skip "a failed copy exits 2 (same)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 14. a failed manifest append leaves the manifest read-only"
+# ---------------------------------------------------------------------------
+# An EMPTY source copies fine under `ulimit -f 0` — cp writes no bytes —
+# so the first write to fail is the manifest append. That path must
+# still restore mode 0440, or the manifest stays writable for good.
+W="$TMP/w14"; mkdir -p "$W/code"
+: > "$W/code/empty.txt"
+out=$( ( ulimit -f 0; "$FREEZE_BIN" "$W/code/empty.txt" --dir "$W/ev" --as nb.PRE.txt ) 2>&1 ); rc=$?
+if (( rc == 4 )); then
+    assert_eq "a failed append exits 4" "$rc" "4"
+    assert_contains "the failure says the freeze is NOT recorded" "$out" "NOT recorded"
+    assert_eq "the manifest is left mode 0440 after a failed append" \
+        "$(stat -c '%a' "$W/ev/MANIFEST.md5")" "440"
+    assert_eq "the frozen copy is still mode 0440" \
+        "$(stat -c '%a' "$W/ev/nb.PRE.txt")" "440"
+else
+    skip "a failed append exits 4 (RLIMIT_FSIZE not enforced here)"
+    skip "the manifest is left mode 0440 after a failed append (same)"
+    skip "the frozen copy is still mode 0440 (same)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 15. a chmod that fails silently is caught, not printed over"
+# ---------------------------------------------------------------------------
+# The script used to run `chmod 0440 … || true` and then print
+# `mode 0440 (read-only)` unconditionally. On a filesystem that ignores
+# chmod, that is a success message standing in for an unrun check — the
+# exact shape of the incident the guard exists to prevent.
+#
+# A PATH-front `chmod` stub that exits 0 and changes nothing simulates
+# that filesystem. It is the only portable way to reach the branch;
+# every real filesystem here honours chmod.
+W="$TMP/w15"; mkdir -p "$W/code" "$W/stub"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+printf '#!/bin/sh\nexit 0\n' > "$W/stub/chmod"
+chmod +x "$W/stub/chmod"
+
+if (( EUID == 0 )); then
+    skip "a silently-failing chmod exits 7 (root: mode 0440 is not enforced anyway)"
+    skip "a silently-failing chmod removes the copy (root)"
+    skip "a silently-failing chmod records nothing (root)"
+else
+    out=$( PATH="$W/stub:$PATH" "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1 ); rc=$?
+    assert_eq "a silently-failing chmod exits 7" "$rc" "7"
+    assert_contains "the failure names the mode it could not set" "$out" "FAILED to set mode 0440"
+    if [[ -e "$W/ev/nb.PRE.txt" ]]; then
+        assert_eq "a silently-failing chmod removes the copy" "left behind" "removed"
+    else
+        assert_eq "a silently-failing chmod removes the copy" "removed" "removed"
+    fi
+    if [[ -e "$W/ev/MANIFEST.md5" ]]; then
+        assert_eq "a silently-failing chmod records nothing" "recorded" "not recorded"
+    else
+        assert_eq "a silently-failing chmod records nothing" "not recorded" "not recorded"
+    fi
+    assert_not_contains "output never claims the mode it did not set" \
+        "$out" "mode   0440 (read-only)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 16. an unprotected manifest is reported, and the freeze is kept"
+# ---------------------------------------------------------------------------
+# The manifest chmod runs AFTER the append, so the freeze is already
+# recorded. Undoing it would be wrong. The script must keep it, say
+# plainly that the manifest is unprotected, and still exit non-zero.
+#
+# The stub passes every chmod through EXCEPT the one on the manifest,
+# so the frozen copy really is 0440 and only the manifest branch fires.
+W="$TMP/w16"; mkdir -p "$W/code" "$W/stub"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+real_chmod=$(command -v chmod)
+{
+    printf '#!/bin/sh\n'
+    printf 'for a in "$@"; do case "$a" in *MANIFEST.md5) exit 0 ;; esac; done\n'
+    printf 'exec %s "$@"\n' "$real_chmod"
+} > "$W/stub/chmod"
+"$real_chmod" +x "$W/stub/chmod"
+
+if (( EUID == 0 )); then
+    skip "an unprotected manifest exits 7 (root: mode 0440 is not enforced anyway)"
+    skip "an unprotected manifest is named (root)"
+    skip "the freeze is kept when only the manifest chmod fails (root)"
+    skip "the manifest still records the freeze (root)"
+else
+    out=$( PATH="$W/stub:$PATH" "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1 ); rc=$?
+    assert_eq "an unprotected manifest exits 7" "$rc" "7"
+    assert_contains "the failure names the manifest" "$out" "FAILED to set mode 0440"
+    assert_eq "the freeze is kept when only the manifest chmod fails" \
+        "$(md5of "$W/ev/nb.PRE.txt")" "$BASE_MD5"
+    assert_eq "the manifest still records the freeze" "$(wc -l < "$W/ev/MANIFEST.md5")" "1"
+    assert_not_contains "output never claims the manifest is append-only" \
+        "$out" "is append-only"
+fi
 
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"

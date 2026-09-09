@@ -35,10 +35,32 @@
 # closes the accidental path — the two incident commands now fail with
 # EACCES — not a deliberate remove-and-recreate. `test-evidence-freeze.sh`
 # case 10 pins that limit so nobody reads the suite as proof of
-# impossibility. Closing it means holding the evidence DIRECTORY
-# read-only between freezes, which also blocks every other write into
-# the directory (sub-directories, READMEs). That is a policy decision
-# for the operator, not a silent addition here.
+# impossibility.
+#
+# Two different options close that gap. The operator picks one; this
+# script implements neither, because the choice is a policy decision.
+#
+#   A. HOLD THE DIRECTORY READ-ONLY between freezes. Removing a file
+#      needs write permission on the DIRECTORY, never on the file, so
+#      this is the only local file mode that stops the unlink. It also
+#      blocks every other write into the directory (sub-directories,
+#      README notes), and the owning uid can chmod the directory back.
+#      Under one uid it adds a command; it is not a boundary.
+#   B. RECORD EACH FREEZE OUT OF BAND, and make `--verify` cross-check
+#      the directory manifest against that record. Directory
+#      permissions do not change at all. Two candidate records:
+#      `monitor/.state/action-log.jsonl` (or a dedicated
+#      `freeze-log.jsonl`), which already carries an
+#      `artefact-collision` event with `live-md5` and `reviewed-md5`
+#      fields; or a bot comment on the issue, which this uid cannot
+#      rewrite and whose edits carry a visible history. Tampering then
+#      needs a consistent edit in two places.
+#
+# Neither option is free. A is intrusive and defeated by one `chmod`.
+# B is the only genuinely out-of-band form available here, and it costs
+# a schema plus a cross-check. What this script DOES deliver today is
+# the cheap partial: `--verify` refuses a directory that holds a
+# regular file the manifest does not record (exit 6, below).
 #
 # Usage:
 #   evidence-freeze.sh <source> --task <slug> [--as <name>]
@@ -60,6 +82,28 @@
 #   3  target already exists — REFUSED (nothing was written)
 #   4  MANIFEST.md5 already records that name, or cannot be appended to
 #   5  --verify found a mismatch, a missing file, or a broken invariant
+#   6  --verify found a regular file the manifest does not record
+#   7  a mode this script promises could not be set (see MODE CHECKS)
+#
+# EXIT 6, AND WHAT IT DOES AND DOES NOT LOOK AT. `--verify` checks
+# REGULAR FILES AT THE TOP LEVEL of the evidence directory only. It
+# does not descend into sub-directories, and it exempts no name. That
+# scope is the manifest's own scope: `md5sum <name>` records a bare
+# name in one directory, so a name in a sub-directory could not be
+# recorded even in principle. The rule is deliberately name-blind. A
+# README exemption would be a hole any file could enter through, and
+# an unrecorded note is exactly the thing a reader should be told
+# about. Evidence directories do legitimately carry notes — the
+# incident night's own additive note is one — so expect exit 6 on a
+# directory that was never fully frozen. The remedy is to freeze the
+# file, which records it. Exit 5 wins if both fire, because a broken
+# invariant is the graver finding.
+#
+# MODE CHECKS. A `chmod` can fail. This script therefore reads the mode
+# back with `stat` after setting it, and exits 7 rather than printing
+# `mode 0440` over an unverified property. That failure is the exact
+# shape of the incident this guard exists to prevent: a success message
+# standing in for a check nobody ran.
 #
 # Env seams (tests): NEXUS_STATE_DIR / NEXUS_ROOT resolve the state dir,
 # exactly as pane-state.sh and retire-preflight.sh resolve it.
@@ -67,7 +111,7 @@
 set -uo pipefail
 
 usage() {
-    sed -n '/^# Usage:/,/^#   5 /p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '/^# Usage:/,/^#   7 /p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 2
 }
 
@@ -83,6 +127,34 @@ else
 fi
 
 MANIFEST_NAME="MANIFEST.md5"
+
+# Does the manifest already record this bare name? Both the freeze path
+# and --verify ask this, so it is defined once, before either runs.
+#
+# Match the name field EXACTLY — a substring test would refuse
+# `nb.ipynb.bak` because `nb.ipynb` is already recorded. Three name
+# forms reach us, and all three mean the same file in this directory:
+#   `<hash>  nb.txt`    GNU md5sum, text mode
+#   `<hash> *nb.txt`    GNU md5sum, binary mode
+#   `<hash>  ./nb.txt`  a manifest built by `md5sum ./*.txt`
+# The third form is what a hand-rolled regeneration writes, so a
+# manifest this script did not write is still read correctly.
+_manifest_records() {
+    local m="$1" n="$2"
+    [[ -f "$m" ]] || return 1
+    awk -v want="$n" '{ line = $0
+                        sub(/^[^ ]+[ ]+/, "", line)
+                        sub(/^\*/, "", line)
+                        sub(/^\.\//, "", line)
+                        if (line == want) found = 1 }
+                      END { exit found ? 0 : 1 }' "$m"
+}
+
+# Read a mode back after setting it. A chmod can fail, and this script
+# must never print a property it did not check.
+_mode_is() {
+    [[ "$(stat -c '%a' -- "$1" 2>/dev/null)" == "$2" ]]
+}
 
 src=""
 task=""
@@ -143,6 +215,26 @@ if [[ "$mode" == verify ]]; then
         rc=5
     fi
 
+    # Invariant 4: the manifest records every regular file that is here.
+    # `md5sum -c` walks the manifest, so it is blind in the other
+    # direction: bytes present under a name nobody recorded pass every
+    # check above. Top level only, and no name is exempt — see "EXIT 6"
+    # in the header for why.
+    unrecorded=0
+    while IFS= read -r path; do
+        base="${path##*/}"
+        [[ "$base" == "$MANIFEST_NAME" ]] && continue
+        if ! _manifest_records "$manifest" "$base"; then
+            echo "evidence-freeze: UNRECORDED file: $base ($MANIFEST_NAME does not list it)" >&2
+            unrecorded=$(( unrecorded + 1 ))
+        fi
+    done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null)
+    if (( unrecorded > 0 )); then
+        echo "evidence-freeze: $unrecorded unrecorded file(s) in $dir — freeze them, or they are not evidence" >&2
+        # Exit 5 wins if an invariant is already broken: it is graver.
+        (( rc == 0 )) && rc=6
+    fi
+
     (( rc == 0 )) && echo "evidence-freeze: $dir verified clean"
     exit "$rc"
 fi
@@ -156,7 +248,10 @@ case "$as_name" in
     "$MANIFEST_NAME") echo "evidence-freeze: refusing to freeze over $MANIFEST_NAME" >&2; exit 2 ;;
 esac
 
-mkdir -p "$dir" || { echo "evidence-freeze: cannot create $dir" >&2; exit 2; }
+# `-m 0770` applies to directories this command CREATES, and leaves an
+# existing directory's mode alone. Without it the mode is whatever the
+# caller's umask leaves, which is not a mode any test can assert.
+mkdir -p -m 0770 "$dir" || { echo "evidence-freeze: cannot create $dir" >&2; exit 2; }
 target="$dir/$as_name"
 manifest="$dir/$MANIFEST_NAME"
 
@@ -178,14 +273,6 @@ fi
 
 # The manifest can record a name whose file was removed. Appending a
 # second entry for it would leave two rows for one name, so refuse.
-# Match the name field exactly — a substring test would refuse
-# `nb.ipynb.bak` because `nb.ipynb` is already recorded.
-_manifest_records() {
-    local m="$1" n="$2"
-    [[ -f "$m" ]] || return 1
-    awk -v want="$n" '{ sub(/^[^ ]+  /, ""); sub(/^\*/, ""); if ($0 == want) found = 1 }
-                      END { exit found ? 0 : 1 }' "$m"
-}
 if _manifest_records "$manifest" "$as_name"; then
     echo "evidence-freeze: REFUSED — $MANIFEST_NAME already records '$as_name' in $dir" >&2
     exit 4
@@ -197,7 +284,19 @@ if ! cp -- "$src" "$target"; then
     rm -f -- "$target"
     exit 2
 fi
-chmod 0440 -- "$target" 2>/dev/null || true
+# Read the mode back. A swallowed chmod failure would leave a WRITABLE
+# freeze under a script that prints `mode 0440`. Nothing is recorded
+# yet, so the safe answer is to undo the copy and fail loudly.
+chmod 0440 -- "$target" 2>/dev/null
+if ! _mode_is "$target" 440; then
+    {
+        echo "evidence-freeze: FAILED to set mode 0440 on $target"
+        echo "  mode is now: $(stat -c '%a' -- "$target" 2>/dev/null || echo unreadable)"
+        echo "  A writable freeze is not a freeze. The copy was removed; nothing was recorded."
+    } >&2
+    rm -f -- "$target"
+    exit 7
+fi
 
 # 3. Append to the manifest, never regenerate it. The manifest is held
 #    read-only between appends, so a stray `md5sum … > MANIFEST.md5`
@@ -210,9 +309,22 @@ if ! ( cd "$dir" && md5sum -- "$as_name" >> "$MANIFEST_NAME" ); then
     chmod 0440 -- "$manifest" 2>/dev/null || true
     exit 4
 fi
-chmod 0440 -- "$manifest" 2>/dev/null || true
+chmod 0440 -- "$manifest" 2>/dev/null
 
 printf 'frozen %s -> %s\n' "$src" "$target"
 printf 'md5    %s\n' "$(tail -1 "$manifest" | cut -d' ' -f1)"
+
+# The freeze IS recorded by this point, so a failure here is not a
+# reason to undo it. It is a reason not to claim the manifest is
+# protected. Report the mode that is actually set.
+if ! _mode_is "$manifest" 440; then
+    {
+        echo "evidence-freeze: FAILED to set mode 0440 on $manifest"
+        echo "  mode is now: $(stat -c '%a' -- "$manifest" 2>/dev/null || echo unreadable)"
+        echo "  The freeze is recorded. The manifest is NOT protected:"
+        echo "  a stray 'md5sum … > $MANIFEST_NAME' would rewrite it."
+    } >&2
+    exit 7
+fi
 printf 'mode   0440 (read-only); %s is append-only\n' "$MANIFEST_NAME"
 exit 0
