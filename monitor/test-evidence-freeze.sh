@@ -256,6 +256,31 @@ mkdir -p "$W/empty"
 "$FREEZE_BIN" --verify --dir "$W/empty" >/dev/null 2>&1; rc=$?
 assert_eq "verify of a dir with no manifest exits 5" "$rc" "5"
 
+# ---------------------------------------------------------------------------
+echo "=== 10. KNOWN LIMIT: remove-and-recreate is not prevented"
+# ---------------------------------------------------------------------------
+# Mode 0440 stops a WRITE, not an UNLINK. The evidence directory is
+# writable, so the owning uid can remove a freeze and its manifest and
+# put new bytes under the old name. This case pins the current truth so
+# the suite is never read as proof of impossibility. If the guard is
+# later hardened — by holding the DIRECTORY read-only between freezes —
+# this case turns RED, and that is the correct signal to update it.
+W="$TMP/w10"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+printf 'REPLACEMENT\n' > "$W/code/nb.txt"
+REPL_MD5=$(md5of "$W/code/nb.txt")
+
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"; rm_rc=$?
+assert_eq "rm of a mode-0440 freeze succeeds (dir is writable)" "$rm_rc" "0"
+cp -p "$W/code/nb.txt" "$W/ev/nb.PRE.txt"
+( cd "$W/ev" && md5sum ./*.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "verify still reports clean after remove-and-recreate" "$rc" "0"
+assert_eq "the substituted bytes are what is stored" \
+    "$(md5of "$W/ev/nb.PRE.txt")" "$REPL_MD5"
+
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 if (( FAIL == 0 )); then

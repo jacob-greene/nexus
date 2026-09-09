@@ -1255,7 +1255,7 @@ capture, the test suite); the facade is an *alias*, not a migration.
 | `ng retire-preflight <window>` | `retire-preflight.sh` | orchestrator — synchronous go/no-go gate before `tmux kill-window` |
 | `ng pane-state <window-index>` | `pane-state.sh` | orchestrator — classify a worker pane (`idle\|busy\|user-typing\|…`) |
 | `ng write-probe <path>` | `write-probe.sh` | worker — pre-flight that a deliverable path is writable |
-| `ng evidence-freeze <src> --task <slug>` | `evidence-freeze.sh` | worker — freeze an artefact into durable evidence: write-once name, mode-0440 copy, append-only `MANIFEST.md5` |
+| `ng evidence-freeze <src> --task <slug>` | `evidence-freeze.sh` | worker — freeze an artefact into durable evidence: write-once name, mode-0440 copy, `MANIFEST.md5` extended by append and never regenerated. Blocks the accidental clobber, not a deliberate `rm` + recreate (see the script header) |
 | `ng declare-wait <kind> <id> <desc>` | `declare-wait.sh` | worker — self-declare an async external wait |
 | `ng declare-no-wait <kind> <id>` | `declare-no-wait.sh` | worker — mark an async launch fire-and-forget |
 | `ng paste-followup <window> ...` | `paste-followup.sh` | orchestrator — canonical follow-up paste into a worker window |

@@ -28,6 +28,18 @@
 # It also copies WITHOUT `-p`, so the frozen file's mtime is the time
 # the freeze happened — the evidence a reader needs.
 #
+# WHAT THIS DOES NOT PREVENT. Mode 0440 stops a WRITE to a frozen file.
+# It does not stop an UNLINK: the evidence directory itself is mode
+# 0770, so the owning uid can `rm` a freeze and its manifest, recreate
+# both, and `--verify` then reports clean on the new bytes. The guard
+# closes the accidental path — the two incident commands now fail with
+# EACCES — not a deliberate remove-and-recreate. `test-evidence-freeze.sh`
+# case 10 pins that limit so nobody reads the suite as proof of
+# impossibility. Closing it means holding the evidence DIRECTORY
+# read-only between freezes, which also blocks every other write into
+# the directory (sub-directories, READMEs). That is a policy decision
+# for the operator, not a silent addition here.
+#
 # Usage:
 #   evidence-freeze.sh <source> --task <slug> [--as <name>]
 #   evidence-freeze.sh <source> --dir <evidence-dir> [--as <name>]
