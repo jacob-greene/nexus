@@ -251,6 +251,23 @@ esac
 # `-m 0770` applies to directories this command CREATES, and leaves an
 # existing directory's mode alone. Without it the mode is whatever the
 # caller's umask leaves, which is not a mode any test can assert.
+#
+# THIS IS A FIXED MODE, AND IT CUTS BOTH WAYS. Measured old (umask-
+# derived) against new (fixed) at each umask:
+#
+#     umask   old   new   direction
+#     0007    770   770   unchanged — the umask in use here
+#     0000    777   770   tightened
+#     0022    755   770   `o` tightened, `g` GAINS w
+#     0027    750   770   `g` GAINS w
+#     0077    700   770   `g` GAINS rwx
+#
+# Under a restrictive umask this WIDENS the directory, and directory
+# write permission is exactly what the remove-and-recreate bypass above
+# needs. On this host nothing changes, because the umask is 0007 and the
+# group is the operator's own. Elsewhere it would. `0700` would never
+# widen, but it would break any setup that reads the state tree by
+# group, so the fixed value is the operator's call, not this script's.
 mkdir -p -m 0770 "$dir" || { echo "evidence-freeze: cannot create $dir" >&2; exit 2; }
 target="$dir/$as_name"
 manifest="$dir/$MANIFEST_NAME"

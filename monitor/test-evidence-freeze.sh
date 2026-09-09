@@ -16,17 +16,27 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body). Thirteen
-# mutations are on record and every one turns at least one case RED:
-# dropping the `chmod 0440`, dropping the clobber refusal, swapping
-# `>>` for `>`, widening the evidence directory to 0777, dropping the
-# rollback after a failed copy, dropping either mode read-back, and
-# dropping the `./` normalisation in `_manifest_records`.
+# it was trusted (see the mutation table in the PR body). Seventeen
+# mutations are on record and every one turns at least one case RED.
 #
-# A suite with no surviving mutant is a claim, not a fact. The first
-# version of this file claimed it and a skeptic found three survivors:
-# the evidence directory's mode, the failed-copy path, and the
-# append-failure path. Cases 12, 13 and 14 exist because of that.
+# A SUITE WITH NO SURVIVING MUTANT IS A CLAIM, NOT A FACT, and on this
+# file the claim has failed twice. Read that before adding a case.
+#
+#   Round 1. The first version claimed no survivors. A skeptic found
+#   three: the evidence directory's mode, the failed-copy path, and the
+#   append-failure path. Cases 12, 13 and 14 exist because of that.
+#
+#   Round 2. The second version claimed it again, over thirteen
+#   mutations. A skeptic found four more: both places that read the GNU
+#   binary name form `<hash> *name`, the dotfile case, and the
+#   "no name is exempt" rule. Cases 17 and 18 exist because of that.
+#
+# The pattern in both rounds is the same. Each author wrote the
+# mutations that matched what they had just been thinking about, then
+# read a green suite as coverage. The four in round 2 all sat on
+# behaviour the script header states as a PROMISE, and none of the
+# promises had an assertion behind them. If you add a promise to the
+# header, add the case that fails when it stops being true.
 #
 # Hermetic: everything happens under a fresh mktemp -d. No tmux, no
 # network, no state outside the temp dir.
@@ -496,6 +506,73 @@ else
     assert_not_contains "output never claims the manifest is append-only" \
         "$out" "is append-only"
 fi
+
+# ---------------------------------------------------------------------------
+echo "=== 17. the GNU binary name form is read in BOTH places that handle it"
+# ---------------------------------------------------------------------------
+# `md5sum -b` writes `<hash> *name`, one space and a star, not two
+# spaces. The script claims to read that form, and it does — but the
+# claim went untested in both places until a skeptic mutated them and
+# the suite stayed green.
+#
+# The two places fail differently, and the second one is the dangerous
+# one. `_manifest_records` failing on this form gives a FALSE POSITIVE:
+# exit 6 on a file that is recorded, which is loud. Invariant 2 failing
+# on it gives a FALSE NEGATIVE: a writable freeze reported clean.
+W="$TMP/w17"; mkdir -p "$W/ev"
+printf 'BASELINE\n' > "$W/ev/nb.txt"
+( cd "$W/ev" && md5sum -b nb.txt > MANIFEST.md5 )
+assert_contains "the fixture really is in binary form" \
+    "$(cat "$W/ev/MANIFEST.md5")" " *nb.txt"
+chmod 0440 "$W/ev/nb.txt" "$W/ev/MANIFEST.md5"
+
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "a binary-form manifest verifies clean" "$rc" "0"
+
+# Invariant 2 must still see a writable freeze through the `*`.
+chmod u+w "$W/ev/nb.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a writable freeze in binary form exits 5" "$rc" "5"
+assert_contains "the writable freeze is named" "$out" "WRITABLE freeze: nb.txt"
+chmod 0440 "$W/ev/nb.txt"
+
+# _manifest_records must also see through the `*`, or a recorded name
+# would read as free and a second freeze would clobber nothing but
+# would double the manifest row.
+W="$TMP/w17b"; mkdir -p "$W/code" "$W/ev"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+cp "$W/code/nb.txt" "$W/ev/nb.txt"
+( cd "$W/ev" && md5sum -b nb.txt > MANIFEST.md5 )
+chmod u+w "$W/ev/nb.txt" && rm -f "$W/ev/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.txt >/dev/null 2>&1; rc=$?
+assert_eq "a binary-form recorded name still exits 4" "$rc" "4"
+
+# ---------------------------------------------------------------------------
+echo "=== 18. exit 6 is name-blind, as the header says it is"
+# ---------------------------------------------------------------------------
+# The header records "Is any name exempt? No" as a deliberate decision.
+# A decision with no assertion behind it is a comment: a skeptic added a
+# README exemption and the suite stayed green. These two cases are that
+# decision, written where it can fail.
+W="$TMP/w18"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+
+printf 'a note nobody recorded\n' > "$W/ev/README-NOTES.md"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "an unrecorded README trips exit 6" "$rc" "6"
+assert_contains "the README is named" "$out" "UNRECORDED file: README-NOTES.md"
+rm -f "$W/ev/README-NOTES.md"
+
+# A dotfile is a regular file too, and `find` must not skip it.
+printf 'hidden and unrecorded\n' > "$W/ev/.hidden.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "an unrecorded dotfile trips exit 6" "$rc" "6"
+assert_contains "the dotfile is named" "$out" "UNRECORDED file: .hidden.txt"
+rm -f "$W/ev/.hidden.txt"
+
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "the dir is clean again once both are gone" "$rc" "0"
 
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
