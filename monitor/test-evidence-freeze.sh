@@ -16,8 +16,9 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body). Thirty-nine
-# mutations are on record and every one turns at least one case RED.
+# it was trusted (see the mutation table in the PR body). Forty-four
+# mutations are on record and every one turns at least one case RED,
+# plus 47 more from an independent skeptic sweep in round 5.
 #
 # A SUITE WITH NO SURVIVING MUTANT IS A CLAIM, NOT A FACT, and on this
 # file the claim has failed three times. Read that before adding a case.
@@ -55,6 +56,26 @@
 #       value it writes, so no line it writes can hold the decoy. The
 #       rule guards a HAND-EDITED row, and case 29b is that row.
 #
+#   Round 5. A depth-1 skeptic ran an INDEPENDENT sweep of 47 mutations
+#   against round 4's suite and found seven survivors. Five are closed by
+#   cases 33 and 34, and they fall into two groups.
+#
+#   Three sat on the freeze log's WRITE side. Exit 8 documents two
+#   meanings, and only one of them was pinned: "the record and the
+#   directory disagree" had eight assertions, "a freeze could not be
+#   recorded out of band" had none. Exit 7 on the log's own mode had none
+#   either. The asymmetry should have been visible from this file alone —
+#   cases 15 and 16 already force a chmod failure for the frozen copy and
+#   for MANIFEST.md5, and nothing did the same for the log.
+#
+#   The other two were round 4's own lesson, repeated in the file that
+#   records it. `window` had no assertion. `src` HAD one, in case 20, and
+#   it could not fail: that fixture's source path is already absolute and
+#   canonical, so `readlink -f` is a no-op on it. An assertion that cannot
+#   distinguish is not coverage. Case 34 freezes through a symlink and by
+#   a relative path, and builds its expected value with `pwd -P` so it
+#   does not restate the call under test.
+#
 # Round 4 also cost the script a real bug that no mutation found, but
 # that writing case 30 did: `awk -v want="$path"` runs the value through
 # awk's escape processing, so an evidence directory whose path held a
@@ -81,7 +102,14 @@
 #      because every case fed that code the same SHAPE of input: an
 #      absolute path, holding no backslash, read by one process at a
 #      time. Ask what all your fixtures have in common, then write the
-#      case that does not.
+#      case that does not. Round 5 broke this rule again, in this very
+#      file: `src` had an assertion that could not fail, because its
+#      fixture path was already canonical.
+#   4. Cover every meaning of an exit code, not just the interesting
+#      one. Exit 8 documents two, and round 4 pinned one. When you add a
+#      meaning to a code, grep this file for the OTHER meanings and
+#      check each has a case. Round 5's three write-side survivors were
+#      all one unpinned meaning.
 #
 # Hermetic: everything happens under a fresh mktemp -d. No tmux, no
 # network, no state outside the temp dir.
@@ -1181,6 +1209,139 @@ chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
 out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
 assert_eq "a relative-frozen dir is still cross-checked" "$rc" "8"
 assert_contains "the recorded hash is printed" "$out" "$BASE_MD5"
+
+# ---------------------------------------------------------------------------
+echo "=== 33. the freeze-log WRITE side fails loudly, and keeps the freeze"
+# ---------------------------------------------------------------------------
+# Exit 8 carries TWO meanings. "The record and the directory disagree" had
+# eight assertions. "A freeze could not be recorded out of band" had NONE,
+# and neither did exit 7 on the log's own mode. A depth-1 skeptic found
+# three surviving mutants sitting in that gap: dropping `|| rc=1` from the
+# append, deleting the exit-8 branch, and deleting the exit-7 mode guard
+# all left the suite fully green.
+#
+# The asymmetry is the tell. This suite already forces a chmod failure for
+# the frozen copy (case 15) and for MANIFEST.md5 (case 16). It did not
+# force one for the freeze log. That was an oversight, not a decision.
+#
+# The rule in both branches is the same as case 16's: the freeze is
+# already copied, read-only and in the manifest, so throwing it away to
+# report a bookkeeping failure would destroy evidence. Keep it, name the
+# promise that went unmet, exit non-zero.
+
+# (a) the append itself cannot land. A read-only log DIRECTORY with no log
+#     in it yet is the portable way to reach that: the create fails.
+W="$TMP/w33"; mkdir -p "$W/code" "$W/logdir"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+chmod 0555 "$W/logdir"
+
+if (( EUID == 0 )); then
+    skip "an unrecordable freeze exits 8 (root writes a 0555 directory anyway)"
+    skip "the failure names the log (root)"
+    skip "the freeze is KEPT when the log cannot be written (root)"
+    skip "and MANIFEST.md5 still records it (root)"
+    skip "the lock failure is announced too (root)"
+else
+    out=$( NEXUS_FREEZE_LOG="$W/logdir/freeze-log.jsonl" \
+           "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1 ); rc=$?
+    assert_eq "an unrecordable freeze exits 8" "$rc" "8"
+    assert_contains "the failure names the log" "$out" "FAILED to record this freeze"
+    assert_contains "the failure says what --verify can no longer do" \
+        "$out" "would not be detected"
+    # Detection is lost; the EVIDENCE is not. Keeping it is the whole rule.
+    assert_eq "the freeze is KEPT when the log cannot be written" \
+        "$(md5of "$W/ev/nb.PRE.txt")" "$BASE_MD5"
+    assert_eq "and MANIFEST.md5 still records it" "$(wc -l < "$W/ev/MANIFEST.md5")" "1"
+    # The lock file cannot be created in that directory either, and that
+    # is announced rather than swallowed.
+    assert_contains "the lock failure is announced too" "$out" "WITHOUT a lock"
+fi
+chmod u+w "$W/logdir" 2>/dev/null
+
+# (b) the append lands, but the log's mode cannot be set. The stub passes
+#     every chmod through EXCEPT the one on the freeze log, so only that
+#     branch fires. The log path is FRESH for this case: against the
+#     suite-wide log, already mode 0440, the stubbed `chmod u+w` would
+#     make the APPEND fail instead, which is branch (a), not this one.
+#     It must also be NAMED `freeze-log.jsonl`: the stub matches on the
+#     name, and a differently-named fixture makes the stub inert and the
+#     case a tautology. That happened on the first run of this case.
+W="$TMP/w33b"; mkdir -p "$W/code" "$W/stub" "$W/logs"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+real_chmod=$(command -v chmod)
+{
+    printf '#!/bin/sh\n'
+    printf 'for a in "$@"; do case "$a" in *freeze-log.jsonl) exit 0 ;; esac; done\n'
+    printf 'exec %s "$@"\n' "$real_chmod"
+} > "$W/stub/chmod"
+"$real_chmod" +x "$W/stub/chmod"
+
+if (( EUID == 0 )); then
+    skip "an unprotected freeze log exits 7 (root: mode 0440 is not enforced anyway)"
+    skip "the failure names the freeze log (root)"
+    skip "the freeze is kept and recorded (root)"
+    skip "output never claims a mode it did not set (root)"
+else
+    out=$( PATH="$W/stub:$PATH" NEXUS_FREEZE_LOG="$W/logs/freeze-log.jsonl" \
+           "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1 ); rc=$?
+    assert_eq "an unprotected freeze log exits 7" "$rc" "7"
+    assert_contains "the failure names the freeze log" "$out" "FAILED to set mode 0440"
+    assert_contains "the failure says the log holds every directory's records" \
+        "$out" "every evidence directory"
+    assert_eq "the freeze is kept and recorded" \
+        "$(md5of "$W/ev/nb.PRE.txt")" "$BASE_MD5"
+    assert_eq "the row landed before the chmod failed" \
+        "$(wc -l < "$W/logs/freeze-log.jsonl")" "1"
+    assert_not_contains "output never claims a mode it did not set" \
+        "$out" "mode   0440 (read-only)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 34. the row's window and src are the values the script EMITS"
+# ---------------------------------------------------------------------------
+# Case 20 checks the schema against a fixture whose source path is ALREADY
+# absolute and canonical. That makes `readlink -f` a no-op, so dropping it
+# left the suite green, and `window` had no assertion at all. Both are the
+# round-4 fixture trap again, in the file that records the round-4 lesson:
+# the code ran, the input shape could not tell the difference.
+
+# (a) window. It is the join key back into the action log's spawn and
+#     wrap-up trace, so an empty one costs a reader that link.
+W="$TMP/w34"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+NEXUS_WORKER_WINDOW=w34-probe-window \
+    "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+EVABS=$(cd "$W/ev" && pwd -P)
+row=$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" | head -1)
+assert_contains "the row carries the worker window" "$row" '"window":"w34-probe-window"'
+
+# (b) src through a SYMLINK. The expected value is built with `pwd -P`,
+#     not with `readlink -f`, so the assertion does not simply restate the
+#     call it is checking.
+W="$TMP/w34b"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/real.txt"
+ln -s real.txt "$W/code/link.txt"
+CODEABS=$(cd "$W/code" && pwd -P)
+"$FREEZE_BIN" "$W/code/link.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1; rc=$?
+assert_eq "freezing through a symlink works" "$rc" "0"
+EVABS=$(cd "$W/ev" && pwd -P)
+row=$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" | head -1)
+assert_contains "src records the RESOLVED source, not the symlink" \
+    "$row" "\"src\":\"$CODEABS/real.txt\""
+assert_not_contains "src is not the symlink path" "$row" "link.txt"
+
+# (c) src given RELATIVELY. Provenance that only resolves from the
+#     caller's old working directory is not provenance.
+W="$TMP/w34c"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+CODEABS=$(cd "$W/code" && pwd -P)
+( cd "$W" && "$FREEZE_BIN" code/nb.txt --dir ev --as nb.PRE.txt >/dev/null 2>&1 )
+EVABS=$(cd "$W/ev" && pwd -P)
+row=$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" | head -1)
+assert_contains "a relative source is recorded absolutely" \
+    "$row" "\"src\":\"$CODEABS/nb.txt\""
 
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
