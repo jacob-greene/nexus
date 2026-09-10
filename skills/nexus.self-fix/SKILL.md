@@ -22,7 +22,7 @@ GitHub-write concerns.
 
 Self-improvement is high-leverage but easy to misfire — a
 mis-scoped issue or a stale-checkout repro burns the operator's
-triage budget and pollutes the tracker. Run these four checks
+triage budget and pollutes the tracker. Run these five checks
 before opening an issue on `<your-org>/nexus-code` or authoring a
 self-fix PR.
 
@@ -123,10 +123,36 @@ self-fix PR.
    A close is not a ruling. Read the closing comment and test it
    against source. On this nexus, eleven issues closed inside 102
    seconds in one bulk action. Four closing comments said "Nothing
-   is lost by closing this". For three it was false: each body
-   also reported that the over-limit row is keyed by role, so a
-   rotation does not clear it. That mechanism was still live and
-   had to be refiled.
+   is lost by closing this". For three of the four it was false.
+   Each of those three bodies carried a defect that the close did
+   not map onto the surviving issue.
+
+   **The unmapped defect is a different one in each case.** One
+   mechanism does not explain a set of closes. Check each body on
+   its own. The *over-limit row* here is the watcher state row
+   that holds emits to the orchestrator while a pane reads
+   rate-limited.
+
+   | Issue | Defect the close left unmapped |
+   |---|---|
+   | `#26` | Its "Defect B": the over-limit row is keyed by role, so a rotation does not clear it |
+   | `#41` | The same role-keyed row, under its "Why it is worse than it looks" heading |
+   | `#30` | Its first enumerated defect: the banner is re-read from stale scrollback |
+
+   `#30` is the one that punishes a fast read. Its Summary
+   mentions the role-keyed row in a single line. The two defects
+   it enumerates are different ones: the stale-scrollback re-arm,
+   and a bare clock time resolved forward. Count what a body
+   enumerates, not what it mentions in passing.
+
+   **Say what a live mechanism now costs.** "Still live" alone is
+   true and incomplete. The role-keyed row is live, and was
+   refiled. But the merged fix bounds the hold three independent
+   ways, so its worst consequence fell from about 6.5 hours of
+   orchestrator blindness to minutes. The stale-scrollback re-arm
+   is also live. It was not refiled, because the source documents
+   it as a bounded residual. A refile needs a live mechanism *and*
+   a consequence the source does not already accept.
 
 Each check is a verifiable action (run the command, paste the
 SHA, name the file). Pass all five before opening the issue or
@@ -149,7 +175,7 @@ issue, added it there, and said so. That is the shape to copy.
 
 ## Opening the self-fix PR — base the default branch, gated merge
 
-Once the four checks pass and you have a fix, open the PR
+Once the five checks pass and you have a fix, open the PR
 against the **remote's default branch** — the `$BASE` resolved
 in check 1 — never a branch you assumed:
 

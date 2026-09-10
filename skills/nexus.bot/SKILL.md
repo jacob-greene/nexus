@@ -404,40 +404,83 @@ REST shape unless you genuinely need a deeply nested traversal or a
 search query (full-text/`is:issue`/`mentions:`) that REST can't
 express.
 
-**On `gh` 1.13.0 most `gh issue` verbs are BROKEN — use REST.** The
-sandbox base image ships that version. Its issue lookup still asks
-for Projects (classic), which GitHub removed, so the verb aborts:
+**On `gh` 1.13.0 many `gh issue` and `gh pr` verbs are BROKEN — use
+REST.** The sandbox base image ships that version. Its lookup for an
+issue or a pull request still asks for Projects (classic), which
+GitHub removed, so the verb aborts:
 
 ```
 GraphQL error: Projects (classic) is being deprecated in favor of the new Projects experience, see: https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/.
 ```
 
-The split is not read versus write. Measured 2026-09-10:
+**The predictor: a verb aborts with that error if, and only if, its
+outgoing GraphQL query selects `projectCards`.** Do not work from a
+list of verbs — test the verb you are about to use:
 
-| Verb | Exit | Wrote anything |
-|---|---|---|
-| `gh issue comment <n>` | 1 | no |
-| `gh issue edit <n>` | 1 | no |
-| `gh issue close <n>` | 1 | no |
-| `gh issue view <n>` | 1 | not a write |
-| `gh pr view <n>` | 1 | not a write |
-| `gh issue create` | 0 | yes |
-| `gh pr comment <n>` | 0 | yes |
-| `gh issue list`, `gh pr list` | 0 | not a write |
+```bash
+DEBUG=api gh <verb> <n> --repo <owner>/<repo> 2>&1 | grep -c projectCards
+```
 
-These failures write nothing, so a retry cannot double-post. Check
-that per verb before you retry any failed CLI write. A call that
-already wrote turns a retry into a double-post.
+A non-zero count means the verb is broken on 1.13.0. Pass the verb
+its required flags. Without them `gh` exits 1 on argument
+validation before it ever calls the API, which reads the same as a
+pass and is not one.
+
+The split is not read versus write, and it is not `issue` versus
+`pr`. The table below illustrates the predictor. The predictor is
+the claim. Measured 2026-09-10 on this nexus:
+
+| Verb | `projectCards` | Exit | Wrote anything |
+|---|---|---|---|
+| `gh issue view <n>` | 2 | 1 | not a write |
+| `gh issue comment <n> --body …` | 2 | 1 | no |
+| `gh issue edit <n> --title …` | 2 | 1 | no |
+| `gh issue close <n>` | 2 | 1 | no |
+| `gh issue reopen <n>` | 2 | 1 | no |
+| `gh pr view <n>` | 2 | 1 | not a write |
+| `gh pr edit <n> --title …` | 2 | 1 | no |
+| `gh pr diff <n>` | 0 | 0 | not a write |
+| `gh pr checkout <n>` | 0 | 0 | local git only |
+| `gh issue create` | 0 | 0 | yes |
+| `gh pr comment <n>` | 0 | 0 | yes |
+| `gh issue list`, `gh pr list` | 0 | 0 | not a write |
+
+`gh pr checks <n>` selects no `projectCards` and is not broken. It
+can still exit 1, with `no checks reported on the 'main' branch`.
+An exit code alone does not identify this failure. Read the error.
+
+These failures write nothing, so a retry cannot double-post. The
+reason is structural: the verb dies in its lookup and never issues
+a mutation. Verified on `gh issue comment`, which left the comment
+count unchanged, and on `gh issue reopen`, which left the state
+`closed`. Check that per verb before you retry any failed CLI
+write. A call that already wrote turns a retry into a double-post.
 
 The REST replacements:
 
 ```bash
-gh api repos/<owner>/<repo>/issues/<n>/comments -f body=@body.md
+gh api repos/<owner>/<repo>/issues/<n>/comments -F body=@body.md
 gh api -X PATCH repos/<owner>/<repo>/issues/<n> -f title='…'
 gh api -X PATCH repos/<owner>/<repo>/issues/<n> \
     -f state=closed -f state_reason=completed
 gh api repos/<owner>/<repo>/issues/<n> --jq '.body'
 ```
+
+The first line reads a file, so it uses capital `-F`. The other
+write lines pass inline strings, so lowercase `-f` is correct
+there. This is the rule stated above under "`gh api` body-from-file
+gotcha — `-F`, never `-f`". Lowercase `-f body=@body.md` sends the
+literal text `@body.md` and publishes your file path. Measured on
+this host against `POST /markdown`, which renders its input and
+writes nothing:
+
+| Form | Rendered output |
+|---|---|
+| `-f text=@probe.md` | `<p>@probe.md</p>` |
+| `-F text=@probe.md` | `<p>HELLO_FROM_FILE</p>` |
+
+After any raw `gh api` write, read the posted body back and confirm
+it is what you intended.
 
 `ng reply`, `ng comment`, `ng close` and `ng issue create` call REST
 directly, so they are unaffected. Prefer them. `gh search` does not
