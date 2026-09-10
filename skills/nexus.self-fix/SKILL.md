@@ -102,9 +102,50 @@ self-fix PR.
    catches the stale-checkout-against-recently-added-feature
    failure mode.
 
+5. **Sweep the tracker in every state, and read closed bodies.**
+   `gh issue list --search` returns OPEN issues only, so a closed
+   issue holding your defect stays invisible. Pass `--state all`.
+   The REST search covers every state by default.
+
+   ```bash
+   gh issue list --repo <owner>/<repo> --search "<terms>" --state all
+   gh api -X GET search/issues -f q='repo:<owner>/<repo> <terms>'
+   ```
+
+   Confirm the query finds a hit you already know. An empty
+   result reads the same whether the tracker is clean or your
+   filter hid the match.
+
+   **Read the bodies, not the titles.** A title names the primary
+   defect only. A secondary defect in the body survives the close
+   and is invisible to a title scan.
+
+   A close is not a ruling. Read the closing comment and test it
+   against source. On this nexus, eleven issues closed inside 102
+   seconds in one bulk action. Four closing comments said "Nothing
+   is lost by closing this". For three it was false: each body
+   also reported that the over-limit row is keyed by role, so a
+   rotation does not clear it. That mechanism was still live and
+   had to be refiled.
+
 Each check is a verifiable action (run the command, paste the
-SHA, name the file). Pass all four before opening the issue or
+SHA, name the file). Pass all five before opening the issue or
 the PR — not posture, output.
+
+## Closing an issue — enumerate what the close settles
+
+The same defect seen from the filing side. A multi-defect body
+gets closed on its primary defect, and the secondary defects
+vanish, because nothing points at them any more.
+
+Before you close, list the distinct defects in the body. For each
+one, say where it now lives: fixed by a named PR, or carried over
+to the surviving issue. Never write "nothing is lost" unless you
+checked every defect in the body.
+
+Carrying over is the step that is skipped. One good close in the
+bulk action above found a symptom missing from the surviving
+issue, added it there, and said so. That is the shape to copy.
 
 ## Opening the self-fix PR — base the default branch, gated merge
 

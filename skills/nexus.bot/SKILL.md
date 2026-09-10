@@ -404,6 +404,69 @@ REST shape unless you genuinely need a deeply nested traversal or a
 search query (full-text/`is:issue`/`mentions:`) that REST can't
 express.
 
+**On `gh` 1.13.0 most `gh issue` verbs are BROKEN — use REST.** The
+sandbox base image ships that version. Its issue lookup still asks
+for Projects (classic), which GitHub removed, so the verb aborts:
+
+```
+GraphQL error: Projects (classic) is being deprecated in favor of the new Projects experience, see: https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/.
+```
+
+The split is not read versus write. Measured 2026-09-10:
+
+| Verb | Exit | Wrote anything |
+|---|---|---|
+| `gh issue comment <n>` | 1 | no |
+| `gh issue edit <n>` | 1 | no |
+| `gh issue close <n>` | 1 | no |
+| `gh issue view <n>` | 1 | not a write |
+| `gh pr view <n>` | 1 | not a write |
+| `gh issue create` | 0 | yes |
+| `gh pr comment <n>` | 0 | yes |
+| `gh issue list`, `gh pr list` | 0 | not a write |
+
+These failures write nothing, so a retry cannot double-post. Check
+that per verb before you retry any failed CLI write. A call that
+already wrote turns a retry into a double-post.
+
+The REST replacements:
+
+```bash
+gh api repos/<owner>/<repo>/issues/<n>/comments -f body=@body.md
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> -f title='…'
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> \
+    -f state=closed -f state_reason=completed
+gh api repos/<owner>/<repo>/issues/<n> --jq '.body'
+```
+
+`ng reply`, `ng comment`, `ng close` and `ng issue create` call REST
+directly, so they are unaffected. Prefer them. `gh search` does not
+exist in 1.13.0 at all; use `gh api -X GET search/issues`.
+
+## Correcting a filed issue — patch the body, and date the patch
+
+A comment that corrects the body leaves the wrong text first on the
+page. Every later reader meets the error before the correction. When
+a filed issue states something false, patch the body in place with
+the `PATCH` form above.
+
+A patch destroys the original claim, so the body must carry its own
+record of the change. Add a short provenance section to the patched
+body:
+
+```markdown
+## Provenance of the corrections in this body
+
+Corrected in place on <date>, at <sha>, by <which pass>. Corrected:
+<what changed>. The measurements the issue was filed on were
+re-derived and held.
+```
+
+GitHub keeps prior versions, but an agent reading `.body` never sees
+them. The in-body note is the only record an API reader gets. A
+worked example on this nexus grew a corrected body from 16,032 to
+21,066 bytes and added exactly that section.
+
 ## The fail-loud rule (security boundary)
 
 `mint-token.sh` returning empty MUST exit non-zero — never let
