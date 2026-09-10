@@ -22,11 +22,11 @@ misses.
 **Lineage.** The methodology is adapted from two sources, cited where
 their ideas appear below:
 
-- **`<yourlab>.ms-audit`** (<your-lab> manuscript audit) — its *skeptic
+- **`setty.ms-audit`** (Setty Lab manuscript audit) — its *skeptic
   confirmation pass*: route every non-trivial finding to a fresh agent
   in a separate context to refute it before reporting. "Trust nothing.
   Read both sides." The bug-first checklist and the verdict ladder are
-  lifted from its sibling `<yourlab>.conclusion-skeptic`.
+  lifted from its sibling `setty.conclusion-skeptic`.
 - **`matsen/bipartite`** (Erick Matsen, MIT, public; HEAD `8888fe5`,
   2026-06-10) — the *bipartite* model: two coupled sides (generation and
   verification) with a dedicated `surprising-conclusion-skeptic` agent
@@ -62,7 +62,7 @@ role.)
 
 | Mode | Meaning | Wrap-up behaviour |
 |---|---|---|
-| `require` | A skeptic **must** validate this result. | Emits **SKEPTIC REQUIRED**, sets a `skeptic-pending` marker, logs `skeptic-request`, and **files a `kind=spawn-skeptic` request** into the watcher-mediated request inbox so the orchestrator gets a *push* signal to spawn the skeptic (<your-org>/nexus-code#545 — see "The push signal" below). The marker is a **hard gate**: `retire-preflight.sh` (the mandatory pre-kill check) returns no-go while it is live, so the window **cannot be retired** until a skeptic returns a verdict (which clears it) — the task is genuinely not *done* until then. A worker cannot waive it: `--skeptic-decision deny` is refused, and `--skeptic-waive` is refused from a worker context (operator-scoped). The waive is loudly audited (`skeptic-decision decision=waived`); it is a discipline-and-audit control scoped to the operator session, not a cryptographic boundary. |
+| `require` | A skeptic **must** validate this result. | Emits **SKEPTIC REQUIRED**, sets a `skeptic-pending` marker, logs `skeptic-request`, and **files a `kind=spawn-skeptic` request** into the watcher-mediated request inbox so the orchestrator gets a *push* signal to spawn the skeptic (settylab/nexus-code#545 — see "The push signal" below). The marker is a **hard gate**: `retire-preflight.sh` (the mandatory pre-kill check) returns no-go while it is live, so the window **cannot be retired** until a skeptic returns a verdict (which clears it) — the task is genuinely not *done* until then. A worker cannot waive it: `--skeptic-decision deny` is refused, and `--skeptic-waive` is refused from a worker context (operator-scoped). The waive is loudly audited (`skeptic-decision decision=waived`); it is a discipline-and-audit control scoped to the operator session, not a cryptographic boundary. |
 | `auto` | No specification at spawn — **the worker decides** at wrap-up. | Presents the responsible-default heuristic and requires the worker to record a decision (`--skeptic-decision require\|deny --skeptic-rationale "<why>"`). Enforced by default (`enforce_auto_decision: true`): wrap-up *fails* until a decision + rationale is recorded. |
 | `deny` | No skeptic (trivial / low-impact / disabled at spawn). | Proceeds; records "skeptic explicitly denied at spawn." A worker may still *escalate* deny→require if it discovers the work was riskier than the spawn assumed (recorded). |
 
@@ -693,4 +693,4 @@ a verdict (clearing the marker) or an operator waives.
   NOT pre-warn an ordinary worker of a skeptic; the await/answer
   mechanics are surfaced at wrap-up (`ng wrap-up` output) and here,
   reached only when a skeptic is actually invoked.
-- `<yourlab>.ms-audit`, `matsen/bipartite` — the methodological lineage.
+- `setty.ms-audit`, `matsen/bipartite` — the methodological lineage.
