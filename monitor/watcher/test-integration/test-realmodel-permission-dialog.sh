@@ -117,6 +117,9 @@ edit_directive() {
     printf '{"mode":"tool_use","tool":{"name":"Edit","input":{"file_path":"%s","old_string":"original","new_string":"edited"}}}' \
         "$OLD_FILE"
 }
+read_directive() {
+    printf '{"mode":"tool_use","tool":{"name":"Read","input":{"file_path":"%s"}}}' "$OLD_FILE"
+}
 
 # Stop a worker re-driving the tool. Escape interrupts the turn; the
 # control file goes back to plain text so the next request it makes is
@@ -226,7 +229,41 @@ probe_dialog() {
     quiesce "$win"
 }
 
+# Read the file before editing it. cc 2.1.173 refuses an `Edit` to a file
+# the session has not read ("File must be read first") and never reaches
+# the permission dialog; cc 2.1.220 does not. Priming the read makes the
+# Edit arm behave the same on both, so this scenario does not silently
+# lose its second dialog shape on whichever version CI happens to pin.
+#
+# The mock replays the current directive for EVERY request, including the
+# tool_result follow-up, so the read is switched back to plain text and
+# the turn is allowed to finish before the edit is driven.
+prime_read() {
+    local win="$1" i
+    echo
+    echo "--- priming: read the file before editing it ---"
+    cch_control "$(read_directive)"
+    cch_send "$win" "Please read the file."
+
+    # There is deliberately NO separate assertion that the read rendered.
+    # The pane is 25 rows, so the `Read(...)` line appears several seconds
+    # in and scrolls off as soon as the turn wraps up; polling for it is
+    # a timing test, not a correctness one, and it failed on 2.1.173 while
+    # the priming itself demonstrably worked. The assertion that matters
+    # is the Edit arm's own hard "a real permission dialog appeared". If
+    # the priming stops working, that assertion fails, loudly, with the
+    # refusal frame quoted.
+    sleep 12
+    cch_control '{"mode":"text","text":"MOCK_OK_HELLO"}'
+    for i in $(seq 1 15); do
+        sleep 2
+        [[ "$(cch_state "$win")" == "idle" ]] && break
+    done
+    echo "    primed; driving the Edit next"
+}
+
 probe_dialog "$WIN_B" Write "$(write_directive "$NEW_FILE_B")"
+prime_read   "$WIN_B"
 probe_dialog "$WIN_B" Edit  "$(edit_directive)"
 
 echo
