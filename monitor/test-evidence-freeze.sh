@@ -16,7 +16,7 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body). Forty-four
+# it was trusted (see the mutation table in the PR body). Forty-six
 # mutations are on record and every one turns at least one case RED,
 # plus 47 more from an independent skeptic sweep in round 5.
 #
@@ -68,7 +68,24 @@
 #   cases 15 and 16 already force a chmod failure for the frozen copy and
 #   for MANIFEST.md5, and nothing did the same for the log.
 #
-#   The other two were round 4's own lesson, repeated in the file that
+#   Survivor 6 was the sharpest of the seven, and it is the same shape a
+#   third time. Case 9 checked that `--as sub/dir.txt` exits 2. It could
+#   not fail: with `$W/ev/sub` absent, a script with the path-separator
+#   guard DELETED falls through to `cp`, the copy fails because the
+#   directory is not there, and it exits 2 as well. Same code, wrong
+#   reason. With the sub-directory PRESENT the guardless script SUCCEEDS,
+#   and the result is the worst false clean this suite knows: the freeze
+#   lands below `--verify`'s maxdepth-1 horizon, so the coverage
+#   denominator is zero and the verdict reads `covers 0 of 0`. Zero of
+#   zero cannot warn anybody. Case 9 now asserts the MESSAGE and repeats
+#   the call with the sub-directory present.
+#
+#   Survivor 7 was fixture breadth, and the skeptic calibrated it before
+#   reporting it: exempting `README` survived, exempting the fixture's own
+#   `README-NOTES.md` was killed. Case 18 pinned one string, not the rule.
+#   It now loops over five note names.
+#
+#   Two more were round 4's own lesson, repeated in the file that
 #   records it. `window` had no assertion. `src` HAD one, in case 20, and
 #   it could not fail: that fixture's source path is already absolute and
 #   canonical, so `readlink -f` is a no-op on it. An assertion that cannot
@@ -365,8 +382,33 @@ assert_eq "no source exits 2" "$rc" "2"
 "$FREEZE_BIN" "$W/code/missing.txt" --dir "$W/ev" >/dev/null 2>&1; rc=$?
 assert_eq "unreadable source exits 2" "$rc" "2"
 
-"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as sub/dir.txt >/dev/null 2>&1; rc=$?
+# --as with a path separator. The exit code ALONE cannot pin this, and for
+# a long time that is all this case checked. With `$W/ev/sub` absent, a
+# script missing the guard falls through to `cp`, the copy fails because
+# the directory does not exist, and it exits 2 as well — same code, wrong
+# reason. So assert the MESSAGE, and run the case again below with the
+# sub-directory PRESENT, where a missing guard cannot fail by accident.
+out=$("$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as sub/dir.txt 2>&1); rc=$?
 assert_eq "--as with a path separator exits 2" "$rc" "2"
+assert_contains "--as refusal names the reason, not just the code" \
+    "$out" "takes a bare file name, not a path"
+
+# The same call where the sub-directory EXISTS. Without the guard this
+# SUCCEEDS, and the result is the worst false clean this suite knows: the
+# freeze lands at `ev/sub/dir.txt`, the manifest records the name
+# `sub/dir.txt`, and `--verify` walks top-level files only — so the frozen
+# file sits below its horizon, the coverage denominator is 0, and the
+# verdict reads `verified clean (freeze-log covers 0 of 0)`. Zero of zero
+# is the one shape that cannot warn anybody.
+W="$TMP/w9b"; mkdir -p "$W/code" "$W/ev/sub"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+out=$("$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as sub/dir.txt 2>&1); rc=$?
+assert_eq "--as with a path separator exits 2 even when the sub-dir exists" "$rc" "2"
+assert_contains "and names the reason there too" "$out" "takes a bare file name, not a path"
+assert_eq "nothing was written anywhere under the evidence dir" \
+    "$(find "$W/ev" -type f | wc -l)" "0"
+assert_eq "and no row was recorded out of band" "$(freeze_log_rows "$W/ev")" "0"
+W="$TMP/w9"
 
 "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as MANIFEST.md5 >/dev/null 2>&1; rc=$?
 assert_eq "--as MANIFEST.md5 exits 2" "$rc" "2"
@@ -685,11 +727,17 @@ W="$TMP/w18"; mkdir -p "$W/code"
 printf 'BASELINE\n' > "$W/code/nb.txt"
 "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
 
-printf 'a note nobody recorded\n' > "$W/ev/README-NOTES.md"
-out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
-assert_eq "an unrecorded README trips exit 6" "$rc" "6"
-assert_contains "the README is named" "$out" "UNRECORDED file: README-NOTES.md"
-rm -f "$W/ev/README-NOTES.md"
+# Several note names, not one. A skeptic exempted the bare name `README`
+# and this case stayed green, because its only fixture was
+# `README-NOTES.md`; exempting THAT name is caught. The rule is name-blind,
+# so the fixture has to be name-plural or it only pins one string.
+for note in README-NOTES.md README README.md NOTES.txt readme; do
+    printf 'a note nobody recorded\n' > "$W/ev/$note"
+    out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+    assert_eq "an unrecorded '$note' trips exit 6" "$rc" "6"
+    assert_contains "'$note' is named" "$out" "UNRECORDED file: $note"
+    rm -f "$W/ev/$note"
+done
 
 # A dotfile is a regular file too, and `find` must not skip it.
 printf 'hidden and unrecorded\n' > "$W/ev/.hidden.txt"
