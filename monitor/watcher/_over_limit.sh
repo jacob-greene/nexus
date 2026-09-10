@@ -20,10 +20,33 @@
 #
 #   <key> <window> <role> <reset_at_token> <reset_epoch>
 #       <first_seen_epoch> <next_attempt_epoch> <attempts>
+#       <session_id>
 #
 # `<key>` is `_orchestrator` when the pane is the watcher's TARGET,
 # otherwise the window name. `<role>` is `orchestrator` or `worker`.
 # All epoch fields are unix seconds.
+#
+# SESSION IDENTITY (issue #161). `<session_id>` names the claude
+# session that owned the pane when the hold was stamped. It is the
+# ninth and last field, so a row written by an older revision (eight
+# fields) still parses — it simply reads as "session unknown" and the
+# identity test below is skipped. Every row-parsing `read` in this
+# module MUST name the ninth field: bash's `read` collapses all
+# remaining fields into the last variable, so an eight-name read of a
+# nine-field row silently corrupts `attempts`.
+#
+# A tmux window name is NOT a session. A context rotation retires the
+# orchestrator session and cold-spawns a replacement into a window of
+# the SAME name, so every name-based test in this module still
+# resolves and the row outlives the session it describes. The fresh
+# session then receives its predecessor's usage-limit recovery brief,
+# and — when the rotation lands inside a live hold — inherits the emit
+# suppression as well. Recording the session and dropping the row when
+# it no longer matches the live one fixes that class, including any
+# path that replaces the session without going through
+# spawn-fresh-orchestrator.sh. Both the wake loop and the pause
+# predicate apply the test, for the same reason the staleness rule is
+# applied in both: neither may depend on the other having run.
 #
 # Public functions:
 #
@@ -43,8 +66,16 @@
 #     only when the renderer reports a DIFFERENT token, and the result
 #     is clamped to first_seen + MAX_HOLD. See "DEADLINE FREEZE" below.
 #
-#   _over_limit_drop <key>
-#     Remove the row, atomically. Silent no-op when row absent.
+#   _over_limit_drop <key> [<window>]
+#     Remove the row, atomically, AND retire the hook-written
+#     per-window JSON stamp the row was latched off. <window> defaults
+#     to the row's own window field. Silent no-op when row absent.
+#     Retiring the JSON is load-bearing: `pane-state.sh` reports
+#     `state=over-limit` straight from that file, so a row dropped
+#     without it leaves a live detector behind and the very next scan
+#     re-stamps the row. A window of the same name that appears later
+#     (a rotation, a re-used worker name) then re-latches off a stamp
+#     written for a pane that no longer exists.
 #
 #   _over_limit_load <key>
 #     Tab-separated row for <key>, or empty on miss. Use IFS=$'\t' read.
@@ -60,6 +91,12 @@
 #
 #   _over_limit_hold_expired <first_seen> <reset_epoch> <now>
 #     Shared staleness rule. Exit 0 when the hold must stop suppressing.
+#
+#   _over_limit_session_rotated <window> <role> <row_session_id>
+#     Shared identity rule. Exit 0 ONLY on a positive mismatch: the row
+#     names a session, the pane names a session, and the two differ.
+#     An unknown id on either side exits 1 (no evidence of a rotation),
+#     so the module never drops a hold on a guess.
 #
 #   _over_limit_state_dir
 #     Resolve the state directory, or fail LOUDLY. Never returns a
@@ -236,6 +273,124 @@ _over_limit_sanitize_key() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'
 }
 
+# --- session identity (issue #161) ----------------------------------
+#
+# Two questions, two sources:
+#
+#   Which session was suspended?  The hook-written per-window stamp
+#     `<state>/over-limit/<window>.json` carries `session_id` — the
+#     session whose turn failed with `rate_limit`. That is the most
+#     precise answer, so it is preferred. It is absent when the
+#     suspension was detected by the renderer scrape instead of the
+#     StopFailure hook, and the live source below is the fallback.
+#
+#   Which session owns the pane now?  For the orchestrator, the pin at
+#     `<state>/orchestrator-session-id`, rewritten by the
+#     UserPromptSubmit hook on every turn. For a worker, `session_id`
+#     in its heartbeat `<state>/heartbeat/<window>.json`.
+#
+# Both readers fail SOFT: an unresolvable path, an absent file or an
+# unparseable body yields the empty string, which the identity test
+# reads as "no evidence" and skips. Dropping a live hold on a failed
+# read would resume emits into a genuinely frozen pane.
+
+# Directory holding the hook-written per-window over-limit stamps.
+_over_limit_stamp_dir() {
+    local dir
+    dir=$(_over_limit_state_dir) || return 1
+    printf '%s/over-limit' "$dir"
+}
+
+# Path of one window's JSON stamp. A window name that could escape the
+# stamp directory is refused outright — the caller `rm -f`s this path.
+_over_limit_stamp_path() {
+    local window="$1" dir
+    [[ -n "$window" && "$window" != *"/"* && "$window" != .* ]] || return 1
+    dir=$(_over_limit_stamp_dir) || return 1
+    printf '%s/%s.json' "$dir" "$window"
+}
+
+# Read one string field out of a JSON file. Uses jq when present; the
+# sed fallback keeps the module working on a host without it, since
+# nothing else here depends on jq. Prints the empty string on any
+# miss, including a JSON `null`.
+_over_limit_json_field() {
+    local file="$1" field="$2" v=""
+    [[ -n "$file" && -f "$file" ]] || { printf ''; return 0; }
+    if command -v jq >/dev/null 2>&1; then
+        v=$(jq -r --arg f "$field" '.[$f] // ""' "$file" 2>/dev/null) || v=""
+    else
+        v=$(sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+            "$file" 2>/dev/null | head -n1) || v=""
+    fi
+    [[ "$v" != "null" ]] || v=""
+    printf '%s' "$v"
+}
+
+# The session that owned the pane NOW (see the block comment above).
+_over_limit_live_session() {
+    local window="$1" role="$2" dir pin v
+    dir=$(_over_limit_state_dir) || { printf ''; return 0; }
+    if [[ "$role" == "orchestrator" ]]; then
+        pin="$dir/orchestrator-session-id"
+        [[ -f "$pin" ]] || { printf ''; return 0; }
+        v=$(head -n1 "$pin" 2>/dev/null) || v=""
+        # The pin is written with a trailing newline; strip any stray
+        # whitespace so the comparison is on the id alone.
+        printf '%s' "${v//[[:space:]]/}"
+        return 0
+    fi
+    [[ -n "$window" && "$window" != *"/"* && "$window" != .* ]] \
+        || { printf ''; return 0; }
+    _over_limit_json_field "$dir/heartbeat/$window.json" "session_id"
+}
+
+# The session to STAMP into a new row: the suspended one when the hook
+# recorded it, else whoever owns the pane now.
+_over_limit_resolve_session() {
+    local window="$1" role="$2" sid="" path
+    if path=$(_over_limit_stamp_path "$window" 2>/dev/null); then
+        sid=$(_over_limit_json_field "$path" "session_id")
+    fi
+    [[ -n "$sid" ]] || sid=$(_over_limit_live_session "$window" "$role")
+    printf '%s' "$sid"
+}
+
+# Exit 0 only on a POSITIVE mismatch — both sides known, and different.
+# An unknown id on either side is not evidence of a rotation.
+_over_limit_session_rotated() {
+    local window="$1" role="$2" row_session="$3" live
+    [[ -n "$row_session" ]] || return 1
+    live=$(_over_limit_live_session "$window" "$role")
+    [[ -n "$live" ]] || return 1
+    [[ "$live" != "$row_session" ]]
+}
+
+# Retire the hook-written per-window stamp. Called from
+# _over_limit_drop so the JSON never outlives the TSV row: see the
+# _over_limit_drop contract in the header for why a row-only drop
+# re-latches. Best-effort — a stamp we cannot remove must not keep the
+# row alive.
+_over_limit_retire_stamp() {
+    local window="$1" path
+    [[ -n "$window" ]] || return 0
+    path=$(_over_limit_stamp_path "$window" 2>/dev/null) || return 0
+    [[ -f "$path" ]] || return 0
+    rm -f "$path" 2>/dev/null || true
+    "$_OVER_LIMIT_LOG_FN" \
+        "over-limit: retired the per-window stamp for '${window}' (${path})"
+}
+
+# The session id stored on a row, or empty. Lets a rewrite carry the
+# field forward without threading it through every caller's arg list —
+# an arity change on the shared helpers is the failure mode that
+# silently breaks a running watcher mid-source-set.
+_over_limit_row_session() {
+    local row
+    row=$(_over_limit_load "$1" 2>/dev/null) || { printf ''; return 0; }
+    awk -F'\t' 'NR==1 {print $9}' <<<"$row"
+}
+
 # Convert a reset_at token to a unix epoch. See header for shape rules.
 # Always prints an integer epoch; never fails the pipeline.
 _over_limit_reset_at_to_epoch() {
@@ -350,22 +505,34 @@ _over_limit_hold_expired() {
 # suppressed 889 emits over 6h36m while the pane itself probed
 # `state=busy active=1`.
 _over_limit_orchestrator_paused() {
-    local path row now reset_epoch first_seen
+    local path row now window role reset_epoch first_seen session
     path=$(_over_limit_state_path) || return 1
     [[ -f "$path" ]] || return 1
     row=$(awk -F'\t' '$1 == "_orchestrator" { print; found=1; exit } END { exit !found }' "$path") \
         || return 1
-    IFS=$'\t' read -r _ _ _ _ reset_epoch first_seen _ _ <<<"$row"
+    IFS=$'\t' read -r _ window role _ reset_epoch first_seen _ _ session <<<"$row"
     now=$(date +%s)
     _over_limit_hold_expired "$first_seen" "$reset_epoch" "$now" && return 1
+    # A row belonging to a session that no longer occupies the pane
+    # holds nothing (issue #161). The wake loop is what DROPS such a
+    # row, and this predicate must not depend on the wake loop having
+    # run — the wake is not due until reset_epoch + margin, while a
+    # rotation inside a live hold closes this gate immediately. Same
+    # independence argument as the staleness bound above.
+    _over_limit_session_rotated "$window" "$role" "$session" && return 1
     return 0
 }
 
 # Atomic rewrite: read all rows, replace any with matching key, append
 # the new row, rename into place.
+# `session` ($9) is optional: an omitted value writes an empty ninth
+# field, which reads back as "session unknown" and skips the identity
+# test. Optional rather than required so an in-memory caller from an
+# older source set still writes a well-formed row.
 _over_limit_write_row() {
     local key="$1" window="$2" role="$3" token="$4"
     local reset_epoch="$5" first_seen="$6" next_attempt="$7" attempts="$8"
+    local session="${9:-}"
     local path tmp dir
     path=$(_over_limit_state_path) || return 1
     dir=$(dirname "$path")
@@ -374,9 +541,10 @@ _over_limit_write_row() {
     if [[ -f "$path" ]]; then
         awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$key" "$window" "$role" "$token" \
         "$reset_epoch" "$first_seen" "$next_attempt" "$attempts" \
+        "$session" \
         >> "$tmp"
     mv "$tmp" "$path"
 }
@@ -386,20 +554,27 @@ _over_limit_record() {
     [[ -n "$key_raw" && -n "$window" && -n "$role" ]] || return 1
     local key
     key=$(_over_limit_sanitize_key "$key_raw")
-    local now reset_epoch wake_margin first_seen attempts
+    local now reset_epoch wake_margin first_seen attempts session
     now=$(date +%s)
     reset_epoch=$(_over_limit_reset_at_to_epoch "$token" "$now")
     wake_margin="${MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS:-300}"
     [[ "$wake_margin" =~ ^[0-9]+$ ]] || wake_margin=300
     first_seen=$now
     attempts=0
+    # The session that owns this suspension (issue #161). Resolved on
+    # every refresh, not just on insert: a refresh re-reads a pane that
+    # STILL renders over-limit, so the freshest answer is the right one.
+    # An unresolvable id falls back to whatever the row already carried,
+    # so a transient read failure never erases a known identity.
+    session=$(_over_limit_resolve_session "$window" "$role")
     local existing
     if existing=$(_over_limit_load "$key"); then
-        local existing_token existing_reset existing_first existing_attempts
-        IFS=$'\t' read -r _ _ _ existing_token existing_reset existing_first _ existing_attempts \
+        local existing_token existing_reset existing_first existing_attempts existing_session
+        IFS=$'\t' read -r _ _ _ existing_token existing_reset existing_first _ existing_attempts existing_session \
             <<<"$existing"
         [[ "$existing_first" =~ ^[0-9]+$ ]] && first_seen="$existing_first"
         [[ "$existing_attempts" =~ ^[0-9]+$ ]] && attempts="$existing_attempts"
+        [[ -n "$session" ]] || session="$existing_session"
         # DEADLINE FREEZE (issue #500). A reset_at token is a bare
         # wall-clock string with no date ("5:30pm_America/Los_Angeles").
         # _over_limit_reset_at_to_epoch resolves it against TODAY and
@@ -433,15 +608,25 @@ _over_limit_record() {
     # stamp longer than the reset window suggested. Lower bound is now.
     (( next_attempt > now )) || next_attempt=$(( now + wake_margin ))
     _over_limit_write_row "$key" "$window" "$role" "$token" \
-        "$reset_epoch" "$first_seen" "$next_attempt" "$attempts"
+        "$reset_epoch" "$first_seen" "$next_attempt" "$attempts" "$session"
 }
 
 _over_limit_drop() {
-    local key_raw="$1"
+    local key_raw="$1" window="${2:-}"
     [[ -n "$key_raw" ]] || return 1
-    local key path tmp
+    local key path tmp row
     key=$(_over_limit_sanitize_key "$key_raw")
     path=$(_over_limit_state_path) || return 1
+    # Retire the JSON stamp alongside the row. The window comes from the
+    # row itself unless the caller named one, because the key is NOT the
+    # window for an orchestrator row (`_orchestrator` is a role constant).
+    # This runs BEFORE the row rewrite — the row is where the window name
+    # lives, so reading it afterwards would read nothing.
+    if [[ -z "$window" ]]; then
+        row=$(_over_limit_load "$key" 2>/dev/null) || row=""
+        [[ -n "$row" ]] && window=$(awk -F'\t' 'NR==1 {print $2}' <<<"$row")
+    fi
+    _over_limit_retire_stamp "$window"
     [[ -f "$path" ]] || return 0
     tmp=$(mktemp "${path}.XXXXXX")
     awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
@@ -646,7 +831,7 @@ _over_limit_failopen() {
     fi
     "$_OVER_LIMIT_PASTE_FN" "$window" "$body" || true
     rm -f "$body"
-    _over_limit_drop "$key"
+    _over_limit_drop "$key" "$window"
 }
 
 # "Still suspended" step: increment attempts, and at MAX_ATTEMPTS FAIL
@@ -689,8 +874,8 @@ _over_limit_bump_or_failopen() {
 # injected _OVER_LIMIT_PASTE_FN.
 _over_limit_evaluate_row() {
     local row="$1" now="$2"
-    local key window role token reset_epoch first_seen next_attempt attempts
-    IFS=$'\t' read -r key window role token reset_epoch first_seen next_attempt attempts \
+    local key window role token reset_epoch first_seen next_attempt attempts session
+    IFS=$'\t' read -r key window role token reset_epoch first_seen next_attempt attempts session \
         <<<"$row"
     [[ -n "$key" ]] || return 0
 
@@ -723,6 +908,27 @@ _over_limit_evaluate_row() {
         return 0
     fi
 
+    # SESSION IDENTITY — the pane may keep its name across a change of
+    # occupant (issue #161). A context rotation cold-spawns a new
+    # orchestrator session into a window of the SAME name, so the name
+    # lookup below still resolves, the healthy new session probes
+    # `idle`, and the resumption branch pastes IT the predecessor's
+    # recovery brief. Drop the row instead, with NO paste: the brief
+    # describes an outage this session never had, and the hold it
+    # represents belongs to a session that is gone.
+    #
+    # LIKE THE CEILING ABOVE, THIS RUNS BEFORE THE DUE-GATE. A rotation
+    # inside a live hold is the damaging case: the pause predicate reads
+    # the row on every cycle while the wake is not due until
+    # reset_epoch + margin, so a check behind the due-gate would leave a
+    # healthy session suppressed for up to the whole remaining hold.
+    if _over_limit_session_rotated "$window" "$role" "$session"; then
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: '${window}' (key=${key}) was stamped for session ${session}, which no longer occupies the pane; the session was replaced — dropping stamp without a paste"
+        _over_limit_drop "$key" "$window"
+        return 0
+    fi
+
     # Not due yet — leave the row alone. `next_attempt` is guarded the
     # same way `first_seen` is above: bash arithmetic evaluates array
     # subscripts, so a non-numeric field is a code path, not a syntax
@@ -745,7 +951,10 @@ _over_limit_evaluate_row() {
     if [[ -z "$probe_target" ]]; then
         "$_OVER_LIMIT_LOG_FN" \
             "over-limit: window '${window}' (key=${key}) absent at wake; dropping stamp"
-        _over_limit_drop "$key"
+        # Pass the window explicitly. This is the path a RETIRED worker
+        # window takes, and its JSON stamp is exactly the one a later
+        # window of the same name would re-latch off (issue #161).
+        _over_limit_drop "$key" "$window"
         return 0
     fi
 
@@ -771,7 +980,7 @@ _over_limit_evaluate_row() {
         absent|blocked)
             "$_OVER_LIMIT_LOG_FN" \
                 "over-limit: '${window}' (key=${key}) reads ${state}; pane lost during suspension — dropping stamp"
-            _over_limit_drop "$key"
+            _over_limit_drop "$key" "$window"
             ;;
         idle|autosuggest-only|empty|busy|user-typing|working-background|working-self-paced|idle-orphan-async)
             # Resumption. ALL of these mean the pane is alive and
@@ -815,7 +1024,7 @@ _over_limit_evaluate_row() {
             if "$_OVER_LIMIT_PASTE_FN" "$window" "$body"; then
                 "$_OVER_LIMIT_LOG_FN" \
                     "over-limit: '${window}' resumed (suspended ${duration}s); resume brief pasted"
-                _over_limit_drop "$key"
+                _over_limit_drop "$key" "$window"
             else
                 "$_OVER_LIMIT_LOG_FN" \
                     "over-limit: '${window}' transitioned out but paste failed; will retry next cycle"
@@ -859,8 +1068,15 @@ _over_limit_apply_backoff() {
     (( delay > cap )) && delay=$cap
     (( delay < initial )) && delay=$initial
     local next_attempt=$(( now + delay ))
+    # Carry the row's session id (issue #161) through the rewrite. Read
+    # from the row rather than taken as a ninth argument: every caller
+    # of this helper would otherwise need a new argument, and an arity
+    # change on a shared helper is what silently breaks a watcher whose
+    # in-memory functions call an updated copy on disk.
+    local session
+    session=$(_over_limit_row_session "$key")
     _over_limit_write_row "$key" "$window" "$role" "$token" \
-        "$reset_epoch" "$first_seen" "$next_attempt" "$attempts"
+        "$reset_epoch" "$first_seen" "$next_attempt" "$attempts" "$session"
 }
 
 _over_limit_load_next_attempt() {
