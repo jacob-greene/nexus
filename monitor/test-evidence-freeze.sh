@@ -16,7 +16,7 @@
 # sequence against the guard and asserts the baseline survives.
 #
 # Every assertion here was watched fail against a mutated script before
-# it was trusted (see the mutation table in the PR body). Twenty-one
+# it was trusted (see the mutation table in the PR body). Thirty-nine
 # mutations are on record and every one turns at least one case RED.
 #
 # A SUITE WITH NO SURVIVING MUTANT IS A CLAIM, NOT A FACT, and on this
@@ -37,19 +37,51 @@
 #   RED, because the fallback quietly covered for it. A new assertion
 #   can subtract coverage. Cases 11b and 11c pin the two paths apart.
 #
+#   Round 4. Option B was built: the out-of-band freeze log. The first
+#   version of cases 20 to 28 claimed no survivors over eighteen new
+#   mutations. Four survived. Every one of the four was a FALSE CLEAN —
+#   a directory reported clean whose bytes had changed — which is the
+#   one failure mode this whole check exists to remove:
+#
+#     * `_json_escape` losing its backslash branch. Cases 20 to 29 all
+#       used paths with no backslash in them. Case 30.
+#     * `_abs_dir` returning its argument unchanged. Every case handed
+#       the SAME absolute path to both sides, so the two agreed by
+#       accident. Case 32.
+#     * the `--verify` shared lock, which nothing sequential can see.
+#       Case 31 blocks the lock and times the wait.
+#     * the JSON extractor's key-boundary rule. The first attempt at
+#       case 29 could not kill it, because this script escapes every
+#       value it writes, so no line it writes can hold the decoy. The
+#       rule guards a HAND-EDITED row, and case 29b is that row.
+#
+# Round 4 also cost the script a real bug that no mutation found, but
+# that writing case 30 did: `awk -v want="$path"` runs the value through
+# awk's escape processing, so an evidence directory whose path held a
+# backslash never joined to its own log rows. It reported "0 of 1
+# recorded out of band" on a file it had just frozen. All three `awk`
+# readers now take the value through `ENVIRON` instead.
+#
 # The pattern in the first two rounds is the same. Each author wrote the
 # mutations that matched what they had just been thinking about, then
 # read a green suite as coverage. The four in round 2 all sat on
 # behaviour the script header states as a PROMISE, and none of the
 # promises had an assertion behind them.
 #
-# Two rules follow, and round 3 is why the second one is here:
+# Three rules follow. Round 3 is why the second one is here, round 4 the
+# third:
 #
 #   1. If you add a promise to the script header, add the case that
 #      fails when it stops being true.
 #   2. If you add a fallback, re-run the WHOLE mutation set, not just
 #      the mutations for the code you added. A fallback that makes a
 #      failing path succeed also makes a deleted check invisible.
+#   3. Vary the FIXTURE, not only the code. Three of round 4's four
+#      survivors lived in code that every case executed. They survived
+#      because every case fed that code the same SHAPE of input: an
+#      absolute path, holding no backslash, read by one process at a
+#      time. Ask what all your fixtures have in common, then write the
+#      case that does not.
 #
 # Hermetic: everything happens under a fresh mktemp -d. No tmux, no
 # network, no state outside the temp dir.
@@ -111,7 +143,24 @@ skip() {
 TMP=$(mktemp -d)
 trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 
+# The out-of-band freeze log MUST be inside the temp dir, or the suite
+# writes rows into the live `monitor/.state/` on every run. Most cases
+# pass `--dir` with no `NEXUS_STATE_DIR`, and the script's state-dir
+# fallback is its OWN directory, so without this export the suite is
+# not hermetic. One log for the whole suite is also the realistic
+# shape: one shared record, many evidence directories.
+export NEXUS_FREEZE_LOG="$TMP/freeze-log.jsonl"
+
 md5of() { md5sum < "$1" | cut -d' ' -f1; }
+
+# Rows in the freeze log for one evidence directory, resolved the same
+# way the script resolves it.
+# `grep -c` prints 0 AND exits 1 on no match, so an `|| echo 0` fallback
+# emits TWO zeroes. Count the lines instead.
+freeze_log_rows() {
+    local d; d=$(cd "$1" && pwd -P)
+    command grep "\"dir\":\"$d\"" "$NEXUS_FREEZE_LOG" 2>/dev/null | wc -l | tr -d ' '
+}
 
 # ---------------------------------------------------------------------------
 echo "=== 1. a first freeze writes a read-only copy and an append-only manifest"
@@ -305,28 +354,50 @@ mkdir -p "$W/empty"
 assert_eq "verify of a dir with no manifest exits 5" "$rc" "5"
 
 # ---------------------------------------------------------------------------
-echo "=== 10. KNOWN LIMIT: remove-and-recreate is not prevented"
+echo "=== 10. remove-and-recreate is DETECTED, out of band (option B)"
 # ---------------------------------------------------------------------------
-# Mode 0440 stops a WRITE, not an UNLINK. The evidence directory is
-# writable, so the owning uid can remove a freeze and its manifest and
-# put new bytes under the old name. This case pins the current truth so
-# the suite is never read as proof of impossibility. If the guard is
-# later hardened — by holding the DIRECTORY read-only between freezes —
-# this case turns RED, and that is the correct signal to update it.
+# This case used to pin remove-and-recreate as WORKING. Option B is now
+# built, so it pins the same sequence as DETECTED. It was written to
+# turn RED exactly when the guard was hardened, and it did.
+#
+# Read the two halves apart, because the difference is the whole claim
+# of option B:
+#
+#   PREVENTION — unchanged. Mode 0440 stops a WRITE, not an UNLINK. The
+#   evidence directory is still mode 0770, the `rm` still succeeds, and
+#   the substituted bytes really are what is stored afterwards. Nothing
+#   in option B stops any of that, and the assertions below say so.
+#
+#   DETECTION — new. The rebuilt directory is INTERNALLY CONSISTENT: a
+#   bare `md5sum -c` inside it passes, because the manifest was
+#   regenerated over the new bytes. Every check that reads only this
+#   directory is satisfied. `--verify` fails anyway, with exit 8,
+#   because the hash recorded OUTSIDE the directory is the baseline's.
 W="$TMP/w10"; mkdir -p "$W/code"
 printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
 "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
 printf 'REPLACEMENT\n' > "$W/code/nb.txt"
 REPL_MD5=$(md5of "$W/code/nb.txt")
 
 rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"; rm_rc=$?
-assert_eq "rm of a mode-0440 freeze succeeds (dir is writable)" "$rm_rc" "0"
+assert_eq "rm of a mode-0440 freeze still succeeds (dir is writable)" "$rm_rc" "0"
 cp -p "$W/code/nb.txt" "$W/ev/nb.PRE.txt"
 ( cd "$W/ev" && md5sum ./*.txt > MANIFEST.md5 )
 chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
-"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
-assert_eq "verify still reports clean after remove-and-recreate" "$rc" "0"
-assert_eq "the substituted bytes are what is stored" \
+
+# The rebuilt directory passes every check that reads only itself.
+( cd "$W/ev" && md5sum -c MANIFEST.md5 >/dev/null 2>&1 ); chk_rc=$?
+assert_eq "the rebuilt directory is internally consistent" "$chk_rc" "0"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "verify of a remove-and-recreate exits 8" "$rc" "8"
+assert_contains "verify names the freeze-log mismatch" "$out" "FREEZE-LOG MISMATCH: nb.PRE.txt"
+assert_contains "verify prints the hash recorded out of band" "$out" "$BASE_MD5"
+assert_contains "verify prints the hash now on disk" "$out" "$REPL_MD5"
+
+# Detection, not prevention. The bytes really were replaced.
+assert_eq "the substituted bytes are still what is stored" \
     "$(md5of "$W/ev/nb.PRE.txt")" "$REPL_MD5"
 
 # ---------------------------------------------------------------------------
@@ -670,6 +741,446 @@ printf 'x  sub/dir/NOT-EVIDENCE.md\n' > "$W/ev/MANIFEST.md5"
 out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
 assert_contains "a different basename does not account for the file" \
     "$out" "UNRECORDED file: EVIDENCE.md"
+
+# ---------------------------------------------------------------------------
+echo "=== 20. the freeze log records the fields the header names"
+# ---------------------------------------------------------------------------
+# The header documents a schema, and a schema with no assertion behind
+# it is a comment. Every field the cross-check or a reader depends on is
+# checked here, by name.
+W="$TMP/w20"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+out=$("$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1)
+assert_contains "stdout names the freeze log" "$out" "logged $NEXUS_FREEZE_LOG"
+assert_eq "exactly one row was appended for this dir" "$(freeze_log_rows "$W/ev")" "1"
+
+EVABS=$(cd "$W/ev" && pwd -P)
+row=$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" | head -1)
+assert_contains "the row carries a schema version" "$row" '{"v":1,'
+assert_contains "the row carries the event type"   "$row" '"event":"freeze"'
+assert_contains "the row carries the frozen name"  "$row" '"name":"nb.PRE.txt"'
+assert_contains "the row carries the md5"          "$row" "\"md5\":\"$BASE_MD5\""
+assert_contains "the row carries the byte count"   "$row" '"bytes":9'
+assert_contains "the row carries the source path"  "$row" "\"src\":\"$W/code/nb.txt\""
+assert_contains "the row carries a timestamp"      "$row" '"ts":"20'
+
+# The log is held read-only between appends, exactly like the manifest.
+assert_eq "the freeze log is mode 0440 between appends" \
+    "$(stat -c '%a' "$NEXUS_FREEZE_LOG")" "440"
+
+# ---------------------------------------------------------------------------
+echo "=== 21. THE LIMIT THAT REMAINS: a consistent edit in two places passes"
+# ---------------------------------------------------------------------------
+# Option B does not make tampering impossible. It makes tampering need a
+# consistent edit in TWO places, one of them shared. This case runs that
+# edit and pins it as PASSING, so the suite is never read as proof of
+# impossibility — the job case 10 used to do.
+W="$TMP/w21"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+printf 'REPLACEMENT\n' > "$W/code/nb.txt"
+REPL_MD5=$(md5of "$W/code/nb.txt")
+EVABS=$(cd "$W/ev" && pwd -P)
+
+# Place one: the evidence directory.
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+cp "$W/code/nb.txt" "$W/ev/nb.PRE.txt"
+( cd "$W/ev" && md5sum nb.PRE.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+
+# Detected, before the second edit.
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "one-place edit alone is detected" "$rc" "8"
+
+# Place two: the shared freeze log. Same uid, so this is one sed away.
+chmod u+w "$NEXUS_FREEZE_LOG"
+sed -i "s|\(\"dir\":\"$EVABS\".*\)$BASE_MD5|\1$REPL_MD5|" "$NEXUS_FREEZE_LOG"
+chmod 0440 "$NEXUS_FREEZE_LOG"
+assert_contains "the log now records the substituted hash" \
+    "$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG")" "$REPL_MD5"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a CONSISTENT two-place edit is NOT detected — the limit" "$rc" "0"
+assert_contains "and it is still reported as covered" "$out" "covers 1 of 1"
+
+# The cheaper second edit: delete the row instead of rewriting it. The
+# file then has no out-of-band record, which PASSES — but never
+# silently. The uncovered notice is the whole of decision 4.
+W="$TMP/w21b"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+EVABS=$(cd "$W/ev" && pwd -P)
+printf 'REPLACEMENT\n' > "$W/code/nb.txt"
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+cp "$W/code/nb.txt" "$W/ev/nb.PRE.txt"
+( cd "$W/ev" && md5sum nb.PRE.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+chmod u+w "$NEXUS_FREEZE_LOG"
+command grep -v "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" > "$TMP/fl.tmp"
+cat "$TMP/fl.tmp" > "$NEXUS_FREEZE_LOG"
+chmod 0440 "$NEXUS_FREEZE_LOG"
+assert_eq "the row is gone" "$(freeze_log_rows "$W/ev")" "0"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a deleted row leaves the file uncovered, and that PASSES" "$rc" "0"
+assert_contains "the uncovered file is counted" "$out" "0 of 1 top-level file(s) recorded out of band"
+assert_contains "the uncovered file is explained" "$out" "this check cannot cover them"
+assert_contains "the clean verdict itself carries the coverage" "$out" "verified clean (freeze-log covers 0 of 1)"
+
+# ---------------------------------------------------------------------------
+echo "=== 22. a logged freeze that is simply GONE is reported"
+# ---------------------------------------------------------------------------
+# The bypass has a lazier form: remove the freeze and do not recreate
+# it, then regenerate the manifest over what is left. Nothing inside the
+# directory then names the missing file, so md5sum -c passes and exit 6
+# never fires. Only the out-of-band record still knows it existed.
+W="$TMP/w22"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+printf 'OTHER\n' > "$W/code/other.txt"
+"$FREEZE_BIN" "$W/code/other.txt" --dir "$W/ev" --as other.txt >/dev/null 2>&1
+
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+( cd "$W/ev" && md5sum other.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/MANIFEST.md5"
+( cd "$W/ev" && md5sum -c MANIFEST.md5 >/dev/null 2>&1 ); chk_rc=$?
+assert_eq "the pruned directory is internally consistent" "$chk_rc" "0"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a logged freeze that is gone exits 8" "$rc" "8"
+assert_contains "the missing freeze is named" "$out" "LOGGED FREEZE MISSING: nb.PRE.txt"
+assert_contains "its recorded hash is printed" "$out" "$BASE_MD5"
+
+# ---------------------------------------------------------------------------
+echo "=== 23. two log rows for one name are the bypass run THROUGH the script"
+# ---------------------------------------------------------------------------
+# This script cannot write two rows for one name: the target refuses to
+# be clobbered and the manifest refuses the name. So a second row means
+# the directory was emptied and re-frozen — the same bypass, using the
+# tool instead of working around it.
+W="$TMP/w23"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+printf 'REPLACEMENT\n' > "$W/code/nb.txt"
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1; rc=$?
+assert_eq "re-freezing into an emptied dir succeeds (nothing local forbids it)" "$rc" "0"
+assert_eq "the log now holds two rows for this dir" "$(freeze_log_rows "$W/ev")" "2"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a duplicate log row exits 8" "$rc" "8"
+assert_contains "the duplicate is named" "$out" "DUPLICATE freeze-log entry for nb.PRE.txt"
+
+# ---------------------------------------------------------------------------
+echo "=== 24. the record outlives the evidence directory"
+# ---------------------------------------------------------------------------
+# The point of putting the record OUT of the directory: removing the
+# directory must not remove the evidence that it existed.
+W="$TMP/w24"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+EVABS=$(cd "$W/ev" && pwd -P)
+
+# The log is not in the evidence directory, so it never trips exit 6.
+if [[ -e "$W/ev/$(basename "$NEXUS_FREEZE_LOG")" ]]; then
+    assert_eq "the freeze log is NOT inside the evidence dir" "inside" "outside"
+else
+    assert_eq "the freeze log is NOT inside the evidence dir" "outside" "outside"
+fi
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "a freshly frozen dir verifies clean" "$rc" "0"
+
+chmod -R u+w "$W/ev"; rm -rf "$W/ev"
+if [[ -d "$W/ev" ]]; then
+    assert_eq "the evidence dir is gone" "present" "gone"
+else
+    assert_eq "the evidence dir is gone" "gone" "gone"
+fi
+assert_eq "the record of the freeze survives it" \
+    "$(command grep -c "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG")" "1"
+assert_contains "and it still carries the frozen hash" \
+    "$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG")" "$BASE_MD5"
+
+# ---------------------------------------------------------------------------
+echo "=== 25. a writable freeze log is a broken invariant"
+# ---------------------------------------------------------------------------
+# Same rule as MANIFEST.md5, and the stakes are higher: one stray `>`
+# would drop the records for EVERY evidence directory, not just one.
+W="$TMP/w25"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+if (( EUID == 0 )); then
+    skip "a writable freeze log exits 5 (root: -w is true whatever the mode)"
+    skip "the writable freeze log is named (root)"
+else
+    chmod u+w "$NEXUS_FREEZE_LOG"
+    out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+    assert_eq "a writable freeze log exits 5" "$rc" "5"
+    assert_contains "the writable freeze log is named" "$out" "WRITABLE freeze-log.jsonl"
+    chmod 0440 "$NEXUS_FREEZE_LOG"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 26. exit 5 outranks exit 8, and exit 8 outranks exit 6"
+# ---------------------------------------------------------------------------
+# Three findings can fire at once, and the header states the order. An
+# order with no assertion behind it is a comment.
+W="$TMP/w26"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+
+# 8 alone: the logged bytes were replaced, and a rogue file is present.
+printf 'REPLACEMENT\n' > "$W/code/nb.txt"
+rm -f "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+cp "$W/code/nb.txt" "$W/ev/nb.PRE.txt"
+( cd "$W/ev" && md5sum nb.PRE.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+printf 'NOBODY RECORDED ME\n' > "$W/ev/rogue.txt"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a log mismatch outranks an unrecorded file" "$rc" "8"
+assert_contains "the unrecorded file is still reported" "$out" "UNRECORDED file: rogue.txt"
+
+# 5 as well: now the manifest is writable too.
+chmod u+w "$W/ev/MANIFEST.md5"
+if (( EUID == 0 )); then
+    skip "a broken invariant outranks a log mismatch (root bypasses mode 0440)"
+else
+    out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+    assert_eq "a broken invariant outranks a log mismatch" "$rc" "5"
+    assert_contains "the log mismatch is still reported" "$out" "FREEZE-LOG MISMATCH"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 27. concurrent freezes do not interleave in the log"
+# ---------------------------------------------------------------------------
+# Several agents freeze at once and the state dir is on NFS, where an
+# O_APPEND write is not guaranteed atomic. Each append takes an
+# exclusive flock. N parallel freezes must leave exactly N well-formed
+# rows — never a half line, never two lines spliced into one.
+#
+# N is fixed and the loop waits for every child, so this cannot grow an
+# unbounded process tree.
+W="$TMP/w27"; mkdir -p "$W/code" "$W/ev"
+N=12
+for i in $(seq 1 "$N"); do printf 'PAYLOAD %s\n' "$i" > "$W/code/nb$i.txt"; done
+for i in $(seq 1 "$N"); do
+    "$FREEZE_BIN" "$W/code/nb$i.txt" --dir "$W/ev" --as "nb$i.txt" >/dev/null 2>&1 &
+done
+wait
+assert_eq "every concurrent freeze landed one row" "$(freeze_log_rows "$W/ev")" "$N"
+assert_eq "every concurrent freeze landed one file" \
+    "$(find "$W/ev" -maxdepth 1 -type f -name 'nb*.txt' | wc -l)" "$N"
+
+# A spliced line would be a row that is not exactly one JSON object.
+EVABS=$(cd "$W/ev" && pwd -P)
+malformed=0
+while IFS= read -r line; do
+    [[ "$line" == '{"v":1,'*'}' ]] || { malformed=$(( malformed + 1 )); continue; }
+    # One object per line: no `}{` splice, and exactly one md5 field.
+    [[ "$line" == *'}{'* ]] && malformed=$(( malformed + 1 ))
+    [[ "$(command grep -o '"md5":' <<< "$line" | wc -l)" == "1" ]] || malformed=$(( malformed + 1 ))
+done < <(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG")
+assert_eq "no row is spliced or truncated" "$malformed" "0"
+
+# The manifest took the same N appends, and verify agrees with the log.
+assert_eq "the manifest took every concurrent append" \
+    "$(wc -l < "$W/ev/MANIFEST.md5")" "$N"
+"$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+assert_eq "the concurrently-built dir verifies clean" "$rc" "0"
+
+# ---------------------------------------------------------------------------
+echo "=== 28. an UNSERIALISED append is announced, never silent"
+# ---------------------------------------------------------------------------
+# The lock can fail to be taken. The append still happens, because
+# losing the record is worse than an unserialised one — but the caller
+# has to be told which kind of append it got. A silent unlocked append
+# would be a success message standing in for a check nobody ran.
+#
+# A PATH-front `flock` stub that always fails is the portable way to
+# reach that branch.
+W="$TMP/w28"; mkdir -p "$W/code" "$W/stub"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+printf '#!/bin/sh\nexit 1\n' > "$W/stub/flock"
+chmod +x "$W/stub/flock"
+out=$( PATH="$W/stub:$PATH" "$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1 ); rc=$?
+assert_eq "an unlockable append still records the freeze" "$rc" "0"
+assert_contains "the unserialised append is announced" "$out" "WITHOUT a lock"
+assert_contains "and the risk is named" "$out" "could interleave"
+assert_eq "the row landed anyway" "$(freeze_log_rows "$W/ev")" "1"
+
+# The normal path says nothing of the kind.
+W="$TMP/w28b"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+out=$("$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt 2>&1)
+assert_not_contains "a locked append prints no warning" "$out" "WITHOUT a lock"
+
+# ---------------------------------------------------------------------------
+echo "=== 29. a field name inside a VALUE is not read as the field"
+# ---------------------------------------------------------------------------
+# The freeze log is read by a hand-written JSON extractor, because this
+# script may not assume a JSON parser is installed. The extractor
+# requires a key to START a field (`{"k":"` or `,"k":"`), and the header
+# says so. That rule had no assertion behind it: a skeptic-style
+# mutation that dropped the boundary left the whole suite green.
+#
+# The fixture is a frozen name that CONTAINS `"md5":"0`. If the
+# extractor matched the key anywhere, it would read `0` as the recorded
+# hash, and a clean directory would report a mismatch.
+W="$TMP/w29"; mkdir -p "$W/code"
+DECOY='nb"md5":"0.txt'
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as "$DECOY" >/dev/null 2>&1; rc=$?
+assert_eq "a name holding a decoy field freezes" "$rc" "0"
+
+EVABS=$(cd "$W/ev" && pwd -P)
+row=$(command grep "\"dir\":\"$EVABS\"" "$NEXUS_FREEZE_LOG" | head -1)
+assert_contains "the quotes in the name are escaped" "$row" '"name":"nb\"md5\":\"0.txt"'
+assert_contains "the real md5 field is still present" "$row" "\"md5\":\"$BASE_MD5\""
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "the decoy is not read as the recorded hash" "$rc" "0"
+assert_contains "and the file counts as covered" "$out" "covers 1 of 1"
+
+# It really is being compared, not skipped: change the bytes and the
+# cross-check must fire.
+chmod u+w "$W/ev/$DECOY" "$W/ev/MANIFEST.md5"
+printf 'SUBSTITUTED\n' > "$W/ev/$DECOY"
+( cd "$W/ev" && md5sum -- "$DECOY" > MANIFEST.md5 )
+chmod 0440 "$W/ev/$DECOY" "$W/ev/MANIFEST.md5"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "substituted bytes under a decoy name still exit 8" "$rc" "8"
+assert_contains "the real recorded hash is the one printed" "$out" "$BASE_MD5"
+
+# The escaping above means this script can never WRITE a line whose raw
+# text holds a stray `"md5":"`. The key-boundary rule therefore guards a
+# row that this script did not write — and the freeze log is a shared,
+# hand-editable file, so that row is exactly the adversary. The fixture
+# below is DELIBERATELY malformed: `xx"md5":"<zeros>` sits ahead of the
+# real field. An extractor that matched the key anywhere would read the
+# zeros and report a mismatch on a clean directory.
+W="$TMP/w29b"; mkdir -p "$W/ev"
+printf 'BASELINE\n' > "$W/ev/nb.txt"
+BASE_MD5=$(md5of "$W/ev/nb.txt")
+( cd "$W/ev" && md5sum nb.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.txt" "$W/ev/MANIFEST.md5"
+EVABS=$(cd "$W/ev" && pwd -P)
+ZEROS=00000000000000000000000000000000
+chmod u+w "$NEXUS_FREEZE_LOG"
+printf '{"v":1,"ts":"2026-01-01T00:00:00-0000","event":"freeze","dir":"%s","name":"nb.txt","xx"md5":"%s,"md5":"%s","bytes":9,"src":"x","window":""}\n' \
+    "$EVABS" "$ZEROS" "$BASE_MD5" >> "$NEXUS_FREEZE_LOG"
+chmod 0440 "$NEXUS_FREEZE_LOG"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a decoy key ahead of the real field is not read as the field" "$rc" "0"
+assert_not_contains "the zeros are never taken for the recorded hash" "$out" "$ZEROS"
+assert_contains "the crafted row still counts as coverage" "$out" "covers 1 of 1"
+
+# ---------------------------------------------------------------------------
+echo "=== 30. a backslash in the evidence path still joins to its own rows"
+# ---------------------------------------------------------------------------
+# Two mechanisms have to agree for this to work, and neither had a case
+# behind it. `_json_escape` must escape the backslash on the way in, and
+# the reader must pass the wanted path to awk through ENVIRON rather
+# than `awk -v`, which runs the value through awk's escape processing.
+#
+# The failure this pins is a FALSE CLEAN, not a loud error. Measured
+# with `awk -v` in place: a directory named `ev\dir` reported "0 of 1
+# recorded out of band" for a file it had just frozen.
+W="$TMP/w30"; mkdir -p "$W/code"
+BSDIR='ev\dir'
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/$BSDIR" --as nb.PRE.txt >/dev/null 2>&1; rc=$?
+assert_eq "a backslashed evidence dir freezes" "$rc" "0"
+
+row=$(tail -1 "$NEXUS_FREEZE_LOG")
+assert_contains "the backslash is escaped in the row" "$row" 'ev\\dir'
+
+out=$("$FREEZE_BIN" --verify --dir "$W/$BSDIR" 2>&1); rc=$?
+assert_eq "a backslashed evidence dir verifies clean" "$rc" "0"
+assert_contains "its own row joins to it" "$out" "covers 1 of 1"
+
+# And the cross-check really runs there: substitute the bytes.
+chmod u+w "$W/$BSDIR/nb.PRE.txt" "$W/$BSDIR/MANIFEST.md5"
+printf 'SUBSTITUTED\n' > "$W/$BSDIR/nb.PRE.txt"
+( cd "$W/$BSDIR" && md5sum nb.PRE.txt > MANIFEST.md5 )
+chmod 0440 "$W/$BSDIR/nb.PRE.txt" "$W/$BSDIR/MANIFEST.md5"
+out=$("$FREEZE_BIN" --verify --dir "$W/$BSDIR" 2>&1); rc=$?
+assert_eq "substituted bytes in a backslashed dir exit 8" "$rc" "8"
+assert_contains "the recorded hash is printed" "$out" "$BASE_MD5"
+
+# ---------------------------------------------------------------------------
+echo "=== 31. --verify WAITS for an in-flight freeze instead of reading past it"
+# ---------------------------------------------------------------------------
+# `--verify` takes a SHARED lock before it reads the log. Without it, a
+# read that lands mid-append sees a torn last line, which parses as no
+# row at all — so the file it named drops silently to "uncovered" and
+# the directory reports clean. That is a false CLEAN again.
+#
+# The assertion is that `--verify` BLOCKS while an exclusive holder has
+# the lock. A holder sleeps 2 s; `--verify` must not return before 1 s.
+# The 1 s floor is half the hold, so ordinary scheduling jitter cannot
+# reach it.
+W="$TMP/w31"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+"$FREEZE_BIN" "$W/code/nb.txt" --dir "$W/ev" --as nb.PRE.txt >/dev/null 2>&1
+
+if ! command -v flock >/dev/null 2>&1; then
+    skip "--verify waits for an in-flight freeze (no flock on this host)"
+    skip "--verify still reports the directory clean afterwards (same)"
+else
+    ( flock -x 9; sleep 2 ) 9>>"$NEXUS_FREEZE_LOG.lock" &
+    holder=$!
+    sleep 0.5                      # let the holder take the lock
+    t0=$(date +%s%N)
+    "$FREEZE_BIN" --verify --dir "$W/ev" >/dev/null 2>&1; rc=$?
+    t1=$(date +%s%N)
+    wait "$holder" 2>/dev/null
+    elapsed_ms=$(( (t1 - t0) / 1000000 ))
+    if (( elapsed_ms >= 1000 )); then
+        assert_eq "--verify waits for an in-flight freeze" "waited" "waited"
+    else
+        assert_eq "--verify waits for an in-flight freeze" "returned in ${elapsed_ms}ms" "waited"
+    fi
+    assert_eq "--verify still reports the directory clean afterwards" "$rc" "0"
+fi
+
+# ---------------------------------------------------------------------------
+echo "=== 32. a relative --dir joins to the same rows as an absolute one"
+# ---------------------------------------------------------------------------
+# `dir` is the join key, so the freeze side and the verify side must
+# resolve a directory to the SAME string. `_abs_dir` is that one
+# function. Every other case passes an absolute path to both sides, so
+# a mutation that made `_abs_dir` return its argument unchanged left the
+# whole suite green — the two sides still agreed, by accident.
+#
+# Freeze with a RELATIVE `--dir` and verify with an absolute one. The
+# failure is a FALSE CLEAN: the row exists, but under a key nothing
+# looks up.
+W="$TMP/w32"; mkdir -p "$W/code"
+printf 'BASELINE\n' > "$W/code/nb.txt"
+BASE_MD5=$(md5of "$W/code/nb.txt")
+( cd "$W" && "$FREEZE_BIN" code/nb.txt --dir ev --as nb.PRE.txt >/dev/null 2>&1 ); rc=$?
+assert_eq "a relative --dir freezes" "$rc" "0"
+assert_eq "the row is keyed by the ABSOLUTE dir" "$(freeze_log_rows "$W/ev")" "1"
+
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "an absolute --verify of it is clean" "$rc" "0"
+assert_contains "and it joins to its own row" "$out" "covers 1 of 1"
+
+# The cross-check really runs across the two spellings.
+chmod u+w "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+printf 'SUBSTITUTED\n' > "$W/ev/nb.PRE.txt"
+( cd "$W/ev" && md5sum nb.PRE.txt > MANIFEST.md5 )
+chmod 0440 "$W/ev/nb.PRE.txt" "$W/ev/MANIFEST.md5"
+out=$("$FREEZE_BIN" --verify --dir "$W/ev" 2>&1); rc=$?
+assert_eq "a relative-frozen dir is still cross-checked" "$rc" "8"
+assert_contains "the recorded hash is printed" "$out" "$BASE_MD5"
 
 echo
 printf 'PASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"

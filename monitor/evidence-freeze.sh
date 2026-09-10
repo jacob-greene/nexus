@@ -13,8 +13,8 @@
 # bytes. `cp -p` compounds it: the copy keeps the SOURCE mtime, so the
 # replaced file does not even look freshly written. That sequence
 # destroyed an 11,648,117-byte baseline (`fb2c326b…`) on 2026-09-09; it
-# is unrecoverable. The three properties this script enforces are each
-# the inverse of one of those mistakes:
+# is unrecoverable. The first three properties this script enforces are
+# each the inverse of one of those mistakes:
 #
 #   1. REFUSE TO CLOBBER. An existing target is an error, never an
 #      overwrite. The first freeze under a name wins.
@@ -25,42 +25,61 @@
 #      script appends (`>>`) under a brief chmod, and refuses to append
 #      a name the manifest already records.
 #
+# A fourth property answers a mistake the incident did not make, but
+# that the first three cannot see:
+#
+#   4. OUT-OF-BAND RECORD. Every freeze also appends one line to a
+#      `freeze-log.jsonl` OUTSIDE the evidence directory, and
+#      `--verify` cross-checks the directory against it. Properties 1
+#      to 3 read only the evidence directory, so a directory that was
+#      emptied and rebuilt is self-consistent and passes all three.
+#      Property 4 is the only one that can see that.
+#
 # It also copies WITHOUT `-p`, so the frozen file's mtime is the time
 # the freeze happened — the evidence a reader needs.
 #
-# WHAT THIS DOES NOT PREVENT. Mode 0440 stops a WRITE to a frozen file.
-# It does not stop an UNLINK: the evidence directory itself is mode
-# 0770, so the owning uid can `rm` a freeze and its manifest, recreate
-# both, and `--verify` then reports clean on the new bytes. The guard
-# closes the accidental path — the two incident commands now fail with
-# EACCES — not a deliberate remove-and-recreate. `test-evidence-freeze.sh`
-# case 10 pins that limit so nobody reads the suite as proof of
-# impossibility.
+# WHAT MODE 0440 DOES NOT PREVENT. Mode 0440 stops a WRITE to a frozen
+# file. It does not stop an UNLINK: the evidence directory itself is
+# mode 0770, so the owning uid can `rm` a freeze and its manifest,
+# recreate both, and every check that reads only this directory then
+# reports clean on the new bytes.
 #
-# Two different options close that gap. The operator picks one; this
-# script implements neither, because the choice is a policy decision.
+# Two options were on the table to close that gap. The operator chose B
+# on 2026-09-09, and B is what this script now implements.
 #
-#   A. HOLD THE DIRECTORY READ-ONLY between freezes. Removing a file
-#      needs write permission on the DIRECTORY, never on the file, so
-#      this is the only local file mode that stops the unlink. It also
-#      blocks every other write into the directory (sub-directories,
-#      README notes), and the owning uid can chmod the directory back.
-#      Under one uid it adds a command; it is not a boundary.
-#   B. RECORD EACH FREEZE OUT OF BAND, and make `--verify` cross-check
-#      the directory manifest against that record. Directory
-#      permissions do not change at all. Two candidate records:
-#      `monitor/.state/action-log.jsonl` (or a dedicated
-#      `freeze-log.jsonl`), which already carries an
-#      `artefact-collision` event with `live-md5` and `reviewed-md5`
-#      fields; or a bot comment on the issue, which this uid cannot
-#      rewrite and whose edits carry a visible history. Tampering then
-#      needs a consistent edit in two places.
+#   A. HOLD THE DIRECTORY READ-ONLY between freezes — REJECTED.
+#      Removing a file needs write permission on the DIRECTORY, never
+#      on the file, so this is the only local file mode that stops the
+#      unlink at the time it is attempted. It was rejected for three
+#      reasons. It blocks every other write into the directory, which
+#      includes sub-directories and the notes a reader legitimately
+#      adds. The owning uid can `chmod` the directory back in one
+#      command, so it stops an accident and not a decision. And it
+#      leaves no trace: after that `chmod` the directory looks exactly
+#      like one that was never protected, so nothing afterwards can
+#      tell the two apart.
+#   B. RECORD EACH FREEZE OUT OF BAND — IMPLEMENTED. Every freeze
+#      appends one line to a `freeze-log.jsonl` that lives in the state
+#      directory, OUTSIDE the evidence directory. `--verify` then
+#      cross-checks the directory against those lines. Directory
+#      permissions do not change at all. See "THE OUT-OF-BAND FREEZE
+#      LOG" below for the file, the schema and the exact rule.
 #
-# Neither option is free. A is intrusive and defeated by one `chmod`.
-# B is the only genuinely out-of-band form available here, and it costs
-# a schema plus a cross-check. What this script DOES deliver today is
-# the cheap partial: `--verify` refuses a directory that holds a
-# regular file the manifest does not record (exit 6, below).
+# WHAT B DELIVERS, AND WHAT IT DOES NOT. B does NOT make tampering
+# impossible, and no wording in this script may suggest that it does.
+# B makes tampering need a CONSISTENT EDIT IN TWO PLACES: the evidence
+# directory, and the shared freeze log. The remove-and-recreate
+# sequence above now fails `--verify` with exit 8, because the
+# recreated bytes do not match the hash recorded out of band. The same
+# uid can still edit the freeze log to agree with the new bytes, and
+# `--verify` reports clean again. `test-evidence-freeze.sh` case 21
+# runs that two-place edit and pins it as PASSING, so the suite is
+# never read as proof of impossibility.
+#
+# B also does not stop a `rm`. Nothing in this script does. B changes
+# what a `rm` costs. The removal is DETECTED afterwards instead of
+# PREVENTED at the time, and the record that the freeze existed
+# survives the removal of the whole evidence directory.
 #
 # Usage:
 #   evidence-freeze.sh <source> --task <slug> [--as <name>]
@@ -73,8 +92,9 @@
 #   --dir <path>    an explicit evidence directory (created if missing).
 #   --as <name>     frozen name (default: the source's basename). Give
 #                   a name that marks the pass, e.g. `nb.PRE_FIXPASS.ipynb`.
-#   --verify        check every manifest entry, plus the mode-0440 and
-#                   manifest-coverage invariants. Writes nothing.
+#   --verify        check every manifest entry, plus the mode-0440, the
+#                   manifest-coverage and the freeze-log invariants.
+#                   Writes nothing.
 #
 # Exit codes:
 #   0  frozen (or verified clean)
@@ -84,6 +104,15 @@
 #   5  --verify found a mismatch, a missing file, or a broken invariant
 #   6  --verify found a regular file the manifest does not record
 #   7  a mode this script promises could not be set (see MODE CHECKS)
+#   8  the out-of-band freeze log and the directory disagree, or a
+#      freeze could not be recorded in it (see THE OUT-OF-BAND FREEZE
+#      LOG)
+# END-USAGE
+#
+# `usage()` prints the block between `# Usage:` and `# END-USAGE`. The
+# end marker is explicit because the previous form ended the range on
+# the last exit code, which meant that adding exit 8 truncated the help
+# text. A marker cannot be broken by a later entry.
 #
 # EXIT 6, AND WHAT IT DOES AND DOES NOT LOOK AT. `--verify` checks
 # REGULAR FILES AT THE TOP LEVEL of the evidence directory only. It
@@ -134,6 +163,113 @@
 # records it. That remedy is correct only for the case above, where no
 # manifest row names the file at all.
 #
+# THE OUT-OF-BAND FREEZE LOG. This is option B, and this section is the
+# whole of it.
+#
+# WHERE. `$STATE_DIR/freeze-log.jsonl`, overridable with
+# `NEXUS_FREEZE_LOG`. It is NOT in the evidence directory, on purpose:
+# removing an evidence directory must not remove the evidence that the
+# directory existed. It is also not under any evidence directory's
+# parent, so `--verify` never reads a record the same `rm -rf` could
+# have taken.
+#
+# WHY A DEDICATED FILE AND NOT `action-log.jsonl`. `action-log.jsonl`
+# was the other candidate, and it was rejected on durability. The
+# watcher rotates it at `monitor.state_log_max_bytes` (10 MiB) and then
+# DELETES the rotated archive after `DIFF_RETENTION_DAYS` (default 7).
+# That lifecycle is correct for a telemetry trace and wrong for a
+# record of record: a freeze record has to outlive the artefact it
+# describes, which is the whole point of freezing. Measured on the live
+# store on 2026-09-09: 4,987 rows, 1,417,332 bytes, first row
+# 2026-06-16 — about 16 KiB a day, so the cap arrives in roughly two
+# years and the archive is gone a week later. Two years is not
+# "durable". A second reason: `action-log.jsonl` takes rows from every
+# agent through `ng log-action`, with free-form `--extra k=v` pairs, so
+# it has many writers and no fixed schema. `freeze-log.jsonl` has one
+# writer and one schema, it is never rotated, and it grows one line per
+# freeze.
+#
+# SCHEMA. One JSON object per line, fields in this order:
+#
+#   v       schema version, integer, currently 1. A later schema change
+#           must be DETECTED, not mis-parsed, because this file gates a
+#           check.
+#   ts      ISO-8601 local time with offset. When the freeze happened.
+#   event   always `freeze` today. Present so the file can later carry
+#           a second row type without a reader having to guess.
+#   dir     the evidence directory, absolute and symlink-resolved. The
+#           join key: `--verify` reads the rows whose `dir` equals the
+#           directory it was given, resolved the same way.
+#   name    the frozen basename, as it appears in `MANIFEST.md5`.
+#   md5     the frozen bytes. The value the cross-check compares.
+#   bytes   the frozen size. Not a second integrity check — it is a
+#           reader aid. The incident is remembered by its size
+#           (11,648,117 bytes) and a row that carries the size can be
+#           matched against a memory of the artefact, not just against
+#           a hash nobody memorised.
+#   src     the source path the bytes were copied from. Provenance:
+#           `md5` says WHAT was frozen, `src` says where it came from.
+#   window  `$NEXUS_WORKER_WINDOW`, or empty. The action log keys its
+#           whole spawn and wrap-up trace by window, so a freeze row
+#           that carries the window joins to that trace.
+#
+# THE CROSS-CHECK, EXACTLY. For the directory under `--verify`:
+#
+#   * every logged (dir, name) whose file is ABSENT is exit 8;
+#   * every logged (dir, name) whose bytes do not match the logged
+#     `md5` is exit 8;
+#   * two rows for the same (dir, name) is exit 8. This script never
+#     writes a second row for a name — property 1 refuses the target
+#     and the manifest refuses the name — so a duplicate means the
+#     directory was emptied and re-frozen, which is the bypass run
+#     through this script instead of around it;
+#   * a top-level file with NO row is NOT an error. See the next
+#     paragraph.
+#
+# A FILE WITH NO ROW IS REPORTED, NEVER SILENTLY PASSED. Hard-failing
+# on a directory the log does not cover was rejected: on the live store
+# on 2026-09-09 there were ten evidence directories and the log covers
+# NONE of them, because the log did not exist until this change. Two of
+# the ten have no `MANIFEST.md5` either. A check that fails on all ten
+# is a check an operator turns off. Silently passing was rejected too,
+# because that is the hole this change exists to close. So `--verify`
+# passes an uncovered file and SAYS SO: it always prints a coverage
+# line, and the clean verdict itself carries the count, e.g.
+#
+#     evidence-freeze: <dir> verified clean (freeze-log covers 2 of 5)
+#
+# A reader can never mistake an uncovered directory for a cross-checked
+# one, because the clean line is not the same line in the two cases.
+# Coverage is per FILE, not per directory, so a directory that predates
+# this change starts being covered the moment the next freeze lands in
+# it, one file at a time.
+#
+# WHAT THE CROSS-CHECK CANNOT SEE. Deleting a row makes its file
+# uncovered, and an uncovered file passes. That is the same two-place
+# edit named at the top of this header, done in the cheaper direction.
+# Moving an evidence directory also drops its coverage to zero, because
+# `dir` is an absolute path; the rows survive, but they no longer join.
+# Both are stated here so that no reader infers a guarantee from a
+# clean verdict.
+#
+# CONCURRENCY. Several agents freeze at once, and the state directory
+# is on NFS, where an `O_APPEND` write is not guaranteed atomic even
+# below `PIPE_BUF`. Each append therefore takes an exclusive `flock` on
+# `$FREEZE_LOG.lock` — a separate file, so the lock never needs the log
+# itself to be writable — and holds it across the whole `chmod u+w` →
+# `>>` → `chmod 0440` sequence. That also serialises the two `chmod`s,
+# which would otherwise race each other. If the lock cannot be taken,
+# for any reason, the append still happens and a WARNING says the
+# append was unserialised. A silent unlocked append would be the same
+# failure this script exists to prevent: a success message standing in
+# for a check nobody ran.
+#
+# The log is held mode 0440 between appends, exactly like
+# `MANIFEST.md5`, so a stray `>` redirect fails with EACCES. `--verify`
+# reports a writable log as a broken invariant (exit 5). A process
+# killed between the two `chmod`s leaves the log writable, and that is
+# the report a reader should get.
+#
 # MODE CHECKS. A `chmod` can fail. This script therefore reads the mode
 # back with `stat` after setting it, and exits 7 rather than printing
 # `mode 0440` over an unverified property. That failure is the exact
@@ -142,11 +278,15 @@
 #
 # Env seams (tests): NEXUS_STATE_DIR / NEXUS_ROOT resolve the state dir,
 # exactly as pane-state.sh and retire-preflight.sh resolve it.
+# NEXUS_FREEZE_LOG overrides the freeze-log path on its own, so a test
+# can keep the log inside its own `mktemp -d` without moving the state
+# dir. `test-evidence-freeze.sh` sets it once, for the whole suite.
 
 set -uo pipefail
 
 usage() {
-    sed -n '/^# Usage:/,/^#   7 /p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '/^# Usage:/,/^# END-USAGE/p' "${BASH_SOURCE[0]}" \
+        | sed '/^# END-USAGE/d; s/^# \{0,1\}//'
     exit 2
 }
 
@@ -162,6 +302,11 @@ else
 fi
 
 MANIFEST_NAME="MANIFEST.md5"
+
+# The out-of-band record. Outside every evidence directory, on purpose
+# — see "THE OUT-OF-BAND FREEZE LOG" in the header.
+FREEZE_LOG="${NEXUS_FREEZE_LOG:-$STATE_DIR/freeze-log.jsonl}"
+FREEZE_LOG_SCHEMA=1
 
 # Does the manifest already record this bare name? Both the freeze path
 # and --verify ask this, so it is defined once, before either runs.
@@ -182,7 +327,13 @@ MANIFEST_NAME="MANIFEST.md5"
 _manifest_records() {
     local m="$1" n="$2"
     [[ -f "$m" ]] || return 1
-    awk -v want="$n" '{ line = $0
+    # The name arrives through the ENVIRONMENT, not through `awk -v`.
+    # `awk -v x='a\db'` runs the value through awk's own escape
+    # processing, so a backslash in a file name silently becomes
+    # something else and the comparison never matches. `ENVIRON` is
+    # passed through byte for byte.
+    EF_WANT="$n" awk '{ line = $0
+                        want = ENVIRON["EF_WANT"]
                         sub(/^[^ ]+[ ]+/, "", line)
                         sub(/^\*/, "", line)
                         sub(/^\.\//, "", line)
@@ -208,12 +359,176 @@ _mode_is() {
 _manifest_hash_for_basename() {
     local m="$1" n="$2"
     [[ -f "$m" ]] || return 1
-    awk -v want="$n" '{ hash = $0; sub(/[ ].*$/, "", hash)
+    # ENVIRON, not `awk -v` — see `_manifest_records` above.
+    EF_WANT="$n" awk '{ hash = $0; sub(/[ ].*$/, "", hash)
+                        want = ENVIRON["EF_WANT"]
                         line = $0
                         sub(/^[^ ]+[ ]+/, "", line)
                         sub(/^\*/, "", line)
                         sub(/^.*\//, "", line)
                         if (line == want) { print hash; exit } }' "$m"
+}
+
+# ---- the out-of-band freeze log (option B) -------------------------------
+# Every function below is documented as a whole in "THE OUT-OF-BAND
+# FREEZE LOG" in the header. Read that first; these are the mechanics.
+
+# Absolute, symlink-resolved directory. The freeze side and the verify
+# side MUST agree on this, or a row never joins to its directory, so it
+# is one function and not two call sites.
+_abs_dir() {
+    ( cd -- "$1" 2>/dev/null && pwd -P ) || return 1
+}
+
+# Escape a value for a JSON string. Backslash first, then quote — the
+# other order would double-escape the backslash it just inserted.
+# Control characters are not escaped because none of these fields can
+# hold one: `name` is a bare file name, `dir` and `src` are paths, and
+# `window` is a tmux window name.
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# The freeze lock. One lock file, `$FREEZE_LOG.lock`, shared by every
+# agent that uses the same freeze log.
+#
+# It is a SEPARATE file, so taking it never needs the log itself to be
+# writable. It is held on a file descriptor and never explicitly
+# released: process exit releases it, which is the only release that
+# cannot be skipped by an `exit` in the middle of the script — and this
+# script exits from nine places.
+#
+# It guards the WHOLE freeze, not just the log append. The manifest
+# append is a `chmod u+w` → `>>` → `chmod 0440` sequence, and two
+# concurrent freezes race on it: one process sets 0440 while the other
+# is between its own chmod and its append, and that append fails with
+# EACCES. Measured before this lock existed: 12 parallel freezes into
+# one directory left 10 rows in `MANIFEST.md5`. The two lost freezes
+# failed LOUDLY, with exit 4, so nothing was silently dropped — but two
+# of twelve is not a rate to live with.
+FREEZE_LOCK_FD=""
+FREEZE_LOCK_HELD=0
+
+# $1: `exclusive` (a freeze) or `shared` (a --verify read).
+# Returns non-zero when the lock was NOT taken. The caller decides what
+# to do about that; nothing here fails the run over it.
+_freeze_lock_acquire() {
+    local kind="${1:-exclusive}" flag="-x" lock
+    [[ "$kind" == shared ]] && flag="-s"
+    local log_dir="${FREEZE_LOG%/*}"
+    [[ "$log_dir" == "$FREEZE_LOG" ]] && log_dir="."
+    mkdir -p -- "$log_dir" 2>/dev/null || true
+    lock="${FREEZE_LOG}.lock"
+
+    # The braces are load-bearing. `exec <redir> 2>/dev/null` with no
+    # command applies BOTH redirections to the shell PERMANENTLY, so a
+    # bare `exec {fd}>>"$lock" 2>/dev/null` sends this script's stderr
+    # to /dev/null for the rest of the run — every later warning and
+    # every failure message silently dropped. Wrapping the `exec` in a
+    # group scopes the `2>/dev/null` to the group; the fd the `exec`
+    # opens still outlives it, which is the point.
+    if ! { exec {FREEZE_LOCK_FD}>>"$lock"; } 2>/dev/null; then
+        FREEZE_LOCK_FD=""
+        FREEZE_LOCK_HELD=0
+        return 1
+    fi
+    # 120 s. A freeze holds the lock across its own copy, so the wait
+    # has to cover one large artefact, not one syscall.
+    if command -v flock >/dev/null 2>&1 && flock "$flag" -w 120 "$FREEZE_LOCK_FD" 2>/dev/null; then
+        FREEZE_LOCK_HELD=1
+        return 0
+    fi
+    FREEZE_LOCK_HELD=0
+    return 1
+}
+
+# Say, once and loudly, that this run is not serialised. A silent
+# unlocked append would be a success message standing in for a check
+# nobody ran — the exact shape of the incident this guard exists to
+# prevent.
+_freeze_lock_warn() {
+    echo "evidence-freeze: WARNING: proceeding WITHOUT a lock on $(basename -- "$FREEZE_LOG")" >&2
+    echo "  a concurrent freeze could interleave with this one" >&2
+}
+
+# Append one line to the freeze log, with the log writable only for the
+# duration. Returns non-zero when the line did not land. Serialisation
+# is the caller's: this runs inside the lock taken above.
+_freeze_log_append() {
+    local d="$1" n="$2" h="$3" b="$4" s="$5"
+    local log_dir="${FREEZE_LOG%/*}"
+    [[ "$log_dir" == "$FREEZE_LOG" ]] && log_dir="."
+    mkdir -p -- "$log_dir" 2>/dev/null || {
+        echo "evidence-freeze: cannot create $log_dir for $FREEZE_LOG" >&2
+        return 1
+    }
+
+    local ts line
+    ts=$(date +%Y-%m-%dT%H:%M:%S%z 2>/dev/null) || ts=""
+    printf -v line \
+        '{"v":%s,"ts":"%s","event":"freeze","dir":"%s","name":"%s","md5":"%s","bytes":%s,"src":"%s","window":"%s"}' \
+        "$FREEZE_LOG_SCHEMA" "$ts" \
+        "$(_json_escape "$d")" "$(_json_escape "$n")" "$h" \
+        "${b:-0}" "$(_json_escape "$s")" \
+        "$(_json_escape "${NEXUS_WORKER_WINDOW:-}")"
+
+    local rc=0
+    [[ -f "$FREEZE_LOG" ]] && { chmod u+w -- "$FREEZE_LOG" 2>/dev/null || true; }
+    printf '%s\n' "$line" >> "$FREEZE_LOG" || rc=1
+    chmod 0440 -- "$FREEZE_LOG" 2>/dev/null || true
+    return "$rc"
+}
+
+# Emit `name<TAB>md5` for every row whose `dir` equals $1, in file
+# order. Duplicates are emitted as they appear — the caller decides
+# what a duplicate means.
+#
+# The extractor reads a JSON string value by hand rather than shelling
+# out to a JSON parser, because this script may not assume one is
+# installed. It requires the key to start a field (`{"k":"` or `,"k":"`)
+# so that a key name occurring INSIDE another value cannot be mistaken
+# for the field itself.
+_freeze_log_rows() {
+    local d="$1"
+    [[ -f "$FREEZE_LOG" ]] || return 0
+    # ENVIRON, not `awk -v`: an evidence directory whose PATH holds a
+    # backslash is written to the log escaped, and `awk -v` would
+    # un-escape the pattern differently, so the row would never join to
+    # its own directory. Measured before this fix: a directory named
+    # `ev\dir` reported "0 of 1 recorded out of band" on a file it had
+    # just frozen — a false CLEAN, which is the failure mode this whole
+    # check exists to remove.
+    EF_WANT="$d" awk '
+        function jget(line, key,   pat, n, i, c, out, esc) {
+            pat = "\"" key "\":\""
+            n = index(line, "{" pat)
+            if (n > 0) { i = n + 1 + length(pat) }
+            else {
+                n = index(line, "," pat)
+                if (n == 0) return ""
+                i = n + 1 + length(pat)
+            }
+            out = ""; esc = 0
+            while (i <= length(line)) {
+                c = substr(line, i, 1)
+                if (esc) { out = out c; esc = 0 }
+                else if (c == "\\") esc = 1
+                else if (c == "\"") break
+                else out = out c
+                i++
+            }
+            return out
+        }
+        {
+            if (jget($0, "dir") != ENVIRON["EF_WANT"]) next
+            n = jget($0, "name"); h = jget($0, "md5")
+            if (n == "" || h == "") next
+            printf "%s\t%s\n", n, h
+        }
+    ' "$FREEZE_LOG" 2>/dev/null
 }
 
 src=""
@@ -310,13 +625,103 @@ if [[ "$mode" == verify ]]; then
         echo "evidence-freeze: UNRECORDED file: $base ($MANIFEST_NAME does not list it)" >&2
         unrecorded=$(( unrecorded + 1 ))
     done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null)
-    if (( unrecorded > 0 )); then
-        echo "evidence-freeze: $unrecorded unrecorded file(s) in $dir — freeze them, or they are not evidence" >&2
-        # Exit 5 wins if an invariant is already broken: it is graver.
-        (( rc == 0 )) && rc=6
+
+    # Invariant 5: the out-of-band freeze log. Invariants 1 to 4 all
+    # read only this directory, so a directory that was emptied and
+    # rebuilt satisfies every one of them. This is the only check that
+    # reads a record the same `rm` could not have taken. Full rule and
+    # its limits: "THE OUT-OF-BAND FREEZE LOG" in the header.
+    crosscheck=0
+    if [[ -f "$FREEZE_LOG" && -w "$FREEZE_LOG" ]]; then
+        echo "evidence-freeze: WRITABLE $(basename -- "$FREEZE_LOG") — a regeneration would not fail" >&2
+        rc=5
     fi
 
-    (( rc == 0 )) && echo "evidence-freeze: $dir verified clean"
+    # A SHARED lock, so several `--verify` runs do not block each other
+    # but none of them reads a line a freeze is halfway through writing.
+    # A torn last line would parse as no row at all, and the file it
+    # named would silently drop to "uncovered" — a false clean.
+    _freeze_lock_acquire shared || _freeze_lock_warn
+
+    abs_dir=$(_abs_dir "$dir") || abs_dir="$dir"
+    declare -A _logged_md5=()
+    logged_names=()
+    while IFS=$'\t' read -r lname lhash; do
+        [[ -n "${lname:-}" ]] || continue
+        if [[ -n "${_logged_md5[$lname]:-}" ]]; then
+            # This script cannot write two rows for one name: the
+            # target refuses to be clobbered and the manifest refuses
+            # the name. A duplicate is the bypass, run THROUGH this
+            # script rather than around it.
+            echo "evidence-freeze: DUPLICATE freeze-log entry for $lname in $abs_dir" >&2
+            echo "  a name is frozen once. Two rows mean the directory was emptied and re-frozen." >&2
+            crosscheck=$(( crosscheck + 1 ))
+        else
+            logged_names+=( "$lname" )
+        fi
+        _logged_md5[$lname]="$lhash"
+    done < <(_freeze_log_rows "$abs_dir")
+
+    for lname in "${logged_names[@]:-}"; do
+        [[ -n "$lname" ]] || continue
+        if [[ ! -f "$dir/$lname" ]]; then
+            echo "evidence-freeze: LOGGED FREEZE MISSING: $lname" >&2
+            echo "  $(basename -- "$FREEZE_LOG") records this freeze; it is not in $dir" >&2
+            echo "  recorded: ${_logged_md5[$lname]}" >&2
+            crosscheck=$(( crosscheck + 1 ))
+            continue
+        fi
+        live_bytes=$(md5sum < "$dir/$lname" 2>/dev/null | cut -d' ' -f1)
+        if [[ "$live_bytes" != "${_logged_md5[$lname]}" ]]; then
+            echo "evidence-freeze: FREEZE-LOG MISMATCH: $lname" >&2
+            echo "  recorded out of band: ${_logged_md5[$lname]}" >&2
+            echo "  on disk:              ${live_bytes:-unreadable}" >&2
+            crosscheck=$(( crosscheck + 1 ))
+        fi
+    done
+
+    # Coverage. Per FILE, never per directory: a directory that predates
+    # the freeze log gains coverage one freeze at a time. This line is
+    # printed on every run, clean or not, so a clean verdict can never
+    # be mistaken for a cross-checked one.
+    covered=0
+    total=0
+    while IFS= read -r path; do
+        base="${path##*/}"
+        [[ "$base" == "$MANIFEST_NAME" ]] && continue
+        total=$(( total + 1 ))
+        [[ -n "${_logged_md5[$base]:-}" ]] && covered=$(( covered + 1 ))
+    done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null)
+
+    if [[ -f "$FREEZE_LOG" ]]; then
+        echo "evidence-freeze: freeze-log cross-check: $covered of $total top-level file(s) recorded out of band" >&2
+    else
+        echo "evidence-freeze: freeze-log cross-check: no $FREEZE_LOG — 0 of $total top-level file(s) recorded out of band" >&2
+    fi
+    if (( covered < total )); then
+        echo "  $(( total - covered )) file(s) have NO out-of-band record, so this check cannot cover them" >&2
+        echo "  that is not an error: it is what a directory frozen before the log looks like" >&2
+    fi
+
+    if (( unrecorded > 0 )); then
+        echo "evidence-freeze: $unrecorded unrecorded file(s) in $dir — freeze them, or they are not evidence" >&2
+    fi
+
+    # Precedence: 5, then 8, then 6.
+    #
+    # 5 is first because a broken invariant is the graver finding and
+    # because it is the one a reader can act on without any other file.
+    # 8 outranks 6 because a disagreement with the out-of-band record
+    # says the STORED BYTES are wrong, while 6 says only that a file
+    # nobody recorded is sitting there.
+    #
+    # This ordering also means exit 8 marks exactly the case no other
+    # check can reach: a directory that is internally consistent and
+    # still wrong.
+    if (( rc == 0 )) && (( crosscheck > 0 )); then rc=8; fi
+    if (( rc == 0 )) && (( unrecorded > 0 )); then rc=6; fi
+
+    (( rc == 0 )) && echo "evidence-freeze: $dir verified clean (freeze-log covers $covered of $total)"
     exit "$rc"
 fi
 
@@ -352,6 +757,12 @@ esac
 mkdir -p -m 0770 "$dir" || { echo "evidence-freeze: cannot create $dir" >&2; exit 2; }
 target="$dir/$as_name"
 manifest="$dir/$MANIFEST_NAME"
+
+# Take the freeze lock BEFORE the clobber check, so the whole
+# check-copy-record sequence is one critical section. Held to process
+# exit; see the lock's own comment above for why it covers the copy and
+# not just the two appends.
+_freeze_lock_acquire exclusive || _freeze_lock_warn
 
 # 1. Refuse to clobber. Print the existing file's hash so the caller can
 #    tell "already frozen, identical" from "a different artefact wants
@@ -409,8 +820,37 @@ if ! ( cd "$dir" && md5sum -- "$as_name" >> "$MANIFEST_NAME" ); then
 fi
 chmod 0440 -- "$manifest" 2>/dev/null
 
+frozen_md5=$(tail -1 "$manifest" | cut -d' ' -f1)
+
+# 4. Record the freeze OUT OF BAND. This runs AFTER the manifest append,
+#    so the log never claims a freeze the manifest does not carry. The
+#    reverse order would leave a row for bytes that failed to be
+#    recorded, and a record that overstates is worse than none.
+#
+#    A failure here does NOT undo the freeze: the bytes are copied,
+#    read-only and recorded in the manifest, and throwing that away
+#    would destroy evidence to report a bookkeeping failure. It exits 8
+#    instead, and says plainly which promise went unmet.
+log_rc=0
+_freeze_log_append \
+    "$(_abs_dir "$dir" || printf '%s' "$dir")" \
+    "$as_name" "$frozen_md5" \
+    "$(stat -c '%s' -- "$target" 2>/dev/null || echo 0)" \
+    "$(readlink -f -- "$src" 2>/dev/null || printf '%s' "$src")" \
+    || log_rc=$?
+
 printf 'frozen %s -> %s\n' "$src" "$target"
-printf 'md5    %s\n' "$(tail -1 "$manifest" | cut -d' ' -f1)"
+printf 'md5    %s\n' "$frozen_md5"
+
+if (( log_rc != 0 )); then
+    {
+        echo "evidence-freeze: FAILED to record this freeze in $FREEZE_LOG"
+        echo "  The freeze is kept and $MANIFEST_NAME records it."
+        echo "  It has NO out-of-band record, so --verify cannot cross-check it:"
+        echo "  a later remove-and-recreate of $as_name would not be detected."
+    } >&2
+    exit 8
+fi
 
 # The freeze IS recorded by this point, so a failure here is not a
 # reason to undo it. It is a reason not to claim the manifest is
@@ -424,5 +864,21 @@ if ! _mode_is "$manifest" 440; then
     } >&2
     exit 7
 fi
+
+# Same rule for the freeze log: report the mode that is actually set,
+# never the mode this script asked for. A writable log is one stray `>`
+# away from losing every record it holds — for every evidence directory,
+# not just this one.
+if ! _mode_is "$FREEZE_LOG" 440; then
+    {
+        echo "evidence-freeze: FAILED to set mode 0440 on $FREEZE_LOG"
+        echo "  mode is now: $(stat -c '%a' -- "$FREEZE_LOG" 2>/dev/null || echo unreadable)"
+        echo "  The freeze is recorded, in $MANIFEST_NAME and out of band."
+        echo "  The freeze log is NOT protected: a stray '>' would rewrite it,"
+        echo "  and it holds the records for every evidence directory."
+    } >&2
+    exit 7
+fi
 printf 'mode   0440 (read-only); %s is append-only\n' "$MANIFEST_NAME"
+printf 'logged %s\n' "$FREEZE_LOG"
 exit 0
