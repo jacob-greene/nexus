@@ -327,6 +327,30 @@ _over_limit_json_field() {
     printf '%s' "$v"
 }
 
+# Normalise a session id for storage and for comparison. EVERY read of
+# an id goes through this, so the two sides of the comparison can never
+# be normalised differently.
+#
+# An asymmetry here is not cosmetic: it makes two spellings of the SAME
+# session compare unequal, which reports a rotation that did not happen
+# and drops a LIVE hold — the one direction this module must never fail
+# in, because it resumes emits into a frozen pane. An earlier revision
+# stripped whitespace on the pin (which is written with a trailing
+# newline) but returned the JSON stamp's value verbatim, so a padded
+# `session_id` in a hook payload was enough to trip it. Reachability was
+# low — the pin writer applies a canonical UUID shape guard
+# (`monitor/hooks/orchestrator-session-pin.sh:48`) while the stamp
+# writer applies none (`monitor/hooks/over-limit-emit.sh:125`) — but the
+# failure direction is the bad one. Skeptic finding, request 002.
+#
+# The strip lives here rather than inside `_over_limit_json_field`
+# because that helper is a general JSON reader; whitespace is not noise
+# in every field it might ever read.
+_over_limit_normalize_session() {
+    local v="$1"
+    printf '%s' "${v//[[:space:]]/}"
+}
+
 # The session that owned the pane NOW (see the block comment above).
 _over_limit_live_session() {
     local window="$1" role="$2" dir pin v
@@ -335,14 +359,13 @@ _over_limit_live_session() {
         pin="$dir/orchestrator-session-id"
         [[ -f "$pin" ]] || { printf ''; return 0; }
         v=$(head -n1 "$pin" 2>/dev/null) || v=""
-        # The pin is written with a trailing newline; strip any stray
-        # whitespace so the comparison is on the id alone.
-        printf '%s' "${v//[[:space:]]/}"
+        _over_limit_normalize_session "$v"
         return 0
     fi
     [[ -n "$window" && "$window" != *"/"* && "$window" != .* ]] \
         || { printf ''; return 0; }
-    _over_limit_json_field "$dir/heartbeat/$window.json" "session_id"
+    v=$(_over_limit_json_field "$dir/heartbeat/$window.json" "session_id")
+    _over_limit_normalize_session "$v"
 }
 
 # The session to STAMP into a new row: the suspended one when the hook
@@ -350,7 +373,8 @@ _over_limit_live_session() {
 _over_limit_resolve_session() {
     local window="$1" role="$2" sid="" path
     if path=$(_over_limit_stamp_path "$window" 2>/dev/null); then
-        sid=$(_over_limit_json_field "$path" "session_id")
+        sid=$(_over_limit_normalize_session \
+            "$(_over_limit_json_field "$path" "session_id")")
     fi
     [[ -n "$sid" ]] || sid=$(_over_limit_live_session "$window" "$role")
     printf '%s' "$sid"
@@ -360,6 +384,10 @@ _over_limit_resolve_session() {
 # An unknown id on either side is not evidence of a rotation.
 _over_limit_session_rotated() {
     local window="$1" role="$2" row_session="$3" live
+    # Normalise the ROW's copy too, so the invariant holds at the point
+    # of comparison and not only at the point of writing. A row written
+    # by any other revision of this module still compares correctly.
+    row_session=$(_over_limit_normalize_session "$row_session")
     [[ -n "$row_session" ]] || return 1
     live=$(_over_limit_live_session "$window" "$role")
     [[ -n "$live" ]] || return 1

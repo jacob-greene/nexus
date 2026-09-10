@@ -337,6 +337,31 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
+echo '=== NO rotation: a padded id is the SAME session, not a new one ==='
+# The pin writer applies a canonical UUID shape guard; the stamp writer
+# applies none, so a hook payload carrying a padded `session_id` reaches
+# the row verbatim unless both readers normalise. Two spellings of one
+# session must not read as a rotation: that drops a LIVE hold and
+# resumes emits into a frozen pane. Skeptic finding, request 002.
+reset_state
+write_pin "$S1"
+mkdir -p "$STATE_DIR/over-limit"
+printf '{"ts": %s, "session_id": "%s ", "error_type": "rate_limit", "reset_at": "3am", "window": "orchestrator", "hook_event_name": "StopFailure"}\n' \
+    "$(date +%s)" "$S1" > "$STATE_DIR/over-limit/orchestrator.json"
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "3am"
+row=$(_over_limit_load "_orchestrator")
+assert_eq "P1 a padded stamp id is stored normalised" "$(row_field "$row" 9)" "$S1"
+if _over_limit_session_rotated "orchestrator" "orchestrator" "$S1 "; then
+    printf '  FAIL: P2 a padded id does not read as a rotation\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: P2 a padded id does not read as a rotation\n'; PASS=$(( PASS + 1 ))
+fi
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: P3 the live hold survives a padded id\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: P3 the live hold survives a padded id\n' >&2; FAIL=$(( FAIL + 1 ))
+fi
+
 echo '=== NO evidence: an unknown id on either side holds the row ==='
 reset_state
 write_pin "$S1"
