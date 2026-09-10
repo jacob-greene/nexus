@@ -73,7 +73,9 @@ work:
 | `demo.sh` | Human-facing live demo (`--stop` to tear down). A real round-trip + an AskUserQuestion menu you attach to and pick from. |
 | `gate.sh` | Pre-update gate: run the scenarios against a candidate cc version in a throwaway prefix; green/red exit. Runs `lint-no-mass-kill.sh` as a pre-flight. |
 | `lint-no-mass-kill.sh` | Safety lint: forbids cmdline-pattern process kills (`pkill -f`/`--full`, `pgrep -f`, `killall`) in harness code — they match the shared project-local claude binary across the sandbox's one PID namespace and wipe every agent (crash postmortem 2026-05-29). Allows PID-scoped `pkill -P`. Run by `gate.sh` and the CI workflow. |
-| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios (`idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). |
+| `../test-cch-launch-string.sh` | Hermetic proof that the `CCH_SKIP_PERMISSIONS` knob leaves the default launch string byte-for-byte unchanged, plus the whitelist of files allowed to build a launch string at all. No tmux, no binary. |
+| `../test-cch-permission-dialog.sh` | Hermetic suite for the permission-dialog assertion. Mostly negative controls: idle REPL, trust dialog, chip bar, prose, chevron-stripped frame. |
+| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios (`idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**, **`nested-trust`**, **`permission-dialog`**). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). |
 
 ## Injectable control — "a pipe we can inject text into"
 
@@ -118,6 +120,15 @@ fragility). Schema (all keys optional):
 # the scenarios (self-skip unless enabled):
 RUN_CC_HARNESS=1 monitor/watcher/run-tests.sh --filter realmodel
 RUN_CC_HARNESS=1 bash monitor/watcher/test-integration/test-realmodel-idle-busy.sh
+
+# the hermetic suites (no tmux, no binary, no mock — run anywhere):
+bash monitor/test-cch-launch-string.sh
+bash monitor/test-cch-permission-dialog.sh
+
+# the permission-dialog scenario, with its XFAIL marker off (goes red
+# until <your-org>/nexus-code#157 is fixed — that is the point):
+RUN_CC_HARNESS=1 CCH_NO_XFAIL=1 \
+  bash monitor/watcher/test-integration/test-realmodel-permission-dialog.sh
 
 # live demo you can attach to and click through:
 monitor/cc-harness/demo.sh
@@ -202,6 +213,62 @@ The general lesson for future scenarios: **anything the harness
 pre-seeds to skip a first-run gate is a surface the harness cannot
 regress-test.** When a changelog entry touches one of those gates,
 un-seed it in a purpose-built scenario.
+
+### The suppressed-dialog blind spot (closed 2026-09-10)
+
+The same lesson, one layer down. Every scenario booted with
+`--dangerously-skip-permissions`, and that flag is exactly what
+suppresses Claude Code's **tool-permission dialog**. So no scenario
+could paint one, and the detector that classifies one could not be
+regression-tested end to end. The flag also sat inside a single
+`printf -v` statement, so a scenario that wanted to drop it had to copy
+the whole launch string. Two agents did that on 2026-09-09.
+
+Three things close it (`<your-org>/nexus-code#158`):
+
+| Piece | What it is |
+|---|---|
+| `CCH_SKIP_PERMISSIONS` | Env knob read by `cch_launch_cmd`. Set it to `0` and the launch string omits `--dangerously-skip-permissions`. Any other value, or unset, keeps the flag. `cch_boot_prompting_worker` is a one-line wrapper that sets it. |
+| `cch_boot_worker <name> [workdir]` | The workdir is now an argument. That was the other reason a scenario copied the launch string. |
+| `cch_has_permission_dialog` / `cch_assert_permission_dialog` / `cch_wait_permission_dialog` | The dialog assertion. Any scenario can use it. |
+
+**The default launch string does not change.**
+`monitor/test-cch-launch-string.sh` proves that by measurement, not by
+assertion: it reads the flag's construction site out of git at the
+commit the knob was written against, feeds the old and new builders the
+same inputs, and compares byte for byte. It also holds the whitelist of
+files allowed to build a launch string, so a new copy fails in the fast
+test loop.
+
+**What the dialog assertion keys on**, and why not the obvious thing. It
+ignores the option-2 text (`Yes, allow all edits during this session
+(shift+tab)`) because that literal moved between cc 2.1.220 and 2.1.267,
+and the same instability broke the trust detector at 2.1.260. It ignores
+the question literal too, because that is the thing under test:
+`pane-state.sh` carries exactly one and therefore misses both file-edit
+shapes. It requires an option row `1. Yes`, a numbered decline row
+`N. No`, both footer phrases `Esc to cancel` and `Tab to amend` (matched
+separately, so a separator change cannot silently disable it), and a
+chevron on a numbered option row as the liveness leg. That last one is
+what stops prose describing the dialog from matching, and the
+`Tab to amend` leg is what separates it from the folder-trust dialog.
+
+`monitor/test-cch-permission-dialog.sh` is the hermetic suite for it.
+Most of it is negative: an idle REPL, the trust dialog, an
+AskUserQuestion chip bar, prose, and a dialog frame with the chevron
+stripped all have to be rejected. An assertion only ever run against
+frames that do carry the dialog is itself a vacuous control.
+
+**`test-realmodel-permission-dialog.sh` is KNOWN-FAILING by design.** It
+paints both dialog shapes and reads `pane-state.sh`, which answers
+`empty` — the state `retire-preflight.sh` reads as safe to kill. That is
+`<your-org>/nexus-code#157`, and the failing assertions carry an XFAIL
+marker so the suite stays green while the bug is open. An XFAIL that
+starts passing is reported as **XPASS** and fails the run, so the marker
+cannot outlive the fix. Run with `CCH_NO_XFAIL=1` to see the real red.
+The scenario is deliberately **absent from `gate.sh`**: an XFAIL-marked
+gate entry tells an operator nothing about a candidate release. Add it
+there in the change that fixes `#157` and deletes the marker.
 
 ## What's NOT here yet (follow-ups)
 

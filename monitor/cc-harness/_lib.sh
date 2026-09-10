@@ -215,26 +215,73 @@ cch_control() {
     printf '%s\n' "$1" > "$CCH_CONTROL"
 }
 
-# Boot the real claude in a new tmux window against the mock. Echoes the
-# new window's index. Renderer-path only (no --settings hooks) so this
-# exercises pane-state's renderer classification; a heartbeat-substrate
-# variant is a documented follow-up.
-cch_boot_worker() {
-    local name="$1"
-    # env -i for a hermetic child: only the vars claude needs. PATH must
-    # carry node (claude is a node program) — pass the harness PATH
-    # through. ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY
-    # avoids the interactive custom-API-key approval dialog.
+# Build the launch command string for a harness worker. THE SINGLE
+# CONSTRUCTION SITE — every scenario must reach the launch string through
+# here, never by copying the `printf -v launch` block. Two scenarios
+# copied that block on 2026-09-09 (both working on your-org/nexus-code#157)
+# because the only way to drop one flag was to reproduce all of it.
+# Duplicated launch flags drift silently from the production spawn flags,
+# so a scenario ends up gating a boot the watcher never performs.
+#
+# env -i gives a hermetic child: only the vars claude needs. PATH must
+# carry node (claude is a node program) — pass the harness PATH through.
+# ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY avoids the
+# interactive custom-API-key approval dialog.
+#
+# CCH_SKIP_PERMISSIONS (default 1) is the one knob:
+#
+#   1 (default)  append `--dangerously-skip-permissions`, exactly as
+#                every scenario booted before this knob existed.
+#   0            omit it, so the real binary renders its permission
+#                dialog when the mock drives a file-writing tool. That
+#                flag is precisely what suppresses the dialog, so no
+#                harness scenario could paint one until now
+#                (your-org/nexus-code#158).
+#
+# WHY AN ENV KNOB AND NOT A `cch_boot_prompting_worker` VARIANT: a
+# separate function would need its own copy of the launch string — the
+# defect this change exists to remove — unless it delegated here anyway.
+# One knob keeps ONE construction site. `cch_boot_prompting_worker` still
+# exists below, but only as a one-line wrapper that sets the knob, so a
+# call site can read as prose without a second copy of the flags.
+#
+# The knob is read at call time, not at source time, so a scenario may
+# boot a default worker and a prompting worker in the same run.
+cch_launch_cmd() {
+    # A separate `%s` tail rather than a literal inside the format string:
+    # with CCH_SKIP_PERMISSIONS unset the expansion is byte-for-byte the
+    # pre-knob string. monitor/test-cch-launch-string.sh proves
+    # that against the flag's construction site at c9c07bc.
+    local skip_flag=' --dangerously-skip-permissions'
+    [[ "${CCH_SKIP_PERMISSIONS:-1}" == "0" ]] && skip_flag=''
     local launch
     printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
 ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
-TERM=%q %q --dangerously-skip-permissions' \
+TERM=%q %q%s' \
         "$CCH_CFG" "$PATH" "$CCH_CFG" \
-        "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" "$CLAUDE_BIN"
+        "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" \
+        "$CLAUDE_BIN" "$skip_flag"
+    printf '%s' "$launch"
+}
 
-    cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$CCH_WORKDIR" "$launch"
+# Boot the real claude in a new tmux window against the mock. Echoes the
+# new window's index. Renderer-path only (no --settings hooks) so this
+# exercises pane-state's renderer classification; a heartbeat-substrate
+# variant is a documented follow-up.
+#
+#   cch_boot_worker <window-name> [workdir]
+#
+# `workdir` defaults to $CCH_WORKDIR, the pre-trusted project dir. A
+# scenario that needs a different cwd (an untrusted nested repo, say)
+# passes it here instead of rebuilding the launch string.
+cch_boot_worker() {
+    local name="$1" workdir="${2:-$CCH_WORKDIR}"
+    local launch
+    launch=$(cch_launch_cmd)
+
+    cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$workdir" "$launch"
     local idx
     idx=$(cch_tmux list-windows -t "$CCH_SESSION" -F '#{window_name} #{window_index}' \
         | awk -v n="$name" '$1==n {print $2; exit}')
@@ -244,6 +291,15 @@ TERM=%q %q --dangerously-skip-permissions' \
     # production watcher configures worker windows.
     [[ -n "$idx" ]] && cch_tmux set-option -t "$CCH_SESSION:$idx" -w remain-on-exit on 2>/dev/null
     printf '%s' "$idx"
+}
+
+# Boot a worker WITHOUT `--dangerously-skip-permissions`, so the real
+# binary renders its permission dialog when the mock drives a
+# file-writing tool. Same arguments as cch_boot_worker. A one-line
+# wrapper on purpose: readable at the call site, no second copy of the
+# launch flags.
+cch_boot_prompting_worker() {
+    CCH_SKIP_PERMISSIONS=0 cch_boot_worker "$@"
 }
 
 # Run the production pane-state.sh against a live window via the wrapper.
@@ -261,6 +317,116 @@ cch_state() {
 # Capture a window's pane (plain text, last 25 rows like pane-state).
 cch_capture() {
     cch_tmux capture-pane -t "$CCH_SESSION:$1" -p -J -S -25 2>/dev/null
+}
+
+# --- permission-dialog assertion (your-org/nexus-code#158, Part B) --------
+#
+# THE PROBLEM THIS SOLVES. A scenario that expects Claude Code's
+# tool-permission dialog and paints none still reads a plausible pane
+# state, so the run looks like a pass. That happened three times: the
+# 2.1.263 evaluation, the 2.1.267 evaluation, and the published #157
+# script, whose control arm ran `Bash true` and therefore exercised
+# nothing. A convention written down twice and broken three times needs
+# a mechanism. These helpers ARE the mechanism, and they are deliberately
+# generic — any scenario that drives a file-writing tool can use them.
+#
+# WHAT IT ASSERTS ON, and why not the obvious thing. It does NOT key on
+# the option-2 text (`Yes, allow all edits during this session
+# (shift+tab)`). That literal changed between cc 2.1.220 and 2.1.267, and
+# the same instability broke the folder-trust detector at 2.1.260. It
+# keys instead on the parts that held across both releases and across
+# both dialog shapes (`Write` -> "Do you want to create …?", `Edit` ->
+# "Do you want to make this edit to …?"):
+#
+#   1. a first option row `1. Yes`, with or without the chevron;
+#   2. a numbered decline row, `N. No`;
+#   3. the two footer phrases `Esc to cancel` and `Tab to amend`;
+#   4. LIVENESS: a chevron sitting on a NUMBERED option row.
+#
+# It does NOT key on the question literal either. That is the whole point
+# of the exercise: monitor/pane-state.sh carries exactly one question
+# literal and therefore misses both file-edit shapes (#157). An assertion
+# built on the same literal could never catch that.
+#
+# The two footer phrases are matched SEPARATELY, not as one string. The
+# release under probe joins them with U+00B7 surrounded by plain spaces;
+# a future release that changes the separator must not silently turn this
+# assertion off.
+#
+# Requirement 4 is what stops prose from matching. An agent transcript
+# quoting this comment, or a report describing the dialog, carries the
+# words but never a chevron-selected numbered option row. It mirrors the
+# liveness leg of `pane-state.sh::_has_trust_overlay`.
+#
+# Requirement 3 is what separates this from the folder-trust dialog,
+# whose footer is `Enter to confirm · Esc to cancel` — no `Tab to amend`.
+
+# Predicate. rc 0 if the frame carries a live tool-permission dialog.
+# Silent: for scenarios that need to branch rather than fail.
+cch_has_permission_dialog() {
+    local plain="$1"
+    grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$plain" \
+        && grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$plain" \
+        && grep -qF 'Esc to cancel' <<<"$plain" \
+        && grep -qF 'Tab to amend' <<<"$plain" \
+        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$plain"
+}
+
+# Assertion. rc 0 if the frame carries the dialog; otherwise rc 1 AND a
+# loud diagnostic on stderr naming which leg failed, with the frame
+# quoted so a CI log carries the evidence.
+#
+#   cch_assert_permission_dialog "$frame" "<what the probe expected>"
+#
+# rc 1 rather than `exit 1`: a scenario tallies it through its own
+# ok()/bad() pair, exactly like every other assertion in the suite. The
+# loudness is the stderr diagnostic plus the non-zero return.
+cch_assert_permission_dialog() {
+    local plain="$1" label="${2:-permission dialog}"
+    if cch_has_permission_dialog "$plain"; then
+        return 0
+    fi
+    {
+        printf 'cch_assert_permission_dialog: NO PERMISSION DIALOG IN FRAME\n'
+        printf '  expected: %s\n' "$label"
+        printf '  missing legs:\n'
+        grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$plain" \
+            || printf '    - an option row `1. Yes`\n'
+        grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$plain" \
+            || printf '    - a numbered decline row `N. No`\n'
+        grep -qF 'Esc to cancel' <<<"$plain" \
+            || printf '    - the footer phrase `Esc to cancel`\n'
+        grep -qF 'Tab to amend' <<<"$plain" \
+            || printf '    - the footer phrase `Tab to amend`\n'
+        grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$plain" \
+            || printf '    - a chevron on a numbered option row (liveness)\n'
+        printf '  frame captured:\n'
+        sed 's/^/    | /' <<<"$plain"
+    } >&2
+    return 1
+}
+
+# Poll a window until its pane carries a permission dialog. Echoes the
+# frame it settled on (dialog present or not) so the caller can assert
+# and report on the SAME bytes it waited for. rc 0 if the dialog
+# appeared, 1 on timeout.
+#
+#   frame=$(cch_wait_permission_dialog "$win" 20) || ...
+#
+# Never treat a timeout as benign: a probe that expected a dialog and
+# timed out has established nothing about the pane it goes on to classify.
+cch_wait_permission_dialog() {
+    local window="$1" timeout_s="${2:-25}" waited=0 frame=""
+    while (( waited < timeout_s )); do
+        frame=$(cch_capture "$window")
+        if cch_has_permission_dialog "$frame"; then
+            printf '%s' "$frame"
+            return 0
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    printf '%s' "$frame"
+    return 1
 }
 
 # Send a prompt the way the watcher injects: type the text, then Enter
