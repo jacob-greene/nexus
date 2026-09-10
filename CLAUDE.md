@@ -202,9 +202,24 @@ Two ways to spin one up:
   work/<project>-<task>/`. Fully isolated `.git` and working
   tree; use when the task touches data the primary reads, or a
   clean remote checkout matters.
-- **Worktree** — `git -C work/<project> worktree add
-  ../<project>-<task> -b <operator>/<task>`. Lighter; shares `.git`,
-  separate working tree and branch. Default for code-only edits.
+- **Worktree** — fetch first, then name the base ref:
+  `git -C work/<project> fetch origin` and
+  `git -C work/<project> worktree add ../<project>-<task> -b
+  <operator>/<task> origin/main`. Lighter; shares `.git`,
+  separate working tree and branch. Default for code-only edits
+  that stay local.
+
+**Always name the base ref.** `worktree add -b <branch>` with no
+base ref starts the branch at the current HEAD. The primary
+clone's local `main` runs ahead of the public `origin/main` by an
+uncleared number of commits. A worktree off that HEAD inherits
+every one of them.
+
+**A PUBLIC pull-request target means a FRESH CLONE.** The pull
+request publishes each inherited commit. That is a leak vector,
+and it has produced a near-miss. Use a worktree only for work
+that stays local. A worktree is also safe when the target
+repository's local branch is not ahead of its remote.
 
 When the worker runs in a **secondary clone** — data-light,
 sandboxed, or otherwise not the canonical state — say so
