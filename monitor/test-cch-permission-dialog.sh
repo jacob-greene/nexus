@@ -212,6 +212,30 @@ read -r -d '' FRAME_MENU_ABOVE_PROSE <<'EOF'
        Esc to cancel · Tab to amend
 EOF
 
+# Skeptic request 004, shape A. A live menu row interleaved BETWEEN two
+# quoted option rows. Contiguous with them, and it satisfies the ordering
+# rule, so only column alignment rejects it: the menu row's `N.` token
+# starts in a different column, so those rows are not one option list.
+read -r -d '' FRAME_INTERLEAVED_MENU <<'EOF'
+  ⎿ docs quote the dialog:
+       1. Yes
+ ❯ 2. Blue
+       3. No
+       Esc to cancel · Tab to amend
+EOF
+
+# Skeptic request 004, shape B. A folder-trust dialog with a bare decline
+# row, plus `Tab to amend` borrowed from an adjacent line. Rejected
+# because the permission dialog's first option row is the bare word
+# `Yes`, and the trust dialog's is `Yes, I trust this folder`.
+read -r -d '' FRAME_TRUST_BARE_NO <<'EOF'
+ Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No
+ Enter to confirm · Esc to cancel
+  ⎿ note: permission dialogs end with Tab to amend
+EOF
+
 # All three selection positions of a real dialog must still match.
 FRAME_CHEVRON_ON_2=${FRAME_WRITE/ ❯ 1. Yes
    2. Yes, allow all edits during this session (shift+tab)/   1. Yes
@@ -242,6 +266,8 @@ should_not_match "empty frame"                                       ""
 should_not_match "prose + an AskUserQuestion menu below it"          "$FRAME_PROSE_PLUS_MENU"
 should_not_match "prose + a bare unrelated chevron row below it"     "$FRAME_PROSE_PLUS_CHEVRON"
 should_not_match "a live menu ABOVE quoted dialog rows"              "$FRAME_MENU_ABOVE_PROSE"
+should_not_match "a live menu INTERLEAVED with quoted dialog rows"   "$FRAME_INTERLEAVED_MENU"
+should_not_match "trust dialog, bare \`2. No\`, borrowed footer"      "$FRAME_TRUST_BARE_NO"
 
 # Co-location, stated directly: the same real dialog still matches when
 # unrelated content sits below it, and stops matching when its option
@@ -315,8 +341,9 @@ done
 # report, tested against the region the predicate actually uses.
 DIAG2=$(cch_assert_permission_dialog "$FRAME_OPTIONS_FAR_ABOVE" "a Write permission dialog" 2>&1 >/dev/null)
 for needle in \
-    'an option row `1. Yes`, in the 8 rows above the footer' \
-    'a chevron on a numbered option row above the footer'
+    'one contiguous, column-aligned run of numbered option' \
+    'at or below the `1. Yes` row' \
+    'present somewhere in that region:'
 do
     if grep -qF -- "$needle" <<<"$DIAG2"; then
         printf '  PASS: per-leg diagnostic carries %q\n' "$needle"; PASS=$(( PASS + 1 ))

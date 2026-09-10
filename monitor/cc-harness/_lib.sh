@@ -419,12 +419,74 @@ _cch_dialog_window() {
 # A real selection only ever moves DOWN the option list from `1. Yes`, so
 # this rule costs nothing legitimate: the chevron on option 1, 2 or 3 of
 # a real dialog all still match.
-_cch_chevron_at_or_below_yes() {
-    local above="$1" y c
-    y=$(grep -nE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" | head -1 | cut -d: -f1)
-    c=$(grep -nE '❯[[:space:]]+[0-9]+\.' <<<"$above" | head -1 | cut -d: -f1)
-    [[ -n "$y" && -n "$c" ]] || return 1
-    (( c >= y ))
+# ONE OVERLAY, not "legs somewhere in a window". The two rules above
+# constrain WHERE each leg may sit relative to the anchor. Neither
+# requires the legs to BELONG TO THE SAME overlay, so each round of
+# fixing closed one arrangement and left the next one open. The
+# nexus-158 skeptic found three arrangements in three tries, which is
+# what independent greps over a shared window will always produce.
+# Request 004 named the property that closes the class instead of the
+# instance, and this is it.
+#
+# A rendered option list has structure that prose plus an unrelated menu
+# never has:
+#
+#   CONTIGUITY  the numbered option rows are consecutive lines;
+#   ALIGNMENT   their `N.` tokens start in the SAME column.
+#
+# So the frame is scanned for maximal RUNS of consecutive numbered option
+# rows, and one single run must carry all of: the `1. Yes` row, an
+# `N. No` row, a chevron, and the chevron at or below the `1. Yes` row.
+#
+# This rejects the interleaved shape, where a live menu row sits between
+# two quoted option rows. Those three rows are consecutive, but the
+# menu row's number starts in a different column, so they are not one
+# option list:
+#
+#      ⎿ docs quote the dialog:
+#           1. Yes            <- column 12
+#     ❯ 2. Blue               <- column 7, so not the same list
+#           3. No             <- column 12
+#           Esc to cancel · Tab to amend
+#
+# EXACT `1. Yes`. The first option row of the permission dialog is the
+# bare word `Yes` and nothing else, measured on 2.1.173 and 2.1.220.
+# The folder-trust dialog's is `1. Yes, I trust this folder`. Requiring
+# the exact row rejects the trust dialog on its own merits, rather than
+# relying on `Tab to amend` being absent — which the skeptic showed can
+# be borrowed from an adjacent line of unrelated text.
+_cch_option_run_ok() {
+    local above="$1"
+    awk '
+        function digitcol(s,   p) { p = match(s, /[0-9]+\./); return p }
+        { line[NR] = $0 }
+        END {
+            opt  = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]"
+            yes  = "^[ \t]*(❯[ \t]+)?1\\.[ \t]+Yes[ \t]*$"
+            no   = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]+No[ \t]*$"
+            chev = "❯[ \t]+[0-9]+\\."
+            i = 1
+            while (i <= NR) {
+                if (line[i] !~ opt) { i++; continue }
+                j = i
+                while (j + 1 <= NR && line[j + 1] ~ opt) j++
+                col = -1; aligned = 1
+                haveyes = 0; haveno = 0; havechev = 0; yidx = 0; cidx = 0
+                for (k = i; k <= j; k++) {
+                    c = digitcol(line[k])
+                    if (col < 0) col = c
+                    else if (c != col) aligned = 0
+                    if (!haveyes  && line[k] ~ yes)  { haveyes = 1;  yidx = k }
+                    if (             line[k] ~ no)     haveno = 1
+                    if (!havechev && line[k] ~ chev) { havechev = 1; cidx = k }
+                }
+                if (aligned && haveyes && haveno && havechev && cidx >= yidx)
+                    exit 0
+                i = j + 1
+            }
+            exit 1
+        }
+    ' <<<"$above"
 }
 
 cch_has_permission_dialog() {
@@ -433,10 +495,7 @@ cch_has_permission_dialog() {
     [[ -n "$window" ]] || return 1
     above=$(grep '^A|' <<<"$window" | sed 's/^A|//')
     whole=$(sed 's/^[AB]|//' <<<"$window")
-    grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" \
-        && grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
-        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
-        && _cch_chevron_at_or_below_yes "$above" \
+    _cch_option_run_ok "$above" \
         && grep -qF 'Tab to amend' <<<"$whole"
 }
 
@@ -468,14 +527,24 @@ cch_assert_permission_dialog() {
         if [[ -z "$window" ]]; then
             printf '    - the footer phrase `Esc to cancel` (no anchor row, so no window)\n'
         else
-            grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" \
-                || printf '    - an option row `1. Yes`, in the 8 rows above the footer\n'
-            grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
-                || printf '    - a numbered decline row `N. No`, in the 8 rows above the footer\n'
-            grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
-                || printf '    - a chevron on a numbered option row above the footer (liveness)\n'
-            _cch_chevron_at_or_below_yes "$above" \
-                || printf '    - the chevron at or below the `1. Yes` row (it sits above it)\n'
+            if ! _cch_option_run_ok "$above"; then
+                printf '    - one contiguous, column-aligned run of numbered option\n'
+                printf '      rows, in the 8 rows above the footer, carrying ALL of:\n'
+                printf '      an exact `1. Yes` row, an `N. No` row, and a chevron\n'
+                printf '      at or below the `1. Yes` row.\n'
+                # Which individual pieces are present at all, purely to
+                # orient the reader. These are NOT the predicate: a leg
+                # can be present here and still not belong to any single
+                # option run.
+                printf '      present somewhere in that region:'
+                grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes[[:space:]]*$' <<<"$above" \
+                    && printf ' `1. Yes`'
+                grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
+                    && printf ' `N. No`'
+                grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
+                    && printf ' a chevron row'
+                printf '\n'
+            fi
             grep -qF 'Tab to amend' <<<"$whole" \
                 || printf '    - the footer phrase `Tab to amend`, at or near the footer\n'
         fi
