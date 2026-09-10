@@ -197,11 +197,38 @@ $FRAME_PROSE
  ❯ 2. something unrelated
 EOF
 
+# The mirror of the same hole, skeptic request 002. Constraining every
+# leg to the rows above the footer was not enough on its own: a live menu
+# drawn ABOVE a quoted dialog lends its chevron to option rows it has
+# nothing to do with, and both land in the same window. The chevron must
+# therefore sit at or below the `1. Yes` row. A real selection only ever
+# moves DOWN the option list, so that costs nothing legitimate.
+read -r -d '' FRAME_MENU_ABOVE_PROSE <<'EOF'
+ ❯ 1. Blue
+   2. Green
+  ⎿ docs quote the dialog:
+       1. Yes
+       3. No
+       Esc to cancel · Tab to amend
+EOF
+
+# All three selection positions of a real dialog must still match.
+FRAME_CHEVRON_ON_2=${FRAME_WRITE/ ❯ 1. Yes
+   2. Yes, allow all edits during this session (shift+tab)/   1. Yes
+ ❯ 2. Yes, allow all edits during this session (shift+tab)}
+FRAME_CHEVRON_ON_3=${FRAME_WRITE/ ❯ 1. Yes
+   2. Yes, allow all edits during this session (shift+tab)
+   3. No/   1. Yes
+   2. Yes, allow all edits during this session (shift+tab)
+ ❯ 3. No}
+
 # ---- positive: real frames must match ------------------------------------
 echo "=== frames that DO carry a permission dialog ==="
 should_match "Write dialog (\"Do you want to create …?\")"          "$FRAME_WRITE"
 should_match "Edit dialog (\"Do you want to make this edit …?\")"   "$FRAME_EDIT"
 should_match "two-option dialog (decline row is \`2. No\`)"          "$FRAME_TWO_OPTION"
+should_match "chevron arrowed down to option 2"                      "$FRAME_CHEVRON_ON_2"
+should_match "chevron arrowed down to option 3"                      "$FRAME_CHEVRON_ON_3"
 
 # ---- negative controls: the point of the exercise ------------------------
 echo
@@ -214,6 +241,7 @@ should_not_match "dialog frame with the chevron stripped"            "$FRAME_NO_
 should_not_match "empty frame"                                       ""
 should_not_match "prose + an AskUserQuestion menu below it"          "$FRAME_PROSE_PLUS_MENU"
 should_not_match "prose + a bare unrelated chevron row below it"     "$FRAME_PROSE_PLUS_CHEVRON"
+should_not_match "a live menu ABOVE quoted dialog rows"              "$FRAME_MENU_ABOVE_PROSE"
 
 # Co-location, stated directly: the same real dialog still matches when
 # unrelated content sits below it, and stops matching when its option

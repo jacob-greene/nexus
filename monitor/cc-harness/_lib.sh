@@ -401,6 +401,32 @@ _cch_dialog_window() {
 
 # Predicate. rc 0 if the frame carries a live tool-permission dialog.
 # Silent: for scenarios that need to branch rather than fail.
+
+# ORDERING, within the window. The chevron row must sit AT or BELOW the
+# `1. Yes` row. Constraining every leg to the eight rows above the anchor
+# still left the mirror of the original hole open: a live menu drawn
+# ABOVE a quoted dialog lends its chevron to option rows it has nothing
+# to do with, and both land in the same window. Found by the nexus-158
+# skeptic, request 002.
+#
+#     ❯ 1. Blue                      <- live menu, unrelated
+#       2. Green
+#      ⎿ docs quote the dialog:
+#            1. Yes                  <- quoted, not live
+#            3. No
+#            Esc to cancel · Tab to amend
+#
+# A real selection only ever moves DOWN the option list from `1. Yes`, so
+# this rule costs nothing legitimate: the chevron on option 1, 2 or 3 of
+# a real dialog all still match.
+_cch_chevron_at_or_below_yes() {
+    local above="$1" y c
+    y=$(grep -nE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" | head -1 | cut -d: -f1)
+    c=$(grep -nE '❯[[:space:]]+[0-9]+\.' <<<"$above" | head -1 | cut -d: -f1)
+    [[ -n "$y" && -n "$c" ]] || return 1
+    (( c >= y ))
+}
+
 cch_has_permission_dialog() {
     local plain="$1" window above whole
     window=$(_cch_dialog_window "$plain") || return 1
@@ -410,6 +436,7 @@ cch_has_permission_dialog() {
     grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" \
         && grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
         && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
+        && _cch_chevron_at_or_below_yes "$above" \
         && grep -qF 'Tab to amend' <<<"$whole"
 }
 
@@ -447,6 +474,8 @@ cch_assert_permission_dialog() {
                 || printf '    - a numbered decline row `N. No`, in the 8 rows above the footer\n'
             grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
                 || printf '    - a chevron on a numbered option row above the footer (liveness)\n'
+            _cch_chevron_at_or_below_yes "$above" \
+                || printf '    - the chevron at or below the `1. Yes` row (it sits above it)\n'
             grep -qF 'Tab to amend' <<<"$whole" \
                 || printf '    - the footer phrase `Tab to amend`, at or near the footer\n'
         fi
