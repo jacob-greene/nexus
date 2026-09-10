@@ -461,6 +461,52 @@ should_not_match "prose list with a mid-row chevron inside one of its rows" \
    2. See ❯ 4. below for the retry path
  Esc to cancel · Tab to amend"
 
+# ---- coverage: the two rules no other fixture gates ----------------------
+#
+# Found by mutation, not by inspection. The skeptic reviewing this fix
+# (`your-org/nexus-code#159`, finding T1) broke one rule at a time in
+# `_cch_option_run_ok` and re-ran this suite. Six of eight mutants were
+# killed. Two survived, which means no fixture below tested the rule
+# they broke:
+#
+#   M1  drops `cidx >= yidx`, the chevron-ordering rule
+#   M8  makes a blank line transparent inside a run
+#
+# Both rules are load-bearing and both are stated in the code, so both
+# read as covered. `cidx >= yidx` was added to close skeptic request
+# 002; its original fixture, FRAME_MENU_ABOVE_PROSE, is now rejected by
+# ALIGNMENT instead, so it no longer reaches the ordering rule. The
+# blank-line rule is asserted in a comment at cc-harness/_lib.sh — "A
+# blank line still breaks the run, so the footer can never be folded
+# in" — and nothing checked it.
+#
+# Each fixture below is built to fail on exactly one of those rules and
+# on nothing else. Every other leg is satisfied: the option rows are
+# contiguous, their `N.` tokens are all in column 4, and the footer
+# carries both phrases. So each one matches if and only if its rule is
+# gone, which is what makes it a test of that rule rather than of the
+# predicate in general.
+echo
+echo "-- the chevron-ordering and blank-line rules are gated --"
+# Chevron ABOVE the `1. Yes` row. A real selection only ever moves DOWN
+# the option list, so this is an unrelated live menu lending its chevron
+# to option rows below it. Matches under M1.
+should_not_match "chevron row sits ABOVE the \`1. Yes\` row" \
+" ❯ 9. Blue
+   1. Yes
+   3. No
+ Esc to cancel · Tab to amend"
+# A blank line between the option rows. The continuation-row loosening
+# folds an indented non-option line into the run; a blank line is not
+# indented past the option column and must still break it, or the
+# footer itself could be folded in. Matches under M8.
+should_not_match "a blank line between the option rows still breaks the run" \
+"   1. Yes
+
+ ❯ 2. Blue
+   3. No
+ Esc to cancel · Tab to amend"
+
 # ---- regression: no locale or awk precondition ---------------------------
 #
 # The option column is compared in TERMINAL COLUMNS. The awk match()
