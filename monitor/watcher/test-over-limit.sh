@@ -658,6 +658,477 @@ fi
 cp "$STUB_DIR/pane-state.sh" "$WORK/monitor/pane-state.sh"
 chmod +x "$WORK/monitor/pane-state.sh"
 
+# ---- LATCH REGRESSIONS (issue #500) --------------------------------------
+#
+# On 2026-09-02 an `_orchestrator` row suppressed 889 emits over 6h36m
+# while the pane itself probed `state=busy active=1`. Four defects
+# compounded. One test group per defect; each one FAILS on the code as it
+# stood before the fix.
+
+echo '=== LATCH d1: pause predicate ignores an expired deadline ==='
+# The predicate used to test only that a row EXISTED. A row whose stored
+# reset_epoch had passed hours earlier still held the gate closed.
+reset_state
+# reset_epoch 10 days in the past; next_attempt still in the future, so
+# the wake loop cannot help. The gate must NOT be paused.
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW - 864000 )) $(( NOW - 864000 )) $(( NOW + 86400 )) 0
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: gate paused on a row whose deadline passed 10 days ago (LATCH)\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: expired deadline does not hold the gate\n'
+    PASS=$(( PASS + 1 ))
+fi
+# A hold past the absolute ceiling must not pause either, even with a
+# deadline still nominally in the future.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW + 3600 )) $(( NOW - 26*3600 )) $(( NOW + 86400 )) 0
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: gate paused on a hold past the 25h absolute ceiling (LATCH)\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: hold past the absolute ceiling does not hold the gate\n'
+    PASS=$(( PASS + 1 ))
+fi
+# The two bounds must be independent. This row is well INSIDE the 25h
+# ceiling (first_seen 2h ago) but its deadline passed 1h57m ago, past the
+# 30m grace. Only the deadline+grace bound can open the gate here — the
+# exact shape of the incident, where first_seen was 6.6h old.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW - 7000 )) $(( NOW - 7200 )) $(( NOW + 68400 )) 0
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: deadline 1h57m past, inside the ceiling, still holds the gate (LATCH)\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: deadline+grace bound opens the gate independently of the ceiling\n'
+    PASS=$(( PASS + 1 ))
+fi
+# A LIVE hold must still pause — the fix must not open the gate early.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW + 3600 )) $(( NOW - 600 )) $(( NOW + 3900 )) 0
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: live hold (deadline ahead, inside ceiling) still pauses\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: live hold no longer pauses — suppression broken\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# A hold whose deadline JUST passed must still pause: the wake sequence
+# (margin + backoff budget) needs room to run before the gate reopens.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW + 240 )) 0
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: deadline inside the stale grace still pauses\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: gate reopened inside the stale grace — wake sequence cut short\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo '=== LATCH d2: refreshing a stamp must not move the deadline ==='
+# reset_at tokens are bare wall-clock strings with no date. Resolving one
+# AFTER its time-of-day has passed lands on tomorrow, so recomputing on
+# every 60s refresh walked reset_epoch — and next_attempt with it — one
+# day further out, forever.
+# First: prove the parser really does jump a day across the boundary.
+_probe_base=$(date +%s)
+_tok_probe=$(date -d "@$(( _probe_base + 60 ))" +%H:%M:%S 2>/dev/null)
+_e_before=$(_over_limit_reset_at_to_epoch "$_tok_probe" "$_probe_base")
+_e_after=$(_over_limit_reset_at_to_epoch  "$_tok_probe" "$(( _probe_base + 120 ))")
+assert_eq "parser jumps a full day once the token's clock time passes" \
+    "$(( _e_after - _e_before ))" "86400"
+# Now the invariant that matters: a refresh of the SAME token across that
+# boundary must leave the stored deadline untouched.
+reset_state
+_now0=$(date +%s)
+_tok=$(date -d "@$(( _now0 + 2 ))" +%H:%M:%S 2>/dev/null)
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "$_tok"
+_r1=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+_n1=$(awk -F'\t' '{print $7}' "$(_over_limit_state_path)")
+# Busy-wait past the token's own clock time (2s), then refresh.
+_target=$(( _now0 + 4 )); while (( $(date +%s) < _target )); do :; done
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "$_tok"
+_r2=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+_n2=$(awk -F'\t' '{print $7}' "$(_over_limit_state_path)")
+assert_eq "reset_epoch frozen across a refresh past the token's clock time" "$_r2" "$_r1"
+assert_eq "next_attempt frozen with it"                                     "$_n2" "$_n1"
+# A genuinely CHANGED token must still be honoured (the documented edge).
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
+    $(( NOW + 100 )) $(( NOW - 600 )) $(( NOW + 400 )) 0
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "11pm"
+_r3=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+if [[ "$_r3" != "$(( NOW + 100 ))" ]]; then
+    printf '  PASS: a changed token still recomputes the deadline\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: changed token did not recompute the deadline\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# ...but the recomputed value is clamped to the absolute ceiling, so no
+# token change can push the wake beyond first_seen + MAX_HOLD.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
+    $(( NOW + 100 )) $(( NOW - 600 )) $(( NOW + 400 )) 0
+MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS=1200 \
+    _over_limit_record "_orchestrator" "orchestrator" "orchestrator" "11pm"
+_r4=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+_f4=$(awk -F'\t' '{print $6}' "$(_over_limit_state_path)")
+if (( _r4 <= _f4 + 1200 )); then
+    printf '  PASS: recomputed deadline clamped to first_seen + max_hold\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: deadline %s exceeds the ceiling %s\n' "$_r4" "$(( _f4 + 1200 ))" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo '=== LATCH d3: the ceiling must not live inside the wake it protects ==='
+# The absolute ceiling used to be evaluated BELOW the due-gate. When
+# reset_epoch is the corrupted value, next_attempt never arrives, so the
+# ceiling was never reached — no ceiling line was logged between
+# 2026-08-26 and the 2026-09-02 incident. It must fire on a row that is
+# past the ceiling but NOT yet due.
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='5:30pm'
+# first_seen 30h ago (> 25h ceiling); next_attempt 19h in the FUTURE —
+# exactly the shape measured on the stuck row.
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW + 68400 )) $(( NOW - 108000 )) $(( NOW + 68400 )) 0
+_over_limit_process_wakes "orchestrator"
+grep -q "absolute ceiling" "$LOG_LOG" \
+    && { printf '  PASS: ceiling fires on a not-yet-due row past the ceiling\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: ceiling never evaluated — it is gated on the wake it protects (LATCH)\n' >&2; FAIL=$(( FAIL + 1 )); }
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: gate still paused after the ceiling should have fired\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: gate reopened by the ceiling despite a far-future next_attempt\n'
+    PASS=$(( PASS + 1 ))
+fi
+grep -q "orchestrator" "$PASTE_LOG" \
+    && { printf '  PASS: ceiling fail-open pasted the resume brief\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: ceiling fail-open did not paste\n' >&2; FAIL=$(( FAIL + 1 )); }
+# A row inside the ceiling and not yet due must still be left alone —
+# hoisting the ceiling must not turn every tick into a probe.
+reset_state
+export MOCK_PANE_STATE_2=over-limit
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW + 3600 )) $(( NOW - 600 )) $(( NOW + 3900 )) 0
+_over_limit_process_wakes "orchestrator"
+_att=$(awk -F'\t' '{print $8}' "$(_over_limit_state_path)")
+assert_eq "not-yet-due row inside the ceiling untouched" "$_att" "0"
+[[ -s "$PASTE_LOG" ]] \
+    && { printf '  FAIL: hoisted ceiling pasted on a healthy not-yet-due row\n' >&2; FAIL=$(( FAIL + 1 )); } \
+    || { printf '  PASS: no paste on a healthy not-yet-due row\n'; PASS=$(( PASS + 1 )); }
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2
+
+echo '=== LATCH d4: state path never resolves relative to the caller cwd ==='
+# `${STATE_DIR:-.}` sent every read and write into the caller's working
+# directory. `_over_limit_drop` then returned 0 having removed a file
+# that was not the state file at all.
+_lonely="$WORK/lonely"; mkdir -p "$_lonely"
+cp "$HELPER" "$_lonely/_over_limit.sh"
+_cwd_probe="$WORK/cwdprobe"; mkdir -p "$_cwd_probe"
+# (a) STATE_DIR set — unchanged behaviour.
+assert_eq "STATE_DIR wins when set" \
+    "$(_over_limit_state_path)" "$STATE_DIR/over-limit-state.tsv"
+# (b) STATE_DIR unset, NEXUS_ROOT set — the bootstrap.sh layout.
+_out=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR NEXUS_ROOT=/opt/nx bash -c \
+    "source '$HELPER'; _over_limit_state_path" 2>/dev/null)
+assert_eq "NEXUS_ROOT rung resolves to its monitor/.state" \
+    "$_out" "/opt/nx/monitor/.state/over-limit-state.tsv"
+# (c) all three unset, helper in a real monitor/watcher checkout — the
+#     repo layout rung. Must be the repo's state dir, never './'.
+_out=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c \
+    "source '$HELPER'; _over_limit_state_path" 2>/dev/null)
+assert_eq "repo-layout rung resolves to the checkout's monitor/.state" \
+    "$_out" "$_repo_root/monitor/.state/over-limit-state.tsv"
+# (d) all three unset AND no monitor/watcher layout — must FAIL LOUDLY,
+#     not silently answer './over-limit-state.tsv'.
+_out=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c \
+    "source '$_lonely/_over_limit.sh'; _over_limit_state_path" 2>/dev/null); _rc=$?
+if (( _rc != 0 )) && [[ -z "$_out" ]]; then
+    printf '  PASS: unresolvable state dir fails loudly instead of using cwd\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: unresolvable state dir returned "%s" (rc=%s)\n' "$_out" "$_rc" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+_err=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c \
+    "source '$_lonely/_over_limit.sh'; _over_limit_state_path" 2>&1 >/dev/null)
+assert_contains "loud failure names the cause on stderr" "$_err" "cannot resolve a state directory"
+# (e) a drop with no resolvable state dir must not touch the cwd. The
+#     decoy holds ONLY an `_orchestrator` row, so a cwd-relative drop
+#     empties it and deletes the file — the failure the operator hit
+#     while restoring service, where the drop reported success and the
+#     real row was still there.
+printf '_orchestrator\torch\torchestrator\t5pm\t1\t1\t1\t0\n' \
+    > "$_cwd_probe/over-limit-state.tsv"
+( cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c \
+    "source '$_lonely/_over_limit.sh'; _over_limit_drop _orchestrator" >/dev/null 2>&1 )
+if [[ -f "$_cwd_probe/over-limit-state.tsv" ]]; then
+    printf '  PASS: drop left the cwd file alone\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: drop deleted a file in the caller cwd\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# (f) the predicate must not read a stranger's row out of the cwd.
+printf '_orchestrator\torch\torchestrator\t5pm\t%s\t%s\t%s\t0\n' \
+    "$(( NOW + 3600 ))" "$NOW" "$(( NOW + 3900 ))" > "$_cwd_probe/over-limit-state.tsv"
+if ( cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c \
+        "source '$_lonely/_over_limit.sh'; _over_limit_orchestrator_paused" >/dev/null 2>&1 ); then
+    printf '  FAIL: predicate read a row from the caller cwd\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: predicate ignores a cwd file when the state dir is unresolvable\n'
+    PASS=$(( PASS + 1 ))
+fi
+# The held-log path follows the same resolver.
+_out=$(cd "$_cwd_probe" && env -u STATE_DIR -u NEXUS_STATE_DIR NEXUS_ROOT=/opt/nx bash -c \
+    "source '$HELPER'; _over_limit_held_log_path" 2>/dev/null)
+assert_eq "held-log path uses the same resolver" \
+    "$_out" "/opt/nx/monitor/.state/over-limit-held.log"
+
+# ---- SKEPTIC ROUND 1 (PR #116) -------------------------------------------
+#
+# Four findings from the skeptic pass. Each one had no assertion behind it
+# when the branch was first pushed.
+
+echo '=== SKEPTIC: the wake sequence is measured, not assumed ==='
+# The shipped comment justified the grace against "300 + 4x300 = 1500s".
+# Both the interval COUNT and their values were wrong: only
+# max_attempts-1 intervals elapse, because _over_limit_bump_or_failopen
+# fails open when the NEXT attempt count reaches the cap.
+seq=$(MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS=300 \
+      MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS=60 \
+      MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS=300 \
+      MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 _over_limit_wake_sequence_seconds)
+assert_eq "wake sequence at defaults is margin + 60 + 120 + 240" "$seq" "720"
+seq=$(MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS=300 \
+      MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS=60 \
+      MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS=300 \
+      MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 _over_limit_wake_sequence_seconds)
+assert_eq "wake sequence at max_attempts=8 reaches the cap" "$seq" "1920"
+# With NO knobs set at all, the sequence must still be 720. This pins the
+# four in-code defaults (margin 300, initial 60, cap 300, attempts 4)
+# that monitor/README.md now quotes, so the doc figures cannot drift from
+# the code unnoticed (skeptic round 2 addendum).
+seq=$( unset MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS \
+             MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS \
+             MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS \
+             MONITOR_OVER_LIMIT_MAX_ATTEMPTS
+       _over_limit_wake_sequence_seconds )
+assert_eq "wake sequence with no knobs set is 720 (defaults 300/60/300/4)" "$seq" "720"
+# The 300s cap first BINDS at max_attempts=5: the fourth interval would
+# be 480. 1020 = 300 + 60 + 120 + 240 + 300; an uncapped fourth interval
+# would give 1200. The README states this, so a test holds it.
+seq=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=5 _over_limit_wake_sequence_seconds)
+assert_eq "the 300s cap first binds at max_attempts=5" "$seq" "1020"
+# The grace default must never be shorter than that sequence, at ANY
+# config. A fixed 1800 was shorter at max_attempts=8.
+g=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 _over_limit_grace_default)
+assert_eq "grace default holds the 1800s floor at defaults" "$g" "1800"
+g=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 _over_limit_grace_default)
+assert_eq "grace default rises with max_attempts" "$g" "1920"
+# The invariant that matters, stated directly.
+for ma in 4 6 8 12; do
+    s=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=$ma _over_limit_wake_sequence_seconds)
+    d=$(MONITOR_OVER_LIMIT_MAX_ATTEMPTS=$ma _over_limit_grace_default)
+    if (( d >= s )); then
+        printf '  PASS: grace default (%s) >= wake sequence (%s) at max_attempts=%s\n' "$d" "$s" "$ma"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: grace default %s is SHORTER than the wake sequence %s at max_attempts=%s\n' \
+            "$d" "$s" "$ma" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+# An explicit value still wins over the derivation.
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    $(( NOW - 900 )) $(( NOW - 1200 )) $(( NOW + 86400 )) 0
+if MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS=60 _over_limit_orchestrator_paused; then
+    printf '  FAIL: an explicit short grace was ignored\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: an explicit grace overrides the derived default\n'
+    PASS=$(( PASS + 1 ))
+fi
+
+echo '=== SKEPTIC r2: the PREDICATE must use the derived grace, not a constant ==='
+# Round-one added assertions for _over_limit_wake_sequence_seconds and
+# _over_limit_grace_default, but both test the helpers in ISOLATION. They
+# assert the derived NUMBER; none asserted that anything CONSUMES it. So
+# reverting _over_limit_hold_expired to a hardcoded 1800 floor left the
+# suite at 115 passed, 0 failed (skeptic round 2). The fix to round-one
+# finding 1 was untested at the only integration point that matters.
+#
+# The discriminating case is a deadline that passed by a value BETWEEN
+# the two grace figures. At max_attempts=8 the sequence is 1920s, so a
+# deadline 1860s past must NOT expire under the derivation and MUST
+# expire under a hardcoded 1800. Both sides of the boundary are pinned.
+#
+# `now` is re-read immediately before each row is written, not taken from
+# the suite-wide NOW: the margin here is 60s and suite runtime would
+# otherwise drift the row across the boundary under test.
+_grace_boundary() {   # <label> <seconds-past-deadline> <want: paused|open>
+    local label="$1" past="$2" want="$3" rt
+    reset_state
+    rt=$(date +%s)
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+        "$(( rt - past ))" "$(( rt - 7200 ))" "$(( rt + 3600 ))" 0
+    local got=open
+    MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 \
+        _over_limit_orchestrator_paused && got=paused
+    if [[ "$got" == "$want" ]]; then
+        printf '  PASS: deadline %ss past, max_attempts=8 → %s (derived grace 1920s)\n' \
+            "$past" "$got"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: deadline %ss past, max_attempts=8 → %s, want %s (predicate ignoring the derived grace?)\n' \
+            "$past" "$got" "$want" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+# Inside the derived grace (1800 < 1860 < 1920): the wake sequence is
+# still legitimately retrying, so the hold must STAND. A hardcoded 1800
+# would open the gate here and cut that wake short.
+_grace_boundary "inside" 1860 paused
+# Past the derived grace: the hold must go.
+_grace_boundary "beyond" 2000 open
+# Same boundary asserted directly on the shared rule, so a future change
+# that keeps the predicate but rewires the rule is also caught.
+_rt=$(date +%s)
+if MONITOR_OVER_LIMIT_MAX_ATTEMPTS=8 \
+    _over_limit_hold_expired "$(( _rt - 7200 ))" "$(( _rt - 1860 ))" "$_rt"; then
+    printf '  FAIL: hold_expired used a constant, not the derived grace\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: hold_expired consumes the derived grace at max_attempts=8\n'
+    PASS=$(( PASS + 1 ))
+fi
+# ...and the same row IS expired at the shipped default, which proves the
+# two settings genuinely differ rather than both being permissive.
+if MONITOR_OVER_LIMIT_MAX_ATTEMPTS=4 \
+    _over_limit_hold_expired "$(( _rt - 7200 ))" "$(( _rt - 1860 ))" "$_rt"; then
+    printf '  PASS: the same row expires at max_attempts=4 (grace 1800s) — the settings differ\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: row not expired at max_attempts=4 — the boundary case is vacuous\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo '=== SKEPTIC: malformed row fields must not reach bash arithmetic ==='
+# Bash evaluates array subscripts inside (( )), so a non-numeric field is
+# a code path, not a syntax error:
+#   fs='a[$(echo INJECTED >&2)]'; (( now - fs > 5 ))   -> prints INJECTED
+# Every field the wake path does arithmetic on needs a numeric guard, and
+# each guard needs an assertion or the next refactor deletes it silently.
+#
+# TWO failure modes, so the assertions check TWO things. Under `set -u`
+# (which main.sh:251 sets, and this file sets too) the unguarded compare
+# aborts the shell before the substitution runs; without it, the
+# substitution EXECUTES. So a canary check alone would pass vacuously on
+# the abort. Each case therefore runs in a SUBSHELL and asserts both that
+# the canary is absent AND that the call completed — otherwise removing a
+# guard would kill this suite mid-file instead of failing an assertion.
+_probe_malformed() {   # <label> <first_seen> <next_attempt>
+    local label="$1" fs="$2" na="$3" rc
+    rm -f "$_canary"
+    reset_state
+    rm -f "$STATE_DIR/machine-input.tsv"
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+        "$(( NOW - 60 ))" "$fs" "$na" 0
+    ( _over_limit_process_wakes "orchestrator" ) >/dev/null 2>&1
+    rc=$?
+    if [[ -e "$_canary" ]]; then
+        printf '  FAIL: %s — malformed field was EXECUTED as arithmetic\n' "$label" >&2
+        FAIL=$(( FAIL + 1 ))
+    elif (( rc != 0 )); then
+        printf '  FAIL: %s — wake path aborted (rc=%s) on a malformed field\n' "$label" "$rc" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: %s — malformed field neither executed nor aborted the wake\n' "$label"
+        PASS=$(( PASS + 1 ))
+    fi
+}
+_canary="$WORK/canary"
+rm -f "$_canary"
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='5:30pm'
+_evil="a[\$(touch $_canary)]"
+# The ceiling compare must not evaluate a malformed first_seen.
+_probe_malformed "first_seen"   "$_evil"           "$(( NOW - 1 ))"
+# The due-gate must not evaluate a malformed next_attempt.
+export MOCK_PANE_STATE_2=idle
+_probe_malformed "next_attempt" "$(( NOW - 600 ))" "$_evil"
+# ...and that row must still be serviced, not parked forever.
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: a row with a malformed next_attempt parked the gate closed\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: a malformed next_attempt reads as due and the row is serviced\n'
+    PASS=$(( PASS + 1 ))
+fi
+# The predicate does arithmetic on both fields too. Same two checks.
+rm -f "$_canary"
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "5:30pm" \
+    "$_evil" "$_evil" $(( NOW + 3600 )) 0
+( _over_limit_orchestrator_paused ) >/dev/null 2>&1
+_pred_rc=$?
+if [[ -e "$_canary" ]]; then
+    printf '  FAIL: the pause predicate EXECUTED a malformed field\n' >&2
+    FAIL=$(( FAIL + 1 ))
+elif (( _pred_rc > 1 )); then
+    printf '  FAIL: the pause predicate aborted (rc=%s) on a malformed field\n' "$_pred_rc" >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: the pause predicate guards both fields it compares\n'
+    PASS=$(( PASS + 1 ))
+fi
+rm -f "$_canary"
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2
+
+echo '=== SKEPTIC: the three bounds are PER-ROW, not per-incident ==='
+# Documented so the guarantee is not overread. After a fail-open drop the
+# next scan re-stamps a still-over-limit pane with a FRESH first_seen, so
+# the ceiling restarts. With a token whose clock time has passed, the new
+# deadline lands ~24h out and the gate closes again. This asserts the
+# ACTUAL behaviour; it is not a claim that the behaviour is ideal.
+reset_state
+_past=$(date -d "@$(( $(date +%s) - 60 ))" +%H:%M:%S 2>/dev/null)
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "$_past"
+_re_first=$(awk -F'\t' '{print $6}' "$(_over_limit_state_path)")
+_re_reset=$(awk -F'\t' '{print $5}' "$(_over_limit_state_path)")
+_ahead=$(( _re_reset - _re_first ))
+if (( _ahead > 82800 )); then
+    printf '  PASS: a re-stamp on a passed token lands ~24h out (%ss) — per-row, not per-incident\n' "$_ahead"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: expected a ~24h re-stamp horizon, got %ss\n' "$_ahead" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: the fresh row pauses again (the documented per-row scope)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fresh row did not pause — scan/record contract changed\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 # ---- off-time log (operator ask, your-nexus#275) ------------------------
 echo '=== off-time log: fresh orchestrator hold starts it; record appends ==='
 reset_state
