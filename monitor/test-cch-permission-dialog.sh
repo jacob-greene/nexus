@@ -362,6 +362,168 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
+
+# ---- regression: narrow terminal, real captured frames -------------------
+#
+# BYTE-EXACT captures from Claude Code 2.1.220, recorded 2026-09-10 by
+# booting the real binary through cch_boot_prompting_worker in a tmux
+# session created at the stated width. Trailing whitespace is part of
+# the capture. Do NOT reflow or strip these fixtures: the wrap position
+# is the whole point, and a reflowed fixture stops testing it.
+#
+# Below about 58 columns the renderer soft-wraps option 2 and emits the
+# tail as its own line. Before your-org/nexus-code#158 finding 2 that split
+# the option run in two, and a REAL dialog was rejected. Both of these
+# fixtures FAIL against a run rule that requires every line of the run
+# to be a numbered option row.
+
+read -r -d '' FRAME_WRITE_W46 <<'EOF'
+ Do you want to create probe-new-46.txt?      
+ ❯ 1. Yes  
+   2. Yes, allow all edits during this session
+      (shift+tab)      
+   3. No   
+
+ Esc to cancel · Tab to amend                 
+EOF
+
+read -r -d '' FRAME_WRITE_W54 <<'EOF'
+ Do you want to create probe-new-54.txt?              
+ ❯ 1. Yes    
+   2. Yes, allow all edits during this session        
+      (shift+tab)          
+   3. No     
+
+ Esc to cancel · Tab to amend                         
+EOF
+
+echo
+echo "-- narrow terminals: the real dialog still matches --"
+should_match "real 2.1.220 Write dialog captured at width 46 (option 2 wraps)" \
+    "$FRAME_WRITE_W46"
+should_match "real 2.1.220 Write dialog captured at width 54 (option 2 wraps)" \
+    "$FRAME_WRITE_W54"
+
+# The loosening is bounded: a non-option line is folded into the run
+# ONLY if it is indented PAST the option column. These two fixtures put
+# a non-option line between the option rows at or LEFT of that column,
+# so it must still break the run.
+echo
+echo "-- the loosening is bounded: an un-indented interloper still breaks the run --"
+should_not_match "prose at the option column between the option rows" \
+" Do you want to create probe.txt?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session
+   see the docs for what option 2 does
+   3. No
+
+ Esc to cancel · Tab to amend"
+should_not_match "prose left of the option column between the option rows" \
+" Do you want to create probe.txt?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session
+ see the docs for what option 2 does
+   3. No
+
+ Esc to cancel · Tab to amend"
+
+# The two shapes the contiguity rule was added to close. They are gated
+# here so the finding-2 loosening can never silently reopen them.
+# Reported by the depth-1 skeptic on your-org/nexus-code#158.
+echo
+echo "-- the shapes contiguity closed must stay closed --"
+should_not_match "live menu row interleaved between quoted option rows" \
+"  ⎿ docs quote the dialog:
+       1. Yes
+ ❯ 2. Blue
+       3. No
+       Esc to cancel · Tab to amend"
+should_not_match "folder-trust dialog borrowing a quoted Tab-to-amend footer" \
+" Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No
+ Enter to confirm · Esc to cancel
+  ⎿ note: permission dialogs end with Tab to amend"
+
+# ---- regression: the chevron leg is anchored ----------------------------
+#
+# `chev` used to match a ❯ ANYWHERE inside a row, unlike `opt`, `yes`
+# and `no`, which are all anchored to the row start. So a numbered list
+# in prose could lend the chevron leg from the middle of one of its own
+# rows. No real dialog draws its chevron anywhere but the row start.
+# Reported by the depth-2 skeptic on your-org/nexus-code#158, finding 3.
+echo
+echo "-- the chevron leg is anchored to the row start --"
+should_not_match "prose list with a mid-row chevron inside one of its rows" \
+" The docs describe the permission dialog. Its options are:
+   1. Yes
+   3. No
+   2. See ❯ 4. below for the retry path
+ Esc to cancel · Tab to amend"
+
+# ---- regression: no locale or awk precondition ---------------------------
+#
+# The option column is compared in TERMINAL COLUMNS. The awk match()
+# function returns a BYTE offset unless the implementation is multibyte-
+# aware in the current locale: mawk never is, and gawk is not under a C
+# locale. The chevron ❯ is one column and three bytes, so a byte-offset
+# implementation reported the chevron row misaligned against every row
+# below it and rejected EVERY real dialog.
+#
+# That is a false negative, which turns a fail-loud assertion silent. It
+# was invisible to this suite because the suite varied fixtures but never
+# the environment. These arms vary the environment instead: they re-run
+# the positive fixtures with the column arithmetic forced byte-wise.
+# Reported by the depth-2 skeptic on your-org/nexus-code#158, finding 1.
+#
+# On the code this replaced, every one of these arms failed.
+
+# Run the predicate in a subshell with a modified environment, so the
+# suite's own environment is never disturbed.
+should_match_in_env() {
+    local label="$1" frame="$2"; shift 2
+    if ( export "$@"; cch_has_permission_dialog "$frame" ); then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — expected a match, got none\n' "$label" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+echo
+echo "-- the column arithmetic does not depend on the locale --"
+for _lc in C POSIX; do
+    should_match_in_env "Write dialog under LC_ALL=$_lc" \
+        "$FRAME_WRITE" "LC_ALL=$_lc"
+    should_match_in_env "width-46 dialog under LC_ALL=$_lc" \
+        "$FRAME_WRITE_W46" "LC_ALL=$_lc"
+done
+
+# The same check against a genuinely byte-only awk. mawk is the default
+# awk on Debian and Ubuntu, so this is the implementation CI is most
+# likely to get. If mawk is absent the arm SKIPS LOUDLY rather than
+# passing quietly: a silent skip here would be the vacuous control this
+# suite exists to prevent.
+echo
+echo "-- the column arithmetic does not depend on the awk implementation --"
+_mawk=$(command -v mawk 2>/dev/null)
+if [[ -n "$_mawk" ]]; then
+    _shim=$(mktemp -d)
+    printf '#!/bin/sh\nexec %s "$@"\n' "$_mawk" > "$_shim/awk"
+    chmod +x "$_shim/awk"
+    should_match_in_env "Write dialog with awk shadowed to mawk" \
+        "$FRAME_WRITE" "PATH=$_shim:$PATH"
+    should_match_in_env "Edit dialog with awk shadowed to mawk" \
+        "$FRAME_EDIT" "PATH=$_shim:$PATH"
+    should_match_in_env "width-46 dialog with awk shadowed to mawk" \
+        "$FRAME_WRITE_W46" "PATH=$_shim:$PATH"
+    rm -rf "$_shim"
+else
+    printf '  SKIP: mawk is not installed, so the mawk arm did not run\n' >&2
+    printf '        Install mawk to exercise it. The LC_ALL arms above\n' >&2
+    printf '        cover the same defect through a different route.\n' >&2
+fi
+
 # ---- summary -------------------------------------------------------------
 echo
 printf 'cch-permission-dialog: %d passed, %d failed\n' "$PASS" "$FAIL"
