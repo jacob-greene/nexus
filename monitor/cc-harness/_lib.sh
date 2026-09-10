@@ -455,30 +455,104 @@ _cch_dialog_window() {
 # the exact row rejects the trust dialog on its own merits, rather than
 # relying on `Tab to amend` being absent — which the skeptic showed can
 # be borrowed from an adjacent line of unrelated text.
+#
+# CONTINUATION ROWS. Contiguity as first written meant "consecutive
+# lines that are themselves option rows", and that rejected a REAL
+# dialog on a narrow terminal. Below about 58 columns Claude Code soft-
+# wraps option 2 inside its own dialog box and emits the tail as its own
+# line, which split the run in two and left neither half with all the
+# legs. Measured on frames captured from the real binary at widths 46,
+# 54, 58, 62 and 120 (your-org/nexus-code#158, depth-2 skeptic finding 2):
+#
+#   ❯ 1. Yes
+#     2. Yes, allow all edits during this session
+#        (shift+tab)          <- the wrap. NOT an option row.
+#     3. No
+#
+# `capture-pane -J` cannot help: this is the application's own wrap, not
+# the terminal's, so the two lines are genuinely separate.
+#
+# So a non-option line no longer breaks the run PROVIDED it is indented
+# PAST the option column. That is the property that separates the two
+# cases, and it is why this loosening does not undo the tightening
+# above. A soft-wrapped continuation is always indented past the `N.` it
+# belongs to, because the renderer indents it under its own option text.
+# An interleaved live menu row is not: it carries its own `N.` token and
+# is caught by ALIGNMENT, exactly as before. A blank line still breaks
+# the run, so the footer can never be folded in.
 _cch_option_run_ok() {
     local above="$1"
     awk '
-        function digitcol(s,   p) { p = match(s, /[0-9]+\./); return p }
+        # The column of the `N.` token, counted in TERMINAL COLUMNS.
+        #
+        # The awk match() function returns a BYTE offset unless the
+        # implementation is multibyte-aware in the current locale.
+        # mawk never is, and
+        # gawk is not under a C locale. The chevron ❯ (U+276F) is ONE
+        # column and THREE bytes, so a byte offset reports the chevron
+        # row two positions right of every row below it, `aligned` goes
+        # 0, and a REAL dialog is discarded. Under mawk that rejected
+        # every positive fixture in the hermetic suite, which turned a
+        # fail-loud assertion permanently silent
+        # (your-org/nexus-code#158, depth-2 skeptic finding 1).
+        #
+        # `opt` admits only spaces, tabs and one optional ❯ before the
+        # digits, so on any row that reaches this function the chevron
+        # is the ONLY character in that prefix whose byte count differs
+        # from its column count. Collapsing it to one ASCII byte makes
+        # the byte offset EQUAL the column offset, under every awk and
+        # every locale. Do NOT fix this by pinning LC_ALL instead: the
+        # assertion should carry no unstated environment precondition.
+        function digitcol(s,   p) {
+            gsub(/❯/, "^", s)
+            p = match(s, /[0-9]+\./)
+            return p
+        }
+        # Column of the first non-blank character. Everything before it
+        # is spaces and tabs, one byte and one column each, so this is
+        # already implementation- and locale-independent.
+        function indentcol(s,   p) { p = match(s, /[^ \t]/); return p }
         { line[NR] = $0 }
         END {
             opt  = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]"
             yes  = "^[ \t]*(❯[ \t]+)?1\\.[ \t]+Yes[ \t]*$"
             no   = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]+No[ \t]*$"
-            chev = "❯[ \t]+[0-9]+\\."
+            # ANCHORED, exactly as `opt`, `yes` and `no` already are. An
+            # unanchored chevron matched a ❯ anywhere INSIDE a row, so
+            # the chevron leg could still be borrowed — now from the
+            # middle of a row rather than from a neighbouring one
+            # (your-org/nexus-code#158, depth-2 skeptic finding 3):
+            #
+            #     1. Yes
+            #     3. No
+            #     2. See ❯ 4. below for the retry path
+            #
+            # No real dialog draws its chevron anywhere but the row
+            # start, so anchoring costs nothing legitimate.
+            chev = "^[ \t]*❯[ \t]+[0-9]+\\."
             i = 1
             while (i <= NR) {
                 if (line[i] !~ opt) { i++; continue }
-                j = i
-                while (j + 1 <= NR && line[j + 1] ~ opt) j++
-                col = -1; aligned = 1
+                col = digitcol(line[i])
+                j = i                     # last OPTION row of this run
+                k = i + 1
+                while (k <= NR) {
+                    if (line[k] ~ opt) { j = k; k++; continue }
+                    # A soft-wrapped continuation is transparent: it
+                    # neither carries a leg nor ends the run.
+                    if (line[k] !~ /^[ \t]*$/ && indentcol(line[k]) > col) {
+                        k++; continue
+                    }
+                    break
+                }
+                aligned = 1
                 haveyes = 0; haveno = 0; havechev = 0; yidx = 0; cidx = 0
-                for (k = i; k <= j; k++) {
-                    c = digitcol(line[k])
-                    if (col < 0) col = c
-                    else if (c != col) aligned = 0
-                    if (!haveyes  && line[k] ~ yes)  { haveyes = 1;  yidx = k }
-                    if (             line[k] ~ no)     haveno = 1
-                    if (!havechev && line[k] ~ chev) { havechev = 1; cidx = k }
+                for (m = i; m <= j; m++) {
+                    if (line[m] !~ opt) continue        # folded wrap row
+                    if (digitcol(line[m]) != col) aligned = 0
+                    if (!haveyes  && line[m] ~ yes)  { haveyes = 1;  yidx = m }
+                    if (             line[m] ~ no)     haveno = 1
+                    if (!havechev && line[m] ~ chev) { havechev = 1; cidx = m }
                 }
                 if (aligned && haveyes && haveno && havechev && cidx >= yidx)
                     exit 0
