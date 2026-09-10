@@ -169,6 +169,7 @@
 #   ng retire-preflight <window>           # synchronous go/no-go gate pre-kill
 #   ng pane-state <window-index>           # classify a worker pane
 #   ng write-probe <path>                  # pre-flight a deliverable path
+#   ng evidence-freeze <src> --task <slug>  # write-once freeze into evidence
 #   ng declare-wait <kind> <id> <desc>     # self-declare an async wait
 #   ng declare-no-wait <kind> <id>         # mark an async launch fire-and-forget
 #   ng paste-followup <window> ...         # canonical follow-up paste
@@ -5120,6 +5121,8 @@ cmd_pane_state()       { _facade pane-state.sh       "$@"; }
 cmd_context()          { _facade context-usage.sh    "$@"; }
 # worker: pre-flight that a deliverable path is writable before compute
 cmd_write_probe()      { _facade write-probe.sh      "$@"; }
+# worker: freeze an artefact into durable evidence, write-once + read-only
+cmd_evidence_freeze()  { _facade evidence-freeze.sh   "$@"; }
 # maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
 cmd_reports_roll()     { _facade reports-roll.sh     "$@"; }
 # worker: self-declare an async external wait (slurm/CI/long curl)
@@ -5195,6 +5198,8 @@ State queries & infra:
   token                          print a bot installation token
   user-pat                       print the user PAT for private reads
   write-probe <path>             pre-flight a deliverable path is writable
+  evidence-freeze <src> --task <slug>   write-once freeze into durable evidence
+  evidence-freeze --verify --task <slug>   check one evidence dir, write nothing
   declare-wait <kind> <id> <desc>   self-declare an async external wait
   declare-no-wait <kind> <id>    mark an async launch fire-and-forget
 
@@ -5251,6 +5256,7 @@ main() {
         pane-state)            cmd_pane_state            "$@" ;;
         context)               cmd_context               "$@" ;;
         write-probe)           cmd_write_probe           "$@" ;;
+        evidence-freeze)       cmd_evidence_freeze       "$@" ;;
         declare-wait)          cmd_declare_wait          "$@" ;;
         declare-no-wait)       cmd_declare_no_wait       "$@" ;;
         paste-followup)        cmd_paste_followup        "$@" ;;
