@@ -202,7 +202,8 @@ Two ways to spin one up:
   work/<project>-<task>/`. Fully isolated `.git` and working
   tree; use when the task touches data the primary reads, or a
   clean remote checkout matters.
-- **Worktree** — fetch first, then name the base ref:
+- **Worktree** — fetch first, then name the base ref. Use the
+  repository's default branch, for example `origin/main`:
   `git -C work/<project> fetch origin` and
   `git -C work/<project> worktree add ../<project>-<task> -b
   <operator>/<task> origin/main`. Lighter; shares `.git`,
@@ -220,6 +221,14 @@ request publishes each inherited commit. That is a leak vector,
 and it has produced a near-miss. Use a worktree only for work
 that stays local. A worktree is also safe when the target
 repository's local branch is not ahead of its remote.
+
+A correct base ref is necessary but not sufficient, which is why
+the rule above says fresh clone and not "just name the base ref".
+A worktree shares the primary clone's `.git`, so the unpushed
+commits stay reachable from it. `git push --all`, `git push
+--tags`, or an accidental `git merge main` publishes them even
+from a correctly based branch. A fresh clone cannot reach what it
+never fetched.
 
 When the worker runs in a **secondary clone** — data-light,
 sandboxed, or otherwise not the canonical state — say so
