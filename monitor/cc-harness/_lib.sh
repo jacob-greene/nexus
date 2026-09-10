@@ -361,15 +361,56 @@ cch_capture() {
 # Requirement 3 is what separates this from the folder-trust dialog,
 # whose footer is `Enter to confirm · Esc to cancel` — no `Tab to amend`.
 
+# CO-LOCATION. The five legs are NOT matched independently across the
+# whole frame. They were at first, and that was a false-positive hole:
+# a transcript quoting the dialog prose satisfies legs 1, 2 and 3 on its
+# own, so ANY unrelated live chevron row elsewhere in the same 25-row
+# capture — an AskUserQuestion menu, say — completed the match with no
+# dialog present. Found by the nexus-158 skeptic, request 001.
+#
+# The frame is therefore reduced to a WINDOW first, anchored on the LAST
+# row carrying `Esc to cancel`:
+#
+#   legs 1, 2 and 4 must all land in the eight rows ABOVE the anchor;
+#   leg 3b (`Tab to amend`) must land at the anchor or within two rows.
+#
+# Above-only for the option rows is what closes the hole: a menu pasted
+# BELOW a quoted footer cannot lend its chevron to the match. Eight rows
+# is generous against the measured dialog, whose option rows sit two to
+# four rows above the footer, and it tolerates a longer option list.
+#
+# Two rows of slack for `Tab to amend` rather than requiring the same
+# row: both measured releases render one footer row, but a narrow pane
+# could wrap it.
+#
+# Rows are tagged `A|` (above the anchor) or `B|` (anchor and below) so
+# the caller can apply a leg to one region or to the window as a whole.
+_cch_dialog_window() {
+    local plain="$1"
+    awk '
+        { line[NR] = $0; if (index($0, "Esc to cancel")) anchor = NR }
+        END {
+            if (!anchor) exit 1
+            start = anchor - 8; if (start < 1) start = 1
+            stop  = anchor + 2; if (stop > NR)  stop  = NR
+            for (i = start; i <= stop; i++)
+                print (i < anchor ? "A|" : "B|") line[i]
+        }
+    ' <<<"$plain"
+}
+
 # Predicate. rc 0 if the frame carries a live tool-permission dialog.
 # Silent: for scenarios that need to branch rather than fail.
 cch_has_permission_dialog() {
-    local plain="$1"
-    grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$plain" \
-        && grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$plain" \
-        && grep -qF 'Esc to cancel' <<<"$plain" \
-        && grep -qF 'Tab to amend' <<<"$plain" \
-        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$plain"
+    local plain="$1" window above whole
+    window=$(_cch_dialog_window "$plain") || return 1
+    [[ -n "$window" ]] || return 1
+    above=$(grep '^A|' <<<"$window" | sed 's/^A|//')
+    whole=$(sed 's/^[AB]|//' <<<"$window")
+    grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" \
+        && grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
+        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
+        && grep -qF 'Tab to amend' <<<"$whole"
 }
 
 # Assertion. rc 0 if the frame carries the dialog; otherwise rc 1 AND a
@@ -390,16 +431,25 @@ cch_assert_permission_dialog() {
         printf 'cch_assert_permission_dialog: NO PERMISSION DIALOG IN FRAME\n'
         printf '  expected: %s\n' "$label"
         printf '  missing legs:\n'
-        grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$plain" \
-            || printf '    - an option row `1. Yes`\n'
-        grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$plain" \
-            || printf '    - a numbered decline row `N. No`\n'
-        grep -qF 'Esc to cancel' <<<"$plain" \
-            || printf '    - the footer phrase `Esc to cancel`\n'
-        grep -qF 'Tab to amend' <<<"$plain" \
-            || printf '    - the footer phrase `Tab to amend`\n'
-        grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$plain" \
-            || printf '    - a chevron on a numbered option row (liveness)\n'
+        # Each leg is reported against the SAME region the predicate
+        # tests it in, so the diagnostic cannot say a leg is present
+        # while the predicate rejects it for being in the wrong place.
+        local window above whole
+        window=$(_cch_dialog_window "$plain") || window=""
+        above=$(grep '^A|' <<<"$window" 2>/dev/null | sed 's/^A|//')
+        whole=$(sed 's/^[AB]|//' <<<"$window" 2>/dev/null)
+        if [[ -z "$window" ]]; then
+            printf '    - the footer phrase `Esc to cancel` (no anchor row, so no window)\n'
+        else
+            grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes' <<<"$above" \
+                || printf '    - an option row `1. Yes`, in the 8 rows above the footer\n'
+            grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
+                || printf '    - a numbered decline row `N. No`, in the 8 rows above the footer\n'
+            grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
+                || printf '    - a chevron on a numbered option row above the footer (liveness)\n'
+            grep -qF 'Tab to amend' <<<"$whole" \
+                || printf '    - the footer phrase `Tab to amend`, at or near the footer\n'
+        fi
         printf '  frame captured:\n'
         sed 's/^/    | /' <<<"$plain"
     } >&2

@@ -173,6 +173,30 @@ EOF
 # half-drawn frame: the words are there, the selection is not.
 FRAME_NO_CHEVRON=${FRAME_WRITE/ ❯ 1. Yes/   1. Yes}
 
+# The nexus-158 skeptic's request 001. The prose fixture satisfies the
+# option rows and both footer phrases on its own; only the chevron leg
+# rejected it. So appending ANY unrelated live chevron row to the same
+# 25-row capture completed the match, with no dialog present. Two shapes,
+# both reachable in one frame:
+#
+#   a) an AskUserQuestion menu drawn under the transcript;
+#   b) a bare chevron row whose number is not even `1.`.
+#
+# The fix is co-location: the option rows and the chevron must sit in the
+# eight rows ABOVE the footer, so a menu BELOW a quoted footer cannot
+# lend its chevron. These two fixtures are the regression test for it.
+read -r -d '' FRAME_PROSE_PLUS_MENU <<EOF
+$FRAME_PROSE
+ Which color should the demo use?
+ ❯ 1. Blue
+   2. Green
+EOF
+
+read -r -d '' FRAME_PROSE_PLUS_CHEVRON <<EOF
+$FRAME_PROSE
+ ❯ 2. something unrelated
+EOF
+
 # ---- positive: real frames must match ------------------------------------
 echo "=== frames that DO carry a permission dialog ==="
 should_match "Write dialog (\"Do you want to create …?\")"          "$FRAME_WRITE"
@@ -188,6 +212,32 @@ should_not_match "AskUserQuestion chip bar"                          "$FRAME_ASK
 should_not_match "prose describing the dialog (no live chevron)"     "$FRAME_PROSE"
 should_not_match "dialog frame with the chevron stripped"            "$FRAME_NO_CHEVRON"
 should_not_match "empty frame"                                       ""
+should_not_match "prose + an AskUserQuestion menu below it"          "$FRAME_PROSE_PLUS_MENU"
+should_not_match "prose + a bare unrelated chevron row below it"     "$FRAME_PROSE_PLUS_CHEVRON"
+
+# Co-location, stated directly: the same real dialog still matches when
+# unrelated content sits below it, and stops matching when its option
+# rows are pushed far above the footer.
+read -r -d '' FRAME_DIALOG_PLUS_NOISE <<EOF
+$FRAME_WRITE
+ ⎿  some later transcript line
+ ❯ 9. an unrelated menu row
+EOF
+should_match "real dialog still matches with noise below it"         "$FRAME_DIALOG_PLUS_NOISE"
+
+read -r -d '' FRAME_OPTIONS_FAR_ABOVE <<EOF
+$FRAME_WRITE
+ filler 1
+ filler 2
+ filler 3
+ filler 4
+ filler 5
+ filler 6
+ filler 7
+ filler 8
+ Esc to cancel · Tab to amend
+EOF
+should_not_match "options pushed out of the window above the footer"  "$FRAME_OPTIONS_FAR_ABOVE"
 
 # ---- the assertion wrapper is loud --------------------------------------
 echo
@@ -216,17 +266,34 @@ fi
 # The diagnostic goes to stderr, names the missing legs, and quotes the
 # frame. A CI log that only keeps stderr must still carry the evidence.
 DIAG=$(cch_assert_permission_dialog "$FRAME_IDLE" "a Write permission dialog" 2>&1 >/dev/null)
+# An idle frame has no `Esc to cancel` anchor at all, so there is no
+# window to test the other legs in. The diagnostic says exactly that
+# rather than listing four legs it never looked for.
 for needle in \
     'NO PERMISSION DIALOG IN FRAME' \
     'expected: a Write permission dialog' \
-    'an option row `1. Yes`' \
-    'the footer phrase `Tab to amend`' \
+    'no anchor row, so no window' \
     'bypass permissions on'
 do
     if grep -qF -- "$needle" <<<"$DIAG"; then
         printf '  PASS: diagnostic carries %q\n' "$needle"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: diagnostic missing %q\n    in: <<%s>>\n' "$needle" "$DIAG" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+# A frame that HAS the anchor but not the option rows gets the per-leg
+# report, tested against the region the predicate actually uses.
+DIAG2=$(cch_assert_permission_dialog "$FRAME_OPTIONS_FAR_ABOVE" "a Write permission dialog" 2>&1 >/dev/null)
+for needle in \
+    'an option row `1. Yes`, in the 8 rows above the footer' \
+    'a chevron on a numbered option row above the footer'
+do
+    if grep -qF -- "$needle" <<<"$DIAG2"; then
+        printf '  PASS: per-leg diagnostic carries %q\n' "$needle"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: per-leg diagnostic missing %q\n    in: <<%s>>\n' "$needle" "$DIAG2" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 done

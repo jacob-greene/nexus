@@ -249,9 +249,19 @@ the question literal too, because that is the thing under test:
 shapes. It requires an option row `1. Yes`, a numbered decline row
 `N. No`, both footer phrases `Esc to cancel` and `Tab to amend` (matched
 separately, so a separator change cannot silently disable it), and a
-chevron on a numbered option row as the liveness leg. That last one is
-what stops prose describing the dialog from matching, and the
-`Tab to amend` leg is what separates it from the folder-trust dialog.
+chevron on a numbered option row as the liveness leg. The `Tab to amend`
+leg is what separates it from the folder-trust dialog.
+
+The legs are **co-located**, not matched independently across the frame.
+`Esc to cancel` is the anchor; the option rows and the chevron must sit
+in the eight rows **above** it. Frame-wide matching was a false-positive
+hole, found by the nexus-158 skeptic: a transcript quoting the dialog
+prose satisfies the option rows and both footer phrases on its own, so
+any unrelated live chevron row in the same 25-row capture — an
+AskUserQuestion menu, say — completed the match with no dialog present.
+Requiring the option rows above the anchor closes it, because a menu
+drawn below a quoted footer cannot lend its chevron. Both shapes are
+regression fixtures in the hermetic suite.
 
 `monitor/test-cch-permission-dialog.sh` is the hermetic suite for it.
 Most of it is negative: an idle REPL, the trust dialog, an
