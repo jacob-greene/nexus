@@ -612,20 +612,130 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
-# 5b. TTL boundary: a stamp INSIDE the TTL still classifies
-#     over-limit (the TTL must not eat live suspensions).
-printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}\n' \
-    "$(( NOW - 20 * 3600 ))" > "$ol_tmp"   # 20h old < 27h TTL
-out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
-                --over-limit-file "$ol_tmp" \
-                --heartbeat-file /dev/null --now "$NOW" 2>&1)
-got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+# Classify against a stamp built from `ts` and `reset_at`, with the
+# clock pinned. Returns the state field only.
+ol_state_for() {   # $1=ts  $2=reset_at JSON value  $3=now
+    printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit",%s"window":"olwin","hook_event_name":"StopFailure"}\n' \
+        "$1" "$2" > "$ol_tmp"
+    "$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
+              --over-limit-file "$ol_tmp" \
+              --heartbeat-file /dev/null --now "$3" 2>&1 \
+        | awk -F'[ =]' '{print $2}'
+}
+
+# 5b. TTL boundary: a stamp INSIDE the TTL still classifies over-limit
+#     (the TTL must not eat live suspensions). The stamp carries NO
+#     reset_at, so the TTL is the only bound — which is the case the
+#     TTL exists for.
+got_state=$(ol_state_for "$(( NOW - 20 * 3600 ))" '' "$NOW")
 if [[ "$got_state" == "over-limit" ]]; then
-    printf '  PASS: 20h-old stamp (inside TTL) still over-limit\n'
+    printf '  PASS: 20h-old stamp, no reset_at (inside TTL) still over-limit\n'
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: inside-TTL stamp lost — got=%s want=over-limit\n' "$got_state" >&2
     FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-ii. A 20h-old stamp whose stated reset is STILL AHEAD keeps
+#     suppressing. The reset-aware bound must not shorten a live
+#     suspension — this is the negative control for defect A's fix.
+ahead_token=$(date -d "@$(( NOW + 7200 ))" '+%-I:%M%P' 2>/dev/null)
+if [[ -n "$ahead_token" ]]; then
+    got_state=$(ol_state_for "$(( NOW - 20 * 3600 ))" \
+                "\"reset_at\":\"${ahead_token}\"," "$NOW")
+    if [[ "$got_state" == "over-limit" ]]; then
+        printf '  PASS: 20h-old stamp whose reset is still ahead stays over-limit\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: future-reset stamp lost — got=%s want=over-limit\n' "$got_state" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# 5b-iii. DEFECT A (jacob-greene/nexus#79). A FRESH stamp whose stated
+#     reset has already passed must not suppress. Before this fix the
+#     27h TTL was the only rule, so this stamp held for another 25h.
+#     Measured on 2026-08-24: three stamps, all 27 minutes past their
+#     own 7:10pm reset, none expired, one window visibly running a tool
+#     call.
+passed_token=$(date -d "@$(( NOW - 5760 ))" '+%-I:%M%P' 2>/dev/null)   # 1.6h ago
+if [[ -n "$passed_token" ]]; then
+    got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+                "\"reset_at\":\"${passed_token}\"," "$NOW")
+    if [[ "$got_state" != "over-limit" ]]; then
+        printf '  PASS: 2h-old stamp past its own reset expires (got %s)\n' "$got_state"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: stamp past its own reset still suppresses — defect A\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# 5b-iv. Inside the grace. The reset passed 5 minutes ago, which is
+#     less than the 1800s grace, so the stamp still holds. A reset is
+#     the earliest the pane can resume, not the instant it does.
+grace_token=$(date -d "@$(( NOW - 300 ))" '+%-I:%M%P' 2>/dev/null)
+if [[ -n "$grace_token" ]]; then
+    got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+                "\"reset_at\":\"${grace_token}\"," "$NOW")
+    if [[ "$got_state" == "over-limit" ]]; then
+        printf '  PASS: stamp inside the 1800s reset grace still over-limit\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: grace window not honoured — got=%s want=over-limit\n' "$got_state" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# 5b-v. An UNRESOLVABLE zone must not be resolved in UTC and then used
+#     as a deadline. The reset-aware bound declines the token and the
+#     TTL governs, so a fresh stamp keeps suppressing.
+got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+            '"reset_at":"3am_America/Nowhere",' "$NOW")
+if [[ "$got_state" == "over-limit" ]]; then
+    printf '  PASS: unresolvable zone falls back to the TTL, not to UTC\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: unresolvable zone changed the stamp verdict — got=%s\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-vi. PARSER PARITY. `_over_limit_stamp_reset_epoch` (pane-state.sh)
+#     and `_over_limit_reset_at_to_epoch` (_over_limit.sh) are separate
+#     copies, because pane-state.sh sources nothing. Pin them to the
+#     same deadline: with `ts` = now, the stamp must flip across the
+#     epoch the WATCHER computes, plus the grace.
+#
+#     This block uses the REAL clock, not this file's synthetic
+#     `NOW=2000000000`. The two parsers resolve the bare wall-clock
+#     token against different reference days: the watcher's copy uses
+#     GNU date's "today", which is the real calendar day, while the
+#     stamp copy uses the stamp's own `ts`. Those agree whenever `ts`
+#     is near the real clock, which is every production case, and
+#     disagree under a synthetic clock. Measuring on the real clock is
+#     what makes the comparison meaningful.
+OL_LIB="$_repo_root/monitor/watcher/_over_limit.sh"
+parity_now=$(date +%s)
+if [[ -f "$OL_LIB" ]]; then
+    # shellcheck disable=SC1090
+    ( . "$OL_LIB" ) >/dev/null 2>&1 && parity_ok=1 || parity_ok=0
+    if (( parity_ok )); then
+        for tok in "3am" "11pm" "3am_America/Los_Angeles" "5:30pm_Europe/Berlin"; do
+            want_epoch=$( . "$OL_LIB"; _over_limit_reset_at_to_epoch "$tok" "$parity_now" )
+            before=$(ol_state_for "$parity_now" "\"reset_at\":\"${tok}\"," \
+                     "$(( want_epoch + 1800 - 60 ))")
+            after=$(ol_state_for "$parity_now" "\"reset_at\":\"${tok}\"," \
+                    "$(( want_epoch + 1800 + 60 ))")
+            if [[ "$before" == "over-limit" && "$after" != "over-limit" ]]; then
+                printf '  PASS: stamp parser agrees with the watcher on %s\n' "$tok"
+                PASS=$(( PASS + 1 ))
+            else
+                printf '  FAIL: parser drift on %s — before=%s after=%s (watcher epoch %s)\n' \
+                    "$tok" "$before" "$after" "$want_epoch" >&2
+                FAIL=$(( FAIL + 1 ))
+            fi
+        done
+    fi
 fi
 
 # 5c. Corrupt stamp (no parseable ts, ancient mtime) ages out via
