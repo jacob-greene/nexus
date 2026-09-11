@@ -3489,7 +3489,12 @@ _verdict_trailer_line() {
                     if (line ~ /-->/) { in_comment = 0 }
                     next
                 }
-                if (line ~ /^[[:space:]]*<!--/ && line !~ /-->/) {
+                # `<!--` ANYWHERE on the line opens the block, not just at
+                # the start of one. A comment opened after other text hid
+                # the trailer from every human reader while still feeding
+                # the gate a verdict. A comment that also closes on the
+                # same line opens nothing.
+                if (line ~ /<!--/ && line !~ /-->/) {
                     in_comment = 1; next
                 }
             }
@@ -3538,7 +3543,12 @@ _verdict_parse() {
     read -ra toks <<<"$line"
     for tok in "${toks[@]}"; do
         case "$tok" in
-            head=*)     head="${tok#head=}" ;;
+            # FIRST head= wins, not the last. `_verdict_render` always emits
+            # head= immediately after the verdict, so the first token is the
+            # canonical one. Last-wins let trailing prose that happens to
+            # contain a `head=` token silently rebind the record to another
+            # commit — the gate would then compare the wrong head.
+            head=*)     [[ -n "$head" ]] || head="${tok#head=}" ;;
             depth=*)    depth="${tok#depth=}" ;;
             findings=*) findings="${tok#findings=}" ;;
             skeptic=*)  skeptic="${tok#skeptic=}" ;;

@@ -205,6 +205,44 @@ assert_eq "T1.4i control — and the trailer after it is read" "$(cut -f2 <<<"$g
 commented=$'<!--\nSkeptic-Verdict: credible head=9999999\n-->\n'
 got=$(printf '%s' "$commented" | _verdict_parse); rc=$?
 assert_eq "T1.4j a trailer inside an HTML comment is not a verdict" "$rc" "3"
+# The comment may open AFTER other text on the line. Anchoring the open to
+# the start of a line missed that, and the miss is the `#155` inversion in
+# the other direction: a reader sees nothing, the gate reads `credible`.
+midline=$'text <!--\nSkeptic-Verdict: credible head=9999999\n-->\n'
+got=$(printf '%s' "$midline" | _verdict_parse); rc=$?
+assert_eq "T1.4j2 a comment opened mid-line also hides the trailer" "$rc" "3"
+# A comment that opens AND closes on one line opens no block, so a trailer
+# after it is still read. Without this the rule above could over-reach.
+sameline=$'text <!-- aside --> more\n\nSkeptic-Verdict: credible head=9999999\n'
+got=$(printf '%s' "$sameline" | _verdict_parse); rc=$?
+assert_eq "T1.4j3 control — a one-line comment opens no block" "$rc" "0"
+assert_eq "T1.4j4 control — and the later trailer is read" "$(cut -f2 <<<"$got")" "9999999"
+
+# T1.4v THE COLUMN-ZERO ANCHOR IS LOAD-BEARING IN THE SCAN, not only in the
+# validator. The awk anchor decides WHICH line is selected; the bash regex
+# only validates the line already selected, and cannot recover a line awk
+# never picked.
+#
+# A real trailer followed LATER by an indented mention of the format is the
+# case that separates them. Without the awk anchor, `last` lands on the
+# indented line because it comes later, the validator rejects it, and the
+# real trailer above is never seen. The direction is fail-open.
+#
+# An earlier version of this suite tested a body containing ONLY an indented
+# line. Both anchors reject that, so they agreed and the test proved nothing.
+anchored=$'Skeptic-Verdict: credible head=9999999\n\nFormat note:\n\n    Skeptic-Verdict: credible head=1111111\n'
+got=$(printf '%s' "$anchored" | _verdict_parse); rc=$?
+assert_eq "T1.4v a real trailer survives a later indented mention" "$rc" "0"
+assert_eq "T1.4w and the head is the real one, not the indented one" \
+    "$(cut -f2 <<<"$got")" "9999999"
+
+# T1.4x the FIRST head= wins. Trailing prose carrying a `head=` token must
+# not rebind the record to another commit.
+twoheads=$'Skeptic-Verdict: credible head=aaaaaaa note head=bbbbbbb\n'
+got=$(printf '%s' "$twoheads" | _verdict_parse); rc=$?
+assert_eq "T1.4x a line with two head= tokens still parses" "$rc" "0"
+assert_eq "T1.4y and binds to the FIRST, the canonical position" \
+    "$(cut -f2 <<<"$got")" "aaaaaaa"
 
 # T1.4q-t the fence rule must cover BOTH fence characters and an indented
 # fence. These close mutations that survived the first round: dropping
@@ -493,6 +531,58 @@ assert_contains "T4.6c and names the likely cause" "$out" "unclosed code fence"
 FX_BODY=$'a description\n```\na CLOSED code fence\n```\n'; reset_calls
 out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
 assert_eq "T4.6d control — a closed fence records normally" "$rc" "0"
+
+# T4.6e-h the read-back must read the PATCH RESPONSE, not the string the
+# function built. Reading the response is the whole reason the check works:
+# it pins the published artefact rather than the intent. A read-back that
+# re-parsed its own `new_body` would pass on a publish that never landed.
+#
+# Drive it by making the RESPONSE disagree with what was sent. The stub
+# echoes a body naming a DIFFERENT head; a response-reading check must
+# refuse, an intent-reading one would not notice.
+_FX_PATCH_ECHO=$'a description\n\nSkeptic-Verdict: credible head=7777777\n'
+api() {
+    printf '%s\n' "$*" >> "$CALLS"
+    local m=GET a prev=""
+    for a in "$@"; do [[ "$prev" == "-X" ]] && m="$a"; prev="$a"; done
+    local req=""
+    [[ "$m" == "PUT" || "$m" == "PATCH" ]] && req=$(cat)
+    [[ -n "$req" ]] && printf '%s' "$req" > "$PATCH_BODY"
+    case "$m" in
+        PATCH) jq -cn --arg u "https://x/pull/175" --arg b "$_FX_PATCH_ECHO" \
+                   '{html_url:$u, body:$b}' ;;
+        *)     jq -n --arg b "$FX_BODY" --arg s "$FX_HEAD_SHA" \
+                   '{number:175, body:$b, head:{ref:"topic", sha:$s}}' ;;
+    esac
+}
+FX_BODY="$BODY_NONE"; FX_HEAD_SHA="$VALIDATED_FULL"; reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
+assert_eq "T4.6e set FAILS when the response names a different head" "$rc" "1"
+assert_contains "T4.6f and names the head that came back" "$out" "7777777"
+assert_contains "T4.6g and says the gate would compare the wrong commit" \
+    "$out" "wrong commit"
+# Control: when the response agrees, the same call succeeds. Without this,
+# T4.6e could pass against a check that refuses everything.
+_FX_PATCH_ECHO=$'a description\n\nSkeptic-Verdict: credible head='"$VALIDATED_FULL"$'\n'
+reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
+assert_eq "T4.6h control — an agreeing response records normally" "$rc" "0"
+# Restore the standard stub for the cases that follow.
+api() {
+    printf '%s\n' "$*" >> "$CALLS"
+    local m=GET a prev=""
+    for a in "$@"; do [[ "$prev" == "-X" ]] && m="$a"; prev="$a"; done
+    local req=""
+    [[ "$m" == "PUT" || "$m" == "PATCH" ]] && req=$(cat)
+    [[ -n "$req" ]] && printf '%s' "$req" > "$PATCH_BODY"
+    case "$m" in
+        PUT)   jq -n --arg s "$FX_MERGE_SHA" '{sha:$s}' ;;
+        PATCH) jq -c --arg u "https://github.com/jacob-greene/nexus/pull/175" \
+                   '{html_url:$u, body:(.body // "")}' <<<"$req" ;;
+        *)     jq -n --arg b "$FX_BODY" --arg s "$FX_HEAD_SHA" \
+                   '{number:175, body:$b, head:{ref:"topic", sha:$s}}' ;;
+    esac
+}
 
 # T4.7 a stale earlier record must not be left winning. If the append lands
 # but an earlier trailer still parses last, the gate compares the wrong
