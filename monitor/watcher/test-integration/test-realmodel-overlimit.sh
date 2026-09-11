@@ -334,6 +334,18 @@ assert_eq "prose carrying hit/your/team/shared/budget/limit → NOT over-limit" 
         "We hit your team's shared budget target, so the limit discussion can wait.")")" \
     "absent"
 
+#     Two more arbitrary lines, so the negative control is not a single
+#     sample. Source code and conversational prose are the two shapes an
+#     agent pane carries most of the time.
+assert_eq "source code carrying budget/limit identifiers → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-code \
+        "def compute_limit(team, budget): return team.shared_budget - budget.spent")")" \
+    "absent"
+assert_eq "conversational prose carrying reached/your/hit/team/shared/budget → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-chat \
+        "I have reached your file and hit save; the team shared a budget spreadsheet.")")" \
+    "absent"
+
 # (8) The canonical path the widening must not disturb, asserted here so
 #     this phase stands alone: state AND the parsed reset token.
 b2_canon=$(b2_make canon-weekly \
@@ -398,9 +410,19 @@ assert_eq "shell assertion carrying the notice → NOT over-limit" \
     "absent"
 
 # (14) `grep -n` output, the other gutter shape.
-assert_eq "grep -n output carrying the notice → NOT over-limit" \
+#
+#      The row carries a COMPLETE canonical notice with its reset time
+#      and no quote, so the only thing standing between it and an
+#      over-limit verdict is the gutter rule. An earlier draft used a
+#      real captured `grep -n` row whose notice was truncated at the
+#      middle dot; that row has no reset time and no sentence-final
+#      stop, so `_detect_over_limit` rejected it at the companion check
+#      with or without the filter, and the assertion pinned nothing.
+#      The skeptic on jacob-greene/nexus#173 found that. This shape is
+#      what a `grep -n` over a fixture file actually emits.
+assert_eq "grep -n output carrying a complete notice → NOT over-limit" \
     "$(b2_state "$(b2_make src-grep \
-'     107:#   over-limit       - the canonical "You'"'"'ve hit your <flavor> limit ·')")" \
+"     557:You've hit your weekly limit · resets 3am (America/Los_Angeles)")")" \
     "absent"
 
 # (15) A markdown bullet quoting the notice in backticks.
