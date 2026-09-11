@@ -419,6 +419,34 @@ assert_eq "indented canonical notice still over-limit (filter is not a blanket r
 "        You've hit your weekly limit · resets 3am (America/Los_Angeles)")")" \
     "over-limit"
 
+# (17) The detector must not classify off its OWN source. Every line of
+#      pane-state.sh that matches the headline is rendered alone on a
+#      pane; none may classify over-limit.
+#
+#      This is not hypothetical. The doc comment added with the widened
+#      pattern first carried its three example notices UNQUOTED. Those
+#      three rows have no gutter, no quote and no marker, so no
+#      provenance rule dropped them, and a `cat` of this file onto a
+#      pane classified over-limit. The quotes in that comment block are
+#      what this assertion holds in place.
+b3_bad=0 b3_n=0
+while IFS= read -r b3_row; do
+    b3_n=$(( b3_n + 1 ))
+    if [[ "$(b2_state "$(b2_make "self-$b3_n" "$b3_row")")" == "over-limit" ]]; then
+        b3_bad=$(( b3_bad + 1 ))
+        echo "        offending row: $b3_row" >&2
+    fi
+done < <(grep -E "You.{0,3}ve (hit|reached) your ([^[:space:]]+ ){0,2}(limit|budget)" \
+            "$REPO_ROOT/monitor/pane-state.sh")
+
+# Positive control on the absence claim above. A mis-scoped or silenced
+# grep scans zero rows and the offender count is trivially 0, which
+# reads exactly like a clean pass.
+assert_eq "self-source scan actually scanned rows (n=$b3_n)" \
+    "$( (( b3_n > 0 )) && echo yes || echo no )" "yes"
+assert_eq "no line of pane-state.sh classifies over-limit off its own source" \
+    "$b3_bad" "0"
+
 # ---- phase C: the watcher's HOLD — gate closes on the detected status ------
 # Source the production _over_limit.sh at its unit seam: record what the
 # probe saw, exactly as _over_limit_scan_panes would, and assert the

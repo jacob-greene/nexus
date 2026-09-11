@@ -552,15 +552,16 @@ _over_limit_drop_quoted_source() {
 
 # Anchor the over-limit notice on the last OVER_LIMIT_SCAN_ROWS
 # non-blank rows above the input box. The
-# canonical text Claude Code renders is:
+# canonical text Claude Code renders is (QUOTED on purpose — see the
+# note in the `_OVER_LIMIT_HEADLINE_RE` block below):
 #
-#     You've hit your limit · resets 3am (America/Los_Angeles)
-#     /extra-usage to finish what you're working on.
+#     "You've hit your limit · resets 3am (America/Los_Angeles)"
+#     "/extra-usage to finish what you're working on."
 #
 # but the headline VARIES by limit flavor — the 2026-07-14 incident
 # (your-org/nexus-code, over-limit emits) rendered
 #
-#     You've hit your weekly limit · resets 3am (America/Los_Angeles)
+#     "You've hit your weekly limit · resets 3am (America/Los_Angeles)"
 #
 # and the exact-substring match on "You've hit your limit" silently
 # missed it, disabling the whole watcher-side hold. The match is now
@@ -589,11 +590,21 @@ _over_limit_drop_quoted_source() {
 # Two widenings over the 2.1.220-era pattern
 # (`You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit`), both
 # forced by the cc 2.1.268 budget-exhaustion family
-# (jacob-greene/nexus#173):
+# (jacob-greene/nexus#173). The three forms are QUOTED below, and the
+# quotes are load-bearing, not decoration — see the note after them:
 #
-#     You've hit your team's shared budget. Switch to another model to continue.
-#     You've hit your team's shared budget. /model to switch models.
-#     You've hit your team's shared budget. Run /usage-credits to raise it …
+#     "You've hit your team's shared budget. Switch to another model to continue."
+#     "You've hit your team's shared budget. /model to switch models."
+#     "You've hit your team's shared budget. Run /usage-credits to raise it …"
+#
+# Those three lines must stay quoted. Unquoted, they are bare notices
+# with no gutter and no marker, so no rule in
+# `_over_limit_drop_quoted_source` drops them, and an agent that `cat`s
+# this file onto its pane classifies over-limit off this comment block.
+# That is the failure this file exists to prevent, and it was measured
+# here, not imagined: unquoted these rows classify `over-limit`, quoted
+# they classify `absent`. A `#   - ` prefix does NOT fix it — the
+# comment's own `#` precedes the marker, so the marker rule never fires.
 #
 #   1. The flavor tokens are any non-space run, not `[[:alnum:]-]`.
 #      "team's" carries an apostrophe, which is not alnum, so the old
