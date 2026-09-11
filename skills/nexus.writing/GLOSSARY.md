@@ -39,6 +39,9 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | skeptic | an independent agent that adversarially rechecks another worker's result |
 | skeptic round | one validation pass, from the request that opens it to the verdict that closes it |
 | verdict | the skeptic's ruling on a worker's result, which closes the skeptic round |
+| head | the tip commit of a pull request's branch |
+| validated head | the exact commit a verdict states it covers, which the verdict does not extend past |
+| verdict trailer | the `Skeptic-Verdict:` line in a pull-request body that names the verdict and its validated head |
 | parked | idle on purpose and exempt from window cleanup, usually while waiting for a skeptic |
 | ghost | Claude Code's dim autosuggest text in a pane, which looks like typed input but is not |
 | preflight | a check that runs before an action and blocks it when a condition fails |
