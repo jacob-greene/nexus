@@ -278,6 +278,21 @@ Where a producer could have headed the failure off (a data inventory on
 ingest, accumulated gate exit codes, pinned versions, a writability probe,
 named-path deletes), **flag the absence of that guard** as a finding.
 
+**A mutation arm's failure count is not per-assertion evidence.** A
+*mutation arm* is one deliberate break of production code, run to prove
+that an assertion pins something. The arm turns the suite red, so the arm
+is recorded as caught. But the assertion it was meant to pin can pass
+against the fixed and the broken code alike. Another assertion went red
+and covered for it. The green/red tally never shows this, so the suite
+reports coverage it does not have. Attribute each arm to the specific
+assertion it is meant to pin. Then confirm **that** assertion flips red.
+"The suite went red somewhere" is a signal, not per-assertion evidence.
+The `#173` over-limit detector chain carries the instance. Its phase B3
+gutter assertion used an input row that a separate check rejected
+outright. No mutation of the rule that assertion claimed to pin could
+make it fail. The arm still counted as caught, because other assertions
+in the same arm went red.
+
 **Proportionality still applies.** Spend the verification budget where
 being wrong is expensive — a merge, a figure, a gene list, an external
 write, a multi-day run. A cosmetic change gets a glance. But when
