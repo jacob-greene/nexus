@@ -504,20 +504,64 @@ _over_limit_window() {
     fi
     printf '%s\n' "$body" \
         | grep -v '^[[:space:]]*$' \
-        | tail -n "$OVER_LIMIT_SCAN_ROWS"
+        | tail -n "$OVER_LIMIT_SCAN_ROWS" \
+        | _over_limit_drop_quoted_source
+}
+
+# PROVENANCE filter over the window: drop rows that are QUOTED SOURCE
+# TEXT rather than a notice the renderer painted.
+#
+# Why this exists. On 2026-09-10 at 23:15 PDT the running watcher armed
+# a real 20.7 h hold against a live, working window. Nothing was
+# limited. The window was an agent editing THIS detector, and the
+# file-edit tool had rendered its own diff onto the pane:
+#
+#       334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+#
+# The scrape read that as a painted notice. The stored token was
+# `3am_America/Los_Angeles"` — the trailing double quote is the source
+# line's closing quote, and it is the byte-exact proof of provenance.
+#
+# The positional anchor above is a POSITIONAL defence, and this input
+# defeats it: an ordinary tool render puts the text inside the window
+# with nobody doing anything unusual. So the window also needs a
+# PROVENANCE defence. Three shapes are dropped, each measured against a
+# real captured pane, never invented:
+#
+#   1. A line-number gutter — `334 +`, `107:`, `551 +#`. Emitted by the
+#      file-edit diff render, by `Read`, and by `grep -n`. A painted
+#      notice never starts with a line number.
+#   2. A `"` or a backtick BEFORE the headline on the same line — the
+#      shell-assertion and markdown-quote shapes (`echo "You've hit …"`,
+#      `- \`You've hit …\``). The apostrophe in "You've" is deliberately
+#      NOT in that set. A painted notice is not quoted; the API-error
+#      render that phase B of test-realmodel-overlimit.sh exercises
+#      carries no quote before the headline.
+#   3. A bare diff or bullet marker at the start of the line (`+ `,
+#      `- `) — the unquoted diff-render shape.
+#
+# This narrows the false-positive surface; it does not close it. A
+# window that paints the notice verbatim with no quote, no gutter and
+# no marker still classifies. That residue is the same bounded one the
+# anchor comment describes, and it is tracked on jacob-greene/nexus#79.
+_over_limit_drop_quoted_source() {
+    grep -vE '^[[:space:]]*[0-9]+[[:space:]]*[:+-]' \
+        | grep -vE '^[^"`]*["`].*You.{0,3}ve (hit|reached) your' \
+        | grep -vE '^[[:space:]]*[-+][[:space:]]'
 }
 
 # Anchor the over-limit notice on the last OVER_LIMIT_SCAN_ROWS
 # non-blank rows above the input box. The
-# canonical text Claude Code renders is:
+# canonical text Claude Code renders is (QUOTED on purpose — see the
+# note in the `_OVER_LIMIT_HEADLINE_RE` block below):
 #
-#     You've hit your limit · resets 3am (America/Los_Angeles)
-#     /extra-usage to finish what you're working on.
+#     "You've hit your limit · resets 3am (America/Los_Angeles)"
+#     "/extra-usage to finish what you're working on."
 #
 # but the headline VARIES by limit flavor — the 2026-07-14 incident
 # (your-org/nexus-code, over-limit emits) rendered
 #
-#     You've hit your weekly limit · resets 3am (America/Los_Angeles)
+#     "You've hit your weekly limit · resets 3am (America/Los_Angeles)"
 #
 # and the exact-substring match on "You've hit your limit" silently
 # missed it, disabling the whole watcher-side hold. The match is now
@@ -526,8 +570,10 @@ _over_limit_window() {
 # apostrophe glyph (the TUI has rendered both ' and ’ historically —
 # the pattern anchors on "ve" and skips the apostrophe entirely).
 #
-# Detection still requires BOTH the headline AND a "resets <time>"
-# companion inside `_over_limit_window`. The position anchor is
+# Detection requires the headline, and then EITHER a "resets <time>"
+# companion OR a sentence-final full stop on the headline line itself
+# (see `_detect_over_limit` for the condition and its rationale), all
+# inside `_over_limit_window`. The position anchor is
 # load-bearing: a transcript scrollback that paraphrases or quotes
 # the notice elsewhere in the pane would otherwise false-trigger
 # (issue #87 edge case). The companion-line requirement defends
@@ -537,13 +583,79 @@ _over_limit_window() {
 # (positional defense only); the consequence is bounded by design —
 # the watcher's hold is capped by the parsed reset time (6h fallback)
 # and fails open with a paste, never latching (_over_limit.sh).
+
+# The headline pattern, factored out so the completeness test in
+# `_detect_over_limit` can reuse it verbatim.
 #
-# The REGEXES below are unchanged from the fixed-`tail -n 15` version.
-# The notice text is intact on cc 2.1.260; only its position moved.
+# Two widenings over the 2.1.220-era pattern
+# (`You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit`), both
+# forced by the cc 2.1.268 budget-exhaustion family
+# (jacob-greene/nexus#173). The three forms are QUOTED below, and the
+# quotes are load-bearing, not decoration — see the note after them:
+#
+#     "You've hit your team's shared budget. Switch to another model to continue."
+#     "You've hit your team's shared budget. /model to switch models."
+#     "You've hit your team's shared budget. Run /usage-credits to raise it …"
+#
+# Those three lines must stay quoted. Unquoted, they are bare notices
+# with no gutter and no marker, so no rule in
+# `_over_limit_drop_quoted_source` drops them, and an agent that `cat`s
+# this file onto its pane classifies over-limit off this comment block.
+# That is the failure this file exists to prevent, and it was measured
+# here, not imagined: unquoted these rows classify `over-limit`, quoted
+# they classify `absent`. A `#   - ` prefix does NOT fix it — the
+# comment's own `#` precedes the marker, so the marker rule never fires.
+#
+#   1. The flavor tokens are any non-space run, not `[[:alnum:]-]`.
+#      "team's" carries an apostrophe, which is not alnum, so the old
+#      class rejected the headline outright. Putting the glyph in the
+#      class is an encoding trap — the TUI has rendered both ' and ’,
+#      and a multibyte ’ inside a bracket expression is byte-dependent.
+#      The pattern therefore skips over the glyph, exactly as the
+#      "You.{0,3}ve" prefix already does for the same reason.
+#   2. The noun is (limit|budget). The 2.1.268 family never uses the
+#      word "limit" at all.
+#
+# The anchor — "You<apostrophe>ve hit/reached your" — is what keeps the
+# widening safe. It is a fixed 4-token phrase; the widened parts are
+# only the <=2 flavor tokens and the final noun.
+_OVER_LIMIT_HEADLINE_RE="You.{0,3}ve (hit|reached) your ([^[:space:]]+ ){0,2}(limit|budget)"
+
 _detect_over_limit() {
     local plain="$1" bottom
     bottom=$(_over_limit_window "$plain")
-    grep -qE "You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit" <<<"$bottom" || return 1
+    grep -qE "$_OVER_LIMIT_HEADLINE_RE" <<<"$bottom" || return 1
+
+    # Companion requirement, CONDITIONAL.
+    #
+    # THE CONDITION: the "resets <time>" companion is waived only when
+    # the headline line ENDS THE SENTENCE — a full stop immediately
+    # after the limit/budget noun, on that same line. Matching
+    # `<headline>\.` in one regex makes "same line" structural, not a
+    # second grep that any other line in the window could satisfy.
+    #
+    # WHY THAT CONDITION: the companion exists to reject a
+    # HALF-RENDERED notice — the renderer painted the headline but not
+    # yet the rest. The canonical notice puts the reset time on the
+    # SAME line, after a "·" separator, so a half-painted canonical
+    # headline stops mid-line with no terminator at all ("You've hit
+    # your weekly limit" and nothing more). A full stop is positive
+    # evidence that the renderer finished the sentence, which is the
+    # thing the companion was standing in for. So the canonical forms
+    # keep their companion requirement and the notices that are
+    # complete WITHOUT a reset time are admitted.
+    #
+    # This also fixes a case that PREDATES 2.1.268: "You've hit your
+    # monthly spend limit." matches the headline but carries no reset
+    # time, so the unconditional companion left it undetected.
+    #
+    # A notice admitted on this branch has no reset time to extract,
+    # so `_extract_over_limit_reset` returns empty and the caller
+    # emits reset_at=unknown. The watcher then holds on its bounded 6h
+    # fallback (_over_limit.sh) — shorter coverage than a parsed
+    # reset, but a hold, where today there is none.
+    grep -qE "${_OVER_LIMIT_HEADLINE_RE}\." <<<"$bottom" && return 0
+
     grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$bottom" || return 1
     return 0
 }
