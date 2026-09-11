@@ -286,12 +286,15 @@ against the fixed and the broken code alike. Another assertion went red
 and covered for it. The green/red tally never shows this, so the suite
 reports coverage it does not have. Attribute each arm to the specific
 assertion it is meant to pin. Then confirm **that** assertion flips red.
-"The suite went red somewhere" is a signal, not per-assertion evidence.
-The `#173` over-limit detector chain carries the instance. Its phase B3
-gutter assertion used an input row that a separate check rejected
-outright. No mutation of the rule that assertion claimed to pin could
-make it fail. The arm still counted as caught, because other assertions
-in the same arm went red.
+A broad break turns many assertions red at once, for reasons the arm does
+not target. So confirm the assertion fails for the arm's stated reason,
+not incidentally. "The suite went red somewhere" is a signal, not
+per-assertion evidence. The instance is recorded in phase B3 of
+`monitor/watcher/test-integration/test-realmodel-overlimit.sh`, with its
+own history in the comments there. A test pinned a rule that rejects rows
+carrying a leading line number. Its input row was rejected earlier by a
+different check. So no mutation of that rule could make the test fail,
+and the arm still counted as caught.
 
 **Proportionality still applies.** Spend the verification budget where
 being wrong is expensive — a merge, a figure, a gene list, an external
