@@ -531,12 +531,28 @@ _over_limit_window() {
 #   1. A line-number gutter — `334 +`, `107:`, `551 +#`. Emitted by the
 #      file-edit diff render, by `Read`, and by `grep -n`. A painted
 #      notice never starts with a line number.
-#   2. A `"` or a backtick BEFORE the headline on the same line — the
-#      shell-assertion and markdown-quote shapes (`echo "You've hit …"`,
-#      `- \`You've hit …\``). The apostrophe in "You've" is deliberately
-#      NOT in that set. A painted notice is not quoted; the API-error
-#      render that phase B of test-realmodel-overlimit.sh exercises
-#      carries no quote before the headline.
+#   2. A quote character BEFORE the headline on the same line — the
+#      shell-assertion and markdown-quote shapes. The class is the
+#      three ASCII quotes: `"`, a backtick, and `'`.
+#
+#      The single quote was added on jacob-greene/nexus#79. PR #174
+#      rewrote the three known single-quoted rows in
+#      `docs/reference/dependency-surface.md` to use backticks, which
+#      closed those three instances but left the CLASS narrow. A
+#      single-quoted notice on a pane whose text this repository did
+#      not author still classified.
+#
+#      WHY THE APOSTROPHE IN "You've" SURVIVES THIS. The rule is
+#      positional, not glyph-based: the prefix `^[^"`']*` cannot cross
+#      a quote character, so the quote the rule matches is always the
+#      FIRST quote on the row, and the headline must start AFTER it.
+#      On a painted notice the first quote IS the apostrophe in
+#      "You've", and no second headline follows it, so the row is
+#      kept. On a quoted source row the first quote is the opening
+#      delimiter and the headline follows, so the row is dropped.
+#      The five true-positive fixtures and the eight over-limit
+#      assertions were measured before and after this widening; all
+#      were unchanged.
 #   3. A bare diff or bullet marker at the start of the line (`+ `,
 #      `- `) — the unquoted diff-render shape.
 #
@@ -546,7 +562,7 @@ _over_limit_window() {
 # anchor comment describes, and it is tracked on jacob-greene/nexus#79.
 _over_limit_drop_quoted_source() {
     grep -vE '^[[:space:]]*[0-9]+[[:space:]]*[:+-]' \
-        | grep -vE '^[^"`]*["`].*You.{0,3}ve (hit|reached) your' \
+        | grep -vE "^[^\"\`']*[\"\`'].*You.{0,3}ve (hit|reached) your" \
         | grep -vE '^[[:space:]]*[-+][[:space:]]'
 }
 

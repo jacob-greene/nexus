@@ -4,6 +4,8 @@
       334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
   ⎿  echo "You've hit your team's shared budget. /model to switch models." \
      - `You've hit your team's shared budget. /model to switch models.`
+     'You've hit your limit · resets 3am (America/Los_Angeles)'
+  ⍿  printf '%s' 'You've hit your limit · resets 3am (America/Los_Angeles)'
 [38;5;246m✻ Brewed for 8s[0m
 
 [38;5;244m─[0m
