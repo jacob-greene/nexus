@@ -3425,6 +3425,12 @@ cmd_pr_edit() {
 # provenance. `ng pr verdict set|get` writes and reads it, and
 # `ng pr merge` compares `head=` against the head it is about to merge.
 #
+# EVERY parse failure is fail-OPEN: no record found means `ng pr merge`
+# warns and merges. So each rule below is written to make a HIDDEN record
+# impossible, not merely to make a visible one readable. The read-back in
+# `cmd_pr_verdict_set` is the other half: it refuses to report success for
+# a trailer that does not parse back out of the body it just published.
+#
 # Parse rules, and why each one exists:
 #   * The line must start at column 0. An indented (four-space) code block
 #     therefore cannot supply one.
@@ -3454,11 +3460,56 @@ _verdict_render() {
 
 # Reduce a pull-request body (stdin) to its single authoritative trailer
 # line, or nothing. Fence-aware; last match wins.
+#
+# Fence tracking follows the CommonMark rule, because the naive "toggle on
+# any fence-looking line" version desynchronises and that failure is
+# fail-open in both directions:
+#   * a NESTED fence (a ``` line inside a ```` block) closed the block
+#     early, so a DOCUMENTED example read as a real verdict;
+#   * an UNCLOSED fence left every later line inside it, so a real trailer
+#     appended to the end of the body became invisible and the gate
+#     silently switched off.
+# So: remember the fence character and its length. Only a fence of the SAME
+# character and AT LEAST the same length closes the block. Anything else
+# inside an open block is content.
+#
+# HTML comments are skipped for the same reason in the other direction: a
+# trailer inside `<!-- -->` is invisible to every human reader of the pull
+# request, so it must not be able to assert a verdict to the gate.
+#
+# Interval expressions (`{0,3}`) are avoided so the program does not need
+# `--re-interval` on a mawk/busybox awk.
 _verdict_trailer_line() {
     tr -d '\r' | awk '
-        /^[[:space:]]*(```|~~~)/ { fence = 1 - fence; next }
-        fence                    { next }
-        /^Skeptic-Verdict:[ \t]/ { last = $0 }
+        # --- HTML comment blocks: invisible to a reader, so invisible here.
+        {
+            line = $0
+            if (!in_fence) {
+                if (in_comment) {
+                    if (line ~ /-->/) { in_comment = 0 }
+                    next
+                }
+                if (line ~ /^[[:space:]]*<!--/ && line !~ /-->/) {
+                    in_comment = 1; next
+                }
+            }
+        }
+        # --- fenced code blocks, CommonMark-style open/close matching.
+        {
+            if (match(line, /^ ? ? ?(```+|~~~+)/)) {
+                tok = substr(line, RSTART, RLENGTH)
+                sub(/^[[:space:]]+/, "", tok)
+                ch = substr(tok, 1, 1)
+                len = length(tok)
+                if (!in_fence) {
+                    in_fence = 1; f_ch = ch; f_len = len; next
+                }
+                if (ch == f_ch && len >= f_len) { in_fence = 0; next }
+                # a different or shorter fence inside an open block is content
+            }
+        }
+        in_fence { next }
+        /^Skeptic-Verdict:[ \t]/ { last = line }
         END { if (last != "") print last }
     '
 }
@@ -3471,18 +3522,32 @@ _verdict_parse() {
     local line
     line=$(_verdict_trailer_line)
     [[ -n "$line" ]] || return 3
-    local re="^Skeptic-Verdict:[[:blank:]]+($_VERDICT_VALUES)[[:blank:]]+head=([0-9a-fA-F]{7,40})([[:blank:]]|\$)"
+    # The verdict word is positional: it follows the colon. Everything else
+    # is a `key=value` token read from ANYWHERE on the line. `head=` was
+    # positional in the first version, which meant
+    # `Skeptic-Verdict: credible depth=1 head=<sha>` parsed as nothing and
+    # the gate silently switched off. A field-order mistake must not be a
+    # fail-open.
+    local re="^Skeptic-Verdict:[[:blank:]]+($_VERDICT_VALUES)([[:blank:]]|\$)"
     [[ "$line" =~ $re ]] || return 3
-    local verdict="${BASH_REMATCH[1]}" head="${BASH_REMATCH[2]}"
-    local depth="" findings="" skeptic="" issue="" tok
-    for tok in $line; do
+    local verdict="${BASH_REMATCH[1]}"
+    local head="" depth="" findings="" skeptic="" issue="" tok
+    # `read -ra` splits on IFS without globbing. An unquoted `for tok in
+    # $line` expanded a `skeptic=*` value against the working directory.
+    local -a toks=()
+    read -ra toks <<<"$line"
+    for tok in "${toks[@]}"; do
         case "$tok" in
+            head=*)     head="${tok#head=}" ;;
             depth=*)    depth="${tok#depth=}" ;;
             findings=*) findings="${tok#findings=}" ;;
             skeptic=*)  skeptic="${tok#skeptic=}" ;;
             issue=*)    issue="${tok#issue=}" ;;
         esac
     done
+    # A record with no well-formed head is NOT a verdict. Binding the head
+    # is the point; a headless record must not read as a valid one.
+    [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] || return 3
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue"
 }
@@ -3618,13 +3683,20 @@ cmd_pr_verdict_set() {
     local verdict="" head="" depth="" findings="" skeptic="" issue="" repo_arg=""
     while (( $# > 0 )); do
         case "$1" in
-            --verdict)  verdict="${2:-}";  shift 2 ;;
-            --head)     head="${2:-}";     shift 2 ;;
-            --depth)    depth="${2:-}";    shift 2 ;;
-            --findings) findings="${2:-}"; shift 2 ;;
-            --skeptic)  skeptic="${2:-}";  shift 2 ;;
-            --issue)    issue="${2:-}";    shift 2 ;;
-            --repo)     repo_arg="${2:-}"; shift 2 ;;
+            # Every value flag is guarded: `shift 2` with one argument left
+            # fails and shifts nothing, which spins the loop forever.
+            --verdict|--head|--depth|--findings|--skeptic|--issue|--repo)
+                (( $# >= 2 )) || die "pr verdict set: $1 requires a value"
+                case "$1" in
+                    --verdict)  verdict="$2"  ;;
+                    --head)     head="$2"     ;;
+                    --depth)    depth="$2"    ;;
+                    --findings) findings="$2" ;;
+                    --skeptic)  skeptic="$2"  ;;
+                    --issue)    issue="$2"    ;;
+                    --repo)     repo_arg="$2" ;;
+                esac
+                shift 2 ;;
             *) die "unknown flag: $1" ;;
         esac
     done
@@ -3641,16 +3713,44 @@ cmd_pr_verdict_set() {
     fi
     [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] \
         || die "pr verdict set: --head must be a 7-40 character commit sha, got '$head'"
-    local trailer body new_body url
+    local trailer body new_body resp url returned_body got_head
     trailer=$(_verdict_render "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue")
     body=$(jq -r '.body // ""' <<<"$raw")
     # Append. The parser takes the LAST trailer, so an earlier record stays
     # readable as history instead of being silently rewritten.
     new_body="${body%$'\n'}"$'\n\n'"$trailer"$'\n'
-    url=$(jq -n --arg b "$new_body" '{body:$b}' \
-          | api -X PATCH "/repos/$target/pulls/$n" --input - \
-          | jq -r '.html_url // empty')
+    resp=$(jq -n --arg b "$new_body" '{body:$b}' \
+           | api -X PATCH "/repos/$target/pulls/$n" --input -)
+    url=$(jq -r '.html_url // empty' <<<"$resp")
     [[ -n "$url" ]] || die "pr verdict set: body patch failed"
+
+    # READ BACK what was actually published, and fail LOUD when it does not
+    # parse to the head just recorded.
+    #
+    # Every failure on the read path is fail-open: a body the parser cannot
+    # read means `ng pr merge` reports "no verdict" and merges. Without this
+    # check, a publish that silently failed to land the trailer — an append
+    # that went nowhere, a trailer swallowed by an unclosed fence earlier in
+    # the body — still exited 0 and printed the trailer. The skeptic would
+    # believe the verdict was recorded and the gate was on, when it was off.
+    #
+    # The check runs against the PATCH RESPONSE, not against the string this
+    # function built, so it pins the published artefact rather than the
+    # intent.
+    returned_body=$(jq -r '.body // empty' <<<"$resp")
+    if [[ -z "$returned_body" ]]; then
+        echo "ng pr verdict set: the API did not return the patched body — the" >&2
+        echo "  published record was NOT verified. Confirm with:" >&2
+        echo "      ng pr verdict get $n --repo $target" >&2
+    else
+        got_head=$(printf '%s' "$returned_body" | _verdict_parse | cut -f2) || got_head=""
+        if [[ -z "$got_head" ]]; then
+            die "pr verdict set: the trailer was published but does not parse back out of the body. The record is NOT readable by \`ng pr merge\`, so the gate is OFF. Check the body for an unclosed code fence before the trailer."
+        fi
+        if ! _verdict_head_match "$got_head" "$head"; then
+            die "pr verdict set: the body parses back to head '$got_head', not the '$head' just recorded. An earlier trailer is winning; the gate would compare the wrong commit."
+        fi
+    fi
     printf '%s\n' "$trailer"
     printf '%s\n' "$url"
 }
@@ -3664,8 +3764,12 @@ cmd_pr_verdict_get() {
     local repo_arg="" field=""
     while (( $# > 0 )); do
         case "$1" in
-            --repo)  repo_arg="${2:-}"; shift 2 ;;
-            --field) field="${2:-}";    shift 2 ;;
+            --repo)
+                (( $# >= 2 )) || die "pr verdict get: --repo requires a value"
+                repo_arg="$2"; shift 2 ;;
+            --field)
+                (( $# >= 2 )) || die "pr verdict get: --field requires a value"
+                field="$2"; shift 2 ;;
             *) die "unknown flag: $1" ;;
         esac
     done
@@ -3715,8 +3819,17 @@ cmd_pr_merge() {
             --rebase) method="rebase"; shift ;;
             --delete-branch) delete_branch=1; shift ;;
             --require-verdict) require_verdict=1; shift ;;
-            --verdict-override) override_reason="${2:-}"; have_override=1; shift 2 ;;
-            --repo)   repo_arg="${2:-}"; shift 2 ;;
+            # `shift 2` with one argument left FAILS and shifts NOTHING, so
+            # the loop spins forever on a trailing value flag. Guard every
+            # value-taking flag in this verb. (The pattern is repo-wide —
+            # `ng pr merge 42 --repo` hangs the same way at `e2f5c04`, before
+            # this change. Only the flags this verb owns are fixed here.)
+            --verdict-override)
+                (( $# >= 2 )) || die "pr merge: --verdict-override requires a reason"
+                override_reason="$2"; have_override=1; shift 2 ;;
+            --repo)
+                (( $# >= 2 )) || die "pr merge: --repo requires a value"
+                repo_arg="$2"; shift 2 ;;
             *) die "unknown flag: $1" ;;
         esac
     done

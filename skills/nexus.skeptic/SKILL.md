@@ -596,6 +596,26 @@ at `ab2fd5f`, the worker pushed `4a284a6` afterwards, and the merge landed
 the unreviewed commit. The merge was correct, but only because the
 orchestrator read the diff by hand. See `jacob-greene/nexus` issue `#155`.
 
+**Read the trailer back before you trust it.** Every failure on the read
+path is fail-open: a record the parser cannot find means `ng pr merge`
+reports "no verdict" and merges. `ng pr verdict set` therefore re-parses
+the body it just published and fails loudly when the record does not come
+back out. Do not ignore that failure. It means the gate is off.
+
+The parser skips a trailer it finds in any of these places. Each rule
+exists so that a record a human reader cannot see cannot assert a verdict.
+
+| Location | Read as a verdict? |
+|---|---|
+| A line starting at column zero | yes |
+| Inside a fenced code block | no |
+| Inside an HTML comment | no |
+| Indented by four spaces | no |
+| After an unclosed code fence | no — and `set` fails loudly rather than report success |
+
+Fence open and close match on character and length, so a nested fence does
+not end a block early. The last trailer in the body wins.
+
 Every mode's wrap-up prints a `CONSEQUENCE:` line stating plainly what
 happens next, so no worker is surprised by the gate: `require` → the
 window cannot retire until a verdict lands; `auto` → record a decision

@@ -79,6 +79,7 @@ FX_BODY=""          # pull-request body the stub serves
 FX_HEAD_SHA=""      # head.sha the stub serves
 FX_MERGE_SHA="deadbee0000000000000000000000000000beef"
 CALLS="$TMP/api-calls.log"
+PATCH_BODY="$TMP/patch-body.json"
 
 token() { printf 'fixture-token'; }
 _resolve_repo() { printf 'jacob-greene/nexus'; }
@@ -100,13 +101,22 @@ api() {
             *) [[ -z "$path" ]] && path="$a"; i=$(( i + 1 )) ;;
         esac
     done
-    # Drain stdin on a body-carrying call so the producing jq never SIGPIPEs.
-    [[ "$method" == "PUT" || "$method" == "PATCH" ]] && cat >/dev/null
+    # Capture the request body rather than discarding it. The first version
+    # of this stub drained stdin to /dev/null and answered a PATCH with a
+    # fixed html_url. That left the PUBLISH path unpinned: a mutation that
+    # dropped the trailer from the patched body kept the suite green,
+    # because nothing ever looked at what was published. The stub now
+    # ECHOES the patched body back, exactly as the REST API does, so the
+    # assertions can read the published artefact.
+    local req=""
+    [[ "$method" == "PUT" || "$method" == "PATCH" ]] && req=$(cat)
+    [[ -n "$req" ]] && printf '%s' "$req" > "$PATCH_BODY"
     case "$method:$path" in
         PUT:*/merge)
             jq -n --arg s "$FX_MERGE_SHA" '{sha:$s}' ;;
         PATCH:*/pulls/*)
-            jq -n '{html_url:"https://github.com/jacob-greene/nexus/pull/175"}' ;;
+            jq -c --arg u "https://github.com/jacob-greene/nexus/pull/175" \
+                '{html_url:$u, body:(.body // "")}' <<<"$req" ;;
         GET:*/pulls/*)
             jq -n --arg b "$FX_BODY" --arg s "$FX_HEAD_SHA" \
                 '{number:175, body:$b, head:{ref:"topic", sha:$s}}' ;;
@@ -114,7 +124,9 @@ api() {
     esac
 }
 
-reset_calls() { : > "$CALLS"; }
+reset_calls() { : > "$CALLS"; : > "$PATCH_BODY"; }
+# The body actually published by the last PATCH.
+published_body() { jq -r '.body // ""' < "$PATCH_BODY" 2>/dev/null; }
 # `grep -c` prints 0 AND exits 1 on no match, so a `|| printf 0` fallback
 # would emit two zeros. Count with grep -c alone and normalise the exit.
 merge_put_count() { local c; c=$(grep -c -- '-X PUT' "$CALLS" 2>/dev/null); printf '%s' "${c:-0}"; }
@@ -166,6 +178,83 @@ got=$(printf '%s' "$unfenced" | _verdict_parse); rc=$?
 assert_eq "T1.4b control — the same line outside the fence is found" "$rc" "0"
 assert_eq "T1.4c control — and it yields the head" "$(cut -f2 <<<"$got")" "9999999"
 
+# T1.4e-j FENCE TRACKING. The naive "toggle on any fence-looking line"
+# version desynchronised, and BOTH directions of that failure are
+# fail-open: a documented example could read as a real verdict, and a real
+# verdict could be hidden. Fence open/close now matches on character and
+# length, CommonMark-style.
+nested=$'````\n```\nSkeptic-Verdict: credible head=9999999\n````\n'
+got=$(printf '%s' "$nested" | _verdict_parse); rc=$?
+assert_eq "T1.4e a nested ``` inside a ```` block does not close it" "$rc" "3"
+nested_t=$'~~~~\n~~~\nSkeptic-Verdict: credible head=9999999\n~~~~\n'
+got=$(printf '%s' "$nested_t" | _verdict_parse); rc=$?
+assert_eq "T1.4f same for a nested ~~~ inside a ~~~~ block" "$rc" "3"
+# A tilde line does not close a backtick fence.
+mixed=$'```\n~~~\nSkeptic-Verdict: credible head=9999999\n```\n'
+got=$(printf '%s' "$mixed" | _verdict_parse); rc=$?
+assert_eq "T1.4g a ~~~ line does not close a ``` fence" "$rc" "3"
+# Positive control: a same-character, same-length fence DOES close, so the
+# trailer after it is found. Without this the three 3s above could all come
+# from a parser that never finds anything.
+closed=$'````\n```\ncode\n````\n\nSkeptic-Verdict: credible head=9999999\n'
+got=$(printf '%s' "$closed" | _verdict_parse); rc=$?
+assert_eq "T1.4h control — a properly closed fence releases the scan" "$rc" "0"
+assert_eq "T1.4i control — and the trailer after it is read" "$(cut -f2 <<<"$got")" "9999999"
+# An HTML comment is invisible to every human reader of the pull request.
+# A record nobody can see must not be able to assert a verdict.
+commented=$'<!--\nSkeptic-Verdict: credible head=9999999\n-->\n'
+got=$(printf '%s' "$commented" | _verdict_parse); rc=$?
+assert_eq "T1.4j a trailer inside an HTML comment is not a verdict" "$rc" "3"
+
+# T1.4q-t the fence rule must cover BOTH fence characters and an indented
+# fence. These close mutations that survived the first round: dropping
+# `~~~` from the fence match, and requiring a fence to start at column 0.
+tilde=$'x\n~~~\nSkeptic-Verdict: credible head=9999999\n~~~\n'
+got=$(printf '%s' "$tilde" | _verdict_parse); rc=$?
+assert_eq "T1.4q a plain ~~~ fence hides a trailer" "$rc" "3"
+indented=$'x\n  ```\n  code\nSkeptic-Verdict: credible head=9999999\n  ```\n'
+got=$(printf '%s' "$indented" | _verdict_parse); rc=$?
+assert_eq "T1.4r a fence indented up to 3 spaces still opens a block" "$rc" "3"
+indented_t=$'x\n   ~~~\nSkeptic-Verdict: credible head=9999999\n   ~~~\n'
+got=$(printf '%s' "$indented_t" | _verdict_parse); rc=$?
+assert_eq "T1.4s same for an indented ~~~ fence" "$rc" "3"
+# Positive control for the three above: without a fence, the same line is
+# found. Three 3s from a parser that never matches would prove nothing.
+got=$(printf '%s' $'x\nSkeptic-Verdict: credible head=9999999\n' | _verdict_parse); rc=$?
+assert_eq "T1.4t control — unfenced, the same line is found" "$rc" "0"
+
+# T1.4u a head longer than 40 hex characters is not a commit.
+toolong=$'Skeptic-Verdict: credible head=abcdef01234567890123456789012345678901234\n'
+got=$(printf '%s' "$toolong" | _verdict_parse); rc=$?
+assert_eq "T1.4u a 41-character head is rejected" "$rc" "3"
+
+# T1.4k CRLF. A body fetched from the API can carry CRLF line endings; the
+# trailing \r would otherwise break the sha match and read as "no verdict".
+crlf=$'a description\r\n\r\nSkeptic-Verdict: credible head=9999999\r\n'
+got=$(printf '%s' "$crlf" | _verdict_parse); rc=$?
+assert_eq "T1.4k a CRLF body still parses" "$rc" "0"
+assert_eq "T1.4l and yields a clean head with no carriage return" \
+    "$(cut -f2 <<<"$got")" "9999999"
+
+# T1.4m FIELD ORDER. `head=` used to be positional, so a record that put
+# depth first parsed as nothing and the gate silently switched off. A
+# field-order mistake must not be a fail-open.
+reordered=$'Skeptic-Verdict: credible depth=1 findings=0 head=9999999 issue=155\n'
+got=$(printf '%s' "$reordered" | _verdict_parse); rc=$?
+assert_eq "T1.4m head= is read from anywhere on the line" "$rc" "0"
+assert_eq "T1.4n and yields the head" "$(cut -f2 <<<"$got")" "9999999"
+assert_eq "T1.4o with the other fields still parsed" "$(cut -f3 <<<"$got")" "1"
+
+# T1.4p a glob in a provenance value must not expand against the cwd.
+# The pattern only bites when a matching FILE exists, so plant one. Without
+# it the token stays unexpanded for the wrong reason and the assertion
+# passes against an unquoted split too.
+mkdir -p "$TMP/globdir" && : > "$TMP/globdir/skeptic=PLANTED"
+globby=$'Skeptic-Verdict: credible head=9999999 skeptic=*\n'
+got=$( cd "$TMP/globdir" && printf '%s' "$globby" | _verdict_parse )
+assert_eq "T1.4p an unquoted split would glob; skeptic= stays literal" \
+    "$(cut -f5 <<<"$got")" "*"
+
 # T1.5 a verdict with no head is NOT well-formed. Binding the head is the
 # point; a headless record must not read as a valid verdict.
 headless=$'Skeptic-Verdict: credible\n'
@@ -191,6 +280,12 @@ _verdict_head_match "ab2fd" "$VALIDATED_FULL"
 assert_eq "T1.6e a token under the 7-character floor never matches" "$?" "1"
 _verdict_head_match "" "$VALIDATED_FULL"
 assert_eq "T1.6f an empty recorded head never matches" "$?" "1"
+# The floor is exactly 7. A 6-character prefix is too weak to identify a
+# commit, so it must never match even when it IS a true prefix.
+_verdict_head_match "ab2fd5" "$VALIDATED_FULL"
+assert_eq "T1.6g a 6-character true prefix is below the floor" "$?" "1"
+_verdict_head_match "ab2fd5f" "$VALIDATED_FULL"
+assert_eq "T1.6h control — 7 characters is at the floor and matches" "$?" "0"
 
 # =========================================================================
 printf '\n--- 2. ng pr merge, through cmd_pr_merge ---\n'
@@ -266,6 +361,19 @@ assert_contains "T3.1h and a verdict-override event was logged" "$alog" '"event"
 mode=$(stat -c '%a' "$NEXUS_STATE_DIR/verdict-override.log" 2>/dev/null)
 assert_eq "T3.1i the audit log is created 0640, not group-writable" "$mode" "640"
 
+# T3.1j-m the OTHER override path: no verdict recorded, --require-verdict
+# passed, override supplied. It must audit too, and under its own kind, so
+# the log distinguishes "merged past a stale verdict" from "merged with no
+# verdict at all".
+FX_BODY="$BODY_NONE"; FX_HEAD_SHA="$MERGED_FULL"; reset_calls
+: > "$NEXUS_STATE_DIR/verdict-override.log"
+out=$( cmd_pr_merge 175 --require-verdict --verdict-override "no skeptic was required for this change" 2>/dev/null ); rc=$?
+audit=$(cat "$NEXUS_STATE_DIR/verdict-override.log" 2>/dev/null)
+assert_eq "T3.1j the missing-verdict override merges" "$rc" "0"
+assert_contains "T3.1k and writes an audit line" "$audit" "no skeptic was required"
+assert_contains "T3.1l under its own kind" "$audit" "kind=missing-verdict"
+assert_contains "T3.1m recording that no head was on record" "$audit" "recorded-head=none"
+
 # T3.2 a silent override is refused. An override with no reason is a
 # disabled gate, not an override.
 FX_BODY="$BODY_OK"; FX_HEAD_SHA="$MERGED_FULL"; reset_calls
@@ -301,6 +409,41 @@ assert_contains "T4.1b the trailer carries the current head" "$out" "head=$VALID
 assert_contains "T4.1c and the verdict" "$out" "Skeptic-Verdict: credible"
 assert_contains "T4.1d and the provenance fields" "$out" "depth=1 findings=0 skeptic=w7 issue=155"
 
+# T4.1k a window name containing whitespace must not break the single-line
+# field split. The render squashes it; without that, everything after the
+# space parses as a separate token and the record is malformed.
+FX_BODY="$BODY_NONE"; reset_calls
+spaced=$( cmd_pr_verdict_set 175 --verdict credible --skeptic "two words" 2>&1 | head -1 )
+assert_contains "T4.1k whitespace in skeptic= is squashed" "$spaced" "skeptic=two_words"
+rt=$(printf '%s\n' "$spaced" | _verdict_parse)
+assert_eq "T4.1l so the record still parses to one skeptic field" \
+    "$(cut -f5 <<<"$rt")" "two_words"
+FX_BODY="$BODY_NONE"; reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible --depth 1 --findings 0 --skeptic w7 --issue 155 2>&1 )
+
+# T4.1e-h THE PUBLISH PATH. Assert on the body that was actually PATCHed,
+# not on the string the function printed. Without these, a mutation that
+# drops the trailer from the patched body leaves the whole feature a no-op
+# and the suite green — `set` still exits 0, still prints the trailer, and
+# still sends the PATCH. Only the published artefact distinguishes them.
+pub=$(published_body)
+assert_contains "T4.1e the PUBLISHED body carries the trailer" \
+    "$pub" "Skeptic-Verdict: credible head=$VALIDATED_FULL"
+assert_contains "T4.1f the published body keeps the original description" \
+    "$pub" "Implements the thing."
+# The record must be readable by the same parser the gate uses.
+pubparse=$(printf '%s' "$pub" | _verdict_parse); rc=$?
+assert_eq "T4.1g the published body parses" "$rc" "0"
+assert_eq "T4.1h and parses to the head that was set" \
+    "$(cut -f2 <<<"$pubparse")" "$VALIDATED_FULL"
+# The trailer is APPENDED, not prepended: the parser takes the last one, so
+# a prepend would let a stale earlier record win.
+assert_eq "T4.1i the trailer is the LAST line of the published body" \
+    "$(printf '%s' "$pub" | grep -c '^Skeptic-Verdict:')" "1"
+tailline=$(printf '%s' "$pub" | grep -v '^[[:space:]]*$' | tail -1)
+assert_contains "T4.1j and it sits after the description, not before" \
+    "$tailline" "Skeptic-Verdict: credible"
+
 # T4.2 round trip: what `set` renders, `_verdict_parse` reads back.
 trailer=$(head -1 <<<"$out")
 rt=$(printf '%s\n' "$trailer" | _verdict_parse); rc=$?
@@ -335,6 +478,49 @@ assert_eq "T4.5 after re-recording, the parser reads the NEW head" \
 FX_BODY="$combined"; reset_calls
 out=$( cmd_pr_merge 175 2>/dev/null ); rc=$?
 assert_eq "T4.5b re-recording at the new head unblocks the merge" "$rc" "0"
+
+# T4.6 THE READ-BACK. An unclosed code fence anywhere before the append
+# swallows the trailer: the parser sees it inside a code block and reports
+# no verdict, so the gate switches off. Nothing about that is visible at
+# record time unless `set` reads back what it published.
+FX_BODY=$'a description\n```\nan unclosed code fence\n'
+FX_HEAD_SHA="$VALIDATED_FULL"; reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
+assert_eq "T4.6a set FAILS when the published trailer does not parse back" "$rc" "1"
+assert_contains "T4.6b and says the gate is off" "$out" "gate is OFF"
+assert_contains "T4.6c and names the likely cause" "$out" "unclosed code fence"
+# Positive control: the same call on a body with no unclosed fence succeeds.
+FX_BODY=$'a description\n```\na CLOSED code fence\n```\n'; reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
+assert_eq "T4.6d control — a closed fence records normally" "$rc" "0"
+
+# T4.7 a stale earlier record must not be left winning. If the append lands
+# but an earlier trailer still parses last, the gate compares the wrong
+# commit, so `set` refuses rather than reporting success.
+FX_BODY="$BODY_NONE"; FX_HEAD_SHA="$VALIDATED_FULL"; reset_calls
+out=$( cmd_pr_verdict_set 175 --verdict credible 2>&1 ); rc=$?
+pubparse=$(published_body | _verdict_parse)
+assert_eq "T4.7 the published record is the one just set" \
+    "$(cut -f2 <<<"$pubparse")" "$VALIDATED_FULL"
+
+# T4.8 a value-taking flag at the END of the argument list must not hang.
+# `shift 2` with one argument left FAILS and shifts nothing, so the parse
+# loop spins forever. Each case runs under a hard timeout; exit 124 is the
+# hang and is a FAILURE, never a pass.
+FX_BODY="$BODY_OK"; FX_HEAD_SHA="$MERGED_FULL"
+for flag in --verdict-override --repo; do
+    ( timeout 10 bash -c '
+        export NEXUS_STATE_DIR="$1"; cd "$2"
+        source ./monitor/ng >/dev/null 2>&1
+        api() { printf ""; }; token() { printf t; }; _resolve_repo() { printf o/r; }
+        cmd_pr_merge 42 "$3"' _ "$NEXUS_STATE_DIR" "$_test_dir/.." "$flag" ) >/dev/null 2>&1
+    rc=$?
+    if (( rc == 124 )); then
+        bad "T4.8 \`pr merge 42 $flag\` (trailing) hangs" "timed out — shift 2 spin"
+    else
+        ok "T4.8 \`pr merge 42 $flag\` (trailing) fails fast, no hang (exit $rc)"
+    fi
+done
 
 # =========================================================================
 printf '\n--- 5. the verdict record carries the head ---\n'
