@@ -407,6 +407,112 @@ REST shape unless you genuinely need a deeply nested traversal or a
 search query (full-text/`is:issue`/`mentions:`) that REST can't
 express.
 
+**On `gh` 1.13.0 many `gh issue` and `gh pr` verbs are BROKEN — use
+REST.** The sandbox base image ships that version. Its lookup for an
+issue or a pull request still asks for Projects (classic), which
+GitHub removed, so the verb aborts:
+
+```
+GraphQL error: Projects (classic) is being deprecated in favor of the new Projects experience, see: https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/.
+```
+
+**The predictor: a verb aborts with that error if, and only if, its
+outgoing GraphQL query selects `projectCards`.** Do not work from a
+list of verbs — test the verb you are about to use:
+
+```bash
+DEBUG=api gh <verb> <n> --repo <owner>/<repo> 2>&1 | grep -c projectCards
+```
+
+A non-zero count means the verb is broken on 1.13.0. Pass the verb
+its required flags. Without them `gh` exits 1 on argument
+validation before it ever calls the API, which reads the same as a
+pass and is not one.
+
+The split is not read versus write, and it is not `issue` versus
+`pr`. The table below illustrates the predictor. The predictor is
+the claim. Measured 2026-09-10 on this nexus:
+
+| Verb | `projectCards` | Exit | Wrote anything |
+|---|---|---|---|
+| `gh issue view <n>` | 2 | 1 | not a write |
+| `gh issue comment <n> --body …` | 2 | 1 | no |
+| `gh issue edit <n> --title …` | 2 | 1 | no |
+| `gh issue close <n>` | 2 | 1 | no |
+| `gh issue reopen <n>` | 2 | 1 | no |
+| `gh pr view <n>` | 2 | 1 | not a write |
+| `gh pr edit <n> --title …` | 2 | 1 | no |
+| `gh pr diff <n>` | 0 | 0 | not a write |
+| `gh pr checkout <n>` | 0 | 0 | local git only |
+| `gh issue create` | 0 | 0 | yes |
+| `gh pr comment <n>` | 0 | 0 | yes |
+| `gh issue list`, `gh pr list` | 0 | 0 | not a write |
+
+`gh pr checks <n>` selects no `projectCards` and is not broken. It
+can still exit 1, with `no checks reported on the 'main' branch`.
+An exit code alone does not identify this failure. Read the error.
+
+These failures write nothing, so a retry cannot double-post. The
+reason is structural: the verb dies in its lookup and never issues
+a mutation. Verified on `gh issue comment`, which left the comment
+count unchanged, and on `gh issue reopen`, which left the state
+`closed`. Check that per verb before you retry any failed CLI
+write. A call that already wrote turns a retry into a double-post.
+
+The REST replacements:
+
+```bash
+gh api repos/<owner>/<repo>/issues/<n>/comments -F body=@body.md
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> -f title='…'
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> \
+    -f state=closed -f state_reason=completed
+gh api repos/<owner>/<repo>/issues/<n> --jq '.body'
+```
+
+The first line reads a file, so it uses capital `-F`. The other
+write lines pass inline strings, so lowercase `-f` is correct
+there. This is the rule stated above under "`gh api` body-from-file
+gotcha — `-F`, never `-f`". Lowercase `-f body=@body.md` sends the
+literal text `@body.md` and publishes your file path. Measured on
+this host against `POST /markdown`, which renders its input and
+writes nothing:
+
+| Form | Rendered output |
+|---|---|
+| `-f text=@probe.md` | `<p>@probe.md</p>` |
+| `-F text=@probe.md` | `<p>HELLO_FROM_FILE</p>` |
+
+After any raw `gh api` write, read the posted body back and confirm
+it is what you intended.
+
+`ng reply`, `ng comment`, `ng close` and `ng issue create` call REST
+directly, so they are unaffected. Prefer them. `gh search` does not
+exist in 1.13.0 at all; use `gh api -X GET search/issues`.
+
+## Correcting a filed issue — patch the body, and date the patch
+
+A comment that corrects the body leaves the wrong text first on the
+page. Every later reader meets the error before the correction. When
+a filed issue states something false, patch the body in place with
+the `PATCH` form above.
+
+A patch destroys the original claim, so the body must carry its own
+record of the change. Add a short provenance section to the patched
+body:
+
+```markdown
+## Provenance of the corrections in this body
+
+Corrected in place on <date>, at <sha>, by <which pass>. Corrected:
+<what changed>. The measurements the issue was filed on were
+re-derived and held.
+```
+
+GitHub keeps prior versions, but an agent reading `.body` never sees
+them. The in-body note is the only record an API reader gets. A
+worked example on this nexus grew a corrected body from 16,032 to
+21,066 bytes and added exactly that section.
+
 ## The fail-loud rule (security boundary)
 
 `mint-token.sh` returning empty MUST exit non-zero — never let
