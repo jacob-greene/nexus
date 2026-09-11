@@ -564,7 +564,8 @@ ng wrap-up <issue> <report-path> --repo <owner>/<repo> \
     --skeptic-verdict <credible|check|suspect|refuted> \
     --skeptic-depth <your-depth> \
     --skeptic-findings <count-of-substantive-new-issues> \
-    [--skeptic-orig <original-worker-window>]   # recursive passes
+    [--skeptic-orig <original-worker-window>] \  # recursive passes
+    [--skeptic-pr <n>] [--skeptic-head <sha>]    # bind the verdict to a commit
 ```
 
 This logs `skeptic-verdict`, clears the **immediately-reviewed** worker's
@@ -573,6 +574,27 @@ is read from the skeptic's own provenance when present (so you usually
 need not pass it); pass it explicitly only when wrapping up off-tmux or to
 override. On a recommended second pass the original worker's marker is
 kept live (parked-and-reachable); on termination it is cleared too.
+
+**Bind your verdict to the commit it covers.** A verdict covers exactly
+one commit. It does not extend to commits pushed after you wrapped up.
+
+| Term | Definition |
+|---|---|
+| Head | The tip commit of a pull request's branch. |
+| Validated head | The exact commit a verdict states it covers. |
+| Trailer | The `Skeptic-Verdict: <v> head=<sha> …` line in a pull-request body. One parser finds it. |
+
+When your review covers a pull request, pass `--skeptic-pr <n>`. The
+wrap-up records the head in the `skeptic-verdict` event and publishes the
+trailer on the pull-request body, where a merge on any host can read it.
+The head defaults to that pull request's head at wrap-up time; pass
+`--skeptic-head <sha>` to state an earlier commit. `ng pr merge` then
+refuses to merge a head your verdict never covered.
+
+This closes a real gap. On 2026-09-11 pull request `#175` was validated
+at `ab2fd5f`, the worker pushed `4a284a6` afterwards, and the merge landed
+the unreviewed commit. The merge was correct, but only because the
+orchestrator read the diff by hand. See `jacob-greene/nexus` issue `#155`.
 
 Every mode's wrap-up prints a `CONSEQUENCE:` line stating plainly what
 happens next, so no worker is surprised by the gate: `require` → the
@@ -686,7 +708,8 @@ All written to `monitor/.state/action-log.jsonl`:
 
 - `skeptic-request` — a skeptic is required for `target-window` at `depth`.
 - `skeptic-spawn` — a skeptic was dispatched (`window` reviews `target-window`).
-- `skeptic-verdict` — a verdict landed (`verdict`, `target-window`, `findings`).
+- `skeptic-verdict` — a verdict landed (`verdict`, `target-window`, `findings`,
+  `head` = the commit it covers, `head-source`, `pr`).
 - `skeptic-decision` — an `auto`/`deny`/`waived` decision was recorded.
 - `skeptic-escalate` — issues persist at the depth cap; operator needed.
 - `skeptic-nudge` — a worker was nudged about pending requests.

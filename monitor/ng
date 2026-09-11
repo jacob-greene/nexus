@@ -40,6 +40,18 @@
 #                # opt-out via --no-reviewer, override via --reviewer <login>
 #   ng pr edit   12 [--title t] [--body-file b.md]                   # print URL
 #   ng pr merge  12 [--squash|--merge|--rebase] [--delete-branch]    # print sha
+#                # Reads the `Skeptic-Verdict:` trailer on the PR body and
+#                # REFUSES (exit 5) when the validated head is not the head
+#                # it is about to merge (jacob-greene/nexus#155).
+#   ng pr merge  12 --require-verdict      # also refuse when NO verdict is recorded
+#   ng pr merge  12 --verdict-override "<why the delta is safe>"
+#                # merge past the gate; the reason is mandatory and the
+#                # override is audited to monitor/.state/verdict-override.log
+#   ng pr verdict set 12 --verdict credible [--head <sha>] [--depth N]
+#                                          [--findings N] [--skeptic <window>]
+#                # record the verdict + the commit it covers on the PR body;
+#                # --head defaults to the PR's current head
+#   ng pr verdict get 12 [--field head]    # read it back; exit 3 when absent
 #   ng pr view   12                        # #12 state=OPEN author=login title=...
 #   ng pr view   12 --json number,state,title   # scriptable JSON (bare --json = full object)
 #   ng preflight your-org/foo              # is the bot installed on this repo?
@@ -55,7 +67,8 @@
 #                                [--skeptic-role --skeptic-target <window>
 #                                 --skeptic-verdict credible|check|suspect|refuted
 #                                 --skeptic-depth N --skeptic-findings N
-#                                 --skeptic-orig <original-worker-window>]
+#                                 --skeptic-orig <original-worker-window>
+#                                 --skeptic-head <sha> --skeptic-pr <n>]
 #                # one-shot end-of-task: upload report + post link
 #                # comment + rocket trigger comment + log action.
 #                # --repo controls the issue-thread (comment) target.
@@ -75,6 +88,11 @@
 #                # skeptic's own wrap-up (logs its --skeptic-verdict and
 #                # applies bounded recursion). --skeptic-waive is the
 #                # operator override of a required skeptic.
+#                # --skeptic-head <sha> binds the verdict to the commit it
+#                # covers; --skeptic-pr <n> publishes that binding as the
+#                # `Skeptic-Verdict:` trailer `ng pr merge` gates on
+#                # (jacob-greene/nexus#155). Without a head, a verdict
+#                # cannot stop a merge of a commit nobody reviewed.
 #   ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|
 #               status|list|nudge|init|dir> ...
 #                # worker↔skeptic comms channel + nudge (delegates to
@@ -363,11 +381,14 @@ _usage_for() {
         cmd_issue_view)     echo "usage: ng issue <n> [--repo <owner/name>] [--with-body] [--with-comments]" ;;
         cmd_issue_create)   echo "usage: ng issue create --title <t> [--body-file <path>] [--repo <owner/name>] [--label <l>]..." ;;
         cmd_issue_comment)  echo "usage: ng issue comment <n> [--repo <owner/name>] [--body-file <path>]" ;;
-        cmd_pr)             echo "usage: ng pr create|edit|merge|view ..." ;;
+        cmd_pr)             echo "usage: ng pr create|edit|merge|view|verdict ..." ;;
         cmd_pr_create)      echo "usage: ng pr create --head <branch> --title <t> [--body-file <path>] [--base main] [--repo <owner/name>] [--reviewer <login>|--no-reviewer]" ;;
         cmd_pr_edit)        echo "usage: ng pr edit <n> [--repo <owner/name>] [--title <t>] [--body-file <path>]" ;;
-        cmd_pr_merge)       echo "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--delete-branch]" ;;
+        cmd_pr_merge)       echo "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--delete-branch] [--require-verdict] [--verdict-override <reason>]   # refuses (exit 5) when the recorded Skeptic-Verdict head != the head to merge" ;;
         cmd_pr_view)        echo "usage: ng pr view <n> [--repo <owner/name>] [--json [field,...]]" ;;
+        cmd_pr_verdict)     echo "usage: ng pr verdict set|get <n> ..." ;;
+        cmd_pr_verdict_set) echo "usage: ng pr verdict set <n> --verdict <credible|check|suspect|refuted> [--head <sha>] [--depth N] [--findings N] [--skeptic <window>] [--issue N] [--repo <owner/name>]   # --head defaults to the PR's current head" ;;
+        cmd_pr_verdict_get) echo "usage: ng pr verdict get <n> [--repo <owner/name>] [--field verdict|head|depth|findings|skeptic|issue]   # exit 3 when no trailer" ;;
         cmd_preflight)      echo "usage: ng preflight <owner/repo>" ;;
         cmd_dashboard)      echo "usage: ng dashboard get|put|scaffold|validate [--body-file <path>]" ;;
         cmd_dashboard_get)  echo "usage: ng dashboard get [--stat]   # --stat = size breakdown only, never the body" ;;
@@ -1697,12 +1718,13 @@ _skeptic_spawn_cmd() {
 # config monitor.skeptic.enforce_auto_decision is truthy.
 # Args: issue source_window repo
 #       role decision rationale waive verdict target depth findings orig
-#       contradicted new_round
+#       contradicted new_round head pr
 _wrapup_skeptic_step() {
     local issue="$1" source_window="$2" repo="$3"
     local f_role="$4" f_decision="$5" f_rationale="$6" f_waive="$7"
     local f_verdict="$8" f_target="$9" f_depth="${10}" f_findings="${11}"
     local f_orig="${12:-}" f_contradicted="${13:-}" f_new_round="${14:-0}"
+    local f_head="${15:-}" f_pr="${16:-}"
     [[ "$f_new_round" == "1" ]] || f_new_round=0
 
     # Request-intent signal for cmd_wrap_up's "Step 2b" (spawn-skeptic
@@ -1764,6 +1786,40 @@ _wrapup_skeptic_step() {
         [[ -n "$orig_eff" && "$orig_eff" != "<unknown-target>" ]] \
             && orig_safe="${orig_eff//[^a-zA-Z0-9_-]/_}"
 
+        # The commit this verdict covers (jacob-greene/nexus#155). A verdict
+        # that names no commit cannot gate a merge: on 2026-09-11 `#175` was
+        # validated at `ab2fd5f`, the worker pushed `4a284a6` afterwards, and
+        # the merge landed the unreviewed commit because nothing compared the
+        # two. Resolution order:
+        #   1. --skeptic-head <sha>, the explicit statement of what was read;
+        #   2. the CURRENT head of --skeptic-pr <n>, which is what a skeptic
+        #      finishing right now has been reviewing;
+        #   3. HEAD of this working tree, when one is a git checkout.
+        # Whatever resolves is recorded in the action-log event AND, when a
+        # pull request is named, published as a `Skeptic-Verdict:` trailer on
+        # the pull-request body, where a merge on any host can read it.
+        local head_sha="$f_head" head_src="flag" pr_raw="" pr_repo=""
+        if [[ -n "$f_pr" ]]; then
+            # Both calls are subshell-guarded: `_resolve_repo` and `api` can
+            # exit, and a failed head lookup must degrade to a loud warning,
+            # never abort the wrap-up that carries the report.
+            pr_repo=$( _resolve_repo write "$repo" 2>/dev/null ) || pr_repo=""
+            [[ -n "$pr_repo" ]] \
+                && { pr_raw=$( api "/repos/$pr_repo/pulls/$f_pr" 2>/dev/null ) || pr_raw=""; }
+        fi
+        if [[ -z "$head_sha" && -n "$pr_raw" ]]; then
+            head_sha=$(jq -r '.head.sha // empty' <<<"$pr_raw" 2>/dev/null || true)
+            [[ -n "$head_sha" ]] && head_src="pr-$f_pr"
+        fi
+        if [[ -z "$head_sha" ]]; then
+            head_sha=$(git rev-parse HEAD 2>/dev/null || true)
+            [[ -n "$head_sha" ]] && head_src="worktree"
+        fi
+        if [[ -n "$head_sha" && ! "$head_sha" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            echo "ng wrap-up: --skeptic-head must be a 7-40 character commit sha, got '$head_sha'" >&2
+            return 1
+        fi
+
         ( cmd_log_action monitor --event skeptic-verdict \
             --extra "window=${source_window:-skeptic}" \
             --extra "target-window=$reviewed" \
@@ -1771,7 +1827,28 @@ _wrapup_skeptic_step() {
             --extra "verdict=$verdict" \
             --extra "depth=$depth" \
             --extra "findings=$findings" \
+            --extra "head=${head_sha:-unknown}" \
+            --extra "head-source=${head_sha:+$head_src}" \
+            --extra "pr=$f_pr" \
             --extra "issue=$issue" ) 2>/dev/null || true
+
+        # Publish the trailer. The action log is per-host and untracked, so a
+        # verdict recorded only there is invisible to a merge run anywhere
+        # else. The trailer travels with the pull request.
+        if [[ -n "$f_pr" ]]; then
+            if [[ -z "$head_sha" ]]; then
+                echo "ng wrap-up: no head resolved for pull request $f_pr — trailer NOT published" >&2
+            elif ( cmd_pr_verdict_set "$f_pr" --verdict "$verdict" --head "$head_sha" \
+                       --depth "$depth" --findings "$findings" \
+                       --skeptic "${source_window:-skeptic}" --issue "$issue" \
+                       ${pr_repo:+--repo "$pr_repo"} ) >/dev/null 2>&1; then
+                printf 'Skeptic-Verdict trailer published on pull request %s at %s\n' \
+                    "$f_pr" "${head_sha:0:7}" >&2
+            else
+                echo "ng wrap-up: failed to publish the Skeptic-Verdict trailer on pull request $f_pr" >&2
+                echo "  record it by hand:  ng pr verdict set $f_pr --verdict $verdict --head $head_sha" >&2
+            fi
+        fi
 
         # A returned verdict SATISFIES the first-pass require-gate, so clear
         # EVERY blocking marker this validation touches: the immediately
@@ -1799,6 +1876,13 @@ _wrapup_skeptic_step() {
         printf 'verdict         : %s\n' "$verdict"
         printf 'depth           : %s\n' "$depth"
         printf 'new findings    : %s\n' "$findings"
+        if [[ -n "$head_sha" ]]; then
+            printf 'validated head  : %s (%s)\n' "$head_sha" "$head_src"
+        else
+            printf 'validated head  : UNKNOWN — pass --skeptic-head <sha>\n'
+            printf '                  A verdict with no head cannot gate a merge.\n'
+        fi
+        [[ -n "$f_pr" ]] && printf 'pull request    : %s\n' "$f_pr"
 
         # Bounded recursion. A second-pass skeptic is warranted only when
         # this pass found SUBSTANTIVE NEW issues (suspect/refuted verdict,
@@ -2415,7 +2499,7 @@ cmd_wrap_up() {
     # the worker's spawn-stamped mode (provenance record) or `auto`.
     local sk_decision="" sk_rationale="" sk_waive="" sk_contradicted=""
     local sk_role=0 sk_verdict="" sk_target="" sk_depth="" sk_findings="" sk_orig=""
-    local sk_new_round=0
+    local sk_new_round=0 sk_head="" sk_pr=""
     while (( $# > 0 )); do
         case "$1" in
             --trigger-comment)  trigger_comment="${2:-}";   shift 2 ;;
@@ -2452,6 +2536,14 @@ cmd_wrap_up() {
             --skeptic-depth)     sk_depth="${2:-}";         shift 2 ;;
             --skeptic-findings)  sk_findings="${2:-}";      shift 2 ;;
             --skeptic-orig)      sk_orig="${2:-}";          shift 2 ;;
+            # --skeptic-head <sha>: the commit this verdict covers
+            # (jacob-greene/nexus#155). Recorded in the skeptic-verdict event
+            # and, with --skeptic-pr, published as the Skeptic-Verdict
+            # trailer that `ng pr merge` gates on.
+            --skeptic-head)      sk_head="${2:-}";          shift 2 ;;
+            # --skeptic-pr <n>: publish the trailer on this pull request. The
+            # head defaults to that pull request's current head.
+            --skeptic-pr)        sk_pr="${2:-}";            shift 2 ;;
             *) die "unknown flag: $1" ;;
         esac
     done
@@ -2554,7 +2646,7 @@ cmd_wrap_up() {
         "$issue" "$source_window" "$target" \
         "$sk_role" "$sk_decision" "$sk_rationale" "$sk_waive" \
         "$sk_verdict" "$sk_target" "$sk_depth" "$sk_findings" "$sk_orig" \
-        "$sk_contradicted" "$sk_new_round" \
+        "$sk_contradicted" "$sk_new_round" "$sk_head" "$sk_pr" \
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
@@ -3207,11 +3299,12 @@ cmd_pr() {
     _help_check_first "$@"
     local sub="${1:-}"; shift || true
     case "$sub" in
-        create) cmd_pr_create "$@" ;;
-        edit)   cmd_pr_edit   "$@" ;;
-        merge)  cmd_pr_merge  "$@" ;;
-        view)   cmd_pr_view   "$@" ;;
-        *)      die "usage: ng pr create|edit|merge|view ..." ;;
+        create)  cmd_pr_create  "$@" ;;
+        edit)    cmd_pr_edit    "$@" ;;
+        merge)   cmd_pr_merge   "$@" ;;
+        view)    cmd_pr_view    "$@" ;;
+        verdict) cmd_pr_verdict "$@" ;;
+        *)       die "usage: ng pr create|edit|merge|view|verdict ..." ;;
     esac
 }
 
@@ -3311,26 +3404,343 @@ cmd_pr_edit() {
     printf '%s\n' "$url"
 }
 
+# ---- skeptic verdict trailer (jacob-greene/nexus#155) --------------------
+#
+# A skeptic's verdict used to live in two places, and neither could gate a
+# merge. The action log (`monitor/.state/action-log.jsonl`) is host-local
+# and untracked, so no other clone and no reader on GitHub can see it. The
+# prose section in a pull-request body is reachable but unparseable, and
+# two merges 39 seconds apart on 2026-09-10 used two different conventions.
+#
+# Neither record named the commit the verdict covered. On 2026-09-11 that
+# cost a merge: `#175` was validated at `ab2fd5f`, the worker then pushed
+# `4a284a6`, and `ng pr merge` landed the unreviewed commit.
+#
+# The fix is one machine-readable line in the pull-request body:
+#
+#     Skeptic-Verdict: credible head=<sha> depth=1 findings=0 skeptic=<win> issue=155
+#
+# It travels with the pull request, so any host and any fresh clone reads
+# the same record. `verdict` and `head=` are load-bearing; the rest is
+# provenance. `ng pr verdict set|get` writes and reads it, and
+# `ng pr merge` compares `head=` against the head it is about to merge.
+#
+# Parse rules, and why each one exists:
+#   * The line must start at column 0. An indented (four-space) code block
+#     therefore cannot supply one.
+#   * Lines inside a fenced code block are skipped. A pull request that
+#     DOCUMENTS this format (this one does) must not be read as carrying a
+#     verdict.
+#   * The LAST surviving trailer wins. Re-validating after a new push
+#     appends a second trailer, so the newest record is authoritative and
+#     the earlier ones stay visible as history.
+
+# Accepted verdict values, shared with `ng wrap-up --skeptic-verdict`.
+_VERDICT_VALUES='credible|check|suspect|refuted'
+
+# Render one trailer line. Empty optional fields are omitted, so a
+# minimal record is `Skeptic-Verdict: credible head=<sha>`.
+_verdict_render() {
+    local verdict="$1" head="$2" depth="${3:-}" findings="${4:-}" skeptic="${5:-}" issue="${6:-}"
+    local line="Skeptic-Verdict: $verdict head=$head"
+    [[ -n "$depth"    ]] && line+=" depth=$depth"
+    [[ -n "$findings" ]] && line+=" findings=$findings"
+    # Whitespace in a window name would break the single-line field split,
+    # so squash it rather than emit an unparseable record.
+    [[ -n "$skeptic"  ]] && line+=" skeptic=${skeptic//[[:space:]]/_}"
+    [[ -n "$issue"    ]] && line+=" issue=$issue"
+    printf '%s' "$line"
+}
+
+# Reduce a pull-request body (stdin) to its single authoritative trailer
+# line, or nothing. Fence-aware; last match wins.
+_verdict_trailer_line() {
+    tr -d '\r' | awk '
+        /^[[:space:]]*(```|~~~)/ { fence = 1 - fence; next }
+        fence                    { next }
+        /^Skeptic-Verdict:[ \t]/ { last = $0 }
+        END { if (last != "") print last }
+    '
+}
+
+# Parse a body (stdin) into TSV: verdict, head, depth, findings, skeptic,
+# issue. Exit 3 when the body carries no well-formed trailer. A line that
+# names a verdict but no `head=` is NOT well-formed — binding the head is
+# the whole point, so a headless record must not read as a valid verdict.
+_verdict_parse() {
+    local line
+    line=$(_verdict_trailer_line)
+    [[ -n "$line" ]] || return 3
+    local re="^Skeptic-Verdict:[[:blank:]]+($_VERDICT_VALUES)[[:blank:]]+head=([0-9a-fA-F]{7,40})([[:blank:]]|\$)"
+    [[ "$line" =~ $re ]] || return 3
+    local verdict="${BASH_REMATCH[1]}" head="${BASH_REMATCH[2]}"
+    local depth="" findings="" skeptic="" issue="" tok
+    for tok in $line; do
+        case "$tok" in
+            depth=*)    depth="${tok#depth=}" ;;
+            findings=*) findings="${tok#findings=}" ;;
+            skeptic=*)  skeptic="${tok#skeptic=}" ;;
+            issue=*)    issue="${tok#issue=}" ;;
+        esac
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue"
+}
+
+# Do two commit identifiers name the same commit? A trailer may carry an
+# abbreviated sha (`ab2fd5f`) while the API reports the full 40. Match
+# when the shorter is a case-insensitive prefix of the longer, with a
+# 7-character floor so a stray short token cannot match half the repo.
+_verdict_head_match() {
+    local a="${1,,}" b="${2,,}"
+    [[ -n "$a" && -n "$b" ]] || return 1
+    (( ${#a} >= 7 && ${#b} >= 7 )) || return 1
+    if (( ${#a} <= ${#b} )); then
+        [[ "$b" == "$a"* ]]
+    else
+        [[ "$a" == "$b"* ]]
+    fi
+}
+
+# Append an audit line for a merge that overrode the head-binding gate.
+# Mirrors the GH_IMPERSONATE trail in monitor/gh-shim.sh: an override
+# nobody can see afterwards is not an override, it is a disabled gate.
+_verdict_audit_override() {
+    local repo="$1" n="$2" recorded="$3" actual="$4" kind="$5" reason="$6"
+    local log_file="$STATE_DIR/verdict-override.log"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    # Explicit mode at creation, same rationale as impersonate.log: a
+    # group-writable audit trail is one anybody in the group can rewrite.
+    if ! command -v _ensure_service_log >/dev/null 2>&1; then
+        # shellcheck source=_log-mode.sh
+        . "$_script_dir/_log-mode.sh" 2>/dev/null || true
+    fi
+    command -v _ensure_service_log >/dev/null 2>&1 \
+        && _ensure_service_log "$log_file" || true
+    printf '%s\tpid=%s\twindow=%s\trepo=%s\tpr=%s\tkind=%s\trecorded-head=%s\tmerged-head=%s\treason=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+        "$$" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+        "$repo" "$n" "$kind" "${recorded:-none}" "$actual" "$reason" \
+        >> "$log_file" 2>/dev/null || true
+    ( cmd_log_action monitor --event verdict-override \
+        --extra "repo=$repo" --extra "pr=$n" --extra "kind=$kind" \
+        --extra "recorded-head=${recorded:-none}" \
+        --extra "merged-head=$actual" \
+        --extra "reason=$reason" ) 2>/dev/null || true
+}
+
+# The gate itself. Returns 0 to let the merge proceed. Exits 5 to refuse.
+# Split out of cmd_pr_merge so the unit suite can drive it directly AND
+# through its real caller.
+#
+# Refusal cases:
+#   (a) the recorded head differs from the head about to be merged;
+#   (b) no verdict is recorded AND --require-verdict was passed.
+# A missing verdict without --require-verdict warns and proceeds: most
+# pull requests on this repo never had a skeptic, and turning every one
+# of them into a hard failure would make the verb unusable.
+_pr_merge_verdict_gate() {
+    local repo="$1" n="$2" head_sha="$3" body="$4"
+    local require_verdict="$5" have_override="$6" override_reason="$7"
+    local parsed verdict recorded depth findings skeptic issue
+    if parsed=$(printf '%s' "$body" | _verdict_parse); then
+        IFS=$'\t' read -r verdict recorded depth findings skeptic issue <<<"$parsed"
+    else
+        verdict=""; recorded=""
+    fi
+
+    if [[ -z "$recorded" ]]; then
+        if (( require_verdict == 1 )); then
+            if (( have_override == 1 )); then
+                _verdict_audit_override "$repo" "$n" "" "$head_sha" missing-verdict "$override_reason"
+                echo "ng pr merge: OVERRIDE — no Skeptic-Verdict trailer, merging anyway" >&2
+                echo "ng pr merge: reason: $override_reason" >&2
+                return 0
+            fi
+            echo "ng pr merge: REFUSED — pull request $n carries no Skeptic-Verdict trailer." >&2
+            echo "  --require-verdict was passed, so an unrecorded verdict is a hard stop." >&2
+            echo "  Record one:  ng pr verdict set $n --verdict <credible|check|suspect|refuted> --repo $repo" >&2
+            echo "  Or override: ng pr merge $n --verdict-override \"<why this merge is safe>\"" >&2
+            exit 5
+        fi
+        echo "ng pr merge: no Skeptic-Verdict trailer on pull request $n — head not checked." >&2
+        return 0
+    fi
+
+    if _verdict_head_match "$recorded" "$head_sha"; then
+        [[ "$verdict" == "credible" ]] \
+            || echo "ng pr merge: recorded verdict is '$verdict', not 'credible' — merging anyway." >&2
+        printf 'ng pr merge: verdict %s validated at %s, matches head %s\n' \
+            "$verdict" "$recorded" "${head_sha:0:7}" >&2
+        return 0
+    fi
+
+    if (( have_override == 1 )); then
+        _verdict_audit_override "$repo" "$n" "$recorded" "$head_sha" head-mismatch "$override_reason"
+        echo "ng pr merge: OVERRIDE — head mismatch, merging anyway" >&2
+        printf '  verdict %s covers %s; the head is %s\n' "$verdict" "$recorded" "$head_sha" >&2
+        echo "  reason: $override_reason" >&2
+        echo "  audited to: $STATE_DIR/verdict-override.log" >&2
+        return 0
+    fi
+
+    echo "ng pr merge: REFUSED — the recorded verdict does not cover this head." >&2
+    printf '  recorded verdict : %s\n' "$verdict" >&2
+    printf '  validated head   : %s\n' "$recorded" >&2
+    printf '  head to merge    : %s\n' "$head_sha" >&2
+    echo "  The branch moved after the verdict. Review the new commits, then either" >&2
+    echo "  re-record the verdict at the current head:" >&2
+    echo "      ng pr verdict set $n --verdict <verdict> --repo $repo" >&2
+    echo "  or state why the delta is safe and merge with an audited override:" >&2
+    echo "      ng pr merge $n --verdict-override \"<why the delta is safe>\"" >&2
+    exit 5
+}
+
+# `ng pr verdict set|get <n>` — write and read the Skeptic-Verdict trailer.
+cmd_pr_verdict() {
+    _help_check_first "$@"
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        set) cmd_pr_verdict_set "$@" ;;
+        get) cmd_pr_verdict_get "$@" ;;
+        *)   die "usage: ng pr verdict set|get <n> ..." ;;
+    esac
+}
+
+# Append a trailer to the pull-request body. --head defaults to the pull
+# request's CURRENT head, which is the commit a skeptic finishing right
+# now has been reviewing. Pass --head explicitly when recording a verdict
+# for an earlier commit.
+cmd_pr_verdict_set() {
+    _help_check "$@"
+    local n="${1:-}"; shift || true
+    [[ -n "$n" ]] || die "usage: ng pr verdict set <n> --verdict <credible|check|suspect|refuted> [--head <sha>] [--depth N] [--findings N] [--skeptic <window>] [--issue N] [--repo <owner/name>]"
+    local verdict="" head="" depth="" findings="" skeptic="" issue="" repo_arg=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --verdict)  verdict="${2:-}";  shift 2 ;;
+            --head)     head="${2:-}";     shift 2 ;;
+            --depth)    depth="${2:-}";    shift 2 ;;
+            --findings) findings="${2:-}"; shift 2 ;;
+            --skeptic)  skeptic="${2:-}";  shift 2 ;;
+            --issue)    issue="${2:-}";    shift 2 ;;
+            --repo)     repo_arg="${2:-}"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    [[ "$verdict" =~ ^($_VERDICT_VALUES)$ ]] \
+        || die "pr verdict set: --verdict must be credible|check|suspect|refuted, got '$verdict'"
+    local target raw
+    target=$(_resolve_repo write "$repo_arg") || exit $?
+    raw=$(api "/repos/$target/pulls/$n" 2>/dev/null)
+    [[ -n "$raw" ]] && jq -e '.number' <<<"$raw" >/dev/null 2>&1 \
+        || die "pr verdict set: could not fetch pull $n"
+    if [[ -z "$head" ]]; then
+        head=$(jq -r '.head.sha // empty' <<<"$raw")
+        [[ -n "$head" ]] || die "pr verdict set: could not resolve the head of pull $n; pass --head"
+    fi
+    [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] \
+        || die "pr verdict set: --head must be a 7-40 character commit sha, got '$head'"
+    local trailer body new_body url
+    trailer=$(_verdict_render "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue")
+    body=$(jq -r '.body // ""' <<<"$raw")
+    # Append. The parser takes the LAST trailer, so an earlier record stays
+    # readable as history instead of being silently rewritten.
+    new_body="${body%$'\n'}"$'\n\n'"$trailer"$'\n'
+    url=$(jq -n --arg b "$new_body" '{body:$b}' \
+          | api -X PATCH "/repos/$target/pulls/$n" --input - \
+          | jq -r '.html_url // empty')
+    [[ -n "$url" ]] || die "pr verdict set: body patch failed"
+    printf '%s\n' "$trailer"
+    printf '%s\n' "$url"
+}
+
+# Print the recorded trailer. Exit 3 when the pull request has none, so a
+# caller can branch on "no verdict" without parsing prose.
+cmd_pr_verdict_get() {
+    _help_check "$@"
+    local n="${1:-}"; shift || true
+    [[ -n "$n" ]] || die "usage: ng pr verdict get <n> [--repo <owner/name>] [--field verdict|head|depth|findings|skeptic|issue]"
+    local repo_arg="" field=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --repo)  repo_arg="${2:-}"; shift 2 ;;
+            --field) field="${2:-}";    shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    local target raw body parsed
+    target=$(_resolve_repo read "$repo_arg") || exit $?
+    raw=$(api "/repos/$target/pulls/$n" 2>/dev/null)
+    [[ -n "$raw" ]] && jq -e '.number' <<<"$raw" >/dev/null 2>&1 \
+        || die "pr verdict get: could not fetch pull $n"
+    body=$(jq -r '.body // ""' <<<"$raw")
+    if ! parsed=$(printf '%s' "$body" | _verdict_parse); then
+        echo "ng: pull request $n carries no Skeptic-Verdict trailer" >&2
+        exit 3
+    fi
+    local verdict head depth findings skeptic issue
+    IFS=$'\t' read -r verdict head depth findings skeptic issue <<<"$parsed"
+    case "$field" in
+        "")         printf 'verdict=%s head=%s depth=%s findings=%s skeptic=%s issue=%s\n' \
+                        "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue" ;;
+        verdict)    printf '%s\n' "$verdict" ;;
+        head)       printf '%s\n' "$head" ;;
+        depth)      printf '%s\n' "$depth" ;;
+        findings)   printf '%s\n' "$findings" ;;
+        skeptic)    printf '%s\n' "$skeptic" ;;
+        issue)      printf '%s\n' "$issue" ;;
+        *) die "pr verdict get: --field must be verdict|head|depth|findings|skeptic|issue" ;;
+    esac
+}
+
 # Merge a PR via the REST API. Prints the merge commit SHA. Optional
 # --delete-branch removes the head ref after a successful merge.
+#
+# Head-binding gate (jacob-greene/nexus#155): the verb reads the
+# `Skeptic-Verdict:` trailer in the pull-request body and refuses (exit 5)
+# when the validated head differs from the head it is about to merge.
+# `--verdict-override "<reason>"` merges anyway, with an audit line in
+# `monitor/.state/verdict-override.log`. The reason is mandatory.
 cmd_pr_merge() {
     _help_check "$@"
     local n="${1:-}"; shift || true
-    [[ -n "$n" ]] || die "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--delete-branch]"
+    [[ -n "$n" ]] || die "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--delete-branch] [--require-verdict] [--verdict-override <reason>]"
     local method="squash" delete_branch=0 repo_arg=""
+    local require_verdict=0 have_override=0 override_reason=""
     while (( $# > 0 )); do
         case "$1" in
             --squash) method="squash"; shift ;;
             --merge)  method="merge";  shift ;;
             --rebase) method="rebase"; shift ;;
             --delete-branch) delete_branch=1; shift ;;
+            --require-verdict) require_verdict=1; shift ;;
+            --verdict-override) override_reason="${2:-}"; have_override=1; shift 2 ;;
             --repo)   repo_arg="${2:-}"; shift 2 ;;
             *) die "unknown flag: $1" ;;
         esac
     done
-    local head_ref sha target
+    # A reason is what makes the override auditable. An empty one, or a
+    # bare flag that swallowed the next flag as its argument, is a silent
+    # override — refuse both.
+    if (( have_override == 1 )); then
+        [[ -n "${override_reason//[[:space:]]/}" ]] \
+            || die "pr merge: --verdict-override requires a non-empty reason"
+        [[ "$override_reason" != --* ]] \
+            || die "pr merge: --verdict-override requires a reason, got the flag '$override_reason'"
+    fi
+    local head_ref head_sha body raw sha target
     target=$(_resolve_repo write "$repo_arg") || exit $?
-    head_ref=$(api "/repos/$target/pulls/$n" 2>/dev/null | jq -r '.head.ref // empty')
+    raw=$(api "/repos/$target/pulls/$n" 2>/dev/null)
+    [[ -n "$raw" ]] && jq -e '.number' <<<"$raw" >/dev/null 2>&1 \
+        || die "pr merge: could not fetch pull $n"
+    head_ref=$(jq -r '.head.ref // empty' <<<"$raw")
+    head_sha=$(jq -r '.head.sha // empty' <<<"$raw")
+    body=$(jq -r '.body // ""' <<<"$raw")
+    [[ -n "$head_sha" ]] \
+        || die "pr merge: could not resolve the head sha of pull $n; refusing to merge unchecked"
+    _pr_merge_verdict_gate "$target" "$n" "$head_sha" "$body" \
+        "$require_verdict" "$have_override" "$override_reason"
     sha=$(jq -n --arg m "$method" '{merge_method:$m}' \
           | api -X PUT "/repos/$target/pulls/$n/merge" --input - \
           | jq -r '.sha // empty')

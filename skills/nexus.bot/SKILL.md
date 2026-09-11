@@ -177,8 +177,11 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 |------------|---------|-------------------|
 | `ng pr create --head <branch> [--base main] --title "…" --body-file b.md` | Open a PR | PR URL |
 | `ng pr edit <n> [--title "…"] [--body-file b.md]` | Edit a PR | PR URL |
-| `ng pr merge <n> [--squash\|--merge\|--rebase] [--delete-branch]` | Merge a PR | merge SHA |
+| `ng pr merge <n> [--squash\|--merge\|--rebase] [--delete-branch]` | Merge a PR, unless a recorded verdict covers a different head | merge SHA |
+| `ng pr merge <n> --verdict-override "<reason>"` | Merge past that refusal; the reason is mandatory and audited | merge SHA |
 | `ng pr view <n>` | Brief PR summary | `#<n> state=… author=… title=…` |
+| `ng pr verdict set <n> --verdict credible [--head <sha>]` | Record a verdict and the commit it covers, on the PR body | the trailer, then the PR URL |
+| `ng pr verdict get <n> [--field head]` | Read that record back; exit 3 when absent | `verdict=… head=… …` |
 | `ng issue create --title "…" --body-file b.md [--label foo]…` | Create an issue | issue URL |
 | `ng issue comment <n> --body-file b.md` | Comment on an issue | comment URL |
 | `ng issue close <n> [--comment "…"]` | Optional comment, then close | `CLOSED` |
