@@ -115,6 +115,21 @@ NBSP=$'\xc2\xa0'
     printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
 } > over-limit-terse-synthetic.ansi
 
+# --- over-limit: cc 2.1.268 budget-exhaustion notice -----------------------
+# Claude Code 2.1.268 added a limit notice with a different shape
+# (jacob-greene/nexus#173). It defeated the pre-#173 detector twice over:
+# the word "limit" is absent, and the apostrophe in "team's" was not in
+# the flavor-token character class. It also carries NO reset time, so the
+# old unconditional "resets <time>" companion requirement rejected it as
+# well. This fixture is the exact shape, byte for byte.
+{
+    printf '%s\n\n' "${ESC}[38;5;246m✻ Brewed for 41m${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '%s\n' "${ESC}[39mYou've hit your team's shared budget. Switch to another model to continue.${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m\n'
+} > over-limit-shared-budget-cc2.1.268-synthetic.ansi
+
 # --- idle pane with the over-limit text in scrollback (false-positive guard)
 # The user's last turn referenced the over-limit message verbatim — but
 # the current pane is idle (empty input box). pane-state.sh must NOT

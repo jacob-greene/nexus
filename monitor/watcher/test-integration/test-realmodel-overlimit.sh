@@ -69,6 +69,12 @@
 #     _detect_over_limit on the real bytes (logged as a note when the
 #     frame is blank). Wake-probe classification over every pane
 #     state is unit-covered in test-over-limit.sh.
+#   - Phase B2 asserts the renderer scrape on limit notices that carry
+#     NO reset time (jacob-greene/nexus#173). Those run against fixture
+#     bytes, never a live pane: the watcher classifies every real window
+#     in the workspace on its normal poll, so painting a limit notice
+#     onto a live pane to test the detector can arm a real hold against
+#     a real worker.
 #
 # Gated on RUN_CC_HARNESS=1 (+ node + a resolvable claude binary).
 # Self-skips cleanly (never a silent pass) where the real binary is
@@ -226,6 +232,116 @@ if grep -q "hit your" <<<"$pane_text"; then
 else
     echo "  note: TUI frame blank (known render gap) — renderer-scrape sub-check not exercisable this run; fixture coverage in test-pane-state.sh"
 fi
+
+# ---- phase B2: limit notices that carry NO reset time ---------------------
+# jacob-greene/nexus#173. Claude Code 2.1.268 ships a budget-exhaustion
+# family that the pre-#173 detector missed on BOTH of its halves: the
+# headline has no word "limit" and an apostrophe in "team's" that the
+# flavor-token class rejected, and the notice carries no reset time at
+# all, so the unconditional "resets <time>" companion also failed.
+#
+# These run against FIXTURE BYTES, not a live pane, on purpose. The
+# watcher polls every real window in the workspace on its normal cycle;
+# painting a limit notice onto a live pane to test the detector can arm
+# a real hold against a real worker.
+#
+# `--over-limit-file` points at a path that does not exist in every
+# case, so the StopFailure-stamp branch can never supply the verdict.
+# What passes here passed through the RENDERER scrape.
+echo
+echo "--- phase B2: renderer scrape on notices with NO reset time (#173) ---"
+B2_DIR="$CCH_DIR/b2"; mkdir -p "$B2_DIR"
+B2_ESC=$'\033'
+B2_FIXTURES="$REPO_ROOT/monitor/watcher/fixtures"
+
+# Build a pane whose only notice is the given line, wrapped in the same
+# chrome the synthetic fixtures use.
+b2_make() {
+    local name="$1" line="$2"
+    {
+        printf '%s\n\n' "${B2_ESC}[38;5;246m✻ Brewed for 41m${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[38;5;244m─${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[39m${line}${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[38;5;244m─${B2_ESC}[0m"
+    } > "$B2_DIR/$name.ansi"
+    printf '%s' "$B2_DIR/$name.ansi"
+}
+
+# state= that production pane-state assigns a fixture, stamp branch off.
+b2_state() {
+    "$CCH_PANE_STATE" --fixture "$1" --window 9 --name b2w --active 0 \
+        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1 \
+        | sed -n 's/.*state=\([^ ]*\).*/\1/p'
+}
+b2_reset() {
+    "$CCH_PANE_STATE" --fixture "$1" --window 9 --name b2w --active 0 \
+        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1 \
+        | grep -oE 'reset_at=[^ ]+' | sed 's/^reset_at=//'
+}
+
+# (1) The committed fixture for the new shape. Pins the apostrophe in
+#     "team's" and the absent word "limit" together.
+b2_budget_fixture="$B2_FIXTURES/over-limit-shared-budget-cc2.1.268-synthetic.ansi"
+assert_file_exists "2.1.268 budget fixture is committed" "$b2_budget_fixture"
+assert_eq "2.1.268 'team's shared budget. Switch to another model…' → over-limit" \
+    "$(b2_state "$b2_budget_fixture")" "over-limit"
+
+# (2) The slash-command variant of the same family.
+assert_eq "2.1.268 'team's shared budget. /model to switch models.' → over-limit" \
+    "$(b2_state "$(b2_make budget-model \
+        "You've hit your team's shared budget. /model to switch models.")")" \
+    "over-limit"
+
+# (3) The /usage-credits variant. Its line does NOT end in a full stop.
+#     This one pins WHERE the waiver looks: at the stop right after the
+#     limit/budget noun, not at the end of the line. A condition keyed on
+#     the line ending would pass (1) and (2) and fail here.
+assert_eq "2.1.268 '…shared budget. Run /usage-credits …' (no trailing stop) → over-limit" \
+    "$(b2_state "$(b2_make budget-credits \
+        "You've hit your team's shared budget. Run /usage-credits to raise it and keep using Opus 4.7 or switch models")")" \
+    "over-limit"
+
+# (4) A waived notice has no reset time to parse, so the emit must say
+#     so. reset_at=unknown is what drops the watcher's hold onto its
+#     bounded 6h fallback; a fabricated token would mis-time the wake.
+assert_eq "budget notice emits reset_at=unknown (6h fallback, not a fabricated token)" \
+    "$(b2_reset "$b2_budget_fixture")" "unknown"
+
+# (5) PRE-2.1.268 regression, pinned separately from the family above.
+#     "You've hit your monthly spend limit." always matched the headline;
+#     it was the unconditional companion that rejected it. It has been
+#     undetected on every release, not only on 2.1.268.
+assert_eq "'You've hit your monthly spend limit.' → over-limit (predates 2.1.268)" \
+    "$(b2_state "$(b2_make monthly-spend \
+        "You've hit your monthly spend limit.")")" \
+    "over-limit"
+
+# (6) The companion check must still do its job. A canonical headline
+#     caught mid-redraw ends with no terminator and no reset time. If
+#     the waiver had been a plain deletion of the companion check, this
+#     would now classify over-limit off half a frame.
+assert_eq "half-rendered canonical headline (no stop, no resets) → NOT over-limit" \
+    "$(b2_state "$(b2_make half-render \
+        "You've hit your weekly limit")")" \
+    "absent"
+
+# (7) Negative control. The widened headline must not be a pattern that
+#     matches everything — every positive assertion above would pass
+#     under one that did. This line carries "hit", "your", "team",
+#     "shared", "budget" and "limit", and must still not classify.
+assert_eq "prose carrying hit/your/team/shared/budget/limit → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-prose \
+        "We hit your team's shared budget target, so the limit discussion can wait.")")" \
+    "absent"
+
+# (8) The canonical path the widening must not disturb, asserted here so
+#     this phase stands alone: state AND the parsed reset token.
+b2_canon=$(b2_make canon-weekly \
+    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+assert_eq "canonical weekly notice still over-limit" \
+    "$(b2_state "$b2_canon")" "over-limit"
+assert_eq "canonical weekly notice still parses its reset token" \
+    "$(b2_reset "$b2_canon")" "3am_America/Los_Angeles"
 
 # ---- phase C: the watcher's HOLD — gate closes on the detected status ------
 # Source the production _over_limit.sh at its unit seam: record what the
