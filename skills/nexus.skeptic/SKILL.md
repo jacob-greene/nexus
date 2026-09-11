@@ -294,8 +294,7 @@ per-assertion evidence. The instance is recorded in phase B3 of
 own history in the comments there. A test pinned a rule that rejects rows
 carrying a leading line number. A different check rejected its input row
 whether or not that rule ran. So no mutation of that rule could make the
-test fail,
-and the arm still counted as caught.
+test fail, and the arm still counted as caught.
 
 **Proportionality still applies.** Spend the verification budget where
 being wrong is expensive — a merge, a figure, a gene list, an external
