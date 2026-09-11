@@ -504,7 +504,50 @@ _over_limit_window() {
     fi
     printf '%s\n' "$body" \
         | grep -v '^[[:space:]]*$' \
-        | tail -n "$OVER_LIMIT_SCAN_ROWS"
+        | tail -n "$OVER_LIMIT_SCAN_ROWS" \
+        | _over_limit_drop_quoted_source
+}
+
+# PROVENANCE filter over the window: drop rows that are QUOTED SOURCE
+# TEXT rather than a notice the renderer painted.
+#
+# Why this exists. On 2026-09-10 at 23:15 PDT the running watcher armed
+# a real 20.7 h hold against a live, working window. Nothing was
+# limited. The window was an agent editing THIS detector, and the
+# file-edit tool had rendered its own diff onto the pane:
+#
+#       334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+#
+# The scrape read that as a painted notice. The stored token was
+# `3am_America/Los_Angeles"` — the trailing double quote is the source
+# line's closing quote, and it is the byte-exact proof of provenance.
+#
+# The positional anchor above is a POSITIONAL defence, and this input
+# defeats it: an ordinary tool render puts the text inside the window
+# with nobody doing anything unusual. So the window also needs a
+# PROVENANCE defence. Three shapes are dropped, each measured against a
+# real captured pane, never invented:
+#
+#   1. A line-number gutter — `334 +`, `107:`, `551 +#`. Emitted by the
+#      file-edit diff render, by `Read`, and by `grep -n`. A painted
+#      notice never starts with a line number.
+#   2. A `"` or a backtick BEFORE the headline on the same line — the
+#      shell-assertion and markdown-quote shapes (`echo "You've hit …"`,
+#      `- \`You've hit …\``). The apostrophe in "You've" is deliberately
+#      NOT in that set. A painted notice is not quoted; the API-error
+#      render that phase B of test-realmodel-overlimit.sh exercises
+#      carries no quote before the headline.
+#   3. A bare diff or bullet marker at the start of the line (`+ `,
+#      `- `) — the unquoted diff-render shape.
+#
+# This narrows the false-positive surface; it does not close it. A
+# window that paints the notice verbatim with no quote, no gutter and
+# no marker still classifies. That residue is the same bounded one the
+# anchor comment describes, and it is tracked on jacob-greene/nexus#79.
+_over_limit_drop_quoted_source() {
+    grep -vE '^[[:space:]]*[0-9]+[[:space:]]*[:+-]' \
+        | grep -vE '^[^"`]*["`].*You.{0,3}ve (hit|reached) your' \
+        | grep -vE '^[[:space:]]*[-+][[:space:]]'
 }
 
 # Anchor the over-limit notice on the last OVER_LIMIT_SCAN_ROWS

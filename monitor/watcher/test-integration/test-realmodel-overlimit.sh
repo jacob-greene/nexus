@@ -343,6 +343,82 @@ assert_eq "canonical weekly notice still over-limit" \
 assert_eq "canonical weekly notice still parses its reset token" \
     "$(b2_reset "$b2_canon")" "3am_America/Los_Angeles"
 
+# ---- phase B3: provenance — QUOTED SOURCE is not a painted notice ---------
+# The live false positive of 2026-09-10 23:15 PDT. The watcher armed a
+# real 20.7 h hold against a working window. Nothing was limited. The
+# window held an agent editing this detector, and the file-edit tool had
+# rendered its own diff onto the pane. The scrape read the diff line as
+# a notice.
+#
+# The stored token was `3am_America/Los_Angeles"`. The trailing double
+# quote is the source line's closing quote and is the byte-exact proof
+# of provenance — no rendered notice can produce it.
+#
+# A widened headline raises the false-positive rate on exactly this
+# input class, so these assertions carry the evidence that the widening
+# is safe. Every line below is copied VERBATIM from a real captured
+# pane, not written as prose approximating one.
+echo
+echo "--- phase B3: quoted source / diff renders must NOT detect ---"
+
+# (9) The committed fixture: five real captured shapes inside the scan
+#     window, with an idle input box below them. The positional anchor
+#     cannot reject these — they are in the window. Only the provenance
+#     filter can.
+b3_fixture="$B2_FIXTURES/idle-overlimit-quoted-source-in-window-synthetic.ansi"
+assert_file_exists "quoted-source fixture is committed" "$b3_fixture"
+assert_eq "pane of quoted source in the scan window → idle, not over-limit" \
+    "$(b2_state "$b3_fixture")" "idle"
+
+# (10) The incident's own emit must not appear at all. A `reset_at` on
+#      this pane means the detector fired; the empty string means it
+#      never did. This is the assertion that pins the 20.7 h hold shut.
+assert_eq "quoted-source pane emits no reset_at (the 2026-09-10 token)" \
+    "$(b2_reset "$b3_fixture")" ""
+
+# (11) The exact line that caused the latch, alone in a window.
+assert_eq "file-edit diff render of a test line → NOT over-limit" \
+    "$(b2_state "$(b2_make src-diff \
+'      334 +    "You'"'"'ve hit your weekly limit · resets 3am (America/Los_Angeles)")')")" \
+    "absent"
+
+# (12) The same render shape with NO quote before the headline — a
+#      diff of a COMMENT line. The quote rule alone cannot reject this
+#      one; the line-number gutter rule is what does.
+assert_eq "file-edit diff render of a comment line (unquoted) → NOT over-limit" \
+    "$(b2_state "$(b2_make src-diff-comment \
+'      551 +#     You'"'"'ve hit your team'"'"'s shared budget. Switch to another model to continue.')")" \
+    "absent"
+
+# (13) The shell-assertion shape, which is what a test for this detector
+#      looks like on a pane while it is being written.
+assert_eq "shell assertion carrying the notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-shell \
+'  ⎿  echo "You'"'"'ve hit your team'"'"'s shared budget. /model to switch models." \')")" \
+    "absent"
+
+# (14) `grep -n` output, the other gutter shape.
+assert_eq "grep -n output carrying the notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-grep \
+'     107:#   over-limit       - the canonical "You'"'"'ve hit your <flavor> limit ·')")" \
+    "absent"
+
+# (15) A markdown bullet quoting the notice in backticks.
+assert_eq "markdown backtick quote of the notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-markdown \
+'     - `You'"'"'ve hit your team'"'"'s shared budget. /model to switch models.`')")" \
+    "absent"
+
+# (16) The filter must not eat a real notice. An INDENTED canonical
+#      notice has no gutter, no quote and no marker, so it still
+#      classifies. Without this the filter could be tightened into a
+#      detector that rejects everything and every assertion above would
+#      still pass.
+assert_eq "indented canonical notice still over-limit (filter is not a blanket reject)" \
+    "$(b2_state "$(b2_make canon-indented \
+"        You've hit your weekly limit · resets 3am (America/Los_Angeles)")")" \
+    "over-limit"
+
 # ---- phase C: the watcher's HOLD — gate closes on the detected status ------
 # Source the production _over_limit.sh at its unit seam: record what the
 # probe saw, exactly as _over_limit_scan_panes would, and assert the
