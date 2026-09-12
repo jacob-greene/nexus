@@ -108,26 +108,6 @@ the PR — not posture, output.
 
 ## Opening the self-fix PR — base the default branch, gated merge
 
-Once the four checks pass and you have a fix, open the PR
-against the **remote's default branch** — the `$BASE` resolved
-in check 1 — never a branch you assumed:
-
-```bash
-ng pr create --base "$BASE" …        # or: gh pr create --base "$BASE" …
-```
-
-Guessing the base is not a cosmetic error. `--base dev` against
-a fork that has no `dev` branch makes the PR **unopenable**, and
-every agent that follows the instruction burns a cycle
-rediscovering that. Confirm the branch exists before you rely on
-it: `git ls-remote --heads origin`.
-
-On a fork whose default is an integration branch (`dev`, and
-`main` promoted from it on a separate operator-gated soak),
-basing on the default branch is also what keeps a self-fix from
-jumping the integration step. Either way the rule is the same —
-resolve, don't assume.
-
 ### Pushing the branch first — the bot token carries the transport
 
 You cannot open the PR until the branch is on the remote, and in a
@@ -156,6 +136,28 @@ not touch it. This is therefore not a breach of the bot-identity
 rule. `nexus.bot`, section "Sandbox exception — push transport when
 there is no user credential", carries the full reasoning and the
 authorship check to run before you commit.
+
+### Opening the PR — base the default branch
+
+Once the four checks pass and you have a fix, open the PR
+against the **remote's default branch** — the `$BASE` resolved
+in check 1 — never a branch you assumed:
+
+```bash
+ng pr create --base "$BASE" …        # or: gh pr create --base "$BASE" …
+```
+
+Guessing the base is not a cosmetic error. `--base dev` against
+a fork that has no `dev` branch makes the PR **unopenable**, and
+every agent that follows the instruction burns a cycle
+rediscovering that. Confirm the branch exists before you rely on
+it: `git ls-remote --heads origin`.
+
+On a fork whose default is an integration branch (`dev`, and
+`main` promoted from it on a separate operator-gated soak),
+basing on the default branch is also what keeps a self-fix from
+jumping the integration step. Either way the rule is the same —
+resolve, don't assume.
 
 **Do NOT merge your own self-fix PR.** The merge is gated, not
 autonomous. After opening the PR, wait for an
