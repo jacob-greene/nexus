@@ -734,6 +734,24 @@ All written to `monitor/.state/action-log.jsonl`:
 - `skeptic-escalate` — issues persist at the depth cap; operator needed.
 - `skeptic-nudge` — a worker was nudged about pending requests.
 
+**The action log is BOUNDED telemetry, not a durable record.** Do not
+treat a `skeptic-` event as evidence that will still exist later. The
+watcher rotates `action-log.jsonl` once it reaches
+`monitor.state_log_max_bytes` (default **10485760 bytes**,
+`monitor/watcher/_config.sh:371`), then deletes rotated archives older
+than `monitor.diff_retention_days` (default **7 days**,
+`monitor/watcher/_config.sh:31`). Both steps run in
+`_prune_rotate_if_oversized` (`monitor/watcher/main.sh:2267`, called for
+the action log at `monitor/watcher/main.sh:2455`). So a `skeptic-request`
+event is erasable within 7 days of a rotation.
+
+The pending marker is what persists, and no gate reads the action log in
+its place. Two consequences. An audit that asks "was a skeptic ever
+required for this window?" from the action log alone can get a false no.
+And a tool that clears a pending marker on the strength of a logged
+event, instead of on a verdict, destroys the only remaining record that
+the validation never happened (`#202`).
+
 The `skeptic-pending` markers under `monitor/.state/skeptic/pending/`
 are the orchestrator's gate: a window with a pending marker has produced
 a result that has **not yet** been validated. The gate is **enforced in
