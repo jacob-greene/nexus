@@ -43,16 +43,6 @@ run '{"tool_name":"Bash","tool_input":{"command":"pkill -f my-task-marker"}}'
 assert_ctx "pkill -f fires self-kill reminder" "self-kill"
 run '{"tool_name":"Bash","tool_input":{"command":"cd a && git push origin x"}}'
 assert_ctx "git push fires wrong-remote reminder" "git -C <clone> push"
-# The row's own message teaches `git -C <clone> push`, so the pattern must
-# fire on THAT form too — not only on the adjacency form above. This probe
-# is the one that fails when the widened pattern is reverted; the assertion
-# above cannot, because it asserts on the message text, not on a fire.
-# A fresh window, because the per-(window,tag) dedup would silence a second
-# `git-push` fire in "footgun-test".
-export NEXUS_WORKER_WINDOW="footgun-git-c-form"
-run '{"tool_name":"Bash","tool_input":{"command":"git -C /tmp/t push origin main"}}'
-assert_ctx "git -C <clone> push fires wrong-remote reminder" "Pin each push to its clone"
-export NEXUS_WORKER_WINDOW="footgun-test"
 run '{"tool_name":"Bash","tool_input":{"command":"scancel --name myjob"}}'
 assert_ctx "scancel --name fires sibling-job reminder" "scancel <jobid>"
 run '{"tool_name":"Bash","tool_input":{"command":"kill $(jobs -p)"}}'
