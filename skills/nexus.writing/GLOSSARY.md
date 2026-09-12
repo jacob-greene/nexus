@@ -56,6 +56,9 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | hook stamp | the JSON file a Claude Code hook writes when a turn fails on a rate limit, naming the window and its reset |
 | reset_at token | the single-token reset time the detector extracts from a limit notice, for example `3am_America/Los_Angeles` |
 | provenance filter | the step that drops scan-window rows that are quoted source text rather than a painted notice |
+| fixture | a recorded pane capture that a test replays in place of a live tmux pane |
+| tracked fixture | a fixture committed to the repository, so its absence is a broken checkout and never a normal condition |
+| silent skip | a test the harness does not run, does not count, and does not report, so the suite still reads green |
 
 ## Project terms
 
