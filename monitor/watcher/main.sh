@@ -3988,7 +3988,7 @@ _v2_task_compose_emit() {
             # regression. `rows == 0` with live workers is already covered by
             # the staging-empty branch above.
             if [[ -z "$_fs_rerender" && -n "$full_state_lines" ]]; then
-                local _fs_rows _fs_live _fs_dead _fs_expected _fs_dead_note
+                local _fs_rows _fs_live _fs_dead _fs_dead_rows _fs_expected _fs_dead_note
                 _fs_rows=$(printf '%s\n' "$full_state_lines" | grep -c '^  - ' || true)
                 _fs_live=$(_idle_list_worker_windows 2>/dev/null \
                     | awk -F'\t' 'NF>0 && $1!="" {n++} END {print n+0}')
@@ -4007,14 +4007,40 @@ _v2_task_compose_emit() {
                 _fs_dead=$(_idle_dead_window_pending_count "$now_ts" \
                                "$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)" \
                            2>/dev/null || printf '0')
+                # …but the TOTAL alone is not sufficient, and this is the
+                # case that proves it (found by the depth-1 skeptic on #202,
+                # req-001, reproduced independently before landing this).
+                # The counts CANCEL for the one population #202 is about: a
+                # worker window that closes while holding a pending marker.
+                # `live` falls by one and `dead` rises by one in the same
+                # cycle, so `live + dead` is unchanged and a staged body
+                # still carrying that window's OLD `(active, state=…)` row
+                # reads as consistent. The emit then asserts a window is
+                # active after it is gone, AND hides the dead-window row
+                # that replaced it. At the parent commit `rows > live`
+                # always caught this, so the total-only form was a
+                # REGRESSION of the #14 guarantee, not merely a gap.
+                #
+                # The fix is a name-aware second test: the staged body must
+                # carry exactly `_fs_dead` dead-window rows. In the
+                # cancelling case the body has 0 and the disk has 1, so the
+                # gate fires. Anchored on the rendered row shape, not a bare
+                # substring, so a window whose NAME contains the class
+                # string cannot inflate the count.
+                _fs_dead_rows=$(printf '%s\n' "$full_state_lines" \
+                    | grep -c '^  - .* dead-window-skeptic-pending' || true)
                 [[ "$_fs_rows" =~ ^[0-9]+$ ]] || _fs_rows=0
                 [[ "$_fs_live" =~ ^[0-9]+$ ]] || _fs_live=0
                 [[ "$_fs_dead" =~ ^[0-9]+$ ]] || _fs_dead=0
+                [[ "$_fs_dead_rows" =~ ^[0-9]+$ ]] || _fs_dead_rows=0
                 _fs_expected=$(( _fs_live + _fs_dead ))
                 _fs_dead_note=""
                 (( _fs_dead > 0 )) && _fs_dead_note=" + ${_fs_dead} dead-window marker(s)"
+                (( _fs_dead_rows != _fs_dead )) \
+                    && _fs_dead_note="${_fs_dead_note}, body carries ${_fs_dead_rows}"
                 if (( _fs_rows > _fs_expected )) \
-                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_expected )) ); then
+                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_expected )) ) \
+                   || (( _fs_dead_rows != _fs_dead )); then
                     _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live${_fs_dead_note} (age ${_fs_age}s)"
                 fi
             fi
