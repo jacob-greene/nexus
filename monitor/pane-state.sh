@@ -531,12 +531,28 @@ _over_limit_window() {
 #   1. A line-number gutter — `334 +`, `107:`, `551 +#`. Emitted by the
 #      file-edit diff render, by `Read`, and by `grep -n`. A painted
 #      notice never starts with a line number.
-#   2. A `"` or a backtick BEFORE the headline on the same line — the
-#      shell-assertion and markdown-quote shapes (`echo "You've hit …"`,
-#      `- \`You've hit …\``). The apostrophe in "You've" is deliberately
-#      NOT in that set. A painted notice is not quoted; the API-error
-#      render that phase B of test-realmodel-overlimit.sh exercises
-#      carries no quote before the headline.
+#   2. A quote character BEFORE the headline on the same line — the
+#      shell-assertion and markdown-quote shapes. The class is the
+#      three ASCII quotes: `"`, a backtick, and `'`.
+#
+#      The single quote was added on jacob-greene/nexus#79. PR #174
+#      rewrote the three known single-quoted rows in
+#      `docs/reference/dependency-surface.md` to use backticks, which
+#      closed those three instances but left the CLASS narrow. A
+#      single-quoted notice on a pane whose text this repository did
+#      not author still classified.
+#
+#      WHY THE APOSTROPHE IN "You've" SURVIVES THIS. The rule is
+#      positional, not glyph-based: the prefix `^[^"`']*` cannot cross
+#      a quote character, so the quote the rule matches is always the
+#      FIRST quote on the row, and the headline must start AFTER it.
+#      On a painted notice the first quote IS the apostrophe in
+#      "You've", and no second headline follows it, so the row is
+#      kept. On a quoted source row the first quote is the opening
+#      delimiter and the headline follows, so the row is dropped.
+#      The five true-positive fixtures and the eight over-limit
+#      assertions were measured before and after this widening; all
+#      were unchanged.
 #   3. A bare diff or bullet marker at the start of the line (`+ `,
 #      `- `) — the unquoted diff-render shape.
 #
@@ -546,7 +562,7 @@ _over_limit_window() {
 # anchor comment describes, and it is tracked on jacob-greene/nexus#79.
 _over_limit_drop_quoted_source() {
     grep -vE '^[[:space:]]*[0-9]+[[:space:]]*[:+-]' \
-        | grep -vE '^[^"`]*["`].*You.{0,3}ve (hit|reached) your' \
+        | grep -vE "^[^\"\`']*[\"\`'].*You.{0,3}ve (hit|reached) your" \
         | grep -vE '^[[:space:]]*[-+][[:space:]]'
 }
 
@@ -1608,6 +1624,64 @@ _emit_over_limit_from_stamp() {
     emit over-limit "reset_at=$reset_at"
 }
 
+# Resolve a stamp's own `reset_at` token to an epoch, relative to the
+# instant the stamp was WRITTEN.
+#
+# This deliberately mirrors `_over_limit_reset_at_to_epoch` in
+# `monitor/watcher/_over_limit.sh`. pane-state.sh sources nothing, by
+# design, so the two are separate copies. `test-pane-state.sh` pins
+# them to the same answers over a shared token table, so a change to
+# one that is not made to the other fails the suite.
+#
+# One semantic difference, and it is deliberate. The watcher's copy
+# resolves "3am" against TODAY, because it re-reads a live notice. A
+# stamp can be a day old and its token is a bare wall-clock string with
+# no date, so this copy resolves against the stamp's own `ts`.
+# Resolving a 28h-old stamp against today would name an instant the
+# notice never described. That is the trap the DEADLINE FREEZE guard
+# closes on the watcher side.
+#
+# Prints nothing and returns 1 when the token is missing, is `unknown`,
+# names a timezone that does not resolve, or does not parse. Every one
+# of those cases leaves the TTL as the only bound, which is the
+# behaviour that shipped before.
+_over_limit_stamp_tz_resolves() {
+    local tz="$1" dir
+    [[ -n "$tz" ]] || return 1
+    [[ "$tz" =~ ^[A-Za-z0-9_+/.-]+$ ]] || return 1
+    [[ "$tz" != *..* ]] || return 1
+    dir="${TZDIR:-/usr/share/zoneinfo}"
+    [[ -d "$dir" ]] || return 0
+    [[ -f "$dir/$tz" ]]
+}
+
+_over_limit_stamp_reset_epoch() {
+    local token="$1" ts="$2" time_part tz_part day epoch
+    [[ -n "$token" && "$token" != "unknown" && "$token" != "null" ]] || return 1
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$token" == *_* ]]; then
+        time_part="${token%%_*}"
+        tz_part="${token#*_}"
+    else
+        time_part="$token"
+        tz_part=""
+    fi
+    if [[ -n "$tz_part" ]]; then
+        _over_limit_stamp_tz_resolves "$tz_part" || return 1
+        day=$(TZ="$tz_part" date -d "@$ts" +%Y-%m-%d 2>/dev/null) || return 1
+        [[ -n "$day" ]] || return 1
+        epoch=$(TZ="$tz_part" date -d "$day $time_part" +%s 2>/dev/null)
+    else
+        day=$(date -d "@$ts" +%Y-%m-%d 2>/dev/null) || return 1
+        [[ -n "$day" ]] || return 1
+        epoch=$(date -d "$day $time_part" +%s 2>/dev/null)
+    fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    # The reset named by a notice is always AFTER the notice.
+    (( epoch <= ts )) && epoch=$(( epoch + 86400 ))
+    printf '%d' "$epoch"
+}
+
 # Anti-latch TTL on the hook-written stamp. The stamp's cleanup
 # contract is "the Stop hook on the next successful turn removes it"
 # — but a pane whose settings lost the Stop entry (respawn with stale
@@ -1618,11 +1692,32 @@ _emit_over_limit_from_stamp() {
 # treated as expired — ignored and best-effort deleted, falling
 # through to the renderer detection, which re-detects a GENUINE
 # ongoing suspension from the live pane text.
+#
+# THE STAMP'S OWN `reset_at` IS THE PRIMARY BOUND (jacob-greene/nexus#79).
+# The TTL used to be the only rule, so a stamp whose stated reset had
+# passed an hour ago kept suppressing for the rest of 27h. Measured on
+# 2026-08-24: three stamps all named a 7:10pm reset, all were 27 minutes
+# past it, none expired, and one of the three windows was visibly
+# running a tool call. The TTL is the wrong instrument for that, because
+# it measures the stamp's AGE and the question is whether the suspension
+# the stamp describes is over.
+#
+# Two bounds now, either sufficient:
+#   (a) the stamp's own reset, plus a grace — when `reset_at` parses.
+#   (b) the 27h TTL — the backstop, and the only bound when `reset_at`
+#       is absent, `unknown`, or unparseable.
+#
+# The grace exists because the reset instant is the earliest the pane
+# can resume, not the instant it does. It defaults to 1800s, the same
+# floor the watcher's `_over_limit_grace_default` uses, so both sides of
+# the system forgive the same overrun.
 # Returns 0 when the stamp is expired (caller skips it).
 _over_limit_stamp_expired() {
-    local f="$1" now ts ttl
+    local f="$1" now ts ttl grace token reset_epoch
     ttl="${MONITOR_OVER_LIMIT_STAMP_TTL_SECONDS:-97200}"
     [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=97200
+    grace="${MONITOR_OVER_LIMIT_STAMP_GRACE_SECONDS:-1800}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=1800
     now="${now_override:-$(date +%s)}"
     ts=""
     if command -v jq >/dev/null 2>&1; then
@@ -1634,6 +1729,19 @@ _over_limit_stamp_expired() {
         ts=$(date +%s -r "$f" 2>/dev/null) || ts=""
     fi
     [[ "$ts" =~ ^[0-9]+$ ]] || return 0  # unreadable ⇒ treat as expired (fail open)
+    # (a) The stamp's own stated reset. Same normalisation the emit path
+    #     uses, so both read one token shape.
+    if command -v jq >/dev/null 2>&1; then
+        token=$(jq -r '.reset_at // empty' "$f" 2>/dev/null)
+        if [[ -n "$token" ]] && [[ "$token" != "null" ]]; then
+            token=$(printf '%s' "$token" | tr -d '()' | tr -s '[:space:]' '_' | sed 's/_*$//')
+            token="${token:0:40}"
+            if reset_epoch=$(_over_limit_stamp_reset_epoch "$token" "$ts"); then
+                (( now > reset_epoch + grace )) && return 0
+            fi
+        fi
+    fi
+    # (b) Backstop.
     (( now - ts > ttl ))
 }
 
