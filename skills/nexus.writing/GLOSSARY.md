@@ -59,6 +59,8 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | fixture | a recorded pane capture that a test replays in place of a live tmux pane |
 | tracked fixture | a fixture committed to the repository, so its absence is a broken checkout and never a normal condition |
 | silent skip | a test the harness does not run, does not count, and does not report, so the suite still reads green |
+| mutation arm | one deliberate break of the code under test, run to prove that a stated assertion turns the suite red |
+| landed-mutation proof | a checksum and a diff taken after a mutation and before the suite runs, so a green arm cannot be a mutation that never applied |
 
 ## Project terms
 
