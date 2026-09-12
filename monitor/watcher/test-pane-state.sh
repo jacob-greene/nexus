@@ -34,6 +34,14 @@
 #
 # Run: bash monitor/watcher/test-pane-state.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
+#
+# Skip accounting (jacob-greene/nexus#182). The summary line reports four
+# numbers: pass, fail, skip, missing fixture. A skip is an assertion the
+# environment cannot run, for example when tmux or python3 is absent. A
+# missing fixture is a tracked file absent from the working tree, which is
+# a broken checkout and is always fatal. Set
+# PANE_STATE_ALLOW_MISSING_FIXTURES=1 to exit 0 anyway; the banner then
+# reads PASSED WITH N MISSING FIXTURE(S), never ALL TESTS PASSED.
 
 set -uo pipefail
 
@@ -44,6 +52,50 @@ FIX_DIR="$_test_dir/fixtures"
 
 PASS=0
 FAIL=0
+SKIP=0
+MISSING=0
+MISSING_FIXTURES=()
+
+# WHY THIS EXISTS (jacob-greene/nexus#182):
+#
+#     A fixture guard written as a bare `if [[ -f "$fixture" ]]` with no
+#     `else` runs fewer assertions when the file is gone, prints nothing,
+#     and leaves FAIL at zero. The suite then reports `ALL TESTS PASSED`
+#     at exit 0 on a broken checkout. Measured at 7c2c466: 21 of the 30
+#     tracked fixtures could be deleted one at a time and every run still
+#     exited 0 with that banner. The reported total fell from 144 to as
+#     low as 141 and no line said why.
+#
+#     PR #179 closed the same class at two sites in this file — the
+#     PermissionRequest heartbeat block and the `_over_limit.sh`
+#     sourceability probe. The helpers below close the residue.
+#
+# `need_fixture` is for a TRACKED fixture: a file committed to the repo,
+# whose absence is a broken checkout and never a normal condition. It is
+# always an error. `skip_test` is for an assertion the ENVIRONMENT cannot
+# run (no python3, no tmux) or a fixture deliberately exempt from prefix
+# classification. Those are counted and reported, but are not fatal.
+need_fixture() {
+    local path="$1" label="${2:-dependent assertions not run}" base seen=0 m
+    base=$(basename "$path")
+    [[ -f "$path" ]] && return 0
+    for m in ${MISSING_FIXTURES[@]+"${MISSING_FIXTURES[@]}"}; do
+        [[ "$m" == "$base" ]] && { seen=1; break; }
+    done
+    if (( ! seen )); then
+        MISSING_FIXTURES+=("$base")
+        MISSING=$(( MISSING + 1 ))
+    fi
+    # Printed at EVERY site, so the operator sees each consequence of the
+    # one absence. Counted once, so the summary counts files not sites.
+    printf '  MISSING FIXTURE: %s — %s\n' "$base" "$label" >&2
+    return 1
+}
+
+skip_test() {
+    SKIP=$(( SKIP + 1 ))
+    printf '  SKIP: %s\n' "$1"
+}
 
 assert_state() {
     local fixture="$1" want="$2"
@@ -80,19 +132,75 @@ expected_state_for() {
     esac
 }
 
+# Fixtures deliberately exempt from filename-prefix classification. Their
+# expected state depends on flags the loop below does not pass (--bg-shells,
+# --bg-cpu, --heartbeat-file), so a bare classification would be wrong. Each
+# is asserted in its own flag-specific block further down. Any OTHER
+# unrecognised name is a naming mistake, not an exemption, and must fail:
+# before this list existed, a new fixture with a misspelled prefix was
+# never classified and never reported.
+PREFIX_EXEMPT=(
+    input-text-bare-dim-synthetic.ansi
+    working-background-bgbash-synthetic.ansi
+    working-background-monitor-synthetic.ansi
+    working-background-shell-realfooter.ansi
+    working-background-spurious-shell-footer-synthetic.ansi
+)
+
+prefix_exempt() {
+    local base="$1" e
+    for e in "${PREFIX_EXEMPT[@]}"; do
+        [[ "$e" == "$base" ]] && return 0
+    done
+    return 1
+}
+
 [[ -x "$HELPER" ]] || { echo "helper not executable: $HELPER" >&2; exit 1; }
 [[ -d "$FIX_DIR" ]] || { echo "fixtures dir missing: $FIX_DIR" >&2; exit 1; }
 
+# The classification loop below iterates a GLOB. A tracked fixture that is
+# simply gone is therefore not in the glob: it contributes no assertion and
+# no message, and the reported total falls in silence. Cross-check the glob
+# against the git index first, so an absent tracked fixture is NAMED before
+# anything else runs.
+echo "=== tracked-fixture manifest ==="
+if git -C "$_repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+    _manifest_n=0
+    while IFS= read -r _rel; do
+        [[ -n "$_rel" ]] || continue
+        _manifest_n=$(( _manifest_n + 1 ))
+        need_fixture "$_repo_root/$_rel" "tracked in git, absent from the working tree"
+    done < <(git -C "$_repo_root" ls-files -- 'monitor/watcher/fixtures/*.ansi')
+    if (( _manifest_n > 0 )); then
+        printf '  PASS: %d tracked fixtures in the index, %d absent\n' \
+            "$_manifest_n" "$MISSING"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: git index lists no fixtures under %s\n' \
+            "monitor/watcher/fixtures" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    skip_test "not a git checkout — tracked-fixture manifest not cross-checked"
+fi
+
+echo
 echo "=== fixture classification ==="
 shopt -s nullglob
 fixtures=("$FIX_DIR"/*.ansi)
 (( ${#fixtures[@]} > 0 )) || { echo "no fixtures found" >&2; exit 1; }
 for f in "${fixtures[@]}"; do
     want=$(expected_state_for "$f")
-    [[ -z "$want" ]] && {
-        printf '  SKIP: %s (unrecognised filename prefix)\n' "$(basename "$f")"
+    if [[ -z "$want" ]]; then
+        if prefix_exempt "$(basename "$f")"; then
+            skip_test "$(basename "$f") (no prefix classification; asserted by its flag-specific block)"
+        else
+            printf '  FAIL: %s — unrecognised filename prefix and not on PREFIX_EXEMPT\n' \
+                "$(basename "$f")" >&2
+            FAIL=$(( FAIL + 1 ))
+        fi
         continue
-    }
+    fi
     assert_state "$f" "$want"
 done
 
@@ -220,7 +328,7 @@ echo "=== heartbeat overrides busy-mid-render fixture ==="
 # heartbeat, pane-state has to infer busy from the spinner token
 # counter. With a fresh `idle_prompt` heartbeat, the heartbeat wins.
 mid_render_fixture="$FIX_DIR/busy-mid-render-no-chevron-synthetic.ansi"
-if [[ -f "$mid_render_fixture" ]]; then
+if need_fixture "$mid_render_fixture" "2 heartbeat-override assertions not run"; then
     printf '{"state":"idle_prompt","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
     out=$("$HELPER" --fixture "$mid_render_fixture" --window 9 --name test --active 0 \
                     --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
@@ -256,7 +364,10 @@ echo "=== heartbeat-idle refined by renderer typing (issue #196) ==="
 # only) must NOT refine; a busy heartbeat is untouched.
 typing_fixture="$FIX_DIR/user-typing-synthetic.ansi"
 autosuggest_fixture="$FIX_DIR/autosuggest-merge-win3.ansi"
-if [[ -f "$typing_fixture" && -f "$autosuggest_fixture" ]]; then
+_typing_ok=1
+need_fixture "$typing_fixture" "3 typing-refinement assertions not run" || _typing_ok=0
+need_fixture "$autosuggest_fixture" "3 typing-refinement assertions not run" || _typing_ok=0
+if (( _typing_ok )); then
     printf '{"state":"idle_prompt","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
     out=$("$HELPER" --fixture "$typing_fixture" --window 9 --name test --active 0 \
                     --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
@@ -289,8 +400,6 @@ if [[ -f "$typing_fixture" && -f "$autosuggest_fixture" ]]; then
         printf '  FAIL: busy heartbeat + typing fixture — got=%s want=busy\n' "$got" >&2
         FAIL=$(( FAIL + 1 ))
     fi
-else
-    printf '  SKIP: typing/autosuggest fixtures missing\n'
 fi
 
 echo
@@ -545,6 +654,9 @@ fi
 #     _unstick.sh case B can fire its auto-Enter cascade. Once the
 #     menu is dismissed (no overlay text), the stamp takes over.
 blocked_fixture=$(ls "$FIX_DIR"/blocked-*.ansi 2>/dev/null | head -1)
+# `blocked-*.ansi` is a CLASS, not one tracked path, so this guard cannot
+# name the file it wants. The manifest cross-check above already names any
+# absent member, so an empty class here means every one of them is gone.
 if [[ -n "$blocked_fixture" ]]; then
     out=$("$HELPER" --fixture "$blocked_fixture" --window 9 --name olwin --active 0 \
                     --over-limit-file "$ol_tmp" \
@@ -558,7 +670,8 @@ if [[ -n "$blocked_fixture" ]]; then
         FAIL=$(( FAIL + 1 ))
     fi
 else
-    printf '  SKIP: no blocked-*.ansi fixture available for case-B precedence check\n'
+    printf '  FAIL: no blocked-*.ansi fixture available for the case-B precedence check\n' >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 # 4. Missing over-limit file → fall through to heartbeat / renderer.
@@ -785,7 +898,7 @@ echo
 echo "=== over-limit detection (issue #87) ==="
 # Canonical fixture: emits reset_at=<token> alongside state=over-limit.
 canonical_fixture="$FIX_DIR/over-limit-canonical-synthetic.ansi"
-if [[ -f "$canonical_fixture" ]]; then
+if need_fixture "$canonical_fixture" "the canonical over-limit reset_at assertion not run"; then
     out=$("$HELPER" --fixture "$canonical_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
@@ -799,7 +912,7 @@ fi
 
 # Terse variant: bare time, no timezone parenthetical.
 terse_fixture="$FIX_DIR/over-limit-terse-synthetic.ansi"
-if [[ -f "$terse_fixture" ]]; then
+if need_fixture "$terse_fixture" "the terse over-limit reset_at assertion not run"; then
     out=$("$HELPER" --fixture "$terse_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=11pm' <<<"$out"; then
@@ -821,7 +934,7 @@ fi
 # while reset_at degraded to `unknown`, which drops the watcher's hold
 # from the parsed reset time to its blind 6h fallback.
 pinned_fixture="$FIX_DIR/over-limit-bottom-pinned-input-cc2.1.260.ansi"
-if [[ -f "$pinned_fixture" ]]; then
+if need_fixture "$pinned_fixture" "the cc 2.1.260 bottom-pinned extractor assertion not run"; then
     out=$("$HELPER" --fixture "$pinned_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
@@ -871,7 +984,7 @@ rm -f "$inputrow_typed_tmp"
 # False-positive guard: idle pane whose scrollback contains the canonical
 # text. Detection is anchored to the bottom 15 rows so this MUST emit idle.
 fp_fixture="$FIX_DIR/idle-overlimit-text-in-scrollback-synthetic.ansi"
-if [[ -f "$fp_fixture" ]]; then
+if need_fixture "$fp_fixture" "the scrollback false-positive guard not run"; then
     out=$("$HELPER" --fixture "$fp_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=idle' <<<"$out" && ! grep -q 'state=over-limit' <<<"$out"; then
         printf '  PASS: over-limit text in scrollback does not false-trigger\n'
@@ -1099,7 +1212,7 @@ if command -v python3 >/dev/null 2>&1; then
         printf '  FAIL: zombie claude read as live (got: %s)\n' "$out_z" >&2; FAIL=$(( FAIL + 1 ))
     fi
 else
-    printf '  SKIP: zombie-claude case (python3 unavailable)\n'
+    skip_test "zombie-claude case (python3 unavailable)"
 fi
 
 echo
@@ -1248,7 +1361,7 @@ assert_async_state "--heartbeat-async-staleness 120 allows 85s-old waits" \
 
 # (7) Pane-footer fallback: no heartbeat, but fixture shows `1 monitor`.
 foot_mon_fixture="$FIX_DIR/working-background-monitor-synthetic.ansi"
-if [[ -f "$foot_mon_fixture" ]]; then
+if need_fixture "$foot_mon_fixture" "the footer-fallback monitor assertion (7) not run"; then
     out=$("$HELPER" --fixture "$foot_mon_fixture" \
                     --window 9 --name ftest --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1264,7 +1377,7 @@ if [[ -f "$foot_mon_fixture" ]]; then
 fi
 
 foot_bg_fixture="$FIX_DIR/working-background-bgbash-synthetic.ansi"
-if [[ -f "$foot_bg_fixture" ]]; then
+if need_fixture "$foot_bg_fixture" "the footer-fallback background-bash assertion (7) not run"; then
     out=$("$HELPER" --fixture "$foot_bg_fixture" \
                     --window 9 --name ftest --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1283,7 +1396,7 @@ fi
 #     can't introspect claude's handle list, so 0 there is "no signal"
 #     not "definitely zero"). If the heartbeat lacks a wait and the
 #     footer carries monitor, we still pick working-background.
-if [[ -f "$foot_mon_fixture" ]]; then
+if need_fixture "$foot_mon_fixture" "the heartbeat-zeros-plus-footer assertion (8) not run"; then
     write_async_hb idle_prompt 5 0 0 - '[]'
     out=$("$HELPER" --fixture "$foot_mon_fixture" \
                     --window 9 --name ftest --active 0 \
@@ -1326,7 +1439,7 @@ echo "=== real-footer shell phrasing + bg_cpu scoping (your-org/nexus-code#445) 
 #      running") → working-background. This is the exact form the old
 #      regex missed. Footer fallback (no heartbeat).
 real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
-if [[ -f "$real_foot" ]]; then
+if need_fixture "$real_foot" "2 real-status-line assertions (10, 10b) not run"; then
     out=$("$HELPER" --fixture "$real_foot" \
                     --window 9 --name paperbench --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1415,7 +1528,7 @@ fi
 #       to `idle`. This is the false-positive the operator flagged:
 #       "the regex may match other output in the window".
 spurious_foot="$FIX_DIR/working-background-spurious-shell-footer-synthetic.ansi"
-if [[ -f "$spurious_foot" ]]; then
+if need_fixture "$spurious_foot" "2 spurious-footer override assertions (11b-i, 11b-ii) not run"; then
     # (11b-i) Fallback path (no reliable tree reading): the footer regex
     #         still fires → working-background. Confirms the fragile
     #         fallback is intact for /proc-restricted environments AND
@@ -1491,7 +1604,7 @@ fi
 # (12b) Fallback path (footer-driven, unreliable tree) → the shell-driven
 #       line still carries bg_reliable=0 so the probe keeps legacy behaviour.
 real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
-if [[ -f "$real_foot" ]]; then
+if need_fixture "$real_foot" "the footer-fallback bg_reliable assertion (12b) not run"; then
     out=$("$HELPER" --fixture "$real_foot" \
                     --window 9 --name bgfields-fallback --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1626,7 +1739,7 @@ TMUXSHIM
     cleanup_bogus
     trap - EXIT
 else
-    printf '  SKIP: tmux unavailable — bogus-index fail-loud tests skipped\n'
+    skip_test "tmux unavailable — bogus-index fail-loud tests skipped"
 fi
 
 echo "=== autosuggest ghost is not evidence of an empty child set (#455 follow-up) ==="
@@ -1645,7 +1758,7 @@ echo "=== autosuggest ghost is not evidence of an empty child set (#455 follow-u
 #       14b asserts the converse.
 for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
     gfx="$FIX_DIR/$gf.ansi"
-    [[ -f "$gfx" ]] || continue
+    need_fixture "$gfx" "the ghost-plus-live-child assertion (14a) not run" || continue
     out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-live --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" \
                     --bg-shells 1 --bg-cpu 500 2>&1)
@@ -1664,7 +1777,7 @@ done
 #       genuinely idle, ready-to-paste pane.
 for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
     gfx="$FIX_DIR/$gf.ansi"
-    [[ -f "$gfx" ]] || continue
+    need_fixture "$gfx" "the childless-ghost assertion (14b) not run" || continue
     out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-idle --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" 2>&1)
     if grep -qF 'state=autosuggest-only' <<<"$out"; then
@@ -1799,8 +1912,27 @@ fi
 
 echo
 echo "=== summary ==="
-printf '  %d pass / %d fail\n' "$PASS" "$FAIL"
+printf '  %d pass / %d fail / %d skip / %d missing fixture\n' \
+    "$PASS" "$FAIL" "$SKIP" "$MISSING"
+if (( MISSING > 0 )); then
+    printf '  missing tracked fixtures: %s\n' "${MISSING_FIXTURES[*]}" >&2
+fi
 if (( FAIL > 0 )); then
+    echo "FAIL"
+    exit 1
+fi
+# An absent tracked fixture means assertions did not run. That is never a
+# pass. `PANE_STATE_ALLOW_MISSING_FIXTURES=1` is the explicit opt-in for a
+# caller that knowingly runs against a partial tree; even then the banner
+# changes, so `ALL TESTS PASSED` can never appear over a missing fixture.
+if (( MISSING > 0 )); then
+    if [[ "${PANE_STATE_ALLOW_MISSING_FIXTURES:-0}" == "1" ]]; then
+        printf 'PASSED WITH %d MISSING FIXTURE(S) — PANE_STATE_ALLOW_MISSING_FIXTURES=1\n' \
+            "$MISSING"
+        exit 0
+    fi
+    printf '  FAIL: %d tracked fixture(s) absent — their assertions never ran\n' \
+        "$MISSING" >&2
     echo "FAIL"
     exit 1
 fi
