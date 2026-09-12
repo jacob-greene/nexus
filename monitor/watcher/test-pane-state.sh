@@ -38,8 +38,8 @@
 # Skip accounting (jacob-greene/nexus#182). The summary line reports four
 # numbers: pass, fail, skip, missing fixture. A skip is an assertion the
 # environment cannot run, for example when tmux or python3 is absent. A
-# missing fixture is a tracked file absent from the working tree, which is
-# a broken checkout and is always fatal. Set
+# missing fixture is a file listed in `fixtures/MANIFEST` but absent from
+# the working tree, which is a broken checkout and is always fatal. Set
 # PANE_STATE_ALLOW_MISSING_FIXTURES=1 to exit 0 anyway; the banner then
 # reads PASSED WITH N MISSING FIXTURE(S), never ALL TESTS PASSED.
 
@@ -160,28 +160,61 @@ prefix_exempt() {
 
 # The classification loop below iterates a GLOB. A tracked fixture that is
 # simply gone is therefore not in the glob: it contributes no assertion and
-# no message, and the reported total falls in silence. Cross-check the glob
-# against the git index first, so an absent tracked fixture is NAMED before
-# anything else runs.
+# no message, and the reported total falls in silence. `fixtures/MANIFEST`
+# is the checked-in list of what MUST be there, and this block pins the glob
+# to it in BOTH directions before anything else runs.
+#
+# WHY A FILE AND NOT THE GIT INDEX (#182, skeptic finding 1): an earlier
+# revision of this block read `git ls-files`. That reports a count, it does
+# not pin one. `git rm <fixture>` drops the name from the index and the
+# working tree together, so the count fell from 30 to 29 and agreed with
+# itself; the suite ran one assertion fewer at exit 0 under ALL TESTS
+# PASSED. A tracked manifest cannot be defeated that way, and it needs no
+# git, so an export or a tarball is accounted for too.
 echo "=== tracked-fixture manifest ==="
-if git -C "$_repo_root" rev-parse --git-dir >/dev/null 2>&1; then
-    _manifest_n=0
-    while IFS= read -r _rel; do
-        [[ -n "$_rel" ]] || continue
-        _manifest_n=$(( _manifest_n + 1 ))
-        need_fixture "$_repo_root/$_rel" "tracked in git, absent from the working tree"
-    done < <(git -C "$_repo_root" ls-files -- 'monitor/watcher/fixtures/*.ansi')
-    if (( _manifest_n > 0 )); then
-        printf '  PASS: %d tracked fixtures in the index, %d absent\n' \
-            "$_manifest_n" "$MISSING"
+MANIFEST_FILE="$FIX_DIR/MANIFEST"
+if [[ -f "$MANIFEST_FILE" ]]; then
+    manifest_names=()
+    while IFS= read -r _line; do
+        _line="${_line%%#*}"
+        _line="${_line//[[:space:]]/}"
+        [[ -n "$_line" ]] || continue
+        manifest_names+=("$_line")
+        need_fixture "$FIX_DIR/$_line" "listed in fixtures/MANIFEST, absent from the working tree"
+    done < "$MANIFEST_FILE"
+
+    if (( ${#manifest_names[@]} > 0 )); then
+        printf '  PASS: fixtures/MANIFEST lists %d fixtures\n' "${#manifest_names[@]}"
         PASS=$(( PASS + 1 ))
     else
-        printf '  FAIL: git index lists no fixtures under %s\n' \
-            "monitor/watcher/fixtures" >&2
+        printf '  FAIL: fixtures/MANIFEST lists no fixtures\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # The converse direction. A fixture present on disk but absent from the
+    # manifest is an unreviewed addition: it would be classified by prefix
+    # and then silently forgotten by every check that reads the manifest.
+    shopt -s nullglob
+    _unlisted=()
+    for _f in "$FIX_DIR"/*.ansi; do
+        _b=$(basename "$_f")
+        _known=0
+        for _m in "${manifest_names[@]}"; do
+            [[ "$_m" == "$_b" ]] && { _known=1; break; }
+        done
+        (( _known )) || _unlisted+=("$_b")
+    done
+    if (( ${#_unlisted[@]} == 0 )); then
+        printf '  PASS: every .ansi on disk is listed in fixtures/MANIFEST\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %d fixture(s) on disk but not in fixtures/MANIFEST: %s\n' \
+            "${#_unlisted[@]}" "${_unlisted[*]}" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 else
-    skip_test "not a git checkout — tracked-fixture manifest not cross-checked"
+    printf '  FAIL: fixtures/MANIFEST is missing — the tracked-fixture set cannot be pinned\n' >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 echo

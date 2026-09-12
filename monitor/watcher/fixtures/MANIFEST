@@ -1,0 +1,47 @@
+# Tracked fixture manifest for test-pane-state.sh.
+#
+# WHY A FILE AND NOT THE GIT INDEX (jacob-greene/nexus#182, skeptic finding 1):
+# reading the index reports a count, it does not pin one. `git rm <fixture>`
+# drops the name from the index AND the working tree, so an index-derived
+# count falls from 30 to 29 and agrees with itself. The suite then ran one
+# assertion fewer at exit 0 under ALL TESTS PASSED — the very defect this
+# file exists to close. A tracked manifest cannot be defeated that way:
+# removing a fixture without editing this file fails the suite, and editing
+# this file is a reviewable diff.
+#
+# It also needs no git, so the suite is fully accounted for in an export,
+# a tarball, or any tree with no index.
+#
+# One basename per line. Blank lines and # comments are ignored.
+# Adding a fixture: add its name here in the same commit.
+
+absent-bash-watcher.ansi
+autosuggest-bare-dim-cc2.1.220.ansi
+autosuggest-merge-win3.ansi
+autosuggest-review-win6.ansi
+autosuggest-why-win4.ansi
+blocked-askuq-synthetic.ansi
+blocked-permission-synthetic.ansi
+blocked-ratelimit-synthetic.ansi
+blocked-trust-numbered-cc2.1.220.ansi
+blocked-trust-unnumbered-cc2.1.260.ansi
+busy-encode-win5.ansi
+busy-mid-render-no-chevron-synthetic.ansi
+busy-orchestrator-win1.ansi
+idle-empty-post-turn-realmodel.ansi
+idle-empty-synthetic.ansi
+idle-empty-with-dim-chrome-synthetic.ansi
+idle-overlimit-quoted-source-in-window-synthetic.ansi
+idle-overlimit-text-in-scrollback-synthetic.ansi
+input-text-bare-dim-synthetic.ansi
+over-limit-bottom-pinned-input-cc2.1.260.ansi
+over-limit-canonical-synthetic.ansi
+over-limit-shared-budget-cc2.1.268-synthetic.ansi
+over-limit-terse-synthetic.ansi
+over-limit-weekly-synthetic.ansi
+user-typing-synthetic.ansi
+user-typing-with-autosuggest-tail-synthetic.ansi
+working-background-bgbash-synthetic.ansi
+working-background-monitor-synthetic.ansi
+working-background-shell-realfooter.ansi
+working-background-spurious-shell-footer-synthetic.ansi
