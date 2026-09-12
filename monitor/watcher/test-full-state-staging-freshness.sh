@@ -382,6 +382,96 @@ assert_not_contains "...and does not trigger a re-render" \
     "$(cat "$WORK/err.parked")" "re-rendered inline"
 
 # ===========================================================================
+echo '=== dead-window skeptic-pending rows count as rows (#202) ==='
+
+# `dead-window-skeptic-pending` is the one snapshot row class whose window is
+# NOT in the enumerator — the window is gone, the marker is not. So the
+# invariant this gate checks is `rows == live + dead-window markers`. Read as
+# `rows == live` it would see every emit as stale and re-render inline on each
+# one (the nexus-code#236 cost the fail-safe above exists to avoid).
+mkdir -p "$STATE_DIR/skeptic/pending"
+printf '1' > "$STATE_DIR/skeptic/pending/ghost-w"
+touch -d "@$(( $(date +%s) - 1900800 ))" "$STATE_DIR/skeptic/pending/ghost-w"
+DEAD_ROW='  - ghost-w dead-window-skeptic-pending (marker 1900800s old; skeptic required 1900800s ago; window GONE)'
+WORKER_ROW='  - nuc-arm-scatter (active, state=busy)'
+
+# 2 rows, 1 live window + 1 dead-window marker ⇒ consistent ⇒ served as-is.
+out=$(compose_cycle "$ONE_WORKER" 10 "$DEAD_ROW"$'\n'"$WORKER_ROW" 2>"$WORK/err.dw1")
+assert_contains "the dead-window row is served from staging" "$out" \
+    "ghost-w dead-window-skeptic-pending"
+assert_not_contains "rows == live + dead ⇒ no row-count mismatch" \
+    "$(cat "$WORK/err.dw1")" "snapshot lists"
+assert_not_contains "rows == live + dead ⇒ no inline re-render" \
+    "$(cat "$WORK/err.dw1")" "re-rendered inline"
+
+# Control: drop the dead-window row from the SAME fixture. Now 1 row against
+# 1 live + 1 dead ⇒ the gate must fire, and must name the dead addend.
+out=$(compose_cycle "$ONE_WORKER" 10 "$WORKER_ROW" 2>"$WORK/err.dw2")
+assert_contains "a MISSING dead-window row is caught by the row count" \
+    "$(cat "$WORK/err.dw2")" "snapshot lists 1 window(s), 1 live + 1 dead-window marker(s)"
+assert_contains "the re-render recovers the omitted dead-window row" \
+    "$out" "ghost-w dead-window-skeptic-pending"
+
+# Control in the other direction: with the marker gone, the same 2-row body is
+# one row too many again — the original #14 capture direction.
+rm -f "$STATE_DIR/skeptic/pending/ghost-w"
+out=$(compose_cycle "$ONE_WORKER" 10 "$DEAD_ROW"$'\n'"$WORKER_ROW" 2>"$WORK/err.dw3")
+assert_contains "with no marker on disk, 2 rows vs 1 live still mismatches" \
+    "$(cat "$WORK/err.dw3")" "snapshot lists 2 window(s), 1 live"
+assert_not_contains "…and the reason carries no dead addend" \
+    "$(cat "$WORK/err.dw3")" "dead-window marker(s)"
+assert_not_contains "…and the re-rendered body drops the stale dead-window row" \
+    "$out" "ghost-w"
+
+# ===========================================================================
+echo '=== the cancelling case: a marker-holding window that CLOSED (#202) ==='
+
+# Found by the depth-1 skeptic on #202 (req-001). A total-only invariant
+# (`rows == live + dead`) MASKS this case, which is the exact population #202
+# is about: a worker window closes while holding a pending marker, so `live`
+# falls by one and `dead` rises by one in the same cycle. The total is
+# unchanged, and a staged body still carrying that window's OLD
+# `(active, state=…)` row reads as consistent. The emit then asserts a window
+# is active after it is gone AND hides the dead-window row that replaced it.
+# At the parent commit `rows > live` always caught this, so a total-only form
+# is a REGRESSION of the #14 guarantee, not merely a gap. The name-aware test
+# (`dead rows in body == dead markers on disk`) is what closes it.
+mkdir -p "$STATE_DIR/skeptic/pending"
+printf '1' > "$STATE_DIR/skeptic/pending/nuc-arm-scatter"
+
+out=$(compose_cycle "$RESERVED_ONLY" 10 "$STALE_BODY" 2>"$WORK/err.mask")
+assert_contains "the cancelling case is CAUGHT, not masked" \
+    "$(cat "$WORK/err.mask")" "snapshot lists 1 window(s), 0 live + 1 dead-window marker(s), body carries 0"
+assert_not_contains "the closed window is no longer served as active" \
+    "$out" "nuc-arm-scatter (active, state=busy)"
+assert_contains "the dead-window row that replaced it IS served" \
+    "$out" "nuc-arm-scatter dead-window-skeptic-pending"
+
+# Control, the other direction: a staged dead-window row whose marker has since
+# been resolved must also re-render, or the emit keeps claiming an unvalidated
+# result that is now validated.
+rm -f "$STATE_DIR/skeptic/pending/nuc-arm-scatter"
+DEAD_ONLY='  - nuc-arm-scatter dead-window-skeptic-pending (marker 900s old; window GONE)'
+out=$(compose_cycle "$RESERVED_ONLY" 10 "$DEAD_ONLY" 2>"$WORK/err.mask2")
+assert_contains "a resolved marker with a stale dead row re-renders" \
+    "$(cat "$WORK/err.mask2")" "body carries 1"
+assert_not_contains "the stale dead-window row is dropped" \
+    "$out" "nuc-arm-scatter"
+
+# Control, the silent case: body and disk agree on BOTH counts ⇒ no re-render.
+# Without this arm the two assertions above could pass on a gate that fires
+# unconditionally.
+printf '1' > "$STATE_DIR/skeptic/pending/ghost-w"
+AGREE_BODY='  - ghost-w dead-window-skeptic-pending (marker 900s old; window GONE)
+  - nuc-arm-scatter (active, state=busy)'
+out=$(compose_cycle "$ONE_WORKER" 10 "$AGREE_BODY" 2>"$WORK/err.mask3")
+assert_not_contains "1 live + 1 dead, body carries both ⇒ gate silent" \
+    "$(cat "$WORK/err.mask3")" "snapshot lists"
+assert_contains "…and the agreeing body is served unchanged" \
+    "$out" "ghost-w dead-window-skeptic-pending"
+rm -f "$STATE_DIR/skeptic/pending/ghost-w"
+
+# ===========================================================================
 echo '=== provenance footer ==='
 
 # Age slack again (staged 120s can read back as 121s); the shape is what is

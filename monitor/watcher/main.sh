@@ -3988,15 +3988,60 @@ _v2_task_compose_emit() {
             # regression. `rows == 0` with live workers is already covered by
             # the staging-empty branch above.
             if [[ -z "$_fs_rerender" && -n "$full_state_lines" ]]; then
-                local _fs_rows _fs_live
+                local _fs_rows _fs_live _fs_dead _fs_dead_rows _fs_expected _fs_dead_note
                 _fs_rows=$(printf '%s\n' "$full_state_lines" | grep -c '^  - ' || true)
                 _fs_live=$(_idle_list_worker_windows 2>/dev/null \
                     | awk -F'\t' 'NF>0 && $1!="" {n++} END {print n+0}')
+                # Dead-window skeptic-pending rows (#202) are the one row
+                # class the snapshot prints for a window the enumerator
+                # CANNOT produce — the window is gone, the marker is not.
+                # They belong in the expected row count, so the invariant is
+                # `rows == live + dead`, not `rows == live`. Omitting the
+                # addend would read EVERY emit as stale and re-render
+                # inline on each one — the nexus-code#236 cost this check's
+                # own fail-safe exists to avoid. Cheap for the same reason
+                # `_fs_live` is: one directory glob plus one action-log grep
+                # per marker, and no pane probes. The full tmux window list
+                # (not the worker subset) is the right liveness set here: an
+                # infra or orchestrator window that still exists is live.
+                _fs_dead=$(_idle_dead_window_pending_count "$now_ts" \
+                               "$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)" \
+                           2>/dev/null || printf '0')
+                # …but the TOTAL alone is not sufficient, and this is the
+                # case that proves it (found by the depth-1 skeptic on #202,
+                # req-001, reproduced independently before landing this).
+                # The counts CANCEL for the one population #202 is about: a
+                # worker window that closes while holding a pending marker.
+                # `live` falls by one and `dead` rises by one in the same
+                # cycle, so `live + dead` is unchanged and a staged body
+                # still carrying that window's OLD `(active, state=…)` row
+                # reads as consistent. The emit then asserts a window is
+                # active after it is gone, AND hides the dead-window row
+                # that replaced it. At the parent commit `rows > live`
+                # always caught this, so the total-only form was a
+                # REGRESSION of the #14 guarantee, not merely a gap.
+                #
+                # The fix is a name-aware second test: the staged body must
+                # carry exactly `_fs_dead` dead-window rows. In the
+                # cancelling case the body has 0 and the disk has 1, so the
+                # gate fires. Anchored on the rendered row shape, not a bare
+                # substring, so a window whose NAME contains the class
+                # string cannot inflate the count.
+                _fs_dead_rows=$(printf '%s\n' "$full_state_lines" \
+                    | grep -c '^  - .* dead-window-skeptic-pending' || true)
                 [[ "$_fs_rows" =~ ^[0-9]+$ ]] || _fs_rows=0
                 [[ "$_fs_live" =~ ^[0-9]+$ ]] || _fs_live=0
-                if (( _fs_rows > _fs_live )) \
-                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_live )) ); then
-                    _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live (age ${_fs_age}s)"
+                [[ "$_fs_dead" =~ ^[0-9]+$ ]] || _fs_dead=0
+                [[ "$_fs_dead_rows" =~ ^[0-9]+$ ]] || _fs_dead_rows=0
+                _fs_expected=$(( _fs_live + _fs_dead ))
+                _fs_dead_note=""
+                (( _fs_dead > 0 )) && _fs_dead_note=" + ${_fs_dead} dead-window marker(s)"
+                (( _fs_dead_rows != _fs_dead )) \
+                    && _fs_dead_note="${_fs_dead_note}, body carries ${_fs_dead_rows}"
+                if (( _fs_rows > _fs_expected )) \
+                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_expected )) ) \
+                   || (( _fs_dead_rows != _fs_dead )); then
+                    _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live${_fs_dead_note} (age ${_fs_age}s)"
                 fi
             fi
             # Provenance carried to _compose_report_body's section footer.
