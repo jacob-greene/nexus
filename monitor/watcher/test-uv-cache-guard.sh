@@ -14,8 +14,13 @@
 # same `uv` command then succeeds. Tests (3)-(5) are the controls: the guard
 # must be a no-op on a healthy link, on a real directory, and on an absent path.
 #
-# Everything is hermetic under a mktemp -d sandbox. Nothing touches the live
-# `locals/` tree.
+# This suite is NOT fully hermetic, and it cannot be. Nothing touches the live
+# `locals/` tree, and almost everything lives under a `mktemp -d` sandbox. But
+# arms (7), (8) and (18) must name paths at the FILESYSTEM ROOT by
+# construction — see the ROOT_FIXTURES block below for why no `mktemp`
+# directory can express those shapes. Those three paths carry this run's own
+# PID, so two concurrent runs cannot share one, and the cleanup removes only
+# paths that carry this run's tag.
 #
 # Run: bash monitor/watcher/test-uv-cache-guard.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
@@ -27,7 +32,25 @@ GUARD="$_test_dir/../uv-cache-guard.sh"
 RECOVER="$_test_dir/../bootstrap-recover.sh"
 LABSH="$_test_dir/../labsh-supervised.sh"
 
-[[ -r "$GUARD" ]] || { echo "FAIL: $GUARD missing" >&2; echo FAILED; exit 1; }
+# Preconditions FAIL the suite; they never shrink it.
+#
+# Arms (13) and (14) used to be wrapped in `if command -v uv` and
+# `if [[ -r "$LABSH" ]]`. A missing tool or an unreadable consumer then removed
+# five assertions and the suite still printed ALL TESTS PASSED and exited 0.
+# Measured: 45 passed, 0 failed with `uv` off PATH, against 50 with it. Arm
+# (13) is the arm this header calls decisive, and arm (14) emitted nothing at
+# all. That is a silent skip: a test the harness does not run, does not count,
+# and does not report, so the suite still reads green.
+#
+# So every precondition is checked ONCE, here, and a missing one is a loud
+# failure. The assertion count is then constant, which is what makes the
+# expected-total tripwire at the foot of this file meaningful.
+_precondition_failed() { printf 'FAIL: precondition — %s\n' "$1" >&2; echo FAILED; exit 1; }
+[[ -r "$GUARD" ]]   || _precondition_failed "$GUARD is missing or unreadable"
+[[ -r "$RECOVER" ]] || _precondition_failed "$RECOVER is missing or unreadable; arms (11) and (12) need it"
+[[ -r "$LABSH" ]]   || _precondition_failed "$LABSH is missing or unreadable; arm (14) needs it"
+command -v uv >/dev/null 2>&1 \
+    || _precondition_failed "uv is not on PATH; arm (13), the decisive end-to-end arm, needs it"
 
 PASS=0
 FAIL=0
@@ -42,24 +65,41 @@ WORK=$(mktemp -d -t nexus-uv-cache-guard-XXXXXX)
 
 # Root-level fixtures — the one thing here that cannot live under $WORK.
 #
-# Arms (7) and (8) must name paths at the filesystem root by construction:
-# (7) needs a target with a single top-level component, and (8) needs a target
-# whose FIRST component does not exist. Neither shape is expressible under a
-# `mktemp` directory, whose own first component exists.
+# Three arms must name paths at the filesystem root by construction:
 #
-# The root is writable in this sandbox, so a REGRESSION under test can create
-# these paths. A survivor is worse than the regression: the next run of the
-# suite then fails arm (7) or arm (8) against CORRECT code, and the failure
-# points at the guard. Remove them before the arms run and again on exit, by
-# exact literal name.
-ROOT_FIXTURES=(/nexus-uv-cache-should-not-exist /nexus-no-such-mount-98)
+#   | Arm  | Shape it needs                    | Why $WORK cannot express it        |
+#   |------|-----------------------------------|------------------------------------|
+#   | (7)  | one component, must NOT exist     | a $WORK path has >= 3 components   |
+#   | (8)  | first component must NOT exist    | $WORK's first component exists     |
+#   | (18) | one component, must EXIST         | a $WORK path has >= 3 components   |
+#
+# The root is writable in this sandbox, and several clones of this branch live
+# on this host, so these paths are shared state in both directions.
+#
+#   * FALSE FAILURE. A regression under test creates the path, the old cleanup
+#     removed only the `mktemp` directory, and the survivor then failed arm (7)
+#     or arm (8) against CORRECT code on the next run.
+#   * FALSE PASS, which is worse. Two runs that share a name let one run's
+#     cleanup remove a path while the other run's arm is asserting on it. A
+#     negative control — a mutation arm that must turn the suite red — then
+#     PASSES against BROKEN code, and the verification record is worthless.
+#
+# A per-run unique name removes the sharing that both directions need. Each
+# name carries this run's PID, which is unique among concurrently live
+# processes, so no two concurrent runs can collide. The remover additionally
+# refuses any path that does not carry this run's own tag, so a bug above can
+# never delete another run's fixture or an unrelated root-level path.
+ROOT_TAG="nexus-uv-cache-guard-$$"
+ROOT_ABSENT="/$ROOT_TAG-absent"      # arm (7)
+ROOT_NOMOUNT="/$ROOT_TAG-nomount"    # arm (8)
+ROOT_PRESENT="/$ROOT_TAG-present"    # arm (18)
+ROOT_FIXTURES=("$ROOT_ABSENT" "$ROOT_NOMOUNT" "$ROOT_PRESENT")
 clean_root_fixtures() {
     local p
     for p in "${ROOT_FIXTURES[@]}"; do
-        # Hard-pin the literals so a later edit of the array above can never
-        # turn this into an arbitrary `rm -rf` at the filesystem root.
+        # Owner check. Only this run's own three names are removable.
         case "$p" in
-            /nexus-uv-cache-should-not-exist|/nexus-no-such-mount-98) : ;;
+            "/$ROOT_TAG-absent"|"/$ROOT_TAG-nomount"|"/$ROOT_TAG-present") : ;;
             *) continue ;;
         esac
         [[ -e "$p" || -L "$p" ]] || continue
@@ -68,11 +108,11 @@ clean_root_fixtures() {
 }
 trap 'rm -rf "$WORK"; clean_root_fixtures' EXIT
 
-# Pre-flight. A stale fixture here is contamination from an earlier run, not a
-# defect in the guard, so say so loudly before it can be misread as one.
+# Pre-flight. A path carrying THIS run's tag can only survive from a crashed
+# run whose PID has since been reused. Say so, then clear it.
 for _rf in "${ROOT_FIXTURES[@]}"; do
     [[ -e "$_rf" || -L "$_rf" ]] \
-        && echo "NOTE: removing a stale root-level fixture left by an earlier run: $_rf" >&2
+        && echo "NOTE: clearing a path left by a crashed run that held this PID: $_rf" >&2
 done
 clean_root_fixtures
 
@@ -153,27 +193,25 @@ assert_eq "(6) relative body, foreign cwd -> exit 10" "$rc" "10"
     || bad "(6) relative body" "the guard created a directory under the cwd"
 
 # ---- (7) REFUSE: a single top-level component is not a plausible cache -----
-# This arm exists to pin the target-plausibility rule, and it must pin THAT
-# rule and no other. Exit 2 alone cannot do that: the guard has five refusal
-# branches and they all return 2.
+# This arm pins the target-plausibility rule, and it must pin THAT rule and no
+# other. Exit 2 alone cannot do that: the guard has five refusal branches and
+# they all return 2.
 #
-# A different fixture cannot do it either. The plausibility rule refuses a
-# target with fewer than two path components. Any such target that reaches the
-# rule is guaranteed to be absent — the guard returns 0 earlier when the link
-# resolves — and the only ancestor of an absent `/x` is `/`, so the
-# nearest-ancestor rule below would refuse the identical fixture for its own
-# reason. The plausibility rule's input set is therefore a strict subset of
-# the ancestor rule's, and no fixture separates them.
+# For THIS arm's fixture — a single-component target that does not exist — the
+# nearest-ancestor rule below would refuse the identical input for its own
+# reason, because the only ancestor of an absent `/x` is `/`. So exit 2 here is
+# not attributable, and this arm attributes by MESSAGE: it requires the text
+# this rule alone emits, and requires the next rule's text to be absent.
 #
-# So the isolation is the MESSAGE, not the fixture: assert the text this rule
-# alone emits, and assert the next rule's text is absent. Delete the
-# plausibility rule and this arm turns red because the ancestor rule answers
-# instead, which is the reason the arm states.
+# That is an attribution, not a boundary. This arm pins ONE fixture's answer.
+# Widen the rule outside that fixture and this arm stays green. Arm (18) is the
+# arm that pins the rule's BEHAVIOUR, on a fixture the ancestor rule cannot
+# refuse — read its header for why such a fixture exists.
 c7="$WORK/c7"; mkdir -p "$c7/locals/uv"
-ln -s "/nexus-uv-cache-should-not-exist" "$c7/locals/uv/cache"
+ln -s "$ROOT_ABSENT" "$c7/locals/uv/cache"
 rc=$(run_guard "$c7/locals/uv/cache" "$WORK/c7.err")
 assert_eq "(7) single top-level target -> exit 2 (refused)" "$rc" "2"
-[[ ! -e "/nexus-uv-cache-should-not-exist" ]] \
+[[ ! -e "$ROOT_ABSENT" ]] \
     && ok "(7) refused without creating anything at /" \
     || bad "(7) refusal" "the guard created a top-level directory"
 grep -q "not a plausible cache path" "$WORK/c7.err" \
@@ -186,13 +224,16 @@ grep -q "no existing ancestor" "$WORK/c7.err" \
 # ---- (8) REFUSE: no existing ancestor below / ------------------------------
 # Models an unmounted scratch filesystem. Creating the tree would shadow the
 # mountpoint with a directory on the root filesystem and hide the real fault.
+#
+# Like arm (7), this arm pins ONE fixture's answer, not the rule's boundary.
+# Narrow the rule outside this fixture and the arm stays green.
 c8="$WORK/c8"; mkdir -p "$c8/locals/uv"
-ln -s "/nexus-no-such-mount-98/group/user/nexus-uv-cache" "$c8/locals/uv/cache"
+ln -s "$ROOT_NOMOUNT/group/user/nexus-uv-cache" "$c8/locals/uv/cache"
 rc=$(run_guard "$c8/locals/uv/cache" "$WORK/c8.err")
 assert_eq "(8) unmounted-looking target -> exit 2 (refused)" "$rc" "2"
-[[ ! -e "/nexus-no-such-mount-98" ]] \
+[[ ! -e "$ROOT_NOMOUNT" ]] \
     && ok "(8) refused without creating a shadow mountpoint" \
-    || bad "(8) refusal" "the guard created /nexus-no-such-mount-98"
+    || bad "(8) refusal" "the guard created $ROOT_NOMOUNT"
 # Attribute the refusal to the nearest-ancestor rule, for the same reason
 # arm (7) attributes its own: five branches return 2, so the exit code alone
 # does not say which rule answered.
@@ -287,116 +328,110 @@ grep -q "uv cache: repaired" <<<"$real_out" \
     || bad "(12) recover log" "output: $real_out"
 
 # ---- (13) THE PROOF: real uv fails, then recovers --------------------------
-if command -v uv >/dev/null 2>&1; then
-    c13="$WORK/c13"; mkdir -p "$c13/locals/uv" "$c13/scratch"
-    ln -s "$c13/scratch/nexus-uv-cache" "$c13/locals/uv/cache"
+c13="$WORK/c13"; mkdir -p "$c13/locals/uv" "$c13/scratch"
+ln -s "$c13/scratch/nexus-uv-cache" "$c13/locals/uv/cache"
 
-    before=$(UV_CACHE_DIR="$c13/locals/uv/cache" uv venv "$c13/venv-before" 2>&1)
-    before_rc=$?
-    if (( before_rc != 0 )); then
-        ok "(13) real uv FAILS against the dangling symlink (rc=$before_rc)"
-    else
-        bad "(13) reproduction" "uv unexpectedly succeeded; the fault was not reproduced"
-    fi
-    grep -qF "File exists (os error 17)" <<<"$before" \
-        && ok "(13) uv reports the incident's exact error: File exists (os error 17)" \
-        || bad "(13) error text" "got: $before"
-
-    rc=$(run_guard "$c13/locals/uv/cache" "$WORK/c13.err")
-    assert_eq "(13) guard repairs it -> exit 10" "$rc" "10"
-
-    after=$(UV_CACHE_DIR="$c13/locals/uv/cache" uv venv "$c13/venv-after" 2>&1)
-    after_rc=$?
-    if (( after_rc == 0 )); then
-        ok "(13) the SAME uv command now SUCCEEDS (rc=0)"
-    else
-        bad "(13) recovery" "uv still fails after the guard: $after"
-    fi
-    [[ -f "$c13/locals/uv/cache/CACHEDIR.TAG" ]] \
-        && ok "(13) uv populated the cache through the repaired symlink" \
-        || bad "(13) cache population" "no CACHEDIR.TAG under the cache path"
+before=$(UV_CACHE_DIR="$c13/locals/uv/cache" uv venv "$c13/venv-before" 2>&1)
+before_rc=$?
+if (( before_rc != 0 )); then
+    ok "(13) real uv FAILS against the dangling symlink (rc=$before_rc)"
 else
-    echo "  SKIP: (13) uv end-to-end — no uv on PATH"
+    bad "(13) reproduction" "uv unexpectedly succeeded; the fault was not reproduced"
 fi
+grep -qF "File exists (os error 17)" <<<"$before" \
+    && ok "(13) uv reports the incident's exact error: File exists (os error 17)" \
+    || bad "(13) error text" "got: $before"
+
+rc=$(run_guard "$c13/locals/uv/cache" "$WORK/c13.err")
+assert_eq "(13) guard repairs it -> exit 10" "$rc" "10"
+
+after=$(UV_CACHE_DIR="$c13/locals/uv/cache" uv venv "$c13/venv-after" 2>&1)
+after_rc=$?
+if (( after_rc == 0 )); then
+    ok "(13) the SAME uv command now SUCCEEDS (rc=0)"
+else
+    bad "(13) recovery" "uv still fails after the guard: $after"
+fi
+[[ -f "$c13/locals/uv/cache/CACHEDIR.TAG" ]] \
+    && ok "(13) uv populated the cache through the repaired symlink" \
+    || bad "(13) cache population" "no CACHEDIR.TAG under the cache path"
 
 # ---- (14) labsh-supervised wiring ------------------------------------------
 # The warm-restart path. bootstrap-recover only covers COLD BOOT; this
 # supervisor restarts on its own long after any recovery sweep, and a purge can
 # land in between.
-if [[ -r "$LABSH" ]]; then
-    grep -q 'uv-cache-guard.sh' "$LABSH" \
-        && ok "(14) labsh-supervised sources the guard" \
-        || bad "(14) labsh wiring" "uv-cache-guard.sh is not sourced"
-    grep -q '^repair_uv_cache()' "$LABSH" \
-        && ok "(14) labsh-supervised defines repair_uv_cache" \
-        || bad "(14) labsh wiring" "repair_uv_cache is not defined"
-    # The call must precede `labsh start` inside _start_cycle.
-    call_line=$(grep -n '^ *repair_uv_cache  *#' "$LABSH" | head -1 | cut -d: -f1)
-    start_line=$(grep -n '^ *labsh start --port' "$LABSH" | head -1 | cut -d: -f1)
-    if [[ -n "$call_line" && -n "$start_line" ]] && (( call_line < start_line )); then
-        ok "(14) repair_uv_cache is called before 'labsh start' (line $call_line < $start_line)"
-    else
-        bad "(14) labsh call site" "call=$call_line start=$start_line"
-    fi
+grep -q 'uv-cache-guard.sh' "$LABSH" \
+    && ok "(14) labsh-supervised sources the guard" \
+    || bad "(14) labsh wiring" "uv-cache-guard.sh is not sourced"
+grep -q '^repair_uv_cache()' "$LABSH" \
+    && ok "(14) labsh-supervised defines repair_uv_cache" \
+    || bad "(14) labsh wiring" "repair_uv_cache is not defined"
+# The call must precede `labsh start` inside _start_cycle.
+call_line=$(grep -n '^ *repair_uv_cache  *#' "$LABSH" | head -1 | cut -d: -f1)
+start_line=$(grep -n '^ *labsh start --port' "$LABSH" | head -1 | cut -d: -f1)
+if [[ -n "$call_line" && -n "$start_line" ]] && (( call_line < start_line )); then
+    ok "(14) repair_uv_cache is called before 'labsh start' (line $call_line < $start_line)"
+else
+    bad "(14) labsh call site" "call=$call_line start=$start_line"
+fi
 
-    # EXECUTE the warm-restart consumer, the way arms (11) and (12) execute the
-    # cold-boot one. The three greps above are text-only: replace the body of
-    # `repair_uv_cache` with `rc=0` and all three still pass, so the higher-value
-    # consumer — the one the 2026-08-25 incident burned, because the supervisor
-    # restarts long after any recovery sweep — was pinned by nothing.
-    #
-    # labsh-supervised.sh cannot be sourced: its last lines start the watchdog's
-    # infinite probe loop. So extract the function block and run THAT. The
-    # extracted text is the real body, so a change to the body changes this arm.
-    labsh_fn=$(awk '/^repair_uv_cache\(\) \{/,/^\}/' "$LABSH")
-    if ! grep -q 'nexus_uv_cache_guard' <<<"$labsh_fn"; then
-        bad "(14) repair_uv_cache is executable in isolation" \
-            "could not extract a repair_uv_cache body that calls the guard (renamed or restructured?)"
-    else
-        # The fault: UV_CACHE_DIR points at a dangling symlink, as it does after
-        # a scratch purge, because locals-env.sh points it at locals/uv/cache.
-        c14="$WORK/c14"; mkdir -p "$c14/locals/uv" "$c14/scratch"
-        ln -s "$c14/scratch/nexus-uv-cache" "$c14/locals/uv/cache"
-        labsh_out=$(
-            env -u NEXUS_LOCALS \
-                UV_CACHE_DIR="$c14/locals/uv/cache" \
-                NEXUS_STATE_DIR="$WORK/state14" \
-                PATH="/usr/bin:/bin" \
-                timeout 60 bash -c '
-                    set -uo pipefail
-                    log() { printf "[labsh-svc] %s\n" "$*"; }
-                    source "$1" >/dev/null 2>&1
-                    eval "$2"
-                    repair_uv_cache
-                ' _ "$GUARD" "$labsh_fn" 2>&1
-        )
-        [[ -d "$c14/scratch/nexus-uv-cache" ]] \
-            && ok "(14) repair_uv_cache REPAIRS a dangling uv cache on the warm-restart path" \
-            || bad "(14) warm-restart repair" "the target was not created; output: $labsh_out"
-        grep -q "repaired dangling uv cache symlink" <<<"$labsh_out" \
-            && ok "(14) the warm restart logs the repair under its [labsh-svc] prefix" \
-            || bad "(14) warm-restart log" "output: $labsh_out"
+# EXECUTE the warm-restart consumer, the way arms (11) and (12) execute the
+# cold-boot one. The three greps above are text-only: replace the body of
+# `repair_uv_cache` with `rc=0` and all three still pass, so the higher-value
+# consumer — the one the 2026-08-25 incident burned, because the supervisor
+# restarts long after any recovery sweep — was pinned by nothing.
+#
+# labsh-supervised.sh cannot be sourced: its last lines start the watchdog's
+# infinite probe loop. So extract the function block and run THAT. The
+# extracted text is the real body, so a change to the body changes this arm.
+labsh_fn=$(awk '/^repair_uv_cache\(\) \{/,/^\}/' "$LABSH")
+if ! grep -q 'nexus_uv_cache_guard' <<<"$labsh_fn"; then
+    bad "(14) repair_uv_cache is executable in isolation" \
+        "could not extract a repair_uv_cache body that calls the guard (renamed or restructured?)"
+else
+    # The fault: UV_CACHE_DIR points at a dangling symlink, as it does after
+    # a scratch purge, because locals-env.sh points it at locals/uv/cache.
+    c14="$WORK/c14"; mkdir -p "$c14/locals/uv" "$c14/scratch"
+    ln -s "$c14/scratch/nexus-uv-cache" "$c14/locals/uv/cache"
+    labsh_out=$(
+        env -u NEXUS_LOCALS \
+            UV_CACHE_DIR="$c14/locals/uv/cache" \
+            NEXUS_STATE_DIR="$WORK/state14" \
+            PATH="/usr/bin:/bin" \
+            timeout 60 bash -c '
+                set -uo pipefail
+                log() { printf "[labsh-svc] %s\n" "$*"; }
+                source "$1" >/dev/null 2>&1
+                eval "$2"
+                repair_uv_cache
+            ' _ "$GUARD" "$labsh_fn" 2>&1
+    )
+    [[ -d "$c14/scratch/nexus-uv-cache" ]] \
+        && ok "(14) repair_uv_cache REPAIRS a dangling uv cache on the warm-restart path" \
+        || bad "(14) warm-restart repair" "the target was not created; output: $labsh_out"
+    grep -q "repaired dangling uv cache symlink" <<<"$labsh_out" \
+        && ok "(14) the warm restart logs the repair under its [labsh-svc] prefix" \
+        || bad "(14) warm-restart log" "output: $labsh_out"
 
-        # CONTROL: a healthy cache must not make the supervisor claim a repair.
-        c14b="$WORK/c14b"; mkdir -p "$c14b/locals/uv" "$c14b/scratch/nexus-uv-cache"
-        ln -s "$c14b/scratch/nexus-uv-cache" "$c14b/locals/uv/cache"
-        labsh_out_ok=$(
-            env -u NEXUS_LOCALS \
-                UV_CACHE_DIR="$c14b/locals/uv/cache" \
-                NEXUS_STATE_DIR="$WORK/state14b" \
-                PATH="/usr/bin:/bin" \
-                timeout 60 bash -c '
-                    set -uo pipefail
-                    log() { printf "[labsh-svc] %s\n" "$*"; }
-                    source "$1" >/dev/null 2>&1
-                    eval "$2"
-                    repair_uv_cache
-                ' _ "$GUARD" "$labsh_fn" 2>&1
-        )
-        [[ -z "$labsh_out_ok" ]] \
-            && ok "(14) a healthy cache is a silent no-op on the warm-restart path" \
-            || bad "(14) warm-restart no-op" "output on a healthy cache: $labsh_out_ok"
-    fi
+    # CONTROL: a healthy cache must not make the supervisor claim a repair.
+    c14b="$WORK/c14b"; mkdir -p "$c14b/locals/uv" "$c14b/scratch/nexus-uv-cache"
+    ln -s "$c14b/scratch/nexus-uv-cache" "$c14b/locals/uv/cache"
+    labsh_out_ok=$(
+        env -u NEXUS_LOCALS \
+            UV_CACHE_DIR="$c14b/locals/uv/cache" \
+            NEXUS_STATE_DIR="$WORK/state14b" \
+            PATH="/usr/bin:/bin" \
+            timeout 60 bash -c '
+                set -uo pipefail
+                log() { printf "[labsh-svc] %s\n" "$*"; }
+                source "$1" >/dev/null 2>&1
+                eval "$2"
+                repair_uv_cache
+            ' _ "$GUARD" "$labsh_fn" 2>&1
+    )
+    [[ -z "$labsh_out_ok" ]] \
+        && ok "(14) a healthy cache is a silent no-op on the warm-restart path" \
+        || bad "(14) warm-restart no-op" "output on a healthy cache: $labsh_out_ok"
 fi
 
 # ---- (15) locals-env.sh stays PURE -----------------------------------------
@@ -466,7 +501,82 @@ env -u UV_CACHE_DIR -u NEXUS_LOCALS \
     timeout 60 "$GUARD" "$WORK/c17-absent-path" >/dev/null 2>&1 || c17_rc=$?
 assert_eq "(17) direct execution runs the guard (no 126 Permission denied)" "$c17_rc" "0"
 
+# ---- (18) the plausibility rule has BEHAVIOUR, not only a message ----------
+# Arm (7) attributes a refusal to this rule by its message, because for arm
+# (7)'s fixture the nearest-ancestor rule would refuse the same input anyway.
+# This arm pins the rule by its EXIT CODE, on a fixture the ancestor rule
+# CANNOT refuse. Such a fixture exists, and an earlier version of this suite
+# claimed it could not.
+#
+# It exists because the guard and the kernel disagree about `..`.
+# `_ucg_normalise` resolves `..` LEXICALLY, with no filesystem access, which
+# is deliberate: the target is missing, so no resolving form can work. The
+# KERNEL resolves `..` AFTER symlink resolution. So a link that sits in a
+# directory reached through a symlink, whose relative body ascends past that
+# symlink, hands the guard a target the kernel never resolved.
+#
+# The fixture exploits exactly that divergence:
+#
+#   | Resolver | Target of the link                    | Exists |
+#   |----------|---------------------------------------|--------|
+#   | kernel   | one level under the sandbox's parent  | no     |
+#   | guard    | a one-component path at the root      | YES    |
+#
+# The link therefore still dangles, so the guard still runs. Its computed
+# target has one component, and that component EXISTS — so the nearest
+# existing ancestor is the target itself, and the ancestor rule accepts it.
+# The plausibility rule is the only check left standing.
+#
+# Delete that rule and the guard reports a repair on a root-level directory and
+# records a purge that never happened. That is the behaviour this arm pins.
+c18="$WORK/c18"; mkdir -p "$c18/real/deep"
+ln -s "$c18/real/deep" "$c18/alias"
+mkdir -p "$ROOT_PRESENT"
+# Ascend exactly as many levels as the LOGICAL directory of the link is deep,
+# so the lexical result is $ROOT_PRESENT itself. Derived, never hard-coded,
+# because $WORK's depth depends on $TMPDIR.
+c18_depth=$(awk -F/ '{print NF-1}' <<<"$c18/alias")
+c18_up=$(printf '../%.0s' $(seq 1 "$c18_depth"))
+ln -s "${c18_up}${ROOT_PRESENT#/}" "$c18/alias/cache"
+
+# Shape check first. If either half of the divergence stops holding, this arm
+# must fail loudly rather than pass for the wrong reason.
+[[ -L "$c18/alias/cache" && ! -e "$c18/alias/cache" ]] \
+    && ok "(18) the fixture link dangles, so the guard runs on it" \
+    || bad "(18) fixture shape" "the link does not dangle; the kernel resolved it to $(readlink -m "$c18/alias/cache" 2>/dev/null)"
+
+rc=$(run_guard "$c18/alias/cache" "$WORK/c18.err")
+assert_eq "(18) existing one-component target -> exit 2 (refused)" "$rc" "2"
+grep -qF "$ROOT_PRESENT" "$WORK/c18.err" \
+    && ok "(18) the guard computed the root-level target (the lexical-vs-kernel divergence holds)" \
+    || bad "(18) fixture divergence" "stderr does not name $ROOT_PRESENT: $(cat "$WORK/c18.err")"
+grep -q "no existing ancestor" "$WORK/c18.err" \
+    && bad "(18) rule isolation" "the nearest-ancestor rule answered; this fixture was supposed to defeat it" \
+    || ok "(18) the nearest-ancestor rule CANNOT refuse this fixture (it isolates the plausibility rule)"
+# `run_guard` shares $WORK/state with arms (1)-(10), which legitimately hold
+# two records, so assert on the TARGET rather than on the record count.
+if grep -qF "$ROOT_PRESENT" "$WORK/state/uv-cache-purged.log" 2>/dev/null; then
+    bad "(18) purge record" "the guard recorded a repair of $ROOT_PRESENT, which it must have refused"
+else
+    ok "(18) no purge was recorded for a root-level target"
+fi
+
 # ---- summary ---------------------------------------------------------------
+#
+# EXPECTED_ASSERTIONS is a tripwire against the silent-skip class: a test the
+# harness does not run, does not count, and does not report, so the suite still
+# reads green. Every precondition is checked at the head of this file, so the
+# count is constant on any host that can run the suite at all. Bump this number
+# in the same commit that adds or removes an assertion.
+#
+# Two arms wrap assertions in a conditional and therefore change the total when
+# their branch flips: arm (10) when no purge record was written, and arm (14)
+# when the consumer's function body cannot be extracted. Both branches fail
+# loudly, so they are explanations rather than holes — and this tripwire firing
+# beside them is correct, not noise.
+EXPECTED_ASSERTIONS=55
+_total=$(( PASS + FAIL ))
+assert_eq "(0) the suite ran its full assertion set (no arm vanished)" "$_total" "$EXPECTED_ASSERTIONS"
 
 echo
 printf '=== summary: %d passed, %d failed ===\n' "$PASS" "$FAIL"
