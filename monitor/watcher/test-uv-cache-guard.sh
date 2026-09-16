@@ -39,7 +39,42 @@ assert_eq() {
 }
 
 WORK=$(mktemp -d -t nexus-uv-cache-guard-XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+
+# Root-level fixtures — the one thing here that cannot live under $WORK.
+#
+# Arms (7) and (8) must name paths at the filesystem root by construction:
+# (7) needs a target with a single top-level component, and (8) needs a target
+# whose FIRST component does not exist. Neither shape is expressible under a
+# `mktemp` directory, whose own first component exists.
+#
+# The root is writable in this sandbox, so a REGRESSION under test can create
+# these paths. A survivor is worse than the regression: the next run of the
+# suite then fails arm (7) or arm (8) against CORRECT code, and the failure
+# points at the guard. Remove them before the arms run and again on exit, by
+# exact literal name.
+ROOT_FIXTURES=(/nexus-uv-cache-should-not-exist /nexus-no-such-mount-98)
+clean_root_fixtures() {
+    local p
+    for p in "${ROOT_FIXTURES[@]}"; do
+        # Hard-pin the literals so a later edit of the array above can never
+        # turn this into an arbitrary `rm -rf` at the filesystem root.
+        case "$p" in
+            /nexus-uv-cache-should-not-exist|/nexus-no-such-mount-98) : ;;
+            *) continue ;;
+        esac
+        [[ -e "$p" || -L "$p" ]] || continue
+        rm -rf -- "$p" 2>/dev/null || true
+    done
+}
+trap 'rm -rf "$WORK"; clean_root_fixtures' EXIT
+
+# Pre-flight. A stale fixture here is contamination from an earlier run, not a
+# defect in the guard, so say so loudly before it can be misread as one.
+for _rf in "${ROOT_FIXTURES[@]}"; do
+    [[ -e "$_rf" || -L "$_rf" ]] \
+        && echo "NOTE: removing a stale root-level fixture left by an earlier run: $_rf" >&2
+done
+clean_root_fixtures
 
 # Run the guard as a SUBPROCESS so a `return` cannot leak into this shell and
 # so each case gets a clean environment. Prints the exit code on stdout;
@@ -118,6 +153,22 @@ assert_eq "(6) relative body, foreign cwd -> exit 10" "$rc" "10"
     || bad "(6) relative body" "the guard created a directory under the cwd"
 
 # ---- (7) REFUSE: a single top-level component is not a plausible cache -----
+# This arm exists to pin the target-plausibility rule, and it must pin THAT
+# rule and no other. Exit 2 alone cannot do that: the guard has five refusal
+# branches and they all return 2.
+#
+# A different fixture cannot do it either. The plausibility rule refuses a
+# target with fewer than two path components. Any such target that reaches the
+# rule is guaranteed to be absent — the guard returns 0 earlier when the link
+# resolves — and the only ancestor of an absent `/x` is `/`, so the
+# nearest-ancestor rule below would refuse the identical fixture for its own
+# reason. The plausibility rule's input set is therefore a strict subset of
+# the ancestor rule's, and no fixture separates them.
+#
+# So the isolation is the MESSAGE, not the fixture: assert the text this rule
+# alone emits, and assert the next rule's text is absent. Delete the
+# plausibility rule and this arm turns red because the ancestor rule answers
+# instead, which is the reason the arm states.
 c7="$WORK/c7"; mkdir -p "$c7/locals/uv"
 ln -s "/nexus-uv-cache-should-not-exist" "$c7/locals/uv/cache"
 rc=$(run_guard "$c7/locals/uv/cache" "$WORK/c7.err")
@@ -125,9 +176,12 @@ assert_eq "(7) single top-level target -> exit 2 (refused)" "$rc" "2"
 [[ ! -e "/nexus-uv-cache-should-not-exist" ]] \
     && ok "(7) refused without creating anything at /" \
     || bad "(7) refusal" "the guard created a top-level directory"
-grep -q "REFUSING" "$WORK/c7.err" \
-    && ok "(7) refusal says why on stderr" \
-    || bad "(7) refusal message" "stderr: $(cat "$WORK/c7.err")"
+grep -q "not a plausible cache path" "$WORK/c7.err" \
+    && ok "(7) the PLAUSIBILITY rule is the rule that refused (its own message)" \
+    || bad "(7) plausibility rule" "the plausibility message is absent; stderr: $(cat "$WORK/c7.err")"
+grep -q "no existing ancestor" "$WORK/c7.err" \
+    && bad "(7) rule attribution" "the nearest-ancestor rule answered, so the plausibility rule did not fire" \
+    || ok "(7) the nearest-ancestor rule did not answer for it (attribution is unambiguous)"
 
 # ---- (8) REFUSE: no existing ancestor below / ------------------------------
 # Models an unmounted scratch filesystem. Creating the tree would shadow the
@@ -139,6 +193,12 @@ assert_eq "(8) unmounted-looking target -> exit 2 (refused)" "$rc" "2"
 [[ ! -e "/nexus-no-such-mount-98" ]] \
     && ok "(8) refused without creating a shadow mountpoint" \
     || bad "(8) refusal" "the guard created /nexus-no-such-mount-98"
+# Attribute the refusal to the nearest-ancestor rule, for the same reason
+# arm (7) attributes its own: five branches return 2, so the exit code alone
+# does not say which rule answered.
+grep -q "no existing ancestor" "$WORK/c8.err" \
+    && ok "(8) the NEAREST-ANCESTOR rule is the rule that refused (its own message)" \
+    || bad "(8) ancestor rule" "the ancestor message is absent; stderr: $(cat "$WORK/c8.err")"
 
 # ---- (9) REFUSE: a symlink cycle terminates ---------------------------------
 c9="$WORK/c9"; mkdir -p "$c9"
@@ -166,17 +226,29 @@ grep -q "WARNING" "$WORK/c1.err" \
 # ---- (11) bootstrap-recover wiring: --dry-run writes NOTHING ---------------
 # boot-recover.sh runs `--dry-run` as a health probe, so it must stay
 # side-effect-free.
+#
+# Arms (11) and (12) deliberately inherit the AMBIENT PATH — that is how they
+# reach the real `sandbox-notify`, and reaching it is what exposed the
+# unbounded bell that arm (16) now pins. An unbounded bell therefore HANGS
+# these two arms. A hang is not a failure: the suite never reaches its
+# summary, and arm (16), the arm written for exactly that regression, is never
+# reached. So bound the invocation here too. A lost bound then fails the
+# suite, with a named reason, instead of stalling it.
 c11="$WORK/c11"; mkdir -p "$c11/locals/uv" "$c11/scratch"
 ln -s "$c11/scratch/nexus-uv-cache" "$c11/locals/uv/cache"
+dry_rc=0
 dry_out=$(
     env -u UV_CACHE_DIR NEXUS_LOCALS="$c11/locals" NEXUS_STATE_DIR="$WORK/state11" \
-        bash -c '
+        timeout 60 bash -c '
             set -uo pipefail
             source "$1" >/dev/null 2>&1
             DRY_RUN=1
             _recover_uv_cache_guard
         ' _ "$RECOVER" 2>&1
-)
+) || dry_rc=$?
+(( dry_rc == 124 )) \
+    && bad "(11) dry-run is bounded" "the dry-run probe hung and was killed at 60s (an unbounded call on the recovery path)" \
+    || ok "(11) the dry-run probe finishes inside its 60s bound (rc=$dry_rc)"
 if [[ ! -e "$c11/scratch/nexus-uv-cache" ]]; then
     ok "(11) bootstrap-recover --dry-run creates nothing"
 else
@@ -192,15 +264,21 @@ grep -qE 'would (relaunch|run|resume)' <<<"$dry_out" \
     || ok "(11) marker does not trip boot-recover's 'would (relaunch|run|resume)' gate"
 
 # ---- (12) bootstrap-recover wiring: a real run repairs ---------------------
+# Bounded for the reason given at arm (11): this is the arm that repairs, so
+# this is the arm that rings the bell, and an unbounded bell hangs it.
+real_rc=0
 real_out=$(
     env -u UV_CACHE_DIR NEXUS_LOCALS="$c11/locals" NEXUS_STATE_DIR="$WORK/state11" \
-        bash -c '
+        timeout 60 bash -c '
             set -uo pipefail
             source "$1" >/dev/null 2>&1
             DRY_RUN=0
             _recover_uv_cache_guard
         ' _ "$RECOVER" 2>&1
-)
+) || real_rc=$?
+(( real_rc == 124 )) \
+    && bad "(12) the real recovery run is bounded" "the repair hung and was killed at 60s — the notification bell is not bounded" \
+    || ok "(12) the real recovery run finishes inside its 60s bound (rc=$real_rc)"
 [[ -d "$c11/scratch/nexus-uv-cache" ]] \
     && ok "(12) bootstrap-recover repairs the cache on a real run" \
     || bad "(12) recover wiring" "target not created; output: $real_out"
@@ -260,6 +338,65 @@ if [[ -r "$LABSH" ]]; then
     else
         bad "(14) labsh call site" "call=$call_line start=$start_line"
     fi
+
+    # EXECUTE the warm-restart consumer, the way arms (11) and (12) execute the
+    # cold-boot one. The three greps above are text-only: replace the body of
+    # `repair_uv_cache` with `rc=0` and all three still pass, so the higher-value
+    # consumer — the one the 2026-08-25 incident burned, because the supervisor
+    # restarts long after any recovery sweep — was pinned by nothing.
+    #
+    # labsh-supervised.sh cannot be sourced: its last lines start the watchdog's
+    # infinite probe loop. So extract the function block and run THAT. The
+    # extracted text is the real body, so a change to the body changes this arm.
+    labsh_fn=$(awk '/^repair_uv_cache\(\) \{/,/^\}/' "$LABSH")
+    if ! grep -q 'nexus_uv_cache_guard' <<<"$labsh_fn"; then
+        bad "(14) repair_uv_cache is executable in isolation" \
+            "could not extract a repair_uv_cache body that calls the guard (renamed or restructured?)"
+    else
+        # The fault: UV_CACHE_DIR points at a dangling symlink, as it does after
+        # a scratch purge, because locals-env.sh points it at locals/uv/cache.
+        c14="$WORK/c14"; mkdir -p "$c14/locals/uv" "$c14/scratch"
+        ln -s "$c14/scratch/nexus-uv-cache" "$c14/locals/uv/cache"
+        labsh_out=$(
+            env -u NEXUS_LOCALS \
+                UV_CACHE_DIR="$c14/locals/uv/cache" \
+                NEXUS_STATE_DIR="$WORK/state14" \
+                PATH="/usr/bin:/bin" \
+                timeout 60 bash -c '
+                    set -uo pipefail
+                    log() { printf "[labsh-svc] %s\n" "$*"; }
+                    source "$1" >/dev/null 2>&1
+                    eval "$2"
+                    repair_uv_cache
+                ' _ "$GUARD" "$labsh_fn" 2>&1
+        )
+        [[ -d "$c14/scratch/nexus-uv-cache" ]] \
+            && ok "(14) repair_uv_cache REPAIRS a dangling uv cache on the warm-restart path" \
+            || bad "(14) warm-restart repair" "the target was not created; output: $labsh_out"
+        grep -q "repaired dangling uv cache symlink" <<<"$labsh_out" \
+            && ok "(14) the warm restart logs the repair under its [labsh-svc] prefix" \
+            || bad "(14) warm-restart log" "output: $labsh_out"
+
+        # CONTROL: a healthy cache must not make the supervisor claim a repair.
+        c14b="$WORK/c14b"; mkdir -p "$c14b/locals/uv" "$c14b/scratch/nexus-uv-cache"
+        ln -s "$c14b/scratch/nexus-uv-cache" "$c14b/locals/uv/cache"
+        labsh_out_ok=$(
+            env -u NEXUS_LOCALS \
+                UV_CACHE_DIR="$c14b/locals/uv/cache" \
+                NEXUS_STATE_DIR="$WORK/state14b" \
+                PATH="/usr/bin:/bin" \
+                timeout 60 bash -c '
+                    set -uo pipefail
+                    log() { printf "[labsh-svc] %s\n" "$*"; }
+                    source "$1" >/dev/null 2>&1
+                    eval "$2"
+                    repair_uv_cache
+                ' _ "$GUARD" "$labsh_fn" 2>&1
+        )
+        [[ -z "$labsh_out_ok" ]] \
+            && ok "(14) a healthy cache is a silent no-op on the warm-restart path" \
+            || bad "(14) warm-restart no-op" "output on a healthy cache: $labsh_out_ok"
+    fi
 fi
 
 # ---- (15) locals-env.sh stays PURE -----------------------------------------
@@ -310,6 +447,24 @@ fi
 [[ -f "$WORK/state16/uv-cache-purged.log" ]] \
     && ok "(16) the durable purge record still landed (surface 2 precedes the bell)" \
     || bad "(16) durable record" "uv-cache-purged.log was not written"
+
+# ---- (17) the guard keeps its executable bit -------------------------------
+# The header documents a direct-execution entry point
+# (`monitor/uv-cache-guard.sh [CACHE_PATH]`) and the file implements it at its
+# foot. Every arm above invokes the guard as `bash "$GUARD"`, which works on a
+# file with no executable bit — so NOTHING above can see the mode. Without the
+# bit, direct execution returns 126 and the documented entry point is broken.
+# Assert the mode, then assert the behaviour the mode exists for.
+[[ -x "$GUARD" ]] \
+    && ok "(17) the guard file is executable" \
+    || bad "(17) guard file mode" "$GUARD is not executable; direct execution returns 126"
+
+c17_rc=0
+env -u UV_CACHE_DIR -u NEXUS_LOCALS \
+    NEXUS_STATE_DIR="$WORK/state17" \
+    PATH="/usr/bin:/bin" \
+    timeout 60 "$GUARD" "$WORK/c17-absent-path" >/dev/null 2>&1 || c17_rc=$?
+assert_eq "(17) direct execution runs the guard (no 126 Permission denied)" "$c17_rc" "0"
 
 # ---- summary ---------------------------------------------------------------
 
