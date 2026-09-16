@@ -156,6 +156,20 @@ else
         # did, stranding every work/<project> worker spawn pre-REPL on a
         # dialog that classified `empty` and matched no unstick case.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-nested-trust.sh"
+        # VI-safe paste (GUIDE.md surface 2c). Every other scenario
+        # either types with `send-keys <text>` or stubs the paste
+        # function outright (test-realmodel-overlimit.sh swaps in
+        # `_ol_test_paste`, which only appends to a log). So no scenario
+        # ran the PRODUCTION `i BSpace` + `paste-buffer` sequence against
+        # the candidate, and VI-mode drift — a lost paste, which reads as
+        # a silent worker — would pass this gate green.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
+        # Hook + settings contract (GUIDE.md surface 2d). cch_boot_worker
+        # is renderer-path only and never passes `--settings`, so the
+        # hook-event names, the matcher syntax and the PreToolUse exit-2
+        # block were never exercised against a candidate. A silently
+        # disabled hook is the one breakage class the watcher cannot see.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-hooks.sh"
     )
 fi
 
