@@ -1,5 +1,5 @@
 ---
-description: "JupyterLab-as-a-service for nexus projects: one-command activation (monitor/jupyter-up.sh), the single work-root session with all project kernels (--root + jupyter-kernel-crawl.sh, the foolproof default for 'a jupyter session'), per-project isolation mode, project-agent access via labsh-root.sh, and supervised auto-revival via services.registry. Builds on <yourlab>.labsh for the labsh primitives."
+description: "JupyterLab-as-a-service for nexus projects: one-command activation (monitor/jupyter-up.sh), the single work-root session with all project kernels (--root + jupyter-kernel-crawl.sh, the foolproof default for 'a jupyter session'), per-project isolation mode, project-agent access via labsh-root.sh, and supervised auto-revival via services.registry. Builds on setty.labsh for the labsh primitives."
 ---
 
 # nexus.jupyter — JupyterLab as a supervised nexus service
@@ -14,8 +14,8 @@ restart; a project kernel needs registering.
 This skill is the nexus *service* layer. The labsh *primitives*
 (`start`/`stop`/`kernel add`/`kernel exec`/`kernel inspect`/`notebook
 attach`/`notebook append`, shared-node etiquette, networking, the
-Rust/AI-extension fallback chain) are documented in the **`<yourlab>.labsh`**
-skill (`~/.claude/<hpc-skills>/skills/<yourlab>.labsh/SKILL.md`) and
+Rust/AI-extension fallback chain) are documented in the **`setty.labsh`**
+skill (`~/.claude/<hpc-skills>/skills/setty.labsh/SKILL.md`) and
 `work/labsh/doc/labsh.md` — read those for anything kernel-level. Here:
 how a project's labsh JupyterLab becomes an activate-once, self-healing,
 boot-surviving nexus service, and what to do by default.
@@ -68,7 +68,7 @@ run it again). The activate path either way:
 4. **Report** — waits for the healthcheck, prints the tokenized URL,
    the token path, and the agent quickstart.
 
-Then interact through labsh, exactly as `<yourlab>.labsh` documents:
+Then interact through labsh, exactly as `setty.labsh` documents:
 
 ```bash
 cd /path/to/project
@@ -117,7 +117,7 @@ report the ambiguity and refuse — disambiguate with `-k PID`.
   `monitor/svc.sh status` for the whole stack.
 - **No kernel yet?** The default path auto-registers. Extra packages at
   creation: `--pkgs "scanpy kompot"`. Later:
-  `labsh kernel install PKG...` (per `<yourlab>.labsh`).
+  `labsh kernel install PKG...` (per `setty.labsh`).
 - **Existing venv elsewhere (Lmod python, shared env)?**
   `monitor/jupyter-up.sh DIR --venv /dir/containing/venv` — the
   argument is the directory CONTAINING `.venv`, not the `.venv`
@@ -176,8 +176,8 @@ project dir; whether to use the root session (default — "interact via
 `monitor/labsh-root.sh notebook attach <nb> --kernel-name
 proj-<project>` then `labsh-root.sh kernel exec`") or per-project
 isolation ("activate with `monitor/jupyter-up.sh <dir>` (idempotent),
-interact via `labsh kernel exec/inspect` per `<yourlab>.labsh`"); and the
-shared-node etiquette line from `<yourlab>.labsh` if the target is <node>.
+interact via `labsh kernel exec/inspect` per `setty.labsh`"); and the
+shared-node etiquette line from `setty.labsh` if the target is <node>.
 Workers must NOT hand-edit `services.registry` — `jupyter-up.sh`
 owns those rows.
 

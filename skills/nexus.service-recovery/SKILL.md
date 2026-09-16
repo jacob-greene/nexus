@@ -148,7 +148,7 @@ It is **not** a storage outage. The signature is a mount that is
 read-write bind missing from `/proc/self/mountinfo`. The filer is
 healthy and has free space — check before anyone pages storage-support.
 
-The watcher does not die on this any more (<your-org>/nexus-code#473).
+The watcher does not die on this any more (settylab/nexus-code#473).
 It enters read-only **degraded mode**: it suspends project-tree
 writes, keeps its loop alive, refuses to self-restart (a
 `--replace` would kill the one working watcher — its successor
