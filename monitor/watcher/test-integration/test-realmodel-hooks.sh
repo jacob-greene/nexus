@@ -117,11 +117,16 @@ wait_for "PreToolUse hook FIRED and its matcher regex selected Bash" 45 -- _mark
 cch_control '{"mode":"text","text":"done"}'
 wait_for "Stop hook FIRED at turn end" 120 -- _mark stop
 
-if _mark posttooluse-bash; then
-    bad "PreToolUse exit 2 did NOT block — the tool ran (PostToolUse fired)"
-else
-    ok "PreToolUse exit 2 still BLOCKS the tool call (no PostToolUse by turn end)"
-fi
+# hold_false, not a bare `[[ -e ]]`: the barrier orders the marker, but
+# a hook command is a forked process and the touch lands whenever the
+# fork is scheduled. The slack between the barrier and the check was
+# measured at 0.19 s, which bounds nothing. The hold keeps the negative
+# true for a window AFTER the ordering event, so a late marker fails the
+# assertion instead of arriving unobserved. It fails on the FIRST poll
+# if the marker is already there, so the blocked-arm cost is 5 s and the
+# broken-arm cost is nothing.
+hold_false "PreToolUse exit 2 still BLOCKS the tool call (no PostToolUse through turn end)" 5 \
+    -- _mark posttooluse-bash
 
 # Control: the marker directory must not report a hook that was never
 # wired, so an `[[ -e ]]` that always succeeds cannot fake the passes.

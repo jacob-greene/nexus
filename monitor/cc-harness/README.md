@@ -221,6 +221,16 @@ un-seed it in a purpose-built scenario.
   (`paste-buffer -p -d -b`). `monitor/watcher/main.sh` and
   `monitor/watcher/_unstick.sh` paste in the respawn form too, so their
   terminal contract is covered, but their own call sites are not.
+- **The follow-up path's insert-mode guard.** `test-realmodel-vipaste.sh`
+  drives `monitor/paste-followup.sh`, but it cannot pin that script's
+  `i BSpace` guard: `paste-buffer -p` wraps the bytes in bracketed-paste
+  markers and Claude Code 2.1.273 takes them as literal text in any VI
+  mode, so the guard is inert on that path and removing it leaves the
+  scenario green (measured). The scenario pins the PROPERTY instead —
+  a bracketed paste lands literally with no guard — so a release that
+  changes it turns the gate red. The guard itself is pinned hermetically
+  by `monitor/watcher/test-paste-followup.sh`, which asserts it is sent
+  and precedes the paste.
 - **The follow-up path's submission confirmation.**
   `monitor/paste-followup.sh` confirms a submit against the target's
   heartbeat and session transcript. A harness window has neither, so the

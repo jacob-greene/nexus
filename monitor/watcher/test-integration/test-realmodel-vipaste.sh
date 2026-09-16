@@ -25,15 +25,36 @@
 # on it.
 #
 # Two production paste paths are covered, because they use two DIFFERENT
-# terminal contracts:
+# terminal contracts. They do NOT pin the same steps, and the difference
+# is physical — read this before adding an assertion to either:
+#
 #   1. the respawn path — `_respawn_paste_prompt_file` in
 #      monitor/watcher/_respawn.sh: `i BSpace` + `load-buffer` +
 #      `paste-buffer -b` + a separate `Enter`. Also the path
 #      monitor/watcher/main.sh and monitor/watcher/_unstick.sh use.
+#      PLAIN paste: tmux delivers the bytes as keystrokes, so in normal
+#      mode they are VI commands. All three steps are pinned here —
+#      remove any one and this scenario goes red.
+#
 #   2. the follow-up path — monitor/paste-followup.sh: `i BSpace` +
 #      `set-buffer` + `paste-buffer -p -d -b` + a separate `Enter`.
-#      `-p` is BRACKETED paste, a separate terminal contract, and this
-#      is the highest-frequency path in daily use.
+#      `-p` is BRACKETED paste, the highest-frequency path in daily use.
+#      Only DELIVERY and SUBMIT are pinned here. The insert-mode guard
+#      is NOT, and cannot be against this candidate: bracketed paste
+#      arrives as literal text whether or not the box is in normal mode,
+#      so `i BSpace` is redundant on this path and removing it leaves
+#      the scenario green. That is deliberate, it was measured (skeptic
+#      request 001 on PR 208), and the last assertion below PINS the
+#      property it rests on. If a release stops treating a bracketed
+#      paste as literal, that assertion goes red and the guard becomes
+#      load-bearing on this path too.
+#      The guard on THIS path is pinned hermetically instead, by
+#      monitor/watcher/test-paste-followup.sh: it records the script's
+#      tmux calls against a stub and asserts the guard is sent AND that
+#      it precedes the paste. Neutralise the guard at
+#      monitor/paste-followup.sh:445 and that suite goes red, this
+#      scenario does not. Behaviour cannot pin a step the candidate makes
+#      redundant; structure can.
 #
 # Both prompt files are written WITHOUT a trailing newline on purpose. A
 # trailing newline is itself a submit, so it would mask the explicit
@@ -75,6 +96,7 @@ echo "    claude:  $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>&1 | head -1))"
 WIN_NAME=vipaste
 MARKER="NEXVPT-$$-KMT"
 MARKER_BKT="NEXVPT-$$-BKT"
+MARKER_LIT="NEXVPT-$$-LTL"
 NEVER="NEXVPT-never-pasted"
 
 SETTINGS="$CCH_DIR/vi-settings.json"
@@ -108,12 +130,32 @@ cch_tmux send-keys -t "$CCH_SESSION:$WIN" Escape
 wait_for "Escape left insert mode (pane is in VI NORMAL mode)" 15 -- _in_normal \
     || cch_capture "$WIN" | tail -6 >&2
 
+PROMPT="$CCH_DIR/vipaste-prompt.txt"
+printf '%s' "$MARKER" > "$PROMPT"      # no trailing newline — see header
+_marker_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER"; }
+
+# ---- negative control: the marker rule, PROVEN, not asserted in a comment
+# The comment above says the marker carries no character that enters
+# insert mode. A rule in a comment decays. Prove it instead: paste the
+# very same bytes into the NORMAL-mode box with NO guard in front, and
+# hold that they do not reach the box. That is the premise the whole
+# path-1 pin rests on — if a release made a plain paste literal too
+# (as a bracketed paste already is), this control goes red and says so
+# BEFORE the guarded assertion below starts passing for the wrong
+# reason.
+cch_tmux load-buffer -b "$CCH_SESSION-ctl" "$PROMPT"
+cch_tmux paste-buffer -b "$CCH_SESSION-ctl" -t "$CCH_SESSION:$WIN"
+hold_false "unguarded plain paste in NORMAL mode does NOT reach the box" 3 \
+    -- _marker_rendered
+# The bytes ran as VI commands, so the box can be in any mode now.
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" Escape
+wait_for "pane is back in VI NORMAL mode after the unguarded control" 15 -- _in_normal \
+    || cch_capture "$WIN" | tail -6 >&2
+
 # ---- path 1: the respawn paste helper --------------------------------
 # Source the production respawn helper and drive it through the harness's
 # PATH-shadow tmux wrapper, so its bare `tmux` calls hit the isolated
 # socket. This is the real sequence the watcher uses for every spawn.
-PROMPT="$CCH_DIR/vipaste-prompt.txt"
-printf '%s' "$MARKER" > "$PROMPT"      # no trailing newline — see header
 export PATH="$CCH_DIR/.bin:$PATH"
 # shellcheck source=/dev/null
 . "$REPO_ROOT/monitor/watcher/_respawn.sh" >/dev/null 2>&1
@@ -130,10 +172,10 @@ else
     bad "respawn paste sequence returned non-zero"
 fi
 
-# In NORMAL mode the pasted bytes are VI commands, not text. So the
-# marker only reaches the box if the `i` really switched to insert —
-# this assertion is what pins the insert-mode step.
-_marker_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER"; }
+# In NORMAL mode the pasted bytes are VI commands, not text — the
+# control above just proved it for these exact bytes. So the marker
+# only reaches the box if the `i` really switched to insert. This
+# assertion is what pins the insert-mode step.
 wait_for "pasted text reached the live TUI (i switched to insert mode)" 30 -- _marker_rendered \
     || cch_capture "$WIN" | tail -15 >&2
 
@@ -200,6 +242,26 @@ wait_for "the bracketed paste SUBMITTED (marker text reached the mock)" 60 -- _m
     || { echo "    follow-up output: $(tail -2 "$CCH_DIR/followup.out")" >&2
          cch_capture "$WIN" | tail -12 >&2
          echo "    request bodies seen: $(command grep -c '===BODY' "$CCH_BODIES" 2>/dev/null)" >&2; }
+
+# ---- the property path 2 rests on, pinned ----------------------------
+# Paste bracketed into a NORMAL-mode box with NO insert-mode guard at
+# all. Today the text still lands, which is why mutating the guard out
+# of paste-followup.sh leaves this scenario green: on a bracketed paste
+# the guard is redundant. This assertion is how a release that CHANGES
+# that gets caught. Red here does not mean production broke — production
+# sends the guard — it means the follow-up path now depends on the
+# guard, so surface 2c needs a fresh look.
+wait_for "pane returned to idle after the follow-up turn" 90 -- cch_state_is "$WIN" idle \
+    || cch_capture "$WIN" | tail -10 >&2
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" Escape
+wait_for "pane is in VI NORMAL mode for the unguarded bracketed probe" 15 -- _in_normal \
+    || cch_capture "$WIN" | tail -6 >&2
+cch_tmux set-buffer -b "$CCH_SESSION-lit" -- "$MARKER_LIT"
+cch_tmux paste-buffer -p -d -b "$CCH_SESSION-lit" -t "$CCH_SESSION:$WIN"
+_lit_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER_LIT"; }
+wait_for "a bracketed paste lands as literal text with NO insert-mode guard" 30 -- _lit_rendered \
+    || { echo "    the guard in monitor/paste-followup.sh is now LOAD-BEARING — re-check surface 2c" >&2
+         cch_capture "$WIN" | tail -12 >&2; }
 
 echo "=== summary: $PASS passed, $FAIL failed ==="
 (( FAIL == 0 ))

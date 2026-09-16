@@ -176,15 +176,30 @@ the key to enter insert, re-validate the spawn + follow-up paste paths
 (`monitor/spawn-worker.sh`, the follow-up `set-buffer`/`paste-buffer`
 sequence).
 
-The gate covers this surface (`test-realmodel-vipaste.sh`) and pins
-three things: that the candidate still honours `editorMode: "vim"`, that
-`i` still switches a normal-mode box to insert, and that a separate
-`Enter` still submits. It drives TWO of the four production paste
-implementations — the respawn form (`paste-buffer -b`, also used by
-`monitor/watcher/main.sh` and `monitor/watcher/_unstick.sh`) and the
-bracketed follow-up form (`paste-buffer -p -d -b`,
-`monitor/paste-followup.sh`). The two forms are separate terminal
-contracts, which is why both are driven.
+The gate covers this surface (`test-realmodel-vipaste.sh`). It drives
+TWO of the four production paste implementations, because they are
+separate terminal contracts, and it pins a DIFFERENT set of steps on
+each:
+
+| Path | Form | Pinned |
+|---|---|---|
+| respawn (`monitor/watcher/_respawn.sh`, also `main.sh` and `_unstick.sh`) | plain `paste-buffer -b` | `editorMode: "vim"` honoured, `i` switches a normal-mode box to insert, a separate `Enter` submits |
+| follow-up (`monitor/paste-followup.sh`) | bracketed `paste-buffer -p -d -b` | delivery and submit only |
+
+The asymmetry is physical, not an oversight. A plain paste arrives as
+keystrokes, so in normal mode the bytes are VI commands and the `i`
+guard is load-bearing. A bracketed paste arrives as literal text
+whichever mode the box is in, so the guard is redundant there — removing
+it from `monitor/paste-followup.sh` leaves the gate green (measured on
+2.1.273). The scenario's last assertion pins that property directly: if
+a release stops treating a bracketed paste as literal, it goes red and
+the guard becomes load-bearing on the follow-up path too.
+
+The follow-up guard itself is pinned hermetically, not by this gate:
+`monitor/watcher/test-paste-followup.sh` records the script's tmux calls
+against a stub and asserts the guard is sent and precedes the paste. So
+a deleted guard is caught by the ordinary suite, and a changed terminal
+contract is caught here. Neither test alone covers both.
 
 ### 2d. Hooks + settings schema
 
@@ -247,21 +262,35 @@ and confirm the glob still finds it.
 Each transcript record carries the Claude Code version that wrote it.
 Two loops read that field, not the binary:
 
-- `monitor/watcher/_cc_auto_update.sh:403` — confirms a restarted
-  session actually runs the new version.
-- `monitor/cc-restart-watchdog-loop.sh:75` — the restart watchdog.
+- `monitor/watcher/_cc_auto_update.sh:468` — reads the last `"version"`
+  stamp to decide whether the running orchestrator is still on the old
+  binary.
+- `monitor/cc-restart-watchdog-loop.sh:146` — the restart watchdog waits
+  for a `"version":"<candidate>"` record to appear past a byte baseline.
 
 A renamed or dropped field makes both read "not upgraded yet" forever,
 so the watchdog keeps restarting a session that is already correct.
 
 ### 2h. The `--version` output string format
 
-`monitor/cc-auto-update-apply.sh:580` and
-`monitor/install-claude-local.sh:347` parse the first line of
-`claude --version` to extract the version number (today:
-`2.1.273 (Claude Code)`). A reformat breaks install verification and the
-autonomous bump's post-check. Check: run `<candidate> --version` and
-confirm the leading `N.N.N` still parses.
+Four sites parse the first line of `claude --version` to extract the
+version number (today: `2.1.273 (Claude Code)`). Two extract with a
+`N.N.N` regex, two take the first whitespace-delimited field, so a
+reformat can break one style and not the other:
+
+| Site | How it parses | What breaks |
+|---|---|---|
+| `monitor/cc-auto-update-apply.sh:580` | `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` | the autonomous bump's post-check, which rolls the pin back on a mismatch |
+| `monitor/cc-restart-watchdog-loop.sh:75` | `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` | the watchdog's baseline candidate, so it waits for a stamp that never matches |
+| `monitor/install-claude-local.sh:180` | `awk '{print $1}'` | the already-installed short circuit, so every launch reinstalls |
+| `monitor/install-claude-local.sh:347` | whole line, compared later | install verification |
+
+This list is exhaustive as of this writing: it is every `claude
+--version` call in `monitor/`, excluding the test stubs and the harness
+banner, which only print it. Re-derive with
+`grep -rn -- '--version' monitor/` if you want to confirm. Check: run
+`<candidate> --version` and confirm both the leading `N.N.N` and the
+first field still parse.
 
 ### 2i. Folder trust for a NESTED git repository
 
@@ -277,7 +306,10 @@ fatal to every spawn.
 > These four surfaces (2f–2i) were added after a skeptic pass on the
 > 2.1.273 evaluation found them absent. Each is nexus code reading a
 > Claude Code output format, so each can break with no changelog entry
-> that names it.
+> that names it. 2g and 2h were first written with the wrong line
+> numbers, which a second skeptic pass caught: `cc-restart-watchdog-loop.sh:75`
+> is a `--version` parse (2h), not a transcript read (2g). Verify a
+> citation before you trust it.
 
 ## Step 3 — TESTING PIPELINE (the cc-harness gate)
 

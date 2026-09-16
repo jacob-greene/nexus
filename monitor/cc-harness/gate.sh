@@ -169,7 +169,10 @@ else
         # pins nothing. It drives two of the four production paste
         # implementations — the respawn form (`paste-buffer -b`) and the
         # bracketed follow-up form (`paste-buffer -p -d -b`), which is a
-        # separate terminal contract.
+        # separate terminal contract. The plain form pins all three
+        # steps; the bracketed form pins delivery and submit only,
+        # because a bracketed paste is literal in any mode. See the
+        # scenario header — that asymmetry is measured, not assumed.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
         # Hook + settings contract (GUIDE.md surface 2d). cch_boot_worker
         # is renderer-path only and never passes `--settings`, so the
