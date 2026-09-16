@@ -22,7 +22,7 @@ GitHub-write concerns.
 
 Self-improvement is high-leverage but easy to misfire — a
 mis-scoped issue or a stale-checkout repro burns the operator's
-triage budget and pollutes the tracker. Run these four checks
+triage budget and pollutes the tracker. Run these five checks
 before opening an issue on `<your-org>/nexus-code` or authoring a
 self-fix PR.
 
@@ -102,13 +102,89 @@ self-fix PR.
    catches the stale-checkout-against-recently-added-feature
    failure mode.
 
+5. **Sweep the tracker in every state, and read closed bodies.**
+   `gh issue list --search` returns OPEN issues only, so a closed
+   issue holding your defect stays invisible. Pass `--state all`.
+   The REST search covers every state by default.
+
+   ```bash
+   gh issue list --repo <owner>/<repo> --search "<terms>" --state all
+   gh api -X GET search/issues -f q='repo:<owner>/<repo> <terms>'
+   ```
+
+   Confirm the query finds a hit you already know. An empty
+   result reads the same whether the tracker is clean or your
+   filter hid the match.
+
+   **Read the bodies, not the titles.** A title names the primary
+   defect only. A secondary defect in the body survives the close
+   and is invisible to a title scan.
+
+   A close is not a ruling. Read the closing comment and test it
+   against source. On this nexus, eleven issues closed inside 102
+   seconds in one bulk action. Four closing comments said "Nothing
+   is lost by closing this". For all four it was false. Every one
+   of those four bodies carried a defect that the close did not
+   map onto the surviving issue.
+
+   **The unmapped defect is a different one in each case.** One
+   mechanism does not explain a set of closes. Check each body on
+   its own. The *over-limit row* here is the watcher state row
+   that holds emits to the orchestrator while a pane reads
+   rate-limited.
+
+   | Issue | Defect the close left unmapped |
+   |---|---|
+   | `#26` | Its "Defect B": the over-limit row is keyed by role, so a rotation does not clear it |
+   | `#41` | The same role-keyed row, under its "Why it is worse than it looks" heading |
+   | `#30` | Its first enumerated defect: the banner is re-read from stale scrollback |
+   | `#84` | Its second, separately headed defect: the latch re-arms off the visible pane |
+
+   `#30` is the one that punishes a fast read. Its Summary
+   mentions the role-keyed row in a single line. The two defects
+   it enumerates are different ones: the stale-scrollback re-arm,
+   and a bare clock time resolved forward. Count what a body
+   enumerates, not what it mentions in passing.
+
+   `#84` is the one that punishes a fast count. Its second defect
+   carries its own `##` heading, so no reading of the body can
+   miss it. The close still mapped only the first. A defect can be
+   impossible to overlook and still go unmapped, because mapping
+   is a separate act from reading.
+
+   **Say what a live mechanism now costs.** "Still live" alone is
+   true and incomplete. The role-keyed row is live, and was
+   refiled. But the merged fix bounds the hold three independent
+   ways, so its worst consequence fell from about 6.5 hours of
+   orchestrator blindness to minutes. The re-arm defect behind
+   `#30` and `#84` is also live. It was not refiled, for two
+   reasons: an open issue already names it, and the source
+   documents its consequence as a bounded residual. A refile needs
+   a live mechanism, no home issue, *and* a consequence the source
+   does not already accept.
+
 Each check is a verifiable action (run the command, paste the
-SHA, name the file). Pass all four before opening the issue or
+SHA, name the file). Pass all five before opening the issue or
 the PR — not posture, output.
+
+## Closing an issue — enumerate what the close settles
+
+The same defect seen from the filing side. A multi-defect body
+gets closed on its primary defect, and the secondary defects
+vanish, because nothing points at them any more.
+
+Before you close, list the distinct defects in the body. For each
+one, say where it now lives: fixed by a named PR, or carried over
+to the surviving issue. Never write "nothing is lost" unless you
+checked every defect in the body.
+
+Carrying over is the step that is skipped. One good close in the
+bulk action above found a symptom missing from the surviving
+issue, added it there, and said so. That is the shape to copy.
 
 ## Opening the self-fix PR — base the default branch, gated merge
 
-Once the four checks pass and you have a fix, open the PR
+Once the five checks pass and you have a fix, open the PR
 against the **remote's default branch** — the `$BASE` resolved
 in check 1 — never a branch you assumed:
 
