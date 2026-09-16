@@ -176,6 +176,16 @@ the key to enter insert, re-validate the spawn + follow-up paste paths
 (`monitor/spawn-worker.sh`, the follow-up `set-buffer`/`paste-buffer`
 sequence).
 
+The gate covers this surface (`test-realmodel-vipaste.sh`) and pins
+three things: that the candidate still honours `editorMode: "vim"`, that
+`i` still switches a normal-mode box to insert, and that a separate
+`Enter` still submits. It drives TWO of the four production paste
+implementations — the respawn form (`paste-buffer -b`, also used by
+`monitor/watcher/main.sh` and `monitor/watcher/_unstick.sh`) and the
+bracketed follow-up form (`paste-buffer -p -d -b`,
+`monitor/paste-followup.sh`). The two forms are separate terminal
+contracts, which is why both are driven.
+
 ### 2d. Hooks + settings schema
 
 The nexus rides Claude Code's hook + settings contract. Files:
@@ -214,6 +224,61 @@ Spawn surfaces invoke the binary with these — confirm each still works:
 A flag rename/removal/semantics-change here breaks spawning or respawn
 outright. Grep the candidate's `--help` and diff against these.
 
+### 2f. The session-transcript path and file name
+
+Several scripts open Claude Code's own transcript
+(`<cc-home>/projects/<slugged-cwd>/<session-id>.jsonl`) and read it as
+an authority. A change to the directory layout, the slug transform, or
+the file name silently turns every one of them into "no evidence
+found":
+
+- `monitor/paste-followup.sh:304` — the submission confirmation. Without
+  the transcript it can never print `submitted`, so every orchestrator
+  follow-up degrades to `unconfirmed` (rc 3).
+- `monitor/cc-auto-update-apply.sh:637` — the autonomous update routine.
+- `monitor/context-usage.sh:157` — the context-budget reading behind
+  `ng context`, which every worker uses to decide when to wrap up.
+
+Check: resolve one live session's transcript with the candidate running
+and confirm the glob still finds it.
+
+### 2g. The `"version"` stamp inside transcript records
+
+Each transcript record carries the Claude Code version that wrote it.
+Two loops read that field, not the binary:
+
+- `monitor/watcher/_cc_auto_update.sh:403` — confirms a restarted
+  session actually runs the new version.
+- `monitor/cc-restart-watchdog-loop.sh:75` — the restart watchdog.
+
+A renamed or dropped field makes both read "not upgraded yet" forever,
+so the watchdog keeps restarting a session that is already correct.
+
+### 2h. The `--version` output string format
+
+`monitor/cc-auto-update-apply.sh:580` and
+`monitor/install-claude-local.sh:347` parse the first line of
+`claude --version` to extract the version number (today:
+`2.1.273 (Claude Code)`). A reformat breaks install verification and the
+autonomous bump's post-check. Check: run `<candidate> --version` and
+confirm the leading `N.N.N` still parses.
+
+### 2i. Folder trust for a NESTED git repository
+
+Claude Code asks for folder trust per project directory, and 2.1.232
+changed the rule for a directory that is a git repository nested inside
+another. That release broke this nexus: every spawned worker stopped at
+a trust dialog. The gate covers it
+(`test-realmodel-nested-trust.sh`, driven from
+`monitor/cc-harness/gate.sh:152`), and it stays on this list because a
+trust-dialog change is invisible in the changelog's usual wording and
+fatal to every spawn.
+
+> These four surfaces (2f–2i) were added after a skeptic pass on the
+> 2.1.273 evaluation found them absent. Each is nexus code reading a
+> Claude Code output format, so each can break with no changelog entry
+> that names it.
+
 ## Step 3 — TESTING PIPELINE (the cc-harness gate)
 
 The renderer surfaces in 2a/2b can only be *proven* by driving the real
@@ -241,20 +306,39 @@ is untouched), then:
    - `test-realmodel-autosuggest.sh` → asserts the production classifier
      on the real autosuggest renderer bytes (**2a** `_detect_autosuggest`),
      anchored to a live pid + the liveness-gated `absent` degrade.
+   - `test-realmodel-nested-trust.sh` → exercises **2i**, folder trust
+     for a git repository nested inside another.
+   - `test-realmodel-vipaste.sh` → exercises **2c**: boots with
+     `editorMode: "vim"`, drops the box to normal mode, and drives the
+     respawn paste helper and `monitor/paste-followup.sh` (bracketed
+     paste) against the live TUI.
+   - `test-realmodel-hooks.sh` → exercises **2d**: boots with
+     `--settings`, asserts `UserPromptSubmit` / `PreToolUse` / `Stop`
+     still fire, that the matcher alternation still selects, and that a
+     `PreToolUse` exit 2 still blocks the tool call.
 
-Exit 0 = **GREEN** (renderer surfaces intact). Non-zero = **RED**.
+Exit 0 = **GREEN** (the surfaces those scenarios drive are intact).
+Non-zero = **RED**.
 
 **What a pass/fail means per surface.** A green gate proves the
-renderer-classification surfaces (2a, and 2b's overlay shape) still
-hold against the candidate. It does **not** cover 2c (VI-mode), 2d
-(hooks/settings — the scenarios run renderer-path only, not the
-heartbeat-substrate variant; see the README "What's NOT here yet"), or
-2e (CLI flags) — those you validate by reading the changelog (Step 1) +
-the manual checks in Step 2. So: **green gate + clean changelog review
-across 2c/2d/2e = safe**. A **red** gate means a specific scenario
-failed → a renderer drift → `pane-state.sh` needs a matching
-`_detect_*` update (and a fresh fixture captured from the candidate)
-*before* the bump is safe.
+renderer-classification surfaces (2a, and 2b's overlay shape), the
+VI-mode paste contract (2c), the hook and settings contract (2d), and
+nested-repository folder trust (2i) still hold against the candidate.
+
+It does **not** cover:
+
+- **2e (CLI flags)** — no scenario probes them; read the changelog
+  (Step 1) and run the flags against the candidate by hand.
+- **2f, 2g, 2h** — the transcript path, the transcript `"version"`
+  stamp, and the `--version` string format. Each is a parse of a Claude
+  Code output format and each is a manual check.
+- **2b Case A** — the permission-prompt dialog text. Only the Case D
+  overlay shape is driven.
+
+So: **green gate + clean changelog review across 2e/2f/2g/2h = safe**. A
+**red** gate names the scenario that failed. A renderer drift means
+`pane-state.sh` needs a matching `_detect_*` update (and a fresh fixture
+captured from the candidate) *before* the bump is safe.
 
 ### Hard safety rule (2026-05-29 postmortem) — do not weaken
 

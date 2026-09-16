@@ -2,12 +2,11 @@
 # test-realmodel-hooks.sh — closes the 2d hole the cc-harness gate leaves
 # open.
 #
-# The gate's scenarios boot the candidate WITHOUT `--settings`
-# (cch_boot_worker is documented "renderer-path only (no --settings
-# hooks)"), so the hook-event contract the whole nexus control surface
-# rides on is never exercised against the candidate. A renamed event, a
-# changed matcher schema, or a dropped exit-2 block would pass the gate
-# green and silently disable the watcher's eyes.
+# The gate's other renderer scenarios boot the candidate WITHOUT
+# `--settings`, so the hook-event contract the whole nexus control
+# surface rides on is never exercised against the candidate there. A
+# renamed event, a changed matcher schema, or a dropped exit-2 block
+# would pass the gate green and silently disable the watcher's eyes.
 #
 # This scenario boots the REAL candidate with a `--settings` file whose
 # hooks write marker files, drives a tool call from the mock, and asserts:
@@ -67,22 +66,11 @@ cat > "$SETTINGS" <<JSON
 }
 JSON
 
-# Boot with --settings. cch_boot_worker deliberately omits it, so the
-# launch line is reproduced here with the flag added.
+# Boot WITH --settings (the two-argument form of cch_boot_worker; the
+# one-argument renderer path deliberately carries no hooks).
 WIN=hooks
-printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
-ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
-DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
-TERM=%q %q --settings %q --dangerously-skip-permissions' \
-    "$CCH_CFG" "$PATH" "$CCH_CFG" \
-    "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" "$CLAUDE_BIN" "$SETTINGS"
-
-cch_tmux new-window -d -t "$CCH_SESSION": -n "$WIN" -c "$CCH_WORKDIR" "$launch"
-IDX=$(cch_tmux list-windows -t "$CCH_SESSION" -F '#{window_name} #{window_index}' \
-    | awk -v n="$WIN" '$1==n {print $2; exit}')
+IDX=$(cch_boot_worker "$WIN" "$SETTINGS")
 [[ -n "$IDX" ]] || { bad "window did not open"; echo "=== summary: $PASS passed, $FAIL failed ==="; exit 1; }
-cch_tmux set-option -t "$CCH_SESSION:$IDX" -w remain-on-exit on 2>/dev/null
 
 wait_for "candidate booted to idle WITH --settings" 60 -- cch_state_is "$IDX" idle \
     || { cch_capture "$IDX" | tail -15 >&2; echo "=== summary: $PASS passed, $FAIL failed ==="; exit 1; }
@@ -102,14 +90,37 @@ _mark() { [[ -e "$MK/$1" ]]; }
 wait_for "UserPromptSubmit hook FIRED" 30 -- _mark userpromptsubmit
 wait_for "PreToolUse hook FIRED and its matcher regex selected Bash" 45 -- _mark pretooluse-matched
 
+# ---- the exit-2 block, asserted behind a turn-end BARRIER -------------
+#
 # The exit-2 block is the load-bearing contract: if it stopped blocking,
 # the orchestrator's AskUserQuestion guard is silently dead. A blocked
 # call must NOT reach PostToolUse.
-sleep 6
+#
+# "PostToolUse never fired" is a NEGATIVE assertion about an ASYNCHRONOUS
+# event, so it is only sound behind an event that ORDERS AFTER it. A
+# fixed sleep is not that event: this scenario first shipped with
+# `sleep 6`, and the skeptic pass on Claude Code 2.1.273 measured the
+# real delay to PostToolUse at about 9 s. With the block removed the
+# tool RAN and the assertion still passed, 3 runs of 3.
+#
+# The barrier used instead is the Stop hook. In BOTH arms it orders
+# after PostToolUse would fire: the tool result (or the block feedback)
+# goes back to the model, the model answers, and only then does the turn
+# end. So `Stop fired` proves the tool-call round trip is complete, and
+# the absence of the PostToolUse marker at that point is real, on any
+# host, at any speed.
+#
+# Getting to Stop needs one harness step first: while the control file
+# still says `tool_use` the mock re-emits the blocked call on every
+# request and the turn never ends. That is a HARNESS artifact, not a
+# candidate defect — switch the mock back to plain text, then wait.
+cch_control '{"mode":"text","text":"done"}'
+wait_for "Stop hook FIRED at turn end" 120 -- _mark stop
+
 if _mark posttooluse-bash; then
     bad "PreToolUse exit 2 did NOT block — the tool ran (PostToolUse fired)"
 else
-    ok "PreToolUse exit 2 still BLOCKS the tool call (no PostToolUse)"
+    ok "PreToolUse exit 2 still BLOCKS the tool call (no PostToolUse by turn end)"
 fi
 
 # Control: the marker directory must not report a hook that was never
@@ -119,13 +130,6 @@ if _mark neverwired; then
 else
     ok "control: an unwired hook marker does not exist"
 fi
-
-# Let the turn actually END: while the control file still says
-# `tool_use`, the mock re-emits the blocked call on every request and the
-# turn never reaches Stop. That is a HARNESS artifact, not a candidate
-# defect — switch the mock back to plain text, then assert Stop.
-cch_control '{"mode":"text","text":"done"}'
-wait_for "Stop hook FIRED at turn end" 90 -- _mark stop
 
 echo "    markers present: $(ls "$MK" 2>/dev/null | tr '\n' ' ')"
 echo "=== summary: $PASS passed, $FAIL failed ==="

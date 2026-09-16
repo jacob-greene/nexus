@@ -8,11 +8,36 @@
 # release would therefore pass the gate green and only surface in
 # production, where a lost paste reads as a silent worker.
 #
-# This scenario runs the PRODUCTION paste helper
-# (`_respawn_paste_prompt_file` from monitor/watcher/_respawn.sh — the
-# `send-keys i BSpace` + `load-buffer` + `paste-buffer` + `Enter`
-# sequence) against the REAL candidate binary booted on the auth-free
-# mock, and asserts the text both LANDS in the prompt and SUBMITS.
+# This scenario boots the REAL candidate with `editorMode: "vim"`, puts
+# the input box in NORMAL mode (the hazard state), and then runs the
+# production paste helpers against it.
+#
+# WHY VI MODE IS FORCED ON. The nexus does not set an editor mode, so a
+# production pane is normally in insert mode and the `i BSpace` guard is
+# inert. A gate that boots the same way pins nothing: the first version
+# of this scenario did exactly that, and dropping `send-keys i BSpace`
+# from the production helper left it green (skeptic pass on Claude Code
+# 2.1.273). The guard exists for the pane that IS in normal mode — an
+# operator who turns VI mode on, or a pane a stray Escape left there —
+# so the honest gate is the contract under VI mode ON. Booting with
+# `--settings` is also what makes an `editorMode` regression visible:
+# the scenario asserts the candidate honours the key before it relies
+# on it.
+#
+# Two production paste paths are covered, because they use two DIFFERENT
+# terminal contracts:
+#   1. the respawn path — `_respawn_paste_prompt_file` in
+#      monitor/watcher/_respawn.sh: `i BSpace` + `load-buffer` +
+#      `paste-buffer -b` + a separate `Enter`. Also the path
+#      monitor/watcher/main.sh and monitor/watcher/_unstick.sh use.
+#   2. the follow-up path — monitor/paste-followup.sh: `i BSpace` +
+#      `set-buffer` + `paste-buffer -p -d -b` + a separate `Enter`.
+#      `-p` is BRACKETED paste, a separate terminal contract, and this
+#      is the highest-frequency path in daily use.
+#
+# Both prompt files are written WITHOUT a trailing newline on purpose. A
+# trailing newline is itself a submit, so it would mask the explicit
+# `Enter` and the "SUBMITTED" assertion would pin nothing.
 #
 # Gated on RUN_CC_HARNESS=1 (+ node + a resolvable claude binary);
 # self-skips otherwise. See monitor/cc-harness/README.md.
@@ -30,26 +55,65 @@ ok()  { printf '  PASS: %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  FAIL: %s\n' "$*" >&2; FAIL=$((FAIL+1)); }
 
 cch_skip_if_disabled
+# Full request bodies, not just the mock's one-line summary. The summary
+# logs only the LAST message of a request, and after the first turn that
+# is a system block — so a "did the text cross the wire" assertion built
+# on the summary can only ever see the first turn (it lands there via the
+# session-title call). bodies.log carries every POST body verbatim.
+export MOCK_DUMP_BODIES=1
 cch_setup
 trap cch_teardown EXIT
+CCH_BODIES="$CCH_DIR/bodies.log"
 
 echo "=== real-binary harness: VI-safe paste (2c) ==="
 echo "    claude:  $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>&1 | head -1))"
 
-WIN=$(cch_boot_worker vipaste)
+# Markers carry NO character that enters insert mode in VI normal mode
+# (no a A i I o O c C s S R). A marker that contained one would type
+# itself into the box even with the `i` guard removed, and the mutation
+# arm that removes the guard would go undetected again.
+WIN_NAME=vipaste
+MARKER="NEXVPT-$$-KMT"
+MARKER_BKT="NEXVPT-$$-BKT"
+NEVER="NEXVPT-never-pasted"
+
+SETTINGS="$CCH_DIR/vi-settings.json"
+cat > "$SETTINGS" <<'JSON'
+{
+  "skipDangerousModePermissionPrompt": true,
+  "env": { "DISABLE_AUTOUPDATER": "1" },
+  "editorMode": "vim"
+}
+JSON
+
+WIN=$(cch_boot_worker "$WIN_NAME" "$SETTINGS")
 [[ -n "$WIN" ]] || { echo "boot failed" >&2; exit 1; }
 
 wait_for "candidate booted to idle" 60 -- cch_state_is "$WIN" idle \
     || { cch_capture "$WIN" | tail -15 >&2; echo "=== summary: $PASS passed, $FAIL failed ==="; exit 1; }
 
-MARKER="NEXUSVIPASTE-$$-canary"
-PROMPT="$CCH_DIR/vipaste-prompt.txt"
-printf 'Reply with exactly: %s\n' "$MARKER" > "$PROMPT"
+# The VI-mode indicator is the whole premise of this scenario. With
+# `editorMode: "vim"` honoured the input box opens in insert mode and
+# renders `-- INSERT --`; Escape drops it to normal mode and the
+# indicator goes away. If a release stops honouring the key, BOTH
+# assertions below go red and say so — the scenario can never quietly
+# degrade into the non-pinning version it replaced.
+_in_insert()  { cch_capture "$WIN" | command grep -qF -- '-- INSERT --'; }
+_in_normal()  { ! _in_insert; }
 
+wait_for "candidate honours editorMode=vim (-- INSERT -- indicator)" 30 -- _in_insert \
+    || cch_capture "$WIN" | tail -6 >&2
+
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" Escape
+wait_for "Escape left insert mode (pane is in VI NORMAL mode)" 15 -- _in_normal \
+    || cch_capture "$WIN" | tail -6 >&2
+
+# ---- path 1: the respawn paste helper --------------------------------
 # Source the production respawn helper and drive it through the harness's
 # PATH-shadow tmux wrapper, so its bare `tmux` calls hit the isolated
-# socket. This is the real sequence the watcher uses for every spawn and
-# follow-up.
+# socket. This is the real sequence the watcher uses for every spawn.
+PROMPT="$CCH_DIR/vipaste-prompt.txt"
+printf '%s' "$MARKER" > "$PROMPT"      # no trailing newline — see header
 export PATH="$CCH_DIR/.bin:$PATH"
 # shellcheck source=/dev/null
 . "$REPO_ROOT/monitor/watcher/_respawn.sh" >/dev/null 2>&1
@@ -61,38 +125,81 @@ else
 fi
 
 if _respawn_paste_prompt_file "$CCH_SESSION:$WIN" "$PROMPT"; then
-    ok "paste sequence (i BSpace + paste-buffer + Enter) returned 0"
+    ok "respawn paste sequence (i BSpace + paste-buffer + Enter) returned 0"
 else
-    bad "paste sequence returned non-zero"
+    bad "respawn paste sequence returned non-zero"
 fi
 
-# The prompt must have SUBMITTED: the pane goes busy, then the mock's
-# reply carries the marker back. Either signal alone would be weak —
-# a marker echoed in the input box without submitting is a lost paste.
+# In NORMAL mode the pasted bytes are VI commands, not text. So the
+# marker only reaches the box if the `i` really switched to insert —
+# this assertion is what pins the insert-mode step.
 _marker_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER"; }
-wait_for "pasted text reached the live TUI (marker rendered)" 30 -- _marker_rendered \
+wait_for "pasted text reached the live TUI (i switched to insert mode)" 30 -- _marker_rendered \
     || cch_capture "$WIN" | tail -15 >&2
 
 # STRONGER than "the log is non-empty": the boot itself issues requests
 # (session title, etc.), so a size check would pass without any submit.
-# Assert the MARKER TEXT crossed the wire as a user message.
-_mock_saw_marker() { command grep -qF "$MARKER" "$CCH_LOG" 2>/dev/null; }
-wait_for "the paste SUBMITTED (marker text reached the mock as a request)" 60 -- _mock_saw_marker \
-    || { echo "    requests seen: $(wc -l < "$CCH_LOG" 2>/dev/null)" >&2; }
+# Assert the MARKER TEXT crossed the wire as a user message. The prompt
+# file carries no trailing newline, so the explicit `Enter` is the only
+# thing that can submit it — this assertion pins that step.
+_mock_saw_marker() { command grep -qF "$MARKER" "$CCH_BODIES" 2>/dev/null; }
+wait_for "the paste SUBMITTED (the explicit Enter submitted it)" 60 -- _mock_saw_marker \
+    || { echo "    request bodies seen: $(command grep -c '===BODY' "$CCH_BODIES" 2>/dev/null)" >&2; }
 
 # Control for that assertion: a string never pasted must NOT be in the log.
-if command grep -qF "NEXUSVIPASTE-never-pasted" "$CCH_LOG" 2>/dev/null; then
+if command grep -qF "$NEVER" "$CCH_BODIES" 2>/dev/null; then
     bad "control: an unpasted string appeared in the request log"
 else
     ok "control: an unpasted string is absent from the request log"
 fi
 
 # Negative control: a marker that was never pasted must not appear.
-if cch_capture "$WIN" | command grep -qF "NEXUSVIPASTE-never-pasted"; then
+if cch_capture "$WIN" | command grep -qF "$NEVER"; then
     bad "control: an unpasted marker appeared — the assertion is not specific"
 else
     ok "control: an unpasted marker does not appear"
 fi
+
+# ---- path 2: the bracketed-paste follow-up helper --------------------
+# monitor/paste-followup.sh is the highest-frequency injector and the
+# only one that uses `paste-buffer -p` (bracketed paste). Run the real
+# script, hermetically: NEXUS_STATE_DIR points at the harness state dir
+# and PASTE_NG_BIN stubs the action-log append.
+#
+# Its submission CONFIRMATION cannot pass here — it reads the target's
+# heartbeat and session transcript, neither of which a harness window
+# has — so it is expected to report `unconfirmed` (rc 3). That is not
+# the contract under test: rc 1 (a tmux/usage hard failure) is a real
+# failure, and the paste itself is proven by the two assertions below.
+wait_for "pane returned to idle after the first turn" 90 -- cch_state_is "$WIN" idle \
+    || cch_capture "$WIN" | tail -10 >&2
+
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" Escape
+wait_for "pane is in VI NORMAL mode again before the follow-up paste" 15 -- _in_normal \
+    || cch_capture "$WIN" | tail -6 >&2
+
+FOLLOWUP="$CCH_DIR/followup-msg.txt"
+printf '%s' "$MARKER_BKT" > "$FOLLOWUP"   # no trailing newline — see header
+NEXUS_STATE_DIR="$CCH_STATE_DIR" PASTE_NG_BIN=/bin/true \
+    bash "$REPO_ROOT/monitor/paste-followup.sh" "$WIN_NAME" \
+        --file "$FOLLOWUP" --src cc-harness --confirm-timeout 2 \
+        > "$CCH_DIR/followup.out" 2>&1
+fu_rc=$?
+if (( fu_rc == 1 )); then
+    bad "paste-followup.sh hard-failed (rc 1): $(tail -2 "$CCH_DIR/followup.out")"
+else
+    ok "paste-followup.sh completed the bracketed paste (rc $fu_rc)"
+fi
+
+_bkt_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER_BKT"; }
+wait_for "bracketed paste (paste-buffer -p -d -b) reached the live TUI" 30 -- _bkt_rendered \
+    || cch_capture "$WIN" | tail -15 >&2
+
+_mock_saw_bkt() { command grep -qF "$MARKER_BKT" "$CCH_BODIES" 2>/dev/null; }
+wait_for "the bracketed paste SUBMITTED (marker text reached the mock)" 60 -- _mock_saw_bkt \
+    || { echo "    follow-up output: $(tail -2 "$CCH_DIR/followup.out")" >&2
+         cch_capture "$WIN" | tail -12 >&2
+         echo "    request bodies seen: $(command grep -c '===BODY' "$CCH_BODIES" 2>/dev/null)" >&2; }
 
 echo "=== summary: $PASS passed, $FAIL failed ==="
 (( FAIL == 0 ))

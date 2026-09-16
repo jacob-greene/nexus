@@ -163,6 +163,13 @@ else
         # ran the PRODUCTION `i BSpace` + `paste-buffer` sequence against
         # the candidate, and VI-mode drift — a lost paste, which reads as
         # a silent worker — would pass this gate green.
+        # It boots with `editorMode: "vim"` and drops the input box to
+        # normal mode FIRST: with the box already in insert mode (the
+        # production default) the `i` guard is inert and the scenario
+        # pins nothing. It drives two of the four production paste
+        # implementations — the respawn form (`paste-buffer -b`) and the
+        # bracketed follow-up form (`paste-buffer -p -d -b`), which is a
+        # separate terminal contract.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
         # Hook + settings contract (GUIDE.md surface 2d). cch_boot_worker
         # is renderer-path only and never passes `--settings`, so the

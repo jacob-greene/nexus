@@ -63,6 +63,9 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | cc-harness gate | `monitor/cc-harness/gate.sh`, which drives a candidate Claude Code binary and asserts the pane classifier still works |
 | local pin | `monitor/.state/cc-version-local`, the gitignored file that sets the Claude Code version this operator runs |
 | version floor | the `package.json` Claude Code version, used only for a fresh install that has no local pin |
+| mutation arm | one deliberate break of production or test code, run to prove that an assertion detects it |
+| bracketed paste | a paste that tmux wraps in the terminal's paste markers (`paste-buffer -p`), so the receiving program reads the text as one literal block |
+| barrier assertion | a negative assertion made only after an event that must order after the thing asserted absent, so no timer decides the verdict |
 
 ## Project terms
 
