@@ -82,20 +82,14 @@ EOF
 }
 
 # Boot the real binary in $1 with the production spawn flags.
+#
+# This used to carry its own copy of the launch-string block from
+# _lib.sh, purely to boot in a cwd other than $CCH_WORKDIR. cch_boot_worker now
+# takes the workdir as its second argument, so the copy is gone
+# (your-org/nexus-code#158). Do not reintroduce one: a duplicated launch
+# string drifts from the production spawn flags without any test noticing.
 boot_in() {
-    local name="$1" workdir="$2" launch idx
-    printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
-ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
-DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
-TERM=%q %q --dangerously-skip-permissions' \
-        "$CCH_CFG" "$PATH" "$CCH_CFG" \
-        "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" "$CLAUDE_BIN"
-    cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$workdir" "$launch"
-    idx=$(cch_tmux list-windows -t "$CCH_SESSION" -F '#{window_name} #{window_index}' \
-        | awk -v n="$name" '$1==n {print $2; exit}')
-    [[ -n "$idx" ]] && cch_tmux set-option -t "$CCH_SESSION:$idx" -w remain-on-exit on 2>/dev/null
-    printf '%s' "$idx"
+    cch_boot_worker "$1" "$2"
 }
 
 # Poll until the pane settles (idle or blocked), up to ~30s.
