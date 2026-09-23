@@ -108,6 +108,37 @@ the PR — not posture, output.
 
 ## Opening the self-fix PR — base the default branch, gated merge
 
+### Pushing the branch first — the bot token carries the transport
+
+You cannot open the PR until the branch is on the remote, and in a
+fresh sandbox clone a plain push fails. There is no user git
+credential: the remote is HTTPS, no credential helper is
+configured, and `gh` is not logged in. The push dies with
+
+```
+fatal: could not read Username for 'https://github.com': No such device or address
+```
+
+Push through the bot's installation token in the URL instead:
+
+```bash
+TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+git -C <clone> push \
+  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+```
+
+Keep the token inline. Never `git remote set-url` it into
+`.git/config`, and filter it out of any output you capture.
+
+The token is the **transport** only. Commit authorship comes from
+`user.name` and `user.email` at `git commit` time, so the token does
+not touch it. This is therefore not a breach of the bot-identity
+rule. `nexus.bot`, section "Sandbox exception — push transport when
+there is no user credential", carries the full reasoning and the
+authorship check to run before you commit.
+
+### Opening the PR — base the default branch
+
 Once the four checks pass and you have a fix, open the PR
 against the **remote's default branch** — the `$BASE` resolved
 in check 1 — never a branch you assumed:
