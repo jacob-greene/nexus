@@ -296,6 +296,42 @@ carrying a leading line number. A different check rejected its input row
 whether or not that rule ran. So no mutation of that rule could make the
 test fail, and the arm still counted as caught.
 
+**A mutation that did not land is not a mutation arm.** Take a
+*landed-mutation proof* on every arm. That is a checksum and a diff,
+taken after the mutation and before the suite runs. Without it, a green
+arm may be a mutation that never applied. The failure is quiet and it
+points the wrong way: an unlanded mutation reads exactly like a gap in
+the suite.
+
+The common cause is a pattern that matches a comment before it matches
+code. The executable line stays untouched and the suite stays green. The
+recorded instance is the `#185` skeptic pass. Two of its arms substituted
+a pattern that appears in both the comments and the code of
+`monitor/pane-state.sh`, at lines 223, 227 and 247. Both stayed green.
+Re-targeted at the executable lines 774 and 799, both turn red. That
+skeptic caught its own error by diffing the mutated file, not by trusting
+the green.
+
+So make the harness enforce it, rather than remembering to check:
+
+| Step | Rule |
+|---|---|
+| After the mutation, before the suite | Abort when the tree is unchanged. Print the changed checksums and the diff |
+| After the suite | Restore the tree, then re-check the checksums |
+| On a restore mismatch | Abort the whole sweep, so no later arm inherits a corrupted tree |
+| Once, before the real arms | Run an arm that mutates nothing, and confirm it aborts |
+
+Give each abort its own exit code, so an abort cannot be read as a pass.
+The last row is not optional. A guard that has never fired is a claim,
+not a control.
+
+Two reference implementations exist, and they share no code. `#187`
+carries the `manifest-pin` arm harness. The `#186` skeptic pass carries
+an independent one, written from scratch, which substitutes with
+`python3` and asserts on the substitution count. Both abort at exit 98 on
+an unlanded mutation, and at exit 99 on a failed restore. The second
+self-tested its own guard on a no-op arm and aborted at 98, as it should.
+
 **Proportionality still applies.** Spend the verification budget where
 being wrong is expensive — a merge, a figure, a gene list, an external
 write, a multi-day run. A cosmetic change gets a glance. But when
@@ -733,6 +769,24 @@ All written to `monitor/.state/action-log.jsonl`:
 - `skeptic-decision` — an `auto`/`deny`/`waived` decision was recorded.
 - `skeptic-escalate` — issues persist at the depth cap; operator needed.
 - `skeptic-nudge` — a worker was nudged about pending requests.
+
+**The action log is BOUNDED telemetry, not a durable record.** Do not
+treat a `skeptic-` event as evidence that will still exist later. The
+watcher rotates `action-log.jsonl` once it reaches
+`monitor.state_log_max_bytes` (default **10485760 bytes**,
+`monitor/watcher/_config.sh:371`), then deletes rotated archives older
+than `monitor.diff_retention_days` (default **7 days**,
+`monitor/watcher/_config.sh:31`). Both steps run in
+`_prune_rotate_if_oversized` (`monitor/watcher/main.sh:2267`, called for
+the action log at `monitor/watcher/main.sh:2455`). So a `skeptic-request`
+event is erasable within 7 days of a rotation.
+
+The pending marker is what persists, and no gate reads the action log in
+its place. Two consequences. An audit that asks "was a skeptic ever
+required for this window?" from the action log alone can get a false no.
+And a tool that clears a pending marker on the strength of a logged
+event, instead of on a verdict, destroys the only remaining record that
+the validation never happened (`#202`).
 
 The `skeptic-pending` markers under `monitor/.state/skeptic/pending/`
 are the orchestrator's gate: a window with a pending marker has produced

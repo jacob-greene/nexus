@@ -39,6 +39,7 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | skeptic | an independent agent that adversarially rechecks another worker's result |
 | skeptic round | one validation pass, from the request that opens it to the verdict that closes it |
 | verdict | the skeptic's ruling on a worker's result, which closes the skeptic round |
+| pending marker | the file `monitor/.state/skeptic/pending/<window>`, which marks a worker as awaiting a skeptic |
 | head | the tip commit of a pull request's branch |
 | validated head | the exact commit a verdict states it covers, which the verdict does not extend past |
 | verdict trailer | the `Skeptic-Verdict:` line in a pull-request body that names the verdict and its validated head |
@@ -59,12 +60,12 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | fixture | a recorded pane capture that a test replays in place of a live tmux pane |
 | tracked fixture | a fixture committed to the repository, so its absence is a broken checkout and never a normal condition |
 | silent skip | a test the harness does not run, does not count, and does not report, so the suite still reads green |
+| mutation arm | one deliberate break of the code under test, run to prove that a stated assertion turns the suite red |
+| landed-mutation proof | a checksum and a diff taken after a mutation and before the suite runs, so a green arm cannot be a mutation that never applied |
 | dangling symlink | a symbolic link whose target does not exist |
-| mutation arm | one deliberate break of the tree under test, run to prove that a stated assertion turns the suite red |
 | negative control | a mutation arm that must turn the suite red, so a green result marks a hole in the suite |
 | masked assertion | an assertion that passes against broken code, because a different check rejects its input first |
 | per-assertion attribution | the rule that a mutation arm counts as caught only when the assertion it targets turns red |
-| landed-mutation proof | a checksum taken after a mutation and before the suite run, so a green arm cannot be an unapplied mutation |
 | hermetic suite | a suite that writes only inside its own sandbox, so no run can change the result of a later run |
 
 ## Project terms
