@@ -11,7 +11,11 @@
 #        `idle Ns` / `idle Nh NNm` / `idle-too-long` ages collapse,
 #        the `N awaiting-input` prelude scalar collapses to
 #        `awaiting-input` (issue #152 — the volatile delta that
-#        toggles 1↔0 every cycle a worker re-pings), and the trailing
+#        toggles 1↔0 every cycle a worker re-pings), the dead-window
+#        skeptic-pending row's `marker Ns old` / `marker NhNNm old`
+#        age collapses to `marker old` (issue #202 — the marker is
+#        never cleared automatically, so the row persists and its age
+#        advances on every poll), and the trailing
 #        `--- nexus-emit-sig <iso> <nonce> ---` footer is dropped.
 #   2. _compose_emit_should_bypass_dedup <body_file>
 #        Returns 0 (bypass) ONLY if the body carries an eligible
