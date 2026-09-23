@@ -236,6 +236,43 @@ _over_limit_sanitize_key() {
     printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'
 }
 
+# Exit 0 when `$1` names a timezone the C library can actually resolve.
+#
+# WHY THIS EXISTS. An invalid TZ string does NOT make `date` fail. glibc
+# resolves the time in UTC and exits 0, so the parser's only guard — the
+# epoch being numeric — passes, and a confidently wrong deadline is
+# stored with no error and no fallback.
+#
+# Measured on 2026-09-10 (jacob-greene/nexus#79). A scan-window row
+# carried the closing quote of the source line it came from, so the
+# extracted token was `3am_America/Los_Angeles"` rather than
+# `3am_America/Los_Angeles`. The zone was dropped, 3am resolved in UTC,
+# and the deadline rolled to the next occurrence:
+#
+#   | Token fed to the parser     | Hold from latch |
+#   |-----------------------------|-----------------|
+#   | `3am_America/Los_Angeles`   | 3.75 h          |
+#   | `3am_America/Los_Angeles"`  | 20.75 h         |
+#
+# Neither the 25 h MAX_HOLD ceiling nor the 27 h stamp TTL clamps
+# 20.75 h, so nothing downstream caught it. The guard has to be here.
+#
+# Two checks, in order. The charset check rejects the stray punctuation
+# that caused the incident. The tzdata lookup rejects a syntactically
+# clean name that does not exist — glibc treats `PDT` or
+# `America/Nowhere` the same way it treated the quoted token, as UTC.
+# When the host has no tzdata at all, the charset check is all we can
+# offer, so we accept and let the caller proceed.
+_over_limit_tz_resolves() {
+    local tz="$1" dir
+    [[ -n "$tz" ]] || return 1
+    [[ "$tz" =~ ^[A-Za-z0-9_+/.-]+$ ]] || return 1
+    [[ "$tz" != *..* ]] || return 1
+    dir="${TZDIR:-/usr/share/zoneinfo}"
+    [[ -d "$dir" ]] || return 0
+    [[ -f "$dir/$tz" ]]
+}
+
 # Convert a reset_at token to a unix epoch. See header for shape rules.
 # Always prints an integer epoch; never fails the pipeline.
 _over_limit_reset_at_to_epoch() {
@@ -254,6 +291,15 @@ _over_limit_reset_at_to_epoch() {
     # Wrap the TZ in a subshell env-prefix when present so we don't bleed
     # TZ into the surrounding process.
     if [[ -n "$tz_part" ]]; then
+        # An unresolvable zone falls to the 6h net rather than to a
+        # silent UTC resolution. A blind 6h hold is recoverable; a
+        # confident 20.75h one is not.
+        if ! _over_limit_tz_resolves "$tz_part"; then
+            "$_OVER_LIMIT_LOG_FN" \
+                "over-limit: reset_at token '${token}' names an unresolvable timezone '${tz_part}'; falling back to the blind 6h deadline"
+            printf '%d' "$fallback"
+            return 0
+        fi
         epoch=$(TZ="$tz_part" date -d "$time_part today" +%s 2>/dev/null)
     else
         epoch=$(date -d "$time_part today" +%s 2>/dev/null)
