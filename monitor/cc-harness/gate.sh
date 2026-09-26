@@ -166,6 +166,30 @@ else
         # did, stranding every work/<project> worker spawn pre-REPL on a
         # dialog that classified `empty` and matched no unstick case.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-nested-trust.sh"
+        # VI-safe paste (GUIDE.md surface 2c). Every other scenario
+        # either types with `send-keys <text>` or stubs the paste
+        # function outright (test-realmodel-overlimit.sh swaps in
+        # `_ol_test_paste`, which only appends to a log). So no scenario
+        # ran the PRODUCTION `i BSpace` + `paste-buffer` sequence against
+        # the candidate, and VI-mode drift — a lost paste, which reads as
+        # a silent worker — would pass this gate green.
+        # It boots with `editorMode: "vim"` and drops the input box to
+        # normal mode FIRST: with the box already in insert mode (the
+        # production default) the `i` guard is inert and the scenario
+        # pins nothing. It drives two of the four production paste
+        # implementations — the respawn form (`paste-buffer -b`) and the
+        # bracketed follow-up form (`paste-buffer -p -d -b`), which is a
+        # separate terminal contract. The plain form pins all three
+        # steps; the bracketed form pins delivery and submit only,
+        # because a bracketed paste is literal in any mode. See the
+        # scenario header — that asymmetry is measured, not assumed.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
+        # Hook + settings contract (GUIDE.md surface 2d). cch_boot_worker
+        # is renderer-path only and never passes `--settings`, so the
+        # hook-event names, the matcher syntax and the PreToolUse exit-2
+        # block were never exercised against a candidate. A silently
+        # disabled hook is the one breakage class the watcher cannot see.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-hooks.sh"
     )
 fi
 

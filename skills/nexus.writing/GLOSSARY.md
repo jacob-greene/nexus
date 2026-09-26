@@ -67,6 +67,13 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | masked assertion | an assertion that passes against broken code, because a different check rejects its input first |
 | per-assertion attribution | the rule that a mutation arm counts as caught only when the assertion it targets turns red |
 | hermetic suite | a suite that writes only inside its own sandbox, so no run can change the result of a later run |
+| collision surface | one nexus file or contract that a Claude Code release can break, listed in `skills/nexus.cc-update/GUIDE.md` |
+| cc-harness gate | `monitor/cc-harness/gate.sh`, which drives a candidate Claude Code binary and asserts the pane classifier still works |
+| local pin | `monitor/.state/cc-version-local`, the gitignored file that sets the Claude Code version this operator runs |
+| version floor | the `package.json` Claude Code version, used only for a fresh install that has no local pin |
+| bracketed paste | a paste that tmux wraps in the terminal's paste markers (`paste-buffer -p`), so the receiving program reads the text as one literal block |
+| watch item | a release change that does not block a version bump, but that an operator must check if the behaviour it names misbehaves later |
+| barrier assertion | a negative assertion made only after an event that must order after the thing asserted absent, so no timer decides the verdict |
 
 ## Project terms
 
