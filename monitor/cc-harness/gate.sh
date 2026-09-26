@@ -125,7 +125,17 @@ if [[ -n "$version" ]]; then
 fi
 
 if [[ -z "$claude_bin" ]]; then
-    claude_bin="$REPO_ROOT/node_modules/.bin/claude"
+    # No --claude-bin and no candidate install: gate whatever this nexus
+    # actually runs, via the shared resolver. Testing the npm path
+    # directly failed outright on a nexus pinned to a native install
+    # (config `nexus.claude_bin`), where that path does not exist.
+    claude_bin=$(
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 && printf '%s' "$CLAUDE_BIN"
+    ) || claude_bin=""
+    [[ -n "$claude_bin" ]] || claude_bin="$REPO_ROOT/node_modules/.bin/claude"
 fi
 [[ -x "$claude_bin" ]] || { echo "gate.sh: no executable claude at $claude_bin" >&2; exit 1; }
 
