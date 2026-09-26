@@ -62,6 +62,11 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | silent skip | a test the harness does not run, does not count, and does not report, so the suite still reads green |
 | mutation arm | one deliberate break of the code under test, run to prove that a stated assertion turns the suite red |
 | landed-mutation proof | a checksum and a diff taken after a mutation and before the suite runs, so a green arm cannot be a mutation that never applied |
+| dangling symlink | a symbolic link whose target does not exist |
+| negative control | a mutation arm that must turn the suite red, so a green result marks a hole in the suite |
+| masked assertion | an assertion that passes against broken code, because a different check rejects its input first |
+| per-assertion attribution | the rule that a mutation arm counts as caught only when the assertion it targets turns red |
+| hermetic suite | a suite that writes only inside its own sandbox, so no run can change the result of a later run |
 | collision surface | one nexus file or contract that a Claude Code release can break, listed in `skills/nexus.cc-update/GUIDE.md` |
 | cc-harness gate | `monitor/cc-harness/gate.sh`, which drives a candidate Claude Code binary and asserts the pane classifier still works |
 | local pin | `monitor/.state/cc-version-local`, the gitignored file that sets the Claude Code version this operator runs |

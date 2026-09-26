@@ -312,6 +312,18 @@ Re-targeted at the executable lines 774 and 799, both turn red. That
 skeptic caught its own error by diffing the mutated file, not by trusting
 the green.
 
+**In Python, a correct proof is still not sufficient.** The proof shows
+that the source changed, not that the interpreter read the change.
+CPython reuses a cached `.pyc` file while the recorded source size and
+modification second both still match. A backup copy and a mutation that
+land inside one second keep that match. The arm then runs against the
+old bytecode, with a correct checksum and a correct diff. The tell is a
+clean `git status` beside a suite that stays red after the restore.
+
+Four arms of a nineteen-arm sweep were invalid this way before the
+skeptic caught it. Set `PYTHONDONTWRITEBYTECODE=1` for every arm, or
+delete `__pycache__` before and after every arm.
+
 So make the harness enforce it, rather than remembering to check:
 
 | Step | Rule |

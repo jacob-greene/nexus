@@ -94,15 +94,30 @@ cch_skip_if_disabled() {
 }
 
 # Resolve the claude binary. Honors CLAUDE_BIN (the pre-update gate sets
-# this to a candidate-version install in a throwaway prefix); else the
-# project-local install. Echoes the path; rc=1 if none found.
+# this to a candidate-version install in a throwaway prefix); else
+# whatever monitor/_claude-bin.sh resolves. Echoes the path; rc=1 if none
+# found.
+#
+# Going through the shared resolver matters here: on a nexus pinned to a
+# native install (config `nexus.claude_bin`) there is no npm tree, so the
+# old direct test found nothing and EVERY harness scenario self-skipped —
+# a gate that quietly stops gating is worse than one that fails.
 cch_resolve_claude() {
     if [[ -n "${CLAUDE_BIN:-}" ]] && [[ -x "$CLAUDE_BIN" ]]; then
         printf '%s' "$CLAUDE_BIN"; return 0
     fi
-    local local_bin="$CCH_REPO_ROOT/node_modules/.bin/claude"
-    if [[ -x "$local_bin" ]]; then
-        printf '%s' "$local_bin"; return 0
+    local resolved
+    resolved=$(
+        # A set-but-unusable CLAUDE_BIN already failed the -x test above;
+        # clear it so the resolver does not hand it straight back.
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$CCH_REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$CCH_REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+            && printf '%s' "$CLAUDE_BIN"
+    ) || resolved=""
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+        printf '%s' "$resolved"; return 0
     fi
     return 1
 }

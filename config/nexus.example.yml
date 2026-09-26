@@ -38,6 +38,34 @@ nexus:
   # See <your-org>/<other-nexus>#41.
   node_module: nodejs
 
+  # Absolute path to a Claude Code binary OUTSIDE this repo — the escape
+  # hatch for an operator who runs the NATIVE Claude Code install rather
+  # than the npm one. LEAVE UNSET (the default) to use the npm install
+  # managed by monitor/install-claude-local.sh; the whole npm path below
+  # is untouched when this key is absent.
+  #
+  # When set, monitor/_claude-bin.sh resolves $CLAUDE_BIN to this path
+  # for EVERY spawn surface (workers, the orchestrator respawn, the
+  # watcher, claude-loop, the cc-harness), and locals/bin/claude is
+  # linked to it so PATH-based resolution agrees. It outranks
+  # node_modules/.bin/claude on purpose: a re-appearing npm tree must not
+  # be able to silently take the workspace back off the operator's
+  # choice. Only the CLAUDE_BIN env var wins over it.
+  #
+  # Two consequences worth knowing before you set it:
+  #   - monitor/install-claude-local.sh REFUSES to run (it would leave an
+  #     unused node_modules behind). Override: CLAUDE_INSTALL_ALLOW_PINNED=1.
+  #   - the autonomous cc-update routine (monitor/cc-auto-update-apply.sh)
+  #     REFUSES to apply a bump (exit 32): it bumps by npm install, which
+  #     cannot move a native binary. Keep the native install current
+  #     yourself; the cc-harness gate still runs against whatever this
+  #     names.
+  # A path that is set but not executable is a FATAL error at every spawn
+  # surface — deliberately, so a typo cannot degrade into "quietly ran a
+  # different claude than you asked for". `~` expands to $HOME.
+  # Env var CLAUDE_BIN wins over this key.
+  # claude_bin: ~/.local/bin/claude
+
 github:
   # GitHub login of the single authorised user. Every script treats
   # comments by this user as directives; nobody else can drive the bot.
