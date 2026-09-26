@@ -1937,6 +1937,42 @@ _compose_report_body() {
 #   2  target window missing
 #   3  paste / submit tmux API call failed
 #   4  paste submitted but signature not visible in pane
+# True (0) when the target's input box still holds the pasted emit: the
+# signature, or a collapsed `[Pasted text #N` placeholder, appears on or
+# below the LAST input-chevron row (`❯` + NBSP). A submitted message is
+# echoed ABOVE the fresh, empty input row, so it never matches.
+_paste_input_holds_sig() {
+    local tgt="$1" sig="$2" nbsp=$'\xc2\xa0'
+    tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
+        | awk -v chev="❯${nbsp}" -v sig="$sig" '
+            index($0, chev) { n = NR; delete buf; k = 0 }
+            n { buf[++k] = $0 }
+            END {
+                for (i = 1; i <= k; i++)
+                    if (index(buf[i], sig) || index(buf[i], "[Pasted text #")) exit 0
+                exit 1
+            }'
+}
+
+# Retry the Enter once if the paste is still sitting unsubmitted in the
+# input box (see the call site in paste_to_target). Logs only when it
+# acts, so a healthy workspace stays quiet.
+_paste_submit_confirm() {
+    local tgt="$1" sig="$2" name="${3:-$1}" i
+    for i in 1 2 3; do
+        _paste_input_holds_sig "$tgt" "$sig" || return 0
+        sleep 0.3
+    done
+    tmux send-keys -t "$tgt" Enter 2>/dev/null || true
+    sleep 0.5
+    if _paste_input_holds_sig "$tgt" "$sig"; then
+        log "paste-submit: ${name}: emit still unsubmitted after one Enter retry (liveness state machine will follow up)"
+        return 1
+    fi
+    log "paste-submit: ${name}: first Enter was swallowed; retried Enter submitted the emit"
+    return 0
+}
+
 paste_to_target() {
     local target="$1" body_file="$2" stamp_mode="${3:-stamp}"
     command -v tmux >/dev/null 2>&1 || return 1
@@ -1974,6 +2010,17 @@ paste_to_target() {
     if [[ -n "$sig" ]]; then
         tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
             | grep -qF -e "$sig" || return 4
+        # Submit confirmation (jacob-greene/nexus#221). The signature
+        # being visible proves the text LANDED, not that the Enter
+        # SUBMITTED it. Claude Code 2.1.277 through at least 2.1.283
+        # swallows the first Enter after a small multi-line plain paste
+        # (measured: 419-byte, 7-line body stuck 6/6 on 2.1.280, 0/6 on
+        # 2.1.276); the text sits in the input box until someone presses
+        # Enter. So: if the signature is still inside the input box,
+        # press Enter once more. Bounded to one retry; the orchestrator-
+        # liveness state machine stays the backstop. The return code is
+        # unchanged (the text landed), so no caller re-pastes it.
+        _paste_submit_confirm "$tgt" "$sig" "$target"
     fi
     # Refresh the orchestrator-liveness pin (issue #150). A successful
     # round-trip here is the strongest "orch is reachable" signal the
