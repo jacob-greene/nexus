@@ -131,6 +131,11 @@ newwin() { tmux new-window -d -t "$1:" -n "$2" -P -F '#{window_id}' sleep 600; }
 board_up() {   # S with orchestrator, services, worker; optional grouped G
     cleanup_sessions
     tmux new-session -d -s "$S" -n orchestrator -x 80 -y 24 sleep 600 || return 1
+    # The server's PID, recorded while it can still be asked (#1576): leg L
+    # below answers "did a server outlive this suite" from these handles. Each
+    # `cleanup_sessions` ends the server with its last session, so a run starts
+    # several; a file rather than an array so a subshell caller still records.
+    tmux display-message -p '#{pid}' >> "$WORK/server.pids" 2>/dev/null || true
     newwin "$S" services >/dev/null; newwin "$S" worker >/dev/null
     tmux set-option -t "$S" automatic-rename off >/dev/null 2>&1 || true
     if [[ "${1-}" == grouped ]]; then tmux new-session -d -t "$S" -s "$G" || return 1; fi
@@ -312,6 +317,9 @@ sel "$S" orchestrator
 TMUX_WINDOW_TMUX_CMD=/bin/false tmux_selection_capture orchestrator "$CAP"; rc=$?
 assert_rc "A10 capture with a dead tmux: rc 3" "$rc" 3
 assert_no_file "A10 ...writes nothing" "$CAP"
+# (#1562) …and SAYS WHY. rc 3 has three causes and every caller discards it
+# `|| true`; without the reason a failed capture is a deleted file and nothing else.
+assert_contains "A10 ...and names the cause: tmux's own exit status" "$TMUX_SELECTION_WHY" "tmux-exit=1"
 tmux_selection_capture orchestrator "$CAP"; kill_orch "$S"; tmux_selection_note_post_kill "$CAP"
 new=$(newwin "$S" orchestrator); before=$(act "$S")
 out=$(TMUX_WINDOW_TMUX_CMD=/bin/false tmux_selection_restore "$new" "$CAP"); rc=$?
@@ -325,6 +333,20 @@ printf '#!/usr/bin/env bash\nprintf "orchestrator\\nservices\\n"\n' > "$WORK/nam
 TMUX_WINDOW_TMUX_CMD="$WORK/namesonly" tmux_selection_capture orchestrator "$CAP"; rc=$?
 assert_rc "A10b unparseable rows: rc 3" "$rc" 3
 assert_no_file "A10b ...nothing written" "$CAP"
+assert_contains "A10b ...and names the cause: the rejected ROW, not a tmux outage (#1562)" "$TMUX_SELECTION_WHY" "bad-row=orchestrator"
+assert_not_contains "A10b ...a rejected row is NOT reported as tmux failing" "$TMUX_SELECTION_WHY" "tmux-exit="
+# A third cause behind the same rc 3: tmux answers, the file cannot be written.
+TMUX_SELECTION_WHY=stale-from-before
+tmux_selection_capture orchestrator "$WORK/no-such-dir/cap"; rc=$?
+assert_rc "A10d unwritable capture path: rc 3" "$rc" 3
+assert_contains "A10d ...names the write, not tmux (#1562)" "$TMUX_SELECTION_WHY" "could not write"
+# MUST-NOT: a SUCCESSFUL capture leaves no reason behind — a stale reason from an
+# earlier failure would be logged against a capture that worked.
+TMUX_SELECTION_WHY=stale-from-before
+tmux_selection_capture orchestrator "$CAP"; rc=$?
+assert_rc "A10e a good capture: rc 0" "$rc" 0
+assert_eq "A10e ...and the reason is CLEARED, not left over from the failure before it" "$TMUX_SELECTION_WHY" ""
+rm -f "$CAP"
 # Garbage in the file: unreadable, consumed, nothing moved.
 printf 'not a capture\n' > "$CAP"
 out=$(tmux_selection_restore "$new" "$CAP"); rc=$?
@@ -630,9 +652,11 @@ assert_eq "E3 main.sh sources the helper that defines it" "$(grep -c 'source "\$
 
 echo "== C: the cc-update verb's call ORDER (source read) =="
 n_cap=$(grep -n 'tmux_selection_capture "\$TARGET_WINDOW" "\$_SEL_CAPTURE_FILE"' "$CCAPPLY" | head -n1 | cut -d: -f1)
-n_wdkill=$(grep -n 'kill-window -t "\$WATCHDOG_WINDOW"' "$CCAPPLY" | head -n1 | cut -d: -f1)
+# The stale-watchdog kill names the EXACT window too since your-org/nexus-code#1627 — keyed on that spelling.
+n_wdkill=$(grep -n 'kill-window -t ":=\$WATCHDOG_WINDOW"' "$CCAPPLY" | head -n1 | cut -d: -f1)
 n_refresh=$(grep -n 'tmux_selection_capture --refresh "\$TARGET_WINDOW" "\$_SEL_CAPTURE_FILE"' "$CCAPPLY" | head -n1 | cut -d: -f1)
-n_kill=$(grep -n '"\$TMUX_CMD" kill-window -t "\$TARGET_WINDOW" 9>&-' "$CCAPPLY" | head -n1 | cut -d: -f1)
+# The kill names the EXACT window, `:=` (your-org/nexus-code#1524) — keyed on that spelling.
+n_kill=$(grep -n '"\$TMUX_CMD" kill-window -t ":=\$TARGET_WINDOW" 9>&-' "$CCAPPLY" | head -n1 | cut -d: -f1)
 n_post=$(grep -n 'tmux_selection_note_post_kill "\$_SEL_CAPTURE_FILE"' "$CCAPPLY" | head -n1 | cut -d: -f1)
 for v in n_cap n_wdkill n_refresh n_kill n_post; do
     [[ "${!v}" =~ ^[0-9]+$ ]] || { printf '  FAIL: C site %s not found in %s\n' "$v" "$CCAPPLY" >&2; _th_fail; }
@@ -653,13 +677,90 @@ assert_eq "C2 ...and that is the ONLY drop (no per-exit rm list)" "$(grep -c 'rm
 assert_eq "C2 both bookkeeping globals are initialised at file scope (set -u safe in the trap)" \
     "$(grep -cE '^_SEL_(CAPTURE_FILE=""|KILL_REACHED=0)$' "$CCAPPLY")" 2
 # The capture calls go through the verb's tmux seam and close the lock fd.
-assert_eq "C3 all three helper calls carry the CC_AUTO_TMUX seam and 9>&-" \
-    "$(grep -cE 'TMUX_WINDOW_TMUX_CMD="\$TMUX_CMD" tmux_selection_(capture|note_post_kill) .*9>&- \|\| true$' "$CCAPPLY")" 3
+# (#1562) They used to be three lines each ending `9>&- || true`, which is what
+# made a failed capture silent. They now go through `_sel_step`, which carries
+# the seam and the fd close ONCE and notes a non-zero status; so the pin is on
+# that one line, on all three calls using it, and on NO bare call surviving.
+assert_eq "C3 all three helper calls go through _sel_step" \
+    "$(grep -cE '^    _sel_step (initial|refresh|post-kill) tmux_selection_(capture|note_post_kill) ' "$CCAPPLY")" 3
+assert_eq "C3 _sel_step carries the CC_AUTO_TMUX seam and 9>&-, and keeps the status" \
+    "$(awk '/^_sel_step\(\) \{/,/^}/' "$CCAPPLY" | grep -cE '^    TMUX_WINDOW_TMUX_CMD="\$TMUX_CMD" "\$@" 9>&- \|\| rc=\$\?$')" 1
+assert_eq "C3 ...and notes a failure with the helper's own reason" \
+    "$(awk '/^_sel_step\(\) \{/,/^}/' "$CCAPPLY" | grep -c 'note "restart: selection capture (\$label) FAILED rc=\$rc — \${TMUX_SELECTION_WHY')" 1
+assert_eq "C3 no selection helper call discards its status any more (#1562)" \
+    "$(grep -cE 'tmux_selection_(capture|note_post_kill) .*\|\| true' "$CCAPPLY")" 0
+
+echo "== L: #1576 — no private tmux SERVER outlives this suite, asked by recorded pid =="
+# WHAT LEAKED. This suite's EXIT trap ran, in REGISTRATION order: `rm -rf $WORK`
+# (the PATH-front shim that pins the socket), then the fixture's `rm -rf` of the
+# socket directory, and only THEN `cleanup_sessions` — which could by then
+# address nothing, so it listed nothing and killed nothing. Every run left a
+# `tmux: server` with its socket unlinked: its own session leader, refused
+# `not-owned` by proc-kill-authorized, unreachable by `-L` or `-S`. 57 were
+# alive on the reporting host on 2026-09-19. The fix is at source, in
+# `_tmux-fixture.sh`: whoever deletes the sockets stops the servers first.
+#
+# ASKED BY PID, never by name: a `ps | grep nx1528` cannot tell this run's
+# server from the 57 others, nor from an agent whose PROMPT quotes the string
+# (your-org/nexus-code#1073). The comm test is the pid-reuse guard.
+_srv_alive() {   # <pid> -> rc 0 while <pid> is still a tmux server
+    [[ "$(cat "/proc/$1/comm" 2>/dev/null)" == "tmux: server" ]]
+}
+_srv_wait_gone() {   # <pid> -> rc 0 once gone; polled, bounded
+    local t0=$SECONDS lim; lim=$(th_deadline 15)
+    while _srv_alive "$1" && (( SECONDS - t0 < lim )); do sleep 0.1; done
+    ! _srv_alive "$1"
+}
+
+# L1 — this run's OWN servers, on the explicit road.
+cleanup_sessions
+nx_tmux_fixture_stop_servers
+_n_srv=$(sort -u "$WORK/server.pids" 2>/dev/null | grep -cE '^[0-9]+$' || true)
+assert_eq "L1 this run recorded the pid of at least one private server (else L1 asserts nothing)" \
+    "$(( _n_srv >= 1 ? 1 : 0 ))" 1
+_survivors=""
+while IFS= read -r _p; do
+    [[ "$_p" =~ ^[0-9]+$ ]] || continue
+    _srv_wait_gone "$_p" || _survivors="$_survivors $_p"
+done < <(sort -u "$WORK/server.pids" 2>/dev/null)
+assert_eq "L1 every private server this run started is GONE after teardown" "$_survivors" ""
+
+# L2 — THE ROAD THAT ACTUALLY LEAKED: the EXIT trap, with no explicit teardown
+# at all. A suite cannot assert on its own EXIT trap, so a child shaped like
+# the leak does it: fixture init, one private server, then `exit` — nothing
+# else. With the fixture's stop removed this child's server survives it, which
+# is what makes D2 the case that FAILS WITHOUT THE FIX.
+cat > "$WORK/leakchild.sh" <<'LEAKCHILD'
+#!/usr/bin/env bash
+set -uo pipefail
+. "$1/_test_helpers.sh"
+. "$1/_tmux-fixture.sh"
+W=$(mktemp -d -t nx1576c-XXXXXX) || exit 9
+printf '%s\n' "$W" > "$3"
+th_trap_exit "rm -rf $(printf '%q' "$W") 2>/dev/null || true"
+nx_tmux_fixture_init "$W" || exit 9
+real=$(nx_real_tmux_bin) || exit 9
+th_tmux_fixture_conf "$W/tmux.conf"
+env -u TMUX "$real" -L "c1576-$$" -f "$W/tmux.conf" new-session -d -s leak -x 80 -y 24 sleep 600 || exit 9
+env -u TMUX "$real" -L "c1576-$$" display-message -p '#{pid}' > "$2" || exit 9
+exit 0
+LEAKCHILD
+bash "$WORK/leakchild.sh" "$_test_dir" "$WORK/leak.pid" "$WORK/leak.root" >/dev/null 2>&1; _lc_rc=$?
+_lp=$(cat "$WORK/leak.pid" 2>/dev/null || true)
+assert_eq "L2 the child started a private server and recorded its pid (rc $_lc_rc)" \
+    "$( [[ "$_lc_rc" == 0 && "$_lp" =~ ^[0-9]+$ ]] && echo recorded || echo "NOT-recorded" )" recorded
+_d2=gone; [[ "$_lp" =~ ^[0-9]+$ ]] && { _srv_wait_gone "$_lp" || _d2="ALIVE pid $_lp"; }
+assert_eq "L2 …and that server is GONE once the child has left through its EXIT trap ALONE" "$_d2" gone
+# If L2 just failed there is a leaked server, and it is this suite's to remove:
+# identity-verified against the child's unique fixture root, never by name.
+if [[ "$_d2" != gone ]]; then
+    th_kill_fixture_pid "$_lp" "$(cat "$WORK/leak.root" 2>/dev/null)" TERM || true
+fi
 
 # ---- assertion-count guard (count=exact, summary-honesty) -------------------
 # The ledger certifies that SOMETHING was asserted; only an exact count makes a
 # VANISHED assertion redden. ONE physical line, as the classifier requires.
-EXPECTED_ASSERTIONS=160
+EXPECTED_ASSERTIONS=174
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 assert_eq "assertion TOTAL matches EXPECTED_ASSERTIONS — no assertion silently dropped or added" "$TOTAL_ASSERTIONS" "$EXPECTED_ASSERTIONS"
 

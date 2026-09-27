@@ -7,10 +7,11 @@
 # editable without touching respawn_agent's control flow.
 #
 # your-org/your-nexus#238: both prompts now carry an explicit
-# "(re-)arm the watcher-supervisor Monitor as your FIRST post-validation
-# action" step, with the exact Monitor command passed in by respawn_agent
-# (computed via _supervisor_monitor_command). The in-process supervisor
-# Monitor dies with the old orchestrator process, so a respawn is exactly
+# "(re-)arm the watcher supervisor as your FIRST post-validation action"
+# step, with the exact instruction passed in by respawn_agent (computed via
+# _supervisor_arm_instruction: the persistent longjob watch, with the
+# Monitor lease as the NOT-ARMED fallback, your-org/nexus-code#1532). The
+# in-process supervisor dies with the old orchestrator process, so a respawn is exactly
 # the moment it must be re-armed; injecting it into the turn-1 prompt
 # closes the post-respawn gap DETERMINISTICALLY (no waiting on a
 # heartbeat-staleness threshold or a signal-driven emit). Placed in the
@@ -32,7 +33,7 @@
 
 # Args: $1 target window name, $2 watcher-recorded reason,
 #       $3 resume command label (e.g. "claude --resume <sid>"),
-#       $4 supervisor-arm Monitor command (from _supervisor_monitor_command;
+#       $4 supervisor-arm instruction (from _supervisor_arm_instruction;
 #          issue #238 — re-arm step injected into the "watcher was right" branch)
 _respawn_render_prompt_resume() {
     local target="$1" reason="$2" resume_cmd_label="$3" sup_cmd="${4:-}"
@@ -67,13 +68,13 @@ Before resuming routine work:
      (\`@N\`), never names — names are ambiguous while two windows exist.
 
 2. If the watcher was right, your FIRST action is to (re-)arm the
-   watcher-supervisor Monitor. It was an in-process \`Monitor\` loop that
-   died with your predecessor's process — until you re-arm it, a watcher
-   CRASH has NO turn-independent revival (mutual-liveness contract). Arm it
-   now, before routine work:
+   watcher supervisor. It lived in your predecessor's process (a persistent
+   longjob watch, or the fallback \`Monitor\` lease) and died with it —
+   until you re-arm it, a watcher CRASH has NO turn-independent revival
+   (mutual-liveness contract). Arm it now, before routine work:
      ${sup_cmd}
-   On its exit (watcher reported DOWN) run \`monitor/revive-watcher.sh\`,
-   then re-arm; see skills/nexus.service-recovery.
+   The watch revives a dead watcher itself and wakes you for the record;
+   see skills/nexus.service-recovery.
 
 3. Then continue per monitor/agent-prompt.md — your prior conversation is
    intact via \`${resume_cmd_label}\`.
@@ -86,7 +87,7 @@ PROMPT
 }
 
 # Args: $1 target window name, $2 watcher-recorded reason,
-#       $3 supervisor-arm Monitor command (from _supervisor_monitor_command;
+#       $3 supervisor-arm instruction (from _supervisor_arm_instruction;
 #          issue #238 — re-arm step injected into the "watcher was right" branch)
 _respawn_render_prompt_fresh() {
     local target="$1" reason="$2" sup_cmd="${3:-}"
@@ -129,13 +130,13 @@ Before resuming routine work:
      (\`@N\`), never names — names are ambiguous while two windows exist.
 
 2. If the watcher was right, your FIRST action is to (re-)arm the
-   watcher-supervisor Monitor. It was an in-process \`Monitor\` loop that
-   died with your predecessor's process — until you re-arm it, a watcher
-   CRASH has NO turn-independent revival (mutual-liveness contract). Arm it
-   now, before routine work:
+   watcher supervisor. It lived in your predecessor's process (a persistent
+   longjob watch, or the fallback \`Monitor\` lease) and died with it —
+   until you re-arm it, a watcher CRASH has NO turn-independent revival
+   (mutual-liveness contract). Arm it now, before routine work:
      ${sup_cmd}
-   On its exit (watcher reported DOWN) run \`monitor/revive-watcher.sh\`,
-   then re-arm; see skills/nexus.service-recovery.
+   The watch revives a dead watcher itself and wakes you for the record;
+   see skills/nexus.service-recovery.
 
 3. Re-onboard from scratch: read CLAUDE.md and \`skills/nexus.*\` for your
    role, \`monitor/agent-prompt.md\` for the wake protocol, then

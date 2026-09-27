@@ -142,9 +142,13 @@ SHELL_FILES_LIB="$repo_root/monitor/shell-files.sh"
 # own comments and fixtures by construction — but it now happens INSIDE the
 # enumerator's output rather than as a `find` predicate, so there is exactly one
 # place where the file list is built.
+#
+# `ignored-under-monitor` (your-org/nexus-code#1594): the GITIGNORED files under
+# `monitor/` are read too — an ignored path is unreviewed by definition, and the
+# root `.gitignore` ignores `bin/`, `logs/`, `.config/` … at any depth.
 files0() {   # <root> -> NUL-separated shell files, minus this lint itself
     local f
-    shf_find0 "$1" shell | while IFS= read -r -d '' f; do
+    shf_find0 "$1" shell ignored-under-monitor | while IFS= read -r -d '' f; do
         [[ "${f##*/}" == "$self_base" ]] && continue
         printf '%s\0' "$f"
     done
@@ -152,9 +156,25 @@ files0() {   # <root> -> NUL-separated shell files, minus this lint itself
 
 scan_file() { awk -f "$AWK_SCAN" "$1" 2>/dev/null | sed "s|^|$1:|"; }
 
+# One awk over the whole population (`with_file=1` prefixes FILENAME, the same
+# `<file>:` scan_file's sed adds), in files0's order. The per-file form forked
+# an awk and a sed per file: 22 s a call at load ~50, and the gate calls it
+# twice per run. Output is byte-identical; see _tmux_kill_scan.awk's header.
+#
+# FAIL CLOSED (skeptic B2 on PR #1630). gawk ABORTS at the first file it cannot
+# open (rc 2, `fatal: cannot open file`), so every LATER file in that batch goes
+# unscanned. Discarding the status turned an unreadable or vanished file into a
+# `clean` verdict that skipped a real offender (measured: a mode-000 `0aaa.sh`
+# enumerated before an unscoped kill-server in `zbad.sh` -> rc 0 "clean"; the
+# per-file form lost only the bad file). So the diagnostic is NOT discarded and
+# a non-zero pipeline status is a refusal (rc 3 here; the caller exits 2),
+# never a clean scan. `set -o pipefail` (above) makes the status the pipeline's.
 scan() {
-    local target="$1" f
-    files0 "$target" | while IFS= read -r -d '' f; do scan_file "$f"; done
+    files0 "$1" | xargs -0 -r awk -v with_file=1 -f "$AWK_SCAN" || {
+        local rc=$?
+        printf 'lint-no-tmux-server-kill: SCAN FAILED under %s (rc %d): a file could not be read or vanished mid-scan, so later files were NOT scanned. Refusing to report clean.\n' "$1" "$rc" >&2
+        return 3
+    }
 }
 
 count_pragmas() {
@@ -280,9 +300,32 @@ TMUX_TMPDIR="$T" tmux kill-window -t a:0'
     _expect 'a pragma does NOT exempt rule2' rule2-tmux-tmpdir-insufficient \
 'TMUX_TMPDIR="$T" tmux new-session -d -s x   # tmux-scoped: I promise it is fine'
 
+    # === 2b. an UNREADABLE file must not make the scan report clean =======
+    # (skeptic B2 on PR #1630) The batched awk aborts at the first file it
+    # cannot open; everything after it went unscanned and the lint said clean.
+    # The skeptic's fixture: a mode-000 file enumerated BEFORE a real offender.
+    echo "=== an unreadable file makes the scan REFUSE, never report clean ==="
+    local ud; ud=$(mktemp -d "$tmp/unread.XXXXXX")
+    printf '#!/bin/bash\necho hi\n' > "$ud/0aaa.sh"; chmod 000 "$ud/0aaa.sh"
+    printf '#!/bin/bash\ntmux kill-server\n' > "$ud/zbad.sh"
+    local urc=0; out=$(scan "$ud" 2>&1) || urc=$?
+    _ck "the batched scan REFUSES (non-zero) when a file cannot be read" \
+        $([[ "$urc" != 0 ]] && grep -qF 'SCAN FAILED' <<<"$out" && echo 0 || echo 1) "rc=$urc out=$out"
+    urc=0; out=$(bash "$self_dir/$self_base" "$ud" 2>&1) || urc=$?
+    _ck "…and the lint EXITS 2 (refused), never 'clean'" \
+        $([[ "$urc" == 2 ]] && ! grep -qF ': clean' <<<"$out" && echo 0 || echo 1) "rc=$urc out=$out"
+    chmod 600 "$ud/0aaa.sh"
+
     # === 3. the hazard beyond kill-server ==================================
     echo "=== server-ending operations that are not kill-server ==="
     _expect 'untargeted kill-window' rule3-untargeted-kill 'tmux -L iso kill-window'
+    # The awk's per-line PREFILTER skips a line with no "tmux" once is_tmux_word's
+    # quote/brace set is deleted. These two pin its edges: the word is only
+    # "tmux" AFTER that deletion, and only in lower case (bundle-0923).
+    _expect 'a quote-split tmux word still reaches the rules' rule1-killserver-unscoped \
+'t"mu"x kill-server'
+    _expect 'an UPPER-case tmux variable still reaches the rules' rule3-untargeted-kill \
+'"$TMUX_CMD" kill-window'
     _expect 'untargeted kill-session' rule3-untargeted-kill 'tmux -L iso kill-session'
     _expect 'untargeted kill-pane' rule3-untargeted-kill 'tmux -L iso kill-pane'
     _expect 'a pin naming the DEFAULT socket' rule4-pins-default-socket \
@@ -358,6 +401,28 @@ TMUX_TMPDIR="$T" tmux kill-window -t a:0'
 "trap 'tmux -L \"\$SOCK\" kill-server 2>/dev/null || true' EXIT"
     _expect 'pragma-annotated wrapper call' CLEAN \
 'cch_tmux kill-server 2>/dev/null || true   # tmux-scoped: cch_tmux pins -L "$CCH_SOCKET"'
+
+    # === 5c. a QUOTED argument ending in `;` is a TMUX separator (#1579) ======
+    # tmux ends a command at any argument whose last character is `;`, judged
+    # after the shell removes quotes (#1578). The scanner used to split every
+    # `;` as SHELL punctuation, tearing `'hi;'` apart so the following verb had
+    # no tmux command word: measured, every quoted shape scanned CLEAN.
+    echo "=== a quoted ';'-ended argument separates tmux commands (#1579) ==="
+    _expect "'hi;' kill-server"          rule1-killserver-unscoped "tmux display-message 'hi;' kill-server"
+    _expect '"hi;" kill-server'          rule1-killserver-unscoped 'tmux display-message "hi;" kill-server'
+    _expect "the VERB slot 'list-windows;'" rule1-killserver-unscoped "tmux 'list-windows;' kill-server"
+    _expect "';;' kill-server"           rule1-killserver-unscoped "tmux display-message ';;' kill-server"
+    _expect "'hi;' then an untargeted kill-window" rule3-untargeted-kill "tmux display-message 'hi;' kill-window"
+    _expect "a quoted ';' inside a pinned invocation stays scoped" CLEAN "tmux -L priv display-message 'hi;' kill-server"
+    _expect "control: a MID-word quoted ';' is data"     CLEAN "tmux display-message 'a;b' kill-server"
+    _expect "control: a quoted '\\;' is a literal ';'"   CLEAN "tmux display-message 'hi\\;' kill-server"
+    _expect "control: tmux does not re-split one argument" CLEAN "tmux display-message 'x; kill-server'"
+    _expect "control: 'hi;'x is ONE word not ending in ';'" CLEAN "tmux display-message 'hi;'x kill-server"
+    # semisplitsk2 F6: an EMPTY quote pair glued on adds nothing to the word.
+    _expect "'hi;''' (empty pair glued on) kill-server"  rule1-killserver-unscoped "tmux display-message 'hi;''' kill-server"
+    _expect '"hi;""" (empty pair glued on) kill-server'  rule1-killserver-unscoped 'tmux display-message "hi;""" kill-server'
+    _expect "'hi;'\"\" (mixed empty pair) kill-server"    rule1-killserver-unscoped "tmux display-message 'hi;'\"\" kill-server"
+    _expect "control: 'hi;'''x — the word goes on past the empty pair" CLEAN "tmux display-message 'hi;'''x kill-server"
 
     # === 6. data is not code ===============================================
     echo "=== corpus must not be read as calls ==="
@@ -479,6 +544,12 @@ tmux kill-server 2>/dev/null || true'
 '#!/usr/bin/env -S bash -e
 tmux kill-server'
 
+    # The UNTRACKED-AND-GITIGNORED plant case (your-org/nexus-code#1594 item 1)
+    # needs a real git fixture, and a `git init` in this file is refused by the
+    # cc-update no-remote-code lint (this lint is in its gated population). It
+    # therefore lives in monitor/watcher/test-shell-files.sh, which runs THIS
+    # lint's CLI against that fixture.
+
     # And the population on the REAL tree, positively. `monitor/ng` is the file
     # `#792` is named for; `.zshenv` is the arm-3 member. Both asserted by
     # PRESENCE, so an empty enumeration reds here too.
@@ -533,7 +604,11 @@ esac
 target="${1:-$repo_root/monitor}"
 [[ -d "$target" ]] || { echo "not a directory: $target" >&2; exit 2; }
 
-hits=$(scan "$target")
+hits=$(scan "$target") || {
+    printf '%s\n' "$hits" | sed 's/^/    /' >&2
+    echo "lint-no-tmux-server-kill: REFUSED — the scan did not complete (see above); this is NOT a clean result" >&2
+    exit 2
+}
 if [[ -n "$hits" ]]; then
     explain
     echo "  Offending lines:" >&2

@@ -544,8 +544,11 @@ _t0=$(date +%s)
 _slow_rc=$(probe_b "$_slow" 1)
 _t1=$(date +%s)
 _elapsed=$(( _t1 - _t0 ))
-[[ "$_slow_rc" == "rc=1" ]] && ok "a --help that never returns → gate returns 1" \
-                            || bad "slow --help did not refuse" "got [$_slow_rc]"
+# rc 0, not 1, since the #1626 skeptic pass: a TIMEOUT is UNKNOWN, and UNKNOWN
+# PASSES the flag (a wrong bet dies loudly with `unknown option`; an omitted
+# --name is the silent failure). This row used to pin rc=1, the omit direction.
+[[ "$_slow_rc" == "rc=0" ]] && ok "a --help that never returns → UNKNOWN → gate returns 0 (pass the flag)" \
+                            || bad "slow --help was not read as UNKNOWN" "got [$_slow_rc]"
 (( _elapsed <= 8 )) \
     && ok "…and it returned in ${_elapsed}s against a 30s stub — the BOUND fired, not patience" \
     || bad "the probe was not bounded" "took ${_elapsed}s; the stub sleeps 30s, the bound was 1s"
@@ -567,6 +570,62 @@ grep -q "could not read" "$WORK/warn.txt" \
 grep -q "TIMED OUT" "$WORK/warn.txt" \
     && bad "a plain failure was reported as a TIMEOUT" "the two have different remedies" \
     || ok "…and the two diagnostics do not collapse into each other"
+
+# UNKNOWN IS NEVER CACHED (the #1611 defect, in this probe — skeptic pass on
+# #1626). The timeout used to be cached as `no`, so ONE slow --help made every
+# later ask in the shell omit --name: every `--continue` respawn of a
+# claude-loop.sh worker. In ONE shell: a hang, then the SAME path answering
+# fast. Observed as each call's rc and the cache after it — never recomputed.
+_flip="$WORK/claude-flip"
+cp "$_slow" "$_flip"
+_seq=$( ( set +u
+          NEXUS_ROOT="$REPO_ROOT"; CLAUDE_BIN="$_flip"; NEXUS_CLAUDE_HELP_TIMEOUT=1
+          export NEXUS_ROOT CLAUDE_BIN NEXUS_CLAUDE_HELP_TIMEOUT
+          . "$CLAUDE_BIN_SH" >/dev/null 2>&1
+          claude_supports_name_flag 2>"$WORK/warn-flip.txt"; r1=$?
+          c1="${_CLAUDE_NAME_FLAG_CACHED-UNSET}"; u1=${_CLAUDE_NAME_FLAG_UNKNOWN_REASON:+set}
+          cp "$STUB_YES" "$CLAUDE_BIN"
+          claude_supports_name_flag 2>/dev/null; r2=$?
+          printf '%s,%s,%s|%s,%s' "$r1" "$c1" "${u1:-unset}" "$r2" "${_CLAUDE_NAME_FLAG_CACHED-UNSET}" ) )
+[[ "$_seq" == "0,UNSET,set|0,yes" ]] \
+    && ok "a TIMEOUT is not cached: the next ask in the same shell re-probes and learns YES" \
+    || bad "a timeout's answer outlived the timeout" "got [$_seq] want [0,UNSET,set|0,yes] (the defect read 1,no,unset|1,no)"
+grep -q "UNKNOWN, not 'unsupported'" "$WORK/warn-flip.txt" \
+    && ok "…and the timeout is SAID to be UNKNOWN, not 'unsupported'" \
+    || bad "the unknown was not named" "[$(cat "$WORK/warn-flip.txt")]"
+# MUST-NOT-FLIP: a COMPLETED no is still an answer — cached, rc 1, flag omitted.
+_seqn=$( ( set +u
+           NEXUS_ROOT="$REPO_ROOT"; CLAUDE_BIN="$STUB_NO"; export NEXUS_ROOT CLAUDE_BIN
+           . "$CLAUDE_BIN_SH" >/dev/null 2>&1
+           claude_supports_name_flag 2>/dev/null; r1=$?
+           printf '%s,%s,%s' "$r1" "${_CLAUDE_NAME_FLAG_CACHED-UNSET}" "${_CLAUDE_NAME_FLAG_UNKNOWN_REASON:-none}" ) )
+[[ "$_seqn" == "1,no,none" ]] \
+    && ok "MUST-NOT-FLIP: a completed 'no' is still rc 1, cached, and not UNKNOWN" \
+    || bad "the completed-no path changed" "got [$_seqn]"
+# An EMPTY --help (not a timeout) still omits the flag (section 4), but is no
+# answer either: not cached, so the same path answering later is re-probed.
+_brk2="$WORK/claude-broken2"; cp "$_broken" "$_brk2"
+_seqb=$( ( set +u
+           NEXUS_ROOT="$REPO_ROOT"; CLAUDE_BIN="$_brk2"; export NEXUS_ROOT CLAUDE_BIN
+           . "$CLAUDE_BIN_SH" >/dev/null 2>&1
+           claude_supports_name_flag 2>/dev/null; r1=$?; c1="${_CLAUDE_NAME_FLAG_CACHED-UNSET}"
+           cp "$STUB_YES" "$CLAUDE_BIN"
+           claude_supports_name_flag 2>/dev/null; r2=$?
+           printf '%s,%s|%s' "$r1" "$c1" "$r2" ) )
+[[ "$_seqb" == "1,UNSET|0" ]] \
+    && ok "an empty --help omits the flag but is NOT cached: the next ask re-probes" \
+    || bad "an empty --help's refusal outlived it" "got [$_seqb] want [1,UNSET|0]"
+# The spawn surface: an UNKNOWN reaches the launcher as a PASSED flag, through
+# spawn-worker's own gate (`claude_supports_name_flag || return 0`).
+_sw_arg=$( ( set +u
+             NEXUS_ROOT="$REPO_ROOT"; CLAUDE_BIN="$_slow"; NEXUS_CLAUDE_HELP_TIMEOUT=1
+             export NEXUS_ROOT CLAUDE_BIN NEXUS_CLAUDE_HELP_TIMEOUT
+             . "$CLAUDE_BIN_SH" >/dev/null 2>&1
+             eval "$(awk '/^_spawn_name_arg\(\) \{/,/^\}/' "$REPO_ROOT/monitor/spawn-worker.sh")"
+             NEXUS_SPAWN_CODE_ROOT="$REPO_ROOT" _spawn_name_arg w-probe 2>/dev/null ) )
+[[ "$_sw_arg" == "--name w-probe" ]] \
+    && ok "spawn-worker's _spawn_name_arg passes --name on an UNKNOWN probe (a wrong bet is a loud launch failure)" \
+    || bad "an UNKNOWN probe silently dropped --name at spawn-worker" "got [$_sw_arg]"
 
 # THE UNBOUNDED PATH IS LOUD. A host with no `timeout` reinstates the #1289
 # wedge; that must be said, not silently tolerated. Reached via the seam.
@@ -604,7 +663,7 @@ _probe_line=$(awk '!/^[[:space:]]*#/' "$CLAUDE_BIN_SH" | grep -c -- '--help')
 # EXACT count guard, per section. A floor ("at least N") would let a fixture
 # that silently stopped composing launchers pass by asserting less; this pins
 # the number so a skipped section is a FAILURE, not a smaller green.
-EXPECTED=$(( 2 + 1 + 2 + 2 + 2 + 3 + 2 + 3 + 2 + 4 + 2 + 2 + 13 ))
+EXPECTED=$(( 2 + 1 + 2 + 2 + 2 + 3 + 2 + 3 + 2 + 4 + 2 + 2 + 18 ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

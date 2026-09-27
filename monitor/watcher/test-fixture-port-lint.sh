@@ -50,6 +50,21 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_test_dir/_test_helpers.sh"
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 
+# ── POPULATION (your-org/nexus-code#1301) ───────────────────────────────
+# The corpus sweep below reads every tracked path matching `*test-*.sh`, so a
+# suite added anywhere joins this lint's population. `_fpl_corpus` is the ONE
+# enumerator: the sweep and `gp_population` both call it. The detector reads the
+# heredoc-stripped view from shell-files.sh through its quote machine, so those
+# are declared too. `gp_handle` EXITS on --population, so it sits above the
+# first line of output.
+_fpl_corpus() { git -C "$REPO_ROOT" ls-files -- '*test-*.sh'; }
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _fpl_corpus | sed "s|^|$REPO_ROOT/|"
+    printf '%s\n' "$REPO_ROOT/monitor/shell-files.sh" "$_test_dir/_shell_quotes.awk" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 # ── THE MARKER ──────────────────────────────────────────────────────────
 # A line may derive a port arithmetically if it carries the marker — either on
 # the derivation line itself, or in the comment block directly above it:
@@ -174,7 +189,7 @@ while IFS= read -r f; do
 # enumerates a corpus TO LINT, and `_harness.sh` is 510 lines carrying exactly
 # the constructs scanned for here. Narrowing it would DELETE COVERAGE from the
 # one file most worth scanning, dressed up as a consistency fix. Leave it wide.
-done < <(git ls-files -- '*test-*.sh')
+done < <(_fpl_corpus)
 
 if (( n_files >= 200 )); then
     _th_pass

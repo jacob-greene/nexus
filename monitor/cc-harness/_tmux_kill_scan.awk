@@ -91,6 +91,46 @@ function glue_quoted_space(s,   i, c, sq, dq, out) {
     return out
 }
 
+# A `;` INSIDE QUOTES (your-org/nexus-code#1579). tmux ends a command at any
+# argument whose LAST character is `;` (unless `\;`) — judged AFTER the shell has
+# removed its quotes (#1578). So `tmux display-message 'hi;' kill-server` runs
+# kill-server, and the blanket `;` -> shell-separator substitution in fragments()
+# tore that line into `tmux display-message 'hi` and `' kill-server`, the second
+# fragment had no tmux command word, and the line scanned CLEAN. Measured on six
+# planted lines at f13cfb74: every QUOTED `;`-ended shape was missed.
+# Rule, per quoted `;`:
+#   * preceded by `\`            -> literal to tmux: an inert placeholder (\004);
+#   * the LAST character of its shell WORD (the closing quote follows it, and a
+#     word boundary follows that) -> a TMUX separator: emit the closing quote,
+#     then the separator mark \002 that fragments() already splits sub-commands on;
+#   * anywhere else              -> data: the inert placeholder.
+# An EMPTY quote pair glued after the closing quote (`'hi;'''`, `"hi;"""`,
+# `'hi;'""`) adds nothing to the shell word, so it is skipped before the
+# boundary test (semisplitsk2 F6: those shapes scanned CLEAN).
+function mark_quoted_semis(s,   i, c, n, sq, dq, out, q, after, j) {
+    sq = 0; dq = 0; out = ""; n = length(s)
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "'" && !dq) { sq = !sq; out = out c; continue }
+        if (c == "\"" && !sq) { dq = !dq; out = out c; continue }
+        if (c == ";" && (sq || dq)) {
+            if (i > 1 && substr(s, i-1, 1) == "\\") { out = out "\004"; continue }
+            q = sq ? "'" : "\""
+            j = i + 2
+            while (substr(s, j, 2) == "''" || substr(s, j, 2) == "\"\"") j += 2
+            after = substr(s, j, 1)
+            if (substr(s, i+1, 1) == q && (after == "" || after ~ /[[:space:];&|)]/)) {
+                out = out q "\002"; i = j - 1
+                if (sq) sq = 0; else dq = 0
+                continue
+            }
+            out = out "\004"; continue
+        }
+        out = out c
+    }
+    return out
+}
+
 function unbalanced_quote(w,   i, c, sq, dq) {
     # Does this token end inside a quote? Same quote bookkeeping as
     # strip_comment above.
@@ -201,6 +241,7 @@ function fragments(s, out,   tmp, n, i, j, m, sub2, k, cnt) {
     # its `tmux` command word — so the kill was invisible and the line scanned
     # CLEAN. Measured: that exact command killed a real server. Protect it here
     # and let the verb scanner treat it as the sub-command separator it is.
+    s = mark_quoted_semis(s)          # #1579: a quoted `;` is tmux's, or data — never the shell's
     gsub(/\\;/, "\002", s)
     gsub(/\|\||&&|;|\||\$\(|`|\{|\}/, "\001", s)
     # trap 'BODY' / eval 'BODY' — unwrap so BODY is analysed as code.
@@ -236,8 +277,24 @@ function neutralises_tmux(frag) {
     return (frag ~ /env[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-u[[:space:]]+TMUX([[:space:]]|$)/)
 }
 
+# `-v with_file=1` prefixes every finding with FILENAME, so the lint can scan
+# its whole population in ONE awk process instead of one awk + one sed per file
+# (your-org/nexus-code bundle-0923: ~700 forks, 22 s per lint call under load,
+# twice per gate run). Every rule below is decided from the current line alone,
+# so nothing carries across a file boundary; FNR is per-file either way.
 {
     raw = $0
+    # PREFILTER. Every finding below needs a fragment whose first command word
+    # passes is_tmux_word(), i.e. contains "tmux" (any case) once is_tmux_word's
+    # own quote/brace set is deleted. Deleting that set from the WHOLE line can
+    # only join more letters, never fewer, so a line failing this test cannot
+    # produce a finding: skipping it changes no output, and it skips the
+    # per-character passes below on ~99% of lines (19 s -> <1 s over all 967
+    # tracked files, bundle-0923). Keep the class IDENTICAL to is_tmux_word's.
+    probe = raw
+    gsub(/["'\''`${}()]/, "", probe)
+    if (tolower(probe) !~ /tmux/) next
+    pfx = with_file ? FILENAME ":" : ""
     line = strip_comment(raw)
     pragma = (raw ~ /#[[:space:]]*tmux-scoped:/)
 
@@ -253,7 +310,7 @@ function neutralises_tmux(frag) {
 
         # --- rule4: a pin that names the DEFAULT socket is not isolation ----
         if (pins_default_socket(f)) {
-            printf "%d:rule4-pins-default-socket:%s\n", FNR, raw
+            printf "%s%d:rule4-pins-default-socket:%s\n", pfx, FNR, raw
             continue
         }
 
@@ -263,7 +320,7 @@ function neutralises_tmux(frag) {
         # unisolated `kill-window` can end it. The defect is the SCOPING
         # IDIOM, not the verb, so keying on the idiom closes the class.
         if (f ~ /TMUX_TMPDIR=/ && !has_socket_pin(f) && !neutralises_tmux(f)) {
-            printf "%d:rule2-tmux-tmpdir-insufficient:%s\n", FNR, raw
+            printf "%s%d:rule2-tmux-tmpdir-insufficient:%s\n", pfx, FNR, raw
         }
 
         # --- rules 1 and 3, PER SUB-COMMAND --------------------------------
@@ -276,7 +333,7 @@ function neutralises_tmux(frag) {
 
             # --- rule1: kill-server must be socket-pinned at the call site -
             if (verb == "kill-server" && !has_socket_pin(f) && !pragma) {
-                printf "%d:rule1-killserver-unscoped:%s\n", FNR, raw
+                printf "%s%d:rule1-killserver-unscoped:%s\n", pfx, FNR, raw
             }
 
             # --- rule3: a kill that can end the server must name a target --
@@ -285,7 +342,7 @@ function neutralises_tmux(frag) {
             # kill-window: killing the last window of the last session leaves
             # "no server running".
             if (verb != "kill-server" && !has_targeted(sc[si]) && !pragma) {
-                printf "%d:rule3-untargeted-kill:%s\n", FNR, raw
+                printf "%s%d:rule3-untargeted-kill:%s\n", pfx, FNR, raw
             }
         }
     }

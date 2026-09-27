@@ -340,6 +340,70 @@ declaring=$(
     done
 )
 n_declaring=$(printf '%s\n' "$declaring" | "$GREP" -c . || true)
+
+# ---------------------------------------------------------------------------
+# THE NAMED PART OF THE BLIND SPOT (your-org/nexus-code#1301, item 1).
+#
+# The footer below has always printed the blind spot as an AGGREGATE — "391 of
+# 482 suites do not declare a population" — and a number that size reads as
+# background noise: nobody can act on it, and on 2026-09-05 it hid the ONE guard
+# with something to say about a change (52 guards selected, all green, and
+# test-guard-closure-boundary.sh in neither list). `#1301` asked for the suites
+# to be NAMED, and said why nobody had: readership is not derivable without a
+# declaration, and the obvious proxy — "does the suite's source mention the
+# changed path?" — fails on the issue's own motivating case, because a lint that
+# enumerates by shebang names no path at all.
+#
+# THAT CASE IS THE KEY TO THE PREDICATE, NOT AN OBSTACLE TO IT. A suite that
+# names no path reads your diff because it SWEEPS: its code enumerates the live
+# tree, so an edit ANYWHERE can join its population. Sweeping is visible in the
+# suite's own source. So the undeclared suites whose CODE lines carry a sweep
+# construct are named on every run — for them the per-diff answer is "possibly
+# this one too", which is exactly what makes them the dangerous ones.
+#
+# THE DIRECTION OF ERROR, stated because `#1301` made that the precondition:
+#   * AS A CLASS it is a LOWER BOUND. A sweep through an enumerator this
+#     pattern does not list — a sourced helper, a path built from parts — is
+#     MISSED. The list is "at least these", never "only these", and the
+#     aggregate count stays beside it for that reason.
+#   * PER MEMBER it is an UPPER BOUND on readership. A sweep scoped to one
+#     directory does not read every diff, and a construct inside a quoted
+#     payload or aimed at a FIXTURE repository is matched too. Measured at
+#     76abc6a5 FROM THIS TOOL'S OWN OUTPUT, each hit then read: 16 named, 14 of
+#     them sweep the live tree; the 2 false members are
+#     test-bash-footgun-guard.sh (the construct sits in JSON payload strings)
+#     and test-public-mirror-symlink-target.sh (aimed at fixture repositories).
+#   * `ls-files --error-unmatch` is EXCLUDED: it asks whether ONE named path is
+#     tracked, which is an existence check and not a sweep.
+#   * A `find`-BASED SWEEP IS NOT MATCHED, deliberately, and that is part of the
+#     lower bound. The first cut carried a `find … -name '*…'` arm; it named 36
+#     MORE suites, and the 13 of those read were every one a `find` inside the
+#     suite's own fixture or state directory. An arm with no precision buries
+#     the 14 names that matter under 36 that do not — the count-reads-as-noise
+#     failure this list exists to end. (That first cut also shipped a comment
+#     quoting "15 named", measured by a DIFFERENT command than the regex beside
+#     it: a count is a property of the command that produced it.)
+# Comment lines are dropped first — a suite DESCRIBING a sweep is not performing
+# one (the string-versus-thing trap, which this file's own predicate note
+# already names). One awk per file, no pipe: a `grep -v | grep -q` pair under
+# `pipefail` reports the early-exit reader's SIGPIPE as "no match".
+#
+# THE REMEDY IS ENROLMENT, not this list: teach the suite `gp_population`
+# (monitor/_guard_population.sh) and it leaves the blind spot for good.
+GFD_SWEEP_RE='(^|[^[:alnum:]_])git( -C [^ ]+)? (ls-files|grep)([^[:alnum:]_-]|$)|shf_(find0|is_shell|is_script|class|count)([^[:alnum:]_]|$)'
+undeclared_sweepers=$(
+    comm -23 <(printf '%s\n' "$all_suites" | sort -u) <(printf '%s\n' "$declaring" | sort -u) \
+    | while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        awk -v re="$GFD_SWEEP_RE" '
+            /^[[:space:]]*#/ { next }
+            /--error-unmatch/ { next }
+            $0 ~ re { found = 1; exit }
+            END { exit !found }' "$f" 2>/dev/null && printf '%s\n' "$f"
+    done
+)
+n_sweepers=$(printf '%s\n' "$undeclared_sweepers" | "$GREP" -c . || true)
+
 if (( n_declaring == 0 )); then
     printf 'guards-for-diff: REFUSED — no suite implements the --population\n' >&2
     printf '  protocol. Either the discovery predicate (%q) has drifted from\n' "$GFD_DECL" >&2
@@ -455,6 +519,10 @@ untracked=$(comm -23 "$tmp/cand.s" "$tmp/cand.tracked")
 n_untracked=$(printf '%s\n' "$untracked" | "$GREP" -c . || true)
 printf '%s\n' "$untracked" | "$GREP" -v '^$' | sort -u > "$tmp/untracked.s" || true
 
+# The per-probe bound. NOT removable and NOT configurable
+# (your-org/nexus-code#1254: the walks it bounds were once unbounded); named
+# only so the refusal below can print the figure it was held to.
+_probe_bound=180
 while IFS= read -r suite; do
     [[ -n "$suite" ]] || continue
     # A bounded probe. `--population` is meant to answer without doing the
@@ -466,10 +534,35 @@ while IFS= read -r suite; do
     # the wrong number is this file's own subject matter, and the timeout arm
     # (124) is exactly the case where the number is the diagnosis.
     probe_rc=0
-    timeout 180 bash "$suite" --population > "$tmp/pop" 2>"$tmp/err" || probe_rc=$?
+    timeout "$_probe_bound" bash "$suite" --population > "$tmp/pop" 2>"$tmp/err" || probe_rc=$?
     if (( probe_rc != 0 )); then
         printf 'guards-for-diff: REFUSED — %s --population failed (rc %d).\n' \
             "$suite" "$probe_rc" >&2
+        # WHICH KIND OF REFUSAL, on the line straight after the one above
+        # (your-org/nexus-code#1615). The two want opposite actions: a probe
+        # that ran out of TIME may answer on a retry (a cold page cache cost
+        # #1615's probe 136 s once and 17 s thereafter), while a probe that
+        # ERRORED will refuse identically forever. The refusal read the same
+        # either way, and an intermittent refusal nobody can classify is one
+        # people learn to route around. `ng wrap-up` relays only the first 12
+        # stderr lines, so this must sit ABOVE the probe's own stderr.
+        #
+        # 124 ALONE, and that is the whole vocabulary here rather than a
+        # shortcut: this call is a plain `timeout` — no `-s`, no `-k`, no
+        # `--preserve-status` — so the wrapper can inject 124 and nothing else
+        # a probe could be confused with (#1248's 137/143 need those flags).
+        # It is a PROXY with a stated error direction: a probe that exits 124
+        # ITSELF reads as a timeout. The first line keeps its exact text
+        # because `ng wrap-up` and test-ng-wrap-up.sh quote it.
+        if (( probe_rc == 124 )); then
+            printf '  TIMEOUT, not a probe error: no answer within the %d s per-probe bound (rc 124 is\n' "$_probe_bound" >&2
+            printf '  `timeout`'"'"'s status; a probe exiting 124 itself would read the same). A cold page\n' >&2
+            printf '  cache or a loaded node can push a working probe past it, so a RETRY MAY SUCCEED;\n' >&2
+            printf '  if it refuses again, the probe is doing work it should not (your-org/nexus-code#1615).\n' >&2
+        else
+            printf '  PROBE ERROR, not a timeout: the probe itself exited %d, so a retry will refuse the\n' "$probe_rc" >&2
+            printf '  same way — its own stderr follows.\n' >&2
+        fi
         sed 's/^/    /' "$tmp/err" >&2
         printf '  Refusing to report a selection with a guard silently dropped from\n' >&2
         printf '  it: a guard the index could not ask looks exactly like a guard that\n' >&2
@@ -576,6 +669,17 @@ printf '\nWHAT THIS DOES NOT COVER — read it before treating a green as covera
 printf '  * %d of %d tracked test suites do not declare a population and are\n' \
     "$(( n_suites - n_declaring ))" "$n_suites"
 printf '    INVISIBLE to this index. It is not a substitute for the full suite.\n'
+if (( n_sweepers > 0 )); then
+    printf '  * AT LEAST %d of those undeclared suites SWEEP THE TREE — their code enumerates\n' "$n_sweepers"
+    printf '    it, so an edit ANYWHERE may have joined their population. They are in NEITHER\n'
+    printf '    list above: not excluded, INVISIBLE. Named, because a count reads as noise\n'
+    printf '    (your-org/nexus-code#1301):\n'
+    printf '%s\n' "$undeclared_sweepers" | sed 's/^/        /'
+    printf '    A LOWER BOUND on the class (a sweep through an enumerator this predicate does\n'
+    printf '    not list is missed) and an UPPER BOUND per member (a sweep scoped to one\n'
+    printf '    directory does not read every diff). Run them — or ENROL them: a suite that\n'
+    printf '    declares `gp_population` leaves this list for good.\n'
+fi
 printf '  * Populations are computed against THIS tree. A guard whose population\n'
 printf '    DEFINITION changed on another branch selects differently after merge\n'
 printf '    — your-org/nexus-code#803'\''s first occurrence (#781 x #791) is exactly\n'

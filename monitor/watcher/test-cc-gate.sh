@@ -64,6 +64,9 @@ mk_stub() {  # $1 = name, $2 = exit code
 }
 S_PASS=$(mk_stub pass.sh 0)
 S_FAIL=$(mk_stub fail.sh 1)
+# 69 = ENVSKIP: the scenario RAN and a discriminating sub-check could not be
+# exercised (test-realmodel-overlimit.sh on a blank TUI frame, #1530).
+S_UNM=$(mk_stub unmeasured.sh 69)
 
 # The SKIP stub drives the REAL skip path (cch_skip_if_disabled), so this
 # is a faithful end-to-end mutation check: it exercises the actual
@@ -117,6 +120,37 @@ if (( rc != 0 )) && grep -q 'GATE RED' <<<"$out" \
     ok "one skip among passes → GATE RED"
 else
     bad "single-skip red" "rc=$rc out=$out"
+fi
+
+# (3b) your-org/nexus-code#1530: an UNMEASURED scenario among passes → RED, and
+#      NAMED as unmeasured rather than as a failure of the candidate. Before the
+#      fix the over-limit scenario exited 0 on a blank frame, so this exact
+#      shape — everything else green, the discriminating sub-check never run —
+#      was GATE GREEN. No fail stub in this run ON PURPOSE: with one, the RED
+#      would be the failure's and this case would assert nothing.
+out=$(run_gate "$S_PASS $S_UNM"); rc=$?
+if (( rc != 0 )) && grep -q 'GATE RED' <<<"$out" && ! grep -q 'GATE GREEN' <<<"$out" \
+   && grep -qE '1 passed / 0 failed / 1 skipped' <<<"$out" \
+   && grep -q '>> UNMEASURED: unmeasured.sh' <<<"$out" \
+   && ! grep -q '>> FAILED: unmeasured.sh' <<<"$out"; then
+    ok "#1530 an UNMEASURED scenario (rc 69) among passes → GATE RED, named UNMEASURED, not FAILED"
+else
+    bad "#1530 unmeasured must be red and named" "rc=$rc out=$out"
+fi
+# …and the classifier itself, extracted and driven without a gate run, so the
+# default-DENY arm is pinned: an rc nobody taught it is a FAILURE, never a pass.
+_cls_src=$(awk '/^_gate_classify_rc\(\) \{/ { c = 1 } c { print } c && /^}$/ { exit }' "$GATE")
+if [[ "$_cls_src" == *"69) echo unmeasured"* ]]; then
+    ok "#1530 positive control: _gate_classify_rc extracted from gate.sh"
+else
+    bad "#1530 classifier extraction" "empty or unrecognised body — the arms below would be vacuous"
+fi
+_cls() { ( eval "$_cls_src"; _gate_classify_rc "$1" ); }
+_cls_got="$(_cls 0) $(_cls 77) $(_cls 69) $(_cls 1) $(_cls 143) $(_cls 78)"
+if [[ "$_cls_got" == "pass skip unmeasured fail fail fail" ]]; then
+    ok "#1530 _gate_classify_rc: 0 pass, 77 skip, 69 unmeasured, and EVERY other rc fail (default-deny)"
+else
+    bad "#1530 classifier arms" "got: $_cls_got"
 fi
 
 # (4) A real failure → RED (unchanged from pre-fix, must still hold).

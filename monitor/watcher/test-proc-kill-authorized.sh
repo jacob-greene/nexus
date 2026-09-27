@@ -66,6 +66,16 @@ assert_kind() {
 WORK=$(mktemp -d -t nexus-pka-XXXXXX)
 cleanup() {
     [[ -n "${_kids:-}" ]] && kill $_kids 2>/dev/null
+    # T17's orphans are OUTSIDE this suite's session by construction, so they
+    # are reaped by the pids the suite itself recorded — frozen first (a stopped
+    # loop cannot fork another `sleep`), children before parents (#1543).
+    local _o _k
+    for _o in ${_t17_pids:-}; do
+        [[ -d "/proc/$_o" ]] || continue
+        kill -STOP "$_o" 2>/dev/null
+        for _k in $(pgrep -P "$_o" 2>/dev/null); do kill -KILL "$_k" 2>/dev/null; done
+        kill -KILL "$_o" 2>/dev/null
+    done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -720,6 +730,108 @@ else
 fi
 
 echo
+echo '=== T17: the ORPHAN of a dead FOREGROUND tool call — `--orphans` (your-org/nexus-code#1543) ==='
+# A foreground Bash tool call is its own session leader. What it orphans is
+# reparented to init inside a session whose leader is GONE: refused `not-owned`
+# with no hint and no TaskStop handle. `--orphans` authorises exactly that shape,
+# as a conjunction (O1..O6 in the helper's header); each row below removes ONE
+# conjunct and must be refused.
+#
+# PREDICTED FLIP SET for "make _orphan_of_mine return 1 unconditionally": rows
+# 2, 3, 4 and 10 go red (the hint, the two permits, the dead-incarnation permit).
+# MUST NOT FLIP: every REFUSED row (1, 5..9, 11, 12) — a refusal is what the
+# helper does without the arm. For "drop the O4 session-id equality": row 6.
+_t17_pids=""
+T17W="$WORK/t17"; mkdir -p "$T17W"
+T17_UU="1543aaaa-bbbb-4ccc-8ddd-eeeeeeee1543"; T17_SIB="1543ffff-0000-4111-8222-333333331543"
+cp "$(command -v bash)" "$T17W/claude"
+cat > "$T17W/call.sh" <<'T17C'
+#!/usr/bin/env bash
+# A stand-in FOREGROUND TOOL CALL: a session leader that orphans a loop and exits.
+# $1 pidfile  $2 the interpreter to run the loop under  $3 (optional) seconds the LEADER stays alive
+"$2" -c 'echo $$ > "$0"; while :; do sleep 1; done' "$1" </dev/null >/dev/null 2>&1 &
+echo $$ > "$1.leader"
+[[ -n "${3:-}" ]] && sleep "$3"
+exit 0
+T17C
+chmod +x "$T17W/call.sh"
+t17_mk() {   # <tag> <interp> <leader-stays-s|""> <env words…> → pid on stdout, "" on failure
+    local tag="$1" interp="$2" stay="$3" i p; shift 3
+    env "$@" setsid "$T17W/call.sh" "$T17W/$tag.pid" "$interp" $stay </dev/null >/dev/null 2>&1 &
+    for i in $(seq 1 80); do
+        p=$(cat "$T17W/$tag.pid" 2>/dev/null)
+        if [[ "$p" =~ ^[0-9]+$ ]]; then
+            if [[ -z "$stay" ]]; then
+                # wait for the LEADER to be gone and the loop REPARENTED
+                [[ ! -e "/proc/$(cat "$T17W/$tag.pid.leader" 2>/dev/null)" ]] && { printf '%s' "$p"; return 0; }
+            else
+                printf '%s' "$p"; return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+t17_h() { env CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$$" "$HELPER" "$@"; }
+_bash=$(command -v bash)
+o_mine=$(t17_mk mine "$_bash" "" CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$$");      _t17_pids+=" $o_mine"
+o_sib=$(t17_mk sib "$_bash" "" CLAUDE_CODE_SESSION_ID="$T17_SIB" CLAUDE_PID="$$");        _t17_pids+=" $o_sib"
+o_noenv=$(t17_mk noenv "$_bash" "" -i PATH="$PATH");                                      _t17_pids+=" $o_noenv"
+o_live=$(t17_mk live "$_bash" 60 CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$$");       _t17_pids+=" $o_live $(cat "$T17W/live.pid.leader" 2>/dev/null)"
+o_otherinc=$(t17_mk oinc "$_bash" "" CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$PPID"); _t17_pids+=" $o_otherinc"
+o_deadinc=$(t17_mk dinc "$_bash" "" CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID=4000000); _t17_pids+=" $o_deadinc"
+o_claude=$(t17_mk cl "$T17W/claude" "" CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$$"); _t17_pids+=" $o_claude"
+# G5: an orphan stamped with a LIVE pid that is NOT an ancestor of the prober (the `live` fixture's leader).
+_t17_x=$(cat "$T17W/live.pid.leader" 2>/dev/null)
+o_g5=$(t17_mk g5 "$_bash" "" CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="${_t17_x:-0}");  _t17_pids+=" $o_g5"
+_t17_pp=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/${o_mine:-0}/status" 2>/dev/null)
+if [[ -z "$o_mine$o_sib" || -z "$o_noenv" || -z "$o_live" || -z "$o_otherinc" || -z "$o_deadinc" || -z "$o_claude" || -z "$o_g5" ]]; then
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do th_skip "T17 row $_i" "an orphan fixture did not come up on this host"; done
+elif [[ "$_t17_pp" != 1 ]]; then
+    # A host with a SUBREAPER (systemd --user, a container init that is not pid
+    # 1) reparents elsewhere. O3 then refuses — the arm is INERT there, which is
+    # the safe direction — and these rows have nothing to measure.
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do th_skip "T17 row $_i" "orphans reparent to pid $_t17_pp here, not 1 — the --orphans arm is inert on this host (safe direction)"; done
+else
+    out=$(t17_h "$o_mine" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 1: WITHOUT --orphans the orphan is still REFUSED not-owned rc 1 — the default path authorises nothing new" || fail "row 1: rc=$rc $out"
+    [[ "$out" == *"ORPHAN-OF-YOURS"* && "$out" == *"--orphans"* && "$out" == *"NOT established -- WHY"* && "$out" == *"DAEMONIZED ITSELF ON PURPOSE"* ]] && pass "row 2: …but the refusal now SAYS what was established (ORPHAN-OF-YOURS, names --orphans) — and that the MECHANISM is not: it may be a deliberate, shared daemon (skeptic F1)" || fail "row 2: $out"
+    out=$(t17_h --orphans "$o_mine" 2>&1); rc=$?
+    [[ "$out" == *"authorized=1 kind=authorized detail=orphan-of-dead-session-"* ]] && (( rc == 0 )) && pass "row 3: --orphans AUTHORISES it (dead leader, reparented, this session id, this CLAUDE_PID)" || fail "row 3: rc=$rc $out"
+    out=$(t17_h --orphans --filter "$o_mine" "$o_sib" 2>/dev/null)
+    [[ "$out" == "$o_mine" ]] && pass "row 4: --orphans --filter emits the orphan and ONLY it (the sibling's is dropped)" || fail "row 4: got '$out' want '$o_mine'"
+    out=$(t17_h --filter "$o_mine" 2>/dev/null)
+    [[ -z "$out" ]] && pass "row 5: plain --filter emits NOTHING for it — the opt-in is the only way in" || fail "row 5: got '$out'"
+    out=$(t17_h --orphans "$o_sib" 2>&1); rc=$?; out2=$(t17_h "$o_sib" 2>&1)
+    [[ "$out" == *"kind=not-owned"* && "$out2" != *"ORPHAN-OF-YOURS"* ]] && (( rc == 1 )) && pass "row 6 (O4): the SAME shape carrying a SIBLING's session id is REFUSED under --orphans, and gets no hint" || fail "row 6: rc=$rc $out | $out2"
+    out=$(t17_h --orphans "$o_noenv" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 7 (O4): an orphan with a SCRUBBED environment carries no evidence → REFUSED" || fail "row 7: rc=$rc $out"
+    out=$(t17_h --orphans "$o_live" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 8 (O2): a member of a session whose LEADER IS ALIVE is REFUSED — a running call is never an orphan" || fail "row 8: rc=$rc $out"
+    out=$(t17_h --orphans "$o_otherinc" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 9 (O5): launched by a DIFFERENT, LIVE claude incarnation of the same session id → REFUSED" || fail "row 9: rc=$rc $out"
+    out=$(t17_h --orphans "$o_deadinc" 2>&1); rc=$?
+    [[ "$out" == *"kind=authorized"* ]] && (( rc == 0 )) && pass "row 10 (O5): launched by an incarnation that is GONE (a respawned session) → authorised" || fail "row 10: rc=$rc $out"
+    out=$(env -u CLAUDE_CODE_SESSION_ID CLAUDE_PID="$$" "$HELPER" --orphans "$o_mine" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 11 (O1): a CALLER with no session id has no left-hand side → REFUSED" || fail "row 11: rc=$rc $out"
+    out=$(env -u CLAUDE_PID CLAUDE_CODE_SESSION_ID="$T17_UU" "$HELPER" --orphans "$o_otherinc" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 13 (O5, skeptic F2): a CALLER with no CLAUDE_PID cannot tell its incarnation from another LIVE one → REFUSED (pre-fix: authorized=1)" || fail "row 13: rc=$rc $out"
+    # A SESSION LEADER is never an orphan (orchestrator's question on #1568). O2
+    # already says so — a leader's sid IS its own live pid, so /proc/<sid> exists —
+    # and this row pins it. It is NOT what separates a daemon from an accident:
+    # measured on this board, the shared git-credential-cache--daemon (pid 3273,
+    # sid 1732, /proc/1732 gone) is a NON-leader, exactly like a real #1543 orphan
+    # (pid 13631, sid 13563). It forks and lets its parent exit; it never setsid()s.
+    _t17_ldr=$(cat "$T17W/live.pid.leader" 2>/dev/null)
+    out=$(t17_h --orphans "$_t17_ldr" 2>&1); rc=$?
+    [[ "$_t17_ldr" =~ ^[0-9]+$ && "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 14 (O2): a live SESSION LEADER carrying this session id (a setsid-detached process) is REFUSED under --orphans" || fail "row 14: leader='$_t17_ldr' rc=$rc $out"
+    out=$(env CLAUDE_CODE_SESSION_ID="$T17_UU" CLAUDE_PID="$_t17_x" "$HELPER" --orphans "$o_g5" 2>&1); rc=$?
+    [[ "$_t17_x" =~ ^[0-9]+$ && -e "/proc/$_t17_x" && "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 15 (O5, delta skeptic G5): a caller carrying a LIVE but UNRELATED CLAUDE_PID ($_t17_x, not its ancestor) is not believed, even for an orphan stamped with that same value → REFUSED (pre-fix: authorized=1)" || fail "row 15: x='$_t17_x' rc=$rc $out"
+    out=$(t17_h --orphans "$o_claude" 2>&1); rc=$?
+    [[ "$out" == *"kind=not-owned"* ]] && (( rc == 1 )) && pass "row 12 (O6): an orphan that IS a \`claude\` is never authorised through this arm" || fail "row 12: rc=$rc $out"
+fi
+
+echo
 # COUNT GUARD. Several cases here are CONDITIONAL (T3 needs a foreign-session
 # pid to exist; the mutant control needs the substitution to apply), so a case
 # that silently stops running shows up as a smaller green rather than a red.
@@ -729,7 +841,7 @@ echo
 # starve the helper of descriptors), so SKIP joins the sum: each contributes
 # exactly 1 either way, which keeps ONE expected total rather than a
 # disjunction over several (your-org/nexus-code#1278).
-_EXPECTED_ASSERTIONS=51
+_EXPECTED_ASSERTIONS=66   # 51 + T17 x15 (#1543; each row is pass-or-skip, so it contributes exactly 1)
 _ran=$(( PASS + FAIL + SKIP + 1 ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     pass "every declared assertion executed ($_EXPECTED_ASSERTIONS)"

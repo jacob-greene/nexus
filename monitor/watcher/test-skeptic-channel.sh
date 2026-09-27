@@ -55,7 +55,7 @@ assert_contains "ask writes req-001 .open.md" "$p1" "req-001-why-lr.open.md"
 assert_file "req-001 file exists" "$p1"
 p2=$("$CHAN" ask "$TASK" repro --message "Repro the 0% baseline on a known case.")
 assert_contains "ask auto-increments to req-002" "$p2" "req-002-repro.open.md"
-assert_eq "status: 2 open" "$("$CHAN" status "$TASK")" "open=2 ack=0 answered=0 total=2 done=0"
+assert_eq "status: 2 open" "$("$CHAN" status "$TASK")" "open=2 ack=0 answered=0 total=2 done=0 done_at=- done_delivered=0 released=0 marker=0"
 
 # Atomic publish: ask builds a temp then renames; no temp ever matches
 # the *.open.md glob the worker acts on (partial-write race guard).
@@ -69,7 +69,7 @@ assert_eq "worker await acks open reqs -> exit 0" "$rc" "0"
 assert_contains "await acked req-001 (→ .ack.md)" "$awk_out" "req-001-why-lr.ack.md"
 assert_contains "await acked req-002 (→ .ack.md)" "$awk_out" "req-002-repro.ack.md"
 assert_nofile "open file gone after ack (the rename IS the signal)" "$p1"
-assert_eq "status: 2 ack after await" "$("$CHAN" status "$TASK")" "open=0 ack=2 answered=0 total=2 done=0"
+assert_eq "status: 2 ack after await" "$("$CHAN" status "$TASK")" "open=0 ack=2 answered=0 total=2 done=0 done_at=- done_delivered=0 released=0 marker=0"
 
 # Bug 1: the worker acking via await stamps the machine-input ledger so a
 # UserPromptSubmit around the exchange is attributed to the protocol, not
@@ -87,7 +87,7 @@ assert_contains "answer renames .ack.md → .answered.md" "$ans" "req-001-why-lr
 assert_file "answered file present" "$ans"
 assert_contains "answered file carries response" "$(cat "$ans")" "Confirmed config drift"
 assert_contains "answered file flips state" "$(cat "$ans")" "state: answered"
-assert_eq "status after one answer" "$("$CHAN" status "$TASK")" "open=0 ack=1 answered=1 total=2 done=0"
+assert_eq "status after one answer" "$("$CHAN" status "$TASK")" "open=0 ack=1 answered=1 total=2 done=0 done_at=- done_delivered=0 released=0 marker=0"
 # Bug 1: answering also stamps the ledger (src skeptic-answer).
 assert_contains "answer stamps machine-input (skeptic-answer)" \
     "$(grep -F "$TASK" "$MI" 2>/dev/null)" $'\tskeptic-answer'
@@ -102,7 +102,7 @@ fi
 # A direct answer of a still-acked req also works (worker answers req-002).
 ans2=$("$CHAN" answer "$TASK" 2 --message "Repro confirmed on the toy case.")
 assert_contains "answer req-002 → answered" "$ans2" "req-002-repro.answered.md"
-assert_eq "status all answered" "$("$CHAN" status "$TASK")" "open=0 ack=0 answered=2 total=2 done=0"
+assert_eq "status all answered" "$("$CHAN" status "$TASK")" "open=0 ack=0 answered=2 total=2 done=0 done_at=- done_delivered=0 released=0 marker=0"
 
 # Skeptic await-answer returns immediately for an already-answered request.
 aw=$("$CHAN" await-answer "$TASK" 1 --timeout 2 --interval 1)
@@ -114,18 +114,28 @@ assert_file "close drops DONE sentinel" "$NEXUS_STATE_DIR/skeptic/$TASK/DONE"
 done_out=$("$CHAN" await "$TASK" --once); rc=$?
 assert_eq "await sees DONE -> exit 10 (terminal)" "$rc" "10"
 assert_contains "await prints DONE" "$done_out" "DONE"
-assert_eq "status reports done=1" "$("$CHAN" status "$TASK")" "open=0 ack=0 answered=2 total=2 done=1"
+# The five leading fields are the long-standing contract; `done_at=` carries a
+# wall-clock stamp, so the appended round fields (#1538) are pinned separately.
+assert_eq "status reports done=1" "$("$CHAN" status "$TASK" | cut -d' ' -f1-5)" "open=0 ack=0 answered=2 total=2 done=1"
+assert_contains "status says the DONE was DELIVERED to the await above (#1538)" "$("$CHAN" status "$TASK")" "done_delivered=1 released=0 marker=0"
 
 # --- await re-entry: a fresh open request after a prior ack is picked up ---
 DTASK=worker-delta
 "$CHAN" ask "$DTASK" later --message "follow-up after the worker re-entered" >/dev/null
 "$CHAN" await "$DTASK" --once >/dev/null
-assert_eq "re-await acks the new request" "$("$CHAN" status "$DTASK")" "open=0 ack=1 answered=0 total=1 done=0"
-# await with NO request and NO DONE times out (exit 4) so the worker re-enters.
+assert_eq "re-await acks the new request" "$("$CHAN" status "$DTASK")" "open=0 ack=1 answered=0 total=1 done=0 done_at=- done_delivered=0 released=0 marker=0"
+# await with NO request and NO DONE times out. With a round OPEN (a pending
+# marker) that is exit 4 and the worker re-enters; with NOTHING armed it is exit
+# 15 (NO-ROUND-OPEN) — re-entering would wait for a counterpart nobody appointed
+# (your-org/nexus-code#1537, #1538, #1573).
 ETASK=worker-empty
 "$CHAN" init "$ETASK" >/dev/null
 "$CHAN" await "$ETASK" --timeout 1 --interval 1 >/dev/null 2>&1
-assert_eq "await with nothing pending -> exit 4 (re-enter)" "$?" "4"
+assert_eq "await with nothing pending and NOTHING ARMED -> exit 15 (do not loop)" "$?" "15"
+mkdir -p "$(dirname "$("$CHAN" dir "$ETASK")")/pending"; printf '1' > "$(dirname "$("$CHAN" dir "$ETASK")")/pending/$ETASK"
+"$CHAN" await "$ETASK" --timeout 1 --interval 1 >/dev/null 2>&1
+assert_eq "await with nothing pending and a round OPEN -> exit 4 (re-enter)" "$?" "4"
+rm -f "$(dirname "$("$CHAN" dir "$ETASK")")/pending/$ETASK"
 
 # poll on a never-initialised task is silent + rc 0 (no channel yet).
 empty=$("$CHAN" poll task-never-seen); rc=$?
@@ -814,7 +824,32 @@ assert_file   "reset LEFT the current round's open request"        "$XDIR/req-00
 arch=$(find "$NEXUS_STATE_DIR/skeptic/.archive" -maxdepth 1 -name "$XTASK.reset-*" 2>/dev/null | head -1)
 assert_file   "archived DONE lives under skeptic/.archive/<task>.reset-*" "$arch/DONE"
 assert_file   "archived verdict lives under skeptic/.archive/<task>.reset-*" "$arch/req-001-verdict.answered.md"
-assert_contains "reset reports what it archived" "$out" "archived 2 stale sentinel(s)"
+# your-org/nexus-code#1609 — the verdict is CORRESPONDENCE, not a sentinel, and
+# is counted as such: one array, two nouns.
+assert_contains "reset counts the SENTINELS on their own" "$out" "archived 1 terminal sentinel(s)"
+assert_contains "…and the CORRESPONDENCE separately, as moved-not-deleted" "$out" "1 correspondence file(s)"
+assert_contains "…naming the archive path" "$out" "$NEXUS_STATE_DIR/skeptic/.archive/$XTASK.reset-"
+assert_not_contains "…and never calls the answers 'stale sentinel(s)'" "$out" "stale sentinel"
+# …and a THIRD party can find the round without having run the command.
+assert_contains "reset writes a skeptic-reset event naming the archive (#1609)" \
+    "$(grep -F '"skeptic-reset"' "$NEXUS_STATE_DIR/action-log.jsonl" 2>/dev/null)" "\"correspondence\":\"1\""
+
+echo '=== #1609: ng skeptic-arm SURFACES the archive path (it used to discard it) ==='
+YTASK=w1609-arm
+YDIR="$NEXUS_STATE_DIR/skeptic/$YTASK"
+mkdir -p "$YDIR"
+printf 'closed\n'                > "$YDIR/DONE"
+printf 'request + answer 1\n'    > "$YDIR/req-001-a.answered.md"
+printf 'request + answer 2\n'    > "$YDIR/req-002-b.answered.md"
+printf 'the report under review\n' > "$WORK/w1609.md"
+yerr=$("$NG" skeptic-arm "$YTASK" --report "$WORK/w1609.md" --state-dir "$NEXUS_STATE_DIR" 2>&1 >/dev/null); rc=$?
+assert_eq "skeptic-arm exits 0" "$rc" "0"
+assert_contains "skeptic-arm prints the reset's archive path" "$yerr" "$NEXUS_STATE_DIR/skeptic/.archive/$YTASK.reset-"
+assert_contains "…with the correspondence counted" "$yerr" "2 correspondence file(s)"
+# A glob, not `find | head -1`: an early-closing reader under pipefail is a
+# population early-exit-readers.manifest pins (#622).
+yarch=""; for _d in "$NEXUS_STATE_DIR/skeptic/.archive/$YTASK".reset-*; do [[ -d "$_d" ]] && { yarch="$_d"; break; }; done
+assert_file "…and the correspondence is really there" "$yarch/req-002-b.answered.md"
 
 # reset on a channel with nothing stale is an idempotent no-op (rc 0).
 "$CHAN" reset "$XTASK" >/dev/null 2>&1; rc=$?
@@ -1714,7 +1749,11 @@ assert_contains "#1523 …and names the launcher that does NOT wake (async-run.s
 assert_contains "#1523 the #1161 window still carries the rc-preserving form" \
     "$(sed -n '/Re-enter the await loop/,+4p' "$CHAN")" 'exit \$rc'
 _t1523="$WORK/t1523"; rm -rf "$_t1523"; mkdir -p "$_t1523"
+# A pending MARKER is planted because a timeout is exit 4 only while a round is
+# OPEN; with nothing armed it is exit 15 (NO-ROUND-OPEN, #1537/#1538), pinned in
+# test-skeptic-round-identity.sh. A real review always has a marker.
 NEXUS_STATE_DIR="$_t1523/state" bash "$CHAN" init to1523 >/dev/null 2>&1
+mkdir -p "$_t1523/state/skeptic/pending"; printf '1' > "$_t1523/state/skeptic/pending/to1523"
 _err1523=$(NEXUS_STATE_DIR="$_t1523/state" bash "$CHAN" await to1523 --timeout 1 --interval 1 2>&1 >/dev/null); _rc1523=$?
 assert_eq "#1523 POSITIVE CONTROL: the timeout path was reached (rc 4)" "$_rc1523" "4"
 assert_contains "#1523 the timeout message names the wake" "$_err1523" 'run_in_background'
@@ -1746,7 +1785,11 @@ _w1178="$WORK/w1178"; rm -rf "$_w1178"; mkdir -p "$_w1178"
 # failure of the code under test; it is the harness failing to look, and it
 # would read as a defect. Hence the assignment idiom below rather than a
 # pid-echoing function.
+# A pending MARKER is planted because a timeout is exit 4 only while a round is
+# OPEN; with nothing armed it is exit 15 (NO-ROUND-OPEN, #1537/#1538), pinned in
+# test-skeptic-round-identity.sh. A real review always has a marker.
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" init d1178 >/dev/null 2>&1
+mkdir -p "$_w1178/state/skeptic/pending"; printf '1' > "$_w1178/state/skeptic/pending/d1178"
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" await d1178 --timeout 45 --interval 1 \
     > "$_w1178/d1178.out" 2>&1 &
 _v1178=$!; sleep 4
@@ -1778,6 +1821,7 @@ kill -TERM "$_o1178" 2>/dev/null; wait "$_o1178" 2>/dev/null; _o1178_rc=$?
 assert_eq "#1178 CONTROL: a NON-displacement TERM still exits 143, unchanged" "$_o1178_rc" "143"
 # …and the documented codes either side are untouched.
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" init f1178 >/dev/null 2>&1
+printf '1' > "$_w1178/state/skeptic/pending/f1178"
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" await f1178 --timeout 2 --interval 1 >/dev/null 2>&1
 assert_eq "#1178 CONTROL: an ordinary timeout is still 4" "$?" "4"
 # The contract must LIST the code the code emits — the whole point of the issue.
@@ -1982,13 +2026,23 @@ _c1209() {   # _c1209 <mode> -> "marker=<y/n> DONE=<y/n>"
         # this the fixture never reaches the arm under test.
         printf -- "---\nproject: c1209t\ndisposition: no-further-pass\n---\nthe report\nplus a later edit\n" > "$W/reports/r.md"
         _SK_REPORT_PATH="$W/reports/r.md"
+        # #1619: a round of NEW work on a NEW report after the close — a
+        # deliverable the settlement was never about.
+        if [ "$mode" = newdeliv ]; then
+            printf -- "---\nproject: c1209t\ndisposition: no-further-pass\n---\nround two, new work\n" > "$W/reports/r2.md"
+            _SK_REPORT_PATH="$W/reports/r2.md"
+        fi
         rearm=""; [ "$mode" = rearm ] && rearm="the base moved under the review"
         out=$(_wrapup_skeptic_step 1209 c1209t owner/repo 0 require "why" "" "" "" "" "" "" "" "$rearm" 2>&1)
-        printf "marker=%s DONE=%s reqs=%s BANNER=%s\n" \
+        # reqs= counts SPAWN-SKEPTIC requests only (slug `skeptic-d<N>`); adj= the
+        # #1619 adjudication request a decline now files — a different kind, and
+        # the one thing that tells the orchestrator a `require` was declined.
+        printf "marker=%s DONE=%s reqs=%s BANNER=%s adj=%s\n" \
             "$([ -e "$P/$K" ] && echo y || echo n)" \
             "$([ -e "$STATE_DIR/skeptic/c1209t/DONE" ] && echo y || echo n)" \
-            "$(find "$STATE_DIR/requests" -name "*.md" 2>/dev/null | wc -l | tr -d " ")" \
-            "$(printf "%s" "$out" | grep -c "RECORDED AS SETTLED" || true)"
+            "$(find "$STATE_DIR/requests" -name "*-skeptic-d*.md" 2>/dev/null | wc -l | tr -d " ")" \
+            "$(printf "%s" "$out" | grep -c "RECORDED AS SETTLED" || true)" \
+            "$(find "$STATE_DIR/requests" -name "*-rearm-declined-*.md" 2>/dev/null | wc -l | tr -d " ")"
     ' _ "$NG" "$w" "$mode" 2>/dev/null
 }
 _s1209=$(_c1209 settled)
@@ -1999,6 +2053,7 @@ assert_contains "#1209 POSITIVE CONTROL: the settled case reached the suppressio
 assert_contains "#1209 a SETTLED obligation is not re-armed" "$_s1209" "marker=n"
 assert_contains "#1209 …and the creditor's DONE sentinel SURVIVES" "$_s1209" "DONE=y"
 assert_contains "#1209 …and no duplicate spawn-skeptic request is filed" "$_s1209" "reqs=0"
+assert_contains "#1619 …but the declined require IS put to the orchestrator (one adjudication request)" "$_s1209" "adj=1"
 # NEGATIVE CONTROL 1 — the load-bearing narrowing. An `armed` row AFTER the
 # settlement re-opens it normally, and `spawn-worker.sh` writes one via
 # `ng skeptic-arm` whenever the orchestrator appoints a reviewer. So re-opening
@@ -2009,6 +2064,14 @@ assert_contains "#1209 NEG CTL: an arm AFTER the settlement still arms normally"
     "$_a1209" "marker=y"
 assert_contains "#1209 NEG CTL: …and the suppression does NOT fire there" \
     "$_a1209" "BANNER=0"
+# your-org/nexus-code#1619 — the close is about a SUBJECT. A new report after it
+# is a deliverable the settlement never covered, so the debtor's require ARMS
+# (the spawn request itself is filed by cmd_wrap_up's Step 2b, pinned in
+# test-ng-wrap-up.sh #1619 A; this harness runs only the step).
+_n1209=$(_c1209 newdeliv)
+assert_contains "#1619 a NEW deliverable after a close ARMS" "$_n1209" "marker=y"
+assert_contains "#1619 …without the settled banner" "$_n1209" "BANNER=0"
+assert_contains "#1619 …and with no adjudication request (nothing was declined)" "$_n1209" "adj=0"
 # NEGATIVE CONTROL 2 — the deliberate, on-the-record override.
 _r1209=$(_c1209 rearm)
 assert_contains "#1209 NEG CTL: --skeptic-rearm overrides the suppression" \
@@ -2027,7 +2090,7 @@ _o=$(_g1371 status .hidden 2>/dev/null); _rc=$?
 assert_eq "#1371 status on a refused key exits non-zero (was rc 0)" "$_rc" "1"
 assert_eq "#1371 …and prints NO status line (was open=0 … done=0)" "$_o" ""
 _o=$(_g1371 status good 2>/dev/null); _rc=$?
-assert_eq "#1371 CONTROL: status on a valid key still answers, rc 0" "$_rc/$_o" "0/open=0 ack=0 answered=0 total=0 done=0"
+assert_eq "#1371 CONTROL: status on a valid key still answers, rc 0" "$_rc/$_o" "0/open=0 ack=0 answered=0 total=0 done=0 done_at=- done_delivered=0 released=0 marker=0"
 _o=$(_g1371 close .hidden 2>/dev/null); _rc=$?
 assert_eq "#1371 a WRITE verb (close) on a refused key exits non-zero" "$_rc" "1"
 assert_eq "#1371 …and mints nothing on disk under the refused key" "$(ls -A "$G1371/skeptic" 2>/dev/null | grep -c '^\.hidden$' || true)" "0"

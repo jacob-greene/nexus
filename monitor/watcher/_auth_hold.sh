@@ -146,15 +146,37 @@
 #                        the module is sourceable by a test with no watcher.
 #   _AUTH_HOLD_ALERT_FN  a function taking one message, routed by main.sh to
 #                        `_watcher_alert` (alerts log + watcher log +
-#                        sandbox-notify). Defaults to a no-op.
+#                        sandbox-notify). Defaults to a no-op. ATTENTION only:
+#                        the bell at the end of that chain carries no text
+#                        (your-org/nexus-code#1533).
+#   _AUTH_HOLD_OPERATOR_ALERT_FN
+#                        the TEXT-CARRYING, turn-independent operator alert
+#                        (`_operator_alert.sh`; main.sh wires `_operator_alert`).
+#                        Called as `<raise|clear|notify> <key> [<severity>]
+#                        <message>`. Defaults to a no-op. This is the leg the
+#                        expiry arm was missing on 2026-09-17 (#1548): the
+#                        watcher observed the expiry at 04:02:52 and this
+#                        module's only outputs for the next 7 h 22 m were log
+#                        lines.
 #
 # No paster is injected: this module never pastes. It sends ONE keystroke
 # (`Escape`) and hands delivery back to `main.sh`.
 
 _auth_hold_log_noop() { :; }
 _auth_hold_alert_noop() { :; }
+# The no-op answers `standing` with rc 1 (nothing is standing) and every other
+# verb with rc 0, so a caller that gates a clear on `standing` never clears
+# into the void every cycle.
+_auth_hold_operator_alert_noop() { [[ "${1:-}" == standing ]] && return 1; return 0; }
 _AUTH_HOLD_LOG_FN="${_AUTH_HOLD_LOG_FN:-_auth_hold_log_noop}"
 _AUTH_HOLD_ALERT_FN="${_AUTH_HOLD_ALERT_FN:-_auth_hold_alert_noop}"
+_AUTH_HOLD_OPERATOR_ALERT_FN="${_AUTH_HOLD_OPERATOR_ALERT_FN:-_auth_hold_operator_alert_noop}"
+
+# The operator-alert KEY for a logged-out orchestrator. ONE key for every
+# sensor that establishes the condition — the pane render here, the typed
+# `StopFailure` marker in `_orchestrator_liveness.sh` (#1520) — so two sensors
+# seeing one outage raise one alert, and either sensor's clear ends it.
+_AUTH_HOLD_EXPIRY_ALERT_KEY="auth-expired"
 
 # ---- state substrate ------------------------------------------------------
 #
@@ -333,7 +355,7 @@ _auth_hold_observe() {
     # Record/clear the EXPIRY row on every cycle, independently of the dialog
     # hold: an expired login needs no dialog on screen, and the hold's own row
     # only exists while one is. F3.
-    _auth_hold_expiry_observe "$auth" "$now"
+    _auth_hold_expiry_observe "$auth" "$now" "$target"
 
     # ════════════════════════════════════════════════════════════════════════
     # THE GATE IS `state=blocked`, STRUCTURALLY — NOT `auth=login`
@@ -487,7 +509,9 @@ _auth_hold_clear() {
 # knob off would leave liveness suppressed by a row nothing refreshes.
 _auth_hold_clear_all() {
     _auth_hold_clear
-    rm -f "$(_auth_hold_expiry_path)" 2>/dev/null || true
+    rm -f "$(_auth_hold_expiry_path)" "$(_auth_hold_ceiling_stamp_path)" "$(_auth_hold_turn_failure_first_path)" 2>/dev/null || true
+    "$_AUTH_HOLD_OPERATOR_ALERT_FN" clear "$_AUTH_HOLD_EXPIRY_ALERT_KEY" \
+        "auth-hold disabled by knob; the logged-out reading is no longer tracked"
 }
 
 # ---- the gate ------------------------------------------------------------
@@ -548,16 +572,55 @@ _auth_hold_active() {
 _auth_hold_expiry_path() {
     printf '%s/auth-expired.tsv' "${STATE_DIR:-.}"
 }
+# The ceiling-line throttle's own stamp: `<last_logged_epoch>\t<next_interval_s>`.
+# A separate file rather than two more columns on the expiry row, because the
+# row is rewritten every cycle by a writer that would have to learn to carry
+# them (#1050: a field that is READ is not a label).
+_auth_hold_ceiling_stamp_path() {
+    printf '%s/auth-expired-ceiling.tsv' "${STATE_DIR:-.}"
+}
+
+# The operator-facing text for a logged-out orchestrator. REMEDY FIRST — an
+# alert read at a glance, on a phone, must say what to do before what happened
+# (`_nexus_rofs_alarm_text`'s rule). Names the channel consequences the
+# operator would otherwise infer wrongly ("the board is quiet, so nothing is
+# happening"), and carries the supervisor's arm state (#1532: 7 h 13 m unarmed
+# during the same outage, visible to nobody).
+_auth_hold_expiry_alert_text() {   # <first_seen_epoch>
+    local first="$1" since ctx
+    since=$(date -Is -d "@$first" 2>/dev/null || printf '%s' "$first")
+    ctx=""
+    declare -F _operator_alert_context >/dev/null 2>&1 && ctx=$(_operator_alert_context)
+    printf 'RUN /login IN THE ORCHESTRATOR WINDOW — its Claude Code session is logged out (auth=expired since %s). Until then NO agent can take a turn: watcher emits are still PASTED into the logged-out session and fail there (only an open /login dialog holds them; every emit is archived either way), orchestrator-liveness files no resubmit and no respawn (neither can fix a credential), and this alert repeats hourly while it stands. %s Detected by the watcher from the orchestrator pane; ceiling %ss, after which liveness fails open. Held-emit ledger: %s.' \
+        "$since" "$ctx" "$(_auth_hold_max_hold)" "$(_auth_hold_held_log_path)"
+}
 
 # Record or clear the expiry row. Called from `_auth_hold_observe`, which already
 # holds a fresh probe — so this costs no extra pane read.
+#
+# THE OPERATOR ALERT IS RAISED ON EVERY CYCLE THE EXPIRY STANDS, not only on
+# the transition, and that is deliberate: `_operator_alert` owns the cadence
+# (silent inside the reminder window, a reminder past it), so calling it each
+# cycle is what buys the hourly reminder without this module keeping a second
+# clock. On the transition OUT it is cleared, which is what closes the record,
+# the push and the GitHub issue.
 _auth_hold_expiry_observe() {
-    local auth="$1" now="$2" path first
+    local auth="$1" now="$2" target="${3:-}" path first
     path=$(_auth_hold_expiry_path)
     if [[ "$auth" != "expired" ]]; then
         if [[ -f "$path" ]]; then
             "$_AUTH_HOLD_LOG_FN" "auth-hold: expiry CLEARED — the orchestrator no longer reports a logged-out session; orchestrator-liveness resumes its ordinary remedies"
-            rm -f "$path" 2>/dev/null || true
+            rm -f "$path" "$(_auth_hold_ceiling_stamp_path)" 2>/dev/null || true
+            "$_AUTH_HOLD_OPERATOR_ALERT_FN" clear "$_AUTH_HOLD_EXPIRY_ALERT_KEY" \
+                "the orchestrator pane no longer reports a logged-out session; the board resumes on the next cycle"
+        elif "$_AUTH_HOLD_OPERATOR_ALERT_FN" standing "$_AUTH_HOLD_EXPIRY_ALERT_KEY" \
+            && { [[ -z "$target" ]] || ! _auth_hold_turn_failure_marker "$target" >/dev/null; }; then
+            # Raised by the TYPED sensor alone (the error never rendered, or
+            # scrolled away): cleared once that sensor is quiet too — the
+            # marker aged past the gate window, or a successful turn's Stop
+            # removed it.
+            "$_AUTH_HOLD_OPERATOR_ALERT_FN" clear "$_AUTH_HOLD_EXPIRY_ALERT_KEY" \
+                "neither the orchestrator pane nor a fresh StopFailure marker reports a logged-out session any more"
         fi
         return 0
     fi
@@ -566,9 +629,193 @@ _auth_hold_expiry_observe() {
         [[ "$first" =~ ^[0-9]+$ ]] || first="$now"
     else
         first="$now"
-        "$_AUTH_HOLD_LOG_FN" "auth-hold: EXPIRY observed — the orchestrator reports a logged-out session (auth=expired). orchestrator-liveness will file NO resubmit and NO respawn while this stands, because neither can fix an expired credential (your-org/nexus-code#1517). Bounded: past $(_auth_hold_max_hold)s this FAILS OPEN and the ordinary remedies resume, so a wedged agent cannot be vouched for indefinitely."
+        "$_AUTH_HOLD_LOG_FN" "auth-hold: EXPIRY observed — the orchestrator reports a logged-out session (auth=expired). orchestrator-liveness will file NO resubmit and NO respawn while this stands, because neither can fix an expired credential (your-org/nexus-code#1517). Bounded: past $(_auth_hold_max_hold)s this FAILS OPEN and the ordinary remedies resume, so a wedged agent cannot be vouched for indefinitely. The operator is being told through the operator-alert legs (your-org/nexus-code#1548)."
     fi
     printf '%s\t%s\n' "$first" "$now" > "$path" 2>/dev/null || true
+    # `due` first: composing the text costs forks (date, the supervisor
+    # heartbeat age) and this runs every 5 s; inside the reminder window the
+    # raise would be a silent no-op anyway. A no-op injection answers `due`
+    # with rc 0, so a test sees every cycle's raise.
+    if "$_AUTH_HOLD_OPERATOR_ALERT_FN" due "$_AUTH_HOLD_EXPIRY_ALERT_KEY"; then
+        "$_AUTH_HOLD_OPERATOR_ALERT_FN" raise "$_AUTH_HOLD_EXPIRY_ALERT_KEY" critical \
+            "$(_auth_hold_expiry_alert_text "$first")"
+    fi
+    return 0
+}
+
+# The ceiling line, THROTTLED (your-org/nexus-code#1548 §2 / P3). The
+# predecessor of this function logged from inside a PREDICATE consulted every
+# ~5 s and produced 3364 identical lines in 5 h 22 m — 1.2 MB, 2.11x the log's
+# remaining headroom — and every one of them carried the words `respawn`,
+# `credential`, `login`, `expired` and `#1518`, so `grep -c respawn` over the
+# outage answered 3365 for a true 0. Silence while the mechanism worked, a
+# flood once it stopped: the polarity was inverted.
+#
+# Now: ONE line on the crossing (it carries the explanation), then a repeat at
+# an exponential backoff from `interval` doubling to a 3600 s cap — ~13 lines
+# over the measured 5 h 22 m instead of 3364. The repeat is worded as an AGE
+# (`held open since …`), because `REACHED after 17723s` read as a hold
+# duration and was not one (#1548 §3), and it deliberately avoids the forensic
+# search terms the crossing line carries, so a count over the outage is not
+# inflated by the diagnostic's own body.
+_auth_hold_ceiling_log() {   # <first_seen> <now>
+    local first="$1" now="$2" stamp last interval next since
+    stamp=$(_auth_hold_ceiling_stamp_path)
+    if [[ -f "$stamp" ]]; then
+        IFS=$'\t' read -r last interval < "$stamp" 2>/dev/null
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+        (( now - last >= interval )) || return 0
+        next=$(( interval * 2 )); (( next > 3600 )) && next=3600
+        printf '%s\t%s\n' "$now" "$next" > "$stamp" 2>/dev/null || true
+        since=$(date -Is -d "@$first" 2>/dev/null || printf '%s' "$first")
+        "$_AUTH_HOLD_LOG_FN" "auth-hold: expiry ceiling held open since ${since} (age $(( now - first ))s, max_hold=$(_auth_hold_max_hold)s); next note in ${next}s"
+        return 0
+    fi
+    printf '%s\t%s\n' "$now" 5 > "$stamp" 2>/dev/null || true
+    "$_AUTH_HOLD_LOG_FN" "auth-hold: expiry ceiling CROSSED — the logged-out reading has stood for $(( now - first ))s (max_hold=$(_auth_hold_max_hold)s) — FAILING OPEN: orchestrator-liveness resumes resubmit/respawn. Neither fixes an expired credential, so if the board is still silent the answer is still a human /login; what this prevents is vouching for a WEDGED agent indefinitely (your-org/nexus-code#1518 F3). Repeats at a backoff capped at 3600s, worded as an age."
+    return 0
+}
+
+# ---- the TYPED sensor: the orchestrator's own StopFailure marker (#1520/#1517)
+#
+# `monitor/hooks/turn-failure-emit.sh` now runs on the orchestrator's
+# `StopFailure` (your-org/nexus-code#1520) and writes
+# `$STATE_DIR/turn-failure/<target>.json`, typed by `_cause_classify.sh`:
+# `{"ts":…,"error":"authentication_failed","category":"auth","recovery":"operator",…}`.
+# Measured on the real binary (test-realmodel-auth-failure-hooks.sh, 2.1.273):
+# a 401 fires UserPromptSubmit then StopFailure — never Stop — and the marker
+# lands ~1 s after the failed turn; a successful turn's Stop clears it.
+#
+# This is the transcript-level half #1517 left open: a pane signal needs the
+# error still RENDERED in the bottom 15 rows, while this marker is a typed
+# field written the moment the turn fails. It is a GATE, like the pane arm —
+# it suppresses the remedies and raises the same alert key — never a trigger
+# for a remedy, because the one thing #1548 F2 established is that making
+# liveness "see" the failure in the other direction reaches `respawn
+# reason=resubmit-failed` at grace_s with nothing to veto it. Bounded by
+# freshness: the marker is refreshed by every failed turn, so a wedged pane
+# that stops producing them releases this gate after
+# MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS (default 600) with no ceiling of its
+# own needed. ONLY `category=auth` / `recovery=operator` gates here: transient,
+# config and conversation failures keep their existing owners (the liveness
+# ladder's own resubmit-then-respawn), which #1520 asks to be decided rather
+# than inherited — recorded as an operator decision in the PR.
+_auth_hold_turn_failure_gate_seconds() {
+    _auth_hold_int "${MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS:-600}" 600
+}
+_auth_hold_turn_failure_path() {   # <target>
+    printf '%s/turn-failure/%s.json' "${STATE_DIR:-.}" "$1"
+}
+_auth_hold_tf_field() {   # <file> <field> — first match on line 1, empty on miss
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null
+    else
+        sed -n "1s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null
+    fi
+}
+# The watcher's last paste epoch, for callers that do not hold it themselves.
+_auth_hold_last_paste_ts() {
+    local f="${ORCH_LAST_PASTE_FILE:-}" v
+    [[ -n "$f" && -f "$f" ]] || return 0
+    v=$(head -n 1 "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v"
+    return 0
+}
+_auth_hold_turn_failure_first_path() { printf '%s/auth-turn-failure.tsv' "${STATE_DIR:-.}"; }
+
+# The RAW sensor, no ceiling: rc 0 iff an auth marker stands for <target> and
+# it is CURRENT, printing `<ts>\t<last_msg>`. "Current" is a disjunction, and
+# the second half is skeptic oplivesk F3:
+#
+#   (a) fresh: now - ts <= the gate window (600 s) — the failure just happened;
+#   (b) ts >= last_paste_ts: the watcher's LATEST poke was answered by an auth
+#       failure and nothing has been poked since, so there is no unanswered
+#       paste to call a wedge.
+#
+# (a) alone left `dead-threshold` open, measured by the skeptic's rig: with no
+# pane render, the window lapses at +600 s, the ladder resubmits at ~+750 s,
+# that fails and re-gates to ~+1350 s, and the FIRST tick after it sees
+# age >= 1320 and respawns (+1385 s) — the resubmit never advances
+# last_paste_ts. (b) closes it without vouching for a wedge: a wedged agent
+# gets a NEWER paste and produces NO newer marker, which releases the gate.
+_auth_hold_turn_failure_marker() {   # <target> [last_paste_ts]
+    local target="${1:?target window required}" lp="${2:-}" f ts rec cat now last
+    f=$(_auth_hold_turn_failure_path "$target")
+    [[ -f "$f" ]] || return 1
+    rec=$(_auth_hold_tf_field "$f" recovery); cat=$(_auth_hold_tf_field "$f" category)
+    [[ "$rec" == "operator" || "$cat" == "auth" ]] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        ts=$(jq -r '.ts // empty' "$f" 2>/dev/null)
+    else
+        ts=$(sed -n '1s/.*"ts":\([0-9]*\).*/\1/p' "$f" 2>/dev/null)
+    fi
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s)
+    [[ "$lp" =~ ^[0-9]+$ ]] || lp=$(_auth_hold_last_paste_ts)
+    if ! (( now - ts <= $(_auth_hold_turn_failure_gate_seconds) )); then
+        [[ "$lp" =~ ^[0-9]+$ ]] && (( lp > 0 && ts >= lp )) || return 1
+    fi
+    last=$(_auth_hold_tf_field "$f" last_msg)
+    printf '%s\t%s' "$ts" "${last:-}"
+    return 0
+}
+
+# THE GATE = the raw sensor UNDER THE SAME CEILING AS THE PANE ARM (skeptic
+# oplivesk F5). Without one, this arm silently revoked the `max_hold` fail-open
+# the alert text and the CROSSED line promise — and that fail-open is the
+# operator's standing decision, not this module's to change. Aged from the
+# FIRST cycle the sensor fired (`auth-turn-failure.tsv`, removed the first
+# cycle it does not); past `max_hold_seconds` it fails open through the same
+# throttled ceiling line.
+_auth_hold_turn_failure_gate() {   # <target> [last_paste_ts]
+    local target="${1:?target window required}" row first now p
+    _auth_hold_enabled || return 1
+    p=$(_auth_hold_turn_failure_first_path)
+    if ! row=$(_auth_hold_turn_failure_marker "$target" "${2:-}"); then
+        rm -f "$p" 2>/dev/null || true
+        return 1
+    fi
+    now=$(date +%s)
+    first=$(cut -f1 "$p" 2>/dev/null); [[ "$first" =~ ^[0-9]+$ ]] || first=""
+    if [[ -z "$first" ]]; then
+        first="$now"
+        { printf '%s\n' "$first" > "$p"; } 2>/dev/null || true
+    fi
+    if (( now - first >= $(_auth_hold_max_hold) )); then
+        _auth_hold_ceiling_log "$first" "$now"
+        return 1
+    fi
+    printf '%s' "$row"
+    return 0
+}
+# Raise the SAME key the pane arm raises, from the typed sensor. Called by
+# `_orchestrator_auth_blocked` on every cycle its turn-failure arm fires; the
+# primitive owns dedup, so this composes text only when `due`.
+_auth_hold_turn_failure_alert() {   # <target>
+    local target="${1:?target window required}" row ts last
+    "$_AUTH_HOLD_OPERATOR_ALERT_FN" due "$_AUTH_HOLD_EXPIRY_ALERT_KEY" || return 0
+    row=$(_auth_hold_turn_failure_gate "$target") || return 0
+    IFS=$'\t' read -r ts last <<<"$row"
+    "$_AUTH_HOLD_OPERATOR_ALERT_FN" raise "$_AUTH_HOLD_EXPIRY_ALERT_KEY" critical \
+        "$(_auth_hold_expiry_alert_text "$ts") Source: the orchestrator's own StopFailure marker (typed: recovery=operator), last message: ${last:-?}"
+    return 0
+}
+
+# rc 0 iff a FRESH expiry row is on disk — "the orchestrator is logged out, as
+# of the last cycle that looked". For OTHER modules (service-health's route
+# check, the cockpit) that must not fork a pane read of their own. Same
+# staleness window as the gate; past the ceiling it still answers 0, because
+# the question here is "is the route down?" and it is.
+_auth_hold_expiry_standing() {
+    local path first last now
+    _auth_hold_enabled || return 1
+    path=$(_auth_hold_expiry_path)
+    [[ -f "$path" ]] || return 1
+    IFS=$'\t' read -r first last < "$path" 2>/dev/null || return 1
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s)
+    (( now - last <= $(_auth_hold_staleness) ))
 }
 
 _auth_hold_auth_expired() {
@@ -582,7 +829,7 @@ _auth_hold_auth_expired() {
         IFS=$'\t' read -r _ex_first _ex_last < "$_ex_path" 2>/dev/null
         _ex_now=$(date +%s)
         if [[ "$_ex_first" =~ ^[0-9]+$ ]] && (( _ex_now - _ex_first >= $(_auth_hold_max_hold) )); then
-            "$_AUTH_HOLD_LOG_FN" "auth-hold: expiry ceiling REACHED after $(( _ex_now - _ex_first ))s (max_hold=$(_auth_hold_max_hold)s) — FAILING OPEN. orchestrator-liveness resumes resubmit/respawn. Neither fixes an expired credential, so if the board is still silent the answer is still a human /login; what this prevents is vouching for a WEDGED agent indefinitely (your-org/nexus-code#1518 F3)."
+            _auth_hold_ceiling_log "$_ex_first" "$_ex_now"
             return 1
         fi
         # A stale row releases too, same reason as the hold's staleness window:
@@ -699,7 +946,10 @@ _auth_hold_escape() {
     else
         held_for=-1
     fi
-    tgt=$(resolve_window_id "$target" 2>/dev/null || true); tgt="${tgt:-$target}"
+    # A failed id resolution falls back to the EXACT name (`:=`), never the bare
+    # one: bare resolves by unique PREFIX when the window is gone, and an Escape
+    # into the live sibling aborts ITS turn (your-org/nexus-code#1524).
+    tgt=$(resolve_window_id "$target" 2>/dev/null || true); tgt="${tgt:-:=$target}"
     if ! tmux send-keys -t "$tgt" Escape 2>/dev/null; then
         "$_AUTH_HOLD_LOG_FN" "auth-hold: Escape to '${target}' FAILED (tmux send-keys error); hold stands, ceiling $(_auth_hold_max_hold)s will release it"
         return 1
@@ -707,6 +957,11 @@ _auth_hold_escape() {
     "$_AUTH_HOLD_LOG_FN" "auth-hold: ESCAPED — sent Escape to '${target}' after ${held_for}s held (aged from first_seen, not from the last retry) with no pane change for $(_auth_hold_active_grace)s+; the login reads ABANDONED, which is the operator's standing instruction to break out (your-org/nexus-code#1518). Held emits paste on the next cycle."
     "$_AUTH_HOLD_ALERT_FN" \
         "login hold EXPIRED on the orchestrator: the /login dialog had been untouched for over $(_auth_hold_escape_after)s, so the watcher sent Escape and is resuming emits. If you still need to log in, run /login again — the board was silent until now."
+    # The bell above carries no text (#1533); an abandoned login is exactly the
+    # case where the operator is NOT at the terminal, so say it on the legs
+    # that reach a phone. An EVENT, not a standing condition: `notify`.
+    "$_AUTH_HOLD_OPERATOR_ALERT_FN" notify auth-dialog-escaped critical \
+        "The orchestrator's /login dialog was left untouched for ${held_for}s, so the watcher sent Escape and resumed pasting. If you still need to log in, run /login again in the orchestrator window — the board was silent until now."
     _auth_hold_clear
     return 0
 }

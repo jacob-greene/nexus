@@ -610,6 +610,26 @@ growth_line() {
 # predicates are compiled into EREs and applied inside the join.
 # ---------------------------------------------------------------------------
 ATTRIB_TIMEOUT_S="${ATTRIB_TIMEOUT_S:-120}"
+# EVERY WALK IN --check IS BOUNDED, AND A WALK THAT DID NOT FINISH SAYS SO
+# (your-org/nexus-code#1601). The depth-1 walks of $ROOT (the entry count, the
+# attribution metadata) and of c71780 had no time limit; on 2026-09-21 a /tmp of
+# 15,234 depth-1 entries under load ~30 made `--check`, and with it
+# `svc.sh status`, stop returning. A walk bounded by `timeout` and then READ AS
+# COMPLETE is the other half of the same defect: its output is truncated at
+# rc 124 and a sum over it is a short count that looks like a measurement. So
+# each bounded walk's status is TESTED: timed out (124, or 137 after -k) means
+# UNMEASURED or, where a partial sum is still useful, a LOWER BOUND named as one.
+# Other non-zero statuses (an entry vanishing mid-walk, routine on /tmp) keep
+# their previous handling.
+#
+# CHECK_WALK_TIMEOUT_S — CHOSEN default 20 s for each DEPTH-1 walk: the 76,453-
+# entry /tmp measured above took under 1 s, so 20 s is a >20x margin under load
+# while keeping the whole check inside a caller's bound (svc.sh status: 20 s per
+# row; the watcher: 60 s). The recursive c71780 payload walk and the attribution
+# `du` keep ATTRIB_TIMEOUT_S; only their TRUNCATION is new here.
+CHECK_WALK_TIMEOUT_S="${CHECK_WALK_TIMEOUT_S:-20}"
+[[ "$CHECK_WALK_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] || CHECK_WALK_TIMEOUT_S=20
+_timed_out() { [ "${1:-0}" = 124 ] || [ "${1:-0}" = 137 ]; }
 # Written WITHOUT an interval expression (`{4,}`): intervals are a portability
 # coin-flip across awk implementations and this must behave identically
 # wherever the watcher runs.
@@ -625,7 +645,12 @@ attribution_block() {   # <root> <top-n> — renders indented lines on stdout
     local root="$1" top="${2:-8}" work rc=0 nl_count total rb rn cutoff
     work=$(mktemp -d "${TMPDIR:-/tmp}/tmpfs-attrib.XXXXXX") \
         || { printf '    (attribution UNAVAILABLE: mktemp failed — UNMEASURED, not zero)\n'; return 0; }
-    find "$root" -mindepth 1 -maxdepth 1 -printf '%u\t%T@\t%p\0' 2>/dev/null > "$work/meta" || true
+    timeout -k 2 "$CHECK_WALK_TIMEOUT_S" find "$root" -mindepth 1 -maxdepth 1 -printf '%u\t%T@\t%p\0' 2>/dev/null > "$work/meta" || rc=$?
+    if _timed_out "$rc"; then
+        printf '    (attribution UNAVAILABLE: the depth-1 walk did not finish within %ss (rc %s) — UNMEASURED, not zero, and not a partial breakdown passed off as a whole one)\n' "$CHECK_WALK_TIMEOUT_S" "$rc"
+        rm -rf -- "$work"; return 0
+    fi
+    rc=0
     if [ ! -s "$work/meta" ]; then
         printf '    (attribution UNAVAILABLE: the depth-1 walk produced nothing — UNMEASURED, not zero)\n'
         rm -rf -- "$work"; return 0
@@ -636,6 +661,12 @@ attribution_block() {   # <root> <top-n> — renders indented lines on stdout
         | timeout "$ATTRIB_TIMEOUT_S" xargs -0 -r du -sb -- 2>/dev/null > "$work/bytes" || rc=$?
     if [ ! -s "$work/bytes" ]; then
         printf '    (attribution UNAVAILABLE: the byte walk produced nothing, rc %s — reported as UNMEASURED, never as zero)\n' "$rc"
+        rm -rf -- "$work"; return 0
+    fi
+    # A TIMED-OUT `du` leaves a NON-EMPTY, TRUNCATED byte list — every share,
+    # total and "would reclaim" below would be computed over part of the root.
+    if _timed_out "$rc"; then
+        printf '    (attribution UNAVAILABLE: the byte walk did not finish within %ss (rc %s) — its totals would be LOWER BOUNDS over an unknown subset, so none are printed)\n' "$ATTRIB_TIMEOUT_S" "$rc"
         rm -rf -- "$work"; return 0
     fi
     awk -v RS='\0' -F'\t' '!index($0, "\n") { printf "%s\t%s\t%s\n", $3, $1, $2 }' "$work/meta" > "$work/own" 2>/dev/null
@@ -720,12 +751,15 @@ do_check() {
     shmem_pct=$(pct_of "$shmem" "$mem_total" || true)
     tmp_of_ram_pct=$(pct_of "$used_kb" "$mem_total" || true)
     # Entry counts: DIAGNOSTIC CONTEXT from here on. They decide nothing.
-    all=$(ls -1A -- "$ROOT" 2>/dev/null)
+    local ls_rc=0
+    all=$(timeout -k 2 "$CHECK_WALK_TIMEOUT_S" ls -1A -- "$ROOT" 2>/dev/null) || ls_rc=$?
     entries=$(printf '%s\n' "$all" | grep -cvE '^\.th-(ledger|ports)\.')
     th=$(printf '%s\n' "$all" | grep -cE '^\.th-(ledger|ports)\.')
     [[ "$entries" =~ ^[0-9]+$ ]] || entries='?'
     [[ "$th" =~ ^[0-9]+$ ]] || th='?'
-    record_sample "$now" "$used_kb" "$entries"
+    # A truncated listing is a SHORT count, never a smaller /tmp (#1601).
+    if _timed_out "$ls_rc"; then entries="?(walk did not finish within ${CHECK_WALK_TIMEOUT_S}s)"; th='?'; fi
+    record_sample "$now" "$used_kb" "$( [[ "$entries" =~ ^[0-9]+$ ]] && printf '%s' "$entries" || printf '?' )"
 
     # ---- conditions ----
     local band="$BAND_OK" b_cap c_mib="" c_entries=""
@@ -750,17 +784,29 @@ do_check() {
     # carried into both the healthy line and the finding, so the contract
     # violation stays VISIBLE either way; what it no longer does is wake the
     # orchestrator on its own while the mount it lives on is nine-tenths free.
-    local socket_over=0
+    local socket_over=0 c_partial=''
     if [ -d "$ROOT/c71780" ]; then
-        local c_bytes
-        c_bytes=$(timeout "$ATTRIB_TIMEOUT_S" find "$ROOT/c71780" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        local c_bytes c_rc=0 ce_rc=0 c_ge=''
+        # THE PAYLOAD SUM IS A LOWER BOUND WHEN ITS WALK TIMES OUT (#1601): awk
+        # sums whatever `find` printed before the kill, and printed it at rc 0.
+        # Taken from `find`'s OWN status (PIPESTATUS[0]), not the pipeline's.
+        c_bytes=$(timeout -k 2 "$ATTRIB_TIMEOUT_S" find "$ROOT/c71780" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
+                  exit "${PIPESTATUS[0]}") || c_rc=$?
         [[ "$c_bytes" =~ ^[0-9]+$ ]] && c_mib=$(( c_bytes / 1048576 ))
-        c_entries=$(find "$ROOT/c71780" -mindepth 1 -maxdepth 1 -printf '.' 2>/dev/null | wc -c)
+        if _timed_out "$c_rc"; then
+            c_partial="the c71780 payload walk did not finish within ${ATTRIB_TIMEOUT_S}s (rc ${c_rc}); ${c_mib:-?} MiB is a LOWER BOUND, not a measurement"
+            c_ge='AT LEAST '
+        fi
+        c_entries=$(timeout -k 2 "$CHECK_WALK_TIMEOUT_S" find "$ROOT/c71780" -mindepth 1 -maxdepth 1 -printf '.' 2>/dev/null | wc -c
+                    exit "${PIPESTATUS[0]}") || ce_rc=$?
+        _timed_out "$ce_rc" && c_entries=''
+        # A lower bound over the limit is still over it; one under the limit
+        # decides nothing and is reported below as UNDECIDED, never as clear.
         if [[ "$c_mib" =~ ^[0-9]+$ ]] && [ "$c_mib" -gt "$MAX_C71780_MIB" ]; then
             socket_over=1
             if [ "$SOCKET_ROOT_TRIGGER" = 1 ]; then
                 conds+=("socket_root"); cond_pairs+=("socket_root=elevated")
-                detail+=("socket_root: $ROOT/c71780 holds ${c_mib} MiB of non-socket payload (limit ${MAX_C71780_MIB} MiB). A CONTRACT violation, NOT memory pressure (your-org/nexus-code#1422): that directory has a short name for the 107-byte sun_path limit and holds sockets and nothing else. Re-derived 2026-09-08: the payload is 100% ours, entirely STALE (0 of ${c_entries:-?} top-level entries modified in 24 h) and concentrated. Silence it with monitor.tmpfs.socket_root_is_trigger=0; it is banded 'elevated' and never higher, so it can never read as pressure.")
+                detail+=("socket_root: $ROOT/c71780 holds ${c_ge}${c_mib} MiB of non-socket payload (limit ${MAX_C71780_MIB} MiB). A CONTRACT violation, NOT memory pressure (your-org/nexus-code#1422): that directory has a short name for the 107-byte sun_path limit and holds sockets and nothing else. Re-derived 2026-09-08: the payload is 100% ours, entirely STALE (0 of ${c_entries:-?} top-level entries modified in 24 h) and concentrated. Silence it with monitor.tmpfs.socket_root_is_trigger=0; it is banded 'elevated' and never higher, so it can never read as pressure.")
                 [ "$BAND_ELEVATED" -gt "$band" ] && band="$BAND_ELEVATED"
             fi
         fi
@@ -769,7 +815,7 @@ do_check() {
     if [ "$band" -eq "$BAND_OK" ]; then
         [ "$QUIET" = 1 ] || printf 'tmpfs-guard: healthy: %s used=%s%% (%s of %s) inodes=%s%% mem-avail=%s%% | context only: entries=%s th-files=%s%s\n' \
             "$ROOT" "$used_pct" "$(human_kb "$used_kb")" "$(human_kb "$size_kb")" "${inode_pct:-?}" "${mem_avail_pct:-?}" "$entries" "$th" \
-            "$( [ "$socket_over" = 1 ] && printf ' | NOTE c71780 holds %s MiB of non-socket payload (contract limit %s MiB, your-org/nexus-code#1422) — reported here rather than raised, because monitor.tmpfs.socket_root_is_trigger is 0' "$c_mib" "$MAX_C71780_MIB" )"
+            "$( [ "$socket_over" = 1 ] && printf ' | NOTE c71780 holds %s%s MiB of non-socket payload (contract limit %s MiB, your-org/nexus-code#1422) — reported here rather than raised, because monitor.tmpfs.socket_root_is_trigger is 0' "${c_ge:-}" "$c_mib" "$MAX_C71780_MIB" )$( [ -n "$c_partial" ] && [ "$socket_over" = 0 ] && printf ' | PARTIAL: %s, so the socket_root contract check is UNDECIDED this run (your-org/nexus-code#1601)' "$c_partial" )"
         return 0
     fi
 
@@ -810,7 +856,8 @@ do_check() {
         printf '  top families BY BYTES (never by count — ranking by count is the defect this replaced):\n'
         attribution_block "$ROOT" 8
         printf '  DIAGNOSTIC CONTEXT (decides nothing; here because it is useful once you already know there is pressure): depth-1 entries excluding .th-* = %s; .th-ledger/.th-ports helper files = %s.\n' "$entries" "$th"
-        [ "$socket_over" = 1 ] && printf '  DIAGNOSTIC CONTEXT: %s/c71780 holds %s MiB of non-socket payload against a %s MiB contract limit (your-org/nexus-code#1422). Not a trigger unless armed; its bytes are already counted in tmp_capacity above.\n' "$ROOT" "$c_mib" "$MAX_C71780_MIB"
+        [ "$socket_over" = 1 ] && printf '  DIAGNOSTIC CONTEXT: %s/c71780 holds %s%s MiB of non-socket payload against a %s MiB contract limit (your-org/nexus-code#1422). Not a trigger unless armed; its bytes are already counted in tmp_capacity above.\n' "$ROOT" "${c_ge:-}" "$c_mib" "$MAX_C71780_MIB"
+        [ -n "$c_partial" ] && printf '  PARTIAL: %s%s (your-org/nexus-code#1601).\n' "$c_partial" "$( [ "$socket_over" = 0 ] && printf ' — the socket_root contract check is UNDECIDED this run' )"
         printf '  remedy: this is a READ-ONLY monitor. Inspect with `monitor/tmpfs-guard.sh --status --root %s`; reaping is NOT armed (your-org/nexus-code#957) and `--reap --dry-run` prints a plan without removing anything.\n' "$ROOT"
     } | emit_both
     # exit 100: a FINDING — this monitor is alive and the condition it watches

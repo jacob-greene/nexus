@@ -80,6 +80,21 @@ _repo_root=$(cd "$_test_dir/../.." && pwd)
 LAUNCHER="$_test_dir/launcher.sh"
 GUIDE="$_repo_root/skills/nexus.cc-update/GUIDE.md"
 
+# ── POPULATION (your-org/nexus-code#1301) ───────────────────────────────
+# E/G sweep every tracked Markdown file, so a doc added anywhere joins this
+# guard's population. `_docs` is the ONE enumerator (defined here so the probe
+# can call it): E, G and `gp_population` all use it. Fixtures are captured
+# terminal output, not instructions — excluded. The launcher it executes and the
+# config loader whose default it recomputes are read too. `gp_handle` EXITS on
+# --population, so it sits above the first line of output.
+_docs() { git -C "$_repo_root" ls-files '*.md' 2>/dev/null | grep -v '^monitor/watcher/fixtures/' || true; }
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _docs | sed "s|^|$_repo_root/|"
+    printf '%s\n' "$LAUNCHER" "$_repo_root/config/load.sh"
+}
+gp_handle "$@"
+
 PASS=0
 FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
@@ -136,8 +151,8 @@ assert_eq "D: omitting --target resolves the config default" "$?" "0"
 # ============================================================
 echo '=== E/G: no doc hands launcher.sh an undefined variable, or a hard-coded name ==='
 # ============================================================
-# Fixtures are captured terminal output, not instructions — exclude them.
-_docs() { git -C "$_repo_root" ls-files '*.md' 2>/dev/null | grep -v '^monitor/watcher/fixtures/' || true; }
+# `_docs` (defined at the top, the ONE enumerator) excludes fixtures: captured
+# terminal output, not instructions.
 
 undef_target=$(cd "$_repo_root" && _docs | xargs grep -nF -- 'launcher.sh --target "$' 2>/dev/null || true)
 assert_eq "E: no doc invokes launcher.sh --target with a shell variable" "$undef_target" ""

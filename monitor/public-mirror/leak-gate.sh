@@ -3,28 +3,71 @@
 # tracked tree. Patterns are read from the mapping file (`deny`/`keep` lines);
 # this script hardcodes NO identifiers, so its own public copy is clean.
 #
-#   leak-gate.sh <mapping.tsv> [<repo-dir>] [--allow-unstaged]
+#   leak-gate.sh <mapping.tsv> [<repo-dir>] [--allow-unstaged] [--commit <sha>]
 #
-# Exit 0 = clean. Exit 1 = leak (offending lines printed). Exit 2 = usage.
+# Exit 0 = clean. Exit 1 = leak (offending lines printed). Exit 2 = usage, and
+#          (with --commit) REFUSED: the sha does not resolve to a commit, or
+#          <repo-dir> is not a git work tree.
 # Exit 5 = REFUSED: the index and the working tree disagree, so this gate cannot
-#          say which artifact it is vouching for. See below.
+#          say which artifact it is vouching for. See below. With --commit,
+#          also: the commit's TREE is not the index this gate scanned.
 # Exit 6 = REFUSED: the index holds an entry whose PUBLISHED content this gate
 #          cannot read, so a PASS would describe a smaller population than the
 #          one being shipped. See the index-entry scan below.
+#
+# --commit <sha> — the mirror is published as ONE commit per sync, so that
+# commit's MESSAGE and IDENTITIES are published bytes too, and the tree scan
+# never reads them (your-org/nexus-code#979, #1006). With --commit the gate
+# ALSO screens every published header of the commit object — author and
+# committer (name AND email), any extra header (encoding, mergetag, …) — and
+# the FULL message, against the same deny/keep patterns. Only `tree`/`parent`
+# are skipped: they are object ids, not authored text.
+#
+# SCOPE: metadata + the tree BY BINDING, not by a second scan. The commit's
+# tree must be byte-identical to the INDEX (`git diff-index --cached`), which
+# is the population every check below already scans (the exit-5 refusal pins
+# the index to the working tree). So a PASS with --commit says: this commit's
+# metadata is clean AND its tree is the one this run scanned. A commit whose
+# tree differs is REFUSED (exit 5), never scanned separately — a second,
+# independent tree scanner would be a second gate to keep in sync with this
+# one. Without --commit, behaviour is unchanged.
 set -uo pipefail
 export LC_ALL=C
 ALLOW_UNSTAGED=0
+COMMIT_MODE=0
+COMMIT=""
 args=()
-for a in "$@"; do
-    case "$a" in
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --allow-unstaged) ALLOW_UNSTAGED=1 ;;
-        *) args+=("$a") ;;
+        --commit)
+            [ "$#" -ge 2 ] || { echo "leak-gate: --commit needs a <sha>" >&2; exit 2; }
+            COMMIT_MODE=1; COMMIT="$2"; shift ;;
+        *) args+=("$1") ;;
     esac
+    shift
 done
 set -- ${args[@]+"${args[@]}"}
-MAP="${1:?usage: leak-gate.sh <mapping.tsv> [repo-dir] [--allow-unstaged]}"
+MAP="${1:?usage: leak-gate.sh <mapping.tsv> [repo-dir] [--allow-unstaged] [--commit <sha>]}"
 DIR="${2:-.}"
 cd "$DIR"
+
+# --commit: resolve FIRST, and fail closed. A sha that does not name a commit
+# in THIS repository is a refusal, never a skipped check — `git rev-parse` on a
+# typo would otherwise leave nothing to screen, and "nothing screened" must not
+# print PASS. `^{commit}` also refuses a tree or blob id passed by mistake.
+if [ "$COMMIT_MODE" -eq 1 ]; then
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "LEAK GATE: REFUSED — --commit needs a git work tree; $DIR is not one." >&2
+        exit 2
+    fi
+    if [ -z "$COMMIT" ] || ! COMMIT_SHA=$(git rev-parse --verify --quiet "${COMMIT}^{commit}" 2>/dev/null) \
+       || [ -z "$COMMIT_SHA" ]; then
+        echo "LEAK GATE: REFUSED — --commit '$COMMIT' does not resolve to a commit in $DIR." >&2
+        echo "  Nothing was screened; this is not a PASS." >&2
+        exit 2
+    fi
+fi
 
 # ---- REFUSE TO VOUCH FOR AN ARTIFACT THAT IS NOT THE ONE BEING SHIPPED ------
 #
@@ -66,6 +109,92 @@ fi
 DENY=$(awk -F'\t' '$1=="deny"{print $2}' "$MAP" | paste -sd'|')
 KEEP=$(awk -F'\t' '$1=="keep"{print $2}' "$MAP" | paste -sd'|')
 [ -n "$DENY" ] || { echo "leak-gate: empty denylist in $MAP" >&2; exit 2; }
+
+# ---- --commit: THE COMMIT'S METADATA, AND ITS TREE BY BINDING ---------------
+#
+# The sync publishes ONE commit on top of the public HEAD. Its message and its
+# author/committer identities ship verbatim, and no tree scan reads them: an
+# operator's private address in the committer line, or an internal issue ref
+# in the message body, passed every check in this file. (your-org/nexus-code
+# #979, #1006.) Screening lives HERE rather than in the recipe so the recipe
+# cannot forget it.
+if [ "$COMMIT_MODE" -eq 1 ]; then
+    # Binding: the tree this run scans is the WORKING TREE, pinned to the INDEX
+    # by the exit-5 check above — unless --allow-unstaged waived that pin, in
+    # which case the scanned tree is not the index and cannot vouch for a
+    # commit made from it. Both equalities are required; neither is implied.
+    if ! git diff --quiet 2>/dev/null; then
+        echo "LEAK GATE: REFUSED — --commit with an index that differs from the working tree." >&2
+        echo "  This run scans the working tree; the commit records a tree built from the index." >&2
+        exit 5
+    fi
+    git diff-index --cached --quiet "$COMMIT_SHA" -- 2>/dev/null; _bind_rc=$?
+    if [ "$_bind_rc" -ne 0 ]; then
+        echo "LEAK GATE: REFUSED — commit ${COMMIT_SHA}'s tree is not the index this gate scans (diff-index rc=$_bind_rc)." >&2
+        echo "  A PASS would vouch for a tree nobody scanned. Re-run on the tree the commit was made from." >&2
+        exit 5
+    fi
+
+    # Every header except the object-id ones, then the whole message. An ident
+    # is split into NAME and EMAIL so the report names the field; the trailing
+    # timestamp is digits and is not screened. A header that does not parse as
+    # an ident is screened WHOLE rather than skipped.
+    #
+    # Read the object into a variable FIRST: a `< <(git cat-file …)` whose
+    # producer failed would feed an empty stream and screen nothing — a PASS
+    # over zero fields. Both identity headers must then actually be SEEN.
+    # `-e` before each pattern: a deny/keep regex beginning with `-` would
+    # otherwise be read as an OPTION (CLAUDE.md, DASH-PATTERN-OPTION).
+    if ! _raw=$(git cat-file commit "$COMMIT_SHA" 2>/dev/null); then
+        echo "LEAK GATE: REFUSED — cannot read commit object ${COMMIT_SHA}." >&2
+        exit 2
+    fi
+    _ident_re='^(.*) <([^>]*)>( .*)?$'
+    meta_hits=""
+    _in_msg=0; _n=0; _hdr=""; _seen=""
+    while IFS= read -r _l; do   # herestring below: the final line is always terminated
+        if [ "$_in_msg" -eq 0 ]; then
+            if [ -z "$_l" ]; then _in_msg=1; continue; fi
+            case "$_l" in
+                " "*) _fields=("${_hdr}	${_l# }") ;;   # continuation of the previous header
+                *)
+                    _hdr=${_l%% *}; _val=${_l#* }
+                    [ "$_val" = "$_l" ] && _val=""
+                    case "$_hdr" in
+                        tree|parent) continue ;;
+                        author|committer)
+                            _seen="${_seen} ${_hdr}"
+                            if [[ "$_val" =~ $_ident_re ]]; then
+                                _fields=("${_hdr}.name	${BASH_REMATCH[1]}" "${_hdr}.email	${BASH_REMATCH[2]}")
+                            else
+                                _fields=("${_hdr}	${_val}")
+                            fi ;;
+                        *) _hdr="header.${_hdr}"; _fields=("${_hdr}	${_val}") ;;
+                    esac ;;
+            esac
+        else
+            _n=$((_n+1)); _fields=("message:${_n}	${_l}")
+        fi
+        for _f in "${_fields[@]}"; do
+            _txt=${_f#*	}
+            grep -qiE -e "$DENY" <<<"$_txt" || continue
+            if [ -n "$KEEP" ] && grep -qE -e "$KEEP" <<<"$_txt"; then continue; fi
+            meta_hits="${meta_hits}${_f%%	*}:${_txt}
+"
+        done
+    done <<<"$_raw"
+    case "$_seen" in
+        *" author"*" committer"*) : ;;
+        *)  echo "LEAK GATE: REFUSED — commit ${COMMIT_SHA}: author/committer headers not found; nothing was screened." >&2
+            exit 2 ;;
+    esac
+    meta_hits=$(printf '%s\n' "$meta_hits" | sed '/^$/d')
+    if [ -n "$meta_hits" ]; then
+        echo "LEAK GATE: FAIL — denied token in commit ${COMMIT_SHA} METADATA (message / author / committer ship verbatim)"
+        printf '%s\n' "$meta_hits"
+        exit 1
+    fi
+fi
 
 # Dictionary guard: the `exclude` paths hold the ONE un-scrubbed copy of the
 # internal dictionary (it names every source identifier by design). It must
@@ -233,4 +362,7 @@ if [ -n "$hits" ]; then
     exit 1
 fi
 echo "LEAK GATE: PASS — zero denied tokens (keep-list applied)"
+if [ "$COMMIT_MODE" -eq 1 ]; then
+    echo "LEAK GATE: PASS — commit ${COMMIT_SHA}: metadata clean, and its tree is the index scanned above"
+fi
 exit 0

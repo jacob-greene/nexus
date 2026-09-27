@@ -1,5 +1,7 @@
 {
   "skipDangerousModePermissionPrompt": true,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
   "env": {
     "DISABLE_AUTOUPDATER": "1"
   },
@@ -93,7 +95,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh permission_prompt"
+            "command": "$NEXUS_ROOT/monitor/hooks/dangerous-rm-decide.sh --mode worker --heartbeat",
+            "timeout": 115
           }
         ]
       }

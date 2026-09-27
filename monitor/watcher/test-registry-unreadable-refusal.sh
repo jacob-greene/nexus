@@ -73,6 +73,25 @@ done
 
 . "$_test_dir/_test_helpers.sh"
 
+# ---- population (your-org/nexus-code#1301) --------------------------------
+# Section 8 sweeps every tracked shell file directly under monitor/ and
+# monitor/watcher/ for the defeated open-test form, so a file added there joins
+# this guard's population. `_rur_sweep_files` is the ONE enumerator: section 8
+# and `gp_population` both call it, beside the five subjects this suite runs.
+# COVERAGE BOUNDARY: section 9's replica census greps the monitor/ DIRECTORY
+# (`grep -r`, untracked files included), which no git enumeration restates, so
+# the declared population is a LOWER BOUND on what section 9 reads.
+# `gp_handle` EXITS on --population, so it sits above the first line of output.
+_rur_sweep_files() {
+    git -C "$_repo_root" ls-files -- ':(glob)monitor/*.sh' ':(glob)monitor/watcher/*.sh' 2>/dev/null
+}
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _rur_sweep_files | sed "s|^|$_repo_root/|"
+    printf '%s\n' "$RECOVER" "$VERIFY" "$SVC" "$SHEALTH" "$IDLEP" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 WORK=$(mktemp -d)
 # Restore any mode-0000 fixture before removal, or the cleanup itself fails.
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -634,8 +653,7 @@ DEFEATED_RE='^[^#]*![[:space:]]*[{(][^)}]*[;)}][^#]*<'
 
 tree_offenders() {                # -> "<count>|<names>" over EVERY file BUT SELF
     local -a F
-    while IFS= read -r line; do F+=("$line"); done < <(
-        git -C "$_repo_root" ls-files -- ':(glob)monitor/*.sh' ':(glob)monitor/watcher/*.sh' 2>/dev/null)
+    while IFS= read -r line; do F+=("$line"); done < <(_rur_sweep_files)
     (( ${#F[@]} > 0 )) || { printf 'POPULATION-EMPTY|'; return; }
     local f n=0 names=""
     for f in "${F[@]}"; do

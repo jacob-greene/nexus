@@ -164,6 +164,12 @@ grep -q "SUCCESS: sid=$SID resumed on $CANDIDATE" "$(logfile "$RS")" \
 [[ ! -f "$RS/monitor/.state/restart-watchdog-baseline" ]] \
     && pass "SUCCESS removes the baseline (left behind, it is the stale baseline w234sk F1 measured a false SUCCESS against)" \
     || fail "SUCCESS left the baseline file behind"
+# #1627: SUCCESS records the VERIFIED marker `retire-watchdog` retires on, bound
+# to THIS run's attempt — the nonce its own `armed:` line printed.
+S_ATT=$(sed -n 's/.*armed: .* attempt=\([^ ]*\).*/\1/p' "$(logfile "$RS")" | tail -n 1)
+[[ -n "$S_ATT" ]] && grep -qx "attempt=$S_ATT" "$RS/monitor/.state/restart-watchdog-verified" 2>/dev/null \
+    && pass "#1627: SUCCESS writes restart-watchdog-verified naming this run's own attempt" \
+    || fail "#1627: no verified marker for attempt '${S_ATT}': $(tr '\n' ' ' < "$RS/monitor/.state/restart-watchdog-verified" 2>/dev/null)"
 
 # ===== FLIP. the #532 false-negative: grace flips it ========================
 echo "== FLIP: candidate record lands AFTER the soft deadline (flush lag) =="
@@ -307,6 +313,9 @@ failed_marker "$RN" && pass "failure marker written" || fail "no failure marker"
 grep -qi "never resumed" "$(logfile "$RN")" \
     && pass "verdict names the never-resumed case (growth-aware)" \
     || fail "verdict did not distinguish the never-grew case"
+[[ ! -f "$RN/monitor/.state/restart-watchdog-verified" ]] \
+    && pass "#1627: a FAILED run writes no verified marker (an unverified watchdog is never auto-retired)" \
+    || fail "#1627: a failed run wrote restart-watchdog-verified"
 armed_removed "$RN" && pass "F-never: fail() released the armed marker this run wrote" \
     || fail "F-never: fail() left its own armed marker behind"
 BFN="$RN/monitor/.state/restart-watchdog-baseline"
@@ -358,6 +367,9 @@ LOOP_ARGS=()
 (( RC == 0 )) && pass "verify-only exit 0 on the same post-kill fixture" || fail "verify-only exit $RC, want 0"
 grep -q "SUCCESS: sid=$SID resumed on $CANDIDATE.*(verify-only)" "$(logfile "$RK")" \
     && pass "logs SUCCESS (verify-only)" || fail "no verify-only SUCCESS line"
+grep -qx "attempt=$PK_ATTEMPT" "$RK/monitor/.state/restart-watchdog-verified" 2>/dev/null \
+    && pass "#1627: a --verify-only SUCCESS records the verified marker for the --attempt it was handed" \
+    || fail "#1627: verify-only SUCCESS wrote no verified marker for $PK_ATTEMPT"
 ! grep -q "armed: candidate=" "$(logfile "$RK")" && [[ ! -f "$RK/monitor/.state/restart-watchdog-armed" ]] \
     && pass "verify-only arms nothing" || fail "verify-only armed"
 ! failed_marker "$RK" && pass "no failure marker" || fail "failure marker written"

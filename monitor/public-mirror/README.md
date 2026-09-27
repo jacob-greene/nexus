@@ -24,8 +24,9 @@ the failure mode; this design closes it.
 | `mapping.example.tsv` | Yes | Placeholder template a new operator fills in. |
 | `scrub.pl` | Yes | Data-driven substitution engine (reads a mapping; hardcodes nothing). Matches **case-insensitively** and preserves the match's case shape. |
 | `build.sh` | Yes | Applies the scrub to the current checkout in place; skips `exclude` paths in the scrub loop, then drops them and **verifies they are gone** (exit 3 otherwise). **Dry run by default** — `--yes` to act (exit 6 without it), refuses a dirty tree (exit 7) unless `--allow-dirty`, and refuses (exit 8) when it cannot establish a work-tree root (#1001). |
-| `leak-gate.sh` | Yes | Fails on any surviving denied token **in file contents or in a file PATH**, and on any `exclude`-listed dictionary path still present in the tree (reads `deny`/`keep`/`exclude` from the mapping). **Refuses (exit 5)** rather than answering when the index and working tree disagree. |
+| `leak-gate.sh` | Yes | Fails on any surviving denied token **in file contents or in a file PATH**, and on any `exclude`-listed dictionary path still present in the tree (reads `deny`/`keep`/`exclude` from the mapping). **Refuses (exit 5)** rather than answering when the index and working tree disagree. `--commit <sha>` also screens that commit's message and author/committer identities, and refuses (exit 5) a commit whose tree is not the scanned index. |
 | `overlay/renames.tsv` | **No** (excluded) | Post-scrub PATH renames, for basenames that carry an internal identifier in the file NAME. |
+| `overlay/files/` | **No** (excluded) — installed copies ship | Mirror-only files carried in source, laid out at their public path and installed by `file` rows in `overlay/manifest.tsv` (#1557). |
 | `README.md` | Yes | This file. |
 
 ## Mapping format (`mapping.tsv`, TAB-separated, applied in file order)
@@ -126,18 +127,26 @@ tree. The shipped, generic stand-in is `mapping.example.tsv`.
 ```bash
 # on a THROWAWAY clone of the source branch (e.g. dev):
 monitor/public-mirror/build.sh                       # DRY RUN — prints the plan, exits 6
+# build.sh DELETES mapping.tsv (it is an `exclude`), so copy the dictionary OUT
+# of the clone first — every gate below reads this copy, as sync-base.sh does:
+map=$(mktemp) && cp monitor/public-mirror/mapping.tsv "$map"
 monitor/public-mirror/build.sh --yes                 # scrub in place, drop excludes, rename paths
 git add -A                                           # <-- NOT OPTIONAL. See below.
-monitor/public-mirror/leak-gate.sh monitor/public-mirror/mapping.tsv .   # must PASS
+monitor/public-mirror/leak-gate.sh "$map" .          # must PASS
 # LINT THE ASSEMBLED TREE, not just source (<your-org>/nexus-code#979 §4).
 # The linter is run FROM the source checkout AGAINST the assembled tree's
 # workflow dir, so a scrub bug in the linter itself cannot hide a workflow bug:
 python3 <source-checkout>/monitor/lint-workflows.py .github/workflows   # must exit 0
 #   exit 2 = REFUSED (empty or missing dir) — a wrong path cannot pass as clean
 # then lay the scrubbed tree as ONE squashed commit on the public repo's
-# current HEAD (fast-forward; never force):
+# current HEAD (fast-forward; never force). Pin the identity on THIS clone
+# first: the commit's author/committer ship verbatim (<your-org>/nexus-code#979).
+git config --local user.name  '<public-name>'
+git config --local user.email '<public-address>'
 tree=$(git write-tree)
 commit=$(git commit-tree "$tree" -p <public-HEAD-sha> -m "Sync public mirror to <source-sha>")
+# GATE THE COMMIT ITSELF before the push — message, author, committer:
+monitor/public-mirror/leak-gate.sh "$map" . --commit "$commit"   # must PASS
 git push <public-remote> "$commit:refs/heads/main"
 # and record it, so the NEXT sync can compute its merge base:
 printf 'sync\t%s\t%s\t%s\tnote\n' "$(date -I)" "$(git rev-parse --short <source-sha>)" \
@@ -146,6 +155,28 @@ printf 'sync\t%s\t%s\t%s\tnote\n' "$(date -I)" "$(git rev-parse --short <source-
 
 The public mirror is deliberately **single-commit-based**: it is a squash on the
 public repo's existing HEAD, never a replay of the private history.
+
+### The commit's metadata is published too — `leak-gate.sh --commit`
+
+A tree scan never reads the commit object, and the one commit a sync publishes
+carries its **full message** and its **author and committer, name and email**,
+verbatim. So `--commit <sha>` (<your-org>/nexus-code#1006, spec from #979) screens
+every published header of that object (all but `tree`/`parent`, which are
+object ids) and every message line against the same `deny`/`keep` patterns,
+and names the field that hit (`author.email:`, `committer.name:`,
+`message:3:`, `header.<name>:`).
+
+It does not scan the commit's tree a second time; it **binds** it. The commit's
+tree must equal the index this run scans (and the index must equal the working
+tree, `--allow-unstaged` notwithstanding), else **exit 5**. So a PASS with
+`--commit` means *this commit's metadata is clean and its tree is the one the
+gate just scanned*. A sha that does not resolve to a commit — a typo, a tree
+id, an empty value — is **REFUSED with exit 2**, never a PASS over nothing.
+
+The `git config --local` step is a convenience, not the guarantee:
+`GIT_AUTHOR_*` / `GIT_COMMITTER_*` in the environment outrank config, which is
+why the recipe gates the commit it actually made rather than trusting the
+config it set.
 
 ### `git add -A` is the difference between publishing the scrub and publishing the source
 
@@ -217,6 +248,35 @@ a linter, a manifest check, a path enumeration — can be broken by bootstrap
 state that exists only downstream. When such a guard's subject is a directory,
 point it at the assembled tree before the push; when it is not parameterisable,
 record that its verdict does not cover mirror-only state.
+
+### Mirror-only files are carried in source (`file` rows, #1557)
+
+A file that exists only in the published tree is outside the population of
+every source-side lint, so each new rule silently widens what the mirror can
+get wrong: `TD001` above, then `AU001` on `pages.yml` two syncs later
+(<your-org>/nexus-code#1557). The remedy removes the class rather than
+monitoring it: carry the file **in source** under `overlay/files/<public
+path>` and add a manifest row
+
+    file	<TARGET>	files/<TARGET>
+
+`build.sh` installs it at `<TARGET>` pre-scrub, `git add`s it so it is scrubbed
+and published, and exits 4 if the source is missing, if `<TARGET>` already
+exists in source (a mirror-only file must not shadow a source file — that is a
+`block`), or if the file does not survive to the output. This is not the
+"fixture copy" rejected above: the carried file IS the artifact, and the
+mirror's copy is the build output. `monitor/watcher/test-public-mirror-overlay-files.sh`
+lints every carried workflow with `lint-workflows.py` on every CI run, and
+enforces the `files/<TARGET>` layout so a workflow row cannot escape the lint.
+
+**Not yet carried: `.github/workflows/pages.yml`.** Its content lives only on
+the mirror, which no agent may read. Until the operator pastes it into
+`monitor/public-mirror/overlay/files/.github/workflows/pages.yml` and adds the
+row `file	.github/workflows/pages.yml	files/.github/workflows/pages.yml`, it
+remains mirror-only and the assembled-tree lint above is still its only check.
+Paste the mirror's **current** (AU001-fixed) copy; the suite will say whether
+it passes today's rules. Once carried, the build output contains it, so the
+three-way merge sees identical content on both sides.
 
 ## Reconstructing the mirror: the merge base decides correctness
 

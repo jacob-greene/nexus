@@ -8,8 +8,17 @@
 # liveness task). The missing half was: who revives a CRASHED watcher?
 # An earlier draft added a bespoke always-on daemon; the operator chose a
 # simpler, symmetric answer — the ORCHESTRATOR'S own always-on agent loop
-# IS the external supervisor the watcher needs. The orchestrator arms a
-# persistent `Monitor` whose until-loop runs THIS script every interval:
+# IS the external supervisor the watcher needs. Two callers run THIS
+# script (your-org/nexus-code#1532):
+#   * PRIMARY: monitor/watcher-supervise-probe.sh, a persistent longjob
+#     watch armed by monitor/arm-watcher-supervisor.sh. The plugin
+#     dispatcher is not bound by the 30-minute Monitor cap and polls
+#     independently of the orchestrator's turns, and the probe runs the
+#     revive itself, so no re-arm lease and no turn are needed.
+#   * FALLBACK (plugin dispatcher NOT ARMED): a `Monitor` until-loop, a
+#     lease of at most 30 minutes the orchestrator re-arms on each expiry.
+#     Its gap while the orchestrator cannot take a turn is real (7 h 13 m
+#     on 2026-09-17); stated in skills/nexus.service-recovery.
 #
 #     Monitor({command:
 #       'until ! /ABS/monitor/watcher-supervise-tick.sh; do sleep 15; done'})

@@ -441,6 +441,33 @@ MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS="${MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS:-$("$_c
 # is only as good as the last cycle that actually SAW the dialog; a watcher
 # that stopped observing must not keep the channel shut on a memory.
 MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS="${MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.observation_staleness_seconds 600)}"
+# ---- operator alert (your-org/nexus-code#1548, #1533, #1534) ---------------
+# The text-carrying, turn-independent alert `_operator_alert.sh` raises when
+# the watcher alone knows the operator must act (a logged-out orchestrator, an
+# emit-only service down while the emit route is unavailable). All chosen.
+# push_enabled: the `monitor/notify.sh` leg (Pushover → ntfy → SMTP). Its only
+# evidence is API ACCEPTANCE; whether a device rendered it is unverified.
+MONITOR_OPERATOR_ALERT_PUSH_ENABLED="${MONITOR_OPERATOR_ALERT_PUSH_ENABLED:-$("$_cfg" monitor.watcher.operator_alert.push_enabled true)}"
+# github_enabled: one bot-authored `operator-alert: <key>` issue per standing
+# condition on github.repo, @-pinging user_login; closed on clear.
+MONITOR_OPERATOR_ALERT_GITHUB_ENABLED="${MONITOR_OPERATOR_ALERT_GITHUB_ENABLED:-$("$_cfg" monitor.watcher.operator_alert.github_enabled true)}"
+# reminder_seconds: a standing condition re-alerts at this cadence (#976: one
+# announcement, slow reminders). 3600 = the over-limit reminder's number.
+MONITOR_OPERATOR_ALERT_REMINDER_SECONDS="${MONITOR_OPERATOR_ALERT_REMINDER_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.reminder_seconds 3600)}"
+# clear_holddown_seconds: a `clear` finalises only after the condition has
+# been absent this long; a raise inside it is a FLAP (no re-ring, no re-file).
+MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS="${MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.clear_holddown_seconds 300)}"
+# comment_interval_seconds: at most one GitHub COMMENT per key per interval
+# (reminders, re-opens, the clear note); open/close state changes are never capped.
+MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS="${MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.comment_interval_seconds 3600)}"
+# net_timeout_seconds: the bound on each network leg (they run detached).
+MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS="${MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.net_timeout_seconds 60)}"
+# turn_failure_gate_seconds: how long a fresh `turn-failure/<target>.json`
+# marker with recovery=operator gates orchestrator-liveness (#1520/#1517).
+# Mirrors the auth-hold observation staleness: the marker is a point event
+# refreshed by every failed turn, so a wedged pane that stops producing them
+# releases the gate after this window.
+MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS="${MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS:-$("$_cfg" monitor.watcher.turn_failure_gate_seconds 600)}"
 # How long after the watcher pastes a resume brief and retires a row that
 # window stays un-re-stampable (your-org/nexus-code#1141). The stale signal
 # that produced the resume is cleared by the turn the brief STARTS, so until
@@ -896,8 +923,10 @@ MONITOR_REPORTS_ROLL_INTERVAL_SECONDS="${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS:-
 MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS="${MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS:-$("$_cfg" monitor.reports_roll.min_age_seconds 300)}"
 [[ "$MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS=300
 # Watcher-supervision (your-org/your-nexus, mutual-liveness design). The
-# ORCHESTRATOR arms a persistent Monitor that revives a crashed watcher
-# and touches a supervisor heartbeat each tick. The watcher's only role
+# ORCHESTRATOR arms a Monitor that revives a crashed watcher and touches a
+# supervisor heartbeat each tick — a LEASE, not a persistent loop: since
+# Claude Code 2.1.271 it expires after at most 30 min and must be re-armed
+# by the orchestrator (your-org/nexus-code#1532). The watcher's only role
 # is the `--- arm watcher supervisor ---` emit reminder when that
 # heartbeat is stale/absent (the Monitor isn't armed). ENABLED gates that
 # reminder; ON by default — an unarmed supervisor means a watcher crash
@@ -997,7 +1026,11 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_OVER_LIMIT_RESUME_SUPPRESSION_SECONDS \
        MONITOR_AUTH_HOLD_ENABLED MONITOR_AUTH_HOLD_ESCAPE_AFTER_SECONDS \
        MONITOR_AUTH_HOLD_ACTIVE_GRACE_SECONDS MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS \
-       MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS
+       MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS \
+       MONITOR_OPERATOR_ALERT_PUSH_ENABLED MONITOR_OPERATOR_ALERT_GITHUB_ENABLED \
+       MONITOR_OPERATOR_ALERT_REMINDER_SECONDS MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS \
+       MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS \
+       MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS
 # Crash-loop guard for `respawn_agent`. If more than RESPAWN_LOOP_LIMIT
 # respawns happen within RESPAWN_LOOP_WINDOW seconds, the watcher
 # stops respawning the orchestrator until the sliding window empties

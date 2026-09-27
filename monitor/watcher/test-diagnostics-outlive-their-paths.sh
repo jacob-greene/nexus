@@ -34,6 +34,22 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_test_dir/_test_helpers.sh"
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 
+# ── POPULATION (your-org/nexus-code#1301) ───────────────────────────────
+# The corpus sweep below reads every tracked path matching `*test-*.sh`, so a
+# suite added anywhere joins this guard's population. `_dop_corpus` is the ONE
+# enumerator: the sweep, its self-membership check and `gp_population` all call
+# it, so the index cannot drift from the scan. The stripped view the detector
+# reads comes from shell-files.sh through its quote machine, so an edit there
+# can change the verdict too. `gp_handle` EXITS on --population, so it sits
+# above the first line of output.
+_dop_corpus() { git -C "$REPO_ROOT" ls-files -- '*test-*.sh'; }
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _dop_corpus | sed "s|^|$REPO_ROOT/|"
+    printf '%s\n' "$REPO_ROOT/monitor/shell-files.sh" "$_test_dir/_shell_quotes.awk" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 # ── THE MANIFEST ────────────────────────────────────────────────────────
 # Diagnostics that cite a trap-doomed path AND are nonetheless allowed to.
 # One `<file>::<reason>` per line. EMPTY is the strongest possible statement
@@ -253,7 +269,7 @@ while IFS= read -r f; do
 # enumerates a corpus TO LINT, and `_harness.sh` is 510 lines carrying exactly
 # the constructs scanned for here. Narrowing it would DELETE COVERAGE from the
 # one file most worth scanning, dressed up as a consistency fix. Leave it wide.
-done < <(git ls-files -- '*test-*.sh')
+done < <(_dop_corpus)
 
 # A population this scan could not have enumerated makes every result below
 # meaningless. 200 is a deliberate floor well under the ~285 tracked today:
@@ -263,7 +279,7 @@ done < <(git ls-files -- '*test-*.sh')
 # "fix" that quietly drops this file from the enumeration would look identical
 # to a clean sweep.
 assert_eq "the scanner's own file is inside the scanned corpus" \
-    "$(git ls-files -- '*test-*.sh' | grep -cxF 'monitor/watcher/test-diagnostics-outlive-their-paths.sh')" "1"
+    "$(_dop_corpus | grep -cxF 'monitor/watcher/test-diagnostics-outlive-their-paths.sh')" "1"
 # "paths matching *test-*.sh", not "test files": git's pathspec `*` crosses `/`
 # so this corpus also holds test-integration/_harness.sh and stub-claude.sh.
 # Scanning them is correct (see the note at the enumeration below); the label is

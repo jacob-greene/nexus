@@ -116,6 +116,24 @@ INTERVAL="${LABSH_SVC_INTERVAL:-15}"
 MAX_FAILS="${LABSH_SVC_FAILS:-3}"
 PORT_BASE="${LABSH_SVC_PORT_BASE:-9700}"
 PERIODIC_EVERY="${LABSH_SVC_PERIODIC_EVERY:-40}"
+# THE PERIODIC HOOK IS BOUNDED. It ran ASYNC behind an overlap guard and nothing
+# else, so a hook that genuinely HANGS would disable itself for good and say so
+# only as one quiet line per round.
+#
+# CORRECTED: this bound was first written as the fix for "a hook that hung ~14 h"
+# on the live service. THERE WAS NO HANG — see `_periodic_in_flight` below: the
+# hook had finished, its pid was recycled as a THREAD id, and the old `kill -0`
+# overlap guard skipped every round after. The bound stays because a hang is
+# still possible and an unbounded async child is still wrong; it is NOT what
+# fixes the incident that prompted it.
+#
+# WE CHOSE 3600 s. The hook fires every PERIODIC_EVERY x INTERVAL (40 x 15 s =
+# 10 min) and is a kernel crawl that may build a venv, so minutes are
+# legitimate and an hour is not. (It was first justified as "small beside the
+# 14 h it replaces"; there was no 14 h hang — see the correction above.)
+# `LABSH_SVC_PERIODIC_TIMEOUT=0` disables the bound.
+PERIODIC_TIMEOUT="${LABSH_SVC_PERIODIC_TIMEOUT:-3600}"
+[[ "$PERIODIC_TIMEOUT" =~ ^[0-9]+$ ]] || PERIODIC_TIMEOUT=3600
 # Seconds to wait for the server to become HEALTHY after `labsh start`
 # (NOT merely to expose a URL — see start_server). This window must cover a
 # *cold* ephemeral `uvx` build on the first start after a version drift or a
@@ -132,6 +150,49 @@ PERIODIC_EVERY="${LABSH_SVC_PERIODIC_EVERY:-40}"
 # seconds (config/nexus.yml) ≥ this so the WATCHER can't interrupt either.
 # Old value was 300s — too short for the reflink→copy fallback that caused #33.
 START_GRACE="${LABSH_SVC_START_GRACE:-900}"
+# A TOKEN ROTATED DURING THE START WAIT IS NOT "STILL COMING UP"
+# (your-org/nexus-code#1584). `start_server` waits up to START_GRACE for a
+# PASSING healthcheck and counts no strikes while it waits. That is right for a
+# warming server — and a warming server may legitimately answer 403 while it
+# imports extensions, which is the restart-flap test-jupyter-service.sh pins:
+# such a server is WAITED OUT, never bounced. This change does not touch that.
+#
+# What it adds is the one case where waiting can never help. jupyter-health.sh
+# re-reads `.jupyter/token` on every probe and exits 22 when the server answers
+# 4xx. If the token FILE has changed since this start began, the running server
+# holds the OLD token: the mismatch is certain, it is permanent, and the
+# watchdog that would fix it is not running because this loop has not returned.
+#
+# Measured 2026-09-19: a token rotated just after a bounce left the service
+# unhealthy for the whole wait — 403 on every probe for 300 s (the test's
+# ceiling; this loop would have held for 900), the supervisor log SILENT after
+# "serving at", where an ordinary server kill healed in 17 s. It is a RACE:
+# whoever polls the fresh server first wins, and if that is a caller who then
+# rotates the token, this loop never sees a green. It reddened
+# test-jupyter-service-real.sh in two consecutive full bands and ~1 isolated run
+# in 4, and was filed as a deadline that was too short.
+#
+# THE DISCRIMINATOR IS THE TOKEN, NOT THE STATUS CODE. rc 22 ALONE was the
+# first design and would have bounced the warming server above. rc 22 AND a
+# token that differs from the one this start began with cannot be a warm-up.
+#
+# BOTH NUMBERS ARE CHOSEN, not inherited:
+#   REJECT_PROBES  4 consecutive qualifying probes at the loop's 0.5 s step,
+#       ~2 s: enough that a rotation caught mid-write is not acted on.
+#   REJECT_BAILS   3, a backstop. A rotation cannot loop by itself — the
+#       bounced server reads the new token and the comparison resets — but a
+#       bound that costs one integer is cheaper than being wrong about that.
+#       After 3 fast bails in a row the loop waits the FULL grace, as before;
+#       any healthy probe restores the budget.
+REJECT_PROBES="${LABSH_SVC_REJECT_PROBES:-4}"
+REJECT_BAILS_MAX="${LABSH_SVC_REJECT_BAILS:-3}"
+# VALIDATED, with a FLOOR OF 1 (skeptic testinfra2sk F3 on PR 1593). `0` or a
+# non-number made `rejected >= REJECT_PROBES` true on the FIRST probe, and an
+# unset-looking knob then bounced a warming server at once — the restart flap,
+# reached through a typo. PERIODIC_TIMEOUT was validated and these were not.
+[[ "$REJECT_PROBES" =~ ^[0-9]+$ ]] && (( REJECT_PROBES >= 1 )) || REJECT_PROBES=4
+[[ "$REJECT_BAILS_MAX" =~ ^[0-9]+$ ]] || REJECT_BAILS_MAX=3
+REJECT_BAILS=0
 
 log() { echo "[$(date -Is)] labsh-svc: $*"; }
 
@@ -312,8 +373,42 @@ command -v labsh >/dev/null 2>&1 || {
     exit 1
 }
 
+# THE PERIODIC HOOK'S PROCESS GROUP IS REAPED ON TERM (skeptic testinfra2sk F1
+# on PR 1593, MEASURED). `svc.sh stop` — and so every restart, including the
+# source-drift one — TERMs THIS supervisor's process group. But `timeout` makes
+# ITSELF a process-group leader, so a bounded hook LEAVES that group: measured,
+# after a group TERM the old unbounded form's hook died and the bounded form's
+# `timeout` + hook SURVIVED, reparented to init, for up to the whole bound —
+# holding `.crawl.lock`, so the NEW supervisor's crawls exit "another crawl
+# holds". The bound then also stopped a restart from curing the very hang it
+# exists for. It is your-org/nexus-code#1585's defect, reintroduced by the fix
+# for a neighbouring one.
+#
+# IDENTITY BEFORE SIGNAL. The pid comes from a file, and pids recycle: it must
+# still be a `timeout`, still lead its OWN group, and still sit in THIS project
+# directory. Not its ppid — the group TERM kills the wrapping subshell first, so
+# by the time this runs the `timeout` is already reparented to init.
+PERIODIC_PGID_FILE=".jupyter/labsh-periodic.pgid"
+_reap_periodic_group() {
+    local t st pg
+    t=$(cat "$PERIODIC_PGID_FILE" 2>/dev/null) || return 0
+    [[ "$t" =~ ^[0-9]+$ ]] || return 0
+    [[ "$(cat "/proc/$t/comm" 2>/dev/null)" == timeout ]] || return 0
+    # PHYSICAL against PHYSICAL: /proc/<pid>/cwd is always resolved, while
+    # $PROJECT_DIR came from a logical `pwd`. Compared as written, a project
+    # reached through a symlink would fail this check and the hook would
+    # survive — fail-safe, and a silent defeat of the fix on exactly such hosts.
+    [[ "$(readlink "/proc/$t/cwd" 2>/dev/null)" == "$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" ]] || return 0
+    { IFS= read -r st < "/proc/$t/stat"; } 2>/dev/null || return 0
+    st=${st##*) }; read -r _ _ pg _ <<<"$st"
+    [[ "$pg" == "$t" ]] || return 0
+    log "stopping ${1:-the in-flight periodic hook} (process group $t) — it is outside this supervisor's group and would outlive it"
+    kill -TERM -- "-$t" 2>/dev/null || true
+    rm -f "$PERIODIC_PGID_FILE"
+}
 on_term() {
     log "signal received — stopping labsh server, exiting"
+    _reap_periodic_group
     labsh stop >/dev/null 2>&1 || true
     exit 0
 }
@@ -525,6 +620,47 @@ record_is_serving() {
         "$scheme://127.0.0.1:$port/api/status"
 }
 
+# _token_mismatch_proven <file-token> — rc 0 iff some runtime record's server
+# answers /api/status WITH ITS OWN RECORDED TOKEN while that token differs from
+# the one in `.jupyter/token`. That is the mismatch proven from the SERVER's
+# side, and it is the sound discriminator for your-org/nexus-code#1584.
+#
+# WHY IT EXISTS BESIDE THE `tok0` SNAPSHOT (skeptic testinfra2sk F2, PR 1593).
+# `tok0` is read after `labsh start` RETURNS, but the server is measurably green
+# 40-205 ms BEFORE that (3 of 3). A rotation landing in that window makes
+# tok0 == the rotated token, the snapshot sees no change, and the 900 s wedge is
+# back. The snapshot can MISS; it can never false-fire, so it stays as a second
+# arm (it is also the only arm a record-less server offers). This one cannot
+# miss, because it asks the server rather than remembering the file.
+#
+# AND IT CANNOT FIRE ON A WARMING SERVER: that server answers 403 to EVERYTHING,
+# so `record_is_serving` is false for it and the restart-flap pin holds.
+#
+# ONLY OUR PORT'S RECORD (skeptic testinfra2sk F5, your-org/nexus-code#1594).
+# The runtime dir can hold a FOREIGN serving record — an operator-exported
+# JUPYTER_DATA_DIR, or a second server labsh's start guard missed. Unbound, that
+# record answered 200 with its own token while OUR server was merely warming
+# (403), every rc-22 probe counted, and the fast bail fired on a warming server:
+# the restart flap, through another door. So a record is consulted only when its
+# `port` is the PORT= this start persisted (the port our health probe asks). No
+# env file or no PORT = cannot tell, and cannot-tell never bails.
+_token_mismatch_proven() {
+    local ftok="$1" rt jf rtok ours
+    [[ -n "$ftok" ]] || return 1
+    # First PORT= only, with no `head` reader (the early-exit-reader ratchet, #622).
+    ours=$(sed -n '/^PORT=/{s///p;q;}' "$ENV_FILE" 2>/dev/null)
+    [[ "$ours" =~ ^[0-9]+$ ]] || return 1
+    rt=$(runtime_dir); [[ -d "$rt" ]] || return 1
+    for jf in "$rt"/jpserver-*.json; do
+        [[ -e "$jf" ]] || continue
+        [[ "$(record_field "$jf" port)" == "$ours" ]] || continue
+        rtok=$(record_field "$jf" token)
+        [[ -n "$rtok" && "$rtok" != "$ftok" ]] || continue
+        record_is_serving "$jf" && return 0
+    done
+    return 1
+}
+
 # Conservative pre-start prune: remove runtime records whose recorded pid is
 # VERIFIABLY DEAD (kill -0 fails). Never touches a pid that is alive — including
 # a warming server that has not yet answered the healthcheck — so it can only
@@ -578,7 +714,7 @@ start_server() {
 }
 
 _start_cycle() {
-    local port rc i tries url_seen=0
+    local port rc i tries url_seen=0 hrc=0 rejected=0 tok0='' tok1=''
     # Prune runtime records for verifiably-dead pids BEFORE start so labsh's
     # start-guard can't adopt a stale dead-pid record. Conservative (kill -0
     # only): a live pid, even a still-warming server, is never touched here.
@@ -628,13 +764,36 @@ _start_cycle() {
     # window: the observed restart flap. So persist the port as soon as a URL
     # appears (once, to avoid log spam), but gate success on a PASSING
     # healthcheck against that port.
+    # The token THIS start began with, read after `labsh start` has written it.
+    # Empty (no file yet) means "cannot tell", and cannot-tell never bails.
+    tok0=$(cat .jupyter/token 2>/dev/null) || tok0=''
     tries=$(( START_GRACE * 2 ))
     for (( i = 0; i < tries; i++ )); do
         if (( ! url_seen )) && persist_env_from_url; then
             url_seen=1
         fi
-        if (( url_seen )) && "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
-            return 0
+        if (( url_seen )); then
+            # rc captured on the same line as the probe (#1202).
+            hrc=0; "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1 || hrc=$?
+            if (( hrc == 0 )); then
+                REJECT_BAILS=0
+                return 0
+            fi
+            # 22 = answered and REJECTED our token — which a WARMING server may
+            # also do, so 22 alone proves nothing. 22 with a token that is no
+            # longer the one this start began with is a rotation: certain,
+            # permanent, and not curable by waiting.
+            tok1=$(cat .jupyter/token 2>/dev/null) || tok1=''
+            if (( hrc == 22 )) && { _token_mismatch_proven "$tok1" || [[ -n "$tok0" && -n "$tok1" && "$tok1" != "$tok0" ]]; }; then
+                rejected=$(( rejected + 1 ))
+            else
+                rejected=0
+            fi
+            if (( rejected >= REJECT_PROBES && REJECT_BAILS < REJECT_BAILS_MAX )); then
+                REJECT_BAILS=$(( REJECT_BAILS + 1 ))
+                log "the auth token was ROTATED during the start wait and the server REJECTS the new one ($rejected consecutive probes) — a certain mismatch, not a slow start; leaving the wait so the watchdog can bounce it (fast bail $REJECT_BAILS/$REJECT_BAILS_MAX, your-org/nexus-code#1584)"
+                return 1
+            fi
         fi
         sleep 0.5
     done
@@ -669,20 +828,84 @@ _start_cycle() {
 # the probe loop. Overlap guard: skip while a previous invocation is
 # still running.
 PERIODIC_PID=''
+# _periodic_in_flight — rc 0 iff the hook THIS supervisor launched is still
+# running. Asked of bash's OWN JOB TABLE, never of the kernel about a number.
+#
+# THE OVERLAP GUARD USED TO BE `kill -0 "$PERIODIC_PID"`, AND THAT IS A QUESTION
+# ABOUT A NUMBER. Once the hook ends and bash reaps it, the number is free, and
+# `kill -0` succeeds for WHATEVER holds it next — including a THREAD, since a
+# thread id is a valid `kill` target. Found on the LIVE service, 2026-09-19: the
+# log said "periodic hook still running (pid 10994) — skipping this round" 84
+# times over ~14 h and was read, by me too, as a hook that had HUNG. It had not.
+# /proc/10994 was `Bun Pool 35`, Tgid 36836 != Pid 10994 — a thread of an
+# unrelated process; `ps -p` does not list threads, so the pid looked gone while
+# `kill -0` kept answering 0. The hook had finished long before and was never
+# run again: a MISSED-RUN bug wearing a hang's log line. The 3600 s bound above
+# is still worth having and does nothing for this.
+#
+# The job table cannot be fooled that way: it lists only this shell's own
+# un-reaped children, so a recycled number that is not our job is not in it.
+# Measured: own live child -> in flight; the same child once ended -> not; an
+# UNRELATED live pid -> `kill -0` says alive, this says not in flight.
+_periodic_in_flight() {
+    local p
+    [[ -n "$PERIODIC_PID" ]] || return 1
+    for p in $(jobs -pr); do
+        if [[ "$p" == "$PERIODIC_PID" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 run_periodic() {
     [[ -f "$PERIODIC_FILE" ]] || return 0
-    if [[ -n "$PERIODIC_PID" ]] && kill -0 "$PERIODIC_PID" 2>/dev/null; then
+    if _periodic_in_flight; then
         log "periodic hook still running (pid $PERIODIC_PID) — skipping this round"
         return 0
     fi
     # Explicit mode at creation (your-org/nexus-code#484).
     _ensure_service_log "$PERIODIC_LOG"
-    bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 &
+    # A SUBSHELL, so the outcome can be LOGGED: the hook is async, and a bare
+    # `timeout … &` would kill a hang in silence — the round after it would
+    # simply stop saying "still running", which reads as the hook having
+    # finished. `$!` is the subshell, so the overlap guard above still covers
+    # the whole attempt. GNU `timeout` makes itself a process-group leader and
+    # signals the GROUP, so a hook's children (uv, a crawl) go with it.
+    #
+    # THE SET, NOT 124: `-k` escalates to KILL, which reports 137 (#1248).
+    (
+        _prc=0
+        if (( PERIODIC_TIMEOUT > 0 )); then
+            # Backgrounded + `wait`, so its pid — which IS its process group —
+            # can be recorded for `on_term` (see `_reap_periodic_group`).
+            timeout -k 30 "$PERIODIC_TIMEOUT" bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 &
+            _pt=$!
+            printf '%s\n' "$_pt" > "$PERIODIC_PGID_FILE.tmp" && mv -f "$PERIODIC_PGID_FILE.tmp" "$PERIODIC_PGID_FILE"
+            wait "$_pt" || _prc=$?
+            rm -f "$PERIODIC_PGID_FILE"
+        else
+            bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 || _prc=$?
+        fi
+        case "$_prc" in
+            124|137) log "periodic hook KILLED after ${PERIODIC_TIMEOUT}s (rc $_prc) — it did not return; the next round will launch it again (log $PROJECT_DIR/$PERIODIC_LOG)" ;;
+        esac
+    ) &
     PERIODIC_PID=$!
-    log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG)"
+    log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG, bound ${PERIODIC_TIMEOUT}s)"
 }
 
 log "supervisor up: project=$PROJECT_DIR interval=${INTERVAL}s threshold=$MAX_FAILS"
+
+# A PREDECESSOR'S ORPHANED HOOK IS REAPED BEFORE THE FIRST ROUND (skeptic
+# testinfra2sk F6, your-org/nexus-code#1594). `on_term` cannot cover two paths:
+# a TERM landing between `timeout … &` and the `mv` that publishes the pgid
+# file, and a supervisor KILLed (or OOM-killed), whose trap never runs. In both
+# the old hook survives, reparented to init, and our first `run_periodic` would
+# OVERWRITE its pgid file — losing the last handle on it. Same identity check as
+# on TERM, so a recycled or garbage pid is left alone. ITS STATED LIMIT: it
+# WOULD kill a foreign, self-grouped `timeout` whose cwd is this same project
+# directory. Nothing starts one today; it is the price of reaping by file.
+_reap_periodic_group "an orphaned periodic hook left by a previous supervisor"
 
 # Immediate bring-up: don't make first activation wait out a failure
 # streak. Adopt-or-start covers both cold boot and an already-live
@@ -700,6 +923,7 @@ while true; do
     (( ticks % PERIODIC_EVERY == 0 )) && run_periodic
     if "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
         fails=0
+        REJECT_BAILS=0      # a healthy probe restores the fast-bail budget (#1584)
         continue
     fi
     fails=$(( fails + 1 ))

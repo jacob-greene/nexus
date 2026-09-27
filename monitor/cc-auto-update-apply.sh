@@ -23,7 +23,10 @@
 #                   REGISTRY publishes in (installed, candidate], with N
 #                   checked against the entry count derived from the
 #                   fetched changelog, and a published release with no
-#                   changelog section refused as OPAQUE, exit 8).
+#                   changelog section refused as OPAQUE, exit 8, unless
+#                   the evaluating agent passes
+#                   --opaque-disposition <release>=accepted:<reason> for
+#                   it — your-org/nexus-code#1526).
 #                   THE ONLY PATH THAT WRITES THE PIN.
 #                   --no-restart: pin + install + verify, then STOP — no
 #                   watcher restart, no orchestrator hand-off; the
@@ -91,23 +94,26 @@
 #   5   binary verification failed (pin rolled back)
 #   6   watcher restart failed (pin + install stand; NO orchestrator kill)
 #   7   another apply is already in flight (lock held)
-#   8   refused: an OPAQUE release (your-org/nexus-code#1007). The registry
-#       publishes a version inside (installed, candidate] that has NO
-#       `## <version>` section in the changelog this run fetched. The
-#       release set is derived from the REGISTRY precisely so this case
-#       is NAMED instead of vanishing from M — 2.1.242 (2026-08-25) was
+#   8   refused: an OPAQUE release (your-org/nexus-code#1007) that the
+#       evaluating agent has not ACCEPTED (your-org/nexus-code#1526). The
+#       registry publishes a version inside (installed, candidate] that has
+#       NO `## <version>` section in the changelog this run fetched. The
+#       release set is derived from the REGISTRY precisely so this case is
+#       NAMED instead of vanishing from M — 2.1.242 (2026-08-25) was
 #       published, sectionless, and `dispositioned 406 of 406` read GREEN
-#       over it. Distinct from 3 because nothing the evaluator supplies
-#       can clear it: the evidence does not exist upstream. The daily
-#       fire retries and clears when the section appears. BOUNDED, not
-#       terminal: after GATE_DEFER_STREAK_CAP consecutive refusals on the
-#       same opaque set (default 3, floor 2, `0` escalates at the floor)
-#       this script escalates the operator itself — sandbox-notify plus a
-#       comment on the cc-update tracking issue (or a filed issue on
-#       $GATE_REPO when none is configured) naming the candidate and the
-#       release(s) — and KEEPS refusing. Delay-then-surface, never
-#       auto-proceed (operator directive 2026-09-10: a busy board may
-#       delay an update, not prevent it).
+#       over it. The evaluating agent dispositions each such release with a
+#       recorded judgment, `--opaque-disposition <ver>=accepted:<reason>` or
+#       `<ver>=blocked:<evidence>`; with every opaque release ACCEPTED (and
+#       every other check passing, the GREEN gate included) the bump
+#       proceeds and each acceptance is recorded as an
+#       `opaque-release-accepted` row. Exit 8 remains for an opaque release
+#       with NO disposition (silence never clears it; detail
+#       `opaque-release=<v…>`) and for one the agent BLOCKED on evidence of
+#       breakage (detail `opaque-release-blocked=<v…>`). No human is
+#       escalated: operator decision 2026-09-25 on #1526 — "we should only
+#       prevent it if we have evidence it breaks the nexus". A malformed
+#       disposition, or one naming a release that is not opaque in this
+#       delta, is exit 3.
 #   9   refused: LIVE TREE DRIFT (your-org/nexus-code#1002) — the live binary
 #       (`$CLAUDE_BIN --version`) does not report the EFFECTIVE pin (the
 #       operator-local pin, else the package.json floor), or one of the two
@@ -259,20 +265,14 @@
 #                                 what was WRITTEN about it), and a test
 #                                 must be able to fail one while the other
 #                                 answers — your-org/nexus-code#1007.
-#   CC_AUTO_TRACKING_ISSUE        the cc-update tracking issue as
-#                                 `owner/repo#N` (default: config
-#                                 monitor.cc_auto_update.tracking_issue,
-#                                 resolved through monitor/issue-ref.sh —
-#                                 a bare number is REFUSED, #866)
-#   CC_AUTO_ISSUE_COMMENT_CMD     the tracking-issue comment post for the
-#                                 bounded opaque-release escalation; receives
-#                                 <repo> <issue> <body-file> (default: minted
-#                                 token + `gh issue comment`)
 #   CC_AUTO_GATE_ISSUE_CMD        the issue create/adopt used by the
-#                                 deployment gate's defect filer AND by the
-#                                 opaque-release escalation when no tracking
-#                                 issue is configured; receives
-#                                 <key> <title> <body-file>
+#                                 deployment gate's defect filer; receives
+#                                 <key> <title> <body-file>. (It was also the
+#                                 opaque-release escalation's fallback, with
+#                                 CC_AUTO_TRACKING_ISSUE and
+#                                 CC_AUTO_ISSUE_COMMENT_CMD; that escalation
+#                                 asked a HUMAN to disposition the release and
+#                                 was removed with your-org/nexus-code#1526.)
 #   CC_AUTO_RESTART_INLINE        when 1, `safe` runs the restart hand-off
 #                                 synchronously in-process (test seam)
 #                                 instead of detaching it — so a test can
@@ -413,8 +413,11 @@ WATCHDOG_WINDOW="${CC_AUTO_WATCHDOG_WINDOW:-cc-restart-watchdog}"
 # exempt on top of these). Shapes the RECORDED count only.
 GATE_WINDOW_EXEMPT="${CC_AUTO_GATE_WINDOW_EXEMPT:-services}"
 # Repo whose open PRs are checked for restart-path collisions, and the
-# restart-path file set (CSV). An open PR touching any of these means the
-# restart mechanics are KNOWN to be under repair — defer the apply.
+# restart-path file set (CSV). An open PR touching any of these is RECORDED
+# (a `restart-path-pr-noted` row, `restart_path_prs=` on the deployment-gate
+# row) — it no longer defers the apply (your-org/nexus-code#1526 follow-up):
+# an open PR is not deployed, and touching a file is not evidence the LIVE
+# restart path is broken. Evidence of that is acted on with `hold`.
 GATE_REPO="${CC_AUTO_GATE_REPO:-${CC_AUTO_COMPAT_REPO:-your-org/nexus-code}}"
 GATE_RESTART_PATHS="${CC_AUTO_GATE_RESTART_PATHS:-monitor/watcher/launcher.sh,monitor/watcher/main.sh,monitor/revive-watcher.sh,monitor/svc.sh,monitor/watcher/_version_restart.sh}"
 # ---- #1113: the two inputs that are ORTHOGONAL to the path list ----------
@@ -559,23 +562,22 @@ if (( GATE_DEFER_STREAK_CAP >= 1 && GATE_DEFER_STREAK_CAP < GATE_DEFER_STREAK_CA
     GATE_DEFER_STREAK_CAP_CLAMPED=1
     GATE_DEFER_STREAK_CAP="$GATE_DEFER_STREAK_CAP_FLOOR"
 fi
-# THE SAME CAP BOUNDS THE OPAQUE-RELEASE REFUSAL (your-org/nexus-code#1007,
-# orchestrator follow-up 2026-09-12). Exit 8 refuses a bump whose delta holds
-# a published release with no changelog section, and on its own that refusal
-# is TERMINAL — a permanently sectionless release would pin the fleet forever,
-# which contradicts the directive above ("DELAY the update, not PREVENT it").
-# So after this many CONSECUTIVE opaque refusals on the SAME opaque set the
-# operator is ESCALATED (notify + a comment on the cc-update tracking issue),
-# and the refusal continues: delay-then-SURFACE, never delay-then-forget, and
-# never auto-proceed. It reuses THIS knob rather than a sibling because it
-# expresses the same operator sentence — "about three days blocked is enough
-# delay before we act" — and the act here is telling a human, which is the
-# only act that can clear an absence of evidence. It also inherits the floor
-# and the loud clamp. ONE deliberate divergence: `0` disables the OVERRIDE
-# bound above, but it cannot disable the ESCALATION — a refusal nobody is
-# told about is the forbidden outcome — so `0` escalates at the floor.
-OPAQUE_ESCALATE_AT="$GATE_DEFER_STREAK_CAP"
-(( OPAQUE_ESCALATE_AT >= 1 )) || OPAQUE_ESCALATE_AT="$GATE_DEFER_STREAK_CAP_FLOOR"
+# THE SAME CAP MARKS A STANDING UNDISPOSITIONED OPAQUE RELEASE
+# (your-org/nexus-code#1007 follow-up, reshaped by #1526). Exit 8 refuses a
+# bump whose delta holds a published release with no changelog section AND no
+# `--opaque-disposition` from the evaluating agent. That refusal used to be
+# cleared only by a HUMAN, and this cap decided when one was told (notify + a
+# tracking-issue comment). The operator reversed that on 2026-09-25 (#1526):
+# the evaluating agent dispositions an opaque release itself, and the bump is
+# prevented only on EVIDENCE of breakage. So nothing here addresses a human
+# any more; after this many CONSECUTIVE undispositioned refusals on the same
+# opaque set a `changelog-opaque-undispositioned` row is written — the record
+# that the evaluator keeps skipping a judgment that is its own to make. The
+# knob is reused for the same sentence as before ("about three days"), with
+# its floor and loud clamp, and `0` still cannot switch the mark off: it
+# marks at the floor.
+OPAQUE_STREAK_AT="$GATE_DEFER_STREAK_CAP"
+(( OPAQUE_STREAK_AT >= 1 )) || OPAQUE_STREAK_AT="$GATE_DEFER_STREAK_CAP_FLOOR"
 # The age bound is an INDEPENDENT second bound, not a restatement of the cap:
 # it expresses the same "about three days blocked" in TIME, so a fire cadence
 # slower than daily cannot make the bound unreachable. Keeping it independent
@@ -765,7 +767,28 @@ record_outcome() {
         [[ "$_same" =~ ^[0-9]+$ ]] || _same=0
     fi
     _cc_auto_log_decision "$AUTO_DIR" "$candidate" "$decision" "$detail"
-    if [[ "$decision" == "safe-refused" ]]; then
+    if [[ "$decision" == "safe-refused" && "$detail" == "gate-evidence:gated-tree-dirty" ]]; then
+        # NOT "a defect in the gate" (your-org/nexus-code#1475): this refusal is
+        # the gate WORKING — a local tracked edit means head does not identify
+        # what ran — and the remedy is an operator's, so the message names the
+        # files and the remedy instead of blaming the gate.
+        local _files="${GATE_EVIDENCE_TRACKED:-<unnamed; git status --porcelain --untracked-files=no in the live clone>}"
+        if (( _same >= 1 )); then
+            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "safe-refused-repeat" "$detail same-reason-streak=$(( _same + 1 ))"
+            notify "cc-auto-update: $candidate NOT applied, $(( _same + 1 )) fires running — tracked edit(s) block the bump: $_files; stash (and keep it stashed until the next fire) or commit and push ($detail, #1475)"
+        else
+            notify "cc-auto-update: $candidate evaluated SAFE but NOT applied — tracked edit(s) block the bump: $_files; stash (and keep it stashed until the next fire) or commit and push ($detail, #1475)"
+        fi
+    elif [[ "$decision" == "safe-refused" && "$detail" == changelog-completeness:opaque-release=* ]]; then
+        # NOT an operator notify (your-org/nexus-code#1526): an undispositioned
+        # opaque release is the EVALUATING AGENT's call (--opaque-disposition),
+        # and the operator ruled that no human intervention is wanted. The row
+        # is kept; the repeat count is logged for the streak, never paged.
+        if (( _same >= 1 )); then
+            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "safe-refused-repeat" "$detail same-reason-streak=$(( _same + 1 ))"
+        fi
+        note "opaque release(s) undispositioned — the evaluator must pass --opaque-disposition (GUIDE Step 1); no human is notified (#1526)"
+    elif [[ "$decision" == "safe-refused" ]]; then
         if (( _same >= 1 )); then
             _cc_auto_log_decision "$AUTO_DIR" "$candidate" "safe-refused-repeat" "$detail same-reason-streak=$(( _same + 1 ))"
             notify "cc-auto-update: SAME safe-refused reason $(( _same + 1 )) fires running ($detail) for $candidate — a STANDING defect in the gate, not a transient tree state (#1400)"
@@ -1061,14 +1084,24 @@ _surface_key_check() {
 # passing every round while the surface it covers recorded as
 # argued-not-driven, on the input path spawn and follow-up delivery depend on.
 #
-# 2c-paste deliberately gets NO entry: the two halves of 2c keep separate
-# labels, and nothing in the harness drives the paste half, so it remains
-# `source-inspection` after this change. Adding it here would be the 2.1.222
-# mistake in the other direction.
+# 2c-paste's entry (your-org/nexus-code#1614). Until then it deliberately had
+# NO entry — nothing in the harness drove the paste half, and mapping it would
+# have been the 2.1.222 mistake in the other direction. Since e2866598
+# (your-org/nexus-code#1591) the harness runs `test-realmodel-paste-held.sh`,
+# listed in gate.sh's production scenario list: it drives production
+# `_paste_to_target_unlocked` through monitor/_paste-deliver.sh against the
+# candidate binary and asserts `reported delivered ==> a request reached the
+# backend AND the transcript recorded it`, with its own negative control
+# (Enter withheld -> no request, no record, pane reads `user-typing`). Without
+# the entry the evaluator had to hand-roll an `empirical` claim the tooling
+# cannot cross-check — exactly the laundering `--surface-evidence` exists to
+# stop. The halves STILL keep separate labels: 2c-paste is payable only by
+# the paste scenario and 2c-vi only by vimode, so neither pays for the other.
 _surface_gate_scenarios() {
     case "$1" in
         2a)    printf 'test-realmodel-idle-busy test-realmodel-autosuggest' ;;
         2b)    printf 'test-realmodel-blocked-question' ;;
+        2c-paste) printf 'test-realmodel-paste-held' ;;
         2c-vi) printf 'test-realmodel-vimode' ;;
         2d)    printf 'test-realmodel-pretooluse-hook' ;;
         *)     printf '' ;;
@@ -1230,6 +1263,30 @@ _gate_log_tree_field() {
         }' "$f" 2>/dev/null
 }
 
+# _gate_log_tracked_paths <file> — the tracked-edit list gate.sh stamps as
+# `=== gated-tree-tracked: <paths> ===` right after a `dirty_tracked=1` tree
+# stamp (your-org/nexus-code#1475). Empty when absent: evidence from before the
+# line existed, or a clean tree. A list stamped BEFORE the last `gated-tree:`
+# line belongs to an earlier run in the same file, so each tree stamp resets it.
+# Same one-awk shape as the readers above, for the same pipefail reason.
+_gate_log_tracked_paths() {
+    awk '
+        index($0, "=== gated-tree: ") == 1 { trk = "" }
+        index($0, "=== gated-tree-tracked: ") == 1 {
+            trk = $0
+            sub(/^=== gated-tree-tracked: /, "", trk)
+            sub(/ ===$/, "", trk)
+        }
+        END { if (trk != "") print trk }' "$1" 2>/dev/null
+}
+
+# The tracked paths behind a `gated-tree-dirty` refusal, for record_outcome's
+# notification. Kept OUT of the refusal code on purpose: the ledger `detail`
+# (`gate-evidence:gated-tree-dirty`) SELECTS — the #1400 same-reason streak and
+# this suite's exact-match regex both key on it — so a path list there would
+# break every streak the day a second file is edited.
+GATE_EVIDENCE_TRACKED=""
+
 # Which check refused, so the audit row can name it. A `decisions.tsv` row
 # reading `gate-evidence` cannot be told apart from any other gate-evidence
 # refusal by a later reader — and un-attributable rows are the whole subject
@@ -1330,8 +1387,16 @@ _check_gate_evidence() {
     # universally: ALSO FALSE, measured by the #1320 skeptic pass.
     #
     # MEASURED, lint channel: `cc-harness/lint-no-mass-kill.sh` and
-    # `lint-no-tmux-server-kill.sh` enumerate with `shf_find0`, a `find` walk,
-    # so an untracked plant takes the lint rc 0 -> rc 1. Fail-CLOSED there.
+    # `lint-no-tmux-server-kill.sh` enumerate with `shf_find0`, so an
+    # untracked plant takes the lint rc 0 -> rc 1. Fail-CLOSED there.
+    # (CORRECTED for your-org/nexus-code#1588: `shf_find0` is no longer "a
+    # `find` walk" inside a work tree; it lists `git ls-files --cached --others
+    # --exclude-standard`. `--others` keeps an untracked plant, so the sentence
+    # above holds. An untracked plant that is ALSO GITIGNORED was, for a while,
+    # read by neither lint; since your-org/nexus-code#1594 both pass
+    # `ignored-under-monitor`, so an ignored plant under `monitor/` is read
+    # again. An ignored plant OUTSIDE `monitor/` is not — see the matching
+    # note in cc-harness/gate.sh for why that boundary is where it is.)
     #
     # MEASURED, the OTHER direction: `cc-harness/gate-coverage.sh` globs the
     # filesystem at `:137` and `:333` feeding vacuity/vocabulary REFUSALS, and
@@ -1366,7 +1431,12 @@ _check_gate_evidence() {
         return 1
     fi
     if [[ "$stamp_dirty" != "0" ]]; then
-        note "REFUSED: the gated tree carried TRACKED modifications (dirty_tracked=${stamp_dirty}), so head=$stamp_head does not identify what actually ran. Commit or stash the tracked changes, then re-gate. (untracked=${stamp_untracked:-unrecorded} entries are NOT what refused this.)"
+        # Name the FILES (your-org/nexus-code#1475): the cause is a local edit
+        # in the gated clone, and a reason string alone sent every fire back to
+        # re-derive a one-line `git status`. Evidence without the list says so
+        # rather than printing an empty one.
+        GATE_EVIDENCE_TRACKED=$(_gate_log_tracked_paths "$file")
+        note "REFUSED: the gated tree carried TRACKED modifications (dirty_tracked=${stamp_dirty}), so head=$stamp_head does not identify what actually ran. Tracked edit(s) block the bump: ${GATE_EVIDENCE_TRACKED:-<not named — this gate log predates the gated-tree-tracked line; run git status --porcelain --untracked-files=no in $NEXUS_ROOT>}; stash (and keep it stashed until the next fire) or commit and push, then re-gate. (untracked=${stamp_untracked:-unrecorded} entries are NOT what refused this.)"
         GATE_EVIDENCE_REFUSAL="gated-tree-dirty"
         return 1
     fi
@@ -1447,11 +1517,12 @@ _check_gate_evidence() {
 #     independent fires read "406 of 406 across 18 releases" over it.
 #     Now such a release is an OPAQUE release and REFUSES with its own
 #     exit code (8), naming the version: an absence of evidence, not an
-#     absence of entries. The refusal is BOUNDED: after OPAQUE_ESCALATE_AT
-#     (= GATE_DEFER_STREAK_CAP) consecutive refusals on the same opaque
-#     set, `_cl_opaque_escalate` tells the operator — notify + a
-#     tracking-issue comment — and the refusal continues; it never
-#     auto-proceeds. The registry fetch gets the changelog fetch's
+#     absence of entries — UNLESS the evaluating agent dispositions it
+#     (your-org/nexus-code#1526): `--opaque-disposition <ver>=accepted:
+#     <reason>` for every opaque release lets the check proceed with those
+#     releases out of the per-entry accounting (they have no entries to
+#     count), `blocked:<evidence>` refuses, and no disposition refuses.
+#     The registry fetch gets the changelog fetch's
 #     treatment (rule 0): a failed fetch, a non-packument body, an empty
 #     version set, or a copy that does not list the candidate all REFUSE
 #     (exit 3) — NEVER fall back to the header-derived set, because that
@@ -1489,6 +1560,13 @@ CHANGELOG_DISPOSITIONS=()
 # same refusal on consecutive fires — an opaque release IS the standing
 # condition that nag exists for.
 CHANGELOG_REFUSAL=""
+# The evaluating agent's judgment on each OPAQUE release (your-org/nexus-code
+# #1526): `--opaque-disposition <ver>=accepted:<reason>` or
+# `<ver>=blocked:<evidence>`, repeated. OPAQUE_ACCEPTED is what the check
+# accepted, one `<ver><TAB><reason>` per release, for cmd_safe's
+# `opaque-release-accepted` rows.
+OPAQUE_DISPOSITIONS=()
+OPAQUE_ACCEPTED=()
 
 # _ver_lt <a> <b> — rc 0 iff version a sorts strictly before b.
 _ver_lt() {
@@ -1604,7 +1682,7 @@ _cl_registry_versions() {
     printf '%s\n' "$out" | sort -V
 }
 
-# ---- the BOUNDED opaque-release refusal (your-org/nexus-code#1007 follow-up) --
+# ---- the STANDING undispositioned opaque release (#1007 follow-up, #1526) --
 #
 # _cl_opaque_streak <detail> — how many CONSECUTIVE fires have been refused
 # with exactly this `safe-refused` detail, read from decisions.tsv the way
@@ -1630,166 +1708,71 @@ _cl_opaque_streak() {
     printf '%s' "$n"
 }
 
-# _cl_tracking_issue — print "<owner/repo> <N>" for the configured cc-update
-# tracking issue; rc 1 (no output) when none is configured, the resolver is
-# missing, or the value is not a qualified reference. Same resolution the
-# watcher's fire path uses (`_cc_auto_update.sh`, #866): the config value
-# through monitor/issue-ref.sh, which REFUSES a bare number rather than
-# guessing its repo — a guessed repo is how writes land, succeed, and are
-# never seen. CC_AUTO_TRACKING_ISSUE overrides the config (test seam, and the
-# same shape as CC_AUTO_TARGET_WINDOW).
-_cl_tracking_issue() {
-    local raw ref repo issue
-    raw="${CC_AUTO_TRACKING_ISSUE:-$("$NEXUS_ROOT/config/load.sh" monitor.cc_auto_update.tracking_issue "" 2>/dev/null || true)}"
-    [[ -n "$raw" ]] || return 1
-    [[ -r "$NEXUS_ROOT/monitor/issue-ref.sh" ]] || return 1
-    ref=$(bash "$NEXUS_ROOT/monitor/issue-ref.sh" "$raw" --field monitor.cc_auto_update.tracking_issue 2>/dev/null) || return 1
-    repo=$(awk -F= '$1=="REPO"{print $2; exit}' <<<"$ref")
-    issue=$(awk -F= '$1=="ISSUE"{print $2; exit}' <<<"$ref")
-    [[ -n "$repo" && "$issue" =~ ^[0-9]+$ ]] || return 1
-    printf '%s %s' "$repo" "$issue"
-}
-
-# _cl_opaque_escalate <candidate> <detail> <opaque-csv> — the bound on exit 8.
-# Returns 0 ALWAYS: a side effect, never a predicate. It does not change the
-# exit code or the outcome token — the fire is still `safe-refused` / exit 8
-# — it makes the Nth consecutive refusal LOUD and HUMAN-ADDRESSED instead of
-# the (N)th identical dark row. The operator directive this serves is the one
-# the deployment gate's bound serves: a busy board may DELAY the update, not
-# PREVENT it — and a refusal nobody is told about is prevention wearing
-# delay's clothes.
+# _cl_opaque_streak_mark <candidate> <detail> <opaque-csv> — the record on an
+# UNDISPOSITIONED exit 8. Returns 0 ALWAYS: a side effect, never a predicate;
+# it changes neither the exit code nor the outcome token.
 #
-# Two channels, two cadences, mirroring `_gate_defer`'s ALERT and
-# `_gate_file_defect`'s cooldown: the NOTIFY (and the audit row) fire on EVERY
-# fire at or past the bound, like the defer alert; the ISSUE POST happens ONCE
-# per opaque set per GATE_DEFECT_REFILE_SECONDS, like the defect filer,
-# because a comment per morning on one sectionless release trains the
-# operator to mute the channel. The breadcrumb lives under
-# $AUTO_DIR/opaque-escalations/<opaque-csv>; a post that FAILS writes no
-# breadcrumb, so the next fire retries, and says so in the ledger
-# (`changelog-opaque-escalation-UNPOSTED`) — the filer's own failure has to
-# be visible (w227 skeptic F2), or "we told someone" is a manufactured
-# success.
-#
-# WHERE IT POSTS. The cc-update tracking issue when one is configured (a
-# COMMENT — the thread the operator already watches); otherwise create-or-
-# adopt an issue on $GATE_REPO carrying a marker, the `_gate_file_defect`
-# shape, through the same seam (CC_AUTO_GATE_ISSUE_CMD). Bot identity via
-# $MINT_CMD + $GH_CMD, the path every other GitHub write in this file uses.
-# SAFE IN FIXTURES BY CONSTRUCTION: the mint must succeed before `gh` is
-# reached, and a fixture's mint-token.sh does not exist.
-_cl_opaque_escalate() {
+# This used to be `_cl_opaque_escalate`, which at the bound notified the
+# operator and commented on the cc-update tracking issue (or filed an issue)
+# asking for a HUMAN disposition. Operator decision 2026-09-25 on
+# your-org/nexus-code#1526: "The update should happen automatically after a
+# green gate and agent judgment without operator intervention." The judgment
+# is the evaluating agent's (`--opaque-disposition`), so a human is no longer
+# addressed from here; what remains is the ledger mark — how many fires in a
+# row the evaluator has left the judgment unmade — so the #1400 repeat-nag
+# and a reader of decisions.tsv can see a standing omission for what it is.
+_cl_opaque_streak_mark() {
     local candidate="$1" detail="$2" opaque="$3" streak
     streak=$(_cl_opaque_streak "$detail")
-    note "opaque-release streak: $streak consecutive fire(s) refused on '$opaque' — escalation at $OPAQUE_ESCALATE_AT (defer_cap=$GATE_DEFER_STREAK_CAP defer_cap_clamped=$GATE_DEFER_STREAK_CAP_CLAMPED). The refusal stands either way; this bound only decides when a human is told."
-    (( streak >= OPAQUE_ESCALATE_AT )) || return 0
-
-    local sentence="upstream shipped no parseable sections; this needs a human disposition."
-    local msg="cc-auto-update: candidate $candidate refused ${streak}× in a row (exit 8) — release(s) $opaque are published inside the delta with no changelog section: $sentence"
-    note "ESCALATION (opaque release, bounded refusal): $msg"
-    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-opaque-escalation" \
-        "streak=$streak escalate_at=$OPAQUE_ESCALATE_AT defer_cap=$GATE_DEFER_STREAK_CAP defer_cap_clamped=$GATE_DEFER_STREAK_CAP_CLAMPED $detail"
-    notify "$msg"
-
-    # The issue post — once per opaque set per cooldown.
-    local dir="$AUTO_DIR/opaque-escalations" bc="$AUTO_DIR/opaque-escalations/$opaque"
-    mkdir -p "$dir" 2>/dev/null || true
-    if [[ -f "$bc" ]]; then
-        local now mt age n head
-        now=$(date +%s); mt=$(stat -c %Y "$bc" 2>/dev/null || echo 0)
-        age=$(( now - mt ))
-        if [[ "$age" =~ ^[0-9]+$ ]] && (( age < GATE_DEFECT_REFILE_SECONDS )); then
-            n=$(awk -F'count=' 'NF>1{print $2+0; exit}' "$bc" 2>/dev/null)
-            [[ "$n" =~ ^[0-9]+$ ]] || n=0
-            head=$(sed -n '1s/ *count=[0-9]*//p' "$bc" 2>/dev/null)
-            [[ -n "$head" ]] || head=$(sed -n 1p "$bc" 2>/dev/null)
-            note "opaque-release escalation for '$opaque' already posted ($head); repeat $(( n + 1 )), not re-posting (cooldown ${GATE_DEFECT_REFILE_SECONDS}s)"
-            printf '%s count=%s\n' "$head" "$(( n + 1 ))" > "$bc.tmp" 2>/dev/null \
-                && mv -f "$bc.tmp" "$bc" 2>/dev/null
-            return 0
-        fi
-    fi
-
-    local body
-    if ! body=$(mktemp 2>/dev/null) || [[ -z "$body" ]]; then
-        note "opaque-release escalation for '$opaque' could NOT be posted — mktemp failed. The operator was notified but the thread was not; retried next fire."
-        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-opaque-escalation-UNPOSTED" "why=mktemp $detail"
-        return 0
-    fi
-    local marker="<!-- cc-auto-opaque-release: $opaque -->"
-    {
-        printf '%s\n\n' "$marker"
-        printf '## cc-auto-update: bounded opaque-release refusal — human disposition needed\n\n'
-        printf -- '- **candidate**: `%s`\n' "$candidate"
-        printf -- '- **opaque release(s)**: `%s` — published by the npm registry inside the delta, NO `## <version>` section in `%s` CHANGELOG.md\n' "$opaque" "$CHANGELOG_REPO"
-        printf -- '- **consecutive refusals**: %s (escalation bound %s = `defer_streak_cap`; floor %s)\n\n' "$streak" "$OPAQUE_ESCALATE_AT" "$GATE_DEFER_STREAK_CAP_FLOOR"
-        printf '%s\n\n' "$sentence"
-        printf 'The autonomous routine has refused this bump `exit 8` on every fire since the streak began and will KEEP refusing — it never auto-proceeds past an absence of evidence. It clears on its own the day upstream publishes the section. Until then the fleet stays on the installed version, and this comment is the bound on that delay (operator directive 2026-09-10: a busy board may DELAY an update, not PREVENT it).\n\n'
-        printf 'Options for a human: (1) wait for upstream; (2) read the release from its tarball / release page and, if it is judged safe, bump by hand per `skills/nexus.cc-update/GUIDE.md` Step 5 — the record of THAT reading is the disposition the changelog could not supply; (3) hold the routine (`monitor/cc-auto-update-apply.sh hold --reason …`).\n\n'
-        printf 'Ledger: `monitor/.state/cc-auto-update/decisions.tsv`, rows `safe-refused changelog-completeness:opaque-release=%s` and `changelog-opaque-escalation`. Mechanism: `_cl_opaque_escalate` in `monitor/cc-auto-update-apply.sh` (your-org/nexus-code#1007).\n' "$opaque"
-    } > "$body"
-
-    local target out="" where=""
-    if target=$(_cl_tracking_issue); then
-        local repo="${target% *}" issue="${target#* }"
-        where="$repo#$issue"
-        if [[ -n "${CC_AUTO_ISSUE_COMMENT_CMD:-}" ]]; then
-            out=$("$CC_AUTO_ISSUE_COMMENT_CMD" "$repo" "$issue" "$body" 2>&1) || out=""
-        else
-            local token
-            if token=$("$MINT_CMD" 2>/dev/null) && [[ -n "$token" ]]; then
-                out=$(GH_TOKEN="$token" "$GH_CMD" issue comment "$issue" --repo "$repo" --body-file "$body" 2>&1) || out=""
-            else
-                out=""
-            fi
-        fi
-    else
-        # No tracking issue: file, or adopt, ONE issue per opaque set on
-        # $GATE_REPO — the deployment gate's defect-filer shape and seam.
-        local key="opaque-release-$opaque"
-        local title="cc-auto-update: opaque release(s) $opaque — no changelog section, bump refused ${streak}× (needs a human disposition)"
-        where="$GATE_REPO (new/adopted issue, key $key)"
-        if [[ -n "${CC_AUTO_GATE_ISSUE_CMD:-}" ]]; then
-            out=$("$CC_AUTO_GATE_ISSUE_CMD" "$key" "$title" "$body" 2>&1) || out=""
-        else
-            local token found
-            if token=$("$MINT_CMD" 2>/dev/null) && [[ -n "$token" ]]; then
-                found=$(GH_TOKEN="$token" "$GH_CMD" issue list --repo "$GATE_REPO" --state open \
-                            --search "$marker" --json number --jq '.[0].number' 2>/dev/null || true)
-                if [[ "$found" =~ ^[0-9]+$ ]]; then
-                    out=$(GH_TOKEN="$token" "$GH_CMD" issue comment "$found" --repo "$GATE_REPO" --body-file "$body" 2>&1) || out=""
-                    [[ -n "$out" ]] || out="$GATE_REPO#$found"
-                else
-                    out=$(GH_TOKEN="$token" "$GH_CMD" issue create --repo "$GATE_REPO" \
-                              --title "$title" --body-file "$body" 2>&1) || out=""
-                fi
-            else
-                out=""
-            fi
-        fi
-    fi
-    rm -f "$body"
-
-    if [[ -n "$out" ]]; then
-        printf 'posted=%s at=%s first=%s count=1\n' "$where" "$(printf '%s' "$out" | tail -1 | cut -c1-200)" "$(date -Is 2>/dev/null || echo unknown)" > "$bc" 2>/dev/null || true
-        note "opaque-release escalation for '$opaque' posted to $where"
-        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-opaque-escalation-posted" "where=$where $detail"
-    else
-        note "opaque-release escalation for '$opaque' could NOT be posted to ${where:-anywhere} (mint/gh/seam failure or no output). The operator was notified but the thread was not — THE BLIND SPOT IS DOUBLE until a fire succeeds; retried on the next fire at or past the bound."
-        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-opaque-escalation-UNPOSTED" "where=${where:-none} $detail"
-        notify "cc-auto-update: opaque-release escalation for $candidate ($opaque) could NOT be posted to ${where:-the tracking issue} — nobody has been told but you"
-    fi
+    note "opaque-release streak: $streak consecutive fire(s) refused on '$opaque' with NO agent disposition — marked standing at $OPAQUE_STREAK_AT (defer_cap=$GATE_DEFER_STREAK_CAP defer_cap_clamped=$GATE_DEFER_STREAK_CAP_CLAMPED). No human is escalated: the disposition is the evaluating agent's to make (your-org/nexus-code#1526)."
+    (( streak >= OPAQUE_STREAK_AT )) || return 0
+    note "STANDING (opaque release, undispositioned): candidate $candidate refused ${streak}× in a row (exit 8) because $opaque carries no --opaque-disposition. The evaluator must judge it (GUIDE Step 1, 'Dispositioning an OPAQUE release') — refusing forever is also damage."
+    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-opaque-undispositioned" \
+        "streak=$streak streak_at=$OPAQUE_STREAK_AT defer_cap=$GATE_DEFER_STREAK_CAP defer_cap_clamped=$GATE_DEFER_STREAK_CAP_CLAMPED $detail"
     return 0
 }
 
 # _check_changelog_completeness <changelog> <ledger> <installed> <candidate>
 #
 # rc 0 accepted; rc 1 refused (cmd_safe exits 3); rc 2 refused because of
-# an OPAQUE release (cmd_safe exits 8) — your-org/nexus-code#1007. The
-# reason for the #1007 arms lands in CHANGELOG_REFUSAL.
+# an OPAQUE release with no agent disposition, or one the agent BLOCKED
+# (cmd_safe exits 8) — your-org/nexus-code#1007, #1526. The reason for the
+# #1007/#1526 arms lands in CHANGELOG_REFUSAL.
 _check_changelog_completeness() {
     local file="$1" ledger="$2" installed="$3" candidate="$4"
     local item key val ver
+
+    # ---- the agent's opaque-release dispositions: SHAPE first (#1526) ----
+    # `<x.y.z>=accepted:<reason>` or `<x.y.z>=blocked:<evidence>`. The reason
+    # is the recorded judgment, so an empty one is refused rather than read
+    # as a judgment: at least one letter or digit after whitespace is
+    # collapsed (tabs and newlines would tear the decisions.tsv row). One
+    # disposition per release — two would leave the recorded judgment
+    # ambiguous. Checked before anything is fetched, and whether or not the
+    # delta turns out to hold an opaque release: a malformed flag is a caller
+    # error either way.
+    local -A od_verdict=() od_reason=()
+    local od_v od_r
+    OPAQUE_ACCEPTED=()
+    for item in ${OPAQUE_DISPOSITIONS+"${OPAQUE_DISPOSITIONS[@]}"}; do
+        key="${item%%=*}"; val="${item#*=}"
+        od_v="${val%%:*}"; od_r="${val#*:}"
+        od_r=$(printf '%s' "$od_r" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+        if [[ "$key" == "$item" || "$od_v" == "$val" ]] \
+           || [[ ! "$key" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+           || [[ "$od_v" != accepted && "$od_v" != blocked ]] \
+           || [[ ! "$od_r" =~ [[:alnum:]] ]]; then
+            CHANGELOG_REFUSAL="opaque-disposition-malformed"
+            note "REFUSED: --opaque-disposition '$item' — the shape is <release>=accepted:<reason> or <release>=blocked:<evidence>, and the reason is REQUIRED: it is the recorded judgment that lets an opaque release through (your-org/nexus-code#1526)."
+            return 1
+        fi
+        if [[ -n "${od_verdict[$key]+x}" ]]; then
+            CHANGELOG_REFUSAL="opaque-disposition-malformed"
+            note "REFUSED: --opaque-disposition names $key twice — one judgment per release."
+            return 1
+        fi
+        od_verdict["$key"]="$od_v"; od_reason["$key"]="$od_r"
+    done
 
     if [[ -z "$file" ]]; then
         note "REFUSED: --changelog-evidence <file> is required — the changelog you fetched from source in THIS evaluation. It is cross-checked, section by section, against the copy this run fetches for itself."
@@ -1891,12 +1874,6 @@ _check_changelog_completeness() {
         for ver in "${releases[@]}"; do
             grep -qxF -- "## $ver" "$fetched" || opaque+=("$ver")
         done
-        if (( ${#opaque[@]} > 0 )); then
-            _cl_done
-            CHANGELOG_REFUSAL="opaque-release=$(IFS=,; printf '%s' "${opaque[*]}")"
-            note "REFUSED (exit 8, OPAQUE RELEASE): ${opaque[*]} — ${#opaque[@]} release(s) the registry publishes inside the delta ($installed, $candidate] with NO '## <version>' section in the $CHANGELOG_REPO CHANGELOG.md this run fetched. An opaque release is an ABSENCE OF EVIDENCE, not an absence of entries: nothing in any ledger can account for what it changed, so this run cannot establish the bump is safe, and nothing you pass can clear this arm. Before your-org/nexus-code#1007 the release set was the changelog's own headers, so such a release was simply not IN the set and 'dispositioned N of M' read GREEN over it (2.1.242, 2026-08-25). The next daily fire retries and clears the day upstream publishes the section; after $OPAQUE_ESCALATE_AT consecutive refusals on this same set the operator is escalated automatically (notify + tracking-issue comment) — bounded delay, never a silent pin."
-            return 2
-        fi
         # Headers for versions the registry does NOT publish: dropped from
         # the set, by CHOICE (rule 2 above) — said out loud, never silent.
         while IFS= read -r hv; do
@@ -1909,6 +1886,65 @@ _check_changelog_completeness() {
             note "WARN changelog: '## ${unpublished[*]}' — ${#unpublished[@]} section(s) inside the delta ($installed, $candidate] whose version the registry does NOT publish; dropped from the release set (nothing installable carries those entries; a disposition for one is refused as outside the delta). your-org/nexus-code#1007."
         fi
     fi
+
+    # ---- OPAQUE releases: the evaluating agent's judgment (#1526) ---------
+    # A disposition must name a release that IS opaque in this delta. One
+    # naming anything else means the evaluator's picture of the delta is not
+    # this run's — most plausibly upstream backfilled the section since, and
+    # the entries now need the ordinary per-entry accounting — so it is
+    # REFUSED (exit 3) rather than ignored: an ignored flag would let a
+    # judgment about one release stand silently beside a different reality.
+    local od_in r
+    for key in "${!od_verdict[@]}"; do
+        od_in=0
+        for r in ${opaque+"${opaque[@]}"}; do [[ "$key" == "$r" ]] && od_in=1; done
+        if (( od_in == 0 )); then
+            _cl_done
+            CHANGELOG_REFUSAL="opaque-disposition-outside-set"
+            note "REFUSED: --opaque-disposition $key=… names a release that is not OPAQUE in the delta (${installed:-?}, $candidate] — opaque here: ${opaque[*]:-none}. If upstream has since published a '## $key' section, read it and account for its entries with --changelog-dispositioned like any other release."
+            return 1
+        fi
+    done
+    # Each opaque release: ACCEPTED, BLOCKED, or no judgment. Equality arms,
+    # and the default — no disposition — refuses: silence never clears.
+    local -a od_accepted=() od_blocked=() od_missing=()
+    for ver in ${opaque+"${opaque[@]}"}; do
+        case "${od_verdict[$ver]:-}" in
+            accepted) od_accepted+=("$ver") ;;
+            blocked)  od_blocked+=("$ver") ;;
+            *)        od_missing+=("$ver") ;;
+        esac
+    done
+    if (( ${#od_blocked[@]} > 0 )); then
+        _cl_done
+        CHANGELOG_REFUSAL="opaque-release-blocked=$(IFS=,; printf '%s' "${od_blocked[*]}")"
+        for ver in "${od_blocked[@]}"; do
+            note "REFUSED (exit 8, OPAQUE RELEASE BLOCKED by the evaluating agent): $ver — evidence: ${od_reason[$ver]}"
+        done
+        note "The evaluator found EVIDENCE that ${od_blocked[*]} breaks the nexus, so the bump to $candidate is refused. Carry that evidence where it can be acted on — a compat fix (\`compat-pr auto\`) or a \`block\` verdict naming it — rather than re-running this."
+        return 2
+    fi
+    if (( ${#od_missing[@]} > 0 )); then
+        _cl_done
+        CHANGELOG_REFUSAL="opaque-release=$(IFS=,; printf '%s' "${od_missing[*]}")"
+        note "REFUSED (exit 8, OPAQUE RELEASE, NO AGENT DISPOSITION): ${od_missing[*]} — ${#od_missing[@]} release(s) the registry publishes inside the delta ($installed, $candidate] with NO '## <version>' section in the $CHANGELOG_REPO CHANGELOG.md this run fetched. An opaque release is an ABSENCE OF EVIDENCE, and silence never clears it: YOU, the evaluating agent, must judge it — no human disposition is needed or requested (operator decision, your-org/nexus-code#1526). Evaluate each per skills/nexus.cc-update/GUIDE.md Step 1 'Dispositioning an OPAQUE release' (publish date; superseded by what, and how fast; deprecated or not; the gate ran GREEN on the candidate binary, which contains it; whether any nexus surface depends on what it could have changed), then re-run with --opaque-disposition <ver>=accepted:<reason> for each, or <ver>=blocked:<evidence> if you found EVIDENCE it breaks the nexus. Block only on evidence: not updating is also damage."
+        return 2
+    fi
+    if (( ${#od_accepted[@]} > 0 )); then
+        # Out of the per-entry accounting: an opaque release has no section,
+        # so it has no entries to count or to find in the ledger. Its
+        # accounting IS the disposition.
+        local -a kept=()
+        for ver in "${releases[@]}"; do
+            [[ -n "${od_verdict[$ver]:-}" ]] || kept+=("$ver")
+        done
+        releases=(${kept+"${kept[@]}"})
+        for ver in "${od_accepted[@]}"; do
+            OPAQUE_ACCEPTED+=("$ver"$'\t'"${od_reason[$ver]}")
+            note "OPAQUE RELEASE ACCEPTED by the evaluating agent's disposition: $ver — reason: ${od_reason[$ver]}"
+        done
+    fi
+
     if (( ${#releases[@]} == 0 )); then
         _cl_done
         note "REFUSED: the registry publishes no release in the delta ($installed, $candidate] — the effective version and the candidate do not describe a real bump"
@@ -1930,6 +1966,11 @@ _check_changelog_completeness() {
         fi
         local in_set=0 r
         for r in "${releases[@]}"; do [[ "$key" == "$r" ]] && in_set=1; done
+        if (( in_set == 0 )) && [[ -n "${od_verdict[$key]:-}" ]]; then
+            _cl_done
+            note "REFUSED: --changelog-dispositioned $key=… names an OPAQUE release — it has no section and so no entries to count; its disposition is --opaque-disposition $key=accepted:<reason> alone."
+            return 1
+        fi
         if (( in_set == 0 )); then
             _cl_done
             note "REFUSED: --changelog-dispositioned $key=… names a release outside the delta. Releases requiring a disposition — what the registry publishes in ($installed, $candidate]: ${releases[*]}"
@@ -2084,6 +2125,9 @@ _check_changelog_completeness() {
     # the counts, and that they were taken from the changelog this run
     # read. NOT where those bytes came from — see the provenance note.
     CHANGELOG_SUMMARY="dispositioned $total_n of $total_m entries across ${#releases[@]} release(s): $summary (release set = the registry's published versions in the delta; M counted from the changelog this run read; provenance NOT established)"
+    if (( ${#OPAQUE_ACCEPTED[@]} > 0 )); then
+        CHANGELOG_SUMMARY+="; opaque release(s) accepted by agent disposition: $(printf '%s\n' "${OPAQUE_ACCEPTED[@]}" | cut -f1 | paste -sd, -)"
+    fi
     note "changelog completeness accepted: $CHANGELOG_SUMMARY"
     return 0
 }
@@ -2217,7 +2261,8 @@ _gate_pane_state() {
     printf '%s' "$st"
 }
 
-# _gate_defer_streak_bump — increment and print the count of CONSECUTIVE
+# _gate_defer_streak_bump — increment and RECORD (in `_gate_defer_run_streak`,
+# printing nothing — see #1602 below) the count of CONSECUTIVE
 # deferred fires; _gate_defer_streak_clear resets it. A gate that never
 # clears is indistinguishable from a gate that is not there, and the
 # tightening this issue adds makes that outcome more reachable, not less
@@ -2227,15 +2272,41 @@ _gate_pane_state() {
 # naive bump would then count one fire as two, inflating the streak toward its
 # own cap — a counter that accelerates because of the mechanism it feeds.
 # `_gate_defer_run_streak` is cleared at the top of `_deployment_gate`.
+#
+# THE MEMO IS A PARENT-SHELL VARIABLE, SO THIS MUST BE CALLED IN THE PARENT
+# SHELL (your-org/nexus-code#1602). Its only caller used to be
+# `streak=$(_gate_defer_streak_bump)`: a command substitution is a SUBSHELL,
+# so the `_gate_defer_run_streak="$n"` below died with it, the memo check was
+# never true, and the second `_gate_defer` of a fire bumped again — the exact
+# acceleration the paragraph above exists to prevent, present since the memo
+# was written. The function therefore RETURNS ITS VALUE IN THE MEMO and prints
+# nothing; the caller reads `_gate_defer_run_streak` after a bare call. Do not
+# reintroduce `$(…)` around it: the memo is only as real as the shell it is
+# written in.
 _gate_defer_run_streak=""
 _gate_defer_streak_bump() {
     local f="$AUTO_DIR/gate-defer-streak" n=0
-    if [[ -n "$_gate_defer_run_streak" ]]; then
-        printf '%s\n' "$_gate_defer_run_streak"
-        return 0
+    [[ -n "$_gate_defer_run_streak" ]] && return 0
+    # THE COUNT GETS THE SAME BYTE DISCIPLINE AS THE AGE STAMP BELOW
+    # (your-org/nexus-code#1603, skeptic item 7 on #1626). This read was
+    # `tr -dc '0-9'`, which LAUNDERS rather than validates: a hand-typed
+    # `2026-09-19` became 20260919, at or above any cap, so the next deferral
+    # TRIPPED the override — the permissive direction, from a file under
+    # monitor/.state/ that a human is invited to read and may well edit. Now:
+    # strip only leading/trailing whitespace; the rest must be 1-6 digits with
+    # no leading zero (bash reads `0…` as OCTAL). SIX DIGITS IS CHOSEN, NOT
+    # DERIVED: the counter is bumped once per fire and cleared on any apply,
+    # so 999999 consecutive deferred fires is decades at any cadence this
+    # routine has had — and it refuses the 8-digit spelling of a date, the
+    # input a human is likeliest to type. Anything else reads as 0, so this
+    # fire starts a NEW streak (count 1, fresh `-since` stamp below): an
+    # unreadable count can only DELAY an override, never trip one.
+    local raw=""
+    if [[ -f "$f" ]] && { raw=$(< "$f"); } 2>/dev/null; then
+        raw="${raw#"${raw%%[![:space:]]*}"}"
+        raw="${raw%"${raw##*[![:space:]]}"}"
+        [[ "$raw" =~ ^[1-9][0-9]{0,5}$ ]] && n="$raw"
     fi
-    [[ -f "$f" ]] && n=$(tr -dc '0-9' < "$f" 2>/dev/null || echo 0)
-    [[ "$n" =~ ^[0-9]+$ ]] || n=0
     n=$(( n + 1 ))
     mkdir -p "$AUTO_DIR" 2>/dev/null || true
     printf '%s\n' "$n" > "$f" 2>/dev/null || true
@@ -2249,7 +2320,6 @@ _gate_defer_streak_bump() {
         printf '%s\n' "$(date +%s)" > "$sf" 2>/dev/null || true
     fi
     _gate_defer_run_streak="$n"
-    printf '%s\n' "$n"
 }
 _gate_defer_streak_clear() {
     rm -f "$AUTO_DIR/gate-defer-streak" "$AUTO_DIR/gate-defer-streak-since" 2>/dev/null || true
@@ -2260,11 +2330,38 @@ _gate_defer_streak_clear() {
 # number either: the caller treats an unreadable age as "age bound not
 # met", so a broken clock or a missing file can never TRIP an override.
 # "I could not tell" must not become "long enough".
+#
+# VALIDATE THE BYTES, DO NOT LAUNDER THEM (your-org/nexus-code#1603). This
+# read was `tr -dc '0-9'` followed by `[[ $t =~ ^[0-9]+$ ]]` — and the regex
+# could reject nothing, because `tr` had already made the string all digits.
+# A stamp that was not an epoch at all was silently reinterpreted as one: a
+# hand-typed DATE-ONLY `2026-09-19` became `20260919`, i.e. 1970-08-23, an age
+# of ~56 years that clears any bound and TRIPS the override — the permissive
+# direction, on a hand-editable file under monitor/.state/. (A full ISO
+# timestamp concatenated to a future epoch and was safe only by the `now < t`
+# road; the dangerous input was the short one a human is likeliest to type.)
+#
+# Now: only LEADING/TRAILING whitespace is stripped (interior whitespace or a
+# second line is not an epoch and is refused), and the rest must be 1-12
+# digits with no leading zero — 12 digits bounds the arithmetic far below
+# int64 wrap (a 20-digit string would wrap SILENTLY into an arbitrary age),
+# and a leading zero is refused because bash arithmetic reads `0…` as OCTAL.
+#
+# THE SANITY FLOOR IS CHOSEN, NOT DERIVED: 1577836800 = 2020-01-01T00:00:00Z.
+# This gate did not exist before 2026, so any stamp older than 2020 is a
+# truncated, half-written or mis-formatted value rather than a real streak
+# start — and every such value is ANCIENT, i.e. exactly the one that trips.
+# It also catches the digits-only spelling of a date (`20260919`), which the
+# shape check alone would accept. Any floor below the gate's first write is
+# equally correct; this one was picked for being round and obviously old.
 _gate_defer_streak_age() {
-    local sf="$AUTO_DIR/gate-defer-streak-since" t now
+    local sf="$AUTO_DIR/gate-defer-streak-since" t now floor=1577836800
     [[ -s "$sf" ]] || return 0
-    t=$(tr -dc '0-9' < "$sf" 2>/dev/null || true)
-    [[ "$t" =~ ^[0-9]+$ ]] || return 0
+    { t=$(< "$sf"); } 2>/dev/null || return 0
+    t="${t#"${t%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    [[ "$t" =~ ^[1-9][0-9]{0,11}$ ]] || return 0
+    (( t >= floor )) || return 0
     now=$(date +%s 2>/dev/null) || return 0
     [[ "$now" =~ ^[0-9]+$ ]] || return 0
     (( now < t )) && return 0
@@ -2527,7 +2624,8 @@ _gate_file_defect() {
 # one verdict here that is permissive.
 _gate_defer() {
     local candidate="$1" detail="$2" msg="$3" overridable="${4:-0}" streak age
-    streak=$(_gate_defer_streak_bump)
+    _gate_defer_streak_bump   # NOT `$(…)` — the memo must land in THIS shell (#1602)
+    streak="$_gate_defer_run_streak"
     [[ "$streak" =~ ^[0-9]+$ ]] || streak=1
     age=$(_gate_defer_streak_age)
 
@@ -2622,15 +2720,15 @@ _gate_integration_branch() {
 #
 # THE ARMS ARE A CONJUNCTION SAMPLED ONCE A DAY, so P(clear) falls with
 # every arm added and no single arm need ever be wrong for the routine to
-# stop delivering. There are TWO `_gate_defer` arms since 2026-09-12 (five
-# before; "seven" never) — re-derive with
+# stop delivering. There is ONE `_gate_defer` arm since 2026-09-25 (two from
+# 2026-09-12, five before; "seven" never) — re-derive with
 # `grep -cE '^\s*(if ! )?_gate_defer "' "$0"` (anchored, so this comment's own
 # mention does not count itself — the bare `grep -c '_gate_defer "'` form
 # that stood here over-counted by exactly one for that reason), and read the
 # knob block at the top of this file for why the three board arms went. Measured on this nexus, decisions.tsv, 2026-06-16 to 2026-09-12:
 # 33 applies, 12 deferrals, spread across FOUR arms —
 #
-#   restart-path PR        5      (proxy, overridable — STILL AN ARM)
+#   restart-path PR        5      (VETO REMOVED 2026-09-25, #1526; hits still NOTED)
 #   PR-under-active-review 3      (proxy, overridable — STILL AN ARM)
 #   live-window COUNT      2      (REMOVED 2026-09-12; count still recorded)
 #   board-not-quiet        2      (REMOVED 2026-09-12; states still recorded)
@@ -2784,11 +2882,24 @@ _deployment_gate() {
         notify "cc-auto-update: could not determine clone staleness vs origin/$branch (${reason:-unspecified}) — staleness is UNVERIFIED, not clean"
     fi
 
-    # 2. Open PRs touching the watcher restart path. The restart being
-    #    under repair is EXACTLY when an autonomous restart must not fire
-    #    (2026-07-10: the evaluator restarted the watcher while PR #503 —
-    #    open precisely because that restart path decapitates — sat
-    #    unmerged with 15 agents mid-flight).
+    # 2. Open PRs touching the watcher restart path — RECORDED, NOT A VETO
+    #    (your-org/nexus-code#1526 follow-up, 2026-09-25). This arm used to
+    #    DEFER (exit 30) on any open PR touching one of GATE_RESTART_PATHS,
+    #    after 2026-07-10: the evaluator restarted the watcher while PR #503 —
+    #    open precisely because that restart path decapitated — sat unmerged
+    #    with 15 agents mid-flight. But what made #503 dangerous was the KNOWN
+    #    decapitation bug, i.e. EVIDENCE, and an evaluating agent acts on that
+    #    kind of evidence with `apply.sh hold` or a blocked verdict. The proxy
+    #    itself carries none: an open PR is not deployed, and the restart a bump
+    #    performs runs the LIVE tree's restart code, so "a PR touches one of
+    #    five files" says nothing about whether this restart is broken. Under
+    #    the operator's #1526 rule — update automatically; prevent it only on
+    #    EVIDENCE it breaks the nexus; not updating is also damage — the veto
+    #    went (it held a SAFE 2.1.282 on PR1634 on 2026-09-25). The probe and
+    #    the evidence stay: each hit is a `restart-path-pr-noted` row and a
+    #    note, the live hits ride the deployment-gate row as
+    #    `restart_path_prs=PR…`, the aged-out ones as `stale-restart-path-pr=`.
+    #    Arm 2b (active review, the bounded #1492 delay) is untouched.
     local ev="behind_integration=$behind integration_branch=$branch drift=$drift"
     # DEGRADE, DO NOT DEFER (your-org/nexus-code#1492 — see the
     # instrument-failure block above `_gate_defer`). This arm measures a PROXY
@@ -2847,22 +2958,26 @@ _deployment_gate() {
         unset IFS
         if [[ -n "$stale_hits" ]]; then
             ev="$ev stale-restart-path-pr=${stale_hits} restart_pr_active_window=${GATE_RESTART_PR_ACTIVE_SECONDS}s"
-            # AN AGED-OUT EXEMPTION IS ANNOUNCED, not only recorded (#1449
-            # skeptic): a decision that lives only in decisions.tsv and the
-            # apply log is read by nobody — the #1400 shape, inside the PR
-            # that closes #1400. The operator learns that a restart-path PR
-            # stopped blocking BEFORE the bump proceeds on that basis.
-            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "restart-path-pr-aged-out" "${stale_hits} window=${GATE_RESTART_PR_ACTIVE_SECONDS}s"
-            notify "cc-auto-update: restart-path PR(s) ${stale_hits} untouched longer than ${GATE_RESTART_PR_ACTIVE_SECONDS}s — NO LONGER blocking the ${candidate} bump (stalled, not under repair; #1414). If one of them IS a live repair, touch it or hold the routine."
         fi
     fi
-    if [[ -n "$live_hits" ]]; then
-        if ! _gate_defer "$candidate" "deferred-pending-${live_hits// /,} $ev" \
-            "open PR(s) touch the watcher restart path ($live_hits on $GATE_REPO, touched within ${GATE_RESTART_PR_ACTIVE_SECONDS}s) — the restart mechanics are under repair. This deferral NAMES A HAZARD, which is what makes it a complete result; see gate-defer-streak for whether it is one of a run." 1
-        then
-            return 1
-        fi
-    fi
+    # One row per hit, live or aged out — the #1414 aged-out row and its
+    # notify are folded in here: with no veto there is no exemption to
+    # announce, only a fact to record. No notify, no _gate_defer, no exit 30.
+    local _nh
+    for _nh in $live_hits; do
+        note "deployment-gate: open PR $_nh on $GATE_REPO touches the watcher restart path — NOTED, not a veto (#1526: an open PR is not deployed; the restart runs the live tree's code). If you hold EVIDENCE the live restart path is broken, use \`hold\`."
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "restart-path-pr-noted" \
+            "pr=$_nh activity=live window=${GATE_RESTART_PR_ACTIVE_SECONDS}s"
+    done
+    local IFS=','
+    local _na
+    for _nh in $stale_hits; do
+        _na="${_nh#*(}"; _na="${_na%)}"
+        note "deployment-gate: open PR ${_nh%%(*} on $GATE_REPO touches the watcher restart path, untouched for $_na — NOTED (aged out, #1414)"
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "restart-path-pr-noted" \
+            "pr=${_nh%%(*} activity=aged-out age=$_na window=${GATE_RESTART_PR_ACTIVE_SECONDS}s"
+    done
+    unset IFS
 
     # 2b. Open PRs UNDER ACTIVE REVIEW — orthogonal to the path list
     #     (your-org/nexus-code#1113). Whether a PR is being reviewed right
@@ -2954,6 +3069,7 @@ _deployment_gate() {
     # decision from. Reaching this line no longer implies either probe
     # succeeded, so the row must say which.
     local _rp_field="none" _ar_field="none" _unfiled
+    [[ -n "$live_hits" ]] && _rp_field="${live_hits// /,}"
     [[ "$pr_probe"        == "UNMEASURED" ]] && _rp_field="UNMEASURED"
     [[ "$act_probe_state" == "UNMEASURED" ]] && _ar_field="UNMEASURED"
     # The UNFILED backlog rides the same row (w227 skeptic F2). A filer whose
@@ -3085,7 +3201,7 @@ cmd_safe() {
     local candidate="" gate_evidence="" surfaces_clear=0
     local changelog_evidence="" changelog_ledger=""
     local no_restart=0 no_orch_restart=0
-    SURFACE_EVIDENCE=(); NEGATIVE_CONTROLS=(); CHANGELOG_DISPOSITIONS=()
+    SURFACE_EVIDENCE=(); NEGATIVE_CONTROLS=(); CHANGELOG_DISPOSITIONS=(); OPAQUE_DISPOSITIONS=()
     while (( $# > 0 )); do
         case "$1" in
             --candidate)         candidate="$2"; shift 2 ;;
@@ -3096,6 +3212,7 @@ cmd_safe() {
             --changelog-evidence)      changelog_evidence="$2"; shift 2 ;;
             --changelog-ledger)        changelog_ledger="$2"; shift 2 ;;
             --changelog-dispositioned) CHANGELOG_DISPOSITIONS+=("$2"); shift 2 ;;
+            --opaque-disposition)      OPAQUE_DISPOSITIONS+=("$2"); shift 2 ;;
             # ---- DECOMPOSITION (your-org/nexus-code#1400) ----------------
             # `safe` welded FOUR operations into one verb: pin, install,
             # watcher restart, orchestrator restart. Only the RESTARTS carry
@@ -3175,21 +3292,25 @@ cmd_safe() {
     # each with an explicit disposition, counted against the fetched
     # changelog rather than asserted — the delta itself being what the
     # registry publishes. See the function. rc 2 is the OPAQUE-release
-    # arm (your-org/nexus-code#1007) and gets its own exit code, 8: unlike
-    # every rc-1 arm, nothing the evaluator supplies can clear it. The
-    # detail carries the #1007 reason when there is one and is otherwise
-    # the pre-existing bare token, so older rows and their readers are
-    # unchanged.
+    # arm (your-org/nexus-code#1007) and gets its own exit code, 8: an opaque
+    # release the evaluating agent has not ACCEPTED (#1526) — either no
+    # disposition at all, or one BLOCKED on evidence. The detail carries the
+    # #1007/#1526 reason when there is one and is otherwise the pre-existing
+    # bare token, so older rows and their readers are unchanged.
     local cl_rc=0
     _check_changelog_completeness "$changelog_evidence" "$changelog_ledger" \
         "$effective" "$candidate" || cl_rc=$?
     if (( cl_rc == 2 )); then
         record_outcome "$candidate" "safe-refused" "changelog-completeness:${CHANGELOG_REFUSAL}"
-        # The bound on exit 8: AFTER the row is written (so this fire counts),
-        # BEFORE the exit; never changes either. `|| true` — a side effect
-        # must not become a new failure mode on the refusal path.
-        _cl_opaque_escalate "$candidate" "changelog-completeness:${CHANGELOG_REFUSAL}" \
-            "${CHANGELOG_REFUSAL#opaque-release=}" || true
+        # The standing-omission mark counts UNDISPOSITIONED refusals only; a
+        # BLOCKED release is a judgment made, not one skipped. AFTER the row
+        # is written (so this fire counts), BEFORE the exit; never changes
+        # either. `|| true` — a side effect must not become a new failure
+        # mode on the refusal path.
+        if [[ "$CHANGELOG_REFUSAL" == opaque-release=* ]]; then
+            _cl_opaque_streak_mark "$candidate" "changelog-completeness:${CHANGELOG_REFUSAL}" \
+                "${CHANGELOG_REFUSAL#opaque-release=}" || true
+        fi
         exit 8
     elif (( cl_rc != 0 )); then
         record_outcome "$candidate" "safe-refused" "changelog-completeness${CHANGELOG_REFUSAL:+:$CHANGELOG_REFUSAL}"
@@ -3197,6 +3318,15 @@ cmd_safe() {
     fi
     _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-completeness" \
         "$CHANGELOG_SUMMARY"
+    # One row per opaque release the agent ACCEPTED (#1526): the judgment
+    # that let a release nobody could read through, auditable beside the
+    # accounting that did not cover it. Written here, when the changelog
+    # check has passed, whatever the deployment gate below then decides.
+    local _oa
+    for _oa in ${OPAQUE_ACCEPTED+"${OPAQUE_ACCEPTED[@]}"}; do
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "opaque-release-accepted" \
+            "release=${_oa%%$'\t'*} reason=${_oa#*$'\t'}"
+    done
 
     # Single-flight lock (mkdir is atomic; stale-lock recovery is manual
     # by design — a torn apply needs eyes, not a silent re-run).
@@ -3480,6 +3610,63 @@ cmd_safe() {
 #
 # The single kill issued anywhere here is `tmux kill-window` — never a
 # cmdline-pattern kill (lint-no-mass-kill.sh).
+# _sel_step <label> <tmux_selection_* fn> [args…] — run one best-effort step of
+# the #1528 window-selection capture and NOTE a non-zero status with the
+# helper's own reason (your-org/nexus-code#1562). Always returns 0: nothing in
+# the capture may change `restart-orchestrator`'s rc. `9>&-` for the reason
+# every tmux call in the locked region carries it (19b). rc 1 from the capture
+# is "written, nothing to restore" — a legitimate outcome, still worth a line,
+# because it is the other way an operator ends up unrestored.
+_sel_step() {
+    local label="$1" rc=0; shift
+    TMUX_SELECTION_WHY=""
+    TMUX_WINDOW_TMUX_CMD="$TMUX_CMD" "$@" 9>&- || rc=$?
+    if (( rc != 0 )); then
+        note "restart: selection capture ($label) FAILED rc=$rc — ${TMUX_SELECTION_WHY:-no reason recorded}. Non-fatal: the restart continues; the operator's window selection may not be restored (#1528)."
+    fi
+    return 0
+}
+
+# _launch_watchdog_retire <attempt> — hand the watchdog's retirement to a
+# DETACHED `retire-watchdog` (your-org/nexus-code#1627; see that verb). Called
+# once, right after the orchestrator kill: only a restart that reached the kill
+# has a watchdog that can verify. Best-effort, and nothing here can change
+# `restart-orchestrator`'s rc. `9>&-` on every child, for the reason every tmux
+# call in this locked region carries it (19b): a detached child holding fd 9
+# would hold the single-flight lock for its whole 3 h life.
+_launch_watchdog_retire() {
+    local attempt="$1" wid="" seam="${CC_AUTO_WATCHDOG_RETIRE_LAUNCH_CMD:-}"
+    # TWO BOARDS (the #1550 class). `retire-watchdog` looks through $TMUX_CMD but
+    # retires through `ng retire-window`, which always addresses the DEFAULT tmux
+    # server. With the tmux seam overridden and the retire seam not, the two are
+    # different boards — every fixture that reaches this kill, for one — and a
+    # detached retire aimed at the operator's real board is the one outcome this
+    # must never have. So it is not launched, and says why. Decided BEFORE any
+    # tmux call, so a path that launches nothing asks tmux nothing.
+    if [[ -z "$seam" && "$TMUX_CMD" != tmux && -z "${CC_AUTO_WATCHDOG_RETIRE_CMD:-}" ]]; then
+        note "restart: watchdog auto-retire NOT launched — CC_AUTO_TMUX ($TMUX_CMD) is overridden but the retire command is the default \`ng retire-window\`, which would address a DIFFERENT tmux server (#1627)"
+        return 0
+    fi
+    wid=$("$TMUX_CMD" display-message -p -t ":=$WATCHDOG_WINDOW" '#{window_id}' 2>/dev/null 9>&- | tr -d '[:space:]')
+    [[ "$wid" =~ ^@[0-9]+$ ]] || wid=""
+    local -a args=(--attempt "$attempt")
+    [[ -n "$wid" ]] && args+=(--window-id "$wid")
+    if [[ -n "$seam" ]]; then
+        # Test seam: the launch, observed rather than detached.
+        "$seam" "${args[@]}" 9>&- \
+            || note "restart: watchdog auto-retire launch seam failed (non-fatal)"
+        return 0
+    fi
+    local rlog="$AUTO_DIR/watchdog-retire.log"
+    _ensure_service_log "$rlog"
+    setsid nohup bash "$SELF_PATH" retire-watchdog "${args[@]}" \
+        >> "$rlog" 2>&1 < /dev/null 9>&- &
+    local rpid=$!
+    disown 2>/dev/null || true
+    note "restart: watchdog auto-retire handed off (pid $rpid, attempt $attempt, window ${wid:-<id unread>}; log $rlog) — '$WATCHDOG_WINDOW' is retired once the loop records SUCCESS and the pane is idle (#1627)"
+    return 0
+}
+
 cmd_restart_orchestrator() {
     local candidate="" sid=""
     while (( $# > 0 )); do
@@ -3822,7 +4009,11 @@ cmd_restart_orchestrator() {
     # Watchdog worker (REQUIRED by GUIDE Step 5b — a script can detect,
     # only an agent can FIX). Clear any stale armed marker first: the
     # marker's fresh write by THIS watchdog is the arm signal.
-    rm -f "$STATE_DIR/restart-watchdog-armed" "$STATE_DIR/restart-watchdog-failed" 2>/dev/null || true
+    # The VERIFIED marker too (#1627): it is what `retire-watchdog` retires on,
+    # and a prior attempt's must never be read as this one's. It carries the
+    # attempt nonce as well, so this is belt to that identity's braces.
+    rm -f "$STATE_DIR/restart-watchdog-armed" "$STATE_DIR/restart-watchdog-failed" \
+        "$STATE_DIR/restart-watchdog-verified" 2>/dev/null || true
     # (your-org/nexus-code#1528) CAPTURE THE OPERATOR'S WINDOW SELECTION BEFORE
     # ANYTHING HERE CAN MOVE IT. The stale-watchdog kill just below is the
     # first such thing: measured on tmux 2.6, killing a session's ACTIVE window
@@ -3843,9 +4034,19 @@ cmd_restart_orchestrator() {
     # other tmux call in the locked region carries it (19b: the single-flight
     # lock must not leak into tmux's children).
     _SEL_CAPTURE_FILE=$(tmux_selection_capture_file "$STATE_DIR")
-    TMUX_WINDOW_TMUX_CMD="$TMUX_CMD" tmux_selection_capture "$TARGET_WINDOW" "$_SEL_CAPTURE_FILE" 9>&- || true
+    # NON-FATAL, NOT SILENT (your-org/nexus-code#1562). These three calls used to
+    # end `|| true`: a failed capture DELETES its file and returned a status
+    # nothing read, so the restart log said nothing and the operator landed on
+    # the wrong window with no line anywhere explaining it. `_sel_step` keeps
+    # the restart unblockable and notes the rc with the helper's own reason.
+    _sel_step initial tmux_selection_capture "$TARGET_WINDOW" "$_SEL_CAPTURE_FILE"
+    # `:=` — EXACT name (your-org/nexus-code#1524, #1627). The exact-name check
+    # above it does not make a bare `-t <name>` exact: the check and the kill are
+    # two tmux calls, and if the window goes in between, a bare name resolves by
+    # unique PREFIX to a sibling (`cc-restart-watchdog-…`). `:=` fails rc 1
+    # instead, which the `|| true` absorbs.
     if grep -Fxq -- "$WATCHDOG_WINDOW" <<<"$("$TMUX_CMD" list-windows -F '#W' 2>/dev/null 9>&-)"; then
-        "$TMUX_CMD" kill-window -t "$WATCHDOG_WINDOW" 2>/dev/null 9>&- || true
+        "$TMUX_CMD" kill-window -t ":=$WATCHDOG_WINDOW" 2>/dev/null 9>&- || true
     fi
     local wd_template="${CC_AUTO_WATCHDOG_PROMPT_TEMPLATE:-$NEXUS_ROOT/monitor/cc-auto-update-watchdog-prompt.md}"
     local wd_prompt="$AUTO_DIR/watchdog-prompt.md"
@@ -3869,6 +4070,10 @@ cmd_restart_orchestrator() {
     # The watchdog's window NAME, for the PreToolUse hook's `cc-update-git`
     # scope (your-org/nexus-code#1529, w241sk D2); see _cc_auto_update.sh.
     printf '%s\n' "$WATCHDOG_WINDOW" > "$AUTO_DIR/watchdog-window" 2>/dev/null || true
+    # The attempt that owns the window from here on (#1627): a `retire-watchdog`
+    # launched by an EARLIER attempt reads this and stands down rather than
+    # retiring a window a later restart now owns under the same name.
+    printf '%s\n' "$wd_attempt" > "$AUTO_DIR/watchdog-attempt" 2>/dev/null || true
     if ! "$SPAWN_CMD" -n "$WATCHDOG_WINDOW" -c "$NEXUS_ROOT" -p "$wd_prompt" >/dev/null 2>&1 9>&-; then
         note "ABORT restart: watchdog spawn failed. Bump itself is complete; NOT killing the orchestrator unwatched."
         record_outcome "$candidate" "safe-bumped-restart-aborted" "watchdog-spawn"
@@ -3893,7 +4098,12 @@ cmd_restart_orchestrator() {
     # says a new site is to be FIXED, not recorded. This form needs no pipe, so
     # there is no EPIPE to mask and no manifest growth. Same idiom as
     # monitor/cc-harness/_lib.sh:710.
-    base_pane_pid=$("$TMUX_CMD" display-message -p -t "$TARGET_WINDOW" '#{pane_pid}' 2>/dev/null 9>&- | tr -d '[:space:]')
+    # `:=` — EXACT name or rc 1 (your-org/nexus-code#1524). A bare name resolves
+    # by unique PREFIX when the exact window is gone, so baseline AND re-read both
+    # returned the SIBLING's pid, agreed with each other, and the guard convicted
+    # nothing: prefix-blind by construction. All three — baseline, re-read, kill —
+    # now name the same exact window or fail.
+    base_pane_pid=$("$TMUX_CMD" display-message -p -t ":=$TARGET_WINDOW" '#{pane_pid}' 2>/dev/null 9>&- | tr -d '[:space:]')
     # NON-DEGRADING BY CONSTRUCTION. The first cut made an unreadable baseline
     # FATAL (exit 22), which REMOVED the ability to restart on any host whose
     # tmux does not answer `list-panes -F '#{pane_pid}'` — and took 16 fixture
@@ -3947,7 +4157,7 @@ cmd_restart_orchestrator() {
     # kill would decapitate the REPLACEMENT. Refuse; do not "kill anyway".
     local now_pane_pid=""
     if [[ -n "$base_pane_pid" ]]; then
-        now_pane_pid=$("$TMUX_CMD" display-message -p -t "$TARGET_WINDOW" '#{pane_pid}' 2>/dev/null 9>&- | tr -d '[:space:]')
+        now_pane_pid=$("$TMUX_CMD" display-message -p -t ":=$TARGET_WINDOW" '#{pane_pid}' 2>/dev/null 9>&- | tr -d '[:space:]')
     fi
     # Only a baseline we actually READ can convict. An empty baseline means the
     # guard disarmed above and this comparison is skipped, never inverted.
@@ -3959,15 +4169,19 @@ cmd_restart_orchestrator() {
     fi
     # (#1528) Refresh the selection capture with what the operator is looking at
     # NOW, kill, then record where tmux put the selection. See the capture above.
-    TMUX_WINDOW_TMUX_CMD="$TMUX_CMD" tmux_selection_capture --refresh "$TARGET_WINDOW" "$_SEL_CAPTURE_FILE" 9>&- || true
-    "$TMUX_CMD" kill-window -t "$TARGET_WINDOW" 9>&-
+    _sel_step refresh tmux_selection_capture --refresh "$TARGET_WINDOW" "$_SEL_CAPTURE_FILE"
+    "$TMUX_CMD" kill-window -t ":=$TARGET_WINDOW" 9>&-
     _SEL_KILL_REACHED=1   # the capture now belongs to a kill; the EXIT trap leaves it
-    TMUX_WINDOW_TMUX_CMD="$TMUX_CMD" tmux_selection_note_post_kill "$_SEL_CAPTURE_FILE" 9>&- || true
+    _sel_step post-kill tmux_selection_note_post_kill "$_SEL_CAPTURE_FILE"
     if [[ -r "$_SEL_CAPTURE_FILE" ]]; then
         note "restart: window selection captured for the respawn to restore ($_SEL_CAPTURE_FILE: $(grep -c '^prior|' "$_SEL_CAPTURE_FILE" 2>/dev/null || echo 0) session(s))"
     else
-        note "restart: no window-selection capture written (tmux would not answer in a parseable shape); the respawn leaves the selection where tmux put it"
+        # The REASON is on the `selection capture (…) FAILED` line(s) above; this
+        # line used to guess one ("tmux would not answer"), and a write failure
+        # or a rejected row read as a tmux outage.
+        note "restart: no window-selection capture on disk at the kill; the respawn falls back to the watcher's snapshot, else leaves the selection where tmux put it"
     fi
+    _launch_watchdog_retire "$wd_attempt"
     if (( forced )); then
         record_outcome "$candidate" "safe-bumped-restart-forced" "restart-triggered-forced sid=$sid"
         notify "cc-auto-update: $candidate applied; orchestrator FORCE-restarted (busy past idle cap) under watchdog — pinned session resumes"
@@ -3976,6 +4190,121 @@ cmd_restart_orchestrator() {
         notify "cc-auto-update: $candidate applied autonomously; orchestrator restart in progress under watchdog"
     fi
     exit 0
+}
+
+# ---- verb: retire-watchdog ------------------------------------------------
+# your-org/nexus-code#1627: the restart watchdog was NEVER RETIRED. Its brief
+# names no tracking issue, so the agent (correctly, by its brief) ran no
+# `ng wrap-up`; with no wrap-up event the cleanup loop had nothing to act on,
+# and the only other cleanup was the NEXT update run's stale-watchdog kill —
+# days away. Measured on 2026-09-22: verified at 11:34, retired by hand about
+# 20 h later. A live watchdog window also holds the watcher's version-split
+# reconcile shut (`_cc_auto_update.sh`, `_cc_auto_window_alive
+# "$CC_AUTO_WATCHDOG_WINDOW" && return 0`) for as long as it lingers.
+#
+# DESIGN CHOSEN: retirement that depends on NO agent remembering anything.
+# `restart-orchestrator` launches this verb, detached, right after its kill.
+# It polls until BOTH hold:
+#   * the watch loop recorded a verified SUCCESS for THIS attempt
+#     (`restart-watchdog-verified`, written by cc-restart-watchdog-loop.sh on
+#     its exit-0 path, in the armed run and in a --verify-only re-run alike) —
+#     a watchdog that failed and is still diagnosing is never retired;
+#   * `ng retire-window` succeeds — the canonical verb, whose synchronous
+#     preflight refuses a pane that is busy, typed into, owed a skeptic pass or
+#     otherwise not done. So the agent finishes its report first; a refusal is
+#     retried on the next poll, never overridden.
+# Not chosen: passing the tracking issue into the brief so the agent wraps up.
+# That still depends on the agent, and a wrap-up comment per successful bump
+# contradicts the routine's own contract that a SAFE bump posts nothing
+# anywhere (cc-auto-update-prompt.md, rule "exactly two outcomes").
+#
+# IDENTITY, NEVER THE NAME ALONE (your-org/nexus-code#1524): the window NAME is
+# reused by every restart, so the verb is bound to this attempt's nonce and,
+# when the caller could read it, to the window's `@id`. It exits WITHOUT acting
+# when a later spawn superseded the attempt (`watchdog-attempt` names another),
+# or when the named window is a different window than the one it was launched
+# for. The kill itself is `ng retire-window`'s, by `@id`.
+#
+# Bounded: CC_AUTO_WATCHDOG_RETIRE_WAIT_SECONDS (default 10800, CHOSEN: 3 h
+# covers the loop's 180 s deadline + grace, a report, and a diagnose-fix-
+# re-verify cycle, which cc-restart-watchdog-loop.sh itself bounds at
+# WATCHDOG_VERIFY_MAX_AGE_SECONDS=3600; and it is far below the daily cadence).
+# Past it the window is LEFT, loudly (note + notify): a watchdog that never
+# verified is one an operator should look at, not one to close.
+#
+# rc 0: retired, already gone, or superseded (nothing of ours to retire).
+# rc 1: not retired within the bound (the window is left in place).
+# rc 2: usage.
+# Seams: CC_AUTO_WATCHDOG_RETIRE_CMD (default `monitor/ng retire-window`),
+# CC_AUTO_WATCHDOG_RETIRE_POLL_SECONDS (default 60).
+cmd_retire_watchdog() {
+    local attempt="" want_id=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --attempt)   attempt="${2:-}"; shift 2 ;;
+            --window-id) want_id="${2:-}"; shift 2 ;;
+            *) note "retire-watchdog: unknown arg $1"; exit 2 ;;
+        esac
+    done
+    [[ -n "$attempt" ]] || { note "retire-watchdog: --attempt required"; exit 2; }
+    local wait_s="${CC_AUTO_WATCHDOG_RETIRE_WAIT_SECONDS:-10800}"
+    local poll_s="${CC_AUTO_WATCHDOG_RETIRE_POLL_SECONDS:-60}"
+    [[ "$wait_s" =~ ^[0-9]+$ ]] || wait_s=10800
+    [[ "$poll_s" =~ ^[0-9]+$ && "$poll_s" -gt 0 ]] || poll_s=60
+    local deadline=$(( $(date +%s) + wait_s ))
+    local cur list rc v_attempt said_unverified=0 last_refusal=""
+    while :; do
+        cur=$(tr -d '[:space:]' < "$AUTO_DIR/watchdog-attempt" 2>/dev/null || true)
+        if [[ -n "$cur" && "$cur" != "$attempt" ]]; then
+            note "retire-watchdog: attempt $attempt superseded by $cur — a later restart owns '$WATCHDOG_WINDOW'; not acting"
+            exit 0
+        fi
+        # ABSENCE IS ESTABLISHED, NEVER INFERRED FROM AN EMPTY READ (the arm-wait's
+        # rule above): only a successful, non-empty listing can say "gone".
+        # `|`, never a TAB: in a non-UTF-8 locale with $TMUX unset tmux rewrites
+        # a non-printable delimiter to `_` and the row never splits; and
+        # validate_window_name forbids `|` inside a minted name.
+        list=$("$TMUX_CMD" list-windows -a -F '#{window_id}|#{window_name}' 2>/dev/null); rc=$?
+        if (( rc == 0 )) && [[ -n "${list//[[:space:]]/}" ]]; then
+            if ! grep -q -F -x -e "$WATCHDOG_WINDOW" <<<"$(cut -d'|' -f2- <<<"$list")"; then
+                note "retire-watchdog: '$WATCHDOG_WINDOW' is already gone (attempt $attempt) — nothing to retire"
+                exit 0
+            fi
+            if [[ -n "$want_id" ]] && ! grep -q -F -x -e "${want_id}|${WATCHDOG_WINDOW}" <<<"$list"; then
+                note "retire-watchdog: '$WATCHDOG_WINDOW' is no longer window $want_id (the one attempt $attempt spawned) — a different window now carries the name; not acting"
+                exit 0
+            fi
+            v_attempt=$(_cc_update_field "$STATE_DIR/restart-watchdog-verified" attempt 2>/dev/null || true)
+            if [[ "$v_attempt" == "$attempt" ]]; then
+                local out rrc=0
+                if [[ -n "${CC_AUTO_WATCHDOG_RETIRE_CMD:-}" ]]; then
+                    out=$("$CC_AUTO_WATCHDOG_RETIRE_CMD" "$WATCHDOG_WINDOW" \
+                        --reason "cc-update restart verified (attempt $attempt); auto-retired by cc-auto-update-apply.sh retire-watchdog (#1627)" 2>&1) || rrc=$?
+                else
+                    out=$("$NEXUS_ROOT/monitor/ng" retire-window "$WATCHDOG_WINDOW" \
+                        --reason "cc-update restart verified (attempt $attempt); auto-retired by cc-auto-update-apply.sh retire-watchdog (#1627)" 2>&1) || rrc=$?
+                fi
+                if (( rrc == 0 )); then
+                    note "retire-watchdog: retired '$WATCHDOG_WINDOW' (attempt $attempt, verified) through ng retire-window"
+                    exit 0
+                fi
+                # One line per DISTINCT refusal, not one per poll.
+                if [[ "$out" != "$last_refusal" ]]; then
+                    note "retire-watchdog: ng retire-window refused (rc $rrc) — retrying every ${poll_s}s: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
+                    last_refusal="$out"
+                fi
+            elif (( said_unverified == 0 )); then
+                note "retire-watchdog: waiting for the watch loop to record SUCCESS for attempt $attempt (verified marker: ${v_attempt:-<none>})"
+                said_unverified=1
+            fi
+        fi
+        if (( $(date +%s) >= deadline )); then
+            note "retire-watchdog: NOT retired within ${wait_s}s — '$WATCHDOG_WINDOW' is LEFT in place (attempt $attempt; verified marker: ${v_attempt:-<none>}). An unverified watchdog is one to look at, not one to close."
+            notify "cc-auto-update: restart watchdog '$WATCHDOG_WINDOW' not auto-retired within ${wait_s}s (attempt $attempt) — inspect it"
+            exit 1
+        fi
+        sleep "$poll_s"
+    done
 }
 
 # ---- verb: compat-pr ------------------------------------------------------
@@ -4569,7 +4898,8 @@ verb="${1:-}"; shift || true
 case "$verb" in
     safe)                 cmd_safe "$@" ;;
     restart-orchestrator) cmd_restart_orchestrator "$@" ;;
-    compat-pr)            cmd_compat_pr "$@" ;;
+    retire-watchdog)      cmd_retire_watchdog "$@" ;;
+    compat-pr)           cmd_compat_pr "$@" ;;
     block)                cmd_block "$@" ;;
     record-outcome)       cmd_record_outcome "$@" ;;
     hold)                 cmd_hold "$@" ;;

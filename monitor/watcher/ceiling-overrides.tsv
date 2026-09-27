@@ -58,6 +58,27 @@
 #                                  the remedy is to move the ceiling OUT of the
 #                                  distribution rather than to retry: a retry
 #                                  burns ten minutes to re-roll the same die.
+#   test-guards-for-diff.sh        A ~25-28 MINUTE suite, and the per-test ceiling a
+#                                  caller picks sits INSIDE its distribution
+#                                  (your-org/nexus-code#1474, local form). Measured
+#                                  2026-09-17: 1487.58 s PASS against 1800 on 12
+#                                  dedicated Slurm cores at --jobs 6 (this repo's
+#                                  test-evidence bundle, ref 76abc6a5); 1668.60 s
+#                                  PASS against 1800 (92%, run-tests.sh itself
+#                                  flagged it CEILING-ADJACENT) at ref 4825e3e1,
+#                                  36 cpus, load ~40, --jobs 4 — reported by the
+#                                  `promote` worker, cited as such; and TIMEOUT-
+#                                  killed four of four times at a 900 s ceiling on
+#                                  the same quiet box (censored: the true wall is
+#                                  > 900 each time). NOT a hang: it completes. It
+#                                  multiplies a ~2-minute primitive (one full
+#                                  `guards-for-diff` population sweep, ~17
+#                                  invocations, cost linear in the guard count,
+#                                  which only grows), so a row only buys time —
+#                                  the lever is the invocation count or the
+#                                  primitive's cost (#1474 thread, w232 item 2).
+#                                  The row is 3600: >= 2x the MAX observed
+#                                  (1668.60), never 2x a single sample.
 #   test-idle-probe.sh             310/0 standalone; flakes under --jobs 4 + load.
 #   test-proc-kill-authorized.sh   red under a parallel sweep, GREEN isolated.
 #   test-assertion-ledger.sh       `dev` ITSELF failed it while a bundle passed
@@ -67,3 +88,4 @@
 #                                  strongest evidence the class is LOAD.
 #
 test-run-tests-bounded.sh	1200	613.23	ceiling set INSIDE the suite's own runtime distribution (n=8, 524.85-613.23, two over 600); 1200 is ~2x the MAX observed, not 2x a single sample (#992 reopen 2026-08-31)
+test-guards-for-diff.sh	3600	1668.60	a ~25-28 min suite (n=2 completed walls 1487.58 / 1668.60 across two quiet boxes, plus 4 censored >900); 3600 is >= 2x the MAX observed, not 2x one sample (#1474 local form; the primitive's cost is the real lever, see the family note above)

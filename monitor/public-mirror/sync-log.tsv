@@ -35,4 +35,20 @@
 #
 # APPEND a row as part of every sync, before you consider it done. A sync that
 # did not record itself has handed the next one a guess.
-sync	2026-08-25	e256d4a	c696071	first sync recorded here; anchors recovered from the sync report on your-org/nexus-code#979
+# CORRECTION (2026-09-18). The row below shipped with MIRROR_HEAD_AFTER =
+# c696071, which is WRONG: c696071e is the mirror head BEFORE that sync, i.e.
+# the PARENT of the commit it produced. The correct value is 7e132e36.
+#
+# How it was established: the mirror tip at the time of this correction was
+# 7e132e36, and `git rev-parse 7e132e36^` is c696071e exactly -- so the
+# recorded value is that commit's parent, not the commit. The SOURCE_SHA
+# column (e256d4a) was NOT affected and is independently corroborated by the
+# mirror commit's own subject, "Sync public mirror to dev e256d4a".
+#
+# The off-by-one entered through the row's own stated provenance -- the
+# anchors were RECOVERED FROM A REPORT rather than read off the mirror. That
+# provenance can recur, so it is named here rather than quietly fixed:
+# a recovered anchor should be checked against the mirror before it is
+# written down. Only column 4 is corrected; nothing else in the row changed.
+sync	2026-08-25	e256d4a	7e132e36	first sync recorded here; anchors recovered from the sync report (MIRROR_HEAD_AFTER corrected 2026-09-18 from c696071, which was that commit's parent)
+sync	2026-09-17	4825e3e1	a76b8b8c	promotion sync: main fast-forwarded to this source sha the same night; MIRROR_HEAD_AFTER read off the live mirror after the push, not recovered from a report

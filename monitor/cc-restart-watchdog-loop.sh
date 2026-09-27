@@ -215,7 +215,10 @@ _binary_candidate() {
 if (( VERIFY_ONLY == 0 )); then
     # 1. baseline
     candidate=$(_binary_candidate)
-    orch_pid=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}' | head -1)
+    # `:=` — the EXACT window or nothing (your-org/nexus-code#1524): a bare name
+    # resolves by unique PREFIX when the target is absent, and the baseline would
+    # be a SIBLING's pane pid.
+    orch_pid=$(tmux list-panes -t ":=$TARGET" -F '#{pane_pid}' | head -1)
     watcher_pid=$(cat "$STATE/watcher.pid" 2>/dev/null || true)
     sid=$(tr -d '[:space:]' < "$STATE/orchestrator-session-id")
     jsonl="$PROJECTS_DIR/$SLUG/$sid.jsonl"
@@ -367,7 +370,7 @@ fi
 
 while :; do
     (( $(date +%s) > DEADLINE )) && fail "no respawn before deadline — read $STATE/watcher.log (re-verify abort? crash-loop?); manual recovery: monitor/watcher/spawn-fresh-orchestrator.sh"
-    new_pid=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}' 2>/dev/null | head -1)
+    new_pid=$(tmux list-panes -t ":=$TARGET" -F '#{pane_pid}' 2>/dev/null | head -1)
     [[ -n "${new_pid:-}" && "$new_pid" != "$orch_pid" ]] && break
     sleep 2
 done
@@ -436,6 +439,20 @@ note "SUCCESS: sid=$sid resumed on $candidate; single window; watcher alive$( ((
 command -v sandbox-notify >/dev/null 2>&1 \
     && sandbox-notify "cc-update self-restart verified: orchestrator on $candidate"
 _release_marker_if_mine || true
+# THE VERIFIED MARKER (your-org/nexus-code#1627): what
+# `cc-auto-update-apply.sh retire-watchdog` retires this watchdog's window on,
+# so the window closes without the agent having to remember anything. Bound to
+# the attempt, in BOTH modes: the armed run's own nonce, or the --attempt a
+# --verify-only re-run was handed (the brief renders the same literal). A run
+# with neither — a hand-run --base-size verify — writes none, and nothing is
+# auto-retired on its word. Best-effort: it cannot change this exit 0.
+_v_attempt="${attempt:-$VERIFY_ATTEMPT}"
+if [[ -n "$_v_attempt" ]]; then
+    printf 'attempt=%s\ncandidate=%s\nverified_at=%s\n' "$_v_attempt" "$candidate" "$(date -Is)" \
+        > "$STATE/restart-watchdog-verified.tmp.$$" 2>/dev/null \
+        && mv -f "$STATE/restart-watchdog-verified.tmp.$$" "$STATE/restart-watchdog-verified" 2>/dev/null \
+        || rm -f "$STATE/restart-watchdog-verified.tmp.$$" 2>/dev/null
+fi
 # A verified baseline has done its job. Left behind, it is the stale baseline
 # w234sk F1 measured a false SUCCESS against, so it is removed in BOTH modes.
 rm -f "$BASELINE_FILE"

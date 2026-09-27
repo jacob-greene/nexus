@@ -1283,6 +1283,165 @@ else
     fail "TOCTOU race guard negative: no override should re-read NEW_TS from file and report stale (rc=0), got rc=1"
 fi
 
+# --- 40: `healthy reason=auth-*` is LOGGED, at a backoff (your-org/nexus-code#1548 P4b)
+#
+# Measured: 0 `reason=auth-` lines in 20 days of watcher.log because steady-
+# state healthy is silent. The auth verdict is the one healthy that is not
+# health, so it logs on entry, then at a doubling backoff capped at 3600 s,
+# and on exit. Driven with an explicit clock, throttle_s=30.
+unset _ORCH_LIVENESS_LOG_STATE _ORCH_LIVENESS_LOG_ENTERED_TS _ORCH_LIVENESS_LOG_LAST_TS \
+      _ORCH_LIVENESS_AUTH_ENTERED_TS _ORCH_LIVENESS_AUTH_LAST_TS _ORCH_LIVENESS_AUTH_INTERVAL
+AUTH_V="healthy reason=auth-expired age=300s (login surface on the orchestrator: no resubmit, no respawn)"
+t0=1000000
+_orchestrator_liveness_log_decide "$AUTH_V" "$t0" 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == *"auth gate ENGAGED"* ]] \
+    && pass "40: auth verdict logs on ENTRY (was: silent, 0 lines in 20 days)" \
+    || fail "40: entry line: '$_ORCH_LIVENESS_LOG_LINE'"
+_orchestrator_liveness_log_decide "$AUTH_V" $(( t0 + 5 )) 30
+[[ -z "$_ORCH_LIVENESS_LOG_LINE" ]] && pass "40: +5 s inside the first interval → silent (no per-poll flood)" || fail "40: +5 s logged '$_ORCH_LIVENESS_LOG_LINE'"
+_orchestrator_liveness_log_decide "$AUTH_V" $(( t0 + 30 )) 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == *"auth gate held 30s; next note in 60s"* ]] \
+    && pass "40: +30 s → one note, interval doubles to 60 s" || fail "40: +30 s line '$_ORCH_LIVENESS_LOG_LINE'"
+_orchestrator_liveness_log_decide "$AUTH_V" $(( t0 + 60 )) 30
+[[ -z "$_ORCH_LIVENESS_LOG_LINE" ]] && pass "40: +60 s (30 s into a 60 s interval) → silent" || fail "40: +60 s logged"
+_orchestrator_liveness_log_decide "$AUTH_V" $(( t0 + 90 )) 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == *"next note in 120s"* ]] && pass "40: +90 s → note, interval 120 s" || fail "40: +90 s '$_ORCH_LIVENESS_LOG_LINE'"
+# Walk the doubling to the cap and count lines over a 7 h 22 m hold at 5 s polls.
+unset _ORCH_LIVENESS_LOG_STATE _ORCH_LIVENESS_AUTH_ENTERED_TS _ORCH_LIVENESS_AUTH_LAST_TS _ORCH_LIVENESS_AUTH_INTERVAL
+lines=0; capped=0
+for (( t = t0; t <= t0 + 26520; t += 5 )); do
+    _orchestrator_liveness_log_decide "$AUTH_V" "$t" 30
+    [[ -n "$_ORCH_LIVENESS_LOG_LINE" ]] && lines=$(( lines + 1 ))
+    [[ "$_ORCH_LIVENESS_LOG_LINE" == *"next note in 3600s"* ]] && capped=1
+done
+(( lines >= 8 && lines <= 20 )) && pass "40: a 26520 s hold (the measured outage) logs $lines lines, not 5304" || fail "40: $lines lines over the outage"
+(( capped )) && pass "40: the backoff reaches the 3600 s cap" || fail "40: never capped"
+_orchestrator_liveness_log_decide "healthy reason=signal-past-paste age=10s" $(( t0 + 26525 )) 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == *"auth gate RELEASED after 26525s"* ]] \
+    && pass "40: leaving the auth state logs the RELEASE with its duration" || fail "40: release line '$_ORCH_LIVENESS_LOG_LINE'"
+# waiting → auth carries the waiting summary; auth → waiting logs the entry.
+unset _ORCH_LIVENESS_LOG_STATE _ORCH_LIVENESS_AUTH_ENTERED_TS _ORCH_LIVENESS_AUTH_LAST_TS _ORCH_LIVENESS_AUTH_INTERVAL
+_orchestrator_liveness_log_decide "waiting reason=unstick-window age=130s" "$t0" 30
+_orchestrator_liveness_log_decide "$AUTH_V" $(( t0 + 40 )) 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == "waiting ended after 40s — "* ]] && pass "40: waiting → auth closes the waiting episode in the same line" || fail "40: '$_ORCH_LIVENESS_LOG_LINE'"
+_orchestrator_liveness_log_decide "waiting reason=unstick-window age=200s" $(( t0 + 80 )) 30
+[[ "$_ORCH_LIVENESS_LOG_LINE" == *"entered waiting"* ]] && pass "40: auth → waiting logs the waiting entry" || fail "40: '$_ORCH_LIVENESS_LOG_LINE'"
+unset _ORCH_LIVENESS_LOG_STATE
+
+# --- 41: idle-pane guard — `busy retrying=` is ALIVE, not wedged (your-org/nexus-code#1559)
+#
+# Since #1554 a mid-retry pane reads `busy retrying=k/N`. The guard takes the
+# raw line as a fifth argument and treats the FIELD as the discriminator; the
+# token alone keeps meaning "frozen spinner = wedge". Both directions, on the
+# real emitter's shapes, plus the override budget.
+RETRY_LINE="state=busy retrying=3/10 active=1 input=blank content_hash=1234"
+SPIN_LINE="state=busy active=1 input=blank content_hash=1234"
+[[ "$(guard "$RESPAWN_V" busy 0 5 "$RETRY_LINE")" == suppress ]] \
+    && pass "41: busy + retrying=3/10 → suppress (alive, backend unreachable — do not respawn INTO the outage)" \
+    || fail "41: retrying expected suppress, got '$(guard "$RESPAWN_V" busy 0 5 "$RETRY_LINE")'"
+[[ "$(guard "$RESPAWN_V" busy 0 5 "$SPIN_LINE")" == proceed ]] \
+    && pass "41: busy WITHOUT the field (frozen spinner) → proceed (a wedge still respawns)" \
+    || fail "41: spinner expected proceed, got '$(guard "$RESPAWN_V" busy 0 5 "$SPIN_LINE")'"
+[[ "$(guard "$RESPAWN_V" busy 5 5 "$RETRY_LINE")" == escalate ]] \
+    && pass "41: retrying with the override budget SPENT → escalate (a session retrying forever is still a wedge)" \
+    || fail "41: retrying+budget expected escalate, got '$(guard "$RESPAWN_V" busy 5 5 "$RETRY_LINE")'"
+[[ "$(guard "$RESPAWN_V" busy 0 5 "")" == proceed ]] \
+    && pass "41: busy with NO line supplied → proceed (an old caller keeps the old meaning)" \
+    || fail "41: no-line expected proceed"
+[[ "$(guard "$RESPAWN_V" busy 0 5 "state=busy retryingx=3 active=1")" == proceed ]] \
+    && pass "41: a field that is not exactly 'retrying=' does not suppress (whole-token match)" \
+    || fail "41: near-miss field suppressed"
+[[ "$(guard "$RESUBMIT_FAILED_V" busy 0 5 "$RETRY_LINE")" == proceed ]] \
+    && pass "41: SCOPE unchanged — a resubmit-failed respawn is not gated by retrying= (an operator decision, stated in the PR)" \
+    || fail "41: resubmit-failed was gated"
+[[ "$(guard "$RESPAWN_V" idle 0 5 "$RETRY_LINE")" == suppress ]] \
+    && pass "41: idle stays suppress whatever the line carries (no regression of the idle arm)" \
+    || fail "41: idle+line regressed"
+
+# --- 42: the typed StopFailure marker GATES liveness (your-org/nexus-code#1520 / #1517 / #1548 F2)
+#
+# `_orchestrator_auth_blocked` consults `_auth_hold_turn_failure_gate` (sourced
+# from _auth_hold.sh) for $TARGET. The scenario #1548 F2 feared: a resubmit has
+# been attempted (marker on disk), the resubmit failed, and a fresh auth
+# marker now stands — the next verdict must be the GATE, never `respawn
+# reason=resubmit-failed`.
+source "$_script_dir/_auth_hold.sh" 2>/dev/null || fail "42: could not source _auth_hold.sh"
+reset_world
+export STATE_DIR="$WORK/state42"; mkdir -p "$STATE_DIR/turn-failure"
+TARGET=orchestrator
+OPCAP42="$WORK/opcap42"; : > "$OPCAP42"
+_cap42() { [[ "${1:-}" == due ]] && return 0; [[ "${1:-}" == standing ]] && return 1; printf '%s\n' "$*" >> "$OPCAP42"; }
+_AUTH_HOLD_OPERATOR_ALERT_FN=_cap42
+_auth_hold_probe() { printf 'idle none 111'; }        # the PANE shows nothing (error scrolled away)
+plant_marker() {   # <category> <recovery> <age_s>
+    printf '{"ts":%s,"error":"authentication_failed","category":"%s","recovery":"%s","last_msg":"Login expired · Please run /login","window":"orchestrator","hook_event_name":"StopFailure"}\n' \
+        "$(( $(date +%s) - $3 ))" "$1" "$2" > "$STATE_DIR/turn-failure/orchestrator.json"
+}
+write_paste_ts "$LP" $(( now - 400 ))          # past grace, inside the ceiling
+stamp_n_seconds_ago "$RS" 130                  # a resubmit was attempted 130 s ago (> grace 120)
+plant_marker auth operator 20                  # …and it failed 20 s ago: fresh auth marker
+if _orchestrator_auth_blocked; then
+    [[ "$ORCH_AUTH_BLOCK_KIND" == turn-failure ]] && pass "42: a fresh auth marker registers as an auth block of kind turn-failure" || fail "42: kind='$ORCH_AUTH_BLOCK_KIND'"
+else
+    fail "42: a fresh auth marker did not register as an auth block"
+fi
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME"); rc=$?
+[[ "$verdict" == healthy\ reason=auth-turn-failure* ]] \
+    && pass "42: F2's scenario (resubmit attempted 130 s ago, failed, fresh auth marker) → the GATE, not respawn resubmit-failed: $verdict" \
+    || fail "42: F2's path is OPEN — verdict '$verdict'"
+assert_rc_eq() { [[ "$1" == "$2" ]] && pass "$3" || fail "$3 (rc $1)"; }
+assert_rc_eq "$rc" 1 "42: …rc 1, no action"
+[[ "$verdict" == *"operator-alert key=auth-expired is RAISED"* ]] && pass "42: the verdict NAMES the channel (P4a), not 'notified out-of-band'" || fail "42: verdict text: $verdict"
+grep -q '^raise auth-expired critical ' "$OPCAP42" && pass "42: the typed sensor raised the operator alert" || fail "42: no raise: $(cat "$OPCAP42")"
+# The step wrapper clears the resubmit marker on the healthy verdict — the episode resets.
+_orchestrator_liveness_step "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" "$CD" 120 150 1320 1800 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME" >/dev/null
+[[ ! -f "$RS" ]] && pass "42: the step clears the resubmit marker (the episode resets instead of escalating)" || fail "42: resubmit marker survived"
+# NEGATIVE CONTROL: the same files with a TRANSIENT marker → the ordinary ladder (resubmit-failed reachable).
+stamp_n_seconds_ago "$RS" 130
+plant_marker transient paste 20
+if _orchestrator_auth_blocked; then fail "42/neg: a transient marker registered as an auth block"; else pass "42/neg: a transient (529) marker is NOT an auth block — the ladder keeps its remedies"; fi
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME")
+[[ "$verdict" == respawn\ reason=resubmit-failed* ]] && pass "42/neg: …and the ordinary ladder reaches resubmit-failed (the gate is specific to auth): $verdict" || fail "42/neg: verdict '$verdict'"
+# NEGATIVE CONTROL: a STALE auth marker → not blocked.
+plant_marker auth operator 4000
+if _orchestrator_auth_blocked; then fail "42/neg: a 4000 s-old auth marker still blocks"; else pass "42/neg: a stale auth marker does not block (freshness gate 600 s)"; fi
+# SKEPTIC oplivesk F3 — DEAD-THRESHOLD, not only resubmit-failed. With a fixed
+# 600 s window the rig respawned at +1385 s: no pane render, the window lapses,
+# the ladder resubmits, that re-gates, and the first tick after sees
+# age >= 1320. The sensor now also holds while marker.ts >= last_paste_ts.
+rm -f "$RS" "$US" "$STATE_DIR/auth-turn-failure.tsv"
+write_paste_ts "$LP" $(( now - 1450 ))          # age 1450 s: PAST dead_threshold 1320
+plant_marker auth operator 1400                 # the failure that ANSWERED that paste (50 s after it)
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME")
+[[ "$verdict" == healthy\ reason=auth-turn-failure* ]] \
+    && pass "42/F3: age 1450 s >= dead 1320 s with the latest paste ANSWERED by an auth failure → the gate, not respawn dead-threshold" \
+    || fail "42/F3: dead-threshold is OPEN under an auth outage — verdict '$verdict'"
+# CONTROL: the same age with a marker that PREDATES the paste (a newer poke went
+# unanswered — the wedge) must still reach the deadline.
+rm -f "$STATE_DIR/auth-turn-failure.tsv"
+plant_marker auth operator 1500
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME")
+[[ "$verdict" == respawn\ reason=dead-threshold* ]] \
+    && pass "42/F3 neg: a marker that PREDATES the unanswered paste does not gate — the wedge still reaches dead-threshold: ${verdict%% age*}" \
+    || fail "42/F3 neg: verdict '$verdict'"
+# F5: past the typed arm's ceiling the gate FAILS OPEN (the operator's standing decision).
+plant_marker auth operator 1400
+printf '%s\n' "$(( $(date +%s) - 9000 ))" > "$STATE_DIR/auth-turn-failure.tsv"
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME")
+[[ "$verdict" == respawn\ reason=dead-threshold* ]] \
+    && pass "42/F5: past max_hold (9000 s > 7200 s) the typed arm fails open like the pane arm" \
+    || fail "42/F5: the typed arm has no ceiling — verdict '$verdict'"
+rm -f "$STATE_DIR/auth-turn-failure.tsv"
+write_paste_ts "$LP" $(( now - 400 ))
+
+# The `hold` verdict names the bell, not the record.
+rm -f "$STATE_DIR/turn-failure/orchestrator.json"
+_auth_hold_active() { return 0; }
+verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120 150 1320 1800 "$FAKE_NEXUS_ROOT" "$FAKE_HOME")
+[[ "$verdict" == healthy\ reason=auth-hold*"rang the watcher ALERT bell"* ]] && pass "42: the hold kind names ITS channel (the bell), not a record it did not write" || fail "42: hold verdict: $verdict"
+unset -f _auth_hold_active _auth_hold_probe
+unset TARGET STATE_DIR
+
 # --- summary -------------------------------------------------------------
 
 echo

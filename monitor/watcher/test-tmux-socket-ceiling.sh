@@ -116,7 +116,7 @@ _tsc_realtmux() {
             }
             return out
         }
-        { if (code_no_comment($0) ~ /new-session/) { print FILENAME; nextfile } }' ) \
+        { if (/new-session/ && code_no_comment($0) ~ /new-session/) { print FILENAME; nextfile } }' ) \
     | grep -v '^monitor/watcher/test-tmux-socket-ceiling\.sh$' \
     | sort
 }
@@ -425,11 +425,19 @@ done < <(_tsc_realtmux)
 # 13/8 since your-org/nexus-code#1528 added test-tmux-selection-restore.sh, a
 # helper-sourcing real-tmux suite that calls th_require_tmux_socket (measured
 # with the file STAGED, per the note above).
-assert_eq "§8 this guard polices 13 real-tmux suites (14 in the tree, minus this one)" \
-          "$realtmux_n" "13"
-assert_eq "§8 …of which 8 source the helpers (9 of 14 including this one)" \
-          "$helper_n"   "8"
-assert_empty "§8 none of those 8 is missing the precondition"        "$unwired"
+# 12/7 -> 13/8 (your-org/nexus-code#1550): test-claude-md-tmux-socket-selection.sh
+# is a new helper-sourcing real-tmux suite, and it now CALLS the precondition.
+# MERGED (#1553 onto dev 5875c560): the two +1s are DIFFERENT suites, so the
+# policed population is 14/9 (15/10 in the tree), confirmed by this suite's
+# own run on the merged tree with everything STAGED.
+# 14/9 -> 15/10 (your-org/nexus-code#1591): test-paste-deliver.sh is a new
+# helper-sourcing real-tmux suite — one private server per row, each behind
+# th_require_tmux_socket in its `row_open` (measured with the file STAGED).
+assert_eq "§8 this guard polices 15 real-tmux suites (16 in the tree, minus this one)" \
+          "$realtmux_n" "15"
+assert_eq "§8 …of which 10 source the helpers (11 of 16 including this one)" \
+          "$helper_n"   "10"
+assert_empty "§8 none of those 10 is missing the precondition"        "$unwired"
 
 # THE PREDICATE MUST DISCRIMINATE, or the assertion above is the mention grep
 # again wearing a new name. Two controls on a planted pair: a file that only
@@ -520,12 +528,24 @@ _s10b=$(TMUX_TMPDIR="$_short" bash -c '
     . "'"$_test_dir"'/_tmux-fixture.sh" >/dev/null 2>&1
     nx_tmux_fixture_init "'"$_deep"'" >/dev/null 2>&1 && echo "root=$NX_TMUX_TMPDIR"' 2>/dev/null)
 assert_contains "§10 CONTROL: a SHORT ambient TMUX_TMPDIR is honoured as the root" "$_s10b" "root=$_short/"
+# …AND THE FALLBACK ROOT IT CREATES GOES WITH IT (your-org/nexus-code#1601).
+# The EXIT trap removed only `<root>/tt-<pid>`, leaving an EMPTY
+# `/tmp/tmux-th-<uid>-<pid>` per run — 95 in /tmp on 2026-09-21. The child
+# exits normally, so its trap runs; the fallback root must not survive it.
+_s10c=$(TMUX_TMPDIR="$_deep" bash -c '
+    . "'"$_test_dir"'/_test_helpers.sh" >/dev/null 2>&1
+    . "'"$_test_dir"'/_tmux-fixture.sh" >/dev/null 2>&1
+    nx_tmux_fixture_init "'"$_deep"'" >/dev/null 2>&1 && echo "root=${NX_TMUX_TMPDIR%/tt-*}"' 2>/dev/null)
+_s10c_root=$(sed -n 's/^root=//p' <<<"$_s10c")
+assert_contains "§10 PRECONDITION: a too-long TMUX_TMPDIR falls back to the short tmux-th root" "$_s10c_root" "/tmp/tmux-th-"
+assert_eq "§10 …and that fallback root is REMOVED when the fixture's process exits (#1601)" \
+    "$( [[ -n "$_s10c_root" && -e "$_s10c_root" ]] && echo "LEFT: $_s10c_root" || echo gone )" "gone"
 rm -rf "$_short" "$_s10w" 2>/dev/null || true
 
 # EXPECTED-COUNT GUARD. A green over fewer assertions than were written is a
 # green that covers nothing; this is the mechanism that says so.
-#   §1a 3 · §1b 4 · §2 1 · §3 2 · §4 1 · §5 8 · §6 5 · §7 4 · §8 7 · §9 4 · §10 4
-EXPECTED=$(( 3 + 4 + 1 + 2 + 1 + 8 + 5 + 4 + 7 + 4 + 4 ))
+#   §1a 3 · §1b 4 · §2 1 · §3 2 · §4 1 · §5 8 · §6 5 · §7 4 · §8 7 · §9 4 · §10 6
+EXPECTED=$(( 3 + 4 + 1 + 2 + 1 + 8 + 5 + 4 + 7 + 4 + 6 ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

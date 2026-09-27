@@ -17,6 +17,8 @@
 #   - rate_limit token → NO marker (over-limit-emit.sh owns it)
 #   - last_msg truncated to ≤200 chars
 #   - missing env (no window) / missing jq path → exit 0, no crash
+#   - NEXUS_ORCHESTRATOR_WINDOW alone resolves (your-org/nexus-code#1520) and
+#     the real expired-login token classifies auth/operator
 #
 # Run: bash monitor/watcher/test-turn-failure-emit.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
@@ -102,6 +104,33 @@ if [[ -f "$f" ]]; then
 else
     bad "long marker" "no file"
 fi
+
+echo "=== the ORCHESTRATOR window (your-org/nexus-code#1520): NEXUS_ORCHESTRATOR_WINDOW alone resolves ==="
+# The exact payload shape 40 production captures carry (stopfailure-raw-
+# captures.jsonl, nexus_window=orchestrator): token `authentication_failed`,
+# copy `Login expired · Please run /login`. At the base this hook exited 0
+# without writing (worker env only) — and had it written, the classifier
+# would have said unknown:paste for this token.
+env -i PATH="$PATH" NEXUS_STATE_DIR="$WORK/state" NEXUS_ORCHESTRATOR_WINDOW=orchestrator \
+    bash "$HELPER" <<<'{"hook_event_name":"StopFailure","session_id":"11111111-2222-4333-8444-555555555555","error":"authentication_failed","last_assistant_message":"Login expired · Please run /login","cwd":"/x"}'
+f="$tf_dir/orchestrator.json"
+if [[ -f "$f" ]]; then
+    ok "marker written for the orchestrator window: $f"
+    [[ "$(jq -r .category "$f")" == "auth" ]]     && ok "category=auth (the measured production token)" || bad "category" "$(jq -r .category "$f")"
+    [[ "$(jq -r .recovery "$f")" == "operator" ]] && ok "recovery=operator (no in-band remedy)"       || bad "recovery" "$(jq -r .recovery "$f")"
+    [[ "$(jq -r .window "$f")" == "orchestrator" ]] && ok "window=orchestrator"                        || bad "window" "$(jq -r .window "$f")"
+else
+    bad "orchestrator marker" "no file at $f — the hook still resolves the worker env only (#1520 leg 1)"
+fi
+# …and the REAL Stop-hook clear removes exactly that file with the same env.
+env -i PATH="$PATH" NEXUS_STATE_DIR="$WORK/state" NEXUS_ORCHESTRATOR_WINDOW=orchestrator \
+    bash "$_repo_root/monitor/hooks/stamp-clear.sh" turn-failure
+[[ ! -f "$f" ]] && ok "stamp-clear.sh turn-failure clears the orchestrator marker" || bad "orchestrator clear" "still present"
+# The worker env WINS when both are set (a worker never carries the
+# orchestrator's name, so this is a resolver-order pin, not a real case).
+env -i PATH="$PATH" NEXUS_STATE_DIR="$WORK/state" NEXUS_WORKER_WINDOW=wboth NEXUS_ORCHESTRATOR_WINDOW=orchestrator \
+    bash "$HELPER" <<<'{"hook_event_name":"StopFailure","error":"server_error","last_assistant_message":"x"}'
+[[ -f "$tf_dir/wboth.json" && ! -f "$tf_dir/orchestrator.json" ]] && ok "worker env takes precedence over the orchestrator env" || bad "precedence" "$(ls "$tf_dir")"
 
 echo "=== robustness: missing window env → exit 0, no marker ==="
 env -i PATH="$PATH" NEXUS_STATE_DIR="$WORK/state" bash "$HELPER" \

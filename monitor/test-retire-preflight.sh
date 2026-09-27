@@ -576,6 +576,75 @@ run_preflight OUT RC disp-win --pane-state idle
 assert_eq      "#813 released-by-resolve exit 0 (go)" "$RC"  "0"
 assert_contains "#813 released-by-resolve safe=1"     "$OUT" "safe=1"
 
+echo "## 15i-2. release (c): an APPEND-ONLY amendment does not re-arm; an EDIT or a NEW SECTION does"
+# Failure 4 of the 2026-09-17 band. The gate re-reads the report LIVE and (a)/(b)
+# compare a release TIME against its mtime, so appending a follow-up record
+# re-armed a released gate on nearly every worker. Release (c) is IDENTITY-based:
+# the bytes above the sanctioned heading must hash to what the resolution covered.
+_amend_case() {   # _amend_case <slug> → plants, resolves, leaves $RPT released
+    reset_state
+    RPT=$(plant_report "$1" disp-win "disposition: second-pass")
+    touch -d '@1000000000' "$RPT"
+    # NEXUS_ROOT points the verb's `ng skeptic-disposition` at THIS corpus: that
+    # is how it learns which report — and so which bytes — the release covers.
+    env -u NEXUS_WORKER_WINDOW -u NEXUS_LOCALS NEXUS_STATE_DIR="$STATE_DIR" NEXUS_ROOT="$WORK" \
+        bash "$_test_dir/skeptic-channel.sh" resolve disp-win --disposition \
+        --reason "adjudicated: the second pass is not warranted, findings are cosmetic" \
+        >/dev/null 2>&1
+}
+_amend_case amend-append
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) POSITIVE CONTROL: released before any amendment" "$RC" "0"
+assert_eq      "(c) resolve --disposition recorded what it covered" \
+    "$(awk -F'\t' '$2 ~ /^[0-9a-f]{64}$/' "$STATE_DIR/skeptic/pending/.disp-win.disposition-cover" 2>/dev/null | wc -l)" "1"
+printf '\n## Follow-up records (no new claims)\n\n- PR opened; skeptic round closed.\n' >> "$RPT"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) an append under the sanctioned heading does NOT re-arm (go)" "$RC" "0"
+_pf_err() { bash "$PREFLIGHT" "$@" --state-dir "$STATE_DIR" --now "$NOW" --reports-dir "$REPORTS_DIR" 2>&1 >/dev/null; }
+assert_contains "(c) …and the gate SAYS it carried the release across an amendment" \
+    "$(_pf_err disp-win --pane-state idle)" "ONLY by appending"
+
+# MUST-NOT-RELEASE 1: the same append, but a reviewed byte was EDITED too.
+_amend_case amend-edit
+sed -i 's/Body text\./Body text, now claiming more./' "$RPT"
+printf '\n## Follow-up records (no new claims)\n\n- a record\n' >> "$RPT"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) NEG: an EDIT above the heading re-arms (no-go)" "$RC" "1"
+
+# MUST-NOT-RELEASE 2: an append that opens a NEW section is a new artefact.
+_amend_case amend-newsection
+printf '\n## Follow-up records (no new claims)\n\n- a record\n\n## New result\n\nA claim nobody reviewed.\n' >> "$RPT"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) NEG: a NEW SECTION after the heading re-arms (no-go)" "$RC" "1"
+
+# MUST-NOT-RELEASE 3: an append with NO sanctioned heading re-arms, as before.
+_amend_case amend-bare
+printf '\nOne more paragraph.\n' >> "$RPT"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) NEG: a bare append re-arms exactly as before (no-go)" "$RC" "1"
+assert_contains "(c) …and the refusal names the heading that would have carried it" \
+    "$(_pf_err disp-win --pane-state idle)" "Follow-up records (no new claims)"
+
+# MUST-NOT-RELEASE 4: the heading over bytes NOTHING ever covered.
+reset_state
+RPT=$(plant_report amend-uncovered disp-win "disposition: second-pass")
+printf '\n## Follow-up records (no new claims)\n\n- a record\n' >> "$RPT"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "(c) NEG: the heading alone releases NOTHING without a covered sha (no-go)" "$RC" "1"
+
+echo "## 15i-3. check 1c-delta: a recorded OWED DELTA REVIEW refuses retirement until armed or withdrawn"
+reset_state
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "delta CONTROL: a clean window goes" "$RC" "0"
+mkdir -p "$STATE_DIR/skeptic/pending"
+printf 'ts=x\nby=t\nwhat=the kill-direction fixes F1-F4\nreason=r\n' > "$STATE_DIR/skeptic/pending/.disp-win.delta-owed"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "delta: an owed delta review REFUSES the kill" "$RC" "1"
+assert_contains "delta: …naming what is owed" "$OUT" "kill-direction fixes F1-F4"
+mv "$STATE_DIR/skeptic/pending/.disp-win.delta-owed" "$STATE_DIR/skeptic/pending/.disp-win.delta-owed.withdrawn-x"
+run_preflight OUT RC disp-win --pane-state idle
+assert_eq      "delta CONTROL: a withdrawn/armed record (suffix) does not gate" "$RC" "0"
+
 echo "## 15j. #813 CONTROL: bare \`resolve\` (no --disposition, no marker) still refuses"
 # The pre-existing fail-loud contract must survive: a bare resolve with
 # nothing to clear is still an error, so `--disposition` is a deliberate act

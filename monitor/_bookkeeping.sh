@@ -461,9 +461,16 @@ _BK_KILL_OK_STATES=(idle autosuggest-only absent idle-orphan-async)
 # the ALLOW list two lines up, so an auth surface that ever became a token and
 # was not enumerated here would be kill-authorised by the gate built to stop
 # precisely that.
+#
+# `retrying` is the FOURTH (your-org/nexus-code#1552): the transport-failure
+# retry render (`✻ Connection refused … · Retrying in 3s · attempt 3/10`) read
+# `idle` — kill-authorised, on every pane on the board at once, for the length
+# of a backend outage. `pane-state.sh` now emits `busy retrying=<k>/<N>`, a
+# FIELD on a state every consumer already refuses; this row is the standing
+# refusal for the day somebody promotes it to a token.
 _BK_ACTIVE_STATES=(busy user-typing blocked working-background
                    working-self-paced over-limit queued throttled
-                   auth-login auth-expired)
+                   auth-login auth-expired retrying)
 
 # bk_pane_kill_authorized <pane-state>
 #

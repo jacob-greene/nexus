@@ -64,13 +64,25 @@
 #            skeptic C-fields). version (schema; _ledger_verdict REFUSES any
 #            other value as `absent`, which is the migration gate), pid +
 #            pid_start (identity, read by the verdict), armed_at (status),
+#            born_ticks (the dispatcher's BIRTH as `dispatch` in /proc start
+#            ticks; read by pane-state.sh:_pane_longjob_root, which refuses to
+#            exclude a root whose dispatcher has a child OLDER than this —
+#            your-org/nexus-code#1565; see cmd_dispatch),
+#            owner_pid + owner_start (the claude this dispatcher prints INTO,
+#            pid + start ticks captured at arm, both "" when there is none —
+#            your-org/nexus-code#1623; read by _ledger_verdict, which reads a
+#            live pid whose owner is gone as `dead`, and by
+#            _ledger_foreign_owner, which ranks writers by owner; a ledger
+#            WITHOUT the keys predates them and its owner is derived live),
 #            last_poll (the LIVENESS field: epoch of the last write; verdict),
 #            poll_seconds (THE WRITER'S cadence; the verdict judges freshness
 #            against it, never against a reader's config), service — the
 #            SERVICE predicate, `polling` | `disabled` | `unscoped`: whether
 #            this process is actually observing the spool and probing
 #            watches (verdict: anything but `polling` is `disabled`, never
-#            `armed`); active (status, display only — a KILL decision counts
+#            `armed`); `stdout-closed` (#1623) is the fourth value: a terminal
+#            write failed, the spool is RELEASED, and _ledger_foreign_owner
+#            reads it as no owner; active (status, display only — a KILL decision counts
 #            the spool itself, see `ledger-verdict`), written (lines handed
 #            to the host; NOT delivered; status), emit_failures (status),
 #            muted (verdict), window (the window this ledger speaks for;
@@ -156,6 +168,16 @@
 # sleeps, an unreadable spool is a loop that logs once and sleeps, and the
 # last watch retiring is a loop that sleeps. The suite asserts the process
 # is alive after every watch has completed.
+#
+# …WITH TWO EXITS, BOTH WHEN NOBODY IS LEFT TO NOTIFY (your-org/nexus-code
+# #1623). The rule exists because an exit costs the SESSION a turn. So the
+# dispatcher exits when the claude it was armed for is gone (an orphan
+# reparented to init ate 7 terminal wakes on lsc2, printing into a dead
+# pipe), and when a dispatcher serving a NEWER claude — a `--resume` of the
+# same session id — has taken the ledger. A failed terminal write is not an
+# exit: the watch is restored un-retired (undoing only this dispatcher's own
+# write — a retirement another dispatcher made meanwhile stands) and the spool
+# released.
 #
 # Usage:
 #   longjob-watch.sh add <kind>:<target> [--desc TEXT] [--id ID] [--interval S]
@@ -298,6 +320,49 @@ _pid_start() {   # <pid> → /proc stat field 22 or empty
     # shellcheck disable=SC2086
     set -- $stat; printf '%s' "${20-}"
 }
+# _find_owner <pid> → "<claude_pid> <claude_start>" of the NEAREST `claude`
+# STRICTLY ABOVE <pid>, or nothing (your-org/nexus-code#1623).
+#
+# THE OWNER is the session process a dispatcher serves: the host launches the
+# monitor as claude → `zsh -c …` → `bash longjob-watch.sh dispatch`, and the
+# dispatcher's stdout is a pipe INTO that claude. When the claude dies the
+# pipe has no reader, and a dispatcher that keeps polling is an orphan
+# (reparented to init) that consumes watches and prints them into nothing —
+# measured on lsc2: 7 terminal wakes `write-failed`, among them a 2335 s suite.
+#
+# IDENTITY IS pid + /proc START TICKS (stat field 22), captured ONCE, at arm.
+# Never ppid: a reparented process has ppid 1 while its pid is fine, and a
+# recycled owner pid would read alive by pid alone. The comm set is the one
+# pane-state.sh:_pane_longjob_root walks to. NOTHING printed = no claude within
+# 16 hops before init (a hermetic test, CI, a hand-run under something else):
+# such a dispatcher has no owner to outlive and never self-exits on this
+# ground — the pre-#1623 behaviour, stated as the boundary.
+_find_owner() {
+    local cur="$1" hop stat after comm ppid
+    local -a f=()
+    for (( hop = 0; hop < 16; hop++ )); do
+        { IFS= read -r stat < "/proc/$cur/stat"; } 2>/dev/null || return 0
+        after="${stat##*) }"; f=($after); ppid="${f[1]:-}"
+        [[ "$ppid" =~ ^[0-9]+$ ]] && (( ppid > 1 )) || return 0
+        cur="$ppid"
+        { IFS= read -r stat < "/proc/$cur/stat"; } 2>/dev/null || return 0
+        comm="${stat%) *}"; comm="${comm#*(}"
+        case "$comm" in
+            claude|claude.exe|claude-code)
+                after="${stat##*) }"; f=($after)
+                [[ "${f[19]:-}" =~ ^[0-9]+$ ]] && printf '%s %s' "$cur" "${f[19]}"
+                return 0 ;;
+        esac
+    done
+    return 0
+}
+# _owner_gone <pid> <start> → rc 0 when an owner was RECORDED and is no longer
+# that process (pid gone, or its start ticks differ: recycled). An empty record
+# is "no owner", never "gone".
+_owner_gone() {
+    [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ ]] || return 1
+    [[ "$(_pid_start "$1")" != "$2" ]]
+}
 
 # ---- spec helpers -------------------------------------------------------------
 _spec_path() { printf '%s/watches/%s.json' "$SPOOL" "$1"; }
@@ -352,10 +417,11 @@ _ledger_path() { printf '%s/dispatcher.json' "$SPOOL"; }
 # order or forget one.
 _ledger_write() {
     local tmp; tmp="$(_ledger_path).$$.tmp"
-    jq -n --arg pid "${DISPATCH_PID:-$$}" --arg ps "${DISPATCH_PS:-}" --arg armed "${ARMED_AT:-0}" --arg now "$(_now)" \
+    jq -n --arg pid "${DISPATCH_PID:-$$}" --arg ps "${DISPATCH_PS:-}" --arg bt "${DISPATCH_BORN_TICKS:-}" --arg armed "${ARMED_AT:-0}" --arg now "$(_now)" \
           --arg active "${ACTIVE:-0}" --arg emitted "${EMITTED:-0}" --arg ef "${EMIT_FAILURES:-0}" --arg muted "${MUTED:-0}" \
           --arg note "${1:-}" --arg win "$WINDOW_NAME" --arg poll "$POLL_SECONDS" --arg svc "${SERVICE:-unscoped}" --arg v "$LJ_VERSION" \
-          '{version:($v|tonumber), pid:($pid|tonumber), pid_start:$ps, armed_at:($armed|tonumber),
+          --arg op "${OWNER_PID:-}" --arg os "${OWNER_PS:-}" \
+          '{version:($v|tonumber), pid:($pid|tonumber), pid_start:$ps, born_ticks:$bt, owner_pid:$op, owner_start:$os, armed_at:($armed|tonumber),
             last_poll:($now|tonumber), poll_seconds:($poll|tonumber), service:$svc, active:($active|tonumber),
             written:($emitted|tonumber), emit_failures:($ef|tonumber), muted:($muted|tonumber), window:$win, note:$note}' \
         > "$tmp" 2>/dev/null && mv -f "$tmp" "$(_ledger_path)" && LAST_LEDGER_WRITE=$(_now)
@@ -386,7 +452,17 @@ _ledger_verdict() {
     if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && [[ -d "/proc/$pid" ]]; then
         [[ -z "$ps" || "$(_pid_start "$pid")" == "$ps" ]] && live=1
     fi
-    if (( live == 0 )); then
+    # ALIVE IS NOT OWNED (your-org/nexus-code#1623): a dispatcher whose
+    # recorded owner — the claude it prints INTO — is gone is an orphan. Its
+    # pid and polls are real and it reads `armed` by every other test here,
+    # while every line it prints goes to a pipe with no reader. It exits on its
+    # own within one poll; this reads it `dead` in that window (and for a
+    # dispatcher wedged in it). An absent or empty owner is not consulted.
+    local opid ops
+    opid=$(jq -r '.owner_pid // ""' "$l" 2>/dev/null); ops=$(jq -r '.owner_start // ""' "$l" 2>/dev/null)
+    if (( live == 1 )) && _owner_gone "$opid" "$ops"; then
+        printf 'dead|dispatcher pid %s is alive but ORPHANED: its session (claude pid %s) is gone, so nothing reads what it prints — this session is NOT armed' "$pid" "$opid"
+    elif (( live == 0 )); then
         printf 'dead|dispatcher pid %s is gone (last poll %ss ago) — this session is NOT armed; the host will not relaunch a monitor command that exited' "$pid" "$age"
     elif (( age > fresh )); then
         printf 'stale|dispatcher pid %s is alive but its last poll was %ss ago (> %ss = 3×its own poll_seconds %s + 30): wedged, or the host stopped scheduling it' "$pid" "$age" "$fresh" "$lpoll"
@@ -401,6 +477,121 @@ _ledger_verdict() {
     else
         printf 'armed|dispatcher pid %s alive, polled %ss ago' "$pid" "$age"
     fi
+}
+
+# _ledger_foreign_owner → prints "<pid> <rel>", rc 0, when the ledger names a
+# DIFFERENT dispatcher that is ALIVE (pid + start ticks), whose polls are FRESH
+# by its own recorded cadence, and that still SERVES A SESSION; rc 1 otherwise —
+# no ledger, unreadable, names THIS dispatcher, names a dead or recycled pid,
+# has gone stale, its recorded owner is gone, or it declared its stdout closed.
+# <rel> is the foreign dispatcher's OWNER relative to THIS one's:
+#   newer   its claude started after mine (or it has one and I have none)
+#   same    the same claude, or neither has one — the #1544 case
+#   older   its claude started before mine, or it has none and I have one
+#
+# THE SINGLE-WRITER RULE (your-org/nexus-code#1544 — KILL DIRECTION). The header
+# of `_ledger_write` says "the ONE writer", and nothing enforced it: `dispatch`
+# started a second time with the inherited CLAUDE_CODE_SESSION_ID wrote
+# `sid-<session>/dispatcher.json` naming ITSELF, the two then alternated writes
+# every poll, and `pane-state.sh` — which excludes the ledger pid's ROOT from
+# the background-shell census WHOLE — read `state=idle` over a live `sleep 600`
+# that shared the hand-run dispatcher's tool shell (sk3 rig 4). `idle` is on
+# the kill allowlist.
+#
+# …AND WHO THE ONE WRITER IS (your-org/nexus-code#1623). #1544 answered "the
+# incumbent", which is right for its case — a hand-run dispatcher under the
+# SAME claude as the host's — and exactly wrong for a `--resume`: the resumed
+# session keeps the session id, so its host-armed dispatcher found the DEAD
+# incarnation's dispatcher (reparented to init, still polling) holding the
+# ledger and refused to arm, for as long as the orphan lived (measured on lsc2:
+# `refused pid=6414 … owned by live dispatcher pid=12201`, 7 wakes then printed
+# into a broken pipe). So the rule is now keyed on the OWNER: the dispatcher
+# serving the NEWEST live claude holds the ledger; with the same owner the
+# incumbent keeps it (#1544 unchanged). A ledger written before #1623 records no
+# owner; for it the owner is DERIVED live by the same ancestry walk, so a
+# pre-#1623 orphan — no claude above it — ranks below any dispatcher that has
+# one, and yields when it next sees the newcomer's write (its own #1544 check).
+#
+# Identity is pid + start ticks, never argv: a sibling session's dispatcher is
+# byte-identical. An EMPTY `pid_start` with a live pid and fresh polls still
+# counts as an owner — something is writing those polls, and the expensive
+# error here is a second writer, not a session left to its `await` fallback.
+# The schema version is deliberately NOT consulted: a dispatcher from another
+# build is still a second writer.
+_ledger_foreign_owner() {
+    local l pid ps last lpoll now svc fo fop fos
+    l=$(_ledger_path); [[ -f "$l" ]] || return 1
+    pid=$(jq -r '.pid // 0' "$l" 2>/dev/null) || return 1
+    ps=$(jq -r '.pid_start // ""' "$l" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) || return 1
+    [[ "$pid" == "${DISPATCH_PID:-$$}" && "$ps" == "${DISPATCH_PS:-}" ]] && return 1
+    [[ -d "/proc/$pid" ]] || return 1
+    [[ -z "$ps" || "$(_pid_start "$pid")" == "$ps" ]] || return 1
+    last=$(jq -r '.last_poll // 0' "$l" 2>/dev/null); [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    lpoll=$(jq -r '.poll_seconds // empty' "$l" 2>/dev/null); [[ "$lpoll" =~ ^[0-9]+$ ]] || lpoll="$POLL_SECONDS"
+    now=$(_now)
+    (( now - last <= lpoll * 3 + 30 )) || return 1
+    # A dispatcher whose stdout is gone has RELEASED the spool (see _poll_once):
+    # it polls and writes nothing more, so it is not a writer to defer to.
+    svc=$(jq -r '.service // ""' "$l" 2>/dev/null)
+    [[ "$svc" == stdout-closed ]] && return 1
+    # THE OWNER: recorded (a #1623+ ledger carries the key, possibly empty) or,
+    # for an older ledger, derived live from the foreign pid's ancestry.
+    if [[ "$(jq -r 'has("owner_pid")' "$l" 2>/dev/null)" == true ]]; then
+        fop=$(jq -r '.owner_pid // ""' "$l" 2>/dev/null); fos=$(jq -r '.owner_start // ""' "$l" 2>/dev/null)
+        _owner_gone "$fop" "$fos" && return 1      # an orphan: it exits on its own within a poll
+    else
+        fo=$(_find_owner "$pid"); fop="${fo% *}"; fos="${fo#* }"; [[ -n "$fo" ]] || { fop=""; fos=""; }
+    fi
+    local rel=same mop="${OWNER_PID:-}" mos="${OWNER_PS:-}"
+    if [[ -z "$fos" && -n "$mos" ]]; then rel=older
+    elif [[ -n "$fos" && -z "$mos" ]]; then rel=newer
+    elif [[ -n "$fos" && -n "$mos" && "$fop:$fos" != "$mop:$mos" ]]; then
+        if (( fos > mos )); then rel=newer; elif (( fos < mos )); then rel=older; fi
+    fi
+    printf '%s %s' "$pid" "$rel"
+}
+
+# _owner_exit_if_gone — THIS dispatcher's own owner check (your-org/nexus-code
+# #1623): when the claude it was armed for is no longer that process, exit.
+# The NEVER-EXIT rule exists because an exit is a "script failed" notice that
+# costs the session a turn; with the session gone there is nobody to notify, and
+# staying is exactly the orphan that ate lsc2's wakes. Called at the top of every
+# loop this process can sit in, so it is bounded by one poll_seconds sleep.
+_owner_exit_if_gone() {
+    _owner_gone "${OWNER_PID:-}" "${OWNER_PS:-}" || return 0
+    [[ -n "$SPOOL" ]] && _log_event dispatcher orphaned not-printed "pid=$$ exits: the claude it serves (pid ${OWNER_PID} start ${OWNER_PS}) is gone — nothing reads its stdout (#1623)"
+    exit 0
+}
+
+# _dispatch_wait_for_ledger → returns once NO dispatcher this one must defer to
+# owns the ledger — one serving the SAME or a NEWER claude (see
+# _ledger_foreign_owner). While one does, this process stays ALIVE (an exit is a
+# delivered failure notice), polls NOTHING and WRITES NOTHING — the owner's
+# ledger is left byte-identical — and says why once, on stderr and in the events
+# log. The refusal lasts exactly as long as the condition that justifies it: an
+# owner that dies, goes stale, is orphaned or closes its stdout releases it on
+# the next tick. A foreign dispatcher serving an OLDER claude (or none, while
+# this one has one) is SUPERSEDED instead: this one arms at once, and the older
+# sees the write and stops (#1623).
+_dispatch_wait_for_ledger() {
+    local owner said=0
+    while owner=$(_ledger_foreign_owner); do
+        if [[ "${owner#* }" == older ]]; then
+            _log_event dispatcher supersedes not-printed "pid=$$ supersedes pid=${owner% *}: that dispatcher serves an older session (or none) — the newest live claude owns the spool (#1623)"
+            break
+        fi
+        if (( said == 0 )); then
+            printf 'longjob-watch dispatch: REFUSING TO ARM — the session ledger %s already names a DIFFERENT live dispatcher (pid %s) with fresh polls, serving the same or a newer session. The ledger has ONE writer: a second one makes pane-state.sh exclude the wrong process subtree, which has read `idle` over live work (your-org/nexus-code#1544). Staying alive, polling NOTHING, writing NOTHING; this re-checks every %ss and arms only if that dispatcher stops. NEVER run `dispatch` by hand in a live session — to be woken without the host dispatcher use `longjob-watch.sh await <id> --timeout <s>` under run_in_background.\n' \
+                "$(_ledger_path)" "${owner% *}" "$POLL_SECONDS" >&2
+            _log_event dispatcher refused not-printed "pid=$$ NOT armed: ledger owned by live dispatcher pid=${owner% *} (single writer, #1544)"
+            said=1
+        fi
+        sleep "$POLL_SECONDS"
+        _owner_exit_if_gone
+    done
+    (( said == 1 )) && _log_event dispatcher released not-printed "pid=$$ the ledger's previous owner stopped; arming"
+    return 0
 }
 
 # ---- declare-wait bridge -------------------------------------------------------
@@ -762,6 +953,22 @@ _compose_line() {   # <STATE> <id> <kind:target> <clause> <detail> <desc>
     (( ${#clause} > 120 )) && clause="${clause:0:119}…"
     (( ${#dsc} > 120 )) && dsc="${dsc:0:119}…"
     local head="longjob-watch: $1 $2 | record: monitor/longjob-watch.sh show $2 | $subj"
+    # AN ALERT GOES FIRST (ncbundle4sk on #1635). A probe whose detail begins
+    # `!! ` (after cmd.sh's `rc=N ` prefix) is saying "act on this", and at the
+    # tail of a line whose state word is DONE it read as a success ~250 chars
+    # in. So the alert text leads the line, bounded to 160 chars, and the state,
+    # id and record pointer follow it.
+    local _alert="$5"
+    [[ "$_alert" =~ ^(rc=[0-9]+\ )?'!! '(.*)$ ]] && _alert="${BASH_REMATCH[2]}" || _alert=""
+    if [[ -n "$_alert" ]]; then
+        _alert="${_alert//$'\n'/ }"; _alert="${_alert//$'\r'/ }"
+        (( ${#_alert} > 160 )) && _alert="${_alert:0:159}…"
+        local _al="longjob-watch: $_alert | $1 $2 | record: monitor/longjob-watch.sh show $2 | $subj"
+        [[ -n "$clause" ]] && _al="$_al | $clause"
+        (( ${#_al} > LINE_MAX )) && _al="${_al:0:$(( LINE_MAX - 1 ))}…"
+        printf '%s' "$_al"
+        return 0
+    fi
     [[ -n "$clause" ]] && head="$head | $clause"
     [[ -n "$dsc" ]] && head="$head [desc: $dsc]"
     local room=$(( LINE_MAX - ${#head} - 3 )) detail="$5" line
@@ -795,7 +1002,7 @@ _log_event() { printf '%s\t%s\t%s\t%s\t%s\n' "$(_now)" "$1" "$2" "$3" "${4//$'\n
 # One pass over the spool. Globals it advances: EMITTED, EMIT_FAILURES, MUTED.
 _poll_once() {
     local f id kind target spec state prev detail now last interval persistent notify events maxev ttl added umax streak
-    local active=0 retired=0 out new_state line printed
+    local active=0 retired=0 out new_state line printed resolve pre mine cur
     now=$(_now)
     # `unmute` grants a FRESH budget of session_max_events; without the
     # reset the very next event would re-trip the cap (measured: a second
@@ -847,13 +1054,18 @@ _poll_once() {
             _ledger_write "ok (mid-pass, before a probe)" || true
         fi
 
-        new_state=""; detail=""; line=""; printed=not-printed
+        new_state=""; detail=""; line=""; printed=not-printed; resolve=0; pre=""; mine=""
         if (( ttl > 0 && now - added > ttl )); then
+            pre=$(cat "$f" 2>/dev/null)
             new_state=failed; detail="watch EXPIRED after ${ttl}s without a terminal state (TTL); the subject may still be running — re-add to keep watching"
             _retire "$f" "$id" expired "$new_state" "$detail" "$now"; retired=$(( retired + 1 )); active=$(( active - 1 ))
             line=$(_compose_line EXPIRED "$id" "$kind:$target" "TTL reached; the wait stays declared — re-add to keep watching" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
         else
             out=$(_probe "$kind" "$target" "$spec"); new_state="${out%%|*}"; detail="${out#*|}"
+            # `pre` is the spec as it stands AFTER the probe and BEFORE this
+            # pass writes it — see the write-failed restore below for why the
+            # restore must use this and not `spec` (read before the probe).
+            pre=$(cat "$f" 2>/dev/null)
             if [[ "$new_state" == unknown ]]; then
                 streak=$(( streak + 1 ))
                 if (( streak >= umax )); then
@@ -872,37 +1084,99 @@ _poll_once() {
                             [[ "$new_state" != "$prev" ]] && line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "persistent: $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
                         else
                             _retire "$f" "$id" terminal "$new_state" "$detail" "$now"; retired=$(( retired + 1 )); active=$(( active - 1 ))
+                            resolve=1
                             line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
                         fi ;;
                     pending|running)
                         _update "$f" "$new_state" "$detail" "$now" 0 0
-                        if [[ "$new_state" != "$prev" ]] && { [[ "$notify" == transitions ]] || { [[ "$persistent" == "true" && "$prev" == failed ]]; }; }; then
+                        # A persistent watch announces the RECOVERY from either
+                        # non-running state: `failed`, and `done`, which the
+                        # watcher supervisor answers while LATCHED (ncbundle4sk
+                        # on #1635: latched → UP was silent).
+                        if [[ "$new_state" != "$prev" ]] && { [[ "$notify" == transitions ]] || { [[ "$persistent" == "true" && ( "$prev" == failed || "$prev" == done ) ]]; }; }; then
                             line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "transition $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
                         fi ;;
                 esac
             fi
         fi
-        [[ -n "$line" ]] || continue
-        # Caps, then print.
+        [[ -n "$line" ]] || { (( resolve )) && _resolve_waits "$id" "$kind" "$target"; continue; }
+        # Caps, then print. A capped or muted line is NOT printed ON PURPOSE, so
+        # its terminal wait resolves as it always did; only a FAILED write
+        # (below) keeps it.
         if (( events >= maxev )); then
             _log_event "$id" "$new_state" capped "watch event cap $maxev reached — $detail"
             _retire "$f" "$id" "event-cap" "$new_state" "$detail" "$now"
+            (( resolve )) && _resolve_waits "$id" "$kind" "$target"
             continue
         fi
-        if (( MUTED )); then _log_event "$id" "$new_state" muted "$detail"; continue; fi
+        if (( MUTED )); then _log_event "$id" "$new_state" muted "$detail"; (( resolve )) && _resolve_waits "$id" "$kind" "$target"; continue; fi
         if (( EMITTED >= SESSION_MAX_EVENTS )); then
             MUTED=1
             # The event that TRIPPED the cap is itself undelivered: log it as
             # MUTED so events.log holds every transition, printed or not.
             _log_event "$id" "$new_state" muted "$detail"
+            (( resolve )) && _resolve_waits "$id" "$kind" "$target"
             _log_event dispatcher muted not-printed "session event cap $SESSION_MAX_EVENTS reached"
-            _emit "longjob-watch: MUTED — this session's event cap ($SESSION_MAX_EVENTS) is reached; further transitions are logged to $SPOOL/events.log but NOT delivered. Run monitor/longjob-watch.sh unmute to resume." || EMIT_FAILURES=$(( EMIT_FAILURES + 1 ))
+            _emit "longjob-watch: MUTED — this session's event cap ($SESSION_MAX_EVENTS) is reached; further transitions are logged to $SPOOL/events.log but NOT delivered. Run monitor/longjob-watch.sh unmute to resume." || { EMIT_FAILURES=$(( EMIT_FAILURES + 1 )); STDOUT_CLOSED=1; }
             EMITTED=$(( EMITTED + 1 ))
+            (( STDOUT_CLOSED )) && break
             continue
         fi
+        mine=$(cat "$f" 2>/dev/null)
         if _emit "$line"; then printed=written; EMITTED=$(( EMITTED + 1 ))
         else printed=write-failed; EMIT_FAILURES=$(( EMIT_FAILURES + 1 )); fi
         _log_event "$id" "$new_state" "$printed" "$detail"
+        if [[ "$printed" == write-failed ]]; then
+            # A FAILED WRITE IS NOT A DELIVERY (your-org/nexus-code#1623). The
+            # line went nowhere — measured on lsc2, 7 terminal wakes into a pipe
+            # whose claude was dead — so the watch must not stay retired as if
+            # it had been told. Restore the spec EXACTLY as this pass read it
+            # (un-retired, the previous state, the old last_probe, so the next
+            # pass by ANY dispatcher probes it at once and prints it again), and
+            # leave its waits declared (resolve is skipped). And then STOP: a
+            # write to the host's pipe fails only when its reader is gone, so
+            # every later line from this process would fail too — retrying here
+            # is the forever-loop, and retiring the next watch would lose it.
+            # _poll_once's caller marks the spool released (service
+            # stdout-closed) so a live dispatcher arms at once; this one never
+            # re-delivers anything, and nothing that was WRITTEN is restored.
+            #
+            # …AND THE RESTORE UNDOES ONLY THIS PASS'S OWN WRITE (skeptic item
+            # 3 on the #1623 bundle). `spec` was read BEFORE the probe, and a
+            # probe takes up to probe_timeout_seconds — long enough for a NEWER
+            # dispatcher to supersede this one (#1623), probe the same watch,
+            # retire it and DELIVER it. Restoring `spec` then un-retired a
+            # delivered watch and the newer dispatcher printed it AGAIN
+            # (measured: two `DONE w1` at d110c584, test-longjob-watch #1623e).
+            # So the restore writes back `pre` — the file as it stood after the
+            # probe, immediately before this pass's own _retire/_update — and
+            # only while the file still holds exactly what this pass wrote
+            # (`mine`). A retirement another dispatcher made mid-probe is
+            # therefore put BACK, not erased; a live watch (the single-
+            # dispatcher case: pre == spec) comes back un-retired as before; a
+            # write by anyone AFTER ours, or a watch `rm`'d meanwhile, is left
+            # alone. Not keyed on ledger ownership: a newer owner that has not
+            # yet probed this watch would then never see it — a silent drop,
+            # the direction this restore exists to close.
+            # BOUNDARY: no flock (the spool is on NFS), so this is a compare
+            # then an atomic rename, not a compare-and-swap. The residual
+            # windows are the few ms between the `pre` read and our write and
+            # between the `cur` read and the restore — not the probe's seconds.
+            cur=$(cat "$f" 2>/dev/null)
+            if [[ -n "$pre" && -n "$cur" && "$cur" == "$mine" ]]; then
+                _spec_write "$f" "$pre" || _log_event "$id" "$new_state" not-printed "write-failed AND the restore write failed: the spec may read retired over an undelivered line (#1623)"
+                if [[ "$(printf '%s' "$pre" | jq -r '.retired' 2>/dev/null)" == true ]]; then
+                    _log_event "$id" "$new_state" not-printed "write-failed; NOT restored un-retired: another dispatcher retired it during this probe — its retirement is put back (#1623)"
+                else
+                    _log_event "$id" "$new_state" not-printed "restored un-retired after write-failed: a live dispatcher will deliver it (#1623)"
+                fi
+            else
+                _log_event "$id" "$new_state" not-printed "write-failed; NOT restored: the spec was changed or removed by another writer after this pass wrote it (#1623)"
+            fi
+            STDOUT_CLOSED=1
+            break
+        fi
+        (( resolve )) && _resolve_waits "$id" "$kind" "$target"
         _bump_events "$f"
     done
     ACTIVE="$active"; RETIRED="$retired"
@@ -910,17 +1184,25 @@ _poll_once() {
 _update() {   # <file> <state> <detail> <now> <streak> <_unused>
     local j; j=$(jq --arg s "$2" --arg d "$3" --arg n "$4" --arg k "$5" '.state=$s | .detail=$d | .last_probe=($n|tonumber) | .unknown_streak=($k|tonumber)' "$1" 2>/dev/null) && _spec_write "$1" "$j"
 }
-_retire() {   # <file> <id> <reason> <state> <detail> <now>
-    local j kind target
-    kind=$(jq -r '.kind // empty' "$1" 2>/dev/null); target=$(jq -r '.target // empty' "$1" 2>/dev/null)
+_retire() {   # <file> <id> <reason> <state> <detail> <now>   (the spec only; waits: _resolve_waits)
+    local j
     j=$(jq --arg r "$3" --arg s "$4" --arg d "$5" --arg n "$6" '.retired=true | .retired_reason=$r | .state=$s | .detail=$d | .last_probe=($n|tonumber) | .retired_at=($n|tonumber)' "$1" 2>/dev/null) && _spec_write "$1" "$j"
+    return 0
+}
+# _resolve_waits <id> <kind> <target> — the external-wait side of a TERMINAL
+# retirement, split out of _retire (your-org/nexus-code#1623) because it must
+# happen only once the line has been HANDED OVER (or deliberately not printed:
+# muted, capped). A terminal line whose write FAILED is restored un-retired
+# for a live dispatcher to deliver, and a wait resolved before that would
+# leave the session reading "nothing outstanding" over a result it never got.
+_resolve_waits() {
+    local kind="$2" target="$3"
     # ONLY a TERMINAL retirement resolves the external wait. An `expired` watch
     # says itself "the subject may still be running", an `unknown` park could
     # not tell, and `event-cap` is a budget, not a verdict — for those the wait
     # STAYS declared, so the session reads `idle-orphan-async` and the watcher's
     # orphan-async loop still has something to resolve (skeptic F3).
-    [[ "$3" == terminal ]] || return 0
-    _undeclare_wait "$2"
+    _undeclare_wait "$1"
     # The launch hook (hooks/async-launch-detect.sh) declares its OWN wait for
     # a detected sbatch/srun/async-run — `slurm <jobid>` / `asyncrun <token>`.
     # The subject is terminal and the agent has been told, so that wait is
@@ -942,13 +1224,45 @@ cmd_dispatch() {
     # sub-verb with a flag it does not own and waits for it to exit —
     # 2400 s ceiling reached, bundle-2609). Refuse at once, rc 2.
     (( $# == 0 )) || die "dispatch: takes no arguments (got: $*)"
+    # BORN_TICKS — the FIRST thing a dispatcher does, before it forks anything
+    # that lives (your-org/nexus-code#1565 — KILL DIRECTION).
+    #
+    # `zsh -c 'sleep 600 & exec bash longjob-watch.sh dispatch'` makes the
+    # `sleep 600` THIS process's child: `exec` keeps the pid, so work forked
+    # before it is re-parented under the dispatcher, and pane-state.sh — which
+    # excludes the dispatcher's root from the background-shell census WHOLE —
+    # read `state=idle` over it (measured: idle, bk_pane_kill_authorized rc 0,
+    # three reads, real `dispatch`). The census cannot tell such a child from
+    # the per-poll `sleep` by NAME, and it cannot tell it by the ledger's
+    # `pid_start` either: `exec` keeps the START TICKS too, so a pre-exec child
+    # is YOUNGER than `pid_start` (measured: parent 1051329988, its pre-exec
+    # child 1051330058), exactly like every child the dispatcher forks itself.
+    # What does separate them is the moment this process BECAME a dispatcher.
+    # That moment is recorded here as the start ticks of a process forked NOW
+    # (`cat`, reading its own /proc/self/stat): everything forked before the
+    # `exec` is older than it, everything the poll loop forks is younger.
+    # EMPTY when /proc cannot be read — and an empty marker is a ledger the
+    # census reads as it did before this field existed, never as a clearance.
+    local _bt; _bt=$(cat /proc/self/stat 2>/dev/null) || _bt=""
+    _bt="${_bt##*) }"
+    # shellcheck disable=SC2086
+    set -- $_bt; DISPATCH_BORN_TICKS="${20-}"; set --
+    [[ "$DISPATCH_BORN_TICKS" =~ ^[0-9]+$ ]] || DISPATCH_BORN_TICKS=""
     # A closed stdout must not kill the loop: ignore SIGPIPE and let printf's
     # rc carry the failure into the ledger instead.
     trap '' PIPE
     local armed_at pid ps note="" enabled
     armed_at=$(_now); pid=$$; ps=$(_pid_start "$pid")
     DISPATCH_PID="$pid"; DISPATCH_PS="$ps"; ARMED_AT="$armed_at"   # the ledger writer reads these
-    EMITTED=0; EMIT_FAILURES=0; MUTED=0; ACTIVE=0; RETIRED=0; SERVICE=unscoped; LAST_LEDGER_WRITE=0
+    EMITTED=0; EMIT_FAILURES=0; MUTED=0; ACTIVE=0; RETIRED=0; SERVICE=unscoped; LAST_LEDGER_WRITE=0; STDOUT_CLOSED=0
+    # THE OWNER, captured ONCE, here (your-org/nexus-code#1623): the nearest
+    # `claude` above this process, as pid + start ticks. Recorded in the ledger
+    # (owner_pid / owner_start) and checked at the top of every loop below —
+    # this process exits when that claude is gone. Empty when there is none
+    # (hermetic tests, CI): then nothing here ever exits on this ground.
+    local _own; _own=$(_find_owner "$$")
+    OWNER_PID=""; OWNER_PS=""
+    [[ -n "$_own" ]] && { OWNER_PID="${_own% *}"; OWNER_PS="${_own#* }"; }
 
     enabled="${MONITOR_LONGJOB_ENABLED:-}"
     [[ -z "$enabled" && -x "$NEXUS_ROOT/config/load.sh" ]] && enabled=$("$NEXUS_ROOT/config/load.sh" monitor.longjob.enabled true 2>/dev/null || echo true)
@@ -962,18 +1276,21 @@ cmd_dispatch() {
         # Unscoped: nothing to poll and nowhere to write a ledger. Stay alive
         # (an exit would be a delivered failure notice) and say why, once.
         printf 'longjob-watch dispatch: no session key (CLAUDE_CODE_SESSION_ID / NEXUS_WORKER_WINDOW unset) — running unscoped, polling nothing\n' >&2
-        while :; do sleep "$POLL_SECONDS"; done
+        while :; do sleep "$POLL_SECONDS"; _owner_exit_if_gone; done
     fi
     if ! mkdir -p "$SPOOL/watches" 2>/dev/null; then
         printf 'longjob-watch dispatch: cannot create %s — staying alive, polling nothing\n' "$SPOOL" >&2
-        while :; do sleep "$POLL_SECONDS"; done
+        while :; do sleep "$POLL_SECONDS"; _owner_exit_if_gone; done
     fi
+    # ONE WRITER (#1544): before ANY branch below writes the ledger — the kill
+    # switch and the config refusal write one too.
+    _dispatch_wait_for_ledger
     case "$enabled" in 1|true|yes|on) ;; *)
         # ALIVE BUT NOT SERVING — said in the service FIELD, which the verdict
         # reads, not only in the note, which nothing reads (skeptic C1).
         SERVICE=disabled
         note="DISABLED by monitor.longjob.enabled / MONITOR_LONGJOB_ENABLED=$enabled; ledger written, spool NOT polled"
-        while :; do _ledger_write "$note"; sleep "$POLL_SECONDS"; done ;;
+        while :; do _owner_exit_if_gone; _ledger_write "$note"; sleep "$POLL_SECONDS"; done ;;
     esac
     # The relation guard on the contract's own bound (see the header): a probe
     # timeout that can outlast the freshness window would make a healthy
@@ -982,29 +1299,74 @@ cmd_dispatch() {
     if (( PROBE_TIMEOUT > 2 * POLL_SECONDS + 30 )); then
         printf 'longjob-watch dispatch: probe_timeout_seconds (%s) exceeds 2×poll_seconds+30 (%s): a slow pass would read stale — fix the config; staying alive polling NOTHING\n' "$PROBE_TIMEOUT" "$(( 2 * POLL_SECONDS + 30 ))" >&2
         SERVICE=disabled
-        while :; do _ledger_write "config: probe_timeout_seconds $PROBE_TIMEOUT > 2×poll_seconds+30; not polling"; sleep "$POLL_SECONDS"; done
+        while :; do _owner_exit_if_gone; _ledger_write "config: probe_timeout_seconds $PROBE_TIMEOUT > 2×poll_seconds+30; not polling"; sleep "$POLL_SECONDS"; done
     fi
     SERVICE=polling
-    _log_event dispatcher armed not-printed "pid=$pid poll=${POLL_SECONDS}s key=$SESSION_KEY"
+    _log_event dispatcher armed not-printed "pid=$pid poll=${POLL_SECONDS}s key=$SESSION_KEY owner=${OWNER_PID:-none}"
     _ledger_write "armed"
     # SUPERVISOR LOOP: the poll pass is a subshell-free function call, but a
     # bug in it (a jq that starts failing, a probe file that traps) must
     # never propagate to an exit. Every iteration is guarded and any error
     # is logged to the ledger note and the events log, then the loop goes on.
-    local rc st="$SPOOL/.poll-state"
+    local rc st="$SPOOL/.poll-state" _sup
     while :; do
+        # …AND THE RULE HOLDS AFTER ARMING (#1544). The arm-time check is a
+        # check-then-write, so two dispatchers started together can both pass
+        # it, and a predecessor that was merely WEDGED when this one armed can
+        # resume. Whichever of the two next finds the OTHER's fresh write
+        # yields: it stops polling and writing, waits as a refused dispatcher
+        # does, and re-arms only if the other stops. Both cannot yield — a
+        # yielding dispatcher has, by construction, not written since the
+        # other's last write, so the other finds its OWN name and continues.
+        #
+        # WHO YIELDS IS DECIDED BY THE OWNER (your-org/nexus-code#1623): a
+        # foreign writer serving a NEWER claude has superseded this one, which
+        # EXITS — "the older sees it and exits instead of competing"; waiting
+        # would leave it alive to re-arm the moment the newer one stops, which
+        # is how the lsc2 orphan came to hold the ledger. The SAME owner is the
+        # #1544 race and yields as before. An OLDER foreign writer is ignored:
+        # this pass's own write reclaims the ledger, and that writer yields on
+        # seeing it (by this rule, or by its pre-#1623 #1544 check).
+        _owner_exit_if_gone
+        if _sup=$(_ledger_foreign_owner); then
+            case "${_sup#* }" in
+                newer)
+                    _log_event dispatcher superseded not-printed "pid=$$ exits: ledger now owned by pid=${_sup% *}, which serves a NEWER session (#1623)"
+                    exit 0 ;;
+                same)
+                    _log_event dispatcher superseded not-printed "pid=$$ yields: ledger now owned by live dispatcher pid=${_sup% *} (single writer, #1544)"
+                    _dispatch_wait_for_ledger
+                    _log_event dispatcher armed not-printed "pid=$pid poll=${POLL_SECONDS}s key=$SESSION_KEY (re-armed)"
+                    _ledger_write "armed" ;;
+            esac
+        fi
         # The pass runs in a SUBSHELL: a bash-FATAL error (an unbound variable
         # in arithmetic, a syntax error a future writer introduces) kills the
         # subshell, not this loop — `rc=$?` can only ever see returns, and the
         # skeptic measured a fatal killing the dispatcher on its first poll
         # (F6). Counters come back through a file; on a fatal they are simply
         # carried over from the last good pass.
-        ( _poll_once; printf '%s %s %s %s %s %s %s\n' "$ACTIVE" "$RETIRED" "$EMITTED" "$EMIT_FAILURES" "$MUTED" "$LAST_EMIT_MS" "$LAST_LEDGER_WRITE" > "$st" ); rc=$?
-        if (( rc == 0 )) && read -r ACTIVE RETIRED EMITTED EMIT_FAILURES MUTED LAST_EMIT_MS LAST_LEDGER_WRITE < "$st" 2>/dev/null; then
+        ( _poll_once; printf '%s %s %s %s %s %s %s %s\n' "$ACTIVE" "$RETIRED" "$EMITTED" "$EMIT_FAILURES" "$MUTED" "$LAST_EMIT_MS" "$LAST_LEDGER_WRITE" "$STDOUT_CLOSED" > "$st" ); rc=$?
+        if (( rc == 0 )) && read -r ACTIVE RETIRED EMITTED EMIT_FAILURES MUTED LAST_EMIT_MS LAST_LEDGER_WRITE STDOUT_CLOSED < "$st" 2>/dev/null; then
             note="ok"
         else
             note="poll pass died rc=$rc at $(_now) (fatal error in the pass; counters carried over; dispatcher continues)"
             _log_event dispatcher error not-printed "$note"
+        fi
+        if [[ "$STDOUT_CLOSED" == 1 ]]; then
+            # RELEASE THE SPOOL (your-org/nexus-code#1623). This process's stdout
+            # has no reader, so it can wake nobody: it writes ONE last ledger
+            # saying so — service `stdout-closed`, which the verdict reads as
+            # not-armed (anything but `polling` is `disabled`) and which
+            # _ledger_foreign_owner reads as NOT an owner, so a live dispatcher
+            # waiting under #1544 arms on its next tick — then polls nothing and
+            # writes nothing more (a second writer would be #1544 again), and
+            # stays alive until its owner goes, the one exit that costs nobody.
+            SERVICE=stdout-closed
+            _ledger_write "stdout closed (a terminal write failed; the watch was restored un-retired): released the spool to a live dispatcher; polling nothing" \
+                || _log_event dispatcher error not-printed "ledger write failed"
+            _log_event dispatcher stdout-closed not-printed "pid=$$ stdout has no reader — released the spool; polls nothing more (#1623)"
+            while :; do sleep "$POLL_SECONDS"; _owner_exit_if_gone; done
         fi
         _ledger_write "$note" || _log_event dispatcher error not-printed "ledger write failed"
         sleep "$POLL_SECONDS"

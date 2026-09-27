@@ -44,7 +44,9 @@ you. What each one is for:
 | `monitor/svc.sh up` | Stack bring-up without the window rebind (delegates to `bootstrap-recover.sh`); `svc.sh` with no args is the read-only cockpit dashboard | You're already in a shell window and want the stack checked/raised without becoming the cockpit |
 | `monitor/bootstrap-recover.sh` | The idempotent recovery engine: watcher → orchestrator → services → workers, each stage skippable by flag | Partial or scripted recovery (`--dry-run`, `--services-only`, `--no-workers`, …) — see "Architecture" 2b |
 | `monitor/watcher/launcher.sh` | Lowest-level watcher (re)spawn: pidfile-guarded, single-flight-locked, group-reaping headless launch (`--replace` / `--ensure` / bare) | Restarting only the watcher: `monitor/svc.sh restart watcher` (idempotent — see "Watcher restart") |
-| `monitor/watcher-supervise-tick.sh` | One tick of the orchestrator-armed watcher-supervisor Monitor: touches the supervisor heartbeat + reports watcher liveness (exit code) | Inside the orchestrator's `Monitor` until-loop — see "Watcher supervision" |
+| `monitor/watcher-supervise-tick.sh` | One tick of the orchestrator-armed watcher supervisor: touches the supervisor heartbeat + reports watcher liveness (exit code) | Inside `watcher-supervise-probe.sh`, or the fallback `Monitor` until-loop — see "Watcher supervision" |
+| `monitor/watcher-supervise-probe.sh` | The supervisor as a longjob `cmd:` probe: runs the tick; on DOWN/WEDGED launches ONE detached `revive-watcher.sh` (log: `.state/watcher-supervisor-revive.log`) | Every 30 s by the orchestrator's plugin dispatcher (#1532) |
+| `monitor/arm-watcher-supervisor.sh` | Idempotently arms the probe as a persistent, TTL-less, uncapped, undeclared longjob watch; exit 3 + the Monitor-lease fallback when the dispatcher is NOT ARMED | Orchestrator session start, respawn, `--- arm watcher supervisor ---` |
 | `monitor/revive-watcher.sh` | Orchestrator's crash-revive: loop-guarded, writes the self-report marker, calls `svc.sh restart watcher`; honours an intentional-stop sentinel | When the supervisor Monitor fires (watcher down) — see "Watcher supervision" |
 | `monitor/boot-recover.sh` | Cold-boot trigger: debounced, non-blocking check that backgrounds `bootstrap-recover.sh` when the stack is down | Normally wired into a SessionStart hook / login shell ("Cold-boot recovery trigger" below), rarely by hand |
 
@@ -208,10 +210,18 @@ Three pieces:
    - Archives the report to `monitor/.state/diffs/<ts>_<shortid>.md`.
    - Pastes the report into the target tmux window (the monitor
      agent; default `orchestrator`, overridable per launcher invocation)
-     via the `tmux set-buffer` + `tmux paste-buffer` + `Enter`
-     pattern documented in `skills/nexus.tmux-spawn/SKILL.md`.
-     Retries once on transient failure, then gives up and relies
-     on the archive.
+     through the confirmed-delivery primitive
+     `monitor/_paste-deliver.sh` (`<your-org>/nexus-code#1591`): the body
+     is normalised, loaded from a FILE (`tmux load-buffer`), pasted
+     bracketed, submitted with `Enter`, and CONFIRMED against the
+     target's transcript; while the pane positively reads "the text is
+     still in the input box" (`state=user-typing input=typed`) `Enter`
+     is pressed again, bounded, and never into an overlay. Retries the
+     PASTE once on a transient tmux failure or a body that never
+     landed; a body that landed but stayed unsubmitted (rc 6) is NOT
+     re-pasted — that would append a second copy to the text already
+     in the box — and falls to the delivery-failure accounting and the
+     archive.
    - Bumps `monitor/.state/watcher-progress` as it advances and
      `monitor/.state/watcher-cycle` at each completed compose cycle.
      Liveness itself lives in `monitor/.state/watcher-heartbeat`
@@ -2112,9 +2122,17 @@ circularity by **mutuality**, not a third daemon.
   top-pinned **`--- arm watcher supervisor ---`** reminder whenever it
   does not see a fresh *supervisor heartbeat* (the orchestrator's Monitor
   isn't armed) — nudging a freshly-(re)started orchestrator to (re)arm.
-- **orchestrator → watcher:** the orchestrator arms a persistent
-  **`Monitor`** whose until-loop runs `monitor/watcher-supervise-tick.sh`
-  every ~15 s. Each tick **touches the supervisor heartbeat**
+- **orchestrator → watcher:** the orchestrator runs
+  **`monitor/arm-watcher-supervisor.sh`**, which adds
+  `monitor/watcher-supervise-probe.sh` as a persistent longjob watch
+  (<your-org>/nexus-code#1532). The plugin dispatcher is not bound by the
+  30-minute `Monitor` cap (measured: ~71.5 h continuous) and polls
+  independently of the orchestrator's turns, and the probe launches the
+  revive itself, so a watcher crash is revived even while the orchestrator
+  cannot take a turn. Only when the dispatcher is NOT ARMED (exit 3) does
+  the orchestrator fall back to a **`Monitor`** lease (at most 30 min,
+  re-armed on every expiry) whose until-loop runs
+  `monitor/watcher-supervise-tick.sh` every ~15 s. Each tick **touches the supervisor heartbeat**
   (`monitor/.state/watcher-supervisor-heartbeat` — that is what clears
   the reminder) and reports watcher liveness via exit code. When the
   watcher dies the loop exits, waking the orchestrator, which runs
@@ -2124,6 +2142,8 @@ circularity by **mutuality**, not a third daemon.
   `skills/nexus.service-recovery`:
 
   ```
+  <NEXUS_ROOT>/monitor/arm-watcher-supervisor.sh     # primary; idempotent
+  # only on its exit 3 (dispatcher NOT ARMED), the fallback lease:
   Monitor({command: 'until ! <NEXUS_ROOT>/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
   # on exit (watcher down):  <NEXUS_ROOT>/monitor/revive-watcher.sh   then re-arm
   ```
@@ -2614,7 +2634,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `boot-recover.session-start-hook.json` | Ready-to-merge Claude Code `SessionStart` (matcher `resume`) hook snippet that fires `boot-recover.sh` when the orchestrator session is brought back at boot | yes |
 | `watcher/_lib.sh`            | Shared watcher helpers: heartbeat/lock parsers, liveness probe (`_watcher_alive`), PID-identity check (`_watcher_pid_is_live_watcher`, immunises lock/pid checks against post-restart PID reuse), emit classifier (`_classify_diff`) | yes |
 | `watcher/_github.sh`         | `snapshot_github` + helpers — three-source union (issues, PR conversation, PR review threads); honours `processed-comments.txt` dedup | yes |
-| `watcher/_unstick.sh`        | Auto-unstick library: case A (permission Enter) + case B (rate-limit cascade + Anthropic API probe + orchestrator ack) + case C (api-error chip Enter) + case D (AskUserQuestion chip-bar Escape + meta-paste, the orchestrator-paste safety net — see `monitor.watcher.on_dialog`) + case W (worker-blocked-question relay: non-target AskUQ overlay → grace → synthesized `blocked_question` pending-decision; never touches the pane — see `monitor.watcher.worker_askuq_grace_seconds`) | yes |
+| `watcher/_unstick.sh`        | Auto-unstick library: case A (permission prompt → refused + surfaced as a pending decision, #1599) + case B (rate-limit cascade + Anthropic API probe + orchestrator ack) + case C (api-error chip Enter) + case D (AskUserQuestion chip-bar Escape + meta-paste, the orchestrator-paste safety net — see `monitor.watcher.on_dialog`) + case W (worker-blocked-question relay: non-target AskUQ overlay → grace → synthesized `blocked_question` pending-decision; never touches the pane — see `monitor.watcher.worker_askuq_grace_seconds`) | yes |
 | `watcher/_orchestrator_liveness.sh` | Orchestrator-liveness state machine (issue #164). Hook-driven heartbeat compared against last-paste timestamp; sequences grace + unstick-window + dead-threshold budgets before escalating to fresh-spawn. Replaces the #157 binary `unresponsive_age > threshold` check. | yes |
 | `watcher/_config.sh`         | Watcher config resolution — the env → config → default lookup block for every knob (extracted from `main.sh`, issue 180 seam S1). NOT side-effect-free: sourcing runs the ~50 `config/load.sh` lookups; `main.sh` sources it once, after the early pidfile publish | yes |
 | `watcher/_emit_filters.sh`   | Emit-stream filters composing the bulk of `_gh_filter_dedup_pipeline`: manual suppression (`ng suppress-emit`), processed-comments live re-check, per-comment emit cooldown, cross-source id dedup (extracted from `main.sh`, issue 180 seam S2) | yes |
@@ -2627,6 +2647,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `watcher/test-paste-dead-pane-guard.sh` | The `#745` dead-pane paste guard: real-tmux predicate, a MANIFEST of every `tmux paste-buffer` call site (so a fifth cannot appear unguarded), stub-tmux parsing contract, and an end-to-end check that the helpers survive a real corpse with an unguarded positive control (run: `SLOW_TESTS=1 bash monitor/watcher/test-paste-dead-pane-guard.sh`) | yes |
 | `watcher/test-lib.sh`        | Mock-tmux unit tests for the standalone classifiers in `_lib.sh` (e.g. `_target_window_present`) (run: `bash monitor/watcher/test-lib.sh`) | yes |
 | `watcher/test-target-window-live.sh` | REAL-tmux tests for `_target_window_present`: a `remain-on-exit` corpse must read ABSENT, a live same-named window in another session must not read PRESENT, and a dead server must read can't-classify (`#741`) (run: `SLOW_TESTS=1 bash monitor/watcher/test-target-window-live.sh`) | yes |
+| `watcher/test-paste-deliver.sh` | Every paste path (emit, unstick, respawn brief, `paste-followup.sh`) against a REAL private tmux server whose pane runs a fake REPL reproducing Claude Code's hold / ignore-Enter / overlay / queue behaviours: `reported delivered ==> the REPL recorded it`, no re-paste on top of a held body, no Enter into an overlay, a trailing `;` survives (`#1590`), and the normaliser's tier tables checked against a table generated from the code points. `SUBJECT_ROOT=<tree>` aims the drivers at another checkout (the pre-fix base) and every assertion carries a stable `[id]` so two runs compare as SETS (run: `bash monitor/watcher/test-paste-deliver.sh`) | yes |
 | `watcher/test-unstick.sh`    | Mock-tmux unit tests for `_unstick.sh` (run: `bash monitor/watcher/test-unstick.sh`) | yes |
 | `watcher/test-snapshot-github.sh` | Mock-gh unit tests for `_github.sh` (run: `bash monitor/watcher/test-snapshot-github.sh`) | yes |
 | `watcher/test-snapshot-github-failure.sh` | Mock-gh unit tests for the detect-and-react path in `_github.sh` (rate-limit sentinel, backoff, expiry) (run: `bash monitor/watcher/test-snapshot-github-failure.sh`) | yes |
@@ -2634,14 +2655,15 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `watcher/test-cc-version.sh` | Unit tests for the effective-version resolver `_cc-version.sh` (floor-plus-local-pin, #226): floor extraction, local-pin path resolution / trim / blank-handling, `effective = local-pin else floor`, atomic write round-trip, and gate-baseline wiring (the gate fires against the effective version, not the lagging floor) (run: `bash monitor/watcher/test-cc-version.sh`) | yes |
 | `_cc-version.sh`             | Shared resolver for the EFFECTIVE Claude Code version (floor-plus-local-pin, #226). `effective = local-pin (monitor/.state/cc-version-local) else package.json floor`. Read by `install-claude-local.sh` (install + verify) and the watcher gate baseline (`_v2_task_cc_version_check`). Atomic local-pin write. | yes |
 | `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. | yes |
-| `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `set-buffer` → `paste-buffer` → `Enter` sequence, appends a `paste-followup` action-log audit event, and persists its own confirmation verdict to `.state/paste-verdicts/<window>.<epoch>` so the watcher's `paste-unconfirmed` detector reads what the sender established rather than re-deriving it from a possibly-rotated session-id (issue #665). Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
+| `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `load-buffer` (the payload is a FILE, never an argv element: tmux 2.6's command-list rule ate a trailing `;` from `set-buffer -- "$MSG"`, `<your-org>/nexus-code#1590`) → bracketed `paste-buffer` → `Enter` sequence through the shared confirmed-delivery primitive `monitor/_paste-deliver.sh` (`#1591`), which confirms the submit against the target's transcript and presses `Enter` again only on positive evidence that the text is still in the input box, never into an overlay, appends a `paste-followup` action-log audit event, and persists its own confirmation verdict to `.state/paste-verdicts/<window>.<epoch>` so the watcher's `paste-unconfirmed` detector reads what the sender established rather than re-deriving it from a possibly-rotated session-id (issue #665). Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
+| `_paste-deliver.sh`          | THE confirmed-delivery primitive (`<your-org>/nexus-code#1591`, `#1590`), sourced by `paste-followup.sh` and by the watcher's emit, unstick and respawn pastes, and holder of the tree's ONLY executable `tmux paste-buffer` (`watcher/paste-buffer-sites.manifest`). `pd_normalise_file` removes the invisible characters Claude Code >= 2.1.277 would hold a prompt for — conservatively: it under-strips and never over-strips relative to 2.1.278's own context-sensitive rule — `pd_paste_file` does the VI-safe bracketed paste from a FILE behind the `#745` dead-pane guard, and `pd_submit` presses `Enter`, looks for a TUI-submission or enqueue record in the target's transcript after a pre-paste byte offset, and presses `Enter` again only while the pane positively reads `state=user-typing input=typed`, never into `blocked`. Result in `PD_OUTCOME` / `PD_ENTER_RETRIES`; rc 0 delivered, 3 unconfirmed, 4 NOT submitted, 5 dead pane, 6 liveness unknown. Tests: `watcher/test-paste-deliver.sh` (hermetic, real tmux + a fake REPL that reproduces the hold) and `watcher/test-integration/test-realmodel-paste-held.sh` (the real binary, gated). | yes |
 | `mint-token.sh`              | Mints / caches the bot's installation token | yes |
 | `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the bot, not the user's gh OAuth identity, must own both the credentials and the commit author — `gh auth setup-git` configures a credential helper ONLY (it never writes `user.name`/`user.email`) and delegates to the user's OAuth token. NOT because `~/.gitconfig` is read-only: it is writable (`-rw-rw-rw-`, measured 2026-09-01 inside agent-sandbox), and that false premise is <your-org>/nexus-code#1244 — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |
 | `ng`                         | Compact GitHub / watcher helper (`process`, `react`, `reply`, `close`, `dashboard get|put|scaffold|validate`, `nexus-identity`, `issue`, `upload`, `watcher-status`, `log-action`) | yes |
 | `upload-asset.sh`            | Commits a local file (image or report markdown) into the asset repo's `main` branch under `assets/...`; prints a SHA-pinned `github.com/{owner}/{asset-repo}/{raw\|blob}/<sha>/...` URL that renders in any browser logged into github.com | yes |
 | `notify.sh`                  | Tiered Pushover / ntfy / SMTP fan-out  | yes      |
 | `agent-prompt.md`            | Launch prompt for the monitor agent    | yes      |
-| `worker-settings.json`       | Per-spawn Claude Code settings passed to every worker via `claude --settings`. Carries `skipDangerousModePermissionPrompt: true` (suppresses the bypass-mode startup dialog) + the canonical hook block (heartbeat, decision-emit, decision-mark-unresolved, notifications JSONL, pending-tool capture). Edit this file to add/change worker hooks; no awk extraction. | yes |
+| `worker-settings.json`       | Per-spawn Claude Code settings passed to every worker via `claude --settings`. Carries `skipDangerousModePermissionPrompt: true` (suppresses the bypass-mode startup dialog) + the canonical hook block (heartbeat, decision-emit, decision-mark-unresolved, notifications JSONL, pending-tool capture). Also sets `syncClaudeAiSkills`/`syncClaudeAiPlugins` to `false` (<your-org>/nexus-code#1600): an absent key means Claude Code 2.1.275+ syncs the signed-in claude.ai account's skills and plugins into every session, outside anything the repo pins. `orchestrator-settings.json` carries the same two keys. Re-enable per operator with `true` in the untracked `worker-settings.local.json` overlay. Edit this file to add/change worker hooks; no awk extraction. | yes |
 | `hooks/decision-emit.sh`     | Notification-hook handler: reads the hook payload from stdin, writes one atomic JSON event per pending decision to `.state/decisions/<window>.<fp>.json`. Fingerprint stable across re-fires so the same prompt yields one file. Tool context (when present) is embedded from `.state/pending-tool/<window>.json`. Hot-path discipline: O(ms), exits 0 on any failure to never block the agent's turn. | yes |
 | `hooks/decision-mark-unresolved.sh` | Stop-hook handler: per turn-end, walks `.state/decisions/<window>.*.json` and adds `unresolved: true` to lingering files (the orchestrator removed any answered ones). Idempotent; tombstones (`*.handled.json`) skipped. | yes |
 | `README.md`                  | This file                              | yes      |
@@ -2822,7 +2844,7 @@ bash -c "grep -ohE '\"\\\$_cfg\" [a-z][a-z0-9_.]+' monitor/watcher/_config.sh | 
 | `DIFF_RETENTION_DAYS`         | `monitor.diff_retention_days`             | days before archived diffs are pruned (default 7) |
 | `AGENT_DEAD_THRESHOLD`        | `monitor.agent_dead_threshold`            | slow-path threshold (default 3): consecutive polls a future "window-present-but-agent-silent" detector must observe before it presumes the agent dead. Reserved — no current detector wires this in. The cleanly-missing-window case is now governed by `AGENT_MISSING_RESPAWN_DELAY` (fast path). |
 | `AGENT_MISSING_RESPAWN_DELAY` | `monitor.agent_missing_respawn_delay`     | fast-path knob (default 3): extra confirming polls after a missing-window observation before the watcher respawns the agent. At the 2 s probe cadence the default demands ~8 s of confirmed absence. `0` respawns on first detection — the pre-2026-06-02 behaviour, where a single transient misread spawned a duplicate orchestrator; do not lower without a reason. The pre-launch re-verification (`_respawn_verify_target_absent`) is an additional, always-on guard. |
-| `MONITOR_AUTO_UNSTICK`        | `monitor.watcher.auto_unstick`            | auto-Enter on stuck permission prompts (case A) AND auto-resume rate-limit prompts post-reset (case B: cascades to all stuck windows + heads-up to orchestrator). Default `true`. |
+| `MONITOR_AUTO_UNSTICK`        | `monitor.watcher.auto_unstick`            | surface stuck permission prompts as pending decisions, never answering them (case A, #1599) AND auto-resume rate-limit prompts post-reset (case B: cascades to all stuck windows + heads-up to orchestrator). Default `true`. |
 | `MONITOR_RATELIMIT_PROBE`     | `monitor.watcher.ratelimit_probe`         | probe the Anthropic API for the rate-limit reset timestamp on case B detection (uses `anthropic-ratelimit-unified-reset` / `-tokens-reset` headers). Default `false`. Requires `ANTHROPIC_API_KEY` in env. |
 | `ANTHROPIC_API_KEY`           | (env-only, never config)                  | Anthropic API key for the case-B reset probe. Falsey/missing disables the probe; the watcher then falls back to `ratelimit_heuristic_minutes`. |
 | `MONITOR_RATELIMIT_HEURISTIC_MIN` | `monitor.watcher.ratelimit_heuristic_minutes` | fallback wait (minutes) when the probe is off or fails (default 30). |

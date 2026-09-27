@@ -72,6 +72,15 @@ tmux() {
                     *)  shift ;;
                 esac
             done
+            # Exact targets (your-org/nexus-code#1524): `_unstick.sh` now reads
+            # through `_unstick_exact_target`, which answers the `@<n>` id the
+            # `list-windows` arm below synthesises, or `:=<name>`. Map both back
+            # to the window NAME the pane fixtures are keyed on — a stub that
+            # only knows bare names answers "no pane" to the fixed code.
+            target="${target#:=}"
+            if [[ "$target" =~ ^@([0-9]+)$ ]]; then
+                target=$(printf '%s\n' "$WINDOWS_LIST" | awk -v n="${BASH_REMATCH[1]}" 'NF && ++i == n')
+            fi
             if [[ -n "$target" && -f "$PANES_DIR/$target" ]]; then
                 cat "$PANES_DIR/$target"
                 return 0
@@ -199,10 +208,23 @@ assert_not_contains "Case D does NOT fire on a non-target window named 'orchestr
 actions_content=$(<"$ACTIONS")
 assert_contains "Case D dismissal pastes into the configured target window" \
     "$actions_content" "paste-buffer"
-assert_contains "Case D paste-buffer targets the configured window" \
-    "$actions_content" "-t $CUSTOM_TARGET"
+# Bare OR exact (`:=<name>`, your-org/nexus-code#1524) — but on the
+# paste-buffer line itself, so a matching Escape elsewhere cannot satisfy it.
+_ttc_paste=$(grep -E '^paste-buffer ' <<<"$actions_content" || true)
+if [[ "$_ttc_paste" =~ -t\ (:=)?${CUSTOM_TARGET}($|[[:space:]]) ]]; then
+    printf '  PASS: %s\n' "Case D paste-buffer targets the configured window"; PASS=$((PASS + 1))
+else
+    printf '  FAIL: %s — paste-buffer line: %s\n' "Case D paste-buffer targets the configured window" "${_ttc_paste:-<none>}" >&2; FAIL=$((FAIL + 1))
+fi
 assert_not_contains "no Case D Escape sent to the 'orchestrator'-named bystander" \
     "$actions_content" "send-keys -t orchestrator Escape"
+# The same bystander in the EXACT spellings #1524 introduced — without these the
+# bare-name row above would pass vacuously against the fixed code. `@3` is the
+# id the list-windows arm synthesises for `orchestrator` (3rd row).
+assert_not_contains "no Case D Escape sent to the bystander by exact name (:=)" \
+    "$actions_content" "send-keys -t :=orchestrator Escape"
+assert_not_contains "no Case D Escape sent to the bystander by window id" \
+    "$actions_content" "send-keys -t @3 Escape"
 
 # Case B heads-up paste: must land in the configured target.
 : > "$ACTIONS"
@@ -212,8 +234,31 @@ _cascade_heads_up_orchestrator 1 "stuck-worker"
 actions_content=$(<"$ACTIONS")
 assert_contains "Case B heads-up pastes into the configured target window" \
     "$actions_content" "paste-buffer"
-assert_contains "Case B paste targets the configured window, not 'orchestrator'" \
-    "$actions_content" "-t $CUSTOM_TARGET"
+# THE PASTE LINE ITSELF, and in the EXACT-window spelling (your-org/nexus-code#1598).
+#
+# This assertion used to grep the whole action log for a bare `-t <target>`, and
+# it was NOT measuring the paste. The bare spelling it matched came from case B's
+# BLIND pre-Enter (`tmux send-keys -t "$target" Enter`, base _unstick.sh), which
+# #1598 removed because an Enter pressed into the orchestrator's pane on no
+# evidence submits whatever is in its input box. The paste has ALWAYS gone
+# through pd_deliver, which targets `:=<name>` — so the old predicate named the
+# paste, matched a different call, and would have passed for a paste aimed
+# anywhere.
+#
+# A BARE `-t <name>` is not a safe target: tmux resolves it by unique PREFIX when
+# the exact window is gone, so a paste aimed at `w` can land on a live `w-sk`
+# (#1524). `:=` is the documented exact form. The assertion is therefore
+# TIGHTENED rather than loosened — it now requires the paste-buffer line to carry
+# the exact spelling positively, which a bare target would NOT satisfy.
+# grep -m1, never `| head`: -m1 stops at the first match with NO PIPELINE, so
+# this site does not join the early-exit-reader population (that population is
+# PINNED by test-early-exit-reader-manifest.sh, and my first draft of this fix
+# joined it — a fix can enlist in a population its author was not thinking
+# about). Same first-match semantics, no writer to take EPIPE, nothing for
+# pipefail to invert (#622).
+paste_line=$(grep -am1 -E "^paste-buffer " <<<"$actions_content")
+assert_contains "Case B paste targets the configured window EXACTLY, not by prefix (#1524)" \
+    "$paste_line" "-t :=$CUSTOM_TARGET"
 
 # ---- 3: idle-probe worker enumeration -------------------------------------
 

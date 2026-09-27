@@ -367,9 +367,13 @@ _shell_files() {   # emits monitor/… paths relative to CWD
 # would train people to ignore the guard).
 _NOT_SHELL_NOT_DOC='\.(py|pl|jq|awk|json|tsv|ansi|gitignore)$|/ci-bash-version$'
 _doc_files() {   # every file _shell_files does NOT claim and that is not declared NEITHER
-    local _sh; _sh=$(_shell_files)
+    # Membership by an associative array, not `grep -qxF "$_f" <<<"$_sh"`: the
+    # grep was a fork per file, most of this guard's `--population` probe
+    # (bundle-0923). Same predicate: whole-line equality with a claimed path.
+    local _sh; local -A _claimed=()
+    while IFS= read -r _sh; do [[ -n "$_sh" ]] && _claimed["$_sh"]=1; done < <(_shell_files)
     find monitor "${_PRUNE_STATE[@]}" -type f -print | sort -u | while IFS= read -r _f; do
-        grep -qxF "$_f" <<<"$_sh" && continue
+        [[ -n "${_claimed[$_f]:-}" ]] && continue
         [[ "$_f" =~ $_NOT_SHELL_NOT_DOC ]] && continue
         printf '%s\n' "$_f"
     done

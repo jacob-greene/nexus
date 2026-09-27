@@ -559,8 +559,9 @@ _usage_for() {
         cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
         cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
         cmd_retire_window)  echo "usage: ng retire-window <window> [--reason <text>] [--dry-run] [--keep-window] [--assume-absent] [--strict]   # preflight + kill + prune the MANIFESTED state surfaces + verify, then report references the manifest does not name (--strict makes those a failure)" ;;
+        cmd_decision_answer) echo "usage: ng decision-answer <window> <fp> allow|deny --nonce <nonce> [--reason <text>]   # ANSWER a forwarded dangerous-rm request (orchestrator-only, #1632)" ;;
         cmd_decision_ack)   echo "usage: ng decision-ack <window> <fingerprint> | <path-to-decision-json> | <window> --all [--reason <text>]   # DURABLE ack of a pending-decision row (\`rm\` does not stick)" ;;
-        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--guards|--no-guards-preflight] [--strict-guards] [--retain <reason>|--no-retain]
+        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--dry-run] [--allow-stub] [--guards|--no-guards-preflight] [--strict-guards] [--retain <reason>|--no-retain]
        ng wrap-up --reply-to <request-id> <report-path> [--issue <n>] [--answer-file <path>] [--repo <owner/name>] [--allow-stub] [--retain <reason>|--no-retain]   # channel delivery: no GitHub issue unless --issue
        ng wrap-up --last [<window>] | --explain [<window>]   # READ-ONLY: replay the last run's persisted output (+ ledger evidence); arms nothing, posts nothing (#1370)
    skeptic protocol (skills/nexus.skeptic) — producer side:
@@ -574,7 +575,8 @@ _usage_for() {
        A retry reproduces 3 exactly; only you can clear it. Either the composed teaser carried no claim
        (#1114), or your report changed outside the Summary section and the composed body did not (#862).
        stderr names the cause and the ways out." ;;
-        cmd_skeptic_arm) echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--state-dir D]   # RECORD WHAT AN ARM IS ABOUT, for the writers of the armed state that live outside ng (spawn-worker.sh --skeptic-role). exit 0 = an \`armed\` row was appended, 3 = this artefact is ALREADY OUTSTANDING so nothing was appended, 4 = COULD NOT NAME A SUBJECT (says so on stderr; a marker may still exist). Skipping the append when the sha is already outstanding is load-bearing: a second arm for one artefact IS \`ambiguous-N-arms-outstanding\` (#1156 pole B)" ;;
+        cmd_skeptic_arm) echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--depth N] [--state-dir D]   # RECORD WHAT AN ARM IS ABOUT — AND OPEN THE ROUND (#1537): a new arm ARCHIVES the prior round (its DONE/RELEASED sentinels AND its *.answered.md correspondence — moved to skeptic/.archive/<task>.reset-<ts>/, path printed on stderr, #1609) and writes the pending marker await reads; an existing marker is never rewritten. RECORD WHAT AN ARM IS ABOUT, for the writers of the armed state that live outside ng (spawn-worker.sh --skeptic-role). exit 0 = an \`armed\` row was appended, 3 = this artefact is ALREADY OUTSTANDING so nothing was appended, 4 = COULD NOT NAME A SUBJECT (says so on stderr; a marker may still exist). Skipping the append when the sha is already outstanding is load-bearing: a second arm for one artefact IS \`ambiguous-N-arms-outstanding\` (#1156 pole B)" ;;
+        cmd_skeptic_ledger_rotate) echo "usage: ng skeptic-ledger-rotate <window> [--state-dir D]   # A REUSED WINDOW NAME MUST NOT MERGE UNRELATED ROUNDS (#1252). Called by spawn-worker.sh on a FRESH spawn. exit 0 = a fully SETTLED ledger was archived to skeptic/.archive/, 3 = no ledger on this key, 5 = REFUSED and KEPT — an arm is outstanding, a marker is pending, or the ledger could not be read. It never rotates an open obligation" ;;
         cmd_skeptic_obligations) echo "usage: ng skeptic-obligations <window> [--state-dir <path>]   # WHAT THIS WINDOW OWES, BY TASK. One line per artefact still outstanding, naming its issue and report. exit 0 = nothing outstanding, 1 = one or more. The pending MARKER cannot answer this: its content is \`1\`, so presence cannot say WHICH obligation and absence cannot be checked (#961)" ;;
         cmd_skeptic_orphans) echo "usage: ng skeptic-orphans [--state-dir <path>]   # EVERY skeptic-pending marker, classified by whether its window is PRESENT in tmux (the only discriminator that separates a live pairing from an orphan — age does not, measured), with the action log's last row for the window. REPORT ONLY, reaps nothing; per orphan the remedy is ng skeptic-evidence then ng skeptic resolve. exit 0 = looked, 3 = no marker store" ;;
         cmd_skeptic_evidence) echo "usage: ng skeptic-evidence <window> [--state-dir <path>]   # DOES A VERDICT EXIST, AND COULD THE BOOKKEEPING MATCH IT. Separates \"no verdict exists\" from \"a verdict was delivered and could not be matched to an arm\" — opposite instructions to the reader, printed identically until now (#1156). READ-ONLY, authorises nothing. exit 0 = looked, 3 = could not look" ;;
@@ -3432,6 +3434,18 @@ _skeptic_record_arm() {
         >> "$(_skeptic_ledger_file "$dir" "$key")" 2>/dev/null || true
 }
 
+# _skeptic_last_arm_ts <pending-dir> <key> — the timestamp (column 3) of the
+# LAST `armed` row, whatever its discharge state. Prints nothing / returns 1
+# when there is no ledger or no arm.
+_skeptic_last_arm_ts() {
+    local f; f=$(_skeptic_ledger_file "$1" "$2")
+    [[ -r "$f" ]] || return 1
+    local ts
+    ts=$(awk -F'\t' '$1 == "armed" && $2 ~ /^[0-9a-f]{64}$/ { t = $3 } END { if (t != "") print t }' "$f" 2>/dev/null) || return 1
+    [[ -n "$ts" ]] || return 1
+    printf '%s' "$ts"
+}
+
 # _skeptic_current_arm_sha <pending-dir> <key>
 # The sha of the LAST arm, whatever its discharge state. This answers "what is
 # this window's obligation about right now" — the question `retire-window`'s
@@ -3902,6 +3916,13 @@ _skeptic_record_discharge() {
     # A drift row (8 fields, `asserted-path`) matches only a prior row holding
     # the same drift hash: a reviewer that read a DIFFERENT later revision has
     # said something new.
+    # DRY RUN (your-org/nexus-code#1580, merge4sk): the wrap-up asks what this
+    # call WOULD record before it records, so a verdict that would name NO
+    # artefact while arms exist can be refused rather than written.
+    if [[ "${_SK_DISCHARGE_DRYRUN:-0}" == 1 ]]; then
+        _SK_DISCHARGE_WOULD_SHA="$sha"; _SK_DISCHARGE_DETAIL="$detail"; _SK_DISCHARGE_WOULD_ARMS="$arms"
+        return 0
+    fi
     local _sk_dup=""
     if [[ -r "$ledger" ]]; then
         _sk_dup=$(awk -F'\t' -v sha="$sha" -v v="${verdict:--}" -v iss="${issue:--}" \
@@ -4025,6 +4046,119 @@ _skeptic_close_settlement() {
     ' "$f" 2>/dev/null) || return 1
     [[ -n "$line" ]] || return 1
     printf '%s' "$line"
+}
+
+# _skeptic_rearm_subject <pending-dir> <key> <report-path> <issue>
+# DOES THE STANDING SETTLEMENT COVER WHAT IS BEING WRAPPED UP?
+# (your-org/nexus-code#1619, the other side of #815.)
+#
+# One line on stdout, three space-separated fields: `<class> <sha|-> <detail>`
+#
+#   new      — the DELIVERABLE (issue, report path) has never been armed on
+#              this key. Nothing any verdict, resolve or close on this ledger
+#              was about. A settlement cannot cover it, so the caller ARMS.
+#   covered  — the deliverable WAS armed here, so the standing settlement is
+#              about it. detail `same-bytes` (this exact content was armed) or
+#              `revised-bytes` (a later revision of an armed deliverable —
+#              unreviewed content, but the deliverable the settlement named).
+#   unknown  — the ledger cannot say: no ledger, no subject-bearing `armed`
+#              row (a legacy or rationale-only resolution), no report, no
+#              sha256 tool. The caller keeps its pre-#1619 suppression.
+#
+# WHY THE KEY IS THE DELIVERABLE AND NOT THE CONTENT HASH. Both live cases
+# have to come out right, and a sha alone separates neither:
+#   * #1619 — round 2 of new work on a resolved window, a NEW report: must ARM.
+#     Keyed on the window (the pre-fix behaviour) it declined, silently, and the
+#     round-2 verdict then landed `unmatched-subject` because the arm it would
+#     have attributed to was never written.
+#   * #815 — "write your findings into the report and wrap up" after a resolve:
+#     that AMENDS the report, so its sha moves on every compliance. Keyed on the
+#     sha, each compliance re-arms and the self-sustaining loop #815 closed is
+#     back. Keyed on (issue, report path) the amendment is `covered
+#     revised-bytes`: declined, and — because unreviewed content IS involved —
+#     declined LOUDLY to the orchestrator (the caller files an adjudication
+#     request), never re-blocking the worker.
+# `(issue, report path)` is the ledger's own notion of a deliverable (#1156's
+# supersede rule, `_skeptic_open_arms`); this reuses it rather than inventing
+# a third identity.
+#
+# DIRECTION OF DOUBT. A path spelled differently from the arm (relative vs
+# absolute) that realpath cannot reconcile reads `new`, which ARMS — the
+# direction this gate always fails in. Every could-not-tell case reads
+# `unknown`, which keeps the pre-existing behaviour and is surfaced by the
+# caller rather than decided here.
+_skeptic_rearm_subject() {
+    local dir="$1" key="$2" rp="${3:-}" iss="${4:-}" f sha="" rp_real=""
+    [[ -n "$dir" && -n "$key" ]] || { printf 'unknown - no-key\n'; return 0; }
+    f=$(_skeptic_ledger_file "$dir" "$key")
+    [[ -r "$f" ]] || { printf 'unknown - no-ledger\n'; return 0; }
+    [[ -n "$rp" && -f "$rp" ]] || { printf 'unknown - no-report\n'; return 0; }
+    sha=$(_skeptic_artefact_sha "$rp") || sha=""
+    [[ -n "$sha" ]] || { printf 'unknown - report-sha-unavailable\n'; return 0; }
+    rp_real=$(realpath -m -- "$rp" 2>/dev/null) || rp_real="$rp"
+    local kind a_sha a_ts a_iss a_rp a_real n_arms=0 same_bytes=0 same_deliv=0
+    while IFS=$'\t' read -r kind a_sha a_ts a_iss a_rp _; do
+        [[ "$kind" == armed && "$a_sha" =~ ^[0-9a-f]{64}$ ]] || continue
+        n_arms=$(( n_arms + 1 ))
+        [[ "$a_sha" == "$sha" ]] && same_bytes=1
+        # An arm with NO issue (`-`) is a wildcard, not a mismatch: `ng skeptic-arm`
+        # from spawn-worker.sh records none, and reading that as "a different
+        # deliverable" would re-arm every #815 loop whose round 1 was spawned.
+        [[ "${a_iss:--}" == "${iss:--}" || "${a_iss:--}" == "-" || "${iss:--}" == "-" ]] || continue
+        if [[ "$a_rp" == "$rp" || "$a_rp" == "$rp_real" ]]; then
+            same_deliv=1
+        elif [[ -n "$a_rp" && "$a_rp" != "-" ]]; then
+            a_real=$(realpath -m -- "$a_rp" 2>/dev/null) || a_real=""
+            [[ -n "$a_real" && "$a_real" == "$rp_real" ]] && same_deliv=1
+        fi
+    done < "$f"
+    if (( n_arms == 0 )); then
+        printf 'unknown %s no-subject-bearing-arm\n' "$sha"
+    elif (( same_bytes )); then
+        printf 'covered %s same-bytes\n' "$sha"
+    elif (( same_deliv )); then
+        printf 'covered %s revised-bytes\n' "$sha"
+    else
+        printf 'new %s deliverable-never-armed\n' "$sha"
+    fi
+}
+
+# _skeptic_file_rearm_adjudication <window> <issue> <report> <sha|-> <class> <detail> <why>
+# A DECLINED require is told to the ORCHESTRATOR, not only printed to the
+# worker (your-org/nexus-code#1619: "a worker must not be able to end its turn
+# believing it asked for something it did not get"). Files ONE
+# `kind=skeptic-rearm-declined` request per (window, subject sha), ever — any
+# state, so an acked one is not re-filed by the next identical wrap-up. That is
+# what keeps this from being #815's loop in a new medium: the same bytes can
+# never produce a second request, and nothing here writes a marker, so nothing
+# re-blocks the worker. Prints a one-word outcome; never fails the wrap-up.
+_skeptic_file_rearm_adjudication() {
+    local window="$1" issue="$2" report="$3" sha="${4:--}" class="$5" detail="$6" why="$7"
+    local chan="$_script_dir/request-channel.sh" origin slug reqdir="$STATE_DIR/requests" g
+    [[ -n "$window" ]] || { printf 'skipped (no window)'; return 0; }
+    [[ -x "$chan" ]] || { printf 'FAILED (request-channel.sh missing)'; return 0; }
+    origin=$(wk_encode_word "$window" 2>/dev/null) || origin=""
+    [[ "$origin" =~ ^[A-Za-z0-9_-]+$ ]] || { printf 'FAILED (window not encodable)'; return 0; }
+    slug="rearm-declined-${sha:0:12}"
+    [[ "$sha" == "-" ]] && slug="rearm-declined-nosubject"
+    if [[ -d "$reqdir" ]]; then
+        local _aso_r; _aso_r=$(shopt -p nullglob); shopt -s nullglob
+        local hit=""
+        for g in "$reqdir"/*-"${origin}"-"${slug}".*.md; do hit="$g"; break; done
+        eval "$_aso_r"
+        [[ -n "$hit" ]] && { printf 'skipped (already filed: %s)' "${hit##*/}"; return 0; }
+    fi
+    local body id
+    body=$(printf '# A require-gate re-arm was DECLINED — adjudicate\n\nwindow: %s\nissue: %s\nreport: %s\nsubject-sha256: %s\nsubject-class: %s (%s)\nwhy-declined: %s\n\nThe worker asked for a skeptic (require). No marker was written and no\nspawn-skeptic request was filed, because the standing settlement on this\nwindow is judged to cover this deliverable (your-org/nexus-code#1619, #815).\nIf a review IS owed: `ng skeptic-arm %s` + spawn a reviewer, or tell the\nworker to re-run with `--skeptic-rearm "<what changed>"`. If not: `ng request ack`.\n' \
+        "$window" "${issue:--}" "${report:--}" "$sha" "$class" "$detail" "$why" "$window")
+    if id=$(printf '%s' "$body" | NEXUS_STATE_DIR="$STATE_DIR" "$chan" file \
+            --origin "$origin" --kind skeptic-rearm-declined \
+            --slug "$slug" --priority normal - 2>/dev/null) && [[ -n "$id" ]]; then
+        printf 'filed %s' "$id"
+    else
+        printf 'FAILED (request-channel file errored)'
+    fi
+    return 0
 }
 
 # _skeptic_verdict_evidence <pending-dir> <key>
@@ -5331,6 +5465,54 @@ _wrapup_skeptic_step() {
         if [[ -n "${_SK_SUBJECT_ARG:-}" && ! "${_SK_SUBJECT_ARG}" =~ ^[0-9a-f]{64}$ ]]; then
             _sk_subject_path="$_SK_SUBJECT_ARG"
         fi
+        # A VERDICT MUST COME FROM A REPORT WRITTEN AFTER THE ROUND IT
+        # DISCHARGES (skprotosk F5). A retained skeptic re-tasked for round 2 that
+        # re-ran its ROUND-1 wrap-up discharged the round-2 arm `attributed`, with
+        # nothing having been reviewed. Refused, not recorded: the arm stays
+        # outstanding, which is the shut direction. Only a POSITIVE "older than
+        # the newest arm" refuses; an unparseable stamp is stated and lets the
+        # verdict through, because a brick teaches the rm bypass.
+        if [[ -n "$_sk_reviewed_key" ]]; then
+            local _sk_arm_ep _sk_rep_ep _sk_arm_ts
+            _sk_arm_ts=$(_skeptic_last_arm_ts "$pending_dir" "$_sk_reviewed_key") || _sk_arm_ts=""
+            _sk_arm_ep=$(date -d "$_sk_arm_ts" +%s 2>/dev/null) || _sk_arm_ep=""
+            _sk_rep_ep=$(stat -c %Y "${_SK_REPORT_PATH:-/nonexistent}" 2>/dev/null) || _sk_rep_ep=""
+            if [[ "$_sk_arm_ep" =~ ^[0-9]+$ && "$_sk_rep_ep" =~ ^[0-9]+$ ]] && (( _sk_rep_ep < _sk_arm_ep )); then
+                echo "ng wrap-up: REFUSING to record this verdict — your report predates the round it would discharge." >&2
+                echo "  report   : ${_SK_REPORT_PATH:-<none>} (mtime $(date -d "@$_sk_rep_ep" -Is 2>/dev/null))" >&2
+                echo "  round    : $reviewed armed at $_sk_arm_ts" >&2
+                echo "  A retained skeptic re-tasked for a new round must write a NEW report (ng report-init)" >&2
+                echo "  after reviewing the new bytes; re-running the previous round's wrap-up would" >&2
+                echo "  discharge a round nobody reviewed. Nothing was recorded; the arm stays outstanding." >&2
+                return 1
+            elif [[ -n "$_sk_arm_ts" && ! "$_sk_arm_ep" =~ ^[0-9]+$ ]]; then
+                echo "ng wrap-up: NOTE — could not parse the newest arm's timestamp ('$_sk_arm_ts') for $reviewed; the report-predates-round check did not run." >&2
+            fi
+        fi
+        # A VERDICT NAMING NO ARTEFACT WHILE THE TARGET HAS ARMS IS REFUSED
+        # (merge4sk, 2026-09-18). It recorded `sha=-` with arms outstanding, and
+        # the worker could then satisfy its gate by NO route: `--skeptic-satisfied-by
+        # <git sha>` is not a sha256, `--skeptic-satisfied-by <skeptic report>` names
+        # bytes no verdict was recorded against, and each attempt re-armed (#1370);
+        # the orchestrator resolved it by hand. Fail-closed choice: refuse HERE,
+        # naming the arms, so the reviewer passes `--skeptic-subject`. With no arm
+        # at all there is nothing to name and the verdict is recorded as before
+        # (`no-arm-on-record` / `no-open-arm` — the irreplaceable fact).
+        if [[ -n "$_sk_reviewed_key" ]]; then
+            _SK_DISCHARGE_WOULD_SHA=""; _SK_DISCHARGE_WOULD_ARMS=""
+            _SK_DISCHARGE_DRYRUN=1 _skeptic_record_discharge "$pending_dir" "$_sk_reviewed_key" \
+                "$verdict" "$issue" "${source_window:-skeptic}" "$_sk_asserted" "$_sk_subject_path"
+            if [[ "$_SK_DISCHARGE_WOULD_SHA" == "-" && -n "$_SK_DISCHARGE_WOULD_ARMS" ]]; then
+                echo "ng wrap-up: REFUSING to record a verdict that names NO artefact while $reviewed has arm(s) outstanding ($_SK_DISCHARGE_DETAIL)." >&2
+                echo "  A sha=- verdict can be attributed to nothing, and the reviewed window can then satisfy its" >&2
+                echo "  gate by no route (--skeptic-satisfied-by has nothing to match). Say what you reviewed:" >&2
+                echo "      ng wrap-up ... --skeptic-subject <the target report you read | its sha256>" >&2
+                echo "  Outstanding arm(s) on $reviewed:" >&2
+                "$_script_dir/ng" skeptic-obligations "$reviewed" 2>/dev/null | sed 's/^/    /' >&2
+                echo "  Nothing was recorded; the marker and the arm(s) stand." >&2
+                return 1
+            fi
+        fi
         [[ -n "$_sk_reviewed_key" ]] \
             && _skeptic_record_discharge "$pending_dir" "$_sk_reviewed_key" \
                    "$verdict" "$issue" "${source_window:-skeptic}" "$_sk_asserted" \
@@ -5804,7 +5986,10 @@ _wrapup_skeptic_step() {
             printf '    # `rc=$?` — reports 0 for a 4, a 10 or an 11 (#1161).\n'
             printf '    # BACKGROUND = the Bash tool`s run_in_background (it re-invokes you\n'
             printf '    # on exit) or a Monitor until-loop — NOT monitor/async-run.sh, which\n'
-            printf '    # retains the rc and re-invokes nobody (#1523).\n'
+                    printf '    # retains the rc and re-invokes nobody (#1523).\n'
+            printf '    # exit 14 (ENDED-WITHOUT-VERDICT) is how a DECLINED next pass reaches\n'
+            printf '    # you: the orchestrator released your gate on the record. It is not a\n'
+            printf '    # review of you; do not re-enter await — finish and go idle.\n'
             printf '\nA second pass is the ORCHESTRATOR'\''s call. If it DECLINES (the findings\n'
             printf 'are minor/acceptable and no further pass is warranted), it terminates the\n'
             printf 'chain normally — `ng skeptic close` the worker(s) and retire. The blocking\n'
@@ -5933,7 +6118,7 @@ _wrapup_skeptic_step() {
         fi
         if (( _sat_verdicts == 0 )); then
             echo "ng wrap-up: --skeptic-satisfied refused — NO verdict is on the ledger for" >&2
-            echo "  '$source_window' (evidence=$_sat_class). `satisfied` means the validation" >&2
+            echo "  '$source_window' (evidence=$_sat_class). \`satisfied\` means the validation" >&2
             echo "  HAPPENED; if it did not, this is a waiver, and --skeptic-waive is the honest" >&2
             echo "  verb. Nothing was recorded." >&2
             return 1
@@ -5955,7 +6140,7 @@ _wrapup_skeptic_step() {
             echo "ng wrap-up: --skeptic-satisfied refused — $_sat_open arms are outstanding on" >&2
             echo "  '$source_window' and a settlement closes them ALL, so this ONE citation would" >&2
             echo "  silently discharge artefacts nobody reviewed. Land the other rounds first," >&2
-            echo "  or use `ng skeptic resolve` and say so on the record. Nothing was recorded." >&2
+            echo "  or use \`ng skeptic resolve\` and say so on the record. Nothing was recorded." >&2
             return 1
         fi
         # The EXISTING `resolved` row shape — every classifier and both entry
@@ -6099,6 +6284,36 @@ _wrapup_skeptic_step() {
             ;;
     esac
 
+    # ── A RESOLUTION RECORDED THAT A DELTA REVIEW IS OWED (#1573 instance 5) ──
+    #
+    # `ng skeptic resolve <w> --delta-owed "<what>"` is the ORCHESTRATOR saying,
+    # on the record, that this window's next artefact must be reviewed. Measured
+    # on `killsafe` 2026-09-18 without it: the promise lived only in --reason
+    # prose, the #815 suppression below (correctly) declined to re-arm, and
+    # never-reviewed kill-direction fixes were told "This window can retire".
+    #
+    # So the record outranks BOTH this worker's decision and the suppressions
+    # below. That is not a worker reversing a resolution — #815 is untouched for
+    # every resolution that carries no such record — it is the resolution's own
+    # instruction being executed. The record is consumed only AFTER the marker
+    # and the arm exist, so at no instant is the promise held by nothing.
+    local _sk_delta_file="" _sk_delta_owed=0 _sk_delta_what="" _sk_settled_round=0
+    if [[ -n "$sw_safe" ]]; then
+        _sk_delta_file="$pending_dir/.${sw_safe}.delta-owed"
+        if [[ -e "$_sk_delta_file" ]]; then
+            _sk_delta_owed=1
+            _sk_delta_what=$(sed -n 's/^what=//p' "$_sk_delta_file" 2>/dev/null | sed -n 1p)
+            printf '\n=== A DELTA REVIEW IS OWED ON THIS WINDOW — ARMING (recorded by the orchestrator) ===\n'
+            printf 'what it must cover: %s\n' "${_sk_delta_what:-<unreadable record: $_sk_delta_file>}"
+            if [[ "$effective" != "required" && "$effective" != "required-escalated" ]]; then
+                printf 'Your decision resolved to `%s`; the recorded obligation overrides it.\n' "$effective"
+                effective=required
+            fi
+            ( cmd_log_action monitor --event skeptic-delta-owed-arm \
+                "${winx[@]}" --extra "what=$_sk_delta_what" --extra "issue=$issue" ) 2>/dev/null || true
+        fi
+    fi
+
     local next=$((depth + 1))
     case "$effective" in
         required|required-escalated)
@@ -6153,7 +6368,11 @@ _wrapup_skeptic_step() {
             # report, no ledger, a malformed line — every one of them yields
             # "no match" and the gate arms normally.
             local _sk_art_sha="" _sk_art_line=""
-            if [[ -n "$sw_safe" && -z "$f_rearm" ]]; then
+            # `_sk_delta_owed == 0`: an OWED delta bypasses this suppression too
+            # (skprotosk F4) — byte-identical bytes are exactly what a worker
+            # re-wraps when the fixes went into CODE and the report did not
+            # change, and "already validated" then buries the promised review.
+            if [[ -n "$sw_safe" && -z "$f_rearm" ]] && (( _sk_delta_owed == 0 )); then
                 _sk_art_sha=$(_skeptic_artefact_sha "${_SK_REPORT_PATH:-}") || _sk_art_sha=""
                 if [[ -n "$_sk_art_sha" ]]; then
                     _sk_art_line=$(_skeptic_artefact_discharged \
@@ -6212,7 +6431,65 @@ _wrapup_skeptic_step() {
                 printf '    ng wrap-up ... --skeptic-rearm "<what changed since that verdict>"\n'
                 return 0
             fi
-            if [[ "$_sk_res_state" == "resolved" && -z "$f_rearm" ]]; then
+            # A SETTLEMENT IS NOT A DECLINE (skprotosk G1 on #1580). `ng skeptic
+            # resolve` on a require window with nothing pending writes the record
+            # `report-check` reads — and that record is what THIS arm reads, so a
+            # worker's next round of NEW work was told "ALREADY RESOLVED — can
+            # retire". The resolution's own last record says which it is; a
+            # settlement declined nothing and suppresses nothing. (The record
+            # header is matched as `skeptic-pending .*resolved via`, not by its
+            # literal text: test-skeptic-verdict-evidence.sh's advice lint keys
+            # an exemption on the FIRST line carrying the literal phrase, and a
+            # second copy earlier in this file would steal it.)
+            if [[ "$_sk_res_state" == "resolved" && -r "$_sk_res_path" ]] \
+               && awk '/^# skeptic-pending .*resolved via/ { s = 0 } /^scope[[:space:]]*:.*settles-completed-round/ { s = 1 } END { exit !s }' "$_sk_res_path" 2>/dev/null; then
+                printf '\n=== SKEPTIC: the last resolution SETTLED A COMPLETED ROUND (declined nothing) — arming normally ===\n'
+                printf 'resolution record: %s\n' "$_sk_res_path"
+                _sk_res_state="settled-round"; _sk_res_detail="settlement-of-completed-round-does-not-suppress"
+                # …and the CLOSE that settlement followed (#1209's arm below)
+                # does not suppress either: the orchestrator's recorded
+                # settlement is the party entitled to re-open, and it did.
+                _sk_settled_round=1
+            fi
+            # A SETTLEMENT IS ABOUT A SUBJECT, NOT A WINDOW (your-org/nexus-code#1619).
+            # Both suppressions below (#815's `resolved` arm and #1209's close
+            # arm) used to key on the WINDOW, so round 1's settlement bound every
+            # later round: a second round of new work on a new report was told
+            # "ALREADY RESOLVED — NOT RE-ARMING", no arm was written, no request
+            # was filed, and a reviewer spawned by hand then recorded
+            # `unmatched-subject` because the arm it should attribute to never
+            # existed. Ask the ledger whether this DELIVERABLE was ever armed
+            # here (`_skeptic_rearm_subject` has the key choice and why a sha
+            # alone would reopen #815). `new` arms — marker, `armed` row and
+            # spawn-skeptic request, through the ordinary path below — and the
+            # settlement stands for everything it was actually about.
+            local _sk_subj_class="" _sk_subj_sha="-" _sk_subj_detail="" _sk_new_subject=0
+            if [[ -n "$sw_safe" && -z "$f_rearm" ]] && (( _sk_delta_owed == 0 && _sk_settled_round == 0 )); then
+                read -r _sk_subj_class _sk_subj_sha _sk_subj_detail \
+                    <<<"$(_skeptic_rearm_subject "$pending_dir" "$sw_safe" "${_SK_REPORT_PATH:-}" "$issue")"
+                [[ -n "$_sk_subj_class" ]] || { _sk_subj_class=unknown; _sk_subj_sha=-; _sk_subj_detail=probe-produced-no-class; }
+            fi
+            if [[ "$_sk_subj_class" == "new" ]] \
+               && { [[ "$_sk_res_state" == "resolved" ]] || _skeptic_close_settlement "$pending_dir" "$sw_safe" >/dev/null; }; then
+                # A separate `ng` process rather than a `( cmd_log_action … )`
+                # group: best-effort, and it adds no site to the
+                # subshell-exit-guards population.
+                NEXUS_STATE_DIR="$STATE_DIR" "$_script_dir/ng" log-action monitor \
+                    --event skeptic-rearm-new-subject \
+                    "${winx[@]}" \
+                    --extra "prior-state=$_sk_res_state" \
+                    --extra "artefact-sha=$_sk_subj_sha" \
+                    --extra "report=${_SK_REPORT_PATH:-}" \
+                    --extra "issue=$issue" >/dev/null 2>&1 || true
+                printf '\n=== SKEPTIC: A PRIOR ROUND IS SETTLED, BUT THIS IS A NEW SUBJECT — ARMING ===\n'
+                printf 'The standing settlement on this window covers the deliverables armed\n'
+                printf 'before it. This one (issue %s, %s) was never armed here, so\n' "${issue:--}" "${_SK_REPORT_PATH:-<none>}"
+                printf 'nothing has reviewed it (your-org/nexus-code#1619). A new round is opened\n'
+                printf 'and recorded against it, so its verdict will attribute.\n'
+                _sk_res_state="new-subject"; _sk_res_detail="deliverable-never-armed"
+                _sk_new_subject=1
+            fi
+            if [[ "$_sk_res_state" == "resolved" && -z "$f_rearm" ]] && (( _sk_delta_owed == 0 )); then
                 ( cmd_log_action monitor --event skeptic-rearm-suppressed \
                     "${winx[@]}" \
                     --extra "decision=$effective" \
@@ -6249,8 +6526,27 @@ _wrapup_skeptic_step() {
                 printf '"write your findings into a report and wrap up" after a resolve would\n'
                 printf 're-block ITSELF by complying — then be unable to record even that without\n'
                 printf 'triggering it again.\n'
-                printf 'CONSEQUENCE: no marker written, no spawn-skeptic request filed. This\n'
-                printf 'window can retire (retire-preflight will not see a live gate from here).\n'
+                # WHAT THE DECLINE IS ABOUT, AND WHO IS TOLD (your-org/nexus-code#1619).
+                # A decline is correct only when the settlement covers this
+                # deliverable; say which, and push it to the ORCHESTRATOR — the
+                # banner alone reached only a worker that already believed it had
+                # asked for a reviewer. rc stays 0 deliberately: this step runs
+                # BEFORE the upload, so a non-zero here would refuse the hand-off
+                # itself and re-create #815 from the other side (a worker told to
+                # record its findings could not). The request is one per subject.
+                printf 'subject        : %s (%s) sha256 %s\n' "${_sk_subj_class:-unknown}" "${_sk_subj_detail:--}" "${_sk_subj_sha:--}"
+                case "$_sk_subj_class" in
+                    covered) printf '  This deliverable (issue %s, this report path) WAS armed on this window\n' "${issue:--}"
+                             printf '  before the resolution, so the resolution is about it.\n' ;;
+                    *)       printf '  The ledger CANNOT say what the resolution covered, so the pre-#1619\n'
+                             printf '  window-keyed decline is kept — and reported, not trusted.\n' ;;
+                esac
+                printf 'adjudication request: %s\n' "$(_skeptic_file_rearm_adjudication "$source_window" "$issue" \
+                    "${_SK_REPORT_PATH:-}" "${_sk_subj_sha:--}" "${_sk_subj_class:-unknown}" \
+                    "${_sk_subj_detail:--}" "resolved:$_sk_res_detail")"
+                printf 'CONSEQUENCE: no marker written, no spawn-skeptic request filed; the\n'
+                printf 'orchestrator has been asked to adjudicate the decline (request above).\n'
+                printf 'Until it does, retire-preflight will not see a live gate from here.\n'
                 printf 'If your result has MATERIALLY CHANGED since that resolution and genuinely\n'
                 printf 'needs a fresh validation pass, re-arm DELIBERATELY and on the record:\n'
                 printf '    ng wrap-up ... --skeptic-rearm "<what changed since the resolution>"\n'
@@ -6384,7 +6680,7 @@ _wrapup_skeptic_step() {
             # and the created timestamp — both functions of wall clock, neither
             # of state.
             local _sk_close_row=""
-            if [[ -n "$sw_safe" && -z "$f_rearm" ]]; then
+            if [[ -n "$sw_safe" && -z "$f_rearm" ]] && (( _sk_delta_owed == 0 && _sk_settled_round == 0 && _sk_new_subject == 0 )); then
                 _sk_close_row=$(_skeptic_close_settlement "$pending_dir" "$sw_safe") || _sk_close_row=""
             fi
             if [[ -n "$_sk_close_row" ]]; then
@@ -6399,6 +6695,12 @@ _wrapup_skeptic_step() {
                 printf 'ledger row: %s\n' "$_sk_close_row"
                 printf 'Nothing has armed this key since that row, so re-arming here would\n'
                 printf 'reopen a settled obligation against a creditor that may have retired.\n'
+                # your-org/nexus-code#1619 — keyed on the SUBJECT: a deliverable never
+                # armed here took the `new` arm above and never reaches this line.
+                printf 'subject   : %s (%s) sha256 %s\n' "${_sk_subj_class:-unknown}" "${_sk_subj_detail:--}" "${_sk_subj_sha:--}"
+                printf 'adjudication request: %s\n' "$(_skeptic_file_rearm_adjudication "$source_window" "$issue" \
+                    "${_SK_REPORT_PATH:-}" "${_sk_subj_sha:--}" "${_sk_subj_class:-unknown}" \
+                    "${_sk_subj_detail:--}" "settled-by-ledger-row")"
                 if [[ -e "$pending_dir/${sw_safe}" ]]; then
                     printf 'CONSEQUENCE: no NEW marker written and no spawn-skeptic request filed.\n'
                     printf 'A marker already exists on this key, so check it before retiring.\n'
@@ -6461,8 +6763,17 @@ _wrapup_skeptic_step() {
             # and stale verdicts do not pollute the new round. await
             # independently refuses a DONE older than the marker; this is the
             # fail-fast half of that pair.
-            [[ -n "$source_window" ]] \
-                && "$_script_dir/skeptic-channel.sh" reset "$source_window" >/dev/null 2>&1 || true
+            # …and SAY what moved (your-org/nexus-code#1609): the output used to be
+            # discarded here too, so the archive of the prior round's answered
+            # correspondence reached nobody. A failed reset is reported, not
+            # swallowed; the marker below is written either way (refusing side).
+            if [[ -n "$source_window" ]]; then
+                local _wu_reset_out="" _wu_reset_rc=0
+                _wu_reset_out=$("$_script_dir/skeptic-channel.sh" reset "$source_window" 2>&1) || _wu_reset_rc=$?
+                [[ -n "$_wu_reset_out" ]] && printf '%s\n' "$_wu_reset_out"
+                (( _wu_reset_rc == 0 )) || printf 'WARNING: archiving the prior skeptic round for %s FAILED (rc=%s) — its DONE/answered files may still be in the channel (#469).\n' \
+                    "$source_window" "$_wu_reset_rc"
+            fi
             [[ -n "$sw_safe" ]] && printf '%s' "$next" > "$pending_dir/${sw_safe}" 2>/dev/null || true
             # RECORD WHAT THIS ARM IS ABOUT (your-org/nexus-code#984, #963).
             #
@@ -6485,6 +6796,13 @@ _wrapup_skeptic_step() {
                 if [[ -n "$_sk_arm_sha" ]]; then
                     _skeptic_record_arm "$pending_dir" "$sw_safe" \
                         "$_sk_arm_sha" "$issue" "${_SK_REPORT_PATH:-}"
+                fi
+                # The owed delta is now carried by the MARKER (and the arm): hand
+                # the promise over, keeping the record for the audit trail. Only
+                # when the marker really exists — otherwise retire-preflight's
+                # delta check keeps refusing, which is the safe side.
+                if (( _sk_delta_owed )) && [[ -e "$pending_dir/${sw_safe}" ]]; then
+                    mv -f "$_sk_delta_file" "$_sk_delta_file.armed-$(date +%Y%m%dT%H%M%S)" 2>/dev/null || true
                 fi
             fi
             ( cmd_log_action monitor --event skeptic-request \
@@ -6570,6 +6888,14 @@ _wrapup_skeptic_step() {
             printf '            (which cleared your pending marker) but never closed the\n'
             printf '            channel. Nothing further can arrive — do NOT re-enter\n'
             printf '            await. Read its report and proceed to retire.\n'
+            printf '  exit 14 → ENDED-WITHOUT-VERDICT: the channel was closed or the gate\n'
+            printf '            released, and the ledger records NO verdict covering your\n'
+            printf '            current artefact. A channel closing is not a verdict\n'
+            printf '            arriving: do NOT re-enter, do NOT report this work as\n'
+            printf '            reviewed, and tell the orchestrator if you expected one.\n'
+            printf '  exit 15 → NO-ROUND-OPEN: nothing is armed for this window (or the DONE\n'
+            printf '            here was already delivered to an earlier await). Nobody is\n'
+            printf '            appointed to end the wait — do NOT loop on it (#1537, #1538).\n'
             ;;
         denied-spawn)
             # WHAT THIS ARM ACTUALLY KNOWS (your-org/nexus-code#1205). It knows
@@ -7646,21 +7972,26 @@ _skeptic_window_reports() {
 #      this as armed-with-a-subject, because a marker will still exist.
 #   2  usage.
 cmd_skeptic_arm() {
-    local window="" report="" issue="" state_dir=""
+    # depth 1 is a value WE CHOSE for a marker this verb has to create: the
+    # marker's content is the recursion depth, the orchestrator appointing a
+    # reviewer for a worker is depth 1, and an existing marker is never rewritten.
+    local window="" report="" issue="" state_dir="" depth=1
     _argloop_prev_37=-1; while (( $# > 0 )); do (( $# != _argloop_prev_37 )) || _argloop_stuck "skeptic-arm $1"; _argloop_prev_37=$#
         case "$1" in
             --report)    _need_val --report    "$#" "${2:-}"; report="$2";    shift 2 ;;
             --issue)     _need_val --issue     "$#" "${2:-}"; issue="$2";     shift 2 ;;
             --state-dir) _need_val --state-dir "$#" "${2:-}"; state_dir="$2"; shift 2 ;;
+            --depth)     _need_val --depth     "$#" "${2:-}"; depth="$2";     shift 2 ;;
             --*) die "skeptic-arm: unknown flag: $(_arg_excerpt "$1")" ;;
             *) if [[ -z "$window" ]]; then window="$1"; shift
                else die "skeptic-arm: unexpected argument: $(_arg_excerpt "$1")"; fi ;;
         esac
     done
     [[ -n "$window" && -n "$report" ]] || {
-        echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--state-dir D]" >&2
+        echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--depth N] [--state-dir D]" >&2
         return 2
     }
+    [[ "$depth" =~ ^[0-9]+$ ]] || { echo "ng skeptic-arm: --depth must be an integer" >&2; return 2; }
     local sd="${state_dir:-$STATE_DIR}"
     local pend="$sd/skeptic/pending"
     local key; key=$(wk_encode "$window")
@@ -7692,11 +8023,143 @@ cmd_skeptic_arm() {
     if [[ -n "$arms" ]] && grep -qx "$sha" <<<"$arms"; then
         printf 'ng skeptic-arm: %s already has this artefact OUTSTANDING (%s…) — nothing appended.\n' \
             "$window" "${sha:0:12}" >&2
+        # An OUTSTANDING arm with NO marker is the two stores disagreeing in the
+        # fail-OPEN direction for `await` (#1537): restore the marker, loudly.
+        _skeptic_arm_open_round "$sd" "$pend" "$key" "$window" "$depth" restore
         return 3
     fi
     mkdir -p "$pend" 2>/dev/null || true
     _skeptic_record_arm "$pend" "$key" "$sha" "$issue" "$rp"
+    _skeptic_arm_open_round "$sd" "$pend" "$key" "$window" "$depth" open
     printf 'armed %s sha=%s issue=%s report=%s\n' "$window" "$sha" "${issue:--}" "$rp"
+    return 0
+}
+
+# _skeptic_arm_open_round <state-dir> <pending-dir> <key> <window> <depth> <open|restore>
+#
+# AN ARM WITHOUT A MARKER IS A ROUND `await` CANNOT SEE (your-org/nexus-code#1537,
+# #1538). `await`'s staleness guard compares the DONE sentinel against the pending
+# MARKER; this verb wrote the LEDGER row and not the marker, so the first thing a
+# correctly-armed second pass saw was the previous round's DONE at exit 10 —
+# measured ~54 minutes on `proj-fig-a` with the ledger reading
+# `rearm-after-close standing_stale=1` throughout. One re-arm path, two stores,
+# and the authoritative one was not the one the gate read.
+#
+# ORDER: the `armed` row is already on the ledger when this runs (the per-task
+# gate is shut), THEN the prior round's sentinels are archived, THEN the marker
+# is written — the order `ng wrap-up --skeptic-decision require` uses. An
+# interruption at any point leaves MORE refusing, never less.
+#
+# `restore` (the already-outstanding path) writes a marker only when none exists
+# and archives nothing: an outstanding arm's round is the CURRENT one, and its
+# sentinels are not stale. An existing marker is never rewritten — its content is
+# a recursion depth another writer chose.
+_skeptic_arm_open_round() {
+    local sd="$1" pend="$2" key="$3" window="$4" depth="$5" mode="$6"
+    local marker="$pend/$key"
+    if [[ "$mode" == "open" ]]; then
+        # THE ARCHIVE PATH IS PRINTED, NOT DISCARDED (your-org/nexus-code#1609).
+        # This used to be `>/dev/null 2>&1 || true`: `reset` MOVES the prior
+        # round's DONE and its whole `*.answered.md` correspondence into
+        # skeptic/.archive/, and said where — to nobody. On stderr, beside this
+        # function's other notices, because spawn-worker.sh captures stdout+stderr
+        # together and shows it only on a failure; stdout stays the one `armed`
+        # line. A FAILED reset is no longer swallowed either: the arm is already
+        # on the ledger (see ORDER above), so it is reported, loudly, and the
+        # marker is still written — more refusing, never less.
+        local _reset_out="" _reset_rc=0
+        _reset_out=$(NEXUS_STATE_DIR="$sd" "$_script_dir/skeptic-channel.sh" reset "$window" 2>&1) || _reset_rc=$?
+        [[ -n "$_reset_out" ]] && printf 'ng skeptic-arm: %s\n' "$_reset_out" >&2
+        if (( _reset_rc != 0 )); then
+            printf 'ng skeptic-arm: WARNING — archiving the prior round for %s FAILED (rc=%s); its DONE or answered files may still sit in the channel, so `await` can read them as this round'"'"'s (#469).\n' \
+                "$window" "$_reset_rc" >&2
+        fi
+    fi
+    if [[ ! -e "$marker" ]]; then
+        if printf '%s' "$depth" > "$marker" 2>/dev/null; then
+            printf 'ng skeptic-arm: opened the round for %s — wrote the skeptic-pending marker (depth %s) that `await` and retire-preflight check 1b read.\n' \
+                "$window" "$depth" >&2
+        else
+            printf 'ng skeptic-arm: WARNING — could not write the pending marker %s; `await` on %s can still read a prior round'"'"'s DONE as current (#1537).\n' \
+                "$marker" "$window" >&2
+        fi
+    fi
+}
+
+# `ng skeptic-ledger-rotate <window> [--state-dir D]`
+# A REUSED WINDOW NAME MUST NOT MERGE UNRELATED ROUNDS (your-org/nexus-code#1252).
+#
+# The ledger is keyed on the WINDOW NAME and names are recycled freely across
+# tasks and days, so a name's ledger became a union of unrelated reviews:
+# `open=N` and `verdicts=N` counted rounds that had nothing to do with each other,
+# and a standing verdict from LAST WEEK's task could read as evidence about this
+# one. `spawn-worker.sh` calls this on every FRESH spawn (never on `--resume`).
+#
+# WE CHOSE rotation over a composite `(window, spawn-origin)` key. The composite
+# key is the sounder design, but every ledger reader would have to take the
+# origin and the origin has its own injectivity history (#960); rotation needs
+# one writer and no reader changes. This is option (a) of the #1252 thread, in
+# its SAFE form:
+#
+#   · a ledger with ANYTHING OUTSTANDING is NEVER rotated (exit 5). Silently
+#     dropping a REQUIRED obligation is the failure the marker exists to prevent;
+#     an unsettled round on a reused name stays on the key, loudly, and the new
+#     session inherits it — the fail-CLOSED direction.
+#   · a pending MARKER on the key likewise refuses, whatever the ledger says.
+#   · a ledger that cannot be READ refuses: "could not look" is not "settled".
+#   · a SETTLED ledger moves to skeptic/.archive/<key>.ledger-<ts> — archived, not
+#     deleted, beside the channel archives (#1434).
+#
+# What rotation COSTS, stated: the new session's `skeptic-evidence` starts from
+# `ledger=absent`, so a re-publication of bytes reviewed under the OLD session is
+# armed and reviewed again rather than suppressed. More review, never less.
+#
+#   0  rotated          3  nothing to rotate (no ledger on this key)
+#   5  REFUSED — outstanding arm, pending marker, or unreadable ledger; kept
+#   2  usage
+cmd_skeptic_ledger_rotate() {
+    local window="" state_dir=""
+    _argloop_prev_lr=-1; while (( $# > 0 )); do (( $# != _argloop_prev_lr )) || _argloop_stuck "skeptic-ledger-rotate $1"; _argloop_prev_lr=$#
+        case "$1" in
+            --state-dir) _need_val --state-dir "$#" "${2:-}"; state_dir="$2"; shift 2 ;;
+            --*) die "skeptic-ledger-rotate: unknown flag: $(_arg_excerpt "$1")" ;;
+            *) if [[ -z "$window" ]]; then window="$1"; shift
+               else die "skeptic-ledger-rotate: unexpected argument: $(_arg_excerpt "$1")"; fi ;;
+        esac
+    done
+    [[ -n "$window" ]] || { echo "usage: ng skeptic-ledger-rotate <window> [--state-dir D]" >&2; return 2; }
+    local sd="${state_dir:-$STATE_DIR}"
+    local pend="$sd/skeptic/pending"
+    local key; key=$(wk_encode "$window")
+    local ledger; ledger=$(_skeptic_ledger_file "$pend" "$key")
+    if [[ ! -e "$ledger" ]]; then
+        printf 'ng skeptic-ledger-rotate: no ledger on key %s — nothing to rotate.\n' "$key"
+        return 3
+    fi
+    local arms="" arms_rc=0
+    arms=$(_skeptic_open_arms "$pend" "$key") || arms_rc=$?
+    if (( arms_rc != 0 )); then
+        printf 'ng skeptic-ledger-rotate: REFUSED — the ledger for %s could not be read (%s). "Could not look" is not "settled"; kept.\n' "$window" "$ledger" >&2
+        return 5
+    fi
+    if [[ -n "$arms" ]]; then
+        printf 'ng skeptic-ledger-rotate: REFUSED — %s still has %s artefact(s) OUTSTANDING from an earlier session on this name; the ledger is KEPT and this session inherits the obligation (your-org/nexus-code#1252).\n' \
+            "$window" "$(grep -c . <<<"$arms")" >&2
+        printf '  Settle it on the record first if it is truly unrelated:  ng skeptic resolve %s --reason "…"\n' "$window" >&2
+        return 5
+    fi
+    if [[ -e "$pend/$key" ]]; then
+        printf 'ng skeptic-ledger-rotate: REFUSED — a skeptic-pending marker exists for %s; a review is pending on this name. Ledger kept.\n' "$window" >&2
+        return 5
+    fi
+    local adir="$sd/skeptic/.archive" ts
+    ts=$(date +%Y-%m-%dT%H%M%S 2>/dev/null) || ts="unknown"
+    mkdir -p "$adir" 2>/dev/null || { printf 'ng skeptic-ledger-rotate: REFUSED — cannot create %s; ledger kept.\n' "$adir" >&2; return 5; }
+    local dest="$adir/$key.ledger-$ts"
+    [[ -e "$dest" ]] && dest="$dest.$$"
+    mv "$ledger" "$dest" 2>/dev/null || { printf 'ng skeptic-ledger-rotate: REFUSED — could not move %s; ledger kept.\n' "$ledger" >&2; return 5; }
+    ( cmd_log_action monitor --event skeptic-ledger-rotate --extra "window=$window" --extra "archived=$dest" ) >/dev/null 2>&1 || true
+    printf 'rotated the settled skeptic ledger for %s → %s\n' "$window" "$dest"
     return 0
 }
 
@@ -9140,16 +9603,10 @@ _wrapup_record_dir() {   # <window-or-empty> -> dir path
     printf '%s/wrap-up-output/%s' "$STATE_DIR" "$key"
 }
 
-# _wrapup_record_open <argv...> -> path of a fresh record with its header written
-# rc 1 (and nothing printed) when the record cannot be created; the caller then
-# runs the verb UNRECORDED rather than refusing a hand-off over bookkeeping.
-_wrapup_record_open() {
-    local w dir f ts a
+# _wrapup_record_header <file> <argv...> — write the record's header; rc 1 on failure.
+_wrapup_record_header() {
+    local f="$1" w a; shift
     w=$(_report_tmux_window)
-    dir=$(_wrapup_record_dir "$w")
-    mkdir -p "$dir" 2>/dev/null || return 1
-    ts=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null) || ts="unknown"
-    f="$dir/${ts}.$$.txt"
     {
         printf '# ng wrap-up — persisted invocation record (your-org/nexus-code#1370)\n'
         printf '# Re-read with: ng wrap-up --last [<window>]   — READ-ONLY: arms nothing, posts nothing.\n'
@@ -9159,12 +9616,40 @@ _wrapup_record_open() {
         printf 'argv: ng wrap-up'
         for a in "$@"; do printf ' %q' "$a"; done
         printf '\n---\n'
-    } > "$f" 2>/dev/null || return 1
+    } > "$f" 2>/dev/null
+}
+
+# _wrapup_record_path -> path for a fresh record (its directory created); rc 1
+# when the directory cannot be made.
+_wrapup_record_path() {
+    local dir ts
+    dir=$(_wrapup_record_dir "$(_report_tmux_window)")
+    mkdir -p "$dir" 2>/dev/null || return 1
+    ts=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null) || ts="unknown"
+    printf '%s/%s.%s.txt' "$dir" "$ts" "$$"
+}
+
+# _wrapup_record_publish <record> — repoint `last` at it and prune the window's
+# store to the newest 20. The two writes that make a record the one `--last`
+# replays; a record that has not been through here is invisible to `--last`.
+_wrapup_record_publish() {
+    local f="$1" dir a
+    dir=$(dirname "$f")
     ln -sfn "$(basename "$f")" "$dir/last" 2>/dev/null || true
-    # Bounded: keep the newest 20 records per window.
     local -a old
     old=( $(ls -1 "$dir" 2>/dev/null | grep -E '\.txt$' | sort | head -n -20) )
     for a in "${old[@]}"; do rm -f "$dir/$a" 2>/dev/null; done
+    return 0
+}
+
+# _wrapup_record_open <argv...> -> path of a fresh record with its header written
+# rc 1 (and nothing printed) when the record cannot be created; the caller then
+# runs the verb UNRECORDED rather than refusing a hand-off over bookkeeping.
+_wrapup_record_open() {
+    local f
+    f=$(_wrapup_record_path) || return 1
+    _wrapup_record_header "$f" "$@" || return 1
+    _wrapup_record_publish "$f"
     printf '%s' "$f"
 }
 
@@ -9223,6 +9708,22 @@ _wrapup_show_record() {
 # `die` inside the verb is a bare `exit` that would otherwise leave the record
 # without its footer and the readers without an EOF to drain to.
 _WU_REC=""; _WU_FIFO_DIR=""; _WU_P1=""; _WU_P2=""; _WU_SO=""; _WU_SE=""
+# your-org/nexus-code#1608 (skeptic item 6): a `--dry-run` promises it WRITES
+# NOTHING, and the record used to break that promise before the verb had
+# parsed a single flag — a record file, `last` repointed at it (so `--last`
+# replayed the PREVIEW instead of the real hand-off it exists to recover), and
+# a prune that could delete a real run's record to make room for it.
+#
+# The wrapper cannot decide "is this a dry run" from argv on its own: every
+# value flag accepts a leading-dash value (`_need_val` refuses only an empty
+# one), so `--skeptic-rationale --dry-run` carries the token without being one.
+# So the token only makes the run a CANDIDATE: its record is STAGED in the
+# FIFO scratch dir (`_WU_STAGED=1`), and the verb's own arg loop — the one
+# authority on what `--dry-run` means — sets `_WU_DRY_CONFIRMED=1`. At finish a
+# confirmed dry run's staged record is discarded with the scratch dir; an
+# unconfirmed one is moved into the store and published exactly as before.
+# A run with no such token takes the unchanged, progressively-persisted path.
+_WU_STAGED=0; _WU_DRY_CONFIRMED=0
 
 _wrapup_record_finish() {   # <rc>
     local rc="${1:-0}"
@@ -9236,37 +9737,58 @@ _wrapup_record_finish() {   # <rc>
     fi
     [[ -n "${_WU_P1:-}" ]] && wait "$_WU_P1" 2>/dev/null
     [[ -n "${_WU_P2:-}" ]] && wait "$_WU_P2" 2>/dev/null
-    [[ -n "${_WU_FIFO_DIR:-}" ]] && rm -rf "$_WU_FIFO_DIR"
+    # The footer BEFORE the scratch dir goes: a staged record lives in it.
     printf -- '---\nrc: %s\n' "$rc" >> "$_WU_REC" 2>/dev/null
-    if (( rc != 0 )); then
+    local persisted=1
+    if (( _WU_STAGED == 1 )); then
+        if (( _WU_DRY_CONFIRMED == 1 )); then
+            persisted=0      # a preview: discarded with the scratch dir below
+        else
+            local dest
+            if dest=$(_wrapup_record_path) && mv -f "$_WU_REC" "$dest" 2>/dev/null; then
+                _wrapup_record_publish "$dest"
+                _WU_REC="$dest"
+            else
+                persisted=0
+                printf 'ng wrap-up: NOTE — could not persist this run'"'"'s output under %s; `--last` will not be able to replay it.\n' "$STATE_DIR/wrap-up-output" >&2
+            fi
+        fi
+    fi
+    [[ -n "${_WU_FIFO_DIR:-}" ]] && rm -rf "$_WU_FIFO_DIR"
+    if (( rc != 0 && persisted == 1 )); then
         printf 'ng wrap-up: this output is persisted at %s\n' "$_WU_REC" >&2
         printf '  Re-read it with `ng wrap-up --last` (READ-ONLY — arms nothing, posts nothing). Do NOT re-run\n' >&2
         printf '  the verb to see this again: every run re-arms the skeptic step (your-org/nexus-code#1370).\n' >&2
     fi
     _WU_REC=""; _WU_FIFO_DIR=""; _WU_P1=""; _WU_P2=""; _WU_SO=""; _WU_SE=""
+    _WU_STAGED=0; _WU_DRY_CONFIRMED=0
     return 0
 }
 
 _cmd_wrap_up_recorded() {
     # No _help_check here: it keys the usage arm on FUNCNAME[1], and the arm
     # belongs to cmd_wrap_up, which runs it.
-    local _wu_a _wu_mode=""
+    local _wu_a _wu_mode="" _wu_dry=0
     for _wu_a in "$@"; do
         case "$_wu_a" in
             --last)    _wu_mode=last ;;
             --explain) _wu_mode=explain ;;
+            --dry-run) _wu_dry=1 ;;   # a CANDIDATE only — see _WU_STAGED above
         esac
     done
     if [[ -n "$_wu_mode" ]]; then
         _wrapup_show_record "$_wu_mode" "$@"
         return $?
     fi
+    _WU_STAGED=0; _WU_DRY_CONFIRMED=0
     local _wu_rec=""
-    _wu_rec=$(_wrapup_record_open "$@") || _wu_rec=""
-    if [[ -z "$_wu_rec" ]]; then
-        printf 'ng wrap-up: NOTE — could not persist this run'"'"'s output under %s; `--last` will not be able to replay it.\n' "$STATE_DIR/wrap-up-output" >&2
-        cmd_wrap_up "$@"
-        return $?
+    if (( _wu_dry == 0 )); then
+        _wu_rec=$(_wrapup_record_open "$@") || _wu_rec=""
+        if [[ -z "$_wu_rec" ]]; then
+            printf 'ng wrap-up: NOTE — could not persist this run'"'"'s output under %s; `--last` will not be able to replay it.\n' "$STATE_DIR/wrap-up-output" >&2
+            cmd_wrap_up "$@"
+            return $?
+        fi
     fi
     local _wu_fifo_dir _wu_fo _wu_fe _wu_rc
     _wu_fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/ng-wrapup-rec.XXXXXX" 2>/dev/null) || _wu_fifo_dir=""
@@ -9275,6 +9797,17 @@ _cmd_wrap_up_recorded() {
         printf 'ng wrap-up: NOTE — no FIFO for the output record; running unrecorded.\n' >&2
         cmd_wrap_up "$@"
         return $?
+    fi
+    if (( _wu_dry == 1 )); then
+        # Staged, not stored: nothing under $STATE_DIR is touched unless the
+        # verb's arg loop says the token was NOT the flag.
+        _wu_rec="$_wu_fifo_dir/record.txt"
+        if ! _wrapup_record_header "$_wu_rec" "$@"; then
+            rm -rf "$_wu_fifo_dir"
+            cmd_wrap_up "$@"
+            return $?
+        fi
+        _WU_STAGED=1
     fi
     _wu_fo="$_wu_fifo_dir/o"; _wu_fe="$_wu_fifo_dir/e"
     # Save the caller's streams; the readers below inherit them, and
@@ -9439,19 +9972,54 @@ _wu_guards_applicable() {   # <report> -> rc 0 iff the automatic arm applies
     corpus=$(realpath -m "$corpus" 2>/dev/null) || true
     [[ "$rp" == "$corpus"/* ]]
 }
-_wu_guards_preflight() {   # <report> <strict:0|1> ; rc 1 only when strict and something is unreported
+_wu_guards_preflight() {   # <report> <strict:0|1> ; rc 1 only when strict and something is unreported OR the selector could not answer (#1588)
     local report="$1" strict="${2:-0}" top bin selected rc line suite base missing=0 n_sel=0
     top=$(git rev-parse --show-toplevel 2>/dev/null) || top="."
     bin="${NG_GUARDS_FOR_DIFF_BIN:-$top/monitor/guards-for-diff.sh}"
     [[ -f "$bin" ]] || { printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): %s not found — skipped, NOT clear.\n' "$bin" >&2; return 0; }
-    selected=$(timeout "${NG_WRAPUP_GUARDS_TIMEOUT:-600}" bash "$bin" --quiet 2>/dev/null); rc=$?
+    # THE SELECTOR'S STDERR IS KEPT (your-org/nexus-code#1588). It used to go to
+    # /dev/null, and the one line it carries on a refusal is the NAME OF THE
+    # PROBE THAT ERRORED — so three consecutive primary-clone wrap-ups printed
+    # "a population probe errored" and none could say which; finding out took a
+    # 535 s re-run by hand. `rc=$?` is read on the very next line, before
+    # anything else can write `$?` (#1202).
+    local errf unmeasured=""
+    errf=$(mktemp "${TMPDIR:-/tmp}/ng-wu-gfd-err.XXXXXX") || errf=/dev/null
+    selected=$(timeout "${NG_WRAPUP_GUARDS_TIMEOUT:-600}" bash "$bin" --quiet 2>"$errf"); rc=$?
     case "$rc" in
         0) ;;
-        3) printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): no registered guard reads this diff (exit 3) — a measured answer, NOT a clearance (#1078).\n' >&2; return 0 ;;
-        2) printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): guards-for-diff REFUSED (exit 2) — a population probe errored; nothing here is clear.\n' >&2; return 0 ;;
-        124|137) printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): the selector did not finish within %ss — UNMEASURED, not clear.\n' "${NG_WRAPUP_GUARDS_TIMEOUT:-600}" >&2; return 0 ;;
-        *) printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): selector exit %s — UNMEASURED, not clear.\n' "$rc" >&2; return 0 ;;
+        3) [[ "$errf" == /dev/null ]] || rm -f "$errf"
+           printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): no registered guard reads this diff (exit 3) — a measured answer, NOT a clearance (#1078).\n' >&2; return 0 ;;
+        2) unmeasured="guards-for-diff REFUSED (exit 2) — a population probe errored; nothing here is clear." ;;
+        # 124 alone is the DEFAULT `timeout` only; a hardened call injects 137
+        # (-s KILL) or 143 (--preserve-status), and 125-127 are the wrapper
+        # failing to run the selector at all (#1248). None is a selector verdict.
+        124|125|126|127|137|143) unmeasured="the selector did not finish within ${NG_WRAPUP_GUARDS_TIMEOUT:-600}s, or could not be run (exit $rc, a \`timeout\` wrapper status) — UNMEASURED, not clear." ;;
+        *) unmeasured="selector exit $rc — UNMEASURED, not clear." ;;
     esac
+    if [[ -n "$unmeasured" ]]; then
+        printf 'ng wrap-up: guards pre-flight (your-org/nexus-code#1459): %s\n' "$unmeasured" >&2
+        # Name the probe. The selector's own REFUSED block is the diagnosis;
+        # bounded, because a probe's stderr can be a whole traceback.
+        if [[ "$errf" != /dev/null && -s "$errf" ]]; then
+            printf 'ng wrap-up: guards pre-flight: what the selector said (first 12 lines of its stderr):\n' >&2
+            sed -n '1,12s/^/    /p' "$errf" >&2
+        else
+            printf 'ng wrap-up: guards pre-flight: the selector wrote NOTHING to stderr — re-run `bash %s --quiet` to see which probe it was on.\n' "$bin" >&2
+        fi
+        [[ "$errf" == /dev/null ]] || rm -f "$errf"
+        # FAIL-CLOSED UNDER --strict-guards (#1588). Strict used to act only on
+        # the SELECTED-BUT-UNREPORTED path below, so a selector that refused,
+        # timed out or crashed PASSED a strict wrap-up: the fail-open direction,
+        # in exactly the mode that asked not to be. "Could not measure" is not
+        # "nothing unreported".
+        if (( strict == 1 )); then
+            printf 'ng wrap-up: REFUSED under --strict-guards — the selector produced NO selection, so "every selected guard is reported" is unestablished, not true. Fix the probe named above (or re-run once it answers), or drop --strict-guards to proceed on an advisory.\n' >&2
+            return 1
+        fi
+        return 0
+    fi
+    [[ "$errf" == /dev/null ]] || rm -f "$errf"
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         suite="${line#bash }"; base="${suite##*/}"
@@ -9476,6 +10044,68 @@ _wu_guards_preflight() {   # <report> <strict:0|1> ; rc 1 only when strict and s
     return 0
 }
 
+
+# _wrapup_print_published_body <body>
+# your-org/nexus-code#1608: on the SUCCESS path, show the bytes that were just
+# published. The refusal paths already print the composed text; the success
+# path printed only a URL, so what an edit did to the teaser was visible only
+# by opening the thread. Indented and fenced so it cannot be mistaken for a
+# status line by a reader scanning `posted comment:`.
+_wrapup_print_published_body() {
+    local b="${1:-}"
+    [[ -n "$b" ]] || return 0
+    printf -- '--- published comment body ---\n'
+    printf '%s\n' "$b" | sed 's/^/  | /'
+    printf -- '------------------------------\n'
+}
+
+# _wrapup_dry_run_print <report> <no_comment> <body_file> <channel_mode> <answer_file> <issue> <reply_to>
+# your-org/nexus-code#1608. Composes BOTH bodies with the SAME composers the
+# publishing path uses — `_wrapup_report_summary` for the GitHub link comment
+# (roughly the first sentence, capped) and `_wrapup_report_section_summary`
+# for `--reply-to` (the full Summary, untruncated) — so the preview cannot
+# drift from what travels. The asset URL does not exist yet (nothing was
+# uploaded), so it is shown as a placeholder. Writes nothing.
+_wrapup_dry_run_print() {
+    local rp="$1" nc="$2" bf="$3" cm="$4" af="$5" iss="$6" rt="$7"
+    local url="<asset-url: assigned at upload>" title summary src=0 body=""
+    printf '=== DRY RUN (--dry-run): nothing uploaded, posted, rocketed, armed or logged ===\n'
+    printf 'report: %s\n' "$rp"
+    if [[ -z "$iss" ]]; then
+        printf '\n[GitHub link comment] none — channel-only wrap-up (no issue)\n'
+    elif (( nc == 1 )); then
+        printf '\n[GitHub link comment] none — --no-comment\n'
+    elif [[ -n "$bf" ]]; then
+        body=$(<"$bf")
+        if [[ "$body" == *"{{REPORT_URL}}"* ]]; then body="${body//\{\{REPORT_URL\}\}/$url}"
+        else body="${body}"$'\n\nFull report: '"$url"; fi
+        printf '\n[GitHub link comment on #%s] from --comment-body-file %s:\n' "$iss" "$bf"
+        printf '%s\n' "$body" | sed 's/^/  | /'
+    else
+        title=$(_wrapup_report_title "$rp")
+        summary=$(_wrapup_report_summary "$rp") || src=$?
+        if (( src == 2 )); then
+            printf '\n[GitHub link comment on #%s] WOULD BE REFUSED — the composed teaser carries no claim (your-org/nexus-code#1114): %q\n' "$iss" "$summary"
+        else
+            if   [[ -z "$title" ]];   then body=$(printf '## %s\n\nReport: %s\n' "${rp##*/}" "$url")
+            elif [[ -n "$summary" ]]; then body=$(printf '## %s\n\n%s\n\nFull report: %s\n' "$title" "$summary" "$url")
+            else                           body=$(printf '## %s\n\nFull report: %s\n' "$title" "$url"); fi
+            printf '\n[GitHub link comment on #%s] composed from the FIRST SENTENCE of `## Summary` (<=200 chars):\n' "$iss"
+            printf '%s\n' "$body" | sed 's/^/  | /'
+        fi
+    fi
+    if (( cm == 1 )); then
+        printf '\n[--reply-to %s channel body]' "$rt"
+        if [[ -n "$af" ]]; then
+            printf ' from --answer-file %s:\n' "$af"
+            sed 's/^/  | /' -- "$af"
+        else
+            printf ' the FULL `## Summary` section, untruncated:\n'
+            _wrapup_report_section_summary "$rp" | sed 's/^/  | /'
+        fi
+    fi
+    printf '\nRe-run without --dry-run to publish.\n'
+}
 
 cmd_wrap_up() {
     _help_check "$@"
@@ -9508,6 +10138,7 @@ cmd_wrap_up() {
     local -a positionals=()
     local answer_file="" issue_flag=""
     local trigger_comment="" repo_arg="" trigger_repo_arg="" body_file="" no_comment=0 allow_stub=0
+    local dry_run=0   # your-org/nexus-code#1608 — compose and SHOW, write nothing
     local guards_mode="" guards_strict=0
     local retain_reason="" no_retain=0
     # Skeptic-protocol flags (skills/nexus.skeptic). All optional and
@@ -9525,6 +10156,7 @@ cmd_wrap_up() {
             --trigger-repo)     _need_val --trigger-repo "$#" "${2:-}"; trigger_repo_arg="$2";  shift 2 ;;
             --comment-body-file) _need_val --comment-body-file "$#" "${2:-}"; body_file="$2";        shift 2 ;;
             --no-comment)       no_comment=1;               shift   ;;
+            --dry-run)          dry_run=1; _WU_DRY_CONFIRMED=1; shift ;;   # #1608: tells the recording wrapper
             --allow-stub)       allow_stub=1;               shift   ;;
             --guards)            guards_mode=force;          shift   ;;
             --no-guards-preflight) guards_mode=skip;         shift   ;;
@@ -9768,6 +10400,19 @@ EOF
             cat "$err_buf"
         } >&2
         return 1
+    fi
+
+    # Step 0-dry (your-org/nexus-code#1608): SHOW WHAT WOULD TRAVEL, AND STOP.
+    # The composed text used to be printed only on the REFUSAL paths, so an
+    # author could fix `## Summary` and silently break the teaser (or the
+    # reverse) with nothing visible before publication. Placed after the
+    # report-check (a dry run of a report that would be refused says so) and
+    # BEFORE Step 0b, which ARMS a skeptic gate: a preview must not arm (#1370).
+    # No upload, no comment, no rocket, no request, no log, no marker.
+    if (( dry_run == 1 )); then
+        _wrapup_dry_run_print "$report_path" "$no_comment" "$body_file" \
+            "$channel_mode" "$answer_file" "$issue" "$reply_to"
+        return 0
     fi
 
     # #1095 item 2 — THE ADVISORY LIVES HERE, not in `cmd_report_check`.
@@ -10493,6 +11138,7 @@ EOF
     fi
     if [[ "$comment_st" == ok ]]; then
         printf 'posted comment: %s\n' "$comment_url"
+        _wrapup_print_published_body "${body:-}"
     elif [[ "$comment_st" == updated ]]; then
         # your-org/nexus-code#656: the headline word was `UPDATED`, which
         # reads as "your correction is published" for a run that published
@@ -10513,6 +11159,7 @@ EOF
         printf 'posted comment: NOTHING PUBLISHED %s (report changed, composed body did not — see stderr)\n' "$comment_url"
     elif [[ "$comment_st" == edited ]]; then
         printf 'posted comment: EDITED %s (composed body changed — the comment was updated in place)\n' "$comment_url"
+        _wrapup_print_published_body "${body:-}"
     elif [[ "$comment_st" == updated-and-posted ]]; then
         # #605: say plainly that BOTH things happened. The old line said
         # `UPDATED` for a run that had published none of the caller's
@@ -14690,6 +15337,83 @@ cmd_decision_ack() {
         "$acked" "$window"
     return 0
 }
+# ng decision-answer <window> <fp> allow|deny --nonce <nonce> [--reason <text>]
+#
+# ANSWER a worker's forwarded dangerous-rm request (your-org/nexus-code#1632).
+# The worker's PermissionRequest hook (monitor/hooks/dangerous-rm-decide.sh)
+# files a `kind: dangerous_rm` row in `decisions/` and waits — at most its
+# deadline, which sits inside Claude Code's own 2-minute auto-deny — for an
+# answer at `decisions/answers/<window>.<fp>.json`. This verb writes that
+# answer. No answer in time is a DENY; this verb is the only way to an allow.
+#
+# ORCHESTRATOR-ONLY, and what that does and does not mean. It refuses inside a
+# worker session (NEXUS_WORKER_WINDOW set), and the hook refuses an answer
+# stamped with the REQUESTING session's id. Both stop an accidental or stale
+# self-approval; neither stops a same-uid process that forges the JSON by hand.
+# The answer records the answering window, Claude session and tmux pane, and
+# the hook copies them into its ledger, so a forgery is attributable.
+#
+# The --nonce is the one printed on the row. It binds the answer to the request
+# the orchestrator actually READ: a request that expired, or a different one,
+# is refused rather than answered.
+cmd_decision_answer() {
+    _help_check "$@"
+    local window="" fp="" decision="" nonce="" reason=""
+    _argloop_prev_da=-1; while (( $# > 0 )); do (( $# != _argloop_prev_da )) || _argloop_stuck "$1"; _argloop_prev_da=$#
+        case "$1" in
+            --nonce)  _need_val --nonce  "$#" "${2:-}"; nonce="$2";  shift 2 ;;
+            --reason) _need_val --reason "$#" "${2:-}"; reason="$2"; shift 2 ;;
+            -*) die "unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$window" ]]; then window="$1"
+                elif [[ -z "$fp" ]]; then fp="$1"
+                elif [[ -z "$decision" ]]; then decision="$1"
+                else die "unexpected POSITIONAL argument $(_arg_excerpt "$1"). Flags must start with --; positionals are matched in order."; fi
+                shift ;;
+        esac
+    done
+    local usage="usage: ng decision-answer <window> <fp> allow|deny --nonce <nonce> [--reason <text>]"
+    [[ -n "$window" && -n "$fp" && -n "$decision" && -n "$nonce" ]] || die "$usage"
+    case "$decision" in allow|deny) ;; *) die "decision-answer: decision must be allow or deny, got $(_arg_excerpt "$decision")" ;; esac
+    [[ "$fp" =~ ^[0-9a-f]{12}$ ]] || die "decision-answer: '$fp' is not a 12-hex fingerprint — copy it from the row's fp= field"
+    if [[ -n "${NEXUS_WORKER_WINDOW:-}" ]]; then
+        printf 'decision-answer: REFUSED — this is an ORCHESTRATOR verb and was invoked from inside a worker session (NEXUS_WORKER_WINDOW=%s). A worker may not answer any dangerous-rm request, including its own; ask the orchestrator.\n' "$NEXUS_WORKER_WINDOW" >&2
+        return 3
+    fi
+    command -v jq >/dev/null 2>&1 || die "decision-answer: jq is required"
+    local dir="$STATE_DIR/decisions"
+    local req="$dir/$window.$fp.json"
+    if [[ ! -f "$req" ]]; then
+        if [[ -f "$dir/$window.$fp.handled.json" ]]; then
+            printf 'decision-answer: TOO LATE — request %s.%s is already closed (outcome: %s). Nothing was written.\n' \
+                "$window" "$fp" "$(jq -r '.outcome // "unknown"' "$dir/$window.$fp.handled.json" 2>/dev/null)" >&2
+            return 4
+        fi
+        die "decision-answer: no open request $window.$fp in $dir"
+    fi
+    [[ "$(jq -r '.kind // empty' "$req" 2>/dev/null)" == dangerous_rm ]] \
+        || die "decision-answer: $window.$fp is not a dangerous_rm request — use ng decision-ack for other rows"
+    local want_nonce; want_nonce=$(jq -r '.nonce // empty' "$req" 2>/dev/null)
+    if [[ "$nonce" != "$want_nonce" ]]; then
+        printf 'decision-answer: REFUSED — --nonce does not match request %s.%s. Answer the row you read, not a different or newer one.\n' "$window" "$fp" >&2
+        return 5
+    fi
+    local by_window="${NEXUS_ORCHESTRATOR_WINDOW:-}"
+    [[ -n "$by_window" || -z "${TMUX_PANE:-}" ]] \
+        || by_window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null || true)
+    mkdir -p "$dir/answers" || die "decision-answer: cannot create $dir/answers"
+    local ans="$dir/answers/$window.$fp.json" tmp
+    tmp="$ans.tmp.$$"
+    jq -n --arg fp "$fp" --arg nonce "$nonce" --arg d "$decision" --arg r "$reason" \
+          --arg bw "${by_window:-unknown}" --arg bs "${CLAUDE_CODE_SESSION_ID:-unknown}" \
+          --arg bp "${TMUX_PANE:-unknown}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '{fingerprint:$fp, nonce:$nonce, decision:$d, reason:$r, ts:$ts,
+            answered_by_window:$bw, answered_by_session:$bs, answered_by_pane:$bp}' > "$tmp" \
+        && mv "$tmp" "$ans" || { rm -f "$tmp"; die "decision-answer: FAILED to write $ans"; }
+    local left; left=$(( $(jq -r '.deadline_epoch // 0' "$req" 2>/dev/null) - $(date +%s) ))
+    printf 'decision-answer: %s written for %s.%s (%ss left before the worker hook denies on timeout). The hook confirms the outcome in dangerous-rm-decisions.tsv.\n' \
+        "$decision" "$window" "$fp" "$left"
+    return 0
+}
 # orchestrator: classify a worker pane (idle|busy|user-typing|…)
 cmd_pane_state()       { _facade pane-state.sh       "$@"; }
 # worker: "wake me when this long job ends, fails, or does anything I asked
@@ -14795,6 +15519,7 @@ Window & worker ops:
                                  dependency; `gate <w>` is what retire-preflight
                                  check 1d asks before a kill (#845)
   decision-ack <window> <fp>     DURABLE ack of a pending-decision row (`rm` does not stick)
+  decision-answer <w> <fp> allow|deny --nonce N   answer a forwarded dangerous-rm request (orchestrator-only)
   skeptic <sub> …                worker↔skeptic comms channel + nudge
   request <sub> …                worker→orchestrator request inbox (file/await/fetch/ack/reply)
   remote <sub> …                 confined remote SSH endpoint secrets (gen-host-key/issue-token/enroll/enroll-invite/prune-enroll/revoke/list/carrier-authline/guard) + client-helper (non-secret: the client tooling set + digests computed at call time)
@@ -14931,6 +15656,7 @@ main() {
         reports-for-window)  cmd_reports_for_window "$@" ;;
         skeptic-disposition) cmd_skeptic_disposition "$@" ;;
         skeptic-arm)         cmd_skeptic_arm         "$@" ;;
+        skeptic-ledger-rotate) cmd_skeptic_ledger_rotate "$@" ;;
         skeptic-obligations) cmd_skeptic_obligations "$@" ;;
         skeptic-evidence)    cmd_skeptic_evidence    "$@" ;;
         skeptic-orphans)     cmd_skeptic_orphans     "$@" ;;
@@ -14945,6 +15671,7 @@ main() {
         obligation)            cmd_obligation            "$@" ;;
         retire-window)         cmd_retire_window         "$@" ;;
         decision-ack)          cmd_decision_ack          "$@" ;;
+        decision-answer)       cmd_decision_answer       "$@" ;;
         pane-state)            cmd_pane_state            "$@" ;;
         longjob)               cmd_longjob               "$@" ;;
         ci-attempts)           cmd_ci_attempts           "$@" ;;

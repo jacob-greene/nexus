@@ -197,7 +197,7 @@ irreversible hazard**:
 
 | instrument | on failure | why |
 |---|---|---|
-| `restart-path-pr-query` | **UNMEASURED, continue** | a proxy; a stronger arm runs after it |
+| `restart-path-pr-query` | **UNMEASURED, continue** | a proxy, and since the #1526 follow-up a recorded one that vetoes nothing |
 | `pr-activity-query` | **UNMEASURED, continue** | the weaker proxy still; its own comment concedes it does not carry the property |
 | `board-enumeration` | **UNMEASURED, continue** (since 2026-09-12; was **DEFER**) | the board is recorded, not gated on — an unenumerable board writes `live_windows=UNMEASURED`, never `0` |
 
@@ -239,8 +239,9 @@ treating a **trigger**. This section is about the **generator**.
 
 ### The generator: a conjunction sampled once a day
 
-The deployment gate is **two** `_gate_defer` arms since 2026-09-12 (five before
-D13 removed the three board arms) — re-derive with
+The deployment gate is **one** `_gate_defer` arm since 2026-09-25 (active
+review; the restart-path arm became a record under the #1526 follow-up), two
+from 2026-09-12, five before D13 removed the three board arms — re-derive with
 `grep -cE '^\s*(if ! )?_gate_defer "' monitor/cc-auto-update-apply.sh` (anchored;
 the bare `grep -c '_gate_defer "'` form counted the script's own comment and
 over-reported by one). **"Seven" was wrong and it was mine to catch**: it
@@ -258,7 +259,7 @@ Measured over the whole ledger — `monitor/.state/cc-auto-update/decisions.tsv`
 
 | arm | kind | deferrals |
 |---|---|---|
-| restart-path PR (`deferred-pending-PR<N>`) | proxy — **still an arm** | **5** |
+| restart-path PR (`deferred-pending-PR<N>`) | proxy — *veto removed 2026-09-25* (#1526 follow-up; each hit is now a `restart-path-pr-noted` row) | **5** |
 | PR-under-active-review | proxy — **still an arm** | 3 |
 | live-window COUNT (`live-windows=N>max=8`) | proxy — *removed 2026-09-12* | 2 |
 | board-not-quiet (state) | **DIRECT** — *removed 2026-09-12* | **1** (2 by 2026-09-12) |
@@ -364,7 +365,7 @@ hazard *directly* and one that measures a *proxy*:
 
 | arm | overridable | why |
 |---|---|---|
-| restart-path PR | **yes** | its own comment calls `GATE_RESTART_PATHS` a proxy |
+| restart-path PR | *veto removed 2026-09-25* | no evidence behind the proxy: an open PR is not deployed, and the restart runs the LIVE tree's code. Recorded (`restart-path-pr-noted`, `restart_path_prs=PR…`); evidence of a broken restart path is acted on with `hold` |
 | PR-under-active-review | **yes** | `updatedAt` recency is a proxy, as its comment says |
 | live-window COUNT | *removed 2026-09-12* | a count is not a hazard; the count is still recorded |
 | board-not-quiet (state) | *removed 2026-09-12* | was "measures the hazard directly"; states still recorded |
@@ -639,8 +640,9 @@ which is which is what stops you from taking risk for nothing:
 | restart the orchestrator | **yes** | it IS a running `claude` process (Step 5b) |
 
 **This matters more than it looks.** The entire deployment gate — since
-2026-09-12 the two PR arms, restart-path PRs and PR-under-active-review; before
-that also board-quiet and the live-window count — exists to answer
+2026-09-25 the one PR arm, PR-under-active-review (restart-path PRs until then;
+now recorded, not gated on); before 2026-09-12 also board-quiet and the
+live-window count — exists to answer
 *"is now a safe moment to restart?"* If the only required restart is the
 orchestrator's, and an orchestrator restart preserves context, then those arms
 are gating an operation that largely should not happen. On 2026-09-03 four arms
@@ -715,7 +717,7 @@ warning is about.** Three of the arms being attacked in that 2026-09-03
 sequence were not timing arms at all — they fired on a QUERY FAILURE, and two
 of those now degrade to UNMEASURED and let the gate continue rather than
 returning early. So the advice above applies to arms that name a HAZARD
-(a live restart-path PR, a PR under active review; until 2026-09-12 also
+(a PR under active review; a live restart-path PR until 2026-09-25; until 2026-09-12 also
 `board-not-quiet` and `live-windows>max`, removed by operator decision — D13):
 those defer for a reason, and narrowing them one at a time is
 the trap this section describes. **An arm that defers because its own
@@ -863,7 +865,7 @@ carries exactly one evidence class:
 
 | Class | Means | Payable when |
 |---|---|---|
-| `gate` | a cc-harness scenario covered it | 2a, 2b, **2c-vi** and 2d — exactly the keys `_surface_gate_scenarios` maps (`monitor/cc-auto-update-apply.sh:670-678`); `2c-vi` since `<your-org>/nexus-code#867`, via `test-realmodel-vimode`. Nothing in the harness covers `2c-paste` or 2e. `apply.sh` cross-checks the scenario name against your gate log. |
+| `gate` | a cc-harness scenario covered it | 2a, 2b, **2c-vi**, **2c-paste** and 2d — exactly the keys `_surface_gate_scenarios` maps in `monitor/cc-auto-update-apply.sh`; `2c-vi` since `<your-org>/nexus-code#867`, via `test-realmodel-vimode`; `2c-paste` since `<your-org>/nexus-code#1614`, via `test-realmodel-paste-held`. Nothing in the harness covers 2e. `apply.sh` cross-checks the scenario name against your gate log. |
 | `empirical` | you drove a probe against the candidate **and showed the probe can go RED** | only with a stated **differential / negative control** |
 | `reachability` | the hazardous input path cannot be reached in this nexus, so the entry is inert here | when you established the path is unreachable — and you say so |
 | `source-inspection` | you read the code and reasoned about it | always honest; never dressed up as `empirical` |
@@ -932,7 +934,8 @@ Each must carry a class that something other than your reasoning
 produced:
 
 - `gate` — a named cc-harness scenario covered it and appears in your
-  gate log (payable for 2b, `2c-vi` and 2d; `2c-paste` has no scenario);
+  gate log (payable for 2b, `2c-vi`, `2c-paste` and 2d — each half of 2c
+  only by its OWN scenario);
 - `empirical` — you drove a probe against the candidate **and** showed it
   can go RED, with the negative control written down;
 - `reachability` — you ran the re-check commands and they came back zero,
@@ -950,8 +953,10 @@ verdict is **needs-review**, not **safe** — escalate rather than absorb.
 scenario exists (`#724`) and `apply.sh` maps it (`#867`), so the label
 there is `gate`. This rule is meant to escalate the cases nobody can
 drive, not to manufacture permanent manual review out of cases someone
-already built a probe for. `2c-paste` is the one half with no scenario:
-drive it and label `empirical` with its control, or escalate.
+already built a probe for. The same now holds for `2c-paste`
+(`<your-org>/nexus-code#1614`): `test-realmodel-paste-held` is in the gate's
+scenario list and `apply.sh` maps it, so where that scenario appears in your
+gate log the label is `gate`, not a hand-rolled `empirical`.
 
 **Why these three specifically.** They are the surfaces where the failure
 is *silent in production*: a changed dialog signature (2b) makes
@@ -1199,35 +1204,58 @@ flagged item maps to a collision surface below.
   You get `dispositioned N of M entries across K release(s)` in
   `decisions.tsv` out of it, with `K` the registry-derived count.
 
-  **An OPAQUE release refuses, with its own exit code (8)**
-  (`<your-org>/nexus-code#1007`). Until that fix the release set was the
-  changelog's own `## <ver>` headers, so a release that PUBLISHES NO
-  SECTION was never *in* the set: not counted toward M, never owed a
-  disposition, and `dispositioned N of M` read GREEN over it. It fired on
-  2026-08-25 — `2.1.242` is published and has no `## 2.1.242` section, and
-  two independent fires read "406 of 406" across it. Now a version the
-  registry publishes inside the delta with no section in the fetched
-  changelog is REFUSED and NAMED (`exit 8`, outcome
-  `safe-refused changelog-completeness:opaque-release=<ver>`). Nothing
-  you pass can clear it — the evidence does not exist upstream — so do
-  not route around it; the daily fire retries on its own, clearing the
-  day the section appears. **The refusal is BOUNDED** (operator
-  directive, 2026-09-10: a busy board may DELAY an update, not PREVENT
-  it — the principle behind `defer_streak_cap`): after that many
-  CONSECUTIVE refusals on the same opaque set (default 3, floor 2, the
-  same knob and clamp as the deployment gate's bound; `0` escalates at
-  the floor because the surfacing cannot be switched off) `apply.sh`
-  escalates the operator itself — `sandbox-notify` plus a comment on the
-  tracking issue (or a filed issue on the gate repo when none is
-  configured) naming the candidate, the release(s), and the sentence
-  *"upstream shipped no parseable sections; this needs a human
-  disposition."* — and KEEPS refusing. Delay-then-surface, never
-  delay-then-forget, never auto-proceed; the exit code and outcome token
-  do not change. The streak is read from `decisions.tsv` as consecutive
-  `safe-refused` rows with the same detail, so a fire that clears the
-  condition resets it; the comment is posted once per opaque set per
-  week, the notify on every fire past the bound. The `#1400` repeat-nag
-  still fires on the second identical refusal. The registry fetch gets
+  **An OPAQUE release refuses, with its own exit code (8), until YOU
+  disposition it** (`<your-org>/nexus-code#1007`, `#1526`). Until #1007 the
+  release set was the changelog's own `## <ver>` headers, so a release
+  that PUBLISHES NO SECTION was never *in* the set: not counted toward M,
+  never owed a disposition, and `dispositioned N of M` read GREEN over it.
+  It fired on 2026-08-25 — `2.1.242` is published and has no
+  `## 2.1.242` section, and two independent fires read "406 of 406"
+  across it. Now a version the registry publishes inside the delta with
+  no section in the fetched changelog is NAMED, and the bump proceeds
+  only on YOUR recorded judgment of it:
+
+  ```bash
+  --opaque-disposition 2.1.242=accepted:'published 2026-08-24, superseded by 2.1.243 3h54m later, not deprecated; gate GREEN on the candidate binary; no nexus surface depends on an intermediate build'
+  --opaque-disposition <ver>=blocked:'<the EVIDENCE that it breaks the nexus>'
+  ```
+
+  One flag per opaque release, repeated. **Operator decision
+  (2026-09-25, `#1526`), verbatim:** *"The update should happen
+  automatically after a green gate and agent judgment without operator
+  intervention. So, in cases like this the updating agent should make its
+  evaluations if this missing info is really endangering the update.
+  There is real damage in not updating too and we should only prevent it
+  if we have evidence it breaks the nexus."* No human dispositions an
+  opaque release, and none is asked to. How to judge one:
+  **"Dispositioning an OPAQUE release"** below.
+
+  What `apply.sh safe` does with it:
+
+  | you pass | result | recorded |
+  |---|---|---|
+  | `accepted:<reason>` for EVERY opaque release, every other check passing (gate GREEN included — the gate is checked first) | proceeds; the opaque releases leave the per-entry accounting (no section, no entries) | `changelog-completeness` row naming them, plus one `opaque-release-accepted` row per release with `release=<v> reason=<reason>`; the apply log carries the reason |
+  | `blocked:<evidence>` for ANY of them | `exit 8`, nothing applied | `safe-refused changelog-completeness:opaque-release-blocked=<v…>`; the evidence in the apply log. Carry it where it can be acted on — a compat PR or a `block` verdict |
+  | no disposition for one or more | `exit 8`, nothing applied; the message tells you, the agent, what to do | `safe-refused changelog-completeness:opaque-release=<the undispositioned v…>` |
+  | a malformed one (no `accepted`/`blocked`, a reason with no letter or digit, a key that is not `x.y.z`, the same release twice) | `exit 3` | `…:opaque-disposition-malformed` |
+  | one naming a release that is NOT opaque in this delta | `exit 3` — refused, not ignored: your picture of the delta is not this run's (most plausibly upstream backfilled the section; read it and count its entries) | `…:opaque-disposition-outside-set` |
+
+  `--changelog-dispositioned <v>=<N>` for an opaque release is refused
+  (`exit 3`): it has no entries; its disposition is the flag above alone.
+  An acceptance clears ONLY the opaque arm — stale or non-GREEN gate
+  evidence still refuses `exit 3` first, and no acceptance row is
+  written.
+
+  Silence never clears: a fire that passes no disposition refuses every
+  time. After `defer_streak_cap` CONSECUTIVE undispositioned refusals on
+  the same opaque set (default 3, floor 2, the deployment gate's knob and
+  clamp; `0` marks at the floor) `apply.sh` writes a
+  `changelog-opaque-undispositioned` row (`streak= streak_at= defer_cap=
+  defer_cap_clamped=`) — the record of an evaluator skipping its own
+  judgment. It notifies and posts nothing: the old escalation that asked
+  a HUMAN for a disposition (`changelog-opaque-escalation*` rows, a
+  tracking-issue comment) was removed by `#1526`. The generic `#1400`
+  safe-refused notify and repeat-nag still fire, as for every refusal. The registry fetch gets
   the changelog fetch's treatment —
   network failure, a non-JSON body, an empty version set, or a copy that
   does not list the candidate all REFUSE (`exit 3`), never fall back to
@@ -1284,25 +1312,24 @@ flagged item maps to a collision surface below.
   The two are opposite states of knowledge, and only one of them is
   compatible with a `safe` verdict.
 
-  So an opaque entry, or an opaque release, **escalates to probing** —
-  drive the surfaces it could plausibly touch and label them `empirical`
-  with a control — or, failing that, it escalates to **needs-review /
-  block**. It NEVER escalates to assuming. Write the opacity down in the
+  So an opaque ENTRY **escalates to probing** — drive the surfaces it
+  could plausibly touch and label them `empirical` with a control — or,
+  failing that, it escalates to **needs-review / block**. It NEVER
+  escalates to assuming. An opaque RELEASE (no section at all) is judged
+  by the procedure below and recorded with `--opaque-disposition`. Write the opacity down in the
   ledger as its own disposition (`opaque — probed 2a/2b`, or `opaque —
   could not probe, escalated`), because an unexplained "no nexus surface"
   on a vague entry is indistinguishable from a real clearance six weeks
   later when someone reads your table.
 
-  Note the asymmetry that makes this dangerous: a **missing** section
-  costs you nothing at the accounting gate. `_check_changelog_completeness`
-  derives the release set with `awk '/^## /{print $2}'` over the changelog
-  it fetched (`monitor/cc-auto-update-apply.sh`, the `releases=()` block)
-  — so a release that publishes **no section is never in the set**,
-  contributes zero entries, leaves the ledger complete, and lets
-  `dispositioned N of M` read GREEN while that release went entirely
-  unexamined. **The completeness check cannot see an absence.** You have
-  to — so enumerate the delta from the **registry**, which is authoritative
-  for what shipped, and diff it against the changelog's `## ` headers:
+  Note the asymmetry that made this dangerous: a **missing** section cost
+  nothing at the accounting gate while the release set was the
+  changelog's own headers — it contributed zero entries, left the ledger
+  complete, and let `dispositioned N of M` read GREEN with the release
+  unexamined. Since `#1007` `apply.sh` derives the set from the
+  **registry** and names every sectionless release (`exit 8` until
+  dispositioned), so the gate now sees the absence. Enumerate it yourself
+  anyway, in Step 1, so the disposition is yours before `apply.sh` asks:
 
   ```bash
   curl -sSL -H 'Accept: application/vnd.npm.install-v1+json' \
@@ -1312,19 +1339,44 @@ flagged item maps to a collision surface below.
   # the changelog is an OPAQUE RELEASE — disposition it explicitly.
   ```
 
-  **This is not hypothetical — it fired on the 2026-08-25 fire.**
-  `2.1.242` is a published release inside that delta (`2.1.231` →
-  `2.1.245`) and has **no `## 2.1.242` section** (found by the
-  `<your-org>/nexus-code#1004` author; re-verified against the registry and
-  the fetched changelog on 2026-09-12: the registry lists `2.1.242`, the
-  changelog's headers run `## 2.1.243` → `## 2.1.241`). It was therefore
-  never counted, never required in the ledger, and nobody noticed: the
-  accounting could read complete with an entire release unexamined. Treat
-  an opaque release as its own ledger line (`2.1.242 — no published
-  section; probed 2a/2b` or `… escalated`). Closing the blind spot in
-  code — deriving the release set from the registry rather than from the
-  changelog's own headers — is a separate change; this paragraph only
-  documents it.
+  **This is not hypothetical.** `2.1.242` is a published release inside
+  the 2026-08-25 delta (`2.1.231` → `2.1.245`) with **no `## 2.1.242`
+  section** (found by the `<your-org>/nexus-code#1004` author; re-verified
+  on 2026-09-12). By 2026-09-23 it had refused `exit 8` on three nexuses,
+  two of which bypassed it by hand after a GREEN gate — the gap `#1526`
+  closed by making the disposition the agent's.
+
+  **Dispositioning an OPAQUE release** (`#1526`). The question is not
+  "do I know everything it changed" — by construction you cannot — but
+  **"is there EVIDENCE this missing information endangers the nexus?"**
+  Not updating is also damage: every day on an old pin forgoes fixes and
+  widens the next delta. Check, and write each into the reason:
+
+  1. **Publish date and supersession.** `curl -sS
+     https://registry.npmjs.org/@anthropic-ai/claude-code | jq -r
+     '.time["<v>"], .time["<next>"]'` — when it shipped, what superseded
+     it, and how fast. An intermediate build superseded within hours,
+     whose successors all carry sections, is the common shape
+     (`2.1.242`: superseded by `2.1.243` in 3h54m).
+  2. **Deprecation.** `jq -r '.versions["<v>"].deprecated // "none"'` on
+     the full packument. A deprecation message naming a defect is
+     evidence — read what it names.
+  3. **The gate ran on a binary that CONTAINS it.** The candidate is
+     later than the opaque release, so its code is in what the gate just
+     drove GREEN. That is the strongest evidence you have, and it is why a
+     GREEN gate is the precondition.
+  4. **Does any nexus surface depend on it specifically?** Nothing in
+     this repo pins, names or special-cases an intermediate version;
+     grep for the version string (`git grep -nF '<v>'`) to confirm.
+  5. **Upstream signals.** A GitHub release or tag for it, an issue
+     naming it, a later changelog entry that reverts or "fixes a
+     regression in" it. A missing release tag alone is not evidence.
+
+  **Accept** unless one of these turns up EVIDENCE of breakage for this
+  nexus — then **block**, quoting that evidence. Absence of information
+  is not evidence; it is the condition you are judging. Record the same
+  judgment in the ledger as the release's own line (`2.1.242 — no
+  published section; accepted: <reason>`) and in the report.
 - **Watch for entries that land on the harness substrate itself**, which
   the 2a-2e taxonomy has no row for. Example (2.1.222): *"stream idle
   timeout firing on custom `ANTHROPIC_BASE_URL` gateways despite server
@@ -1334,6 +1386,20 @@ flagged item maps to a collision surface below.
   under a **2f — harness substrate** heading in your table.
 
 ### The carry-forward queue — entries a PRIOR fire left undriven
+
+**An item the evaluator is structurally barred from acting on goes to the
+ORCHESTRATOR, not back into the queue** (<your-org>/nexus-code#1540). A SAFE
+fire is silent by the routing invariant and may not open issues or author
+fixes, so a documentation defect it finds can only be deferred — it was
+deferred three fires running before #1540/#1549 were filed by hand. Mark such
+an entry `needs-orchestrator:` in the queue — **but know that nothing reads
+that mark today** (<your-org>/nexus-code#1567). The queue file is read only by
+the evaluator's own prompt (`monitor/cc-auto-update-prompt.md`, step 0); the
+orchestrator's prompt (`monitor/agent-prompt.md`) and the watcher's emit never
+open it, so a `needs-orchestrator:` entry reaches the orchestrator only if a
+human or the orchestrator goes and reads the queue by hand. The mark records
+the routing; it does not perform it. A carry-forward that only the barred
+agent can see will defer forever — and a mark with no reader is still that.
 
 A fire that reads an entry, judges it relevant, and then does not drive
 it has produced a **debt**, not a disposition. Left in a report, that
@@ -1395,11 +1461,31 @@ The classifier greps raw ANSI off the live pane. Current signatures
   rendering ghost text classified `empty` before arm (b) existed. Arm
   (a) alone is what a `0;2m` → `2m` change breaks; check both.
 - **`_detect_user_typing`** — `\x1b[38;5;231m` (bright-white user text).
-- **`_detect_busy`** — TWO forms, and the second is not optional:
-  (a) the active token-counter `[↓↑] N tokens` on the spinner row in the
-  10 lines above the input (the idle banner uses a past-tense form with
-  no counter, so a wording/format change to the counter mis-reads
-  busy↔idle); (b) `_detect_throttled`, below.
+- **`_detect_busy`** — THREE forms, and the second and third are not
+  optional: (a) the active token-counter `[↓↑] N tokens` on the spinner
+  row in the 10 lines above the input (the idle banner uses a past-tense
+  form with no counter, so a wording/format change to the counter
+  mis-reads busy↔idle); (b) `_detect_throttled`; (c)
+  `_pane_retry_attempt`, both below.
+- **`_pane_retry_attempt`** — the TRANSPORT-RETRY chrome
+  (`<your-org>/nexus-code#1552`): `Retrying in <t> · attempt <k>/<N>` on a
+  SPINNER row, matched case-INSENSITIVELY against the JOINED logical row
+  (a column-0 row plus its indented continuations), and IGNORED when that
+  row's head is a transcript/chrome glyph (`●`, `⎿`, `❯`, `>`, `│`).
+  Measured at **2.1.273** (`✻ Connection refused — … · Retrying in 3s ·
+  attempt 3/10`) and at **2.1.268** for the 401 render. It is keyed on
+  the harness's retry CONSTRUCT rather than on any one failure's words,
+  because the failure vocabulary keeps growing and the construct is what
+  the members share. **Failure direction: NOT safe.** A reword of
+  `Retrying in` or of `attempt k/N`, or a spinner row that stops starting
+  at column 0, returns every pane on the board to `idle` — KILL
+  ALLOWLIST, paste-me — for the length of a backend outage, all at once.
+  Re-capture by killing the mock backend mid-stream under
+  `monitor/cc-harness` (the recipe is in the fixture's manifest row).
+  Carried as the FIELD `retrying=<k>/<N>` on `busy`. Fixtures
+  `…/transport-retry-connrefused-realmodel-273.ansi`, and
+  `…/transport-retry-exhausted-realmodel-273.ansi` — the SAME pane once
+  the budget is spent, which must stay `idle`.
 - **`_detect_throttled`** — **the entry `monitor/pane-state.sh` itself
   names this list for** (`:1598-1601`, `<your-org>/nexus-code#1340`). The
   `/low-priority` retry chrome: `esc to interrupt` AND
@@ -1410,6 +1496,40 @@ The classifier greps raw ANSI off the live pane. Current signatures
   live, mid-turn pane to `idle`, which is on the KILL ALLOWLIST. It is
   carried as the FIELD `throttled=1` on `busy`, never as a state token.
   Fixture: `monitor/watcher/fixtures/throttled-low-priority-capitalised-synthetic.ansi`.
+- **`proc-kill-authorized --orphans`** — three facts about how the HARNESS
+  launches a tool shell, none of them ours (`<your-org>/nexus-code#1543`,
+  PR `#1568`). (1) `CLAUDE_CODE_SESSION_ID` and (2) `CLAUDE_PID` are
+  EXPORTED into every Bash tool call — conjuncts O1, O4 and O5 read them
+  from the caller's environment and from the orphan's `/proc/<pid>/environ`.
+  (3) **`CLAUDE_PID` IS ONE OF THE TOOL-CALL PROCESS'S OWN ANCESTORS**, read
+  from `/proc` — measured at the pin this was written against: ancestor walk
+  `29637 27629 15529 12801 12373 12` with `CLAUDE_PID=15529`. A release that
+  starts tool shells through a REPARENTING intermediary, or stops exporting
+  either variable, makes `--orphans` refuse EVERYTHING
+  (`O5-caller-CLAUDE_PID-is-not-one-of-its-own-ancestors`, or O1/O4). That
+  is the SAFE direction and it is loud — but it silently removes the only
+  sanctioned stop for what a foreground tool call orphans, so it is a
+  collision, not a nicety. A caller that has itself been REPARENTED is
+  refused the same way; that limit is by design. CHECK on the candidate,
+  from a REAL tool call (not from a script the harness did not launch) —
+  self-contained, so it can be pasted as it stands:
+
+  ```bash
+  : "${CLAUDE_CODE_SESSION_ID:?NOT exported into this tool shell: O1/O4 will refuse}"
+  : "${CLAUDE_PID:?NOT exported into this tool shell: O5 will refuse}"
+  cur=$$; found=no
+  for hop in $(seq 1 32); do
+      [ "$cur" = "$CLAUDE_PID" ] && { found=yes; break; }
+      cur=$(ps -o ppid= -p "$cur" | tr -d ' ')
+      [ -n "$cur" ] && [ "$cur" -gt 1 ] || break
+  done
+  echo "CLAUDE_PID=$CLAUDE_PID is an ancestor of this tool call: $found (after $hop hop(s))"
+  ```
+
+  `found=yes` is the only passing answer. Then run
+  `monitor/watcher/test-proc-kill-authorized.sh` and read T17 rows 3 and 10
+  (the legitimate-caller rows) — they must still AUTHORISE, and must not
+  have turned into SKIPs.
 - **`_dialog_is_login`** — the `/login` flow's select dialog
   (`<your-org>/nexus-code#1518`). THREE disjuncts, any one sufficient, all
   case-INSENSITIVE: a bare `Login` row (`^\s*Login\s*$`),
@@ -1487,6 +1607,36 @@ The classifier greps raw ANSI off the live pane. Current signatures
   not the `❯<NBSP>` of the real input row: a reword drops the pane back
   through `_find_input_row` to `empty` — *"don't know yet"* — for the one
   situation an orchestrator most needs to read correctly (`#603`, `#607`).
+  **TWO RENDERINGS, and the second is a collision that ALREADY HAPPENED
+  (`<your-org>/nexus-code#1531`).** At **2.1.273** the placeholder sits on
+  the REAL `❯<NBSP>` row, as ghost text whose first glyph is UNDER the
+  cursor cell: `\x1b[7m\x1b[39mP\x1b[0;2mress up to edit …`. The colour
+  reset between the reverse-video introducer and the glyph defeated
+  `_input_row_typed_text`'s byte-exact ghost cut, so in vim INSERT the
+  lone `P` read as operator text: `state=user-typing input=typed` with
+  NO `queued=1`. The cut now tolerates SGR sequences inside the cursor
+  cell. Re-check BOTH the placeholder literal AND the cursor-cell bytes
+  per pin: queue a second message behind a dripped mock turn and require
+  `busy … queued=1`. Fixture `…/queued-vim-insert-realmodel-273.ansi`.
+  **And the idle+queued rendering `#1531` was filed for** — a
+  just-resumed orchestrator showing the placeholder under its
+  predecessor's still-fresh Stop stamp read `state=idle` with no
+  `queued=` — was the HEARTBEAT ROUTE never consulting this detector; it
+  now defers to the renderer whenever the pane contradicts `idle`
+  (`#1521`). That is a classifier fact, not a harness one, but the
+  re-check above is what would catch its return.
+- **`_input_row_has_content_chip`** — the collapsed-paste placeholder
+  `[Pasted text #N +M lines]` on the input row
+  (`<your-org>/nexus-code#1527`), and `[Image #N]` (included for direction,
+  NOT measured). Measured identical at **2.1.268 / 2.1.270 / 2.1.273**:
+  no bright-typed marker, no dim run, and a cursor cell that satisfies
+  the empty-box arm — so a box holding an unsubmitted multi-line brief
+  read `state=idle input=blank`. It now reads `user-typing input=typed`,
+  which is what `_respawn.sh`'s typed-retry needs to recover a stranded
+  BRACKETED respawn brief (`#1514` × `#1516`). **Failure direction: NOT
+  safe** — a reword returns the row to `blank`. Re-capture with
+  `paste-buffer -p` of a 4-line buffer and the Enter withheld. Fixture
+  `…/pasted-multiline-chip-realmodel-273.ansi`.
 - **`_detect_empty_input`** — reverse-video space cursor `\x1b[7m \x1b[0m`,
   PLUS the 2.1.147 post-turn trailing-cursor variant (the harness's
   first catch; fixture `monitor/watcher/fixtures/idle-empty-post-turn-realmodel.ansi`).
@@ -1520,8 +1670,25 @@ The auto-unstick state machine matches literal dialog text:
 
 - **Case A (permission prompt)** — the `Do you want to proceed?` /
   `What do you want to do?` text + the `❯ N.` numbered-option chevron.
-  Action: auto-Enter the first option. If the release rewords the
-  permission prompt or restyles the chevron, Case A stops firing.
+  Action (since <your-org>/nexus-code#1599): NO key is sent; the prompt is
+  refused and surfaced as a pending decision. If the release rewords the
+  permission prompt or restyles the chevron, Case A stops DETECTING it, so
+  a blocked worker is no longer surfaced to the operator.
+- **Case A danger vocabulary (<your-org>/nexus-code#1599)** — since `#1599`
+  Case A sends NO key: every permission prompt is refused and surfaced as a
+  `permission_prompt` decision. The
+  verdict keys on `_UNSTICK_PERMISSION_DANGER_MARKERS` in `_unstick.sh`,
+  harness strings measured on builds up to 2.1.273: `Dangerous ` (the
+  `Dangerous rm|rmdir operation on …` family), `possibly-empty variable
+  path`, `critical path`, `statically-unresolvable target`, `working
+  directory or its ancestor`, `This command requires approval`, `which is a
+  sensitive file`. A reword moves a prompt from `verdict=danger` to
+  `verdict=unlisted` — still refused, so the drift costs the row's WORDING,
+  never a keypress. It becomes safety-relevant the day anyone adds an
+  allow arm: then the danger arm must still match, so re-capture a
+  dangerous prompt on the candidate build and diff it against this list.
+  The prompt fingerprint also hashes the 12 rows above the title, so a
+  layout change there changes fingerprints (a re-surface, not a silence).
 - **Case D (AskUserQuestion chip-bar dialog)** — a **shape gate** (the
   chip-bar's two final options `Type something.` penultimate + `Chat
   about this` final) AND a **live-ness gate** (the bottom-anchored
@@ -1535,7 +1702,21 @@ The auto-unstick state machine matches literal dialog text:
   `Stop and wait for limit`. Same two literals as
   `_has_blocked_overlay`'s rate-limit arm in **2a**, so a reword breaks
   the classification and the unstick together; check them once, credit
-  them twice.
+  them twice. **The unstick side now needs MORE than the two literals**
+  (`<your-org>/nexus-code#1598`): `_unstick_ratelimit_menu_verdict` also
+  requires a LIVE menu — a highlighted `❯ N.` option row after the title
+  and no REPL input row (`❯` + no-break space) beneath it — and presses
+  the dismiss Enter only when that highlighted row IS the Stop option.
+  So three more things are the candidate's to break: the `❯ N.` row
+  shape of the Select component, whether the dialog still REPLACES the
+  input box, and the option ORDER. The order is already upstream's to
+  flip at runtime: in 2.1.273 it is
+  `Vo ? [...billing, stop, …] : [stop, …, ...billing]` with
+  `Vo = P("tengu_jade_anvil_4", !1)`. Re-read that expression in the
+  candidate's bundle. Every one of these fails toward NO ENTER (a window
+  left on its menu and logged `cascade-refused`), never a wrong Enter;
+  the pane-state side still keys on the two literals alone, so a pane
+  that merely QUOTES them reads `blocked overlay=rate-limit`.
 - **Case C (api-error chip)** — a two-`grep -F` AND on
   `API Error: {"type":"error"` and `"Internal server error"`. These are
   a RENDERED API-error payload, i.e. bytes the candidate composes: a
@@ -1585,15 +1766,25 @@ first to force insert mode before pasting, else the message would execute
 as VI motions and be silently lost (`skills/nexus.tmux-spawn` "VI-mode
 hazard"). If a release changes the default mode, the mode indicator, or
 the key to enter insert, re-validate the spawn + follow-up paste paths
-(`monitor/spawn-worker.sh`, the follow-up `set-buffer`/`paste-buffer`
-sequence).
+(`monitor/spawn-worker.sh`, and the follow-up / emit / unstick / respawn
+paste, which is ONE sequence now: `monitor/_paste-deliver.sh`,
+`load-buffer` from a file + bracketed `paste-buffer` + confirmed `Enter`).
 
 #### 2c is TWO sub-claims: `2c-paste` (driven) and `2c-vi` (measured per host)
 
 Label them separately — `apply.sh` refuses the aggregate key `2c`. The
-**delivery** half (multi-line `set-buffer`/`paste-buffer` arriving as one
-turn) is genuinely drivable and has been driven with a real negative
-control. The **VI-insert** half is the one this subsection is about, and its
+**delivery** half (a multi-line `load-buffer`/`paste-buffer` arriving as one
+turn, AND being SUBMITTED rather than held in the input box) is genuinely
+drivable and has been driven with a real negative control. Since
+`<your-org>/nexus-code#1591` it is also GATED: `test-realmodel-paste-held.sh`
+drives the production emit paste through `monitor/_paste-deliver.sh` with
+emit-shaped bodies and asserts `reported delivered ==> a request reached the
+backend AND the transcript recorded it`. 2.1.277's review step (a prompt
+carrying an invisible character is HELD on the first Enter, gated by the
+feature flag `tengu_tranquil_cloud`, client default TRUE, so it is armed under
+the mock) is what that scenario exists to catch; an ad-hoc probe that pastes a
+SINGLE-LINE body does not represent an emit, which collapses to a
+`[Pasted text #N …]` placeholder and fails differently. The **VI-insert** half is the one this subsection is about, and its
 class is **a property of the host you are evaluating on**, not of this repo.
 The 2.1.224 round is the sixth of seven to label the pair `empirical` on the
 strength of the delivery half alone.
@@ -1733,14 +1924,25 @@ these is payable:
 #     only config files can turn it on — scope the grep to those. A bare
 #     repo-wide grep matches prose (this guide discusses `editorMode` by
 #     name, as does monitor/cc-harness/_lib.sh) and returns a guaranteed
-#     false alarm.
+#     false alarm. `monitor/.state` is EXCLUDED: its pending-tool/*.json
+#     records quote agents' tool calls, so an agent that merely typed
+#     `editorMode` self-matches there (<your-org>/nexus-code#1625).
+#     The operator arm reads the EFFECTIVE config dir too: in an agent
+#     sandbox Claude Code reads `$CLAUDE_CONFIG_DIR` (e.g.
+#     ~/.claude/sandbox-config/), NOT ~/.claude — without it this arm
+#     returns a silent 0 on a host whose effective config selects vim.
 { grep -rln --include='*.json' --include='*.yml' --include='*.yaml' \
+       --exclude-dir=.state \
        -e 'editorMode' -e 'vimMode' monitor config skills 2>/dev/null
   grep -ln -e 'editorMode' -e 'vimMode' \
        ~/.claude.json ~/.claude/settings.json \
-       ~/.claude/settings.local.json 2>/dev/null
+       ~/.claude/settings.local.json \
+       "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/.claude.json \
+       "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/settings.json \
+       "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/settings.local.json 2>/dev/null
 } | sort -u | grep -c .            # 0 => unreachable. YOURS is whatever this
                                    # prints: Host A read 2, Host B read 0.
+echo "effective config dir: ${CLAUDE_CONFIG_DIR:-$HOME/.claude (unset)}"   # name it in the label
 
 # (ii) no live agent pane is actually in VI mode. Read the STATUS LINE, not
 #      the scrollback: the indicator lives in the last rows the TUI paints,
@@ -1774,6 +1976,13 @@ executed rather than carried over:
   `grep --no-ignore-files`, `rg` and a JSON parse. It returns 1 more when
   `editorMode` is planted into `monitor/worker-settings.json`, so the
   repo-surface arm is live rather than vacuously zero.
+- (i) after #1625, 2026-09-23, in an agent sandbox (`CLAUDE_CONFIG_DIR` =
+  `~/.claude/sandbox-config`): **4**, where the old form read **2** — the two
+  it missed are the EFFECTIVE `.claude.json` and `settings.json`, both
+  `editorMode: "vim"`. Planted controls, old → new form: `editorMode` in
+  `settings.json` under the `CLAUDE_CONFIG_DIR` directory alone reads **0 → 1**; a
+  `monitor/.state/pending-tool/*.json` record quoting `editorMode` reads
+  **1 → 0**.
 - (ii) returns **`9 of 10`** across the live windows (4 consecutive runs, all
   identical; the non-match is `services`, not an agent pane), fires on both
   committed fixtures whose status line genuinely
@@ -1805,11 +2014,16 @@ that a real, driven, control-tested probe passed every round while the surface
 it covers recorded as argued-not-driven, on the input path spawn and follow-up
 delivery depend on.
 
-**`2c-paste` is deliberately still unpayable as `gate`.** Nothing in the
-harness drives the paste-delivery half, so it keeps `empirical` (with a stated
-negative control) or `source-inspection`. The two halves of `2c` keep separate
-labels — that is the whole reason the surface was split — and the composite
-still records as the WEAKEST of them.
+**`2c-paste=gate` is payable too** (`<your-org>/nexus-code#1614`). It was
+deliberately unpayable while nothing in the harness drove the paste-delivery
+half; since `<your-org>/nexus-code#1591` the gate runs
+`test-realmodel-paste-held` (production emit paste, real candidate binary, its
+own Enter-withheld negative control), and `_surface_gate_scenarios` maps
+`2c-paste → test-realmodel-paste-held`. The two halves of `2c` still keep
+separate labels — that is the whole reason the surface was split: each is
+payable only by ITS scenario (a log carrying only `test-realmodel-vimode`
+cannot clear `2c-paste`, and vice versa), and the composite still records as
+the WEAKEST of them.
 
 ### 2d. Hooks + settings schema
 
@@ -1835,6 +2049,58 @@ hook scripts in `monitor/hooks/`.
   for the worker, the same set plus `PermissionRequest`. An earlier
   revision of this line named only three orchestrator events and omitted
   `StopFailure`, which is precisely the event the over-limit path rides.
+  Since <your-org>/nexus-code#1632 the orchestrator carries `PermissionRequest`
+  too (see the next bullet), so the derivation above returns seven for both.
+- **The dangerous-`rm` prompt is DECIDED by a `PermissionRequest` hook**
+  (<your-org>/nexus-code#1632; design per PR #1633).
+  `monitor/hooks/dangerous-rm-decide.sh` is wired in BOTH settings files, and
+  acts only for tool `Bash`, `permission_mode` `bypassPermissions`, and a
+  command with an `rm`/`rmdir` word:
+  - `--mode orchestrator` DENIES at once with a "delegate it to a worker"
+    message;
+  - `--mode worker` files a `kind: dangerous_rm` row in `decisions/`, waits
+    ≤100 s for `ng decision-answer`, and DENIES on timeout.
+
+  Deny is the only default. Things the candidate can break, each SILENTLY:
+  1. **The mechanism.** Measured on 2.1.281: a `PermissionRequest` answer
+     decides the bypass-immune `dangerousRemoval` check. A `PreToolUse`
+     `permissionDecision` does NOT, and neither does a `permissions.allow` rule.
+     A deny `message` reaches the model verbatim as the tool result.
+  2. **The timing.** Measured on 2.1.281: the dialog and its 2-minute countdown
+     render IN PARALLEL with the hook. An answer at 45 s or 90 s decides the
+     prompt; a hook still running at ~120 s LOSES to the built-in deny. The
+     worker wait (100 s) and the settings `timeout` (115 s) are sized to that.
+     A candidate that shortens the countdown, or waits for the hook before
+     rendering, changes the budget.
+  3. **The payload fields** the predicate reads: `hook_event_name`,
+     `tool_name`, `permission_mode`, `tool_input.command`, `session_id`,
+     `cwd`. A renamed field makes the hook answer nothing, so the prompt runs
+     to the built-in deny (the safe direction).
+  4. **The classes.** The hook keys on an rm WORD, not on the checker's
+     classes. Read the candidate's `dangerousRemoval`/`bypassImmune` table
+     (`dt={dangerousRemoval:{bypassImmune:!0,…}` in the 2.1.281 bundle) for a
+     new bypass-immune entry that could fire on an rm-bearing command.
+
+  The gate covers 1–3: `test-realmodel-dangerous-rm-decide.sh` wires the REAL
+  hook and asserts each outcome through the tool result:
+  - orchestrator deny;
+  - answer-driven worker allow and deny, through the real verb;
+  - a timeout deny inside the countdown;
+  - a behaviour-stripped control that prompts;
+  - two must-not-flip arms (a non-rm Bash prompt and a Write prompt) that
+    still prompt and forward nothing.
+
+  Its substitution-class arm runs only from 2.1.281, because 2.1.280 raises no
+  prompt for that class. Env knobs NOT to reach for:
+  `CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT=1` silences only the
+  substitution class; `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT=1` makes the
+  prompt wait FOREVER.
+
+  A hookless pane (an operator-started orchestrator without `--settings`, or
+  `bootstrap-install.sh`) still meets the bare prompt. Case A refuses it there,
+  as it does the dialog a hooked pane shows while the hook waits, and its
+  fingerprint now normalises the ticking `deny this request in M:SS`
+  countdown.
 - The `skipDangerousModePermissionPrompt: true` settings key — and the
   **MIGRATION** that puts it there, which is itself version-sensitive
   (<your-org>/nexus-code#768). On first boot the binary moves
@@ -2163,7 +2429,7 @@ into evidence classes:
 | **2a** pane-state markers | full (`idle-busy`, `autosuggest`) | `gate` |
 | **2b** unstick dialogs | overlay **shape** only — not the Case D footer, not Case A | `gate` for the shape; footer/Case A need a changelog read |
 | **2c-vi** VI-mode | `test-realmodel-vimode` (`#724`, mapped `#867`) | `gate` where the 2c re-checks come back NON-zero; `reachability` where they come back zero — re-check per host, see 2c |
-| **2c-paste** paste delivery | none — `gate-coverage.tsv` declares `monitor/paste-followup.sh` a `known-gap` | `empirical` (with a stated negative control) or `source-inspection` |
+| **2c-paste** paste delivery | `test-realmodel-paste-held` (`#1591`, mapped `#1614`) | `gate` when that scenario is in your gate log; otherwise `empirical` (with a stated negative control) or `source-inspection` |
 | **2d** hooks + settings | `PreToolUse` + over-limit `Stop`/`StopFailure` | `gate` for those events; every other event is `source-inspection` |
 | **2e** CLI flags | none | `empirical` (a `--help` diff on the candidate binary, with a negative control) or `source-inspection` |
 
@@ -2257,9 +2523,9 @@ Combine the gate result with the changelog review:
 
 | Verdict | When | Action |
 |---|---|---|
-| **safe to bump** | gate GREEN **and** every surface key (`2a 2b 2c-paste 2c-vi 2d 2e`) carries an honest evidence class (no unsubstantiated `empirical`) **and** `2b`/`2c-paste`/`2c-vi`/`2d` are each cleared by `gate`, `empirical` or `reachability` — **never** by `source-inspection` and never by changelog silence (see "Silence is not clearance") **and** every changelog entry of every release in the delta is dispositioned, with no release contributing an opaque or absent section (see "An OPAQUE changelog", Step 1) **and** the live tree equals the effective pin (below) | proceed to Step 5 |
-| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump, **or** any of 2b/2c/2d rests on `source-inspection`, **or** any release in the delta published an opaque/absent changelog section | do the targeted manual check for the flagged surface; if it holds, bump; if uncertain, surface on `<your-org>/nexus-code` with the specifics (never the asset repo) |
-| **block** | gate RED, **or** a confirmed contract break you can't mitigate | do NOT bump. Fix the affected `_detect_*` / dialog signature / hook first (capture a fresh fixture), land that, re-gate. Surface the blocker on `<your-org>/nexus-code` (issue or `cc-compat` PR), never the asset repo. |
+| **safe to bump** | gate GREEN **and** every surface key (`2a 2b 2c-paste 2c-vi 2d 2e`) carries an honest evidence class (no unsubstantiated `empirical`) **and** `2b`/`2c-paste`/`2c-vi`/`2d` are each cleared by `gate`, `empirical` or `reachability` — **never** by `source-inspection` and never by changelog silence (see "Silence is not clearance") **and** every changelog entry of every release in the delta is dispositioned **and** every OPAQUE release (published, no section) carries your `--opaque-disposition <v>=accepted:<reason>` judgment (see "Dispositioning an OPAQUE release", Step 1 — accept unless you have EVIDENCE it breaks the nexus) **and** the live tree equals the effective pin (below) | proceed to Step 5 |
+| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump, **or** any of 2b/2c/2d rests on `source-inspection` (an opaque release is NOT a needs-review trigger on its own: you judge it and record `accepted`/`blocked`, `#1526`) | do the targeted manual check for the flagged surface; if it holds, bump; if uncertain, surface on `<your-org>/nexus-code` with the specifics (never the asset repo) |
+| **block** | gate RED, **or** a confirmed contract break you can't mitigate, **or** EVIDENCE that an opaque release breaks the nexus (`--opaque-disposition <v>=blocked:<evidence>`) | do NOT bump. Fix the affected `_detect_*` / dialog signature / hook first (capture a fresh fixture), land that, re-gate. Surface the blocker on `<your-org>/nexus-code` (issue or `cc-compat` PR), never the asset repo. |
 
 **Clone freshness is NOT a verdict input** (operator directive,
 `<your-org>/nexus-code#1475`, 2026-09-06: *"The update should not depend on
@@ -2409,13 +2675,15 @@ at all (see the routing invariant above).
 >     --changelog-evidence <the CHANGELOG.md you fetched this session> \
 >     --changelog-ledger <one line per entry: verbatim quote + disposition> \
 >     --changelog-dispositioned <older release>=<N> \
->     --changelog-dispositioned <candidate>=<N>
+>     --changelog-dispositioned <candidate>=<N> \
+>     --opaque-disposition <opaque release>=accepted:'<your judgment>'   # one per OPAQUE release, if any
 > ```
 >
 > Classes: `gate` (cross-checked against the scenario names in your gate
-> log; payable for 2a/2b/**2c-vi**/2d — `2c-vi` since
-> `<your-org>/nexus-code#867`, via `test-realmodel-vimode`; `2c-paste` and
-> `2e` still have no scenario), `empirical` (**requires** a
+> log; payable for 2a/2b/**2c-vi**/**2c-paste**/2d — `2c-vi` since
+> `<your-org>/nexus-code#867`, via `test-realmodel-vimode`; `2c-paste` since
+> `<your-org>/nexus-code#1614`, via `test-realmodel-paste-held`; `2e` still
+> has no scenario), `empirical` (**requires** a
 > `--negative-control` for that surface), `reachability`,
 > `source-inspection`. Surface keys are `2a 2b 2c-paste 2c-vi 2d 2e` —
 > the aggregate `2c` is refused, because its two halves have different
@@ -2427,15 +2695,18 @@ at all (see the routing invariant above).
 > changelog's headers (`<your-org>/nexus-code#1007`) — `N` checked against
 > the entry count `apply.sh` derives from the changelog it fetches, and
 > every entry required to appear verbatim in the ledger. A published
-> release with NO section is refused as opaque (`exit 8`, bounded: after
-> `defer_streak_cap` consecutive refusals the operator is escalated and
-> the refusal continues); a registry that cannot be read refuses
+> release with NO section is OPAQUE and refused (`exit 8`) until you pass
+> `--opaque-disposition <v>=accepted:<reason>` for it (`blocked:<evidence>`
+> refuses; no human is asked — `#1526`); a registry that cannot be read refuses
 > (`exit 3`) rather than falling back.
 >
 > Both accepted attestations are appended to `decisions.tsv` — a
 > `surface-evidence` row (per-surface labels plus the derived
 > weakest-of-sub-claims label for `2c`) and a `changelog-completeness`
-> row (`dispositioned N of M entries across K release(s)`) — so a later
+> row (`dispositioned N of M entries across K release(s)`, naming any
+> opaque release accepted by disposition), plus one
+> `opaque-release-accepted` row per accepted opaque release carrying your
+> reason — so a later
 > reviewer can see what was claimed without re-reading the report. Use
 > the same labels and the same counts in your report table.
 
@@ -2514,7 +2785,12 @@ and lets the watcher's standard absent-target recovery do the rest:
 # Resolve the coordinator window from config — it is NOT always named
 # `orchestrator` (nexus-code#459); a hard-coded name kills nothing.
 TARGET_WINDOW=$("$NEXUS_ROOT/config/load.sh" monitor.target_window orchestrator)
-tmux kill-window -t "$TARGET_WINDOW"    # the orchestrator's own, final act
+# `:=` — EXACTLY that window, or rc 1 (<your-org>/nexus-code#1524). A bare
+# `-t "$TARGET_WINDOW"` falls back to a UNIQUE-PREFIX match when the exact
+# window is absent, so it can kill `<target>-sk` at rc 0. Measured on tmux
+# 2.6: `:=name` is exact for kill-window, send-keys, paste-buffer and
+# display-message alike; a bare `=name` is exact for kill-window ONLY.
+tmux kill-window -t ":=${TARGET_WINDOW}"    # the orchestrator's own, final act
 ```
 
 **Do NOT run this yet** — the pre-flight and the restart watchdog
@@ -2826,8 +3102,12 @@ inner mechanism, not a substitute for it.
 - **Deployment gate (nexus-code#512):** the gate above vets the BINARY;
   `apply.sh safe` additionally vets the ACT of deploying it, before any
   state mutation: it defers (exit 30, nothing applied, retried at the
-  next daily fire) while an open nexus-code PR touches the watcher
-  restart path or while an open PR is under active review (the
+  next daily fire) while an open PR is under active review (an open
+  PR touching the watcher restart path is RECORDED — a
+  `restart-path-pr-noted` row, `restart_path_prs=PR…` — and no longer
+  defers since the #1526 follow-up: an open PR is not deployed, and
+  the restart runs the live tree's code; with EVIDENCE the live restart
+  path is broken, `hold` the routine) (the
   live-window arms — `max_live_windows` and board-quiet — were removed
   2026-09-12 by operator decision; the window count is recorded in
   every apply record, not gated on), records clone staleness in every

@@ -72,10 +72,84 @@ fi
 WORK=$(mktemp -d -t nexus-nullcmd-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
+# A RETURNING form's bound. WE CHOSE 60 s (it was 10): the form returns the
+# instant it is done, so this is a polled ceiling and a larger one costs nothing
+# on a green run — and 10 s was BELOW the 10.2 s zsh startup `#1589` measured on
+# this host at load ~40, so the three returning legs were one loaded band away
+# from the same false red as the BLOCK leg. 60 is ~6x that worst measurement.
+# `th_deadline` adds the `--jobs` scaling on top; note it scales by jobs/cpus
+# and is therefore x1 on this 36-core host — it does NOT see other agents' load,
+# which is why the base itself had to move.
+RETURN_CEILING=$(th_deadline 60)
+STARTUP_CEILING=$(th_deadline 60)   # same reasoning: how long zsh may take to REACH its redirection
+BLOCK_WINDOW=3                      # unchanged: how long a form must stay blocked to be called blocked
+
+# _held_verdict <form> -> blocked | returned | never-started   (stdout)
+#
+# Runs <form> in $PWD with stdin HELD OPEN, against a fresh 4-byte `f`.
+#   returned       the form exited by itself
+#   blocked        `f` was OBSERVED emptied — zsh reached the redirection — and
+#                  the form was still alive BLOCK_WINDOW seconds AFTER that
+#   never-started  `f` was never emptied within STARTUP_CEILING: a statement
+#                  about the HOST, deliberately not folded into either verdict
+# Side files: $WORK/held.out (the form's output), $WORK/held.sig (the argv of
+# the blocked form's grandchild, read WHILE it is blocked).
+#
+# `exec timeout …` so `$!` IS the `timeout` process: GNU timeout makes itself a
+# process-group leader and forwards a TERM it receives to that whole group, so
+# one signal to a pid this suite owns reaps zsh AND the `cat` under it. That
+# `cat` holds BOTH ends of the fifo through the inherited `<>` descriptor and
+# would otherwise never see EOF — an orphan that outlives the suite.
+_held_verdict() {
+    local form="$1" pid t0 verdict zpid cpid=""
+    printf 'old\n' > f
+    : > "$WORK/held.out"; : > "$WORK/held.sig"; : > "$WORK/held.reaped"
+    eval "exec timeout -k 5 $(( STARTUP_CEILING + BLOCK_WINDOW + 60 )) $form" \
+        <&"$_HELD_FD" > "$WORK/held.out" 2>&1 &
+    pid=$!
+    t0=$SECONDS
+    while kill -0 "$pid" 2>/dev/null && [[ -s f ]] && (( SECONDS - t0 < STARTUP_CEILING )); do
+        sleep 0.1
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+        verdict=returned
+    elif [[ -s f ]]; then
+        verdict=never-started
+    else
+        t0=$SECONDS
+        while kill -0 "$pid" 2>/dev/null && (( SECONDS - t0 < BLOCK_WINDOW )); do sleep 0.1; done
+        if kill -0 "$pid" 2>/dev/null; then
+            verdict=blocked
+            zpid=$(ps -o pid= --ppid "$pid" 2>/dev/null | tr -d ' ' | sed -n 1p)
+            if [[ "$zpid" =~ ^[0-9]+$ ]]; then
+                ps -o args= --ppid "$zpid" 2>/dev/null | sed -n 1p | sed 's/[[:space:]]*$//' > "$WORK/held.sig"
+                cpid=$(ps -o pid= --ppid "$zpid" 2>/dev/null | tr -d ' ' | sed -n 1p)
+            fi
+        else
+            verdict=returned
+        fi
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    # REAPED, ASKED BY HANDLE. The blocked `cat` is the process that would
+    # outlive this suite, and "did it" is answered from the PID recorded while
+    # it was blocked — never from a `ps | grep cat`, which cannot tell this
+    # `cat` from anybody else's (your-org/nexus-code#1073). `timeout` forwards
+    # the TERM asynchronously, so poll briefly rather than sample once.
+    if [[ "$cpid" =~ ^[0-9]+$ ]]; then
+        t0=$SECONDS
+        while [[ -d "/proc/$cpid" ]] && (( SECONDS - t0 < 10 )); do sleep 0.1; done
+        [[ -d "/proc/$cpid" ]] && printf 'no' > "$WORK/held.reaped" || printf 'yes' > "$WORK/held.reaped"
+    fi
+    printf '%s' "$verdict"
+}
+
 # ---- assertion-count guard --------------------------------------------------
 _th_count_guard() {
     local EXPECTED_ASSERTIONS=9          # extraction (6) + bash arm (3)
-    [[ "$HAVE_ZSH" == yes ]] && EXPECTED_ASSERTIONS=$(( EXPECTED_ASSERTIONS + 10 ))
+    # zsh arm: NULLCMD (1) + mask (3) + block (5) + slow-startup block (2)
+    #          + verdict discrimination (1) + remedy (3)
+    [[ "$HAVE_ZSH" == yes ]] && EXPECTED_ASSERTIONS=$(( EXPECTED_ASSERTIONS + 15 ))
     [[ "$HAVE_JQ"  == yes ]] && EXPECTED_ASSERTIONS=$(( EXPECTED_ASSERTIONS + 10 ))
     assert_eq "assertion TOTAL matches the EXPECTED total (zsh=$HAVE_ZSH jq=$HAVE_JQ)" \
               "$(( PASS + FAIL ))" "$EXPECTED_ASSERTIONS"
@@ -113,7 +187,7 @@ echo
 echo '=== THE ASYMMETRY, bash half: a command-less redirection only truncates ==='
 cd "$WORK" || th_abort "cannot cd to $WORK"
 printf 'old\n' > f
-out=$(eval "timeout 10 $FORM_BASH" 2>&1); rc=$?
+out=$(eval "timeout $RETURN_CEILING $FORM_BASH" 2>&1); rc=$?
 assert_eq       "the bash form exits 0 (control C)" "$rc" "0"
 assert_contains "…and returns"                      "$out" "returned"
 assert_eq       "…having truncated the file"        "$(wc -c < f)" "0"
@@ -126,7 +200,7 @@ if [[ "$HAVE_ZSH" == yes ]]; then
     echo
     echo '=== THE MASK: zsh with stdin at /dev/null RETURNS (why nobody finds it) ==='
     printf 'old\n' > f
-    out=$(eval "timeout 10 $FORM_MASK" 2>&1); rc=$?
+    out=$(eval "timeout $RETURN_CEILING $FORM_MASK" 2>&1); rc=$?
     assert_eq       "the masked zsh form exits 0 (control C)" "$rc" "0"
     assert_contains "…and returns"                            "$out" "returned"
     assert_eq       "…having truncated the file"              "$(wc -c < f)" "0"
@@ -144,18 +218,53 @@ if [[ "$HAVE_ZSH" == yes ]]; then
     # removes the rendezvous entirely.)
     mkfifo "$WORK/held"
     exec {_HELD_FD}<>"$WORK/held"
-    printf 'old\n' > f
-    out=$(eval "timeout 3 $FORM_BLOCK" <&"$_HELD_FD" 2>&1); rc=$?
-    assert_eq           "the blocking form is KILLED by timeout (rc 124), it does not return" "$rc" "124"
-    assert_not_contains "…and never printed its trailing echo"                             "$out" "returned"
+    # THE CLOCK STARTS WHEN ZSH REACHES THE REDIRECTION, NOT WHEN IT IS SPAWNED
+    # (your-org/nexus-code#1589). This leg used to be `timeout 3 <form>` and then
+    # asserted the file was truncated — which silently assumed zsh STARTED and
+    # reached `> f` inside those 3 s. Measured on this host at load ~40:
+    # `time zsh -c true` = 10.2 s. `timeout` then killed zsh before the
+    # redirection ran, the file kept its 4 bytes, and the row read a HOST
+    # condition as a failure of the mechanism under test: red in two full bands,
+    # green in isolation, reproduced exactly by a `.zshenv` that sleeps 4 s.
+    #
+    # Raising the bound is the wrong fix: a BLOCKING form always runs to its
+    # bound, so 30 s would cost 30 s on every GREEN run. `_held_verdict` instead
+    # waits for the OBSERVABLE the old row assumed — `f` emptied — and only then
+    # opens the block window. Startup gets a generous polled ceiling (free on
+    # green); the window stays at the 3 s it always was.
+    _v=$(_held_verdict "$FORM_BLOCK")
+    assert_eq           "the blocking form reaches its redirection and is STILL BLOCKED when the window closes" "$_v" "blocked"
+    assert_not_contains "…and never printed its trailing echo"              "$(cat "$WORK/held.out")" "returned"
+    # THE SIGNATURE CLAUDE.md tells a reader to look for in /proc: a child `cat`
+    # with NO ARGUMENTS. Every `cat` an author writes has a file argument; this
+    # one has none because zsh supplied it. Read while the form is still blocked.
+    assert_eq           "…blocked in an ARGUMENT-LESS \`cat\` that zsh, not the author, supplied" "$(cat "$WORK/held.sig")" "cat"
     # The `cat` ran and consumed nothing: the file was truncated by the open
     # and stays empty, so the artefact looks exactly like a successful truncate.
     assert_eq           "…yet the file IS truncated — the artefact reads as success" "$(wc -c < f)" "0"
+    assert_eq           "…and reaping the form left NO \`cat\` behind holding the fifo (asked by recorded pid)" "$(cat "$WORK/held.reaped")" "yes"
+
+    echo
+    echo '=== #1589: the same verdict when zsh takes LONGER TO START than the old 3 s bound ==='
+    # The regression pin, in-suite so it cannot rot: a ZDOTDIR whose `.zshenv`
+    # sleeps past the OLD budget. Before the fix this is the exact red the bands
+    # saw. 4 s is `#1589`'s own reproduction value: above 3, and small enough
+    # to cost this suite ~4 s.
+    mkdir -p "$WORK/slowzsh"; printf 'sleep 4\n' > "$WORK/slowzsh/.zshenv"
+    _v=$(ZDOTDIR="$WORK/slowzsh" _held_verdict "$FORM_BLOCK")
+    assert_eq "a 4 s zsh startup still yields \`blocked\` — startup is no longer inside the block budget" "$_v" "blocked"
+    assert_eq "…and the file is truncated, which is what the old row mis-read"   "$(wc -c < f)" "0"
+
+    echo
+    echo '=== the verdict DISCRIMINATES: the remedy form through the same instrument is `returned` ==='
+    # Without this, `blocked` could be what `_held_verdict` says about everything.
+    assert_eq "the remedy form is \`returned\`, not \`blocked\`, against the SAME held-open stdin" \
+        "$(_held_verdict "$FORM_FIX")" "returned"
 
     echo
     echo '=== CONTROL B + THE REMEDY: ": > f" returns even with stdin held open ==='
     printf 'old\n' > f
-    out=$(eval "timeout 10 $FORM_FIX" < "$WORK/held" 2>&1); rc=$?
+    out=$(eval "timeout $RETURN_CEILING $FORM_FIX" < "$WORK/held" 2>&1); rc=$?
     assert_eq       "the remedy form exits 0 against the SAME held-open stdin" "$rc" "0"
     assert_contains "…and returns — so the fifo is not what blocked above"    "$out" "returned"
     assert_eq       "…and truncates the file"                                 "$(wc -c < f)" "0"

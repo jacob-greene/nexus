@@ -213,6 +213,7 @@ monitor/watcher/test-instance-heartbeat.sh::ledger=no::count=none
 monitor/watcher/test-instance-lock-fd-leak.sh::ledger=yes::count=none
 monitor/watcher/test-instance-lock.sh::ledger=no::count=none
 monitor/watcher/test-integration/test-graceful-exit-relaunch.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-auth-failure-hooks.sh::ledger=yes::count=none
 monitor/watcher/test-integration/test-same-name-recycle.sh::ledger=yes::count=none
 monitor/watcher/test-integration/test-slow-grind-respawn.sh::ledger=yes::count=none
 monitor/watcher/test-integration/test-spawn-busy-idle-absent.sh::ledger=yes::count=none
@@ -271,6 +272,7 @@ monitor/watcher/test-ng-wrap-up-reply-to.sh::ledger=no::count=none
 monitor/watcher/test-ng-wrap-up.sh::ledger=no::count=none
 monitor/watcher/test-no-sandbox-gate.sh::ledger=no::count=none
 monitor/watcher/test-notification-record.sh::ledger=no::count=none
+monitor/watcher/test-operator-alert.sh::ledger=yes::count=none
 monitor/watcher/test-orchestrator-liveness-probe.sh::ledger=no::count=none
 monitor/watcher/test-orchestrator-liveness.sh::ledger=no::count=none
 monitor/watcher/test-orchestrator-session-pin.sh::ledger=no::count=none

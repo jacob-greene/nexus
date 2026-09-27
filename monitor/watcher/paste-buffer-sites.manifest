@@ -6,7 +6,12 @@
 # must be acknowledged in a commit message: a new site is expected to ADD a row,
 # and a removed site to drop one. Regenerating without saying which happened is
 # what the derived floor exists to prevent.
-monitor/paste-followup.sh	1
-monitor/watcher/_respawn.sh	1
-monitor/watcher/_unstick.sh	1
-monitor/watcher/main.sh	1
+#
+# 2026-09-19, your-org/nexus-code#1591: FOUR sites REMOVED and ONE ADDED, on
+# purpose. paste-followup.sh, watcher/main.sh, watcher/_unstick.sh and
+# watcher/_respawn.sh each used to make their own call; all four now go through
+# monitor/_paste-deliver.sh, the confirmed-delivery primitive, which makes the
+# only one. A SECOND row appearing here means a paste path has grown outside
+# the primitive — i.e. outside the submit confirmation — and is the thing to
+# refuse, not to record.
+monitor/_paste-deliver.sh	1

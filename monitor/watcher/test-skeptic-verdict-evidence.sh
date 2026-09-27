@@ -98,6 +98,21 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_test_dir/_test_helpers.sh"
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
+
+# ---- population (your-org/nexus-code#1301) --------------------------------
+# The orphan-advice lint below sweeps every tracked production shell file
+# directly under monitor/ and monitor/watcher/, plus monitor/ng, so a site added
+# there joins this guard's population. `_orph_files` is the ONE enumerator: the
+# lint and `gp_population` both call it (the ng dispatcher and
+# skeptic-channel.sh this suite executes are inside it). `gp_handle` EXITS on
+# --population, so it sits above the first line of output.
+_orph_files() {
+    git -C "$REPO_ROOT" ls-files -- ':(glob)monitor/*.sh' ':(glob)monitor/watcher/*.sh' monitor/ng \
+        | grep -v '/test-'
+}
+. "$REPO_ROOT/monitor/_guard_population.sh"
+gp_population() { _orph_files | sed "s|^|$REPO_ROOT/|"; printf '%s\n' "$_test_dir/_test_helpers.sh"; }
+gp_handle "$@"
 NG="$REPO_ROOT/monitor/ng"
 PREFLIGHT="$REPO_ROOT/monitor/retire-preflight.sh"
 
@@ -535,8 +550,7 @@ _orph_all=""
 while IFS= read -r _f; do
     [[ -n "$_f" && -r "$REPO_ROOT/$_f" ]] || continue
     _orph_all+="$(_orph_lint "$REPO_ROOT/$_f")"$'\n'
-done < <(git -C "$REPO_ROOT" ls-files -- ':(glob)monitor/*.sh' ':(glob)monitor/watcher/*.sh' monitor/ng \
-         | grep -v '/test-')
+done < <(_orph_files)
 _orph_n=$(grep -c ' \(OK\|BAD\) ' <<<"$_orph_all" || true)
 # Drop the DECLARED exemptions, then require zero violations of what remains.
 _orph_bad_list=$(grep ' BAD ' <<<"$_orph_all" || true)

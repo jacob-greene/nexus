@@ -823,7 +823,221 @@ if [[ "$discovered" == "$recorded" ]]; then
     # tree with everything STAGED:
     #     bash monitor/watcher/test-guards-for-diff.sh --population | sort -u | wc -l
     # The pin is that reading, not the sum.
-    _TGFD_POP_EXPECTED=189
+    #
+    # +2 for test-claude-md-tmux-socket-selection.sh's row (PR #1553, branched
+    # from 353867a0, so its 184 -> 186 was measured BEFORE the bundle-2609 +5)
+    # (your-org/nexus-code#1550, declaring at birth): its own suite path, and
+    # the one sentinel no other row named — monitor/tmuxwrap/tmux, the shim
+    # whose refusal the CLAUDE.md block it executes is about. CLAUDE.md and
+    # monitor/watcher/_test_helpers.sh were already members. MEASURED as a set
+    # difference against a detached worktree at origin/dev 353867a0, same
+    # command, everything STAGED, with the HEAD guard and the tracked-file
+    # positive control run FIRST (#1150): TWO added, ZERO removed, each named
+    # above, and the base read 184 there — the pin this line replaces, so the
+    # instrument agrees with itself on the base before the delta is believed.
+    # Selection cost: this suite runs 85 --population probes when selected;
+    # two more members is a selection-RATE change of at most the rate at which
+    # those two files are touched, and monitor/tmuxwrap/tmux is edited rarely
+    # (your-org/nexus-code#1226 asks for the rate, not just the constant).
+    #
+    # MERGED (#1553 onto dev 5875c560, whose pin was 189): the #1553 +2 above
+    # (its own suite path and monitor/tmuxwrap/tmux) is disjoint from the
+    # bundle-2609 +5, so 189 + 2 = 191 is the arithmetic — and 191 is what
+    # THIS suite measured on the merged tree with everything STAGED, as a SET
+    # DIFFERENCE against 5875c560 (189): exactly those two added, none removed:
+    #     bash monitor/watcher/test-guards-for-diff.sh --population | sort -u | wc -l
+    # The pin is that reading, not the sum.
+    #
+    # +8 for four suites declaring AT BIRTH (the test-evidence bundle:
+    # your-org/nexus-code#1519/#1510, #1474, #1530, #1301), measured on that tree with
+    # everything STAGED as a SET DIFFERENCE against a separate clone at the base
+    # d5874b26 (its HEAD checked first; this suite's own --population, sorted
+    # unique, reads 189 there): EIGHT added, ZERO removed, each named —
+    #   monitor/watcher/test-guards-for-diff-sweepers.sh    (suite path; its one
+    #       sentinel, monitor/guards-for-diff.sh, was already a member)
+    #   monitor/watcher/test-mutation-gate-subject.sh       (suite path)
+    #   monitor/mutation-gate.sh                            (its sentinel; NOT a
+    #       member before: test-mutation-gate-bounds.sh's row names only
+    #       test-claude-md-zsh-path-tie.sh, so an edit to the gate itself used
+    #       to select this index through no sentinel at all)
+    #   monitor/watcher/mutation-provenance.tsv             (its sentinel: the
+    #       tracked #1510 ledger, a NON-SHELL member whose row shape it pins)
+    #   monitor/watcher/test-run-tests-runner-signal.sh     (suite path)
+    #   monitor/watcher/test-realmodel-overlimit-unmeasured.sh          (suite path)
+    #   monitor/watcher/test-integration/_renderer_scrape_check.sh      (sentinel)
+    #   monitor/watcher/test-integration/test-realmodel-overlimit.sh    (sentinel)
+    # The other sentinels named by the four rows (monitor/shell-files.sh,
+    # monitor/watcher/run-tests.sh, monitor/guards-for-diff.sh) were already
+    # members.
+    # Selection rate over the last 120 first-parent commits of d5874b26, by the
+    # documented `git diff-tree -r --no-commit-id --name-only <sha>^ <sha>` form
+    # (0 of the 120 had an empty diff): 84/120 with the 189-member set and
+    # 84/120 with the 197-member set — the cost moved by nothing measurable.
+    #
+    # MERGED (#1558 onto dev b4439702 = #1553's merge, whose pin was 191): the
+    # #1558 +8 above is disjoint from #1553's +2 (monitor/tmuxwrap/tmux and the
+    # socket-selection suite path), so 191 + 8 = 199 is the arithmetic — and
+    # 199 is what THIS suite measured on the merged tree with everything STAGED,
+    # as a SET DIFFERENCE against b4439702 (191): exactly the eight above added:
+    #     bash monitor/watcher/test-guards-for-diff.sh --population | sort -u | wc -l
+    # The pin is that reading, not the sum.
+    # +2 for test-operator-alert.sh's row (your-org/nexus-code#1548, oplive,
+    # declaring at birth): its own suite path (by DISCOVERY) and the one
+    # sentinel no other row named, monitor/watcher/_operator_alert.sh — the
+    # text-carrying operator-alert primitive it drives. MEASURED as a SET
+    # DIFFERENCE against a detached worktree at origin/dev 02406fec (HEAD
+    # equality, an empty `status --porcelain --ignored` and the CLAUDE.md
+    # tracked-file positive control checked first), everything COMMITTED on
+    # the rebased oplive tree: the base reads 199 there, the head 201,
+    # TWO added, ZERO removed, each named. Selection rate over the last 120
+    # first-parent commits of 02406fec: 82/120 with the base set and
+    # 82/120 with the head set.
+    #
+    # +3 for test-heredoc-backtick-lint.sh (your-org/nexus-code#1555) declaring
+    # its population at birth: its own suite path plus the two sentinels no
+    # other row named — monitor/spawn-worker.sh (the PRODUCT site the lint
+    # found on enrolment) and monitor/watcher/strip-heredocs-failsafe.manifest
+    # (non-shell; its drift changes which files the lint can parse). Its third
+    # sentinel, monitor/ng, and the two parser files it declares
+    # (monitor/shell-files.sh, monitor/watcher/_shell_quotes.awk) were already
+    # members. 199 + 3 = 202: measured with everything STAGED, same command, as
+    # a SET DIFFERENCE (`comm -3`) against this suite's own reading on the same
+    # clone at 02406fec BEFORE the row existed (199, the pin this replaces, so
+    # the instrument agreed with itself on the base): exactly those three
+    # added, none removed.
+    #
+    # MERGED (#1569 onto dev efd4e3a8 = #1566's merge, whose pin was 201; both
+    # sides re-pinned from the common base 199): the #1566 +2 and the #1569 +3
+    # are DISJOINT, so 199 + 2 + 3 = 204 is the arithmetic — and 204 is what
+    # THIS suite measured on the merged tree with everything STAGED
+    # (merge4, 2026-09-18), as SET DIFFERENCES against detached worktrees at
+    # efd4e3a8 (201) and 6e68f47f (202), each worktree's HEAD, an empty
+    # `status --porcelain --ignored` and the CLAUDE.md positive control
+    # checked first: against efd4e3a8 exactly #1569's three added, against
+    # 6e68f47f exactly #1566's two added, ZERO removed on either side:
+    #     bash monitor/watcher/test-guards-for-diff.sh --population | sort -u | wc -l
+    # The pin is that reading, not the sum.
+    # +3 for test-skeptic-round-identity.sh's row (your-org/nexus-code#1537,
+    # #1538, #1573, declaring at birth): its own suite path (by DISCOVERY) and
+    # the two sentinels no other row named, monitor/skeptic-channel.sh and
+    # monitor/spawn-worker.sh (its third, monitor/ng, was already in the set).
+    # MEASURED as a SET DIFFERENCE against a detached worktree at origin/dev
+    # efd4e3a8 (HEAD equality, an empty `status --porcelain --ignored` and the
+    # CLAUDE.md tracked-file positive control checked first), everything STAGED
+    # on the skproto tree: the base reads 201 there, the head 204, THREE added,
+    # ZERO removed, each named. Selection rate over the last 120 first-parent
+    # commits of efd4e3a8 (0 of the 120 with an empty diff): 83/120 with the
+    # base set and 85/120 with the head set — two more commits select this
+    # guard, both for touching skeptic-channel.sh or spawn-worker.sh, which is
+    # the coverage the row exists to add.
+    #
+    # MERGED (#1580 onto dev f13cfb74 = #1568's merge, whose pin was 204): the
+    # #1580 +3 above SHARES monitor/spawn-worker.sh with #1569's +3, so the
+    # naive 204 + 3 = 207 is WRONG and 204 + 2 = 206 is the arithmetic — and
+    # 206 is what THIS suite measured on the rebased tree with everything
+    # committed, as a SET DIFFERENCE against a detached worktree at f13cfb74
+    # (HEAD equality, an empty `status --porcelain --ignored` and the CLAUDE.md
+    # positive control checked first): exactly monitor/skeptic-channel.sh and
+    # monitor/watcher/test-skeptic-round-identity.sh added, ZERO removed.
+    # skprotosk's independent trial merge of #1580 + #1569 read 206 too.
+    # RE-MEASURED after the second rebase, onto dev 4bbfe878 (#1582's merge,
+    # tmuxwrap/tmux already a member): dev 204, head 206, the SAME two added,
+    # ZERO removed — same detached-worktree guards, same command.
+    # Selection rate over the last 120 first-parent commits of f13cfb74 (0 of
+    # the 120 with an empty diff): 86/120 with the dev set and 86/120 with the
+    # rebased set — no commit in that window touches either added file
+    # without also touching a file already in the population.
+    # The pin is that reading, not the sum.
+    #
+    # +1 for test-population-primary-shape.sh's row (your-org/nexus-code#1588,
+    # declaring at birth): its own suite path and NOTHING else. All three of its
+    # sentinels — monitor/guards-for-diff.sh, monitor/shell-files.sh and
+    # monitor/watcher/test-tee-reopen-lint.sh — were already members, so the
+    # naive "+1 suite +3 sentinels = 210" is WRONG and 206 + 1 = 207 is the
+    # reading. Measured 2026-09-19 as a SET DIFFERENCE against a detached
+    # worktree at dev 17f1f926 (HEAD equality, an empty `status --porcelain
+    # --ignored` and the CLAUDE.md positive control checked first), everything
+    # STAGED here, same command both sides (`--population | sort -u`): base 206
+    # — which independently equals the pin committed AT that ref — head 207,
+    # ONE added (monitor/watcher/test-population-primary-shape.sh), ZERO removed.
+    # The reading at THAT ref was 207.
+    # +4 for test-paste-deliver.sh's row (your-org/nexus-code#1591, declaring at
+    # birth): its own suite path (by DISCOVERY) and the three sentinels no other
+    # row named — monitor/_paste-deliver.sh, monitor/watcher/_fs_guard.sh and
+    # monitor/watcher/_unstick.sh (paste-followup.sh and _respawn.sh were already
+    # in the set). MEASURED as a SET DIFFERENCE against a detached worktree at
+    # dev 17f1f926 (HEAD equality, an empty `status --porcelain --ignored` and
+    # the CLAUDE.md tracked-file positive control checked first), everything
+    # STAGED: the base reads 206 there, the head 210, FOUR added, ZERO removed,
+    # each named. Selection rate over the last 120 first-parent commits of
+    # 17f1f926 (0 of the 120 with an empty diff): 88/120 with the base set and
+    # 88/120 with the head set.
+    # THE FIRST CUT OF THAT ROW READ 211 AND 95/120, and the difference is the
+    # reason this comment demands the rate and not just the count:
+    # monitor/watcher/main.sh was a sentinel, and main.sh alone selected this
+    # 17-minute guard on seven more of those 120 commits, each attributed by
+    # name. A sentinel buys non-vacuity for an enumerator; the other five already
+    # did, so main.sh bought nothing and was dropped from the SENTINELS — the
+    # suite still reads it and is still selected by an edit to it.
+    # The reading on THAT branch, before the merge below, was 210.
+    # MERGED (#1595 onto dev 086b82bf = #1593's merge, whose pin was 207; both
+    # sides re-pinned from the common base 17f1f926 = 206): the #1593 +1
+    # (monitor/watcher/test-population-primary-shape.sh) and the #1595 +4
+    # (monitor/_paste-deliver.sh, monitor/watcher/_fs_guard.sh,
+    # monitor/watcher/_unstick.sh, monitor/watcher/test-paste-deliver.sh) are
+    # DISJOINT, so 206 + 1 + 4 = 211 is the arithmetic — and 211 is what THIS
+    # suite measured on the merged tree with everything STAGED, as SET DIFFERENCES
+    # against detached worktrees at BOTH parents (each worktree's HEAD, an empty
+    # `status --porcelain --ignored` and the CLAUDE.md positive control checked
+    # first): against 367cde4b (#1595's head, 210) exactly #1593's one added,
+    # against 086b82bf (dev, 207) exactly #1595's four added, ZERO removed on
+    # either side. Selection rate over the last 120 first-parent commits of
+    # 086b82bf (0 of the 120 with an empty diff): 89/120 with the dev set and
+    # 89/120 with the merged set.
+    # The pin is that reading, not the sum.
+    # +2 for test-run-tests-shape-census.sh's row (your-org/nexus-code#1618,
+    # #1620, declaring at birth): its own suite path and monitor/watcher/
+    # band-verdict.sh, the one sentinel no other row named (run-tests.sh and
+    # _test_helpers.sh were already in the set). MEASURED as a SET DIFFERENCE
+    # against the detached base worktree at dev 9f0b719a (HEAD checked; its only
+    # untracked entry was a concurrent band's .gfd-plant), everything STAGED:
+    # base 211 — equal to the pin committed at that ref — head 213, TWO added,
+    # ZERO removed, each named. Selection rate over the last 120 first-parent
+    # commits of 9f0b719a (0 of the 120 with an empty diff): 92/120 with the base
+    # set and 92/120 with the head set, so the two paths cost no selections.
+    # +4 for test-dangerous-rm-decide-hook.sh's row (your-org/nexus-code#1632,
+    # declaring at birth): its own suite path and three of its sentinels no
+    # other row named, monitor/hooks/dangerous-rm-decide.sh,
+    # monitor/watcher/_compose_nudge.sh and monitor/worker-settings.json (ng,
+    # _idle_probe.sh, orchestrator-settings.json and worker-heartbeat.sh were
+    # already in the set). MEASURED as a SET DIFFERENCE (`comm -3` of the two
+    # sorted emits) against a detached base worktree at dev 946067b9 (fetched
+    # 2026-09-25, HEAD checked, CLAUDE.md visible as the positive control),
+    # everything STAGED: base 213 — equal to the pin committed at that ref —
+    # head 217, FOUR added, ZERO removed.
+    # +21 for your-org/nexus-code#1301 item 2 (fourteen tree-sweeping suites
+    # enrolled) and #1496 (test-claude-md-fallback-collapse.sh, declaring at
+    # birth): twelve suite paths (conflict-marker-lint, the dictionary-coverage
+    # suite and zsh-modifier-lint were already sentinels of other rows) and nine
+    # sentinels no other row named — ci-trigger-audit.py, lint-workflows.py,
+    # _remote_lib.sh, remote-up.sh, launcher.sh, paste-buffer-sites.manifest,
+    # _requests.sh, state-dir-propagation.manifest and _cc-version.sh. MEASURED
+    # as a SET DIFFERENCE (`comm -3` of the two sorted emits) against a detached
+    # base worktree at dev 049b31d6 (HEAD checked, `status --porcelain
+    # --ignored` empty): base 217 — equal to the pin committed at that ref — and
+    # head 238 in a second detached worktree carrying the bundle's whole working
+    # state STAGED: 21 added, ZERO removed. Selection rate over the last 120
+    # first-parent commits of 049b31d6 (0 empty): 94/120 base, 95/120 head.
+    # +2 for test-public-mirror-overlay-files.sh's row (your-org/nexus-code#1557,
+    # declaring at birth): its own suite path and one sentinel no other row
+    # named, monitor/public-mirror/overlay/manifest.tsv (build.sh and
+    # lint-workflows.py were already in the set). MEASURED as a SET DIFFERENCE
+    # (`comm -3` of the two sorted gp_render emits, this suite's own
+    # gp_population extracted verbatim) against a detached base worktree at dev
+    # 98482eed (HEAD checked, `status --porcelain --ignored` empty): base 238 —
+    # equal to the pin committed at that ref — and head 240 with the bundle's
+    # registry rows committed: TWO added, ZERO removed.
+    _TGFD_POP_EXPECTED=240
     _n_pop=$( gp_render "" 2>/dev/null | sort -u | "$REAL_GREP" -c . )
     _n_nosent=$(
         gp_population() { printf '%s\n' "$INDEX" "$PROTO" "$MANIFEST"
@@ -887,9 +1101,16 @@ echo "=== 2. each declared population is above its floor, and every path is real
 # Two derivations of the same threshold is one too many, so the literal lives
 # here and the assertion below pins the index to it. A drift in either
 # direction reds this suite rather than silently re-opening the band.
+#
+# The index NAMES the value since your-org/nexus-code#1615 (so its refusal can
+# print the bound it was held to), so the pin is a PAIR: the named value equals
+# this literal, AND the probe call uses that name. Either alone could drift —
+# the value changed, or the call re-hardcoded to a different number.
 GFD_PROBE_BUDGET=180
 assert_contains "the index probes with the SAME budget this suite enforces — a probe that would REFUSE the tool must RED the guard" \
-    "$(cat "$INDEX")" "timeout $GFD_PROBE_BUDGET bash \"\$suite\" --population"
+    "$(cat "$INDEX")" "_probe_bound=$GFD_PROBE_BUDGET"
+assert_contains "…and the probe call is bounded BY that named value" \
+    "$(cat "$INDEX")" "timeout \"\$_probe_bound\" bash \"\$suite\" --population"
 # `_sentinels_missing <pop-file> <comma-list>` — which named members are ABSENT
 # from a declared population. Extracted so §2b's live check and §2c's planted
 # control run the SAME predicate; a control that re-implements what it controls
@@ -1063,6 +1284,52 @@ assert_contains "the report states the residual as <not-declaring> of <all suite
     "$out" "$want_residual of $n_suites tracked test suites"
 assert_contains "…and says plainly that it is not a substitute for the full suite" \
     "$out" "not a substitute for the full suite"
+
+# 4a. THE ENROLLED SWEEPERS LEFT THE BLIND SPOT (your-org/nexus-code#1301 item 2).
+#     Fourteen suites whose code swept the live tree were NAMED in the
+#     undeclared-sweeper list until they were taught gp_population. Pinned both
+#     ways, so neither half can pass vacuously: each is VISIBLE to the index (a
+#     guard row — two-space indent — under SELECTED or CONSIDERED AND EXCLUDED;
+#     the sweeper block indents eight, so it cannot satisfy this) AND absent from the
+#     sweeper block. The block is extracted between its header and its
+#     error-direction footer, and the extractor is held to the header's own
+#     count, so an extraction that silently read nothing cannot certify an
+#     absence. A suite that stops declaring reddens here by name.
+_tgfd_enrolled_sweepers='monitor/test-conflict-marker-lint.sh
+monitor/test-lint-errexit-branch.sh
+monitor/watcher/test-diagnostics-outlive-their-paths.sh
+monitor/watcher/test-fixture-port-lint.sh
+monitor/watcher/test-launcher-empty-target.sh
+monitor/watcher/test-paste-bracketed.sh
+monitor/watcher/test-public-mirror-dictionary-coverage.sh
+monitor/watcher/test-registry-unreadable-refusal.sh
+monitor/watcher/test-remote-posture-change.sh
+monitor/watcher/test-request-state-field.sh
+monitor/watcher/test-skeptic-verdict-evidence.sh
+monitor/watcher/test-state-dir-propagation.sh
+monitor/watcher/test-strip-heredocs.sh
+monitor/watcher/test-zsh-modifier-lint.sh'
+_tgfd_sweep_block=$(awk '
+    /SWEEP THE TREE/            { inb = 1; next }
+    inb && /A LOWER BOUND/      { exit }
+    inb && /^[[:space:]]+[^[:space:]]+\.sh$/ { sub(/^[[:space:]]+/, ""); print }' <<<"$out")
+_tgfd_sweep_hdr=$(sed -n 's/.*AT LEAST \([0-9][0-9]*\) of those undeclared suites SWEEP THE TREE.*/\1/p' <<<"$out")
+_tgfd_sweep_n=$(printf '%s\n' "$_tgfd_sweep_block" | "$REAL_GREP" -c . || true)
+assert_eq "the sweeper-block extractor reads exactly the count the header states (${_tgfd_sweep_hdr:-no header})" \
+    "$_tgfd_sweep_n" "${_tgfd_sweep_hdr:-0}"
+_tgfd_vis_missing=""; _tgfd_still_named=""
+while IFS= read -r _s; do
+    [[ -n "$_s" ]] || continue
+    # Herestrings, never `printf | grep -q`: an early-exit reader under
+    # pipefail inverts a TRUE match (test-sigpipe-assertion-lint.sh).
+    "$REAL_GREP" -qE "^  ${_s//./\\.}( |\$)" <<<"$out" \
+        || _tgfd_vis_missing+=" $_s"
+    "$REAL_GREP" -qxF -- "$_s" <<<"$_tgfd_sweep_block" && _tgfd_still_named+=" $_s"
+done <<<"$_tgfd_enrolled_sweepers"
+assert_eq "all 14 enrolled sweepers are VISIBLE to the index (missing:${_tgfd_vis_missing:- none})" \
+    "${_tgfd_vis_missing:-none}" "none"
+assert_eq "…and none is named as an undeclared sweeper (named:${_tgfd_still_named:- none})" \
+    "${_tgfd_still_named:-none}" "none"
 
 # 4b. The UNTRACKED warning. Several enrolled guards enumerate via
 #     `git ls-files`, which cannot see a file that has not been `git add`ed —

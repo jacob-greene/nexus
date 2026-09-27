@@ -40,6 +40,20 @@ fail=0
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL %s\n' "$1" >&2; fail=$((fail + 1)); }
 
+# --- population (your-org/nexus-code#1301) ---------------------------------
+# Layer 2b sweeps every tracked YAML under .github/, so a YAML added anywhere
+# there joins this guard's population. `_eb_yaml_files` is the ONE enumerator:
+# layer 2b filters what it returns and `gp_population` declares it, alongside
+# the lint every layer drives and the sibling module the lint imports.
+# `gp_handle` EXITS on --population, so it sits above the first line of output.
+_eb_yaml_files() { git -C "$HERE/.." ls-files -- '.github/**/*.yml' '.github/**/*.yaml'; }
+. "$HERE/_guard_population.sh"
+gp_population() {
+    _eb_yaml_files | sed "s|^|$HERE/../|"
+    printf '%s\n' "$LINT" "$HERE/ci-trigger-audit.py"
+}
+gp_handle "$@"
+
 # --- layer 0: preconditions ------------------------------------------------
 # Dependencies are ASSERTED, never skipped over: a guard that silently stops
 # guarding is the defect class this whole family exists inside.
@@ -351,7 +365,7 @@ if command -v git >/dev/null 2>&1 && git -C "$HERE/.." rev-parse --git-dir >/dev
     # `git ls-files` (glob pathspecs), NOT `git ls-tree` (path PREFIXES) — the
     # latter returns a confident zero on a glob, which is the exact shape of
     # bug that would make this guard report "no strays" over nothing.
-    strays=$(git -C "$HERE/.." ls-files -- '.github/**/*.yml' '.github/**/*.yaml' \
+    strays=$(_eb_yaml_files \
              | grep -v '^\.github/workflows/[^/]*$' || true)
     tracked=$(git -C "$HERE/.." ls-files -- '.github/workflows/*.yml' | wc -l)
     if [ "$tracked" -lt 3 ]; then

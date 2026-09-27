@@ -6216,7 +6216,7 @@ render_pending_decisions() {
 
     # Gather current pending set into a TSV: window\tfp\tfile\tkind\texcerpt\tunresolved
     # We skip *.handled.json tombstones — those are terminal.
-    local current=""
+    local current="" _drm_live=""
     local f bn win_fp win fp kind excerpt unresolved
     # Ambient-shell-state independence (issue #721). Two distinct properties
     # here, both MEASURED rather than argued — see test-pending-decisions.sh
@@ -6311,6 +6311,17 @@ render_pending_decisions() {
             continue
         fi
         unresolved=$(jq -r 'if .unresolved == true then "true" else "false" end' "$f" 2>/dev/null)
+        # A forwarded dangerous-rm request (your-org/nexus-code#1632) is LIVE
+        # only while its worker hook is still waiting. The hook tombstones it on
+        # every outcome; a request past its deadline + 30 s belongs to a hook
+        # that was killed mid-wait, and is no longer answerable — drop it.
+        if [[ "$kind" == dangerous_rm ]]; then
+            local _drm_dl
+            _drm_dl=$(jq -r '.deadline_epoch // 0' "$f" 2>/dev/null)
+            [[ "$_drm_dl" =~ ^[0-9]+$ ]] || _drm_dl=0
+            (( now <= _drm_dl + 30 )) || continue
+            _drm_live+="$win"$'\n'
+        fi
         current+="$win"$'\t'"$fp"$'\t'"$f"$'\t'"$kind"$'\t'"$excerpt"$'\t'"$unresolved"$'\n'
     done
     eval "$_rpd_restore_nullglob"   # NOT `shopt -u` — see (b) above.
@@ -6368,6 +6379,29 @@ render_pending_decisions() {
         # cycle surfaces it as brand-new — nothing permanently muted.
         if [[ "$kind" == "idle_prompt" ]] \
            && { _openg_marked "$win" || _idle_skeptic_parked "$win" "$now"; }; then
+            continue
+        fi
+        # A forwarded dangerous-rm request (your-org/nexus-code#1632) is the
+        # decision for that window's modal. The generic `permission_prompt`
+        # rows about the SAME modal (the Notification hook's, and Case A's
+        # refusal record) would ask the orchestrator to answer it in the pane,
+        # where there is nothing to answer — suppress them while it is open.
+        if [[ "$kind" == permission_prompt && -n "$_drm_live" ]] && grep -qxF -- "$win" <<<"$_drm_live"; then
+            continue
+        fi
+        # And the request itself is emitted on EVERY render while it is open:
+        # its worker hook denies at its deadline (≤ 100 s, inside Claude Code's
+        # 2-minute auto-deny), so a cooldown or a pane-gate hold would let it
+        # expire unseen. The staging file is overwritten every render, so a
+        # row printed once and then withheld is visible to compose_emit for
+        # one 10 s window only.
+        if [[ "$kind" == dangerous_rm ]]; then
+            local _drm_j
+            _drm_j=$(jq -r '"    command=\(.command // "")\n    cwd=\(.cwd // "")\n    classifier=\(.classifier // "")\n    deadline-in=\((.deadline_epoch // 0) - '"$now"')s  (then the worker hook DENIES)\n    answer=ng decision-answer \(.window) \(.fingerprint) allow|deny --nonce \(.nonce) [--reason <text>]"' "$file" 2>/dev/null)
+            emit_lines+="window=$win fp=$fp kind=dangerous_rm unresolved=true   ANSWER NOW — a worker is blocked on this"$'\n'
+            emit_lines+="$_drm_j"$'\n'
+            emit_lines+="    file=$file"$'\n'
+            next_state+="$win"$'\t'"$fp"$'\t'"$now"$'\n'
             continue
         fi
         local key="$win"$'\t'"$fp"

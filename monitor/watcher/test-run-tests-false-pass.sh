@@ -106,6 +106,26 @@ while read -r _fn; do
 done < <(command grep -oE '^export -f [A-Za-z_][A-Za-z0-9_]*' "$RUNNER" | awk '{print $3}')
 printf '  (inherited runner helpers scrubbed: %d — non-zero means this suite was reached THROUGH a runner)\n' "$_inherited"
 
+# …AND THE INHERITED RUNNER *ENVIRONMENT* (your-org/nexus-code#1571 F5). The
+# functions above are one carrier; exported VARIABLES are the other. Measured by
+# the #1569 skeptic: this suite's `rtfp-skipbanner` fixture logs landed in the
+# OUTER run's `--keep-logs` directory, because `KEEP_LOGS_DIR` reached the
+# nested runner. The list is derived from the runner, like the one above.
+th_scrub_inherited_runner_env "$RUNNER"
+printf '  (inherited runner env inputs scrubbed: %d)\n' "$TH_RUNNER_ENV_SCRUBBED"
+# Controls, in a SUBSHELL so they cannot disturb this suite's own environment:
+# a planted policy input is removed, a keep-listed one survives, and the
+# derivation is non-vacuous (a broken one would scrub nothing and pass).
+_scrub_probe=$(
+    export KEEP_LOGS_DIR=/planted/outer NEXUS_TEST_REQUIRE_RUN=1 NEXUS_TEST_CEILING_FILE=/planted/c NEXUS_TEST_JOBS=4
+    th_scrub_inherited_runner_env "$RUNNER"
+    printf '%s|%s|%s|%s' "${KEEP_LOGS_DIR-GONE}" "${NEXUS_TEST_REQUIRE_RUN-GONE}" "${NEXUS_TEST_CEILING_FILE-GONE}" "${NEXUS_TEST_JOBS-GONE}"
+)
+assert_eq "the outer caller's runner POLICY inputs do not reach a nested runner, and the suite's own deadline input does" \
+          "$_scrub_probe" "GONE|GONE|GONE|4"
+assert_eq "…and the derived input list is non-vacuous and names the variable that leaked" \
+          "$(th_runner_env_inputs "$RUNNER" | command grep -cx 'KEEP_LOGS_DIR'):$(( $(th_runner_env_inputs "$RUNNER" | command grep -c .) >= 8 ? 1 : 0 ))" "1:1"
+
 # POSITIVE CONTROL ON THE SCRUB. Asserted rather than assumed, and phrased so
 # it holds in BOTH modes: standalone there is nothing to scrub, through a
 # runner there is, and either way no runner helper may survive into the
@@ -292,11 +312,11 @@ run_mutant "M4 _rt_path_in_repo not exported (parallel arm only)" 2 m4
 m5() { python3 - "$1" <<'PY'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-old='(( ${_false_pass:-0} > 0 )) && exit 1\n'
+old='(( ${_false_pass:-0} > 0 )) && _rt_exit 1\n'
 assert old in s
 s=s.replace(old,"",1)
-old2=''' && ${_vacuous_pass:-0} == 0 \\\n       && ${_false_pass:-0} == 0 )) && exit 0'''
-new2=''' && ${_vacuous_pass:-0} == 0 )) && exit 0'''
+old2=''' && ${_vacuous_pass:-0} == 0 \\\n       && ${_false_pass:-0} == 0 )) && _rt_exit 0'''
+new2=''' && ${_vacuous_pass:-0} == 0 )) && _rt_exit 0'''
 assert old2 in s
 open(p,'w',encoding='utf-8').write(s.replace(old2,new2,1))
 PY
@@ -324,7 +344,7 @@ assert_eq "the mutant runner is gone"           "$( [[ -e "$MUTANT" ]] && echo p
 # fixture that bailed, a helper that vanished at rc 127, which nothing else
 # counts), and the ledger catches a FAIL recorded inside a subshell whose
 # increment died with it.
-EXPECTED_ASSERTIONS=27
+EXPECTED_ASSERTIONS=29
 echo
 if (( PASS + FAIL != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. Some assertion did not execute.\n' \

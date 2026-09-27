@@ -6,12 +6,31 @@
 #   state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent|over-limit|
 #          working-background|working-self-paced|idle-orphan-async|unknown> \
 #     active=<0|1> window=<idx> name=<windowname> [input=<typed|ghost|blank|?>] \
-#     [queued=1] [reset_at=<token>] [limit=<flavour>] \
+#     [queued=1] [throttled=1] [retrying=<k>/<N>] [reset_at=<token>] [limit=<flavour>] \
 #     [evidence=<token>] [reason=<token> site=<label> [capture=failed]] \
 #     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies> \
 #      bg_oldest_start=<epoch> bg_infra=<count> bg_stale=<count> \
 #      bg_cmd=<comm:cmd-tail> bg_cpu_bp=<basis-points|-> bg_wedged=<0|1>
-#      bg_members=<digest> bg_quiesce=<count> bg_longjob=<0|1>]
+#      bg_members=<digest> bg_quiesce=<count> bg_longjob=<0|1> [bg_longjob_kept=<count>]] \
+#     [bg_longjob=1] [bg_longjob_watches=<count>]
+#
+# The LAST line is the longjob exclusion's RECORD on the two lines it DECIDES
+# and which carry no bg_* tail (your-org/nexus-code#1546): `bg_longjob=1` on an
+# `idle` line whose only shell was the dispatcher's excluded root, and
+# `bg_longjob_watches=<n>` on the Monitor-style `working-background` line a live
+# watch is holding. `retrying=<k>/<N>` is a sub-condition of `busy`, as
+# `throttled=1` is (your-org/nexus-code#1552).
+#
+# `bg_longjob_kept=<n>` (your-org/nexus-code#1627) — of the `bg_shells` counted,
+# how many are roots holding a longjob-watch DISPATCHER that the exclusion did
+# NOT remove: a dispatcher the ledger does not name (a second one under the same
+# claude, refused or yielding under #1544, or one that released the spool with
+# its stdout closed — both stay alive until their claude exits), a ledger that
+# is not `armed`, or a root the #1544/#1565 co-tenant rules kept. A RECORD, not
+# an input: it changes no verdict, so the pane still reads
+# `working-background`, and it says WHY. Keyed on ARGV — acceptable only because
+# it selects nothing and is scoped to THIS pane's own counted subtrees; the
+# exclusion itself stays identity-keyed. Emitted only when non-zero.
 #
 # A background SHELL is detected from the kernel PROCESS TREE — claude's
 # live background-shell child subtrees (your-org/nexus-code#445, made the
@@ -1831,6 +1850,115 @@ _detect_throttled() {
     grep -qiE 'waiting for capacity|lower priority' <<<"$window"
 }
 
+# A turn is IN FLIGHT and the harness is RETRYING THE REQUEST — the transport
+# failure render (your-org/nexus-code#1552). Measured on the real 2.1.273
+# binary, mock backend killed mid-stream, and unchanged since 2.1.268:
+#
+#     ✻ Connection refused — a firewall or proxy may be blocking it
+#       (ConnectionRefused) · Retrying in 3s · attempt 3/10
+#     ✻ 401 OAuth token has expired. Please obtain a new token or refresh your
+#       existing to… · Retrying in 16s · attempt 6/10
+#
+#     pane-state: state=idle active=0 input=blank
+#     bk_pane_kill_authorized idle  ->  rc 0, KILL AUTHORIZED
+#
+# No token counter and no `esc to interrupt`, so neither arm of `_detect_busy`
+# fired. This is the pane EVERY agent on the board shows during a backend or
+# network outage, so the whole board became kill-eligible and paste-eligible at
+# once — and the paste half is `#1517`'s resubmit storm.
+#
+# WHY `busy retrying=<k>/<N>` AND NOT `idle retrying=…`, which is what `#1552`
+# first proposed. `#1340`'s argument for a FIELD is that every consumer already
+# treats `busy` as never-kill and never-paste, so the field needs no consumer
+# audit. That argument holds ONLY while the state it rides on is `busy`. A field
+# on `idle` is the opposite trade: `bk_pane_kill_authorized` takes a state token
+# and nothing else, so `idle retrying=3/10` stays kill-authorised until every
+# reader of `idle` has been taught the field — the audit the field was chosen to
+# avoid. And `busy` is not a euphemism: the harness re-sends on its own, so a
+# pane mid-retry IS a turn in flight, exactly as a throttled one is. When the
+# budget is exhausted the render changes to a past-tense `● API Error: …` plus
+# `✻ Cogitated for 3m 11s`, which carries no retry construct and reads `idle`,
+# correctly — the turn is lost (`transport-retry-exhausted-realmodel-273.ansi`).
+#
+# KEYED ON THE CONSTRUCT, NOT ON ONE FAILURE'S VOCABULARY. `_detect_throttled`
+# and `_detect_auth_expired` each key on one failure's strings, and this is the
+# third member of a family that keeps producing new ones (connection refused,
+# 401, 5xx, overloaded, …). What they share is the harness's own retry chrome:
+# `Retrying in <t> · attempt <k>/<N>`. So `#1518`'s 401 mid-retry render now
+# reads `busy retrying=6/10 auth=expired` — `auth=` rides on whatever verdict
+# the pane produces (see `emit`), and `_auth_hold.sh` keys on the field alone.
+#
+# LIVE vs QUOTED, and it is STRUCTURAL because there is no second literal to
+# lean on (the throttled render has `esc to interrupt`; this one has nothing).
+# The retry row is a SPINNER row: it starts at column 0 with the spinner glyph.
+# Everything that can QUOTE the construct starts otherwise — assistant prose
+# and tool calls under `●`, tool output under an indented `⎿`, a user echo
+# under `❯`, box chrome under `│`, and every continuation row is indented. So
+# the window is cut into LOGICAL rows (a column-0 row plus its indented
+# continuations), the construct is matched against the JOINED row so a wrap
+# cannot split it, and a logical row whose head is one of the known
+# transcript/chrome glyphs is ignored.
+#
+# THAT HEAD TEST IS A DENYLIST WITH A PERMISSIVE DEFAULT, ON PURPOSE, and the
+# direction is the reason: the permissive arm here is `busy`. An unrecognised
+# head glyph reads as a live retry → the pane is not retired and not pasted
+# into, until anything else paints. Enumerating the SPINNER glyphs instead
+# would put the default on the `idle` side, and the spinner set is the
+# harness's to change.
+#
+# FAILURE DIRECTIONS:
+#   * MISS (harness rewords `Retrying in` / `attempt k/N`) → back to `idle`,
+#     kill-authorised: `#1552` exactly. CC-VERSION-SENSITIVE, so it is on the
+#     collision list in `skills/nexus.cc-update/GUIDE.md` beside `#1340`'s.
+#   * OVER-FIRE → `busy` on a quiet pane: a wedge, not a kill, bounded by the
+#     10-row window scrolling. `transport-retry-quoted-synthetic.ansi` is the
+#     control that a pane merely QUOTING the construct is untouched.
+# Case-insensitive for `#1340`'s measured reason: a capitalisation-only reword
+# must not silently return the pane to the kill allowlist.
+#
+# _pane_retry_attempt <plain> <input_ln> → prints `<k>/<N>`, rc 0 | rc 1
+_pane_retry_attempt() {
+    local plain="$1" input_ln="$2"
+    _pane_spinner_window "$plain" "$input_ln" | awk '
+        function flush(   l, s) {
+            if (head_ok && buf != "") {
+                l = tolower(buf)
+                if (match(l, /retrying in [^\/]*attempt [0-9]+\/[0-9]+/)) {
+                    s = substr(l, RSTART, RLENGTH)
+                    sub(/^.*attempt /, "", s)
+                    found = s
+                }
+            }
+            buf = ""; head_ok = 0
+        }
+        /^[ \t]*$/ { flush(); next }
+        /^[^ \t]/ {
+            flush()
+            head_ok = 1
+            if (index($0, "●") == 1 || index($0, "⎿") == 1 || index($0, "❯") == 1 \
+                || index($0, ">") == 1 || index($0, "│") == 1) head_ok = 0
+            buf = $0
+            next
+        }
+        { if (buf != "") buf = buf " " $0 }
+        END { flush(); if (found == "") exit 1; print found }'
+}
+
+_detect_retrying() {
+    _pane_retry_attempt "$1" "$2" >/dev/null
+}
+
+# The SUB-CONDITIONS of `busy`, as emit fields: ` throttled=1`, ` retrying=k/N`,
+# both, or nothing. One place, because `busy` is emitted from three ladders and
+# a field added at N of them is a field missing from arm N+1 (`#788`'s lesson,
+# which `emit` records for `auth=`).
+_busy_subfields() {
+    local plain="$1" input_ln="$2" out="" att
+    _detect_throttled "$plain" "$input_ln" && out+=" throttled=1"
+    att=$(_pane_retry_attempt "$plain" "$input_ln") && [[ "$att" =~ ^[0-9]+/[0-9]+$ ]] && out+=" retrying=$att"
+    printf '%s' "${out# }"
+}
+
 _detect_busy() {
     # POSITIVE EVIDENCE THAT A TURN IS IN FLIGHT. Two forms, and the second
     # exists because the first is a proxy that `/low-priority` broke:
@@ -1842,7 +1970,12 @@ _detect_busy() {
     #   (b) the THROTTLED-RETRY chrome — a turn that is running and
     #       deliberately not generating (your-org/nexus-code#1340). See
     #       `_detect_throttled` for the measurement and the failure
-    #       directions.
+    #       directions;
+    #   (c) the TRANSPORT-RETRY chrome — a turn whose request FAILED and which
+    #       the harness is re-sending by itself (your-org/nexus-code#1552). See
+    #       `_pane_retry_attempt`. The proxy in (a) came apart from the
+    #       property a second time, by the same route: a retrying turn is not
+    #       generating either.
     #
     # The disjunction lives HERE, in the shared predicate, rather than at the
     # call sites: `_detect_busy` has four callers — the menu-dialog frame's
@@ -1855,7 +1988,8 @@ _detect_busy() {
     local window
     window=$(_pane_spinner_window "$plain" "$input_ln")
     grep -qE '[↓↑] +[0-9]+(\.[0-9]+)?[kKmM]? +tokens' <<<"$window" && return 0
-    _detect_throttled "$plain" "$input_ln"
+    _detect_throttled "$plain" "$input_ln" && return 0
+    _detect_retrying "$plain" "$input_ln"
 }
 
 _detect_queued_message() {
@@ -1921,7 +2055,17 @@ _input_row_typed_text() {
     # holding real operator text reads as empty, the very reading `#603`
     # added this function to prevent.
     raw=$(_strip_dim_box_chrome "$raw")
-    head=$(printf '%s' "$raw" | sed -E $'s/\x1b\\[7m.\x1b\\[0;2m.*$//') || head="$raw"
+    # THE CURSOR CELL MAY CARRY ITS OWN SGR (your-org/nexus-code#1531, measured
+    # on the real 2.1.273 binary). The ghost's first glyph sits UNDER the
+    # cursor, and 2.1.273 paints that cell as `\x1b[7m\x1b[39mP\x1b[0;2mress up
+    # to edit queued messages` — a colour reset BETWEEN the reverse-video
+    # introducer and the glyph. The byte-exact `\x1b[7m.\x1b[0;2m` did not
+    # match, the bare-dim cut below then started one glyph late, and the lone
+    # `P` was read as OPERATOR-TYPED TEXT: a vim-INSERT pane with a message
+    # queued behind a running turn read `user-typing input=typed` and carried
+    # no `queued=1` at all. So any run of SGR sequences is tolerated between
+    # the introducer and the glyph, and the glyph may be multi-byte.
+    head=$(printf '%s' "$raw" | sed -E $'s/\x1b\\[7m(\x1b\\[[0-9;]*m)*[^\x1b]{1,4}\x1b\\[0;2m.*$//') || head="$raw"
     # …and the bare-dim rendering of the same thing (#626): everything
     # from the first whole-parameter SGR 2 onward is ghost. Without this
     # the vim-INSERT refinement promotes a ghost to `user-typing`, which
@@ -2005,6 +2149,67 @@ _detect_empty_input() {
     after="${after##*❯}"
     after="${after//$NBSP/}"
     [[ -z "${after//[[:space:]]/}" ]]
+}
+
+# A COLLAPSED-CONTENT CHIP in the input box (your-org/nexus-code#1527).
+#
+# Claude Code collapses a multi-line BRACKETED paste into a placeholder:
+#
+#     ❯<NBSP>[Pasted text #1 +3 lines]<cursor>
+#       paste again to expand
+#
+# Measured on the real binary at 2.1.268, 2.1.270 and 2.1.273: the chip carries
+# NEITHER the bright-white typed marker NOR a dim run, and the reverse-video
+# cursor cell that follows it satisfies `_detect_empty_input`'s first arm — so a
+# box HOLDING an unsubmitted multi-line message read `input=blank`, and (the
+# half `#1527` left unmeasured, measured here at 2.1.273) `state=idle`: a pane
+# with a stranded brief in its box was PASTE-authorised and KILL-authorised.
+# `_respawn.sh`'s typed-retry, which presses its recovery Enter only on
+# `input=typed` (`#1514` F8, correctly narrow), could never recover exactly the
+# strand it exists for, since `#1516` made the respawn brief a bracketed paste.
+#
+# The chip is CONTENT SOMEBODY PLACED, so the box is `typed`, and the pane is
+# `user-typing` exactly as a single-line paste already is. This widens what
+# COUNTS as typed; it does not widen what receives Enter.
+#
+# `[Image #N]` is the same chrome for a pasted image. It is NOT measured here
+# (the hermetic harness cannot paste an image); it is included because the
+# error direction is the safe one — a box holding that text holds content
+# either way — and it is labelled as unmeasured rather than as observed.
+#
+# CC-VERSION-SENSITIVE: the chip text is the HARNESS's. A reword returns the row
+# to `blank`, the dangerous direction, so it is on the collision list in
+# `skills/nexus.cc-update/GUIDE.md`.
+_input_row_has_content_chip() {
+    local after
+    after=$(printf '%s' "$1" | _strip_ansi)
+    after="${after##*❯}"
+    grep -qE '\[(Pasted text|Image) #[0-9]+[^]]*\]' <<<"$after"
+}
+
+# _pane_input_kind <raw input row> <plain pane> → typed | ghost | blank | ?
+#
+# THE ONE ANSWER to "what is in the input box", shared by BOTH classification
+# routes. It used to be derived inline on the renderer route only, while the
+# heartbeat route asked a single question of the row (the bright marker) — so
+# vim-INSERT text without the marker, a content chip, and an undecidable row
+# were all invisible to every heartbeat-fresh pane, which is every worker for
+# the 30 minutes after each turn. Order is the renderer ladder's own:
+# bright/chip → typed; the vim-INSERT refinement (`#603`) → typed, and it
+# outranks a ghost reading; then ghost; then blank; else `?`.
+_pane_input_kind() {
+    local row="$1" plain="$2"
+    if _detect_user_typing "$row" || _input_row_has_content_chip "$row"; then
+        printf 'typed'
+    elif _detect_vim_insert "$plain" && _input_row_typed_text "$row"; then
+        printf 'typed'
+    elif _detect_autosuggest "$row"; then
+        printf 'ghost'
+    elif _detect_empty_input "$row"; then
+        printf 'blank'
+    else
+        printf '?'
+    fi
 }
 
 # Walk the pane's process tree for a live `claude` (or `claude-code`)
@@ -2673,7 +2878,7 @@ _pane_background_shells() {
     # skipped; empty → nothing skipped, the exact pre-existing walk.
     local pane_pid="$1" excl="${2:-}"
     if ! [[ "$pane_pid" =~ ^[0-9]+$ ]] || ! command -v pgrep >/dev/null 2>&1; then
-        printf '0 0 0 0 0 0 0 - -'; return 0
+        printf '0 0 0 0 0 0 0 0 - -'; return 0
     fi
     local total=0 count=0 proc_ok=0 claude_found=0
     # MEMBERSHIP (your-org/nexus-code#1460): every pid this walk visits, keyed
@@ -2702,6 +2907,8 @@ _pane_background_shells() {
     #                whole, a nexus protocol wait loop (_pane_payload_is_pure_wait)
     #   stale_roots  " pid " list of roots #1208 resolved as waiting on a died job
     local wait_roots=" " stale_roots=" "
+    # #1627: roots holding a longjob-watch dispatcher argv (see bg_longjob_kept).
+    local lj_kept_roots=" "
     # Oldest background-shell subtree ROOT start time, in clock ticks since
     # boot (`/proc/<pid>/stat` field 22). Converted to an epoch by the caller
     # side of this function. This is what makes the with-children episode age
@@ -2790,6 +2997,12 @@ _pane_background_shells() {
                 # it: one ordinary orchestration command printed
                 # `line 2391: /proc/27901/cmdline: No such file or directory`.
                 cmdl=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | head -c 4096)
+                if [[ -n "$cmdl" ]] && (( bgroot > 0 )) && _pane_cmd_is_longjob_dispatch "$cmdl"; then
+                    case "$lj_kept_roots" in
+                        *" $bgroot "*) : ;;
+                        *) lj_kept_roots="${lj_kept_roots}${bgroot} " ;;
+                    esac
+                fi
                 if [[ -n "$cmdl" ]] && _pane_cmd_is_protocol_wait "$cmdl"; then
                     case "$infra_roots" in
                         *" $bgroot "*) : ;;
@@ -2933,10 +3146,12 @@ _pane_background_shells() {
         members_digest=$(printf '%s\n' $members | sort | cksum | cut -d' ' -f1)
         [[ "$members_digest" =~ ^[0-9]+$ ]] || members_digest="-"
     fi
-    # Field 7 (quiesce) sits BEFORE members/desc so `desc`, which a `read` takes
-    # as the remainder, stays last.
-    printf '%d %d %d %d %d %d %d %s %s' "$count" "$total" "$reliable" "$oldest_epoch" \
-        "$infra" "$stale" "$quiesce" "$members_digest" "$desc"
+    local lj_kept=0 _r
+    for _r in $lj_kept_roots; do lj_kept=$(( lj_kept + 1 )); done
+    # Field 7 (quiesce) and field 8 (lj_kept, #1627) sit BEFORE members/desc so
+    # `desc`, which a `read` takes as the remainder, stays last.
+    printf '%d %d %d %d %d %d %d %d %s %s' "$count" "$total" "$reliable" "$oldest_epoch" \
+        "$infra" "$stale" "$quiesce" "$lj_kept" "$members_digest" "$desc"
 }
 
 # _pane_root_payload <cmdline> — the command a Claude Code tool/Monitor shell
@@ -3087,6 +3302,20 @@ _pane_payload_is_pure_wait() {
 # (A hypothetical `command: "sh"` entry would be counted — as a task shell, not
 # as a protocol wait — which is a residual noted in the scope block above and
 # not something a package-name filter here would fix either.)
+# _pane_cmd_is_longjob_dispatch <cmdline> — rc 0 iff the space-joined argv is
+# EXACTLY `<interpreter> <…/>longjob-watch.sh dispatch`: the shape
+# monitor/longjob-plugin/dispatch.sh execs, and the only one `dispatch` runs
+# under (it takes no arguments). A RECORD's predicate (your-org/nexus-code#1627,
+# `bg_longjob_kept`), never an exclusion's: argv cannot tell one dispatcher from
+# another, which is why the exclusion keys on the ledger's pid + start ticks.
+# A path holding a space splits into more words and does not match — the field
+# is then absent, which is the line as it was.
+# Bash-native, no here-string or subprocess: it runs inside the /proc walk.
+_pane_cmd_is_longjob_dispatch() {
+    local re='^[^[:space:]]+[[:space:]]+([^[:space:]]*/)?longjob-watch\.sh[[:space:]]+dispatch[[:space:]]*$'
+    [[ "$1" =~ $re ]]
+}
+
 _pane_cmd_is_protocol_wait() {
     local c="${1:-}"
     case "$c" in
@@ -3532,7 +3761,31 @@ _longjob_dispatcher_ledger() {
     sd=$(cd "$(dirname "$hb")/.." 2>/dev/null && pwd) || return 1
     sid=$(jq -r '.session_id // empty' "$hb" 2>/dev/null) || sid=""
     win=$(jq -r '.window // empty' "$hb" 2>/dev/null) || win=""
-    for key in "${sid:+sid-$sid}" "${win:+win-$win}"; do
+    # THE `win-` KEY IS ENCODED BY ITS WRITER (your-org/nexus-code#1542).
+    # `longjob-watch.sh:_resolve_key` writes the spool under
+    # `win-$(_wk_encode "$win")`, and this reader used to look under the RAW
+    # name — so a window whose name holds any character outside
+    # `[A-Za-z0-9_-]`, and whose heartbeat carries no `session_id`, never found
+    # its ledger: never discounted, never excluded, `working-background` for
+    # ever. The safe direction, and one window's cleanup frozen. A field that
+    # SELECTS is not a label: this is the ONLY reader that composes the key
+    # itself (every other consumer asks `longjob-watch.sh`, which derives it).
+    #
+    # Encoded with the CANONICAL function, sourced lazily, rather than a third
+    # private copy of its alphabet: the writer's copy is already the second,
+    # and a copy that drifts here fails in silence. Only the fallback arm pays
+    # for the source — a heartbeat with a `session_id`, which is every worker
+    # the current launcher starts, never reaches it. No encoder → no `win-` key
+    # → no ledger → the handle is kept.
+    local wkey=""
+    if [[ -n "$win" ]]; then
+        if ! declare -F wk_encode >/dev/null 2>&1 && [[ -r "$_PS_SCRIPT_DIR/_bookkeeping.sh" ]]; then
+            # shellcheck disable=SC1091
+            . "$_PS_SCRIPT_DIR/_bookkeeping.sh" 2>/dev/null || true
+        fi
+        declare -F wk_encode >/dev/null 2>&1 && wkey="win-$(wk_encode "$win")"
+    fi
+    for key in "${sid:+sid-$sid}" "$wkey"; do
         [[ -n "$key" && -f "$sd/longjob/$key/dispatcher.json" ]] && { ledger="$sd/longjob/$key/dispatcher.json"; break; }
     done
     [[ -n "$ledger" ]] || return 1
@@ -3612,6 +3865,17 @@ _pane_longjob_root() {
             claude|claude.exe|claude-code) claude_pid="$cur"; break ;;
         esac
         if _pane_comm_is_shell "$comm"; then chain_shell+=(1); else chain_shell+=(0); fi
+        # HOP 1 IS THE DISPATCHER, AND THE DISPATCHER IS A SHELL
+        # (your-org/nexus-code#1547; sk3 case D3). Start ticks alone let a
+        # ledger pid that EXEC'd into a non-shell — pid and ticks kept, comm
+        # `sleep` — still identify a root. Unreachable today (the dispatcher is
+        # `$$` of a bash poll loop and never execs), so this is the one-line
+        # close, failing toward "nothing excluded". It reads the answer of the
+        # shared-predicate call just above rather than making a second one:
+        # `test-mcp-shell-risk.sh` pins how many call sites of that predicate
+        # this file has, by its literal spelling — which is also why the
+        # spelling does not appear in this comment.
+        if (( hop == 1 )) && (( ${chain_shell[0]} == 0 )); then return 0; fi
         chain_pid+=("$cur"); chain_start+=("$start")
         [[ "$ppid" =~ ^[0-9]+$ ]] && (( ppid > 1 )) || return 0
         cur="$ppid"
@@ -3628,6 +3892,76 @@ _pane_longjob_root() {
     (( ok == 1 )) || return 0
     for (( i=${#chain_pid[@]}-1; i>=0; i-- )); do
         if (( ${chain_shell[i]} == 1 )) && [[ "${chain_start[i]}" =~ ^[0-9]+$ ]]; then
+            # THE ROOT MUST BE THE DISPATCHER'S WRAPPER AND NOTHING ELSE
+            # (your-org/nexus-code#1544 — KILL DIRECTION; sk3 F1, rig 4).
+            #
+            # The exclusion removes this root WHOLE, so everything that SHARES
+            # it leaves the census with it. Measured on the real script: a tool
+            # shell running `bash longjob-watch.sh dispatch & sleep 600` wrote
+            # the session ledger naming itself, and the pane read `state=idle`
+            # OVER THE `sleep 600` — kill-authorised over live work; the control
+            # with the ledger removed read `working-background bg_shells=1`.
+            #
+            # The host's wrapper is a chain and nothing but a chain: `zsh -c …`
+            # → `bash longjob-watch.sh dispatch`. So every node from the
+            # dispatcher's PARENT up to this root must have exactly ONE child,
+            # the next chain node. Any other child is a CO-TENANT, and then
+            # NOTHING is excluded: the root stays a counted shell and the pane
+            # reads `working-background` — the direction that keeps a handle.
+            # The dispatcher's OWN children are its per-poll `sleep` and its
+            # probes, which churn by design, so they are not examined by NAME
+            # or by count — only by AGE (below).
+            #
+            # A `pgrep` that cannot answer is a co-tenant we could not rule out.
+            local j kids k
+            command -v pgrep >/dev/null 2>&1 || return 0
+            # WORK FORKED BELOW THE DISPATCHER (your-org/nexus-code#1565 — KILL
+            # DIRECTION; the residue sk3 D1 named). A shell that runs
+            # `sleep 600 & exec bash longjob-watch.sh dispatch` hands the
+            # `sleep 600` to the dispatcher as its own child: `exec` keeps the
+            # pid. The dispatcher is then the root, the chain above it is empty,
+            # the co-tenant loop below has nothing to walk, and the pane read
+            # `state=idle` — kill-authorised — over the live job (measured with
+            # the real `dispatch`, three reads, authorizer rc 0).
+            #
+            # Such a child cannot be told from the per-poll `sleep` by name
+            # (the measured one IS a `sleep`), nor by the ledger's `pid_start`:
+            # `exec` keeps the start ticks as well, so a pre-exec child is
+            # YOUNGER than `pid_start`, like every other child. It IS older
+            # than the dispatcher's BIRTH AS A DISPATCHER, which `cmd_dispatch`
+            # records first thing as `born_ticks`. So: any child of the
+            # dispatcher whose start ticks are <= `born_ticks` was not forked
+            # by the poll loop → NOTHING is excluded → the root stays a counted
+            # shell → `working-background`. `<=`, not `<`: a tie can only be a
+            # child forked in the marker's own 10 ms tick, and the cost of
+            # calling one of those a co-tenant is one `working-background`
+            # reading; the cost of the other error is a killed job.
+            #
+            # A ledger with NO `born_ticks` was written by a dispatcher that
+            # predates the field. It is read as it was before — NOT refused —
+            # because refusing would hold every session armed before this
+            # landed at `working-background`, which is never aged out (#1535's
+            # board-wide freeze). ERROR DIRECTION, stated: this check cannot
+            # see a pre-exec child under a dispatcher running a pre-#1565
+            # script. Every dispatcher started from this tree writes the field.
+            local bt kstat kafter; local -a kf=()
+            bt=$(jq -r '.born_ticks // empty' "$ledger" 2>/dev/null)
+            if [[ "$bt" =~ ^[0-9]+$ ]]; then
+                kids=$(pgrep -P "${chain_pid[0]}" 2>/dev/null)
+                (( $? <= 1 )) || return 0
+                for k in $kids; do
+                    { IFS= read -r kstat < "/proc/$k/stat"; } 2>/dev/null || continue   # gone mid-walk: not work
+                    kafter="${kstat##*) }"; kf=($kafter)
+                    [[ "${kf[19]:-}" =~ ^[0-9]+$ ]] || return 0
+                    (( kf[19] <= bt )) && return 0
+                done
+            fi
+            for (( j=1; j<=i; j++ )); do
+                kids=$(pgrep -P "${chain_pid[j]}" 2>/dev/null) || return 0
+                for k in $kids; do
+                    [[ "$k" == "${chain_pid[j-1]}" ]] || return 0
+                done
+            done
             printf '%s:%s' "${chain_pid[i]}" "${chain_start[i]}"
             return 0
         fi
@@ -4760,7 +5094,7 @@ _finalize_idle_verdict() {
     #                    bg (preserves pre-#455 fixture semantics).
     #   --bg-oldest-start EPOCH → inject the oldest background-shell start
     #                    epoch (the DERIVED episode start) for fixtures.
-    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0 pt_infra=0 pt_stale=0 pt_quiesce=0 pt_members="-" pt_desc="-" pt_lj=0
+    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0 pt_infra=0 pt_stale=0 pt_quiesce=0 pt_members="-" pt_desc="-" pt_lj=0 pt_ljkept=0
     # The longjob ledger verdict, read ONCE; and, only when ARMED and the tree
     # is really walked, the dispatcher's root for the census to leave out.
     local lj_v="" lj_root=""
@@ -4786,7 +5120,7 @@ _finalize_idle_verdict() {
         pt_members="${bg_members_override:--}"
         pt_desc="${bg_cmd_override:--}"
     else
-        read -r pt_count pt_cpu pt_reliable pt_oldest pt_infra pt_stale pt_quiesce pt_members pt_desc \
+        read -r pt_count pt_cpu pt_reliable pt_oldest pt_infra pt_stale pt_quiesce pt_ljkept pt_members pt_desc \
             < <(_pane_background_shells "${pane_pid:-}" "$lj_root")
     fi
     [[ -n "$pt_members" ]] || pt_members="-"
@@ -4903,6 +5237,10 @@ _finalize_idle_verdict() {
         # that matches a contiguous run of the fields above is disturbed.
         [[ "$pt_quiesce" =~ ^[0-9]+$ ]] || pt_quiesce=0
         refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest bg_infra=$pt_infra bg_stale=$pt_stale bg_cmd=$pt_desc bg_cpu_bp=$bg_cpu_bp bg_wedged=$bg_wedged bg_members=$pt_members bg_quiesce=$pt_quiesce bg_longjob=$pt_lj"
+        # #1627: APPENDED LAST, and only when non-zero, so every existing line
+        # is byte-identical. See `bg_longjob_kept` in the header.
+        [[ "$pt_ljkept" =~ ^[0-9]+$ ]] && (( pt_ljkept > 0 )) \
+            && refined_extra="$refined_extra bg_longjob_kept=$pt_ljkept"
     elif (( pt_reliable == 1 )) && [[ "$pt_stale" =~ ^[0-9]+$ ]] && (( pt_stale > 0 )); then
         # THE VERDICT MUST NOT DESTROY THE EVIDENCE THAT PRODUCED IT
         # (your-org/nexus-code#1214 skeptic F1). The block above rides on the
@@ -4923,6 +5261,46 @@ _finalize_idle_verdict() {
         # reading for a state it does not govern.
         [[ "$pt_count" =~ ^[0-9]+$ ]] || pt_count=0
         refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_stale=$pt_stale"
+    fi
+    # THE SAME RULE, FOR THE LONGJOB EXCLUSION (your-org/nexus-code#1546; sk3
+    # N1). `bg_longjob=1` — "a root was excluded from every bg_* field on this
+    # line" — rode only on the SHELL-driven block above, i.e. on the one line
+    # where a real shell REMAINED and the exclusion therefore decided nothing.
+    # On the two lines where it DECIDES the verdict there was no record at all:
+    #
+    #   state=idle                 the dispatcher's root was the only shell, it
+    #                              was left out, and THAT is why the pane is
+    #                              idle — kill-authorised, with nothing on the
+    #                              line to say a process subtree was discounted;
+    #   state=working-background   Monitor-style, held by a LIVE watch: no bg_*
+    #                              tail by design (the idle probe must never
+    #                              grace-cap a self-waking wait).
+    #
+    # READER AUDIT FIRST, because a field that SELECTS is not a label. Every
+    # non-test reader of this tail, enumerated with
+    # `git grep -lE 'bg_(shells|longjob|…)'` at d5874b26: `_idle_probe.sh`
+    # (`_idle_pane_line_field`, by NAME), `cc-auto-update-apply.sh`
+    # (`_restart_line_field`, by NAME and delimiter-anchored; plus one
+    # PRESENCE test, on the literal `bg_cpu=`, which is what separates the
+    # Monitor flavour from the shell flavour), `retire-preflight.sh`
+    # (`bg_oldest_start=`) and a comment in `skeptic-channel.sh`. None keys on
+    # a bare `bg_` prefix, so a lone `bg_longjob=1` selects nothing and
+    # `bg_cpu=` stays absent from the Monitor-held line, as it must.
+    #
+    # `bg_longjob_watches=<n>` is the live-watch count that HOLDS the
+    # Monitor-style line. Deliberately NOT spelled `…_active=`: several readers
+    # take `active=` with an unanchored greedy match, which returns the LAST
+    # occurrence on the line — a field ending in `active=` would silently
+    # become the window-active flag.
+    #
+    # Emitted only when there is something to record, so an ordinary idle line
+    # is byte-identical to what it was.
+    if [[ "$refined_extra" != *"bg_longjob="* ]]; then
+        (( pt_lj == 1 )) && refined_extra="${refined_extra:+$refined_extra }bg_longjob=1"
+        if [[ "$refined_state" == "working-background" ]] && (( bg_shell == 0 )) \
+           && [[ "$lj_v" == armed\ * ]] && [[ "${lj_v#armed }" =~ ^[0-9]+$ ]] && (( ${lj_v#armed } > 0 )); then
+            refined_extra="${refined_extra:+$refined_extra }bg_longjob_watches=${lj_v#armed }"
+        fi
     fi
 }
 
@@ -4950,30 +5328,100 @@ if [[ -n "$win_name" ]] || [[ -n "$hb_file_override" ]]; then
             if [[ -n "${pane_ansi:-}" ]]; then
                 pane_plain=$(printf '%s' "$pane_ansi" | _strip_ansi)
                 pane_content_hash=$(_content_hash "$pane_plain")
-                # Operator-typing refinement (issue #196). The
-                # heartbeat's `idle_prompt` only proves the agent's
-                # turn ended — the hook cannot see the operator
-                # typing into the input box afterwards, and the
-                # Stop-anchored staleness window (default 30 min)
-                # means the renderer fallback may not run for the
-                # whole stretch, leaving genuine typing invisible
-                # to every caller. Check the bright-text marker on
-                # the input row and emit `user-typing` instead.
-                # Autosuggest ghost text is dim-only and cannot
-                # false-trigger; the blocked-overlay case never
-                # reaches here (its heartbeat state is
-                # `permission_prompt` → blocked).
+                # ------------------------------------------------------------
+                # THE HEARTBEAT'S `idle` IS A CLAIM ABOUT THE TURN. THE PANE IS
+                # THE ONLY WITNESS OF EVERYTHING ELSE — your-org/nexus-code
+                # #1521, #1531, and the heartbeat half of #1552.
+                # ------------------------------------------------------------
+                #
+                # `idle_prompt` says one thing: the last hook to fire was a Stop
+                # (or the idle Notification). No hook can see what is RAISED or
+                # PLACED afterwards, and this route used to emit `idle` and
+                # `exit 0` having asked the pane exactly one question (the
+                # bright-typed marker, `#196`). For up to
+                # `_HEARTBEAT_TURN_END_STALENESS_DEFAULT` (1800 s) after every
+                # turn — i.e. the normal condition of every worker — all of
+                # these read `state=idle`, which is on the KILL allowlist and is
+                # the canonical paste-me state:
+                #
+                #   * a `/login`, permission, AskUserQuestion or bypass dialog
+                #     (`#1521`, measured at 4bd1b127 and again here) — which
+                #     also made `#1200`'s `state=blocked` paste refusal INERT
+                #     for every heartbeat-fresh pane, since a pane that never
+                #     reads `blocked` is never offered to that refusal;
+                #   * a message QUEUED behind a turn the hooks have not
+                #     announced yet (`#1531`: a just-resumed orchestrator
+                #     showing `Press up to edit queued messages` under its
+                #     predecessor's still-fresh Stop stamp read `idle` with no
+                #     `queued=` field at all);
+                #   * a turn in flight that fired no `UserPromptSubmit` — a
+                #     harness-initiated wake — including one mid-retry
+                #     (`#1552`);
+                #   * a box holding content with no bright marker: vim-INSERT
+                #     text (`#603`'s case, never applied on this route), a
+                #     collapsed-paste chip (`#1527`), an undecidable row.
+                #
+                # So the hook is believed about `idle` ONLY WHERE THE PANE
+                # AGREES IT COULD BE IDLE: no overlay, a REPL input row that
+                # is blank or a ghost, nothing queued, no in-flight chrome.
+                # Anything else DEFERS to the renderer ladder below, which
+                # already answers every one of those cases and is the route
+                # every pane takes anyway once its heartbeat goes stale — so
+                # no new verdict is introduced, an existing one is merely
+                # reached without a 30-minute delay during which the pane was
+                # killable.
+                #
+                # THE RULE IS STATED ON THE PERMISSIVE SIDE (`#1121`). The test
+                # is not "does any contradiction arm fire" — a denylist whose
+                # default arm is `idle` — but "is the box positively blank or
+                # ghost, and does nothing else object". A row that answers `?`
+                # defers, because `?` is this file's own spelling of "treat it
+                # as a draft".
+                #
+                # POLARITY (`#1521`'s second requirement). Deferring can only
+                # NARROW: the renderer ladder cannot answer `idle` for any pane
+                # that reaches it from here, since each trigger below is one of
+                # its own non-idle arms (`blocked`; `busy`; `user-typing`;
+                # `empty`; and for a pane with no REPL row, `over-limit`,
+                # `empty`, or the one door to `absent`, which re-derives the
+                # process facts and answers `unknown` over a live descendant).
+                # And a capture that FAILED reaches none of this: `pane_ansi` is
+                # empty, the hook's `idle` stands exactly as before, so a tmux
+                # hiccup cannot manufacture a `blocked` that nothing retires.
+                #
+                # COST (`#1521`'s first). None: the live path captures the pane
+                # unconditionally at gather time, so the capture this route
+                # "saves" was already spent; what is added is a few greps.
+                hb_defer=0
                 hb_input_row=$(_find_input_row "$pane_ansi")
-                if [[ -n "$hb_input_row" ]] && _detect_user_typing "$hb_input_row"; then
-                    emit user-typing
-                    exit 0
+                if _has_blocked_overlay "$pane_plain"; then
+                    hb_defer=1
+                elif [[ -z "$hb_input_row" ]]; then
+                    hb_defer=1
+                else
+                    hb_input_ln=$(grep -nF "❯${NBSP}" <<<"$pane_plain" | tail -1 | cut -d: -f1)
+                    [[ -z "$hb_input_ln" ]] && hb_input_ln=$(wc -l <<<"$pane_plain")
+                    hb_input_kind=$(_pane_input_kind "$hb_input_row" "$pane_plain")
+                    if [[ "$hb_input_kind" != blank && "$hb_input_kind" != ghost ]]; then
+                        hb_defer=1
+                    elif _detect_queued_message "$pane_plain"; then
+                        hb_defer=1
+                    elif _detect_busy "$pane_plain" "$hb_input_ln"; then
+                        hb_defer=1
+                    fi
                 fi
             fi
-            _finalize_idle_verdict "$hb_state"
-            hb_state="$refined_state"
+            if (( ${hb_defer:-0} == 0 )); then
+                _finalize_idle_verdict "$hb_state"
+                hb_state="$refined_state"
+            fi
         fi
-        emit "$hb_state" ${refined_extra:+"$refined_extra"}
-        exit 0
+        if (( ${hb_defer:-0} == 0 )); then
+            emit "$hb_state" ${refined_extra:+"$refined_extra"}
+            exit 0
+        fi
+        # Deferred: fall through to the renderer ladder with the capture (and
+        # `pane_plain` / `pane_content_hash`) already in hand.
     fi
 fi
 
@@ -5175,14 +5623,12 @@ if [[ -z "$input_row" ]]; then
         exit 0
     fi
     if _detect_busy "$pane_plain" "$bottom_ln"; then
-        # `throttled=1` follows the `queued=1` precedent exactly (#603/#607):
-        # a SUB-CONDITION of busy carried as a FIELD, not as a new state
-        # token. See the note at the main decision ladder for why.
-        if _detect_throttled "$pane_plain" "$bottom_ln"; then
-            emit busy throttled=1
-        else
-            emit busy
-        fi
+        # `throttled=1` / `retrying=k/N` follow the `queued=1` precedent exactly
+        # (#603/#607): a SUB-CONDITION of busy carried as a FIELD, not as a new
+        # state token. See the note at the main decision ladder for why.
+        _bsf=$(_busy_subfields "$pane_plain" "$bottom_ln")
+        # shellcheck disable=SC2086  # deliberately word-split: zero, one or two fields
+        emit busy $_bsf
         exit 0
     fi
     if [[ -n "$pane_pid" ]] && _pane_has_live_claude "$pane_pid"; then
@@ -5206,9 +5652,6 @@ has_bright=0
 empty_input=0
 
 _detect_busy "$pane_plain" "$input_ln" && busy=1
-_detect_user_typing "$input_row" && has_bright=1
-_detect_autosuggest "$input_row" && has_autosuggest=1
-_detect_empty_input "$input_row" && empty_input=1
 
 # `input=` — the GHOST-vs-DRAFT answer, stated explicitly
 # (your-org/nexus-code#626). The orchestrator's question is not "what
@@ -5226,11 +5669,20 @@ _detect_empty_input "$input_row" && empty_input=1
 #   ?      a non-blank row matching NEITHER marker. Reported honestly
 #          rather than guessed: this is the residue #626 describes, and
 #          it is where an input-event channel would be needed.
-input_kind='?'
-if   (( has_bright ));      then input_kind=typed
-elif (( has_autosuggest )); then input_kind=ghost
-elif (( empty_input ));     then input_kind=blank
-fi
+#
+# DERIVED IN ONE PLACE — `_pane_input_kind` — and the three ladder flags below
+# are READ OFF ITS ANSWER rather than computed beside it. They used to be four
+# independent detector calls here plus a refinement forty lines down, and the
+# heartbeat route asked only ONE of those questions; a content chip (`#1527`)
+# would have been the fifth thing to keep in step across two routes. `typed`
+# includes the vim-INSERT refinement (`#603`, whose reasoning stays below) and
+# the collapsed-paste chip.
+input_kind=$(_pane_input_kind "$input_row" "$pane_plain")
+case "$input_kind" in
+    typed) has_bright=1 ;;
+    ghost) has_autosuggest=1 ;;
+    blank) empty_input=1 ;;
+esac
 input_field="input=$input_kind"
 
 # Vim-mode refinement (your-org/nexus-code#603). `_detect_user_typing`
@@ -5241,23 +5693,18 @@ input_field="input=$input_kind"
 # operator input, unconditionally: the indicator only appears when the
 # pane is accepting keystrokes into the box, and there is no rendering
 # in which a non-blank box under it means anything else.
-if (( has_bright == 0 )); then
-    if _detect_vim_insert "$pane_plain" && _input_row_typed_text "$input_row"; then
-        has_bright=1
-        # …and say so on the `input=` axis too. These two answers are read by
-        # DIFFERENT consumers — `state=` gates retirement, `input=` gates
-        # PASTING — so leaving `input=` at whatever the pre-refinement
-        # detectors said publishes `state=user-typing input=blank`: "a human
-        # is at this keyboard" and "the box is empty, paste away" in the same
-        # line. `blank` and `ghost` both mean safe-to-paste; the refinement
-        # has just established the opposite. Narrows a permissive answer,
-        # never widens one. Surfaced by the `#801` kill-axis fixture
-        # (user-typing-vim-dim-box-border-synthetic), which is the first
-        # fixture to exercise vim INSERT + real text + NO bright marker.
-        input_kind=typed
-        input_field="input=$input_kind"
-    fi
-fi
+# (That refinement now lives in `_pane_input_kind`, so BOTH routes apply it. What
+# it established about the two axes still governs, and is kept verbatim:)
+# …and say so on the `input=` axis too. These two answers are read by
+# DIFFERENT consumers — `state=` gates retirement, `input=` gates
+# PASTING — so leaving `input=` at whatever the pre-refinement
+# detectors said publishes `state=user-typing input=blank`: "a human
+# is at this keyboard" and "the box is empty, paste away" in the same
+# line. `blank` and `ghost` both mean safe-to-paste; the refinement
+# has just established the opposite. Narrows a permissive answer,
+# never widens one. Surfaced by the `#801` kill-axis fixture
+# (user-typing-vim-dim-box-border-synthetic), which is the first
+# fixture to exercise vim INSERT + real text + NO bright marker.
 
 # A queued message outranks every renderer reading below: it is direct
 # evidence that a turn is running and text is waiting behind it.
@@ -5266,11 +5713,9 @@ fi
 # never trample), and before the busy/idle ladder so the queued fact
 # cannot be lost to an idle-looking box.
 if _detect_queued_message "$pane_plain" && (( has_bright == 0 )); then
-    if _detect_throttled "$pane_plain" "$input_ln"; then
-        emit busy queued=1 throttled=1
-    else
-        emit busy queued=1
-    fi
+    _bsf=$(_busy_subfields "$pane_plain" "$input_ln")
+    # shellcheck disable=SC2086  # deliberately word-split: zero, one or two fields
+    emit busy queued=1 $_bsf
     exit 0
 fi
 
@@ -5312,11 +5757,12 @@ elif (( busy )); then
     # `_BK_ACTIVE_STATES`, exactly as `queued` is and for the same stated
     # reason: if a future revision promotes the field to a state, the gate
     # already REFUSES instead of inheriting a permit.
-    if _detect_throttled "$pane_plain" "$input_ln"; then
-        emit busy "$input_field" throttled=1
-    else
-        emit busy "$input_field"
-    fi
+    #
+    # `retrying=<k>/<N>` (`#1552`) is the THIRD such field and rides the same
+    # argument; `retrying` is pre-registered beside `throttled`.
+    _bsf=$(_busy_subfields "$pane_plain" "$input_ln")
+    # shellcheck disable=SC2086  # deliberately word-split: zero, one or two fields
+    emit busy "$input_field" $_bsf
 elif (( has_autosuggest )); then
     # An autosuggest ghost is a RENDERING of the input row. It says nothing
     # about whether the process tree has live children, and ghost text renders

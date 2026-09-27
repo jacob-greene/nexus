@@ -301,6 +301,24 @@ reports per session — `reports/kompot_2026-04-14_103000_fig2-start.md`
 followed by `reports/kompot_2026-04-14_153200_fig2-done.md` is the
 intended shape.
 
+### Amending a report whose skeptic gate is already released
+
+`retire-preflight` check 1c re-reads your report's frontmatter LIVE, so any
+later write to a `disposition: second-pass` report re-arms the gate — by design,
+because an amended report is a new artefact. Follow-up RECORDS ("PR opened",
+"round 2 closed") are not new claims, and they carry the release with them when
+appended under this exact heading, with every byte above it left untouched:
+
+```markdown
+## Follow-up records (no new claims)
+```
+
+The gate hashes the bytes above the heading and carries the release only when
+they are byte-identical to what a recorded verdict or `ng skeptic resolve
+--disposition` covered, and only when no other `#`/`##` section follows. An edit
+to the reviewed text, or a new section, re-arms it. A new CLAIM belongs in a new
+report and is meant to be reviewed.
+
 ## How to share a report on GitHub
 
 `reports/` is gitignored at the workspace level — readers on

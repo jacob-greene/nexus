@@ -94,6 +94,13 @@
 #       loss. This used to be exit 0 with EMPTY stdout, which is exactly what a
 #       lost reply looks like; it is now a distinct code AND a stdout line.
 #   64  usage error   (bad invocation — fix the launch, not the channel)
+#   143 stopped       (SIGINT/SIGTERM, or the --stop-file appeared) — a clean
+#       exit with NO emit. It says nothing about the request, which is still
+#       pending on the server; resume the wait with `nexus-reply-watch <id>`.
+#
+#   This block is CHECKED against the `exit N` literals in this file plus
+#   _nexus_watch_lib.sh by monitor/watcher/test-nexus-reply-watch.sh
+#   (your-org/nexus-code#1581).
 #
 # USAGE
 #   nexus-request --slug S [--kind K] [--priority normal|high]

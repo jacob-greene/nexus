@@ -20,6 +20,9 @@
 #      switch, the restart cooldown, and the loop guard (never storms), and
 #      the functional_check handler only self-heals on the WATCHER-FAULT
 #      (delivery-stale) case, never the orchestrator-fault one.
+#   5. RECOVERY FROM A LOGOUT pastes within one cycle (your-org/nexus-code#1567
+#      G2): the auth-expired clear transition pulls compose_emit forward, and
+#      forces a full-state emit only when the latest paste's turn FAILED.
 #
 # Hand-rolled harness (matches test-lib.sh): mock externals as bash
 # functions, extract the main.sh functions under test by name, stub the
@@ -185,11 +188,87 @@ assert_eq "self-heal fired exactly once at limit" "$(wc -l < "$SELFHEAL_CALLS")"
 assert_contains "delivery failure alerted LOUDLY" "$(cat "$LOGCAP")" "ALERT"
 assert_contains "alert names UNDELIVERED" "$(cat "$LOGCAP")" "UNDELIVERED"
 # A success resets the counter and stamps the delivery clock.
+OPA_CALLS="$STATE/opalert.txt"; : > "$OPA_CALLS"
+_operator_alert() { printf '%s\n' "$*" >> "$OPA_CALLS"; return 0; }
 _emit_delivery_ok
 assert_no_count "success clears the failure counter"
 [[ -f "$EMIT_LAST_DELIVERY_FILE" ]] && pass "success stamps delivery clock" || fail "delivery clock not stamped"
+# #1572: a delivery is the "absent" signal for the loop-guard operator alert.
+assert_contains "success CLEARS the loop-guard operator alert (#1572)" "$(cat "$OPA_CALLS")" "clear watcher-self-heal-loop-guard"
+
+# #1572 — a LOGGED-OUT orchestrator is not a watcher fault. 3,004 consecutive
+# rc=4 during a logout drove the watcher's own self-heal into its loop guard.
+# Each of the two existing logout signals, alone, exempts the failure. The
+# pane arm is stubbed here; the typed-marker arm is tested against the REAL
+# module below (a constant stub of it is what hid #1626 F2).
+: > "$SELFHEAL_CALLS"; : > "$LOGCAP"; rm -f "$EMIT_DELIVERY_FAIL_FILE"
+_auth_hold_expiry_standing() { return "$EXPIRY_STANDING"; }
+EXPIRY_STANDING=0
+for _i in 1 2 3 4; do _emit_delivery_fail 4; done
+assert_no_count "logout (pane expiry row) rc=4 x4 is NOT counted (#1572)"
+assert_eq "logout (pane expiry row): no self-heal (#1572)" "$(wc -l < "$SELFHEAL_CALLS")" "0"
+assert_contains "logout exemption is logged as an ORCHESTRATOR fact" "$(cat "$LOGCAP")" "NOT counted toward self-heal"
+# CONTROL: with neither signal, the very same rc=4 streak is counted and heals.
+EXPIRY_STANDING=1; : > "$SELFHEAL_CALLS"; rm -f "$EMIT_DELIVERY_FAIL_FILE"
+for _i in 1 2 3; do _emit_delivery_fail 4; done
+assert_eq "control: no logout signal => rc=4 x3 IS counted" "$(cat "$EMIT_DELIVERY_FAIL_FILE")" "3"
+assert_eq "control: no logout signal => self-heal fires at the limit" "$(wc -l < "$SELFHEAL_CALLS")" "1"
+
+# #1572 typed-marker arm, against the REAL module (skeptic verdict on
+# your-org/nexus-code#1626, finding 2). The rows above stub the predicate to a
+# constant, which is why they could not see that the raw sensor has no
+# ceiling: it stays CURRENT while `ts >= last_paste_ts`, and a failing
+# delivery never moves last_paste_ts. So here `_auth_hold.sh` is SOURCED and
+# the marker is a real file; only the pane arm stays stubbed (to "not
+# standing"), so the typed arm is the one under test.
+# shellcheck source=/dev/null
+source "$_test_dir/_auth_hold.sh"
+_auth_hold_expiry_standing() { return 1; }
+unset MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS MONITOR_AUTH_HOLD_ENABLED
+export ORCH_LAST_PASTE_FILE="$STATE/orchestrator-last-paste.ts"
+_rb_now=$(date +%s)
+plant_marker() {   # <age_s> — last paste 800 s BEFORE the marker, so it reads current via ts >= last_paste
+    mkdir -p "$STATE/turn-failure"
+    printf '{"ts":%s,"error":"authentication_failed","category":"auth","recovery":"operator","last_msg":"Login expired","window":"%s","hook_event_name":"StopFailure"}\n' \
+        "$(( _rb_now - $1 ))" "$TARGET" > "$STATE/turn-failure/$TARGET.json"
+    printf '%s\n' "$(( _rb_now - $1 - 800 ))" > "$ORCH_LAST_PASTE_FILE"
+}
+reset_counting() { : > "$SELFHEAL_CALLS"; : > "$LOGCAP"; rm -f "$EMIT_DELIVERY_FAIL_FILE"; }
+# (i) FRESH marker (60 s): exempt — the #1572 behaviour is kept.
+reset_counting; plant_marker 60
+for _i in 1 2 3 4; do _emit_delivery_fail 3; done
+assert_no_count "real module: FRESH auth marker (60s) => rc=3 x4 NOT counted (#1572)"
+assert_eq "real module: FRESH auth marker => no self-heal" "$(wc -l < "$SELFHEAL_CALLS")" "0"
+# (ii) marker current ONLY via ts >= last_paste, but under the ceiling (7000 s):
+# still exempt. Pins that the cap is max_hold, not the 600 s freshness window.
+reset_counting; plant_marker 7000
+_auth_hold_turn_failure_marker "$TARGET" >/dev/null && pass "precondition: 7000s marker reads CURRENT to the raw sensor" \
+    || fail "precondition: 7000s marker should read current (ts >= last paste)"
+for _i in 1 2 3; do _emit_delivery_fail 3; done
+assert_no_count "real module: marker 7000s old (< max_hold 7200) => still NOT counted"
+# (iii) STALE marker (72 h), still current to the raw sensor: the exemption
+# FAILS OPEN and counting, ALERT and self-heal resume — the skeptic's repro.
+reset_counting; plant_marker $(( 72 * 3600 ))
+_auth_hold_turn_failure_marker "$TARGET" >/dev/null && pass "precondition: 72h marker reads CURRENT to the raw sensor (the uncapped hazard)" \
+    || fail "precondition: 72h marker should read current to the raw sensor"
+for _i in 1 2 3 4 5; do _emit_delivery_fail 3; done
+assert_eq "real module: STALE auth marker (72h) => rc=3 x5 IS counted (skeptic #1626 F2)" "$(cat "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null)" "5"
+assert_eq "real module: STALE auth marker => ALERT on every failure" "$(command grep -c 'ALERT' "$LOGCAP")" "5"
+assert_eq "real module: STALE auth marker => self-heal fires (limit 3: calls 3,4,5)" "$(wc -l < "$SELFHEAL_CALLS")" "3"
+assert_contains "real module: the fail-open is LOGGED, naming max_hold" "$(cat "$LOGCAP")" "older than max_hold=7200s"
+# (iv) the ceiling is the MODULE's knob, not a copy: lowering it re-classifies (ii).
+reset_counting; plant_marker 7000
+MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS=3600 _emit_delivery_fail 3
+assert_eq "real module: max_hold knob=3600 => the 7000s marker IS counted" "$(cat "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null)" "1"
+# (v) NO marker: counts (control for the whole block).
+reset_counting; rm -f "$STATE/turn-failure/$TARGET.json"
+for _i in 1 2 3; do _emit_delivery_fail 3; done
+assert_eq "real module: NO marker => rc=3 x3 IS counted" "$(cat "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null)" "3"
+assert_eq "real module: NO marker => self-heal at the limit" "$(wc -l < "$SELFHEAL_CALLS")" "1"
+unset ORCH_LAST_PASTE_FILE
 rm -rf "$STATE"
-unset -f log _watcher_self_heal_restart _watcher_alert _emit_delivery_ok _emit_delivery_fail
+unset -f log _watcher_self_heal_restart _watcher_alert _emit_delivery_ok _emit_delivery_fail \
+    _operator_alert _auth_hold_expiry_standing _auth_hold_turn_failure_marker plant_marker reset_counting
 
 # ---------------------------------------------------------------------------
 echo '=== mode #3: HEARTBEAT is the proof-of-working-loop ==='
@@ -314,6 +393,10 @@ _version_restart_self() { printf 'restart %s\n' "$3" >> "$RESTART_CALLS"; return
 
 eval "$(_extract_fn "$MAIN_SH" _watcher_alert)"
 eval "$(_extract_fn "$MAIN_SH" _watcher_self_heal_restart)"
+# #1572: the operator-alert primitive, recorded. `due` answers yes, as the
+# primitive does outside its reminder window.
+HSOPA="$HS/opalert.txt"; : > "$HSOPA"
+_operator_alert() { printf '%s\n' "$*" >> "$HSOPA"; return 0; }
 
 # (a) enabled + cooldown ok + guard ok => restart fires + revived marker.
 COOLDOWN_OK=0; GUARD_OK=0
@@ -329,6 +412,7 @@ MONITOR_WATCHER_SELF_HEAL_ENABLED=true MONITOR_VERSION_SELF_RESTART=true \
     _watcher_self_heal_restart "test-fault"
 assert_eq "cooldown suppresses restart (no storm)" "$(wc -l < "$RESTART_CALLS")" "0"
 assert_contains "cooldown suppression logged" "$(cat "$HSLOG")" "cooldown"
+assert_not_contains "control: neither a restart nor a cooldown pages the operator (#1572)" "$(cat "$HSOPA")" "raise"
 
 # (c) loop guard tripped => suppressed.
 : > "$RESTART_CALLS"; : > "$HSLOG"
@@ -337,6 +421,9 @@ MONITOR_WATCHER_SELF_HEAL_ENABLED=true MONITOR_VERSION_SELF_RESTART=true \
     _watcher_self_heal_restart "test-fault"
 assert_eq "loop guard suppresses restart" "$(wc -l < "$RESTART_CALLS")" "0"
 assert_contains "guard suppression logged" "$(cat "$HSLOG")" "guard"
+# #1572: "manual restart required" must REACH the operator, not only the log.
+assert_contains "loop-guard trip RAISES a critical operator alert (#1572)" "$(cat "$HSOPA")" "raise watcher-self-heal-loop-guard critical"
+assert_contains "…whose text says what to do first (#1572)" "$(cat "$HSOPA")" "RESTART THE WATCHER BY HAND"
 
 # (d) master switch off => suppressed.
 : > "$RESTART_CALLS"
@@ -344,7 +431,7 @@ COOLDOWN_OK=0; GUARD_OK=0
 MONITOR_WATCHER_SELF_HEAL_ENABLED=false MONITOR_VERSION_SELF_RESTART=true \
     _watcher_self_heal_restart "test-fault"
 assert_eq "self_heal_enabled=false suppresses restart" "$(wc -l < "$RESTART_CALLS")" "0"
-unset -f command
+unset -f command _operator_alert
 rm -rf "$HS"
 
 echo '=== mode #4: functional_check self-heals only on WATCHER-FAULT (loop-heartbeat re-aim) ==='
@@ -430,6 +517,149 @@ assert_contains "E: logged WATCHER-FAULT" "$(cat "$FCLOG")" "WATCHER-FAULT"
 
 unset -f _watcher_alive _watcher_self_heal_restart log _functional_check_decide
 rm -rf "$FC"
+
+# ---------------------------------------------------------------------------
+echo '=== mode #5: recovery from a logout pastes within ONE cycle (your-org/nexus-code#1567 G2) ==='
+# After a /login, the emit whose turn FAILED used to wait for the next paste —
+# on a quiet board the full-state heartbeat, up to 1200 s. The fix: the
+# `auth-expired` clear transition fires compose_emit at once and, when the
+# latest paste is the one that failed, makes that compose a full-state one.
+#
+# Driven END TO END: the REAL `_operator_alert` clear → the REAL main.sh hook →
+# the REAL scheduler → the REAL `_v2_task_compose_emit`, whose collaborators
+# are stubbed. `paste_with_retry` is the recorder, and the dedup gate is
+# stubbed to NEVER suppress, so "pastes nothing" cannot be the stub's doing: a
+# compose that reached the paste ladder at all would be counted.
+#
+# PREDICTED before running, against the base (hook absent, CLEARED_FN no-op):
+#   FLIP  "G2 pending: compose_emit pulled forward"      (next_fire stays 60)
+#   FLIP  "G2 pending: ONE full-state paste"             (0 pastes)
+#   FLIP  "G2 nothing pending: compose_emit pulled forward"
+#   HOLD  "G2 control: quiet compose pastes nothing" and both "pastes nothing"
+#         rows (nothing due ⇒ no paste, with or without the hook).
+G2=$(mktemp -d)
+export STATE_DIR="$G2/state" TARGET="orchestrator" NEXUS_NOTIFY_QUIET=1
+mkdir -p "$STATE_DIR" "$G2/stage" "$G2/tmp"
+V2_STAGE_DIR="$G2/stage"; tmp_dir="$G2/tmp"; emit_body="$G2/tmp/emit.md"
+BASELINE="$STATE_DIR/last-snapshot.txt"; LAST_CHANGE="$STATE_DIR/last-change.txt"
+FULL_STATE_STAMP="$STATE_DIR/last-full-state-emit.ts"
+FULL_STATE_CANONICAL_CACHE="$STATE_DIR/last-full-state-canonical.txt"
+FULL_STATE_IDLE_ANCHOR="$STATE_DIR/last-full-state-change.ts"
+export ORCH_LAST_PASTE_FILE="$STATE_DIR/orchestrator-last-paste.ts"
+# CHOSEN: a 300 s due-cadence under a 1200 s floor — the production shape the
+# issue measured ("up to 1200 s"), so a quiet board's heartbeat is NOT due.
+MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS=300 MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS=1200
+MONITOR_FULL_STATE_RESTAT_WINDOWS=false MONITOR_IDLE_RESTAT_WINDOWS=false
+RESPAWN_HISTORY="$G2/rh" RESPAWN_TRIPPED="$G2/rt" RESPAWN_CONSEC_COUNTER="$G2/rc" RESPAWN_SLOW_GRIND_TRIPPED="$G2/rs"
+SERVICE_HEALTH_STATE_DIR="$G2" VERSION_STATE_DIR="$G2" REPORTS_ROLL_NOTICE_FILE="$G2/roll" WATCHER_SUPERVISOR_HEARTBEAT="$G2/hb"
+NEXUS_ROOT="$G2"
+# The operator alert keeps a fallback memo under $TMPDIR; pin it into the fixture.
+_g2_saved_tmpdir="${TMPDIR-}"; export TMPDIR="$G2/tmp"
+PASTES="$G2/pastes"; : > "$PASTES"; LOGCAP="$G2/log"; : > "$LOGCAP"
+# The REAL modules first, so the stubs below win over anything they define.
+# shellcheck source=/dev/null
+source "$_test_dir/_scheduler.sh"
+# shellcheck source=/dev/null
+source "$_test_dir/_auth_hold.sh"
+# shellcheck source=/dev/null
+source "$_test_dir/_operator_alert.sh"
+log() { printf '%s\n' "$*" >> "$LOGCAP"; }
+_ensure_watcher_tmp_dir() { mkdir -p "$tmp_dir"; }
+_progress_bump() { :; }; _cycle_bump() { :; }; bump_heartbeat() { :; }
+_compose_gh_now() { :; }; _render_budget_seconds() { printf 5; }; _bounded_failure_log() { :; }
+_run_bounded() { local o="$2"; shift 2; "$@" > "$o"; }
+render_full_state_snapshot() { printf 'worker-a idle\nworker-b busy\n'; }
+render_idle_prelude() { printf 'prelude\n'; }
+_emit_volatile_strip() { cat; }
+_full_state_effective_floor() { printf '%s' "$MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS"; }
+_classify_diff() { return 0; }
+_oneshot_reset() { :; }; _oneshot_defer() { :; }; _oneshot_commit() { :; }
+_cc_update_emit_section() { :; }; _version_emit_section() { :; }; _service_health_emit_section() { :; }
+_reports_roll_emit_section() { :; }; _supervisor_arm_emit_section() { :; }
+compose_report() { printf 'reason=%s\n%s\n' "$1" "$6"; }
+archive_emit() { printf '%s/archive.md' "$G2"; }
+_compose_emit_should_suppress() { return 1; }     # NEVER suppress — see above
+_over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1; }
+paste_with_retry() { printf '%s\n' "$(head -n1 "$2")" >> "$PASTES"; return 0; }
+_emit_delivery_ok() { :; }; _compose_emit_record_emit() { :; }; requests_commit_emitted() { :; }
+_respawn_loop_reset() { :; }; _respawn_consec_reset() { :; }
+eval "$(_extract_fn "$MAIN_SH" _v2_task_compose_emit)"
+eval "$(_extract_fn "$MAIN_SH" _operator_alert_cleared_to_watcher)"
+_OPERATOR_ALERT_LOG_FN=log; _OPERATOR_ALERT_BELL_FN=log
+if declare -F _operator_alert_cleared_to_watcher >/dev/null; then
+    _OPERATOR_ALERT_CLEARED_FN=_operator_alert_cleared_to_watcher
+else
+    fail "G2: main.sh defines no _operator_alert_cleared_to_watcher (the clear-transition hook)"
+fi
+_g2_quiet_board() {   # a board with NOTHING due: snapshot == baseline, full-state inside its floor
+    printf 'fmt v1\nworker-a\n' > "$V2_STAGE_DIR/snapshot_local.out"
+    cp "$V2_STAGE_DIR/snapshot_local.out" "$BASELINE"
+    date +%s > "$FULL_STATE_STAMP"
+    printf 'prelude\n---snapshot---\nworker-a idle\nworker-b busy\n' > "$FULL_STATE_CANONICAL_CACHE"
+    : > "$PASTES"
+}
+_g2_next_fire() { printf '%s' "${TASK_NEXT_FIRE[compose_emit]:-unset}"; }
+_g2_cycle() {   # raise → clear (the transition) → one compose_emit iff the scheduler says it is due
+    _scheduler_reset_for_tests
+    _schedule_task compose_emit 60 _v2_task_compose_emit --class medium --async
+    TASK_NEXT_FIRE[compose_emit]=60
+    rm -rf "$STATE_DIR/operator-alert"; _operator_alert_memo_clear auth-expired
+    _operator_alert raise auth-expired critical "logged out" >/dev/null 2>&1
+    _operator_alert clear auth-expired "logged back in" >/dev/null 2>&1
+    [[ "$(_g2_next_fire)" == 0 ]] && _v2_task_compose_emit
+}
+g2_now=$(date +%s)
+plant_g2_marker() {   # <marker_ts> <last_paste_ts>
+    mkdir -p "$STATE_DIR/turn-failure"
+    printf '{"ts":%s,"error":"authentication_failed","category":"auth","recovery":"operator","last_msg":"Login expired","window":"%s","hook_event_name":"StopFailure"}\n' \
+        "$1" "$TARGET" > "$STATE_DIR/turn-failure/$TARGET.json"
+    printf '%s\n' "$2" > "$ORCH_LAST_PASTE_FILE"
+}
+
+# CONTROL: a quiet board's compose pastes nothing (the stubs cannot paste on their own).
+_g2_quiet_board; _v2_task_compose_emit
+assert_eq "G2 control: quiet compose pastes nothing" "$(wc -l < "$PASTES")" "0"
+
+# (a) NOTHING pending: the last paste's turn did not fail (no marker).
+_g2_quiet_board; rm -rf "$STATE_DIR/turn-failure"; printf '%s\n' "$(( g2_now - 100 ))" > "$ORCH_LAST_PASTE_FILE"
+_g2_cycle
+assert_eq "G2 nothing pending: compose_emit pulled forward to the next tick" "$(_g2_next_fire)" "0"
+assert_eq "G2 nothing pending: a clear with nothing due pastes NOTHING" "$(wc -l < "$PASTES")" "0"
+[[ -f "$FULL_STATE_STAMP" && -f "$FULL_STATE_CANONICAL_CACHE" ]] \
+    && pass "G2 nothing pending: the full-state clock is left alone" || fail "G2 nothing pending: the hook touched the full-state clock"
+
+# (b) a PENDING failed emit: the marker answers the latest paste (ts >= last paste).
+_g2_quiet_board; plant_g2_marker "$(( g2_now - 90 ))" "$(( g2_now - 100 ))"
+_g2_cycle
+assert_eq "G2 pending: compose_emit pulled forward to the next tick" "$(_g2_next_fire)" "0"
+assert_eq "G2 pending: ONE full-state paste in that one cycle" "$(cat "$PASTES")" "reason=poll-full-state"
+assert_contains "G2 pending: the forced emit is LOGGED with its evidence" "$(cat "$LOGCAP")" "forcing a full-state emit"
+
+# (c) the marker is OLDER than the latest paste — a later paste already landed,
+# so nothing is pending even though the marker file still exists.
+_g2_quiet_board; plant_g2_marker "$(( g2_now - 100 ))" "$(( g2_now - 90 ))"
+_g2_cycle
+assert_eq "G2 stale marker (ts < last paste): pastes NOTHING" "$(wc -l < "$PASTES")" "0"
+
+# (d) another key's clear does nothing here (service-health / loop-guard keys).
+_g2_quiet_board; plant_g2_marker "$(( g2_now - 90 ))" "$(( g2_now - 100 ))"
+_scheduler_reset_for_tests; _schedule_task compose_emit 60 _v2_task_compose_emit --class medium --async
+TASK_NEXT_FIRE[compose_emit]=60
+_operator_alert raise service-health:x critical "down" >/dev/null 2>&1
+_operator_alert clear service-health:x "up" >/dev/null 2>&1
+assert_eq "G2 another key's clear leaves compose_emit's schedule alone" "$(_g2_next_fire)" "60"
+
+unset -f log _ensure_watcher_tmp_dir _progress_bump _cycle_bump bump_heartbeat _compose_gh_now \
+    _render_budget_seconds _bounded_failure_log _run_bounded render_full_state_snapshot render_idle_prelude \
+    _emit_volatile_strip _full_state_effective_floor _classify_diff _oneshot_reset _oneshot_defer _oneshot_commit \
+    _cc_update_emit_section _version_emit_section _service_health_emit_section _reports_roll_emit_section \
+    _supervisor_arm_emit_section compose_report archive_emit _compose_emit_should_suppress \
+    _over_limit_orchestrator_paused _auth_hold_active paste_with_retry _emit_delivery_ok \
+    _compose_emit_record_emit requests_commit_emitted _respawn_loop_reset _respawn_consec_reset \
+    _g2_quiet_board _g2_next_fire _g2_cycle plant_g2_marker
+unset NEXUS_NOTIFY_QUIET ORCH_LAST_PASTE_FILE
+if [[ -n "$_g2_saved_tmpdir" ]]; then export TMPDIR="$_g2_saved_tmpdir"; else unset TMPDIR; fi
+rm -rf "$G2"
 
 # ---------------------------------------------------------------------------
 echo

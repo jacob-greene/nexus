@@ -88,8 +88,14 @@ _fs_escalate_once() {
     # body through a file on the very filesystem that is read-only — so this
     # is a literal, write-free send-keys.
     if [[ -z "$oob" ]] && command -v tmux >/dev/null 2>&1; then
-        if tmux send-keys -t "$TARGET" -l "$text" 2>/dev/null; then
-            tmux send-keys -t "$TARGET" Enter 2>/dev/null || true
+        # `:=` — EXACTLY the window named $TARGET, or nothing
+        # (your-org/nexus-code#1524). A bare `-t "$TARGET"` falls back to a
+        # unique PREFIX match when the exact window is absent, so with the
+        # orchestrator gone this literal text and its Enter would land in
+        # `<TARGET>-sk` or `<TARGET>-skeptic` at rc 0. Measured on tmux 2.6:
+        # `:=name` acts on the exact window and fails rc 1 otherwise.
+        if tmux send-keys -t ":=${TARGET}" -l "$text" 2>/dev/null; then
+            tmux send-keys -t ":=${TARGET}" Enter 2>/dev/null || true
             chans="${chans:+$chans,}tmux-paste"
         fi
     fi

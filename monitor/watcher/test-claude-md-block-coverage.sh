@@ -132,6 +132,62 @@ _bc_code_refs() {
     done
 }
 
+# _bc_untracked_text — NUL-separated: the untracked, non-ignored paths that
+# `git grep -I` would NOT skip as binary (your-org/nexus-code#1615). Withheld:
+# a REGULAR file whose first 8000 bytes contain a NUL AND whose `diff`
+# attribute is `unspecified` or `unset`. That is git's own rule, reproduced
+# rather than approximated — grep_source_is_binary() asks the diff driver
+# first and sniffs only when the driver has no opinion (binary == -1), then
+# buffer_is_binary(): a NUL in the first FIRST_FEW_BYTES = 8000. The three
+# driver answers are NOT symmetric, and this helper once treated them as if
+# they were (your-org/nexus-code#1615, skeptic item 8 on #1626): `unset`
+# (`-diff`) is userdiff's `driver_false`, binary = 1, SKIPPED; `unspecified`
+# is the default driver, binary = -1, SNIFFED; but `set` (a bare `diff`) is
+# `driver_true`, binary = 0 — FORCED TEXT, searched however many NULs it
+# holds. Withholding `set` dropped a file git reads, i.e. a SMALLER corpus,
+# the one direction this helper promises never to err in. Measured on git
+# 2.17.1: `*.dat diff` + `a.dat` = `\0FXMARK` — `git grep -I --untracked`
+# finds it. A NAMED driver may force text via `diff.<name>.binary`, so such a
+# file is passed through and git decides. Non-regular entries (symlinks, a nested repo's `dir/`) and any
+# unreadable file are passed through too: every doubt resolves to "let git
+# look", so the error direction is a slower probe, never a smaller corpus.
+# The walk is `ls-files --others --exclude-standard`, the same set
+# `git grep --untracked` walks (0.7 s over 2,323 files on the primary clone).
+_bc_untracked_text() {
+    git -C "$REPO_ROOT" ls-files -z --others --exclude-standard > "$WORK_BC/others" \
+        || return 1
+    python3 - "$REPO_ROOT" "$WORK_BC/others" <<'PY'
+import os, stat, subprocess, sys
+root, lst = sys.argv[1], sys.argv[2]
+paths = [p for p in open(lst, 'rb').read().split(b'\0') if p]
+keep, nul = [], []
+for p in paths:
+    try:
+        st = os.lstat(os.path.join(root.encode(), p))
+        if not stat.S_ISREG(st.st_mode):
+            keep.append(p); continue
+        with open(os.path.join(root.encode(), p), 'rb') as fh:
+            head = fh.read(8000)
+    except OSError:
+        keep.append(p); continue
+    (nul if b'\0' in head else keep).append(p)
+if nul:
+    out = subprocess.run(['git', '-C', root, 'check-attr', '-z', '--stdin', 'diff'],
+                         input=b'\0'.join(nul) + b'\0', stdout=subprocess.PIPE,
+                         check=True).stdout.split(b'\0')
+    trip = [out[i:i + 3] for i in range(0, len(out) - 2, 3)]
+    if len(trip) != len(nul):
+        sys.exit(3)          # an answer we cannot pair up is not an answer
+    keep += [t[0] for t in trip if t[2] not in (b'unspecified', b'unset')]
+sys.stdout.buffer.write(b''.join(p + b'\0' for p in keep))
+PY
+}
+
+# Scratch for _bc_corpus. Made HERE, not with the suite's WORK below, because
+# `--population` exits inside gp_handle before WORK exists.
+WORK_BC=$(mktemp -d -t nexus-bc-pop-XXXXXX) || exit 2
+trap 'rm -rf "$WORK_BC"' EXIT
+
 # _bc_corpus — every tracked file that mentions ANY marker at all. This is the
 # guard's read set beyond the doc: its verdict depends on those bytes.
 # THE `--untracked` IS LOAD-BEARING, AND ITS ABSENCE PRODUCED A FALSE RED HERE
@@ -181,8 +237,49 @@ _bc_corpus() {
     #
     # It cannot change the ANSWER here: every marker-bearing file in this repo
     # is text, and the equality above was measured on the worst tree available.
-    git -C "$REPO_ROOT" grep -I -l --untracked -F "${pats[@]}" -- . 2>/dev/null \
-        | sort -u \
+    #
+    # AND `-I` DOES NOT STOP GIT READING THE FILE (your-org/nexus-code#1615).
+    # git 2.17.1 — this host's git — decides "binary" in
+    # grep_source_is_binary() by LOADING THE WHOLE FILE and then looking for a
+    # NUL in its first 8000 bytes. Measured with strace on one untracked
+    # 5,541,651,288-byte `.h5ad`: 5.533 GB read, zero hits, 4.1 s. So `-I`
+    # saved the SEARCH, never the READ, and the probe still read the primary
+    # clone's ~44.65 GB of untracked `artifacts/` on every call: 136 s from a
+    # cold page cache, 17 s warm, against guards-for-diff's 180 s bound — the
+    # intermittent rc 124 REFUSAL #1615 reports, on an idle board.
+    #
+    # So the sniff git would do is done HERE, on the first 8000 bytes only,
+    # before git is asked (_bc_untracked_text), and git greps the TRACKED files
+    # and the untracked SURVIVORS. The answer cannot move: a file is withheld
+    # from git only when git's own -I rule would skip it — see that helper for
+    # the equivalence argument. Any failure of the split falls back to the
+    # historical single walk, which is slow but was always correct.
+    local -a utext=()
+    local u split_ok=1
+    if _bc_untracked_text > "$WORK_BC/utext" 2>/dev/null; then
+        while IFS= read -r -d '' u; do utext+=("$u"); done < "$WORK_BC/utext"
+    else
+        split_ok=0
+    fi
+    {
+        if (( split_ok )); then
+            git -C "$REPO_ROOT" grep -I -l -F "${pats[@]}" -- . 2>/dev/null
+            # rc 1 from a batch is "no match" and is fine; anything above it
+            # is an error, and an error must not become a smaller corpus —
+            # 255 makes xargs stop and report, and the fallback runs.
+            if (( ${#utext[@]} > 0 )); then
+                printf '%s\0' "${utext[@]}" \
+                    | GIT_LITERAL_PATHSPECS=1 xargs -0 bash -c \
+                        'git -C "$0" grep -I -l --untracked -F "$@"; r=$?; (( r <= 1 )) || exit 255' \
+                        "$REPO_ROOT" "${pats[@]}" -- 2>/dev/null \
+                    > "$WORK_BC/ugrep" || split_ok=0
+                (( split_ok )) && cat "$WORK_BC/ugrep"
+            fi
+        fi
+        if (( ! split_ok )); then
+            git -C "$REPO_ROOT" grep -I -l --untracked -F "${pats[@]}" -- . 2>/dev/null
+        fi
+    } | sort -u \
         | command grep -v '^CLAUDE\.md$' \
         | command grep -v '^monitor/watcher/test-claude-md-block-coverage\.sh$' \
         | command grep -v '^monitor/watcher/guard-populations\.manifest$' \
@@ -228,7 +325,7 @@ gp_population() {
 gp_handle "$@"
 
 WORK=$(mktemp -d -t nexus-bc-XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK" "$WORK_BC"' EXIT
 
 # ===========================================================================
 echo '=== §1 The marker pairs are WELL-FORMED — every BEGIN has its END ==='

@@ -226,3 +226,52 @@ if [ -n "${NEXUS_ROOT:-}" ]; then
     unset -f _nb_front_dir _nb_front_off
     unset _nb_locals
 fi
+
+# (c) STRIP the resume-picker thresholds from a Claude Code TOOL SHELL
+#     (your-org/nexus-code#1613). claude-loop.sh and spawn-worker.sh's resume
+#     launcher set CLAUDE_CODE_RESUME_THRESHOLD_MINUTES / _TOKEN_THRESHOLD in
+#     the inline per-child form, and that form is REQUIRED: claude reads them
+#     from its own process env to suppress the stale-large-session picker. But
+#     claude hands its env to every Bash tool shell, so every resumed or
+#     resurrected session exported the pair into every command, suite and band
+#     it ran, and test-claude-loop.sh's clean-parent assertion went red for a
+#     reason unrelated to the code under test. So this is fixed at the shell,
+#     not at the launcher: the launcher cannot hand claude a variable its
+#     children will not inherit.
+#
+#     KEYED ON THE PARENT BEING `claude`, not unconditional. This file also
+#     runs at the start of a bash WRAPPER or stub launched as
+#     `VAR=v "$CLAUDE_BIN"` (test-claude-loop.sh's stub is exactly that), and
+#     stripping there would remove the suppression before the real binary
+#     sees it. A tool shell's parent is the claude process (measured:
+#     /proc/$PPID/comm = `claude`); a wrapper's parent is the launcher
+#     (`claude-loop.sh`, `bash`). Boundary: an install whose process is not
+#     named `claude` (a node-run cli.js reads `node`) is not stripped, which
+#     is the pre-#1613 behaviour, not a new failure. A builtin `read`, no fork,
+#     and silent on every path, because this runs in every shell.
+if [ -n "${CLAUDE_CODE_RESUME_THRESHOLD_MINUTES+x}${CLAUDE_CODE_RESUME_TOKEN_THRESHOLD+x}" ]; then
+    _nx_pcomm=''
+    { read -r _nx_pcomm < "/proc/$PPID/comm"; } 2>/dev/null || :
+    if [ "$_nx_pcomm" = claude ]; then
+        unset CLAUDE_CODE_RESUME_THRESHOLD_MINUTES CLAUDE_CODE_RESUME_TOKEN_THRESHOLD
+    fi
+    unset _nx_pcomm
+fi
+
+# GUARANTEE a usable TMPDIR in a Claude Code TOOL SHELL (your-org/nexus-code#1628).
+#   Claude Code leaves TMPDIR unset, so `$TMPDIR/x` is `/x` at the sandbox root.
+#   The launchers export one through locals-env.sh; this covers sessions started
+#   before that, and the orchestrator. KEYED ON THE PARENT BEING `claude`, like
+#   the #1613 strip above, and for a second reason: this file runs at the start
+#   of EVERY non-interactive bash, including a suite's deliberate
+#   `env -u TMPDIR bash …` that exists to test the unset path — its parent is a
+#   shell, not claude, so it is left alone. The logic lives in tmpdir.sh, shared
+#   with .zshenv and locals-env.sh so the three cannot drift.
+if [ -z "${TMPDIR:-}" ]; then
+    _nx_pcomm=''
+    { read -r _nx_pcomm < "/proc/$PPID/comm"; } 2>/dev/null || :
+    if [ "$_nx_pcomm" = claude ] && [ -r "${BASH_SOURCE[0]%/*}/tmpdir.sh" ]; then
+        . "${BASH_SOURCE[0]%/*}/tmpdir.sh"
+    fi
+    unset _nx_pcomm
+fi

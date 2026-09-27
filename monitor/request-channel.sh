@@ -1115,6 +1115,33 @@ cmd_reply() {
                 if (( skeptic_resolved )); then
                     printf 'request-channel: NOTE — --skeptic-resolved given; not resolving %s again. You are asserting the gate is already discharged.\n' \
                         "${req_origin:-<unknown-origin>}" >&2
+                    # A DECLINE MUST CLOSE THE CHAIN IT DECLINES. This arm skipped
+                    # `resolve` and therefore touched nothing the origin's own
+                    # `await` reads: measured twice on 2026-09-17 (`promotesk`,
+                    # `killsafesk`), a declined depth-2 left the skeptic awaiting a
+                    # reviewer that was never coming — pane `working-background`,
+                    # `retire-preflight` `safe=0` — until a separate `close`.
+                    #
+                    # `release` ends the WAIT and never the GATE, and it VERIFIES
+                    # the assertion this flag makes: a marker, an outstanding arm
+                    # or a live reviewer is a PENDING review, and it refuses
+                    # (rc 7). A false assertion is then refused HERE, before the
+                    # request transitions — the same order-is-the-guarantee
+                    # argument as the resolve arm below (#665).
+                    if [[ -n "$req_origin" ]]; then
+                        local _rl_bin="$_script_dir/skeptic-channel.sh" _rl_out _rl_rc=0
+                        local _rl_reason; _rl_reason=$(tr '\n' ' ' < "$bodyfile" | sed 's/  */ /g; s/^ //; s/ $//')
+                        _rl_out=$("$_rl_bin" release "$req_origin" \
+                            --reason "spawn-skeptic request $id DECLINED by the orchestrator (gate asserted already discharged): $_rl_reason" 2>&1) || _rl_rc=$?
+                        if (( _rl_rc != 0 )); then
+                            rm -f "$bodyfile"
+                            printf 'request-channel: --skeptic-resolved asserts %s'"'"'s gate is ALREADY discharged, and that could not be confirmed (release rc %s) — REFUSING to record the decline.\n' "$req_origin" "$_rl_rc" >&2
+                            printf '%s\n' "$_rl_out" | sed 's/^/  /' >&2
+                            printf '  Nothing was written. Drop --skeptic-resolved to decline AND resolve in one act.\n' >&2
+                            exit 6
+                        fi
+                        printf 'request-channel: released any await on %s'"'"'s own channel — a declined review closes that chain.\n' "$req_origin" >&2
+                    fi
                 else
                     [[ -n "$req_origin" ]] || { printf 'request-channel: spawn-skeptic decline for id %s has no `origin` in its frontmatter; cannot resolve a gate without a window\n' "$id" >&2; exit 6; }
                     # The rationale is written to the audit trail beside the

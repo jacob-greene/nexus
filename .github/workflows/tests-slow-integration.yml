@@ -447,9 +447,18 @@ jobs:
             echo 'echo "FAIL: canary — planted regression, MUST be reported red"'
             echo 'exit 1'
           } > "$canary"
-          # (a) gate ON  -> the canary runs and the runner MUST go red (nonzero).
-          if RUN_INTEGRATION=1 bash monitor/watcher/run-tests.sh "$canary" >/dev/null 2>&1; then
+          # (a) gate ON  -> the canary runs and the runner MUST report a RED TEST
+          #     RESULT: rc == 1 exactly (<your-org>/nexus-code#1563, #1558 round-2
+          #     G6). "Any non-zero" read 2 (refused to run), 3 (incomplete), 4
+          #     (not a verdict) and 97 (aborted) as "went red" too — a runner
+          #     that never executed the canary would have passed this check.
+          canary_rc=0
+          RUN_INTEGRATION=1 bash monitor/watcher/run-tests.sh "$canary" >/dev/null 2>&1 || canary_rc=$?
+          if [ "$canary_rc" -eq 0 ]; then
             echo "::error::runner reported GREEN on a planted always-failing test — vacuous-pass hazard"
+            exit 1
+          elif [ "$canary_rc" -ne 1 ]; then
+            echo "::error::runner exited $canary_rc on the planted failure — not a test verdict (1); the canary was not shown to RUN and fail"
             exit 1
           fi
           echo "OK: runner went red on the planted failure (gate ON)"

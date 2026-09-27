@@ -60,6 +60,9 @@
 #      healthy `UP`: STATUS degrades to `DEGRADED`, SUPERVISOR reads
 #      `orphan`, and a legend explains it + names the reconcile action. A
 #      DOWN service with the same dead record keeps the honest `stale`.
+# 16b. a healthcheck that does not finish within SVC_STATUS_HEALTH_TIMEOUT
+#      renders UNKNOWN with the bound named, and status returns; a check's
+#      own rc 124 inside the bound stays DOWN (your-org/nexus-code#1601).
 #
 # Run: bash monitor/watcher/test-svc.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -93,6 +96,8 @@ build_case() {
     cp "$REAL_RECOVER" "$ROOT/monitor/bootstrap-recover.sh"
     cp "$REAL_LIB" "$ROOT/monitor/watcher/_lib.sh"
     cp "$REAL_FS_PROBE" "$ROOT/monitor/_fs_probe.sh"
+    # The logged-out predicate the orchestrator row reads (#1548 row E).
+    cp "$_real_test_dir/_auth_hold.sh" "$ROOT/monitor/watcher/_auth_hold.sh"
     chmod +x "$ROOT/monitor/svc.sh" "$ROOT/monitor/bootstrap-recover.sh"
     SVC="$ROOT/monitor/svc.sh"
     REG="$ROOT/monitor/services.registry"
@@ -420,6 +425,21 @@ grep -qE '^ 0  watcher .*UP' "$ROOT/out" \
 grep -qE '^ -  orchestrator .*UP .*watcher' "$ROOT/out" \
     && pass "orchestrator pinned, UP, supervised-by-watcher" \
     || fail "orchestrator row: $(grep orchestrator "$ROOT/out")"
+# your-org/nexus-code#1548 row E: a FRESH expiry row turns the orchestrator row
+# LOGGED-OUT with the remedy in the detail; a STALE row (the watcher stopped
+# looking) does not — the same staleness the liveness gate applies.
+_now=$(date +%s)
+printf '%s\t%s\n' "$(( _now - 3000 ))" "$_now" > "$ROOT/monitor/.state/auth-expired.tsv"
+run_svc status
+grep -qE '^ -  orchestrator .*LOGGED-OUT .*run /login' "$ROOT/out" \
+    && pass "a fresh auth-expired row renders LOGGED-OUT with the remedy (was: green UP for 7 h on 2026-09-17)" \
+    || fail "logged-out row: $(grep orchestrator "$ROOT/out")"
+printf '%s\t%s\n' "$(( _now - 3000 ))" "$(( _now - 1200 ))" > "$ROOT/monitor/.state/auth-expired.tsv"
+run_svc status
+grep -qE '^ -  orchestrator .*UP .*watcher' "$ROOT/out" \
+    && pass "a STALE auth-expired row (last observed 1200 s ago > 600 s) does not paint LOGGED-OUT" \
+    || fail "stale row: $(grep orchestrator "$ROOT/out")"
+rm -f "$ROOT/monitor/.state/auth-expired.tsv"
 grep -qE 'svc-up .*UP' "$ROOT/out" && grep -qE 'svc-down .*DOWN' "$ROOT/out" \
     && pass "registry rows show UP/DOWN per healthcheck" \
     || fail "service rows: $(cat "$ROOT/out")"
@@ -1148,6 +1168,36 @@ grep -q 'svc.sh restart <name>' "$ROOT/out" \
     && pass "orphan: legend names the reconcile action" \
     || fail "legend has no action"
 unset NEXUS_ROOT
+cleanup_case
+
+# --- Case 16b: a healthcheck that does not finish renders UNKNOWN ------------
+# your-org/nexus-code#1601: `tmpfs-guard.sh --check` walking a 15k-entry /tmp
+# made `svc.sh status` print ZERO lines in 180 s. The readout is now bounded
+# per row and says it does not know. `exit 124` is the negative control: a
+# callee's OWN 124 inside the bound is a failing check (DOWN), not a timeout.
+echo '=== case 16b: a hung healthcheck renders UNKNOWN within the bound, never nothing ==='
+build_case hungcheck
+mkdir -p "$ROOT/wd"
+{
+    reg_line svchung "$ROOT/wd" 'echo noop' 'sleep 30'   # never finishes in time
+    reg_line svc124  "$ROOT/wd" 'echo noop' 'exit 124'   # fast, says 124 itself
+    reg_line svcok   "$ROOT/wd" 'echo noop' 'true'
+} > "$REG"
+_t0=$SECONDS
+SVC_STATUS_HEALTH_TIMEOUT=1 run_svc status
+_el=$(( SECONDS - _t0 ))
+(( _el < 15 )) \
+    && pass "hung check: status returned within the bound (1s + kill grace), not after the 30 s check" \
+    || fail "hung check: status took ${_el}s — the row is not bounded"
+grep -qE 'svchung +UNKNOWN .*did not finish within 1s' "$ROOT/out" \
+    && pass "hung check: row renders UNKNOWN and names the bound" \
+    || fail "hung row: $(grep svchung "$ROOT/out")"
+grep -qE 'svc124 +DOWN' "$ROOT/out" \
+    && pass "a check's OWN rc 124 inside the bound stays DOWN (the clock, not the code, decides timeout)" \
+    || fail "svc124 row: $(grep svc124 "$ROOT/out")"
+grep -qE 'svcok +UP' "$ROOT/out" \
+    && pass "hung check: a healthy row beside it still renders UP" \
+    || fail "svcok row: $(grep svcok "$ROOT/out")"
 cleanup_case
 
 # --- Case 17: `stop` on an orphan must NOT read as an all-clear -------------

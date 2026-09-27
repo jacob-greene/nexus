@@ -286,7 +286,13 @@ jobs:
     name: unit suite (${{ matrix.login_shell }}, jobs ${{ matrix.jobs }})
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 60, was 40 (<your-org>/nexus-code#1474 item 18, operator decision 2026-09-25):
+    # four of five bands sat within two minutes of 40 and the bash cell was
+    # cancelled in 7 of the last 12 `dev` runs. A STOPGAP — suite growth
+    # re-consumes it in weeks; the durable fixes are the band-cost items there.
+    # The band itself is bounded BELOW this by `ci-diag-budget.sh --run-bound`,
+    # so a band that outgrows it ends as an explicit NO VERDICT, not a cancel.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -299,7 +305,7 @@ jobs:
       # `timeout-minutes` above, in seconds. The diagnostics budget is DERIVED
       # from the job's remaining time against this (<your-org>/nexus-code#1442);
       # test-ci-diag-budget.sh asserts the two never drift apart.
-      JOB_CEILING_S: "2400"
+      JOB_CEILING_S: "3600"
       # tmux derives an unpinned pane's shell from $SHELL (<your-org>/nexus-code
       # #555). Pointing it at the matrix shell exercises the login-shell axis
       # for every fixture that does NOT pin its own (the ones that DO, via
@@ -417,6 +423,30 @@ jobs:
         # tmux-matrix job here and, systemically, in the scheduled full-suite
         # job proposed in the coverage-gap issue. This band is the fast unit
         # suite, now run at the matrix's parallelism and login shell.
+        #
+        # NEXUS_ROOT AND NEXUS_LOCALS ARE SCRUBBED HERE, EXPLICITLY — this is
+        # what the dropped `clean-env` job ("unit suite (NEXUS_ROOT unset)")
+        # guaranteed (<your-org>/nexus-code#1474 item 13). A test that references
+        # $NEXUS_ROOT bare under `set -u` passes in the sandbox (where the
+        # operator exports it) and aborts on a clean runner — `set -u` kills a
+        # fixture heredoc AFTER `>` already truncated the target, so an
+        # emit-body fixture renders EMPTY and silently defeats the
+        # discriminating assertion (sandbox 32/32, CI 31/32). A runner does not
+        # export either variable, so every cell already ran unset; the job
+        # existed to make that EXPLICIT, and a whole band (~4,000 job-min/week,
+        # 18% of the bill, measured on #1474) is a steep price for a spelling.
+        # The `env -u` below keeps the guarantee explicit for BOTH matrix cells
+        # (the step is shared; bash@4 is the cell #1474 named), matches the
+        # documented local repro `env -u NEXUS_ROOT bash test-X.sh`, and holds
+        # even if a future runner image or job `env:` starts exporting either.
+        # Its mirror, the EXPORTED side, is the `inherited-root` job below.
+        #
+        # BOUNDED BELOW THE JOB CEILING (#1474 item 1). A job killed by
+        # `timeout-minutes` is CANCELLED, and no later step can relabel a
+        # cancellation — so the band is stopped HERE, by `timeout`, with a
+        # reserve left for the verdict step to read the log. `timeout` signals
+        # the runner's whole process group; run-tests.sh traps it and ends its
+        # log `END rc=4` (NOT A VERDICT), and the next step says so.
         id: unit_suite
         env:
           NEXUS_TEST_JOBS: ${{ matrix.jobs }}
@@ -434,15 +464,42 @@ jobs:
           fi
           echo "Discovered ${#tests[@]} tests. SHELL=$SHELL jobs=${{ matrix.jobs }}"
           echo
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound (JOB_CEILING_S=${JOB_CEILING_S:-unset} JOB_START_S=${JOB_START_S:-unset})"
+            exit 1
+          }
+          echo "band bound: ${bound}s (job ceiling ${JOB_CEILING_S}s, less time spent and the post-band reserve)"
+          mkdir -p "${RUNNER_TEMP}/test-failure-artifacts"
           rc=0
-          bash monitor/watcher/run-tests.sh --jobs ${{ matrix.jobs }} \
+          env -u NEXUS_ROOT -u NEXUS_LOCALS \
+            timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs ${{ matrix.jobs }} \
               --keep-logs "${RUNNER_TEMP}/test-failure-artifacts/first-run-logs" \
-              "${tests[@]}" || rc=$?
+              "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/test-failure-artifacts/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
           # LEGIBLE BEFORE IT CAN BE KILLED (<your-org>/nexus-code#1443 remedy 1):
           # a ceiling kill reports `cancelled` and carries no information, so
           # the band says where it stood against its own ceiling on every run.
           bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
           exit "$rc"
+
+      # THE READER OF THE END MARKER (<your-org>/nexus-code#1474 item 1). A
+      # truncated band used to render as `fail` beside a band whose suites
+      # failed assertions. This step reads the band log through band-verdict.sh
+      # and annotates it `RED` or `NO VERDICT` (or `VERDICT REFUSED`), with a
+      # step-summary line carrying reported/selected counts. The JOB still
+      # concludes `failure` on a no-verdict — a truncated band is not a pass,
+      # and a step cannot conclude `neutral`; the TITLE is what separates it.
+      # `always()` so it runs after a failed or bounded band; skipped only when
+      # the band step never started (then there is no log to read).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.unit_suite.outcome != 'skipped'
+        env:
+          BAND_NAME: unit suite (${{ matrix.login_shell }}, jobs ${{ matrix.jobs }})
+          RUN_RC: ${{ steps.unit_suite.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "$BAND_NAME" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/test-failure-artifacts/band.log"
 
       - name: collect failure artifacts
         # On failure, re-run each failing test serially with `bash -x` plus
@@ -591,63 +648,13 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Clean-env job: the suite with NEXUS_ROOT UNSET.
-  #
-  # A test that references $NEXUS_ROOT bare under `set -u` passes in the
-  # sandbox (where the operator exports it) and aborts on a clean runner where
-  # it is unset — `set -u` kills a fixture heredoc AFTER `>` already truncated
-  # the target, so an emit-body fixture renders EMPTY, hashes to the empty
-  # string, and silently defeats the discriminating assertion (sandbox 32/32,
-  # CI 31/32; <your-org>/nexus-code self-fix skill "sandbox-only test passes").
-  # The other matrix cells run on runners that also lack NEXUS_ROOT, but this
-  # job makes the guarantee EXPLICIT and unmissable, and `env -u` here matches
-  # the documented local repro `env -u NEXUS_ROOT bash test-X.sh`.
-  # ---------------------------------------------------------------------------
-  clean-env:
-    name: unit suite (NEXUS_ROOT unset)
-    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      JOB_CEILING_S: "2400"   # = timeout-minutes, in seconds (#1442)
-    steps:
-      # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
-      # `$SECONDS` restarts at zero in every step, so nothing inside a later
-      # step can know how much of `timeout-minutes` the job has already spent
-      # — the diagnostics budget used to be a constant for exactly that
-      # reason, and a band killed at its ceiling left no line saying so. The
-      # epoch goes into $GITHUB_ENV and JOB_CEILING_S sits beside
-      # `timeout-minutes` above; test-ci-diag-budget.sh pins the two equal.
-      - name: record the job start
-        run: echo "JOB_START_S=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
-      - name: install runtime deps (jq + tmux + zsh)
-        run: |
-          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
-          # source before updating (its index outage fails `apt-get update` at exit 100
-          # for packages this build never installs), then retry a transient index
-          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*
-          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
-          sudo apt-get install -y --no-install-recommends jq tmux zsh
-      - name: run unit suite with NEXUS_ROOT and NEXUS_LOCALS unset
-        run: |
-          set -uo pipefail
-          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
-          (( ${#tests[@]} > 0 )) || { echo "::error::no tests selected"; exit 1; }
-          echo "Discovered ${#tests[@]} tests (NEXUS_ROOT/NEXUS_LOCALS scrubbed)."
-          rc=0
-          env -u NEXUS_ROOT -u NEXUS_LOCALS \
-            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" || rc=$?
-          bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"   # #1443 remedy 1
-          exit "$rc"
-
-  # ---------------------------------------------------------------------------
   # INHERITED-ROOT job: the suite with NEXUS_ROOT EXPORTED — the MIRROR of
-  # clean-env above, and the half CI has never run (<your-org>/nexus-code#655).
+  # the `unit` cells' explicit `env -u NEXUS_ROOT -u NEXUS_LOCALS` above (the
+  # scrub the dropped `clean-env` job used to carry, <your-org>/nexus-code#1474
+  # item 13), and the half CI had never run (<your-org>/nexus-code#655).
   #
-  # `clean-env` and the three matrix cells all run on runners where NEXUS_ROOT
-  # is unset. That is ONE side of the variable. Every nexus-spawned agent runs
+  # The matrix cells run with NEXUS_ROOT unset. That is ONE side of the
+  # variable. Every nexus-spawned agent runs
   # on the OTHER side: monitor/spawn-worker.sh exports NEXUS_ROOT into every
   # worker process, so the environment a suite meets in the sandbox is the one
   # CI never reproduced. A suite that leaks the ambient root is therefore green
@@ -716,9 +723,12 @@ jobs:
     # plus a report step and a seconds-long self-test. The band prints its
     # elapsed time against this ceiling at the end of the suite step, so the
     # next squeeze is visible before it cancels anything (#1388 option 3).
-    timeout-minutes: 45
+    #
+    # 60, was 45 (<your-org>/nexus-code#1474 item 18) — the same stopgap as the
+    # `unit` cells, and the band is bounded below it the same way.
+    timeout-minutes: 60
     env:
-      JOB_CEILING_S: "2700"   # = timeout-minutes, in seconds (#1442)
+      JOB_CEILING_S: "3600"   # = timeout-minutes, in seconds (#1442)
     steps:
       # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
       # `$SECONDS` restarts at zero in every step, so nothing inside a later
@@ -759,6 +769,7 @@ jobs:
           echo "baseline OK — no monitor/.state before the band."
 
       - name: run unit suite with NEXUS_ROOT exported to the checkout
+        id: band
         env:
           # The one variable this job exists for. Set at job scope rather than
           # inline so every step below — including any future diagnostic step —
@@ -778,11 +789,26 @@ jobs:
             }
           done
           echo "Discovered ${#tests[@]} tests (NEXUS_ROOT=$NEXUS_ROOT exported)."
+          # Bounded below the job ceiling, as in `unit` (#1474 item 1).
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound"; exit 1; }
+          echo "band bound: ${bound}s"
           rc=0
-          bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" || rc=$?
+          timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
           # LEGIBLE BEFORE IT CAN BE KILLED (<your-org>/nexus-code#1443 remedy 1).
           bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
           exit "$rc"
+
+      # The END-marker reader, as in `unit` (#1474 item 1).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.band.outcome != 'skipped'
+        env:
+          RUN_RC: ${{ steps.band.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "unit suite (NEXUS_ROOT exported)" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/band.log"
 
       # -------------------------------------------------------------------
       # SIDE-EFFECT gate (<your-org>/nexus-code#655). The step above is
@@ -1114,9 +1140,11 @@ jobs:
     name: unit suite (bash 4.4, the version this lab runs)
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60, was 45 (<your-org>/nexus-code#1474 item 18) — the same stopgap as the
+    # `unit` cells, and the band is bounded below it the same way.
+    timeout-minutes: 60
     env:
-      JOB_CEILING_S: "2700"   # = timeout-minutes, in seconds (#1442)
+      JOB_CEILING_S: "3600"   # = timeout-minutes, in seconds (#1442)
     steps:
       # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
       # `$SECONDS` restarts at zero in every step, so nothing inside a later
@@ -1156,6 +1184,7 @@ jobs:
           "$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)" --version | head -1
 
       - name: run unit suite under bash 4.4.18
+        id: band
         run: |
           set -uo pipefail
           legacy=$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)
@@ -1165,11 +1194,26 @@ jobs:
             exit 1
           fi
           echo "Discovered ${#tests[@]} tests; interpreter: $legacy"
+          # Bounded below the job ceiling, as in `unit` (#1474 item 1).
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound"; exit 1; }
+          echo "band bound: ${bound}s"
           rc=0
           NEXUS_TEST_SHELL="$legacy" \
-            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" || rc=$?
+            timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
           bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"   # #1443 remedy 1
           exit "$rc"
+
+      # The END-marker reader, as in `unit` (#1474 item 1).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.band.outcome != 'skipped'
+        env:
+          RUN_RC: ${{ steps.band.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "unit suite (bash 4.4)" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/band.log"
 
   # ---------------------------------------------------------------------------
   # tmux-version matrix: prove the `paste-buffer -p` capability probe

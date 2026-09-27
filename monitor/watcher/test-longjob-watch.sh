@@ -115,6 +115,29 @@ got=$(probe slurm:12345); [[ "$got" == pending\|*squeue* ]] && ok "no sacct row 
 : > "$LJ_SQUEUE_FILE"
 got=$(probe slurm:abc); [[ "$got" == unknown\|* ]] && ok "a non-numeric slurm target → unknown" || bad "bad jobid: $got"
 
+echo "=== #1629: a Slurm ARRAY is a SET — terminal only when EVERY task is ==="
+# sacct -X prints one row per array task; the probe used to read the FIRST row
+# only, so the first task's COMPLETED emitted DONE while its siblings ran, and
+# after two of them had FAILED 139 (worker-a, 2026-09-23, arrays 4200102/4200101).
+: > "$LJ_SQUEUE_FILE"
+_arr() { printf '%s\n' "$@" > "$LJ_SACCT_FILE"; probe slurm:4200102; }
+got=$(_arr 'COMPLETED|0:0' 'RUNNING|0:0' 'PENDING|0:0')
+[[ "$got" == running\|* ]] && ok "#1629 array: first task COMPLETED, a sibling RUNNING → running, never done" || bad "#1629 completed+running: $got"
+got=$(_arr 'COMPLETED|0:0' 'COMPLETED|0:0' 'PENDING|0:0')
+[[ "$got" == pending\|* ]] && ok "#1629 array: completed tasks + a PENDING remainder → pending, never done" || bad "#1629 completed+pending: $got"
+got=$(_arr 'COMPLETED|0:0' 'FAILED|139:0' 'COMPLETED|0:0' 'FAILED|139:0')
+[[ "$got" == failed\|*"2 failed"*"FAILED exit=139:0"* ]] && ok "#1629 array: all terminal, two FAILED 139 → failed, naming the count and the first failure" || bad "#1629 failed set: $got"
+got=$(_arr 'FAILED|139:0' 'RUNNING|0:0')
+[[ "$got" == running\|*"first failure so far: FAILED exit=139:0"* ]] && ok "#1629 array: a failure while siblings still RUN → running (not terminal yet), the failure named" || bad "#1629 failed+running: $got"
+got=$(_arr 'COMPLETED|0:0' 'SOME_NEW_STATE|0:0')
+[[ "$got" == failed\|* ]] && ok "#1629 array: an UNRECOGNISED member state keeps the default arm → failed" || bad "#1629 unrecognised: $got"
+got=$(_arr 'COMPLETED|0:0' 'COMPLETED|0:0' 'COMPLETED|0:0')
+[[ "$got" == "done|COMPLETED array/het set of 3 rows: 3 completed, 0 failed, 0 running, 0 pending" ]] && ok "#1629 array: every task COMPLETED → done (control)" || bad "#1629 all completed: $got"
+printf 'COMPLETED|0:0\n' > "$LJ_SACCT_FILE"
+got=$(probe slurm:12345)
+[[ "$got" == "done|COMPLETED exit=0:0" ]] && ok "#1629 a SINGLE-row job prints exactly what it printed before (control)" || bad "#1629 single row: $got"
+: > "$LJ_SACCT_FILE"
+
 echo "=== probe contract: asyncrun via stubbed async-run.sh ==="
 [[ "$(probe asyncrun:tok-live)" == running\|* ]] && ok "live → running" || bad "asyncrun live"
 [[ "$(probe asyncrun:tok-ok)"   == done\|* ]]    && ok "settled rc=0 → done" || bad "asyncrun ok"
@@ -329,13 +352,35 @@ got=$(_orphan_async_resolve longjob r-none lj-win)
 export NEXUS_LONGJOB_KEY="t5"
 # retirement removes the wait: run a dispatcher on t5 and let b2 retire
 NEXUS_ROOT="$FROOT" "$LJ" dispatch >/dev/null 2>&1 &
-D5=$!; DPIDS+=("$D5"); sleep 7
+D5=$!; DPIDS+=("$D5")
+# A fixed `sleep 7` here and below raced a 5 s poll cadence under load:
+# `--jobs 6` band, Slurm 8478569, 1 red in 3 — `FAIL: F3 unknown` with b4 not
+# yet retired (your-org/nexus-code#1317). Poll instead, until every named
+# watch carries a retired_reason AND the dispatcher has finished the pass that
+# retired it — its end-of-pass ledger write (note exactly "ok", last_poll ≥
+# the latest retired_at). The second half matters: the wait side of a
+# retirement (_resolve_waits) runs AFTER _retire in the same pass, so stopping
+# at the retired_reason alone would read the waits mid-pass and a mutant that
+# wrongly undeclared a non-terminal wait could slip past. Bound 60 s (CHOSEN,
+# as the post-unmute poll above); on timeout it falls through and the
+# assertions below go red on their own evidence — a timeout never passes.
+_retired_settled() {   # <spool> <id>…
+    local sp="$1" id ra lp note maxra=0; shift
+    for id in "$@"; do
+        ra=$(jq -r 'if (.retired_reason // "") != "" then (.retired_at // 0) else empty end' "$sp/watches/$id.json" 2>/dev/null)
+        [[ "$ra" =~ ^[0-9]+$ ]] || return 1
+        (( ra > maxra )) && maxra=$ra
+    done
+    note=$(jq -r '.note // ""' "$sp/dispatcher.json" 2>/dev/null); lp=$(jq -r '.last_poll // 0' "$sp/dispatcher.json" 2>/dev/null)
+    [[ "$note" == ok && "$lp" =~ ^[0-9]+$ ]] && (( lp >= maxra ))
+}
+for i in $(seq 1 120); do _retired_settled "$SPOOL5" b2 && break; sleep 0.5; done
 [[ -z "$(jq -r '.external_waits[] | select(.id=="b2") | .id' "$HB")" ]] && ok "retiring b2 removed its external wait" || bad "wait b2 still declared: $(cat "$HB")"
 [[ "$(jq -r '.external_waits[] | select(.id=="b1") | .id' "$HB")" == b1 ]] && ok "the still-running b1 wait is still declared" || bad "b1 wait gone"
 echo "=== F3: a NON-terminal retirement keeps the external wait (the backstop) ==="
 "$LJ" add cmd:'exit 1' --id b3 --interval 5 --ttl 1 >/dev/null 2>&1
 "$LJ" add cmd:'exit 3' --id b4 --interval 5 --unknown-max 1 >/dev/null 2>&1
-sleep 7
+for i in $(seq 1 120); do _retired_settled "$SPOOL5" b3 b4 && break; sleep 0.5; done   # was `sleep 7` (#1317; see _retired_settled)
 [[ "$(jq -r .retired_reason "$SPOOL5/watches/b3.json")" == expired && "$(jq -r '.external_waits[] | select(.id=="b3") | .id' "$HB")" == b3 ]] && ok "F3: TTL expiry retires the WATCH but keeps the WAIT declared" || bad "F3 expired: $(jq -c . "$SPOOL5/watches/b3.json") waits=$(jq -c .external_waits "$HB")"
 [[ "$(jq -r .retired_reason "$SPOOL5/watches/b4.json")" == unknown && "$(jq -r '.external_waits[] | select(.id=="b4") | .id' "$HB")" == b4 ]] && ok "F3: an unknown park keeps the wait declared too" || bad "F3 unknown: waits=$(jq -c .external_waits "$HB")"
 [[ "$("$LJ" resolve b3)" == running\|* ]] && ok "F3: resolve on an expired watch probes the SUBJECT live (running), not the park" || bad "F3 resolve b3: $("$LJ" resolve b3)"
@@ -488,6 +533,209 @@ v=$("$LJ" ledger-verdict "$LV2/dispatcher.json"); [[ "$v" == absent\|*"schema ve
 jq '.version = 2 | .retired = 3' "$LV2/dispatcher.json" > "$LV2/x" && mv "$LV2/x" "$LV2/dispatcher.json"
 v=$("$LJ" ledger-verdict "$LV2/dispatcher.json"); [[ "$v" == armed\|* ]] && ok "version control: the same ledger at version 2 → armed" || bad "version control: $v"
 ! jq -e '.retired or .session_key or .session_id' "$SPOOL12/dispatcher.json" >/dev/null 2>&1 && ok "unread fields gone: the writer no longer emits retired / session_key / session_id" || bad "unread field present: $(jq -c . "$SPOOL12/dispatcher.json")"
+
+echo "=== #1544: the session ledger has ONE writer — a second dispatch refuses to arm, and only for as long as the first lives ==="
+# KILL DIRECTION (your-org/nexus-code#1544). pane-state.sh excludes the ledger
+# pid's ROOT from the background-shell census WHOLE, so a second dispatcher that
+# overwrites the ledger makes it exclude the wrong subtree: sk3's rig 4 read
+# `idle` over a live `sleep 600`. PREDICTED FLIP SET for "delete the
+# `_dispatch_wait_for_ledger` call in cmd_dispatch" (written before the mutation
+# round): the `NEVER named the second` row, the stderr row and the `refused`
+# event row go red, and so does the `released` row (nothing was ever held); the
+# first-arms control, the alive row, the status row, the takeover row and the
+# stale-owner control stay green.
+export NEXUS_LONGJOB_KEY="t1544"; SPOOL44="$NEXUS_STATE_DIR/longjob/t1544"
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out44a.txt" 2> "$WORK/err44a.txt" &
+D44A=$!; DPIDS+=("$D44A")
+for _i in $(seq 1 80); do [[ "$(jq -r '.service // empty' "$SPOOL44/dispatcher.json" 2>/dev/null)" == polling ]] && break; sleep 0.25; done
+[[ "$(jq -r .pid "$SPOOL44/dispatcher.json" 2>/dev/null)" == "$D44A" ]] && ok "#1544 control: the first dispatcher arms and the ledger names it (pid $D44A)" || bad "#1544 first dispatcher did not arm: $(cat "$SPOOL44/dispatcher.json" 2>&1)"
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out44b.txt" 2> "$WORK/err44b.txt" &
+D44B=$!; DPIDS+=("$D44B")
+# SAMPLED, not read once: two unguarded dispatchers ALTERNATE writes, so a single
+# read after a sleep sees the first one's name about half the time and the
+# mutant would pass on a coin flip. 12 s at 0.5 s covers two full polls (5 s).
+_seen_b=0
+for _i in $(seq 1 24); do
+    [[ "$(jq -r .pid "$SPOOL44/dispatcher.json" 2>/dev/null)" == "$D44B" ]] && _seen_b=1
+    sleep 0.5
+done
+[[ -d "/proc/$D44B" ]] && ok "#1544 the refused dispatcher stays ALIVE (an exit would be a delivered failure notice)" || bad "#1544 the second dispatcher exited"
+(( _seen_b == 0 )) && [[ "$(jq -r .pid "$SPOOL44/dispatcher.json" 2>/dev/null)" == "$D44A" ]] && ok "#1544 across 24 samples in 12 s the ledger NEVER named the second dispatcher — it never wrote it" || bad "#1544 the ledger was overwritten: pid=$(jq -r .pid "$SPOOL44/dispatcher.json" 2>&1), first=$D44A second=$D44B"
+grep -q 'REFUSING TO ARM' "$WORK/err44b.txt" && grep -q "pid $D44A" "$WORK/err44b.txt" && ok "#1544 the refusal says so on stderr and names the owner" || bad "#1544 stderr: $(cat "$WORK/err44b.txt")"
+grep -qE "dispatcher[[:space:]]refused[[:space:]].*pid=$D44B .*pid=$D44A" "$SPOOL44/events.log" && ok "#1544 …and in the events log (refused pid=$D44B, owner pid=$D44A)" || bad "#1544 events.log: $(cat "$SPOOL44/events.log" 2>&1)"
+out=$("$LJ" status 2>&1); [[ "$out" == *"dispatcher=armed"* ]] && ok "#1544 status still reads armed — from the owner's ledger" || bad "#1544 status: $out"
+# The refusal lasts exactly as long as its reason: stop the owner and the second arms.
+for _k in $(pgrep -P "$D44A" 2>/dev/null); do kill "$_k" 2>/dev/null; done
+kill "$D44A"; wait "$D44A" 2>/dev/null
+for _i in $(seq 1 160); do [[ "$(jq -r .pid "$SPOOL44/dispatcher.json" 2>/dev/null)" == "$D44B" ]] && break; sleep 0.25; done
+[[ "$(jq -r .pid "$SPOOL44/dispatcher.json" 2>/dev/null)" == "$D44B" && "$(jq -r .service "$SPOOL44/dispatcher.json" 2>/dev/null)" == polling ]] \
+    && ok "#1544 once the owner is gone the waiting dispatcher ARMS (a respawned session is not locked out by a predecessor that stopped)" \
+    || bad "#1544 no takeover after the owner died: $(cat "$SPOOL44/dispatcher.json" 2>&1)"
+grep -qE "dispatcher[[:space:]]released" "$SPOOL44/events.log" && ok "#1544 the release is recorded" || bad "#1544 no release event: $(cat "$SPOOL44/events.log" 2>&1)"
+for _k in $(pgrep -P "$D44B" 2>/dev/null); do kill "$_k" 2>/dev/null; done
+kill "$D44B"; wait "$D44B" 2>/dev/null
+# A ledger naming a LIVE pid that has STOPPED POLLING is not an owner: no lock-out by a wedged predecessor.
+export NEXUS_LONGJOB_KEY="t1544s"; SPOOL44S="$NEXUS_STATE_DIR/longjob/t1544s"; mkdir -p "$SPOOL44S/watches"
+jq -n --arg p "$$" --arg s "$(awk '{print $22}' /proc/$$/stat)" '{version:2, service:"polling", pid:($p|tonumber), pid_start:$s, last_poll:(now|floor - 10000), active:0, poll_seconds:5, muted:0}' > "$SPOOL44S/dispatcher.json"
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out44s.txt" 2> "$WORK/err44s.txt" &
+D44S=$!; DPIDS+=("$D44S")
+for _i in $(seq 1 80); do [[ "$(jq -r .pid "$SPOOL44S/dispatcher.json" 2>/dev/null)" == "$D44S" ]] && break; sleep 0.25; done
+[[ "$(jq -r .pid "$SPOOL44S/dispatcher.json" 2>/dev/null)" == "$D44S" ]] && ok "#1544 control: a LIVE pid with a 10 000 s old poll is not an owner — the new dispatcher arms at once" || bad "#1544 stale owner locked the dispatcher out: $(cat "$SPOOL44S/dispatcher.json" 2>&1) / $(cat "$WORK/err44s.txt")"
+for _k in $(pgrep -P "$D44S" 2>/dev/null); do kill "$_k" 2>/dev/null; done
+kill "$D44S"; wait "$D44S" 2>/dev/null
+export NEXUS_LONGJOB_KEY="t1"
+
+echo "=== #1623: a dispatcher serves ONE live claude — exits when it is gone, yields to a newer one, and a failed write is never a delivery ==="
+# your-org/nexus-code#1623. A `--resume` keeps the session id, so the resumed
+# session's host-armed dispatcher found the DEAD incarnation's dispatcher
+# (reparented to init, still polling) holding the ledger, refused to arm under
+# #1544, and the orphan retired 7 terminal watches into a broken pipe.
+#
+# THE OWNER IS FOUND BY COMM, so these rigs launch each dispatcher under a
+# stand-in `claude`: a `#!/bin/bash` script's comm is its FILE NAME (measured:
+# `cat /proc/<pid>/comm` → claude). Killing the stand-in is the session dying.
+# Every other rig in this suite runs with the owner this suite inherits (the
+# agent's real claude, or none in CI) — the same for both of #1544's
+# dispatchers, which is what keeps that block the SAME-owner control.
+#
+# PREDICTED FLIP SETS (written before the mutation round; subject
+# monitor/longjob-watch.sh):
+#   delete the main loop's `_owner_exit_if_gone`      → `#1623a orphaned dispatcher EXITS`,
+#       `#1623a …and says why`; NOT the #1623a control, NOT any #1623b/c/d row.
+#   delete the `break` of the supersede arm in _dispatch_wait_for_ledger →
+#       `#1623b the newer session's dispatcher ARMS AT ONCE`, `#1623b never refused`,
+#       `#1623b supersedes`, `#1623b the older dispatcher EXITS`, `#1623c`; NOT #1623a/d.
+#   delete the `_spec_write "$f" "$spec"` restore      → `#1623d the watch is UN-RETIRED`,
+#       `#1623d the live dispatcher delivers`, `#1623d …then the wait resolves`; NOT
+#       `#1623d wait still declared`, NOT `#1623d attempted ONCE`.
+#   delete the `stdout-closed` non-owner line          → `#1623d the live dispatcher ARMS`,
+#       `#1623d the live dispatcher delivers`, `#1623d …then the wait resolves`.
+#   restore `$spec` instead of `$pre` (skeptic item 3)  → `#1623e w1 is delivered exactly ONCE`;
+#       NOT `#1623e stays retired`, NOT any #1623d row.
+FC="$WORK/fc"; mkdir -p "$FC"
+printf '#!/bin/bash\n"$@" &\nwait\n' > "$FC/claude"; chmod +x "$FC/claude"
+_lj_pid_of() { jq -r '.pid // empty' "$1/dispatcher.json" 2>/dev/null; }
+_lj_wait_pid() { local i; for i in $(seq 1 "${3:-80}"); do [[ "$(_lj_pid_of "$1")" == "$2" ]] && return 0; sleep 0.25; done; return 1; }
+_lj_wait_gone() { local i; for i in $(seq 1 "${2:-80}"); do [[ -d "/proc/$1" ]] || return 0; sleep 0.25; done; return 1; }
+_lj_kill_tree() { local k; for k in $(pgrep -P "$1" 2>/dev/null); do _lj_kill_tree "$k"; done; kill "$1" 2>/dev/null; }
+
+# (a) the owner dies → the dispatcher exits
+export NEXUS_LONGJOB_KEY="t1623a"; SPA="$NEXUS_STATE_DIR/longjob/t1623a"
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23a.txt" 2> "$WORK/err23a.txt" &
+C1=$!; DPIDS+=("$C1")
+for _i in $(seq 1 80); do [[ "$(jq -r '.service // empty' "$SPA/dispatcher.json" 2>/dev/null)" == polling ]] && break; sleep 0.25; done
+DA=$(_lj_pid_of "$SPA"); DPIDS+=("$DA")
+[[ "$(jq -r .owner_pid "$SPA/dispatcher.json" 2>/dev/null)" == "$C1" && "$(jq -r .owner_start "$SPA/dispatcher.json" 2>/dev/null)" == "$(awk '{print $22}' /proc/$C1/stat)" ]] \
+    && ok "#1623a the ledger records the owner as pid + start ticks" || bad "#1623a the ledger records the owner as pid + start ticks: $(jq -c . "$SPA/dispatcher.json" 2>&1)"
+sleep 6
+[[ -n "$DA" && -d "/proc/$DA" ]] && ok "#1623a control: with its owner alive the dispatcher stays up across a poll" || bad "#1623a control: with its owner alive the dispatcher stays up across a poll"
+kill -9 "$C1"; wait "$C1" 2>/dev/null
+_lj_wait_gone "$DA" 60 && ok "#1623a orphaned dispatcher EXITS once its claude is gone (≤ one poll)" || bad "#1623a orphaned dispatcher EXITS once its claude is gone (≤ one poll): still polling, pid $DA ppid $(awk '{print $4}' /proc/$DA/stat 2>/dev/null)"
+grep -qE "dispatcher[[:space:]]orphaned[[:space:]].*pid=$DA " "$SPA/events.log" && ok "#1623a …and says why in the events log" || bad "#1623a …and says why in the events log: $(cat "$SPA/events.log" 2>&1)"
+# the verdict: a LIVE pid whose recorded owner is gone reads dead, not armed
+export NEXUS_LONGJOB_KEY="t1623v"; SPV="$NEXUS_STATE_DIR/longjob/t1623v"; mkdir -p "$SPV/watches"
+_mk_ledger() { jq -n --arg p "$$" --arg s "$(awk '{print $22}' /proc/$$/stat)" --arg op "$1" --arg os "$2" '{version:2, service:"polling", pid:($p|tonumber), pid_start:$s, owner_pid:$op, owner_start:$os, last_poll:(now|floor), active:0, poll_seconds:5, muted:0}' > "$SPV/dispatcher.json"; }
+_mk_ledger "$DA" "1"
+[[ "$("$LJ" ledger-verdict "$SPV/dispatcher.json")" == dead\|*ORPHANED* ]] && ok "#1623v ledger-verdict: a live pid whose owner is gone → dead (orphaned), never armed" || bad "#1623v ledger-verdict: a live pid whose owner is gone → dead (orphaned), never armed: $("$LJ" ledger-verdict "$SPV/dispatcher.json")"
+_mk_ledger "" ""
+[[ "$("$LJ" ledger-verdict "$SPV/dispatcher.json")" == armed\|* ]] && ok "#1623v control: the same ledger with NO recorded owner → armed" || bad "#1623v control: the same ledger with NO recorded owner → armed: $("$LJ" ledger-verdict "$SPV/dispatcher.json")"
+
+# (b) a newer session's dispatcher supersedes; the older one exits
+export NEXUS_LONGJOB_KEY="t1623b"; SPB="$NEXUS_STATE_DIR/longjob/t1623b"
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23b1.txt" 2> "$WORK/err23b1.txt" &
+C1=$!; DPIDS+=("$C1")
+for _i in $(seq 1 80); do [[ "$(jq -r '.service // empty' "$SPB/dispatcher.json" 2>/dev/null)" == polling ]] && break; sleep 0.25; done
+DB1=$(_lj_pid_of "$SPB"); DPIDS+=("$DB1"); sleep 1
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23b2.txt" 2> "$WORK/err23b2.txt" &
+C2=$!; DPIDS+=("$C2")
+for _i in $(seq 1 40); do DB2=$(pgrep -P "$C2" 2>/dev/null | head -1); [[ -n "$DB2" ]] && break; sleep 0.25; done; DPIDS+=("$DB2")
+_lj_wait_pid "$SPB" "$DB2" 32 && ok "#1623b the newer session's dispatcher ARMS AT ONCE over a live older one" || bad "#1623b the newer session's dispatcher ARMS AT ONCE over a live older one: $(jq -c '{pid,owner_pid,service}' "$SPB/dispatcher.json" 2>&1) newer=$DB2 older=$DB1"
+! grep -q 'REFUSING TO ARM' "$WORK/err23b2.txt" && ok "#1623b the newer one never refused" || bad "#1623b the newer one never refused: $(cat "$WORK/err23b2.txt")"
+grep -qE "dispatcher[[:space:]]supersedes[[:space:]].*pid=$DB2 supersedes pid=$DB1" "$SPB/events.log" && ok "#1623b supersedes is recorded" || bad "#1623b supersedes is recorded: $(cut -f2-5 "$SPB/events.log" 2>&1 | tr '\n' '|')"
+_lj_wait_gone "$DB1" 80 && ok "#1623b the older dispatcher EXITS on seeing the newer write — it does not compete" || bad "#1623b the older dispatcher EXITS on seeing the newer write — it does not compete"
+grep -qE "dispatcher[[:space:]]superseded[[:space:]].*pid=$DB1 exits" "$SPB/events.log" && ok "#1623b …and records that it was superseded" || bad "#1623b …and records that it was superseded: $(cut -f2-5 "$SPB/events.log" | tr '\n' '|')"
+_lj_kill_tree "$C1"; _lj_kill_tree "$C2"; wait "$C1" "$C2" 2>/dev/null
+
+# (c) a PRE-#1623 ledger (no owner fields) naming a reparented orphan is superseded
+export NEXUS_LONGJOB_KEY="t1623c"; SPC="$NEXUS_STATE_DIR/longjob/t1623c"; mkdir -p "$SPC/watches"
+( sleep 300 & echo $! > "$WORK/orphan23" ); OP=$(cat "$WORK/orphan23"); DPIDS+=("$OP")
+jq -n --arg p "$OP" --arg s "$(awk '{print $22}' /proc/$OP/stat)" '{version:2, service:"polling", pid:($p|tonumber), pid_start:$s, last_poll:(now|floor), active:0, poll_seconds:5, muted:0}' > "$SPC/dispatcher.json"
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23c.txt" 2> "$WORK/err23c.txt" &
+C3=$!; DPIDS+=("$C3")
+for _i in $(seq 1 40); do DC=$(pgrep -P "$C3" 2>/dev/null | head -1); [[ -n "$DC" ]] && break; sleep 0.25; done; DPIDS+=("$DC")
+_lj_wait_pid "$SPC" "$DC" 32 && ! grep -q 'REFUSING' "$WORK/err23c.txt" && ok "#1623c a pre-#1623 ledger naming a live ORPHAN (ppid 1, no claude above it) does not lock out a session's dispatcher" || bad "#1623c a pre-#1623 ledger naming a live ORPHAN (ppid 1, no claude above it) does not lock out a session's dispatcher: $(jq -c '{pid,service}' "$SPC/dispatcher.json") err=$(cat "$WORK/err23c.txt")"
+_lj_kill_tree "$C3"; wait "$C3" 2>/dev/null; kill "$OP" 2>/dev/null
+
+# (d) a terminal write that FAILS is restored un-retired and delivered by a live dispatcher, once
+export NEXUS_LONGJOB_KEY="t1623d" NEXUS_WORKER_WINDOW="lj-w23"; SPD="$NEXUS_STATE_DIR/longjob/t1623d"
+HB23="$NEXUS_STATE_DIR/heartbeat/lj-w23.json"
+jq -n '{window:"lj-w23", state:"idle", external_waits:[]}' > "$HB23"
+"$LJ" add cmd:'exit 0' --id gone1 --interval 5 --no-first-probe >/dev/null 2>&1
+jq '.retired=true | .retired_reason="terminal" | .state="done" | .events=1' "$SPD/watches/gone1.json" > "$WORK/g1" && mv "$WORK/g1" "$SPD/watches/gone1.json"   # delivered earlier
+_wait23() { [[ "$(jq -r '[.external_waits[] | select(.kind=="longjob") | .id] | index("lost1") != null' "$HB23" 2>/dev/null)" == true ]]; }
+mkfifo "$WORK/pipe23"
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/pipe23" 2>/dev/null &
+DD=$!; DPIDS+=("$DD")
+sleep 1 < "$WORK/pipe23"          # the reader opens the pipe, then goes: every later write is EPIPE
+sleep 1                           # …so the watch is added only once nobody reads (a buffered write would SUCCEED)
+"$LJ" add cmd:'exit 0' --id lost1 --interval 5 --no-first-probe >/dev/null 2>&1
+for _i in $(seq 1 80); do grep -q $'\tlost1\tdone\twrite-failed\t' "$SPD/events.log" 2>/dev/null && break; sleep 0.25; done
+grep -q $'\tlost1\tdone\twrite-failed\t' "$SPD/events.log" && ok "#1623d rig: the terminal line's write FAILED (events: write-failed)" || bad "#1623d rig: the terminal line's write FAILED (events: write-failed): $(cat "$SPD/events.log" 2>&1)"
+sleep 1
+[[ "$(jq -r '.retired' "$SPD/watches/lost1.json")" == false ]] && ok "#1623d the watch is UN-RETIRED after the failed write (not lost)" || bad "#1623d the watch is UN-RETIRED after the failed write (not lost): $(jq -c '{retired,retired_reason,state}' "$SPD/watches/lost1.json")"
+_wait23 && ok "#1623d its wait is still declared (never resolved for an undelivered result)" || bad "#1623d its wait is still declared (never resolved for an undelivered result): $(jq -c .external_waits "$HB23")"
+[[ "$(jq -r .service "$SPD/dispatcher.json")" == stdout-closed ]] && [[ "$("$LJ" ledger-verdict "$SPD/dispatcher.json")" != armed* ]] && ok "#1623d the deaf dispatcher released the spool: service=stdout-closed, verdict not armed" || bad "#1623d the deaf dispatcher released the spool: service=stdout-closed, verdict not armed: $(jq -c '{service,note}' "$SPD/dispatcher.json") verdict=$("$LJ" ledger-verdict "$SPD/dispatcher.json")"
+sleep 12
+(( $(grep -c $'\tlost1\tdone\twrite-failed\t' "$SPD/events.log") == 1 )) && [[ -d "/proc/$DD" ]] && ok "#1623d the deaf dispatcher attempted it ONCE — no retry loop — and is still alive" || bad "#1623d the deaf dispatcher attempted it ONCE — no retry loop — and is still alive: attempts=$(grep -c $'\tlost1\t' "$SPD/events.log") alive=$([ -d /proc/$DD ] && echo y || echo n)"
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23d.txt" 2> "$WORK/err23d.txt" &
+DL=$!; DPIDS+=("$DL")
+_lj_wait_pid "$SPD" "$DL" 32 && ! grep -q 'REFUSING' "$WORK/err23d.txt" && ok "#1623d the live dispatcher ARMS at once beside the released one" || bad "#1623d the live dispatcher ARMS at once beside the released one: $(jq -c '{pid,service}' "$SPD/dispatcher.json") err=$(cat "$WORK/err23d.txt")"
+for _i in $(seq 1 60); do grep -q '^longjob-watch: DONE lost1 ' "$WORK/out23d.txt" && break; sleep 0.25; done; sleep 3
+(( $(grep -c '^longjob-watch: DONE lost1 ' "$WORK/out23d.txt") == 1 )) && ! grep -q 'gone1' "$WORK/out23d.txt" && ok "#1623d the live dispatcher delivers the restored line exactly ONCE, and nothing already delivered" || bad "#1623d the live dispatcher delivers the restored line exactly ONCE, and nothing already delivered: $(cat "$WORK/out23d.txt")"
+! _wait23 && [[ "$(jq -r .retired_reason "$SPD/watches/lost1.json")" == terminal ]] && ok "#1623d …then the wait resolves and the watch retires terminal" || bad "#1623d …then the wait resolves and the watch retires terminal: waits=$(jq -c .external_waits "$HB23") spec=$(jq -c '{retired,retired_reason}' "$SPD/watches/lost1.json")"
+_lj_kill_tree "$DD"; _lj_kill_tree "$DL"; wait "$DD" "$DL" 2>/dev/null
+unset NEXUS_WORKER_WINDOW
+export NEXUS_LONGJOB_KEY="t1"
+
+# (e) THE RESTORE UNDOES ONLY ITS OWN WRITE (skeptic item 3 on the #1623
+# bundle). Older dispatcher A (reader-less stdout) is MID-PROBE on w1 when
+# newer dispatcher B supersedes it, probes w1, retires it and DELIVERS it. A's
+# probe then returns, A retires w1 over B's retirement, its write fails, and at
+# d110c584 it restored w1 EXACTLY as it read it before the probe — un-retired —
+# so B delivered w1 a SECOND time (the skeptic measured two `DONE w1`). The
+# probe is a first-caller gate: the FIRST probe of w1 (A's) blocks until the
+# rig releases it, every later one (B's) answers done at once, so the order
+# A-probes / B-delivers / A-fails is forced, not raced.
+# PREDICTED FLIPS: restoring `$spec` instead of `$pre` → `#1623e delivered
+# exactly ONCE` ONLY; NOT the rig rows, NOT #1623d (single dispatcher: pre ==
+# spec, so both forms restore the same bytes). `#1623e stays retired` is a
+# sanity row, NOT a discriminator: measured at d110c584 it PASSES, because B
+# re-retires the watch when it re-delivers it — the duplicate is visible only
+# in B's output.
+export NEXUS_LONGJOB_KEY="t1623e"; SPE="$NEXUS_STATE_DIR/longjob/t1623e"
+GATE23="$WORK/gate23e"; REL23="$WORK/rel23e"
+mkfifo "$WORK/pipe23e"
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/pipe23e" 2>/dev/null &
+CA=$!; DPIDS+=("$CA")
+sleep 1 < "$WORK/pipe23e"          # the reader opens and goes: A's every later write is EPIPE
+for _i in $(seq 1 80); do [[ "$(jq -r '.service // empty' "$SPE/dispatcher.json" 2>/dev/null)" == polling ]] && break; sleep 0.25; done
+DEA=$(_lj_pid_of "$SPE"); DPIDS+=("$DEA")
+"$LJ" add cmd:"if mkdir '$GATE23' 2>/dev/null; then while [ ! -e '$REL23' ]; do sleep 0.1; done; fi; exit 0" --id w1 --interval 5 --no-first-probe >/dev/null 2>&1
+for _i in $(seq 1 60); do [[ -d "$GATE23" ]] && break; sleep 0.25; done
+[[ -d "$GATE23" ]] && ok "#1623e rig: the older dispatcher is mid-probe on w1" || bad "#1623e rig: the older dispatcher is mid-probe on w1: $(cat "$SPE/events.log" 2>&1)"
+"$FC/claude" env NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23e.txt" 2> "$WORK/err23e.txt" &
+CB=$!; DPIDS+=("$CB")
+for _i in $(seq 1 40); do DEB=$(pgrep -P "$CB" 2>/dev/null); DEB="${DEB%%$'\n'*}"; [[ -n "$DEB" ]] && break; sleep 0.25; done; DPIDS+=("$DEB")   # no `| head`: not an early-exit reader
+for _i in $(seq 1 60); do grep -q '^longjob-watch: DONE w1 ' "$WORK/out23e.txt" 2>/dev/null && break; sleep 0.25; done
+grep -q '^longjob-watch: DONE w1 ' "$WORK/out23e.txt" && ok "#1623e rig: the newer dispatcher superseded and delivered w1 while the older was mid-probe" || bad "#1623e rig: the newer dispatcher superseded and delivered w1 while the older was mid-probe: out=$(cat "$WORK/out23e.txt") events=$(cut -f2-5 "$SPE/events.log" | tr '\n' '|')"
+: > "$REL23"
+for _i in $(seq 1 60); do grep -q $'\tw1\tdone\twrite-failed\t' "$SPE/events.log" 2>/dev/null && break; sleep 0.25; done
+grep -q $'\tw1\tdone\twrite-failed\t' "$SPE/events.log" && ok "#1623e rig: the older dispatcher's write of w1 FAILED" || bad "#1623e rig: the older dispatcher's write of w1 FAILED: $(cut -f2-5 "$SPE/events.log" | tr '\n' '|')"
+sleep 12                            # two of B's polls: a restored-un-retired w1 would be probed (done at once) and printed again
+(( $(grep -c '^longjob-watch: DONE w1 ' "$WORK/out23e.txt") == 1 )) && ok "#1623e w1 is delivered exactly ONCE — the failed writer does not un-retire what another dispatcher delivered" || bad "#1623e w1 is delivered exactly ONCE — the failed writer does not un-retire what another dispatcher delivered: $(cat "$WORK/out23e.txt")"
+[[ "$(jq -r '.retired' "$SPE/watches/w1.json")" == true ]] && ok "#1623e w1 stays retired" || bad "#1623e w1 stays retired: $(jq -c '{retired,retired_reason,state}' "$SPE/watches/w1.json")"
+_lj_kill_tree "$CA"; _lj_kill_tree "$CB"; wait "$CA" "$CB" 2>/dev/null
+export NEXUS_LONGJOB_KEY="t1"
 
 echo "=== usage refusals ==="
 "$LJ" add nosuch:x >/dev/null 2>&1; rc=$?; (( rc == 2 )) && ok "add with an unknown kind → rc 2" || bad "add unknown kind rc=$rc"

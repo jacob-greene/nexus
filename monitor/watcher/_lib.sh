@@ -1331,8 +1331,10 @@ _watcher_heartbeat_ticker_loop() {
 
 # _supervisor_monitor_command [nexus_root]
 #
-# THE single source of truth for the exact persistent-`Monitor` command
-# the orchestrator arms (and re-arms) to supervise the watcher. Emitted
+# THE single source of truth for the exact `Monitor` command the
+# orchestrator arms (and RE-ARMS — since Claude Code 2.1.271 a Monitor is
+# deadline-bounded at 30 min, so this is a lease, not a persistent loop;
+# your-org/nexus-code#1532) to supervise the watcher. Emitted
 # verbatim by all three recovery surfaces — the `--- arm watcher
 # supervisor ---` reminder (_supervisor_arm_emit_section), the
 # supervise-tick DOWN message (_supervisor_down_recovery_message), and
@@ -1342,6 +1344,23 @@ _supervisor_monitor_command() {
     local nexus_root="${1:-${NEXUS_ROOT:-}}"
     printf 'Monitor({command: "until ! %smonitor/watcher-supervise-tick.sh; do sleep 15; done"})' \
         "${nexus_root:+$nexus_root/}"
+}
+
+# _supervisor_arm_instruction [nexus_root]
+#
+# THE single source of truth for how the orchestrator (re-)arms the watcher
+# supervisor (your-org/nexus-code#1532). The primary form is
+# monitor/arm-watcher-supervisor.sh: a PERSISTENT longjob watch run by the
+# session's plugin dispatcher, which is not bound by the 30-minute Monitor
+# cap, polls independently of the orchestrator's turns, and revives a dead
+# watcher itself. Only when that script exits 3 (the plugin dispatcher is
+# NOT ARMED in this session) does the orchestrator fall back to the
+# 30-minute Monitor lease of _supervisor_monitor_command. One line; always
+# returns 0.
+_supervisor_arm_instruction() {
+    local nexus_root="${1:-${NEXUS_ROOT:-}}"
+    printf 'run %smonitor/arm-watcher-supervisor.sh (persistent longjob watch; no re-arm lease). Only if it exits 3 (plugin dispatcher NOT ARMED), arm the fallback lease and re-arm it on every expiry: %s' \
+        "${nexus_root:+$nexus_root/}" "$(_supervisor_monitor_command "$nexus_root")"
 }
 
 # _supervisor_down_recovery_message <reason> [nexus_root]
@@ -1361,7 +1380,7 @@ _supervisor_down_recovery_message() {
     printf 'watcher DOWN: %s — the mutual-liveness supervisor must recover it now.\n' "$reason"
     printf 'Recover (mutual-liveness contract; see skills/nexus.service-recovery):\n'
     printf '  1. Revive — converges to EXACTLY ONE live watcher (idempotent; safe if already up): %smonitor/revive-watcher.sh\n' "$p"
-    printf '  2. Re-arm the supervisor Monitor: %s\n' "$(_supervisor_monitor_command "$nexus_root")"
+    printf '  2. Re-arm the supervisor: %s\n' "$(_supervisor_arm_instruction "$nexus_root")"
 }
 
 # _nexus_dir_writable <dir>
@@ -1954,8 +1973,9 @@ _nexus_github_incident_escalate() {
 #
 # Emit body for the `--- arm watcher supervisor ---` reminder (your-org/
 # your-nexus watcher-supervision, mutual-liveness design). The
-# orchestrator arms a persistent Monitor that revives a crashed watcher
-# and TOUCHES the supervisor heartbeat each tick. If that heartbeat is
+# orchestrator arms a Monitor — deadline-bounded at 30 min since 2.1.271,
+# so re-armed on every expiry (your-org/nexus-code#1532) — that revives a
+# crashed watcher and TOUCHES the supervisor heartbeat each tick. If that heartbeat is
 # stale/absent the supervisor is NOT armed → the watcher nudges the
 # (possibly freshly-restarted) orchestrator to (re)arm it. A STANDING
 # condition, not a one-shot: it reflects the live heartbeat freshness on
@@ -1975,11 +1995,11 @@ _supervisor_arm_emit_section() {
     # Body is intentionally STABLE (no live age number) so the emit
     # content-hash dedup collapses repeats — the reminder surfaces once
     # per genuine emit while unarmed, never spamming a quiet workspace.
-    printf 'No fresh watcher-supervisor heartbeat (%s) — the supervisor Monitor is NOT armed.\n' \
+    printf 'No fresh watcher-supervisor heartbeat (%s) — the watcher supervisor is NOT armed.\n' \
         "$hb"
     printf 'Without it a watcher CRASH has no turn-independent revival. (Re)arm it now (mutual-liveness contract):\n'
-    printf '  %s\n' "$(_supervisor_monitor_command "$nexus_root")"
-    printf '  On exit (watcher down) run %smonitor/revive-watcher.sh, then re-arm. See skills/nexus.service-recovery.\n' \
+    printf '  %s\n' "$(_supervisor_arm_instruction "$nexus_root")"
+    printf '  The persistent watch revives a dead watcher itself; under the fallback lease, on its exit run %smonitor/revive-watcher.sh, then re-arm. See skills/nexus.service-recovery.\n' \
         "${nexus_root:+$nexus_root/}"
     return 0
 }

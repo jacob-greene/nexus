@@ -358,6 +358,30 @@ _orchestrator_auth_blocked() {
         ORCH_AUTH_BLOCK_KIND=hold
         return 0
     fi
+    # THE TYPED SENSOR (your-org/nexus-code#1520, the transcript half of #1517).
+    # `turn-failure/<target>.json`, written by the orchestrator's own StopFailure
+    # hook ~1 s after a failed turn and typed `category=auth recovery=operator`
+    # by `_cause_classify.sh`. Checked BEFORE the pane arm because it is the
+    # fresher and the typed of the two; both raise ONE alert key. This arm is
+    # a GATE and nothing else — see the note above `_auth_hold_turn_failure_gate`
+    # on why it must never become a trigger: #1548 F2 measured that a liveness
+    # that "sees" the failure in the other direction reaches `respawn
+    # reason=resubmit-failed` at grace_s = 120 s with nothing to veto it. Here,
+    # after a resubmit fails, the fresh marker makes the NEXT tick `healthy
+    # reason=auth-turn-failure`, the step wrapper clears the resubmit marker,
+    # and the episode resets — this arm is the guard on the RESUBMIT-FAILED
+    # path. `dead-threshold` is closed by a different property of the sensor
+    # (skeptic oplivesk F3): it also holds while marker.ts >= last_paste_ts,
+    # i.e. while the watcher's latest poke was answered by an auth failure —
+    # a fixed freshness window alone respawned at +1385 s in the skeptic's rig.
+    # Both are bounded by the same `max_hold` ceiling as the pane arm (F5).
+    if [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_turn_failure_gate >/dev/null 2>&1 \
+        && _auth_hold_turn_failure_gate "$TARGET" "${_ORCH_AUTH_LAST_PASTE_TS:-}" >/dev/null; then
+        ORCH_AUTH_BLOCK_KIND=turn-failure
+        declare -F _auth_hold_turn_failure_alert >/dev/null 2>&1 \
+            && _auth_hold_turn_failure_alert "$TARGET"
+        return 0
+    fi
     if [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_auth_expired >/dev/null 2>&1 \
         && _auth_hold_auth_expired "$TARGET"; then
         ORCH_AUTH_BLOCK_KIND=expired
@@ -420,13 +444,30 @@ _orchestrator_liveness_decide() {
     #
     # `return 1` — no action — is the right verdict rather than a new escalation
     # class, because there is no remedy in this module's vocabulary. The REMEDY
-    # is a human `/login`, and `_auth_hold.sh` has already fired the
-    # out-of-band `sandbox-notify` that asks for it. What this gate adds is the
-    # two things `#1517` found missing: the remedies do not fire, and the log
-    # says `auth`.
+    # is a human `/login`, and `_auth_hold.sh` is what asks for it, per kind:
+    # for `hold` the dialog hold's `_watcher_alert` bell (attention, no text,
+    # #1533); for `expired`/`turn-failure` the text-carrying operator alert,
+    # key `auth-expired` (#1548) — the `_auth_told` clause below names the same
+    # channel in the verdict. What this gate adds is the two things `#1517`
+    # found missing: the remedies do not fire, and the log says `auth`.
+    _ORCH_AUTH_LAST_PASTE_TS="$last_paste_ts"
     if _orchestrator_auth_blocked; then
-        printf 'healthy reason=auth-%s age=%ds (login surface on the orchestrator: no resubmit, no respawn — neither can fix an expired credential; the operator has been notified out-of-band, your-org/nexus-code#1518/#1517)' \
-            "$ORCH_AUTH_BLOCK_KIND" "$age"
+        # NAME THE CHANNEL, per kind, so the sentence is checkable by grep
+        # (your-org/nexus-code#1548 P4a). The predecessor asserted "the operator
+        # has been notified out-of-band" for every kind, and for `expired` that
+        # was false: 0 alerts in 7 h 22 m. A verdict a reader consults to decide
+        # whether to trust the gate must not promise a channel that did not fire.
+        local _auth_told
+        case "$ORCH_AUTH_BLOCK_KIND" in
+            hold)
+                _auth_told="the dialog hold rang the watcher ALERT bell once when it engaged (attention only — the bell carries no text, #1533)" ;;
+            expired|turn-failure)
+                _auth_told="operator-alert key=auth-expired is RAISED on the text-carrying legs (record: ${STATE_DIR:-monitor/.state}/operator-alerts.jsonl; #1548)" ;;
+            *)
+                _auth_told="no channel is claimed for kind '${ORCH_AUTH_BLOCK_KIND}'" ;;
+        esac
+        printf 'healthy reason=auth-%s age=%ds (login surface on the orchestrator: no resubmit, no respawn — neither can fix an expired credential; %s; your-org/nexus-code#1518/#1517/#1548)' \
+            "$ORCH_AUTH_BLOCK_KIND" "$age" "$_auth_told"
         return 1
     fi
 
@@ -757,6 +798,14 @@ _orchestrator_idle_pane_guard() {
     local pane_state="${2-}"
     local override_count="${3:-0}"
     local max_overrides="${4:-5}"
+    # The RAW pane-state line (your-org/nexus-code#1559). Since #1554 a
+    # transport- or auth-retry pane reads `busy retrying=<k>/<N>` — alive, the
+    # harness re-sending, the backend unreachable — and one state TOKEN cannot
+    # separate that from `busy` with a frozen spinner (a wedge). Those want
+    # opposite decisions: a respawn INTO an outage discards context and cannot
+    # reach the backend either. Bounded like the idle case, by the same
+    # override budget, so a session retrying forever is still escalated.
+    local pane_line="${5-}"
 
     # Gate ONLY the dead-threshold respawn (see SCOPE above); every other
     # verdict — including resubmit-failed respawns — passes through.
@@ -771,6 +820,23 @@ _orchestrator_idle_pane_guard() {
                 printf 'escalate'
             else
                 printf 'suppress'
+            fi
+            ;;
+        busy)
+            # A FIELD on the line decides, never the token alone: `retrying=`
+            # is emitted by pane-state.sh only for the live retry construct
+            # (#1554 keys on the harness's own `Retrying in Ns · attempt k/N`
+            # and ignores a pane QUOTING it), so this is the harness telling
+            # us the turn is in flight. Without the field, `busy` keeps its
+            # documented meaning: a frozen spinner is a wedge — proceed.
+            if [[ " $pane_line " == *" retrying="* ]]; then
+                if (( max_overrides > 0 )) && (( override_count >= max_overrides )); then
+                    printf 'escalate'
+                else
+                    printf 'suppress'
+                fi
+            else
+                printf 'proceed'
             fi
             ;;
         *)
@@ -811,6 +877,7 @@ _orchestrator_liveness_log_decide() {
     # Classify the verdict into a state for transition tracking.
     local state
     case "$verdict" in
+        healthy\ reason=auth-*)         state=auth ;;
         waiting*|blocked-by-cooldown*) state=waiting ;;
         resubmit*)                     state=resubmit ;;
         respawn*)                      state=respawn ;;
@@ -844,6 +911,32 @@ _orchestrator_liveness_log_decide() {
                 _ORCH_LIVENESS_LOG_SUPPRESSED=$(( ${_ORCH_LIVENESS_LOG_SUPPRESSED:-0} + 1 ))
             fi
             ;;
+        auth)
+            # `healthy reason=auth-*` is the ONE healthy that is not health
+            # (your-org/nexus-code#1548 P4b). Measured over 20 days of
+            # watcher.log: `reason=auth-` occurred 0 times against 236
+            # `orchestrator-liveness:` lines, because steady-state healthy is
+            # silent — so #1517's ask, "the log says auth", was met only by
+            # _auth_hold.sh's own lines. Logged on ENTRY, then at a DOUBLING
+            # backoff from throttle_s capped at 3600 s (~13 lines over the
+            # 7 h 22 m outage, not one per 5 s poll), and on EXIT below.
+            if [[ "$prev" != auth ]]; then
+                local _apfx=""
+                if [[ "$prev" == waiting || "$prev" == resubmit ]]; then
+                    _apfx="waiting ended after $(( now - ${_ORCH_LIVENESS_LOG_ENTERED_TS:-$now} ))s — "
+                fi
+                _ORCH_LIVENESS_AUTH_ENTERED_TS=$now
+                _ORCH_LIVENESS_AUTH_LAST_TS=$now
+                _ORCH_LIVENESS_AUTH_INTERVAL=$throttle_s
+                _ORCH_LIVENESS_LOG_LINE="${_apfx}$verdict (auth gate ENGAGED; notes at a backoff from ${throttle_s}s, capped at 3600s)"
+            elif (( now - ${_ORCH_LIVENESS_AUTH_LAST_TS:-0} >= ${_ORCH_LIVENESS_AUTH_INTERVAL:-$throttle_s} )); then
+                local _aheld=$(( now - ${_ORCH_LIVENESS_AUTH_ENTERED_TS:-$now} )) _aiv
+                _aiv=$(( ${_ORCH_LIVENESS_AUTH_INTERVAL:-$throttle_s} * 2 )); (( _aiv > 3600 )) && _aiv=3600
+                _ORCH_LIVENESS_AUTH_INTERVAL=$_aiv
+                _ORCH_LIVENESS_AUTH_LAST_TS=$now
+                _ORCH_LIVENESS_LOG_LINE="$verdict (auth gate held ${_aheld}s; next note in ${_aiv}s)"
+            fi
+            ;;
         healthy)
             # Steady state is silent. The one exception: exiting the
             # waiting/resubmit phase — emit the recovery summary so
@@ -851,6 +944,8 @@ _orchestrator_liveness_log_decide() {
             if [[ "$prev" == waiting || "$prev" == resubmit ]]; then
                 local dur=$(( now - ${_ORCH_LIVENESS_LOG_ENTERED_TS:-$now} ))
                 _ORCH_LIVENESS_LOG_LINE="recovered after ${dur}s ($verdict)"
+            elif [[ "$prev" == auth ]]; then
+                _ORCH_LIVENESS_LOG_LINE="auth gate RELEASED after $(( now - ${_ORCH_LIVENESS_AUTH_ENTERED_TS:-$now} ))s ($verdict)"
             fi
             ;;
         respawn)

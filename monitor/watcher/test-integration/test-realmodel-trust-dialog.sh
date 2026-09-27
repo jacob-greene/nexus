@@ -33,6 +33,26 @@
 # repaint of the menu chrome — the thing that would silently un-cover the class
 # — must.
 #
+# ARMS 1b AND 2b — THE DELIVERY GUARD, AGAINST THE REAL DIALOG
+# (your-org/nexus-code#1321). `paste-followup.sh` refuses to paste into a pane
+# sitting on an overlay, and its ENTIRE trigger is `pane-state.sh` answering
+# `state=blocked`. It fails OPEN by design ("every doubt pastes"). So a release
+# that repaints the dialog makes the detector stop saying `blocked`, the guard
+# silently stops guarding, and the trailing Enter selects the dialog's
+# highlighted default — `No, exit` since 2.1.248 — which DESTROYS THE PANE while
+# the script reports `pasted (N chars)` (measured end to end on 2.1.258,
+# reports/cc258-skeptic_2026-09-02). Its unit suite STUBS pane-state, so nothing
+# a candidate binary could do would ever fail it. These two arms are what does:
+#
+#   1b  the REAL paste-followup.sh, on the REAL dialog: must REFUSE (rc 1), must
+#       name the overlay, must stamp NOTHING — and the pane must SURVIVE.
+#   2b  the CONTROL: the same script into the trusted, idle pane must DELIVER.
+#       Without it, 1b is satisfied by a guard that refuses everything.
+#
+# Hermetic on every axis the script writes through: the harness's private tmux
+# socket, a private NEXUS_STATE_DIR (the machine-input ledger), and a stub `ng`
+# (the action log). Nothing reaches the live board.
+#
 # Gated on RUN_CC_HARNESS=1 (+ node + a resolvable claude binary);
 # self-skips otherwise. See monitor/cc-harness/README.md.
 
@@ -95,6 +115,21 @@ _detector_skeleton() {
 
 echo "=== real-binary harness: workspace-trust dialog -> blocked ==="
 
+# pf_run <window-name> <message> — the production delivery path, hermetic.
+# `session:NAME`, because the harness session is not `0`: that spelling is the
+# one the guard used to be silently disarmed for (see paste-followup.sh, #1321).
+PF_STATE="$CCH_DIR/pf-state"; mkdir -p "$PF_STATE"
+PF_NG="$CCH_DIR/ng-stub"; printf '#!/usr/bin/env bash\nexit 0\n' > "$PF_NG"; chmod +x "$PF_NG"
+PF_OUT=""; PF_RC=0
+pf_run() {   # <window-name> <message> [extra paste-followup flags…]
+    local name="$1" msg="$2"; shift 2
+    PF_OUT=$(env -u TMUX -u NEXUS_ROOT TMUX_TMPDIR="$CCH_TMUX_TMPDIR" PATH="$CCH_DIR/.bin:$PATH" \
+                 NEXUS_STATE_DIR="$PF_STATE" PASTE_NG_BIN="$PF_NG" \
+                 bash "$_repo_root/monitor/paste-followup.sh" "$CCH_SESSION:$name" --message "$msg" "$@" 2>&1)
+    PF_RC=$?
+}
+pane_has() { grep -qF -- "$2" <<<"$(cch_capture "$1")"; }
+
 # --- arm 1: the trust gate UNSEEDED -> the dialog, and it must be `blocked`.
 # `cch_setup` seeds `projects.<cwd>.hasTrustDialogAccepted`; removing it is the
 # ONLY difference from a normal harness boot, which is what makes arm 2 a
@@ -119,6 +154,28 @@ assert_contains "the live dialog names itself" "$live_state" "overlay=workspace-
 live_pane=$(cch_capture "$win")
 assert_contains "the live pane really is the trust dialog" "$live_pane" "trust this folder"
 
+# --- arm 1b: the REAL delivery guard on the REAL dialog (#1321).
+PROBE_BLOCKED="PROBE-1321-MUST-NOT-LAND"
+pf_run untrusted "$PROBE_BLOCKED"
+assert_eq       "1b paste-followup REFUSES a pane sitting on the real trust dialog (rc 1)" "$PF_RC" "1"
+assert_contains "1b …and names the overlay the REAL classifier saw" "$PF_OUT" "overlay=workspace-trust"
+assert_not_contains "1b …without claiming a paste" "$PF_OUT" "pasted ("
+assert_no_file  "1b …and without stamping the machine-input ledger (refused BEFORE the stamp)" "$PF_STATE/machine-input.tsv"
+# THE PANE SURVIVES. This is the half the fail-open path loses: there the Enter
+# answers the dialog with its default and the pane dies under `pasted (N chars)`.
+assert_contains "1b the pane SURVIVED: still classified blocked on the dialog" "$(cch_pane_state "$win")" "state=blocked"
+# ASK TMUX WHETHER THE PANE IS DEAD — not whether the dialog is still PAINTED.
+# The first cut asserted the painted text, and a subject mutant that disarmed
+# the guard (so the Enter killed the pane) left that assertion GREEN: every
+# harness window carries `remain-on-exit`, so a corpse keeps its last frame and
+# the dialog is "still painted" on a dead pane. An assertion named for survival
+# and defended by something else (your-org/nexus-code#1519's shape, found by
+# a refuted `--predict`). `#{pane_dead}` is the fact itself.
+after_pane=$(cch_capture "$win")
+assert_eq "1b …and tmux reports the pane ALIVE (pane_dead=0) — a retained last frame would not" \
+    "$(cch_tmux display-message -p -t "$CCH_SESSION:$win" '#{pane_dead}' 2>/dev/null)" "0"
+assert_not_contains "1b …and the probe text never reached the pane" "$after_pane" "$PROBE_BLOCKED"
+
 # --- arm 2: the CONTROL. Same binary, same harness, same window shape — put the
 # one key back and the pane reaches idle. Without this arm, arm 1 would be
 # consistent with "this harness cannot boot at all", which is a different bug.
@@ -131,6 +188,16 @@ ctrl=$(cch_boot_worker trusted)
 wait_for "trusted control -> boots to idle" 30 -- cch_state_is "$ctrl" idle
 assert_not_contains "the control pane carries no overlay claim" \
     "$(cch_pane_state "$ctrl")" "overlay="
+
+# --- arm 2b: the CONTROL for 1b — the same script DELIVERS into the idle pane.
+# `--no-enter`: the property is that the text ARRIVES when no overlay is up. A
+# submit would start a turn against the mock and race arm 3's reads of the
+# other pane for nothing; the no-enter path stamps and pastes identically.
+PROBE_IDLE="PROBE-1321-CONTROL-LANDS"
+pf_run trusted "$PROBE_IDLE" --no-enter
+assert_eq       "2b CONTROL: the same script delivers into a trusted, idle pane (rc 0)" "$PF_RC" "0"
+assert_contains "2b …and stamped the ledger for that window" "$(cat "$PF_STATE/machine-input.tsv" 2>/dev/null)" $'trusted\t'
+wait_for "2b …and the probe text is IN the pane" 15 -- pane_has "$ctrl" "$PROBE_IDLE"
 
 # --- arm 3: SOME committed fixture still matches what the binary renders.
 #
@@ -194,14 +261,15 @@ done
 # precondition + 2 in arm 1 + 1 control assertion in arm 2 + one file-exists PER
 # fixture + 1 skeleton comparison (whichever branch is taken, exactly one
 # outcome) + two classification assertions PER fixture + 1 arm-2 idle wait
-# + 1 arm-1 blocked wait. Every skip path exits through `cch_skip_if_disabled`
+# + 1 arm-1 blocked wait + 7 in arm 1b (the real delivery guard, #1321) + 3 in
+# arm 2b (its control). Every skip path exits through `cch_skip_if_disabled`
 # long before here, so by this point all arms have run.
 #
 # Added because your-org/nexus-code#872 raises `summary-honesty.manifest`'s
 # standard: a `ledger=yes` suite now also needs `count=exact`. Fixed here rather
 # than by appending a manifest line — the guard's own message is explicit that a
 # new suite appending its own opt-out is the thing not to do.
-EXPECTED=$(( 1 + 2 + 1 + ${#FIXTURES[@]} + 1 + 2 * ${#FIXTURES[@]} + 1 + 1 ))
+EXPECTED=$(( 1 + 2 + 1 + ${#FIXTURES[@]} + 1 + 2 * ${#FIXTURES[@]} + 1 + 1 + 7 + 3 ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

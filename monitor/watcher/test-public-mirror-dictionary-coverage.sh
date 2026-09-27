@@ -73,6 +73,33 @@ fail(){ printf '  FAIL: %s\n' "$1" >&2; _th_fail; }
 
 decline(){ printf 'DECLINED (exit 77): %s\n' "$1" >&2; exit 77; }
 
+# --- population (your-org/nexus-code#1301) --------------------------------
+# The residue scan below builds and greps a CLONE of this tree: every tracked
+# file (the clone, plus `git diff HEAD` applied, carries exactly the source's
+# tracked set), plus every untracked non-ignored source file under the inject
+# cap. So an edit anywhere joins this guard's population. The untracked half is
+# the ONE enumerator `_dc_untracked` + `_dc_injectable`, called by the injection
+# loop and by `gp_population`; the tracked half is the same `git ls-files` the
+# clone's scrub and gate iterate, asked of the source rather than of the copy
+# (the probe must not build). `gp_handle` EXITS on --population, so it sits
+# above the first line of output. Paths only — no file content is printed.
+_inject_max=${DICTCOV_MAX_INJECT_BYTES:-1048576}
+_dc_untracked() { git -C "$SRC_ROOT" ls-files --others --exclude-standard -z 2>/dev/null; }
+_dc_injectable() {   # <repo-relative path> -> 0 iff at or under the inject cap
+    local _usz
+    _usz=$(stat -c %s -- "$SRC_ROOT/$1" 2>/dev/null || echo 0)
+    [ "$_usz" -le "$_inject_max" ]
+}
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    local u
+    git -C "$SRC_ROOT" ls-files 2>/dev/null | sed "s|^|$SRC_ROOT/|"
+    while IFS= read -r -d '' u; do
+        [ -n "$u" ] && _dc_injectable "$u" && printf '%s\n' "$SRC_ROOT/$u"
+    done < <(_dc_untracked)
+}
+gp_handle "$@"
+
 [ -r "$MAPPING" ] || decline "no dictionary at $MAPPING (a fresh operator has none)"
 [ -r "$GATE" ]    || decline "no leak-gate.sh at $PM"
 command -v python3 >/dev/null 2>&1 || decline "python3 not on PATH"
@@ -395,16 +422,14 @@ else
         # reported beside the injected count, so the bound is visible rather
         # than silent.
         n_untracked=0; n_untracked_skipped=0
-        _inject_max=${DICTCOV_MAX_INJECT_BYTES:-1048576}
         while IFS= read -r -d '' u; do
             [ -n "$u" ] || continue
-            _usz=$(stat -c %s -- "$SRC_ROOT/$u" 2>/dev/null || echo 0)
-            if [ "$_usz" -gt "$_inject_max" ]; then
+            if ! _dc_injectable "$u"; then
                 n_untracked_skipped=$((n_untracked_skipped+1)); continue
             fi
             mkdir -p -- "$TREE/$(dirname -- "$u")" 2>/dev/null
             cp -p -- "$SRC_ROOT/$u" "$TREE/$u" 2>/dev/null && n_untracked=$((n_untracked+1))
-        done < <(git -C "$SRC_ROOT" ls-files --others --exclude-standard -z 2>/dev/null)
+        done < <(_dc_untracked)
 
         git -C "$TREE" add -A >/dev/null 2>&1
         # The population the scrub is ABOUT to iterate, recorded before it runs.
@@ -488,6 +513,13 @@ else
             if [ -r "$PM/overlay/renames.tsv" ]; then
                 grep -v '^[[:space:]]*#' "$PM/overlay/renames.tsv" \
                     | awk -F'\t' '$1=="rename" && $3!=""{print $3}' >> "$WORK/pop.expected"
+            fi
+            # Overlay `file` targets (#1557): build.sh installs and `git add`s
+            # them BEFORE the scrub loop, so they are scrubbed — but they are
+            # absent from pop.build, which was taken before the build ran.
+            if [ -r "$PM/overlay/manifest.tsv" ]; then
+                grep -v '^[[:space:]]*#' "$PM/overlay/manifest.tsv" \
+                    | awk -F'\t' '$1=="file" && $2!=""{print $2}' >> "$WORK/pop.expected"
             fi
             # sort before comm — comm compares LEXICALLY and silently
             # misreports unsorted input.

@@ -148,6 +148,27 @@ EOF
     echo \$! > "\$J/stub.pid"; echo "\$port" > "\$J/stub.port"
     echo \$(( \$(cat "\$J/stub-start-count" 2>/dev/null || echo 0) + 1 )) > "\$J/stub-start-count"
     for i in \$(seq 1 20); do curl -fs -o /dev/null "http://127.0.0.1:\$port/x" 2>/dev/null && break; sleep 0.1; done
+    # THE #1584 F2 WINDOW, STAGED (skeptic testinfra2sk): the real server is
+    # green 40-205 ms BEFORE the start verb returns, so a rotation can land
+    # before the supervisor snapshots the token. On the FIRST start only: write
+    #
+    # NO BACKTICKS IN THIS BLOCK, AND THAT IS NOT STYLE. This is the body of an
+    # EXPANDING heredoc, written before the stub is on PATH. The line above used
+    # to quote the start verb in backticks, which is a COMMAND SUBSTITUTION
+    # here: generating this stub RAN THE REAL labsh, which started a real
+    # Jupyter server on 0.0.0.0 in the cwd of whoever ran the suite — mine for
+    # ~90 min, and the skeptic's clone when it verified the change. The suite
+    # stayed 109/109 throughout, because nothing it asserts depends on that
+    # command. test-heredoc-backtick-lint.sh is what caught it
+    # (your-org/nexus-code#1157, #1555).
+    # the runtime record a real server writes (its OWN token), then rotate the
+    # file — the server holds A, the file says B, and the snapshot will read B.
+    if [[ -n "\${LABSH_STUB_ROTATE_INSIDE_START:-}" && "\$(cat "\$J/stub-start-count")" == 1 ]]; then
+        mkdir -p "\$J/share/jupyter/runtime"
+        printf '{\n  "pid": %s,\n  "port": %s,\n  "token": "%s",\n  "secure": false\n}\n' \
+            "\$(cat "\$J/stub.pid")" "\$port" "\$(cat "\$J/token")" > "\$J/share/jupyter/runtime/jpserver-\$(cat "\$J/stub.pid").json"
+        printf 'rotated-inside-start-%s' "\$RANDOM" > "\$J/token"
+    fi
     echo "labsh-stub: running at http://127.0.0.1:\$port/" >&2
     ;;
   url)
@@ -500,6 +521,165 @@ kill -KILL "$SUP3" 2>/dev/null
 wait "$SUP3" 2>/dev/null   # reap our own child: no zombie, no exit-status noise later
 [[ -f "$P3/.jupyter/stub.pid" ]] && kill "$(cat "$P3/.jupyter/stub.pid")" 2>/dev/null
 
+# --- a token ROTATED during the start wait is bounced, not waited out (#1584) -------
+# THE OTHER HALF OF THE CASE ABOVE, and it must not undo it. Above: 403 with the
+# token UNCHANGED may be a warming server, and is waited out for the full grace.
+# Here: the SAME 403, but the token file has changed since the start began. The
+# running server holds the old token, so the mismatch is certain and permanent —
+# and while `start_server` waited, the watchdog was not running at all. Measured
+# on the real service: 403 on every probe for 300 s with the supervisor log
+# silent, where a server kill healed in 17 s. It was a RACE between two 0.5 s
+# pollers and was filed as a deadline that was too short.
+#
+# Same fixture as above on purpose: `.warming` holds /api/status at 403, so the
+# ONLY thing that differs between the two cases is whether the token moved.
+echo '=== a token rotated DURING the start wait is bounced promptly, not held for START_GRACE ==='
+P4="$WORK/proj4"; mkdir -p "$P4/.jupyter"
+: > "$P4/.jupyter/.warming"
+SUP4LOG="$P4/.jupyter/sup.log"
+# START_GRACE=120: far longer than anything below waits, so a bounce seen here
+# cannot be the grace expiring — it can only be the rotation being recognised.
+LABSH_SVC_START_GRACE=120 "$SUP" "$P4" >"$SUP4LOG" 2>&1 &
+SUP4=$!
+wait_for "supervisor reached serving-at (URL present)" 20 -- grep -q 'serving at' "$SUP4LOG"
+assert_eq "CONTROL: one start so far, and still parked in the start wait (no restart line)" \
+    "$(cat "$P4/.jupyter/stub-start-count" 2>/dev/null):$(grep -c 'restarting labsh server' "$SUP4LOG" 2>/dev/null || true)" "1:0"
+printf 'rotated-during-start-%s' "$RANDOM" > "$P4/.jupyter/token"
+if wait_for "the rotation is RECOGNISED inside the start wait (not after 120 s of grace)" 20 -- \
+        grep -q 'ROTATED during the start wait' "$SUP4LOG"; then
+    rm -f "$P4/.jupyter/.warming"    # let the bounced server come up healthy
+    if wait_for "…the watchdog then bounces it" 20 -- grep -q 'restarting labsh server' "$SUP4LOG"; then
+        wait_for "…and the service is healthy again with the ROTATED token" 25 -- "$HEALTH" "$P4" || true
+    else
+        blocked_by "…the watchdog then bounces it" "…and the service is healthy again with the ROTATED token"
+    fi
+else
+    blocked_by "the rotation is RECOGNISED inside the start wait (not after 120 s of grace)" \
+        "…the watchdog then bounces it" "…and the service is healthy again with the ROTATED token"
+fi
+kill -KILL "$SUP4" 2>/dev/null
+wait "$SUP4" 2>/dev/null
+[[ -f "$P4/.jupyter/stub.pid" ]] && kill "$(cat "$P4/.jupyter/stub.pid")" 2>/dev/null
+
+# --- a periodic hook that HANGS is killed, SAID, and launched again ----------------------
+# The hook ran async with no bound, so a hook that genuinely never returns
+# would disable itself for good. NOT what happened on the live service — that
+# was a recycled pid fooling the overlap guard, pinned by the case further down;
+# this case was written while it was still misread as a hang, and it stays
+# because the property is real: an unbounded async child is wrong regardless.
+echo '=== a periodic hook that never returns is KILLED at its bound, logged, and re-launched ==='
+P5="$WORK/proj5"; mkdir -p "$P5/.jupyter"
+printf '#!/usr/bin/env bash\necho "hook run $$" >> "%s/.jupyter/hook-runs"\nsleep 600\n' "$P5" > "$P5/.jupyter/labsh-service.periodic"
+SUP5LOG="$P5/.jupyter/sup.log"
+LABSH_SVC_PERIODIC_TIMEOUT=2 "$SUP" "$P5" >"$SUP5LOG" 2>&1 &
+SUP5=$!
+if wait_for "the hung hook is KILLED at its bound, and the kill is LOGGED with the bound" 30 -- \
+        grep -q 'periodic hook KILLED after 2s' "$SUP5LOG"; then
+    # …and the hook is not dead for good: a LATER round launches it again.
+    wait_for "…and a LATER round launches the hook again (it used to skip forever)" 40 -- \
+        bash -c '[ "$(grep -c "hook run" "$1" 2>/dev/null)" -ge 2 ]' _ "$P5/.jupyter/hook-runs" || true
+else
+    blocked_by "the hung hook is KILLED at its bound, and the kill is LOGGED with the bound" \
+        "…and a LATER round launches the hook again (it used to skip forever)"
+fi
+kill -KILL "$SUP5" 2>/dev/null
+wait "$SUP5" 2>/dev/null
+[[ -f "$P5/.jupyter/stub.pid" ]] && kill "$(cat "$P5/.jupyter/stub.pid")" 2>/dev/null
+
+# --- the periodic OVERLAP GUARD asks bash about ITS OWN child, not the kernel about a number
+# On the LIVE service the log said "periodic hook still running (pid 10994) —
+# skipping this round" 84 times over ~14 h, and it was read as a HANG. It was
+# not: /proc/10994 was a THREAD of an unrelated process (Tgid != Pid). The hook
+# had finished, its pid was recycled, and `kill -0` — which succeeds on a thread
+# id — kept the guard shut. A missed-run bug, not a hang.
+#
+# Driven on the guard EXTRACTED VERBATIM from the supervisor, so this cannot
+# drift from the code it judges. `$PPID` stands in for the recycled number: a
+# live process of this uid that is NOT the inner shell's child.
+echo '=== overlap guard: a RECYCLED pid that is not the hook must not read as "still running" ==='
+_pif=$(awk '/^_periodic_in_flight\(\) \{/,/^}/' "$SUP")
+assert_contains "CONTROL: the guard function was really extracted from the supervisor" "$_pif" 'jobs -pr'
+_pif_out=$(bash -c "$_pif"'
+    ( sleep 5 ) & PERIODIC_PID=$!
+    _periodic_in_flight && a=in-flight || a=not
+    kill "$PERIODIC_PID" 2>/dev/null; wait "$PERIODIC_PID" 2>/dev/null
+    _periodic_in_flight && b=in-flight || b=not
+    PERIODIC_PID=$PPID
+    kill -0 "$PERIODIC_PID" 2>/dev/null && old=alive || old=dead
+    _periodic_in_flight && c=in-flight || c=not
+    PERIODIC_PID=""
+    _periodic_in_flight && d=in-flight || d=not
+    printf "%s|%s|%s|%s|%s" "$a" "$b" "$old" "$c" "$d"' 2>&1)
+assert_eq "own LIVE child -> in flight | ended -> not | an UNRELATED live pid: kill -0 says alive, the guard says NOT | unset -> not" \
+    "$_pif_out" "in-flight|not|alive|not|not"
+
+# --- skeptic testinfra2sk on PR 1593: F2, F3, F1 ------------------------------------
+echo '=== F2: a rotation that lands BEFORE the token snapshot is still recognised (the record arm) ==='
+# The snapshot arm reads the token after `labsh start` returns; here the file is
+# already rotated by then, so that arm sees NO change and is blind. Only asking
+# the SERVER — its runtime record answers 200 with its own token, which is not
+# the file's — can see it.
+P7="$WORK/proj7"; mkdir -p "$P7/.jupyter"
+SUP7LOG="$P7/.jupyter/sup.log"
+LABSH_STUB_ROTATE_INSIDE_START=1 LABSH_SVC_START_GRACE=120 "$SUP" "$P7" >"$SUP7LOG" 2>&1 &
+SUP7=$!
+if wait_for "F2 the pre-snapshot rotation is RECOGNISED (not parked for 120 s of grace)" 25 -- \
+        grep -q 'ROTATED during the start wait' "$SUP7LOG"; then
+    wait_for "F2 …and the service heals with the rotated token" 30 -- "$HEALTH" "$P7" || true
+else
+    blocked_by "F2 the pre-snapshot rotation is RECOGNISED (not parked for 120 s of grace)" \
+        "F2 …and the service heals with the rotated token"
+fi
+kill -KILL "$SUP7" 2>/dev/null; wait "$SUP7" 2>/dev/null
+[[ -f "$P7/.jupyter/stub.pid" ]] && kill "$(cat "$P7/.jupyter/stub.pid")" 2>/dev/null
+
+echo '=== F3: LABSH_SVC_REJECT_PROBES=0 must not turn the fast bail into the restart flap ==='
+# 0 made `rejected >= REJECT_PROBES` true on the FIRST non-green probe of any
+# kind, so a WARMING server was bounced at once. A NEGATIVE observation, so the
+# window is scaled and costs its wall time (same reasoning as the case above).
+P8="$WORK/proj8"; mkdir -p "$P8/.jupyter"; : > "$P8/.jupyter/.warming"
+SUP8LOG="$P8/.jupyter/sup.log"
+LABSH_SVC_REJECT_PROBES=0 LABSH_SVC_START_GRACE=60 "$SUP" "$P8" >"$SUP8LOG" 2>&1 &
+SUP8=$!
+wait_for "F3 supervisor reached serving-at" 20 -- grep -q 'serving at' "$SUP8LOG"
+_f3_w=$(th_deadline 8); _f3_i=0; _f3_bounced=""
+while (( _f3_i < _f3_w * 4 )); do
+    if [[ "$(cat "$P8/.jupyter/stub-start-count" 2>/dev/null)" != "1" ]] || grep -q 'restarting labsh server\|leaving the wait' "$SUP8LOG" 2>/dev/null; then
+        _f3_bounced=yes; break
+    fi
+    sleep 0.25; _f3_i=$(( _f3_i + 1 ))
+done
+assert_eq "F3 REJECT_PROBES=0 does not bounce a warming server (invalid knob -> the default, floor 1)" "${_f3_bounced:-no}" "no"
+kill -KILL "$SUP8" 2>/dev/null; wait "$SUP8" 2>/dev/null
+[[ -f "$P8/.jupyter/stub.pid" ]] && kill "$(cat "$P8/.jupyter/stub.pid")" 2>/dev/null
+
+echo '=== F1: a group TERM to the supervisor (what svc.sh stop sends) takes the in-flight periodic hook with it ==='
+# `timeout` leads its OWN process group, so the bounded hook is OUTSIDE the
+# group `svc.sh stop` signals. Measured by the skeptic: `timeout` and the hook
+# survived, reparented to init, holding the crawl lock for up to the bound.
+# `setsid`, so the supervisor leads a group as it does under svc.sh; the TERM
+# below is the literal form svc.sh:1507 sends. Survival is asked BY PID.
+P9="$WORK/proj9"; mkdir -p "$P9/.jupyter"
+printf '#!/usr/bin/env bash\necho $$ > "%s/.jupyter/hook.pid"\nsleep 600\n' "$P9" > "$P9/.jupyter/labsh-service.periodic"
+SUP9LOG="$P9/.jupyter/sup.log"
+setsid "$SUP" "$P9" >"$SUP9LOG" 2>&1 &
+SUP9=$!
+if wait_for "F1 the hook is in flight (its pid is recorded)" 30 -- test -s "$P9/.jupyter/hook.pid"; then
+    _hp=$(cat "$P9/.jupyter/hook.pid")
+    assert_eq "F1 PRECONDITION: the hook really is OUTSIDE the supervisor's process group (else this case cannot see F1)" \
+        "$( [[ "$(ps -o pgid= -p "$_hp" 2>/dev/null | tr -d ' ')" != "$SUP9" ]] && echo outside || echo inside )" "outside"
+    kill -TERM -- "-$SUP9" 2>/dev/null
+    wait_gone "F1 the in-flight hook is GONE after the group TERM (it survived, before)" 15 "$_hp"
+    # If F1 regressed there is a 600 s sleeper left, and it is this suite's to remove.
+    th_kill_fixture_pid "$_hp" "$P9" KILL 2>/dev/null || true
+else
+    blocked_by "F1 the hook is in flight (its pid is recorded)" \
+        "F1 PRECONDITION: the hook really is OUTSIDE the supervisor's process group (else this case cannot see F1)" \
+        "F1 the in-flight hook is GONE after the group TERM (it survived, before)"
+fi
+kill -KILL "$SUP9" 2>/dev/null; wait "$SUP9" 2>/dev/null
+[[ -f "$P9/.jupyter/stub.pid" ]] && kill "$(cat "$P9/.jupyter/stub.pid")" 2>/dev/null
+
 # --- supervisor death → bootstrap-recover relaunches --------------------------------
 echo '=== dead supervisor (stale pidfile) → bootstrap-recover revives ==='
 sup=$(sup_pid jupyter-proj1)
@@ -606,6 +786,14 @@ assert_eq "no new labsh register calls" "$(grep -c '^register' "$ROOTWS/.jupyter
 echo '=== root mode: supervisor periodic re-crawl discovers a new project ==='
 fake_venv "$ROOTWS/delta"
 wait_for "proj-delta appears without re-activation" 20 -- test -f "$KDIR/proj-delta/kernel.json"
+# MUST NOT FLIP for the periodic-hook bound: a REAL hook that returns is never
+# reported killed. Asserted HERE, against the one supervisor in this suite that
+# demonstrably runs a hook, and with the launch line beside it — a log with no
+# hook in it would satisfy "no KILLED line" vacuously.
+_rws_log=$(cat "$ROOTWS/.jupyter/labsh-service.log" 2>/dev/null || true)
+assert_contains "CONTROL: the root supervisor really launched its periodic hook, under a bound" \
+    "$_rws_log" "periodic hook launched (pid "
+assert_not_contains "a periodic hook that RETURNS is never reported killed" "$_rws_log" "periodic hook KILLED"
 
 echo '=== root mode: removed project → stale kernelspec pruned ==='
 # Deterministic prune: the supervisor's periodic crawl (every ~3 s at

@@ -17,7 +17,12 @@
 #     LIVE pinned skeptic and notifies it, so the target's push is
 #     observable to its reviewer without either window pasting into the
 #     other;
-#   * `ng wrap-up --skeptic-role --skeptic-verdict …` settles it.
+#   * `ng wrap-up --skeptic-role --skeptic-verdict …` RECORDS the verdict on
+#     the edge and settles NOTHING (sk926 / #926; your-org/nexus-code#1606):
+#     a retained reviewer is the designated reviewer for the NEXT round too,
+#     so it is owed again the moment its target pushes a delta. The pairing
+#     ends via `ng skeptic close`, `ng skeptic resolve`, supersession, the
+#     creditor leaving tmux, or the audited `ng obligation settle`.
 #
 # and it is read by the mechanism that can act on it:
 #

@@ -35,6 +35,20 @@
 #       prints `elapsed XmYYs of Zm ceiling (P% used)` — the line a band prints
 #       before it can be killed, so a ceiling kill is legible from the log
 #       rather than only from the jobs API (#1443 remedy 1).
+#   ci-diag-budget.sh --run-bound <ceiling-seconds> <job-start-epoch> [<post-reserve-seconds>]
+#       prints ONE integer: the seconds the band's run step may spend, for
+#       `timeout "${bound}s"` (your-org/nexus-code#1474).
+#         bound = max(1, ceiling - (now - start) - reserve)
+#       A job killed by `timeout-minutes` is CANCELLED by GitHub, and no later
+#       step can relabel a cancellation — so the only way a truncated band can
+#       say "no verdict" itself is to be stopped INSIDE the job, below the
+#       ceiling, with time left for the verdict step to read its log. The
+#       reserve (default 360 s) funds what runs after the band: the runner's
+#       own TERM handling (`--kill-after` grace), the verdict step, the
+#       diagnostics budget above (itself derived from what remains) and the
+#       artifact upload. The floor is 1, NEVER 0: `timeout 0` DISABLES the
+#       timeout, so an exhausted budget printed as 0 would un-bound the band
+#       at exactly the moment it most needs one.
 #
 # Exit: 0 on a computed answer (a ZERO budget is a computed answer — it is the
 #       arm that turns a real verdict into a non-verdict, and it must print
@@ -48,9 +62,12 @@ set -uo pipefail
 _cdb_num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 _cdb_die() { printf 'ci-diag-budget: %s\n' "$*" >&2; exit 2; }
 
-mode=budget
-if [ "${1:-}" = "--elapsed" ]; then mode=elapsed; shift; fi
-ceiling="${1:-}"; start="${2:-}"; reserve="${3:-120}"
+mode=budget; reserve_default=120
+case "${1:-}" in
+    --elapsed)   mode=elapsed; shift ;;
+    --run-bound) mode=run-bound; reserve_default=360; shift ;;
+esac
+ceiling="${1:-}"; start="${2:-}"; reserve="${3:-$reserve_default}"
 _cdb_num "$ceiling" || _cdb_die "ceiling-seconds must be a non-negative integer (got '${ceiling}')"
 _cdb_num "$start"   || _cdb_die "job-start-epoch must be a non-negative integer (got '${start}')"
 _cdb_num "$reserve" || _cdb_die "upload-reserve-seconds must be a non-negative integer (got '${reserve}')"
@@ -67,6 +84,11 @@ if [ "$mode" = elapsed ]; then
 fi
 
 remaining=$(( ceiling - elapsed - reserve ))
+if [ "$mode" = run-bound ]; then
+    (( remaining < 1 )) && remaining=1
+    printf '%d\n' "$remaining"
+    exit 0
+fi
 (( remaining < 0 )) && remaining=0
 budget=$remaining
 (( budget > 420 )) && budget=420

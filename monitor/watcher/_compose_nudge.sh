@@ -57,6 +57,7 @@ _NEXUS_COMPOSE_NUDGE_LOADED=1
 _compose_nudge_last_queue_mtime=0
 _compose_nudge_last_github_mtime=0
 _compose_nudge_last_requests_mtime=0
+_compose_nudge_last_urgent_mtime=0
 
 # Return mtime in epoch seconds; 0 when the file is absent or stat fails.
 _compose_nudge_mtime() {
@@ -90,7 +91,7 @@ _compose_nudge_size() {
 # quiet. A sustained re-nudge therefore only happens while pastes are
 # actually failing, where compose churn is the cheapest of the problems.
 _compose_emit_nudge_check() {
-    local queue_file="$1" gh_out_file="$2" requests_out_file="${3:-}"
+    local queue_file="$1" gh_out_file="$2" requests_out_file="${3:-}" urgent_file="${4:-}"
     local queue_mtime queue_size gh_mtime gh_size req_mtime req_size
     queue_mtime=$(_compose_nudge_mtime "$queue_file")
     queue_size=$(_compose_nudge_size  "$queue_file")
@@ -126,6 +127,22 @@ _compose_emit_nudge_check() {
         fi
     fi
 
+    # Urgent decisions (your-org/nexus-code#1632): a worker's forwarded
+    # dangerous-rm request touches this stamp when it files, and its hook
+    # DENIES at a deadline inside Claude Code's 2-minute auto-deny. At the
+    # 60 s base cadence the row could spend half its life unpasted, so a new
+    # request pulls compose_emit forward exactly like a new request-inbox row.
+    local nudge_render=0
+    if [[ -n "$urgent_file" ]]; then
+        local urg_mtime urg_size
+        urg_mtime=$(_compose_nudge_mtime "$urgent_file")
+        urg_size=$(_compose_nudge_size  "$urgent_file")
+        if (( urg_mtime > _compose_nudge_last_urgent_mtime )); then
+            _compose_nudge_last_urgent_mtime=$urg_mtime
+            (( urg_size > 0 )) && { nudge_compose=1; nudge_render=1; }
+        fi
+    fi
+
     if (( nudge_comments == 1 )) && [[ -z "${TASK_FN[comment_surface]:-}" ]]; then
         nudge_comments=0
         nudge_compose=1
@@ -143,6 +160,12 @@ _compose_emit_nudge_check() {
         _schedule_override comment_surface 5 60 2>/dev/null || true
         fired=0
     fi
+    # The urgent row is RENDERED by pending_decisions (10 s cadence); fire it
+    # first so the compose pulled forward below finds the row already staged,
+    # instead of waiting up to one render period for it.
+    if (( nudge_render == 1 )) && [[ -n "${TASK_FN[pending_decisions]:-}" ]]; then
+        _schedule_fire_now pending_decisions 2>/dev/null || true
+    fi
     if (( nudge_compose == 1 )) && [[ -n "${TASK_FN[compose_emit]:-}" ]]; then
         _schedule_fire_now compose_emit 2>/dev/null || true
         _schedule_override compose_emit 5 60 2>/dev/null || true
@@ -157,4 +180,5 @@ _compose_nudge_reset_for_tests() {
     _compose_nudge_last_queue_mtime=0
     _compose_nudge_last_github_mtime=0
     _compose_nudge_last_requests_mtime=0
+    _compose_nudge_last_urgent_mtime=0
 }

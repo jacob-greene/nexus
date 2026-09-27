@@ -4,7 +4,8 @@
 #
 # THE HAZARD. Every nexus-spawned agent runs with NEXUS_ROOT exported
 # (monitor/spawn-worker.sh). CI ran the band with NEXUS_ROOT UNSET in every
-# cell — the three matrix cells plus `clean-env`, which scrubs it explicitly.
+# cell — the matrix cells, which now scrub it explicitly with `env -u` (the
+# former `clean-env` job's guarantee, folded in by your-org/nexus-code#1474).
 # So one whole side of the variable was never exercised, and a suite that
 # leaks the ambient root is green in CI and red on every developer's machine.
 # That is the "dev red locally / green in CI" half of #655, whose first

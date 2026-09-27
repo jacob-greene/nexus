@@ -798,7 +798,11 @@ monitor:
   # orchestrator (orchestrator-liveness), so the orchestrator's own
   # always-on agent loop is the external supervisor the watcher needs —
   # closing the circularity by MUTUALITY, not a new process. The
-  # orchestrator arms a persistent Monitor:
+  # orchestrator runs monitor/arm-watcher-supervisor.sh, a PERSISTENT
+  # longjob watch on its plugin dispatcher (not bound by the 30-min Monitor
+  # cap, polled independently of its turns) whose probe revives a dead
+  # watcher itself (<your-org>/nexus-code#1532). Only when the dispatcher is
+  # NOT ARMED does it fall back to a Monitor lease re-armed every 30 min:
   #     Monitor({command:
   #       'until ! /ABS/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
   # Each tick TOUCHES a supervisor heartbeat (proving it is armed) and
@@ -1892,9 +1896,11 @@ monitor:
   watcher:
     # Auto-unstick stalled agent prompts. The watcher captures every
     # non-watcher tmux pane each cycle; if a permission prompt
-    # ("Do you want to proceed?") is showing, the watcher sends
-    # Enter to accept the default-highlighted option and resume
-    # automation. Action and pre-action pane capture are recorded
+    # ("Do you want to proceed?") is showing, the watcher does NOT
+    # answer it: it sends no key and surfaces the prompt as a pending
+    # decision for the operator (<your-org>/nexus-code#1599 — in bypass
+    # mode the prompts that still render are the dangerous-operation
+    # guards a human is meant to answer). Action and pane capture are recorded
     # under monitor/.state/watcher-unstick.log and
     # monitor/.state/unstick/ for post-hoc audit. The rate-limit
     # prompt is also handled: every stuck non-watcher window gets
@@ -1905,7 +1911,7 @@ monitor:
     # nudges the failed turn into retry, with a per-fingerprint
     # backoff (api_error_backoff_minutes) so a chronically broken
     # endpoint isn't hammered. Set to false to opt out of all three
-    # branches and require manual confirmation.
+    # branches.
     auto_unstick: true
 
     # Worker-blocked-question relay (case W — <your-org>/<your-nexus>
@@ -2042,6 +2048,47 @@ monitor:
     dead_threshold_floor_margin_seconds: 60
     idle_pane_override_max: 5
     liveness_log_throttle_seconds: 30
+    # How long a fresh `turn-failure/<target>.json` marker with
+    # recovery=operator (an expired login, typed by the StopFailure hook ~1 s
+    # after the failed turn) gates orchestrator-liveness: no resubmit, no
+    # respawn, the operator alerted (<your-org>/nexus-code#1520, #1517). The
+    # marker is refreshed by every failed turn, so a wedged pane that stops
+    # producing them releases the gate after this window. Env:
+    # MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS.
+    turn_failure_gate_seconds: 600
+    # The text-carrying, turn-independent OPERATOR ALERT (<your-org>/nexus-code
+    # #1548, #1533, #1534): raised when the watcher alone knows the operator
+    # must act — a logged-out orchestrator, an emit-only service down while
+    # the emit route is unavailable. Legs: a durable record in
+    # monitor/.state/operator-alerts.jsonl (always), the `watcher ALERT:`
+    # bell (always, attention only), a push through monitor/notify.sh, and
+    # one bot-authored `operator-alert: <key>` issue on github.repo that
+    # @-pings user_login and is closed when the condition clears.
+    operator_alert:
+      # The monitor/notify.sh leg (Pushover → ntfy → SMTP). `pushover ok`
+      # proves API acceptance, not that a device rendered it. Env:
+      # MONITOR_OPERATOR_ALERT_PUSH_ENABLED.
+      push_enabled: true
+      # The GitHub issue leg — the one channel with observed delivery (the
+      # operator answers bot comments daily). Env:
+      # MONITOR_OPERATOR_ALERT_GITHUB_ENABLED.
+      github_enabled: true
+      # A standing condition re-alerts (bell + push + a comment on its
+      # issue) at this cadence; never a second issue. Env:
+      # MONITOR_OPERATOR_ALERT_REMINDER_SECONDS.
+      reminder_seconds: 3600
+      # A `clear` finalises (push, close the issue) only after the condition
+      # has been absent this long; a raise inside the hold-down is a FLAP —
+      # recorded, but no re-ring, no re-file. Env:
+      # MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS.
+      clear_holddown_seconds: 300
+      # At most one GitHub COMMENT per key per interval (reminders, re-opens,
+      # the clear note). Open/close state changes are never capped. Env:
+      # MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS.
+      comment_interval_seconds: 3600
+      # Bound on each network leg; they run detached from the watcher loop.
+      # Env: MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS.
+      net_timeout_seconds: 60
     # ---- silent-watcher hardening (nexus-code#236) ----
     # Emit-FUNCTIONAL liveness is the HEARTBEAT itself — no knob. The watcher
     # bumps its heartbeat ONLY at the end of a correct compose cycle, so a

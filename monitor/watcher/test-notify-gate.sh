@@ -86,6 +86,54 @@ assert_eq "T1: ORCHESTRATOR idle default is suppressed too" \
 assert_contains "T1: recorded as a class suppression" \
     "$(_verdicts)" '"class":"agent-default","verdict":"suppress-class"'
 
+# ─── T1b: an idle default from a window that CANNOT TAKE A TURN rings ───────
+# your-org/nexus-code#1551: 13 harness `Needs attention` notifications during
+# the 2026-09-17 login expiry, all 13 suppressed by T1's arm. The text cannot
+# discriminate; the fresh `turn-failure/<window>.json` marker (recovery=operator)
+# can. Positive arm, then four negative controls that each remove ONE premise.
+_plant_tf() {   # <window> <recovery> <age_s> [category]
+    mkdir -p "$STATE/turn-failure"
+    printf '{"ts":%s,"error":"authentication_failed","category":"%s","recovery":"%s","last_msg":"Login expired · Please run /login","session_id":"s","window":"%s","hook_event_name":"StopFailure"}\n' \
+        "$(( $(date +%s) - $3 ))" "${4:-auth}" "$2" "$1" > "$STATE/turn-failure/$1.json"
+}
+_fresh_state t1b
+_plant_tf orchestrator operator 60
+assert_eq "T1b: 'Needs attention' from a window with a FRESH auth turn-failure marker RINGS" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "RANG"
+assert_contains "T1b: the bell's record names the window and the cause (what the bell itself cannot say, #1533)" \
+    "$(_last_bell)" 'turn FAILED (needs operator): orchestrator cannot take a turn — auth: Login expired'
+assert_contains "T1b: recorded as a context reword" \
+    "$(_verdicts)" '"class":"context","verdict":"reword-turn-failure"'
+assert_contains "T1b: …and classed failure (120 s cooldown = the per-window rate cap)" \
+    "$(_verdicts)" '"class":"failure","verdict":"ring"'
+assert_eq "T1b: a second one seconds later is cooled down, not a bell per minute" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "silent"
+_fresh_state t1c
+_plant_tf orchestrator paste 60 transient
+assert_eq "T1c/neg: a TRANSIENT marker (529, recovery=paste) does NOT ring — the orchestrator's business" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "silent"
+_fresh_state t1d
+_plant_tf orchestrator operator 4000
+assert_eq "T1d/neg: a STALE auth marker (4000 s > 1800 s) does NOT ring" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "silent"
+_fresh_state t1e
+_plant_tf w-other operator 60
+assert_eq "T1e/neg: a fresh auth marker for a DIFFERENT window does not ring this one" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "silent"
+_fresh_state t1f
+mkdir -p "$STATE/turn-failure"; printf 'not json at all\n' > "$STATE/turn-failure/orchestrator.json"
+assert_eq "T1f/neg: a MALFORMED marker leaves the default suppressed (falls back to T1, never crashes)" \
+    "$(_ring 'Needs attention' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "silent"
+_fresh_state t1g
+_plant_tf w1 operator 60
+assert_eq "T1g: a WORKER with a fresh auth marker rings too" \
+    "$(_ring 'Needs attention' NEXUS_WORKER_WINDOW=w1)" "RANG"
+_fresh_state t1h
+_plant_tf orchestrator operator 60
+assert_eq "T1h: a NON-default message is never reworded (the probe keys on the literal)" \
+    "$(_ring 'cc-auto-update: 2.1.160 applied' NEXUS_ORCHESTRATOR_WINDOW=orchestrator)" "RANG"
+assert_contains "T1h: …and it kept its own class" "$(_verdicts)" '"class":"infra","verdict":"ring"'
+
 # ─── T2: infra chatter rings ONCE, then is cooled down ───────────────────────
 # THE REGRESSION CASE. Every one of these passed v1's gate unconditionally.
 _fresh_state t2

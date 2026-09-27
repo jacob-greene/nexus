@@ -25,7 +25,13 @@ GUARD="$REPO_ROOT/monitor/tmpfs-guard.sh"
 MG="${TMPFS_GUARD_MG:-$REPO_ROOT/monitor/mutation-gate.sh}"
 
 . "$_test_dir/_test_helpers.sh"
-EXPECTED_ASSERTIONS=81   # +4: your-org/nexus-code#1490 — emit_both does not truncate an
+EXPECTED_ASSERTIONS=99   # +6: your-org/nexus-code#1601 — a SIGKILLed mutation-gate run's workdir is
+                         #     swept by a later run, only when every attribution axis agrees.
+                         # +9: your-org/nexus-code#1601 — every --check walk is bounded, and a
+                         #     truncated walk says UNMEASURED / LOWER BOUND instead of a short count.
+                         # +3: your-org/nexus-code#1601 — mutation-gate runs both arms in its OWN
+                         #     TMPDIR, so a suite's spawn-* scratch dies with the workdir.
+                         # +4: your-org/nexus-code#1490 — emit_both does not truncate an
                          #     append-opened log, with a potency arm on the pre-fix construct.
                          # +35: your-org/nexus-code#1423 — the pressure trigger, its bands,
                          # the two protocol lines, owner attribution, and the
@@ -261,6 +267,38 @@ assert_eq "mutation-gate leaves no mutgate-* workdir behind" "$(find "$MGTMP" -m
 TMPDIR="$MGTMP" "$MG" --suite "$stub" --list --keep-workdir >/dev/null 2>&1 || true
 assert_eq "…unless --keep-workdir asks for it"                "$(find "$MGTMP" -maxdepth 1 -name 'mutgate-*' | wc -l)" 1
 
+# your-org/nexus-code#1601: the SUITE's scratch is the gate's too. A suite that
+# stubs tmux leaves spawn-worker.sh's spawn-prompt-*/spawn-launcher-* in
+# ${TMPDIR:-/tmp} (only the never-run launcher removes them); the gate used to
+# run both arms in the CALLER's TMPDIR, so every invocation leaked two of each.
+MG2="$ROOT/mg2"; mkdir -p "$MG2"
+leaky="$ROOT/leaky-suite.sh"
+printf '#!/usr/bin/env bash\n: > "${TMPDIR:-/tmp}/spawn-prompt-leak.$$.txt"\necho "PASS: one"\necho "PASS: two"\necho "=== summary: 2 passed, 0 failed ==="\necho ALL TESTS PASSED\n' > "$leaky"; chmod +x "$leaky"
+TMPDIR="$MG2" "$MG" --suite "$leaky" --line 4 >/dev/null 2>&1; rc=$?
+assert_rc "the leaky suite ran both arms (survived: line 4 is not an assertion anything checks)" "$rc" 4
+assert_eq "a full mutation run leaves NO suite scratch in the caller's TMPDIR" "$(find "$MG2" -maxdepth 1 -name 'spawn-prompt-*' | wc -l)" 0
+assert_eq "…and no mutgate-* workdir"                                             "$(find "$MG2" -maxdepth 1 -name 'mutgate-*' | wc -l)" 0
+
+# your-org/nexus-code#1601: a SIGKILLed run's workdir is swept by a LATER run —
+# only when every axis attributes it (shape, age, dead pid, no .kept marker).
+MG3="$ROOT/mg3"; mkdir -p "$MG3"
+_dead=99999999; while kill -0 "$_dead" 2>/dev/null || [ -d "/proc/$_dead" ]; do _dead=$(( _dead - 1 )); done
+mkdir -p "$MG3/mutgate-$_dead/cap" "$MG3/mutgate-$$" "$MG3/mutgate-$(( _dead - 1 ))" "$MG3/mutgate-x$_dead" "$MG3/mutgate-$(( _dead - 2 ))"
+: > "$MG3/mutgate-$(( _dead - 1 ))/.kept"
+old "$MG3/mutgate-$_dead" "$MG3/mutgate-$$" "$MG3/mutgate-$(( _dead - 1 ))" "$MG3/mutgate-x$_dead"   # _dead-2 stays YOUNG
+TMPDIR="$MG3" "$MG" --suite "$stub" --list >/dev/null 2>&1 || true
+_present() { [[ -d "$1" ]] && echo present || echo gone; }
+assert_eq "#1601 SWEPT: an old mutgate-<dead pid> left by a SIGKILLed run"    "$(_present "$MG3/mutgate-$_dead")" "gone"
+assert_eq "#1601 KEPT: …an old one whose pid is ALIVE (it may be that run)"  "$(_present "$MG3/mutgate-$$")" "present"
+assert_eq "#1601 KEPT: …an old one --keep-workdir marked .kept"              "$(_present "$MG3/mutgate-$(( _dead - 1 ))")" "present"
+assert_eq "#1601 KEPT: …a YOUNG one"                                         "$(_present "$MG3/mutgate-$(( _dead - 2 ))")" "present"
+assert_eq "#1601 KEPT: …an old dir whose name is not mutgate-<pid>"          "$(_present "$MG3/mutgate-x$_dead")" "present"
+TMPDIR="$MG3" "$MG" --suite "$stub" --list --keep-workdir >/dev/null 2>&1 || true
+# Counted among markers NEWER than the last plant, so this row asks only whether
+# the kept run WROTE one — not whether the sweep spared the planted one above.
+assert_eq "#1601: --keep-workdir writes the .kept marker the sweep honours" \
+    "$(find "$MG3" -mindepth 2 -maxdepth 2 -name .kept -newer "$MG3/mutgate-$(( _dead - 2 ))" | wc -l)" 1
+
 # ── your-org/nexus-code#1441: the READ-ONLY half ships as its own mode ─────
 # `--check-daemon` loops --check and NEVER reaps; `--daemon` is the deleting
 # half. The registry example carries the reporter by default and the reaper
@@ -329,6 +367,50 @@ _e1490_err=$(bash -c "$_e1490_fn"$'\n''emit_both "a finding"' 2>&1 >/dev/null)
 assert_eq "#1490: …and it still writes to STDERR (the emit surface production reads)" \
     "$_e1490_err" "a finding"
 rm -rf "$_e1490_dir"
+
+# ---- #1601: every --check walk is BOUNDED, and a truncated walk SAYS so ------
+#
+# `ls`/`find` are replaced by PATH-front stubs that, when ARMED by env, print a
+# little and then hang — the shape of a walk over a 15k-entry /tmp under load.
+# Disarmed they exec the real tool, which is the CONTROL. A walk bounded by
+# `timeout` and then summed as if complete is a SHORT count at rc 0: the c71780
+# stub prints 5 x 1 MiB before hanging, so a guard that reads its truncated
+# output as whole reports "5 MiB" as a measurement.
+_s1601=$(mktemp -d)
+_real_find=$(type -P find); _real_ls=$(type -P ls)
+cat > "$_s1601/find" <<STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *"/c71780 -type f"*) if [ -n "\${TG1601_HANG_C:-}" ]; then for i in 1 2 3 4 5; do echo 1048576; done; exec sleep 30; fi ;;
+  *"/c71780 -mindepth 1"*) if [ -n "\${TG1601_HANG_C:-}" ]; then printf ..; exec sleep 30; fi ;;
+  *"%u"*) if [ -n "\${TG1601_HANG_META:-}" ]; then exec sleep 30; fi ;;
+esac
+exec "$_real_find" "\$@"
+STUB
+cat > "$_s1601/ls" <<STUB
+#!/usr/bin/env bash
+if [ -n "\${TG1601_HANG_LS:-}" ]; then printf 'a\nb\n'; exec sleep 30; fi
+exec "$_real_ls" "\$@"
+STUB
+chmod +x "$_s1601/find" "$_s1601/ls"
+_g1601() { PATH="$_s1601:$PATH" CHECK_WALK_TIMEOUT_S=1 ATTRIB_TIMEOUT_S=1 "$GUARD" --check --root "$ROOT" "$@" 2>/dev/null; }
+_healthy_flags=(--warn-pct 101 --high-pct 101 --critical-pct 101 --mem-avail-low-pct 0 --max-inode-pct 101)
+out=$(_g1601 "${_healthy_flags[@]}" --max-c71780-mib 100000); rc=$?
+assert_not_contains "#1601 CONTROL: stubs present but DISARMED — no walk is reported partial" "$out" "PARTIAL"
+_t0=$SECONDS
+out=$(TG1601_HANG_LS=1 TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-c71780-mib 100000); rc=$?
+assert_eq "#1601: with every walk HUNG, --check still returns (within 15 s at a 1 s bound)" \
+    "$(( SECONDS - _t0 < 15 ? 1 : 0 ))" "1"
+assert_contains "#1601: a timed-out entry walk is UNMEASURED, never a short count" "$out" "entries=?(walk did not finish within 1s)"
+assert_rc "#1601: a partial c71780 sum UNDER the limit decides nothing — rc 0, not a finding" "$rc" 0
+assert_contains "#1601: …and the healthy line says the contract check is UNDECIDED" "$out" "socket_root contract check is UNDECIDED"
+assert_contains "#1601: …naming the payload as a LOWER BOUND" "$out" "5 MiB is a LOWER BOUND"
+out=$(TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-c71780-mib 1); rc=$?
+assert_rc "#1601: a partial sum OVER the limit is still over it — the finding holds (rc 100)" "$rc" 100
+assert_contains "#1601: …stated as AT LEAST, never as the measured payload" "$out" "holds AT LEAST 5 MiB"
+out=$(TG1601_HANG_META=1 _g1601 --warn-pct 0 --high-pct 0 --critical-pct 0 --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 100000)
+assert_contains "#1601: a timed-out attribution walk prints NO breakdown and says why" "$out" "attribution UNAVAILABLE: the depth-1 walk did not finish within 1s"
+rm -rf "$_s1601"
 
 # Census: the assertion total is pinned EXACTLY (count=exact in
 # summary-honesty.manifest), counted BEFORE this census assertion itself.

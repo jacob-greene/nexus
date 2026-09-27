@@ -63,7 +63,20 @@ sandbox-notify "watcher heartbeat stale 8 min; respawned via launcher"
 
 This emits a tmux notification in both the sandbox tmux and the outer tmux (via the chaperon). The hooks for `Notification` and `Stop` events are pre-configured so the operator sees an alert when an agent finishes a turn or needs attention.
 
-`sandbox-notify` is the right tool for **in-pane blockers** ("worker is wedged on a permission prompt, paste needed") and **end-of-turn cues** ("worker filed final report, ready for review"). For events that should reach the phone, use `notify.sh`.
+**It delivers ATTENTION, not content** (<your-org>/nexus-code#1533). The real tool assigns its argument once and never reads it again; what reaches the operator is a bare BEL. The words survive only in the nexus wrapper's decision log (`monitor/.state/notify-decisions.jsonl` — every ring, suppression, batch and digest, with the text) and, for watcher alerts, in `monitor/.state/watcher-alerts.log`. So `sandbox-notify` is the right tool for **in-pane blockers** ("worker is wedged on a permission prompt, paste needed") and **end-of-turn cues** ("worker filed final report, ready for review") — cases where the operator is at the terminal and the bell points them at a pane. For anything a human must READ, or that must reach the phone, use the operator alert below or `notify.sh`.
+
+The wrapper suppresses the harness's own `Needs attention` idle default for every agent (it fires after every turn). One context re-classifies it (#1551): when the window's last turn FAILED with no in-band remedy — a fresh `monitor/.state/turn-failure/<window>.json` with `recovery=operator`, i.e. an expired login — the same four bytes are reworded to `turn FAILED (needs operator): <window> cannot take a turn — …` and ring on the `failure` class (120 s cooldown). The harness payload cannot tell "idle" from "logged out" (`notification_type: idle_prompt` in both); the marker can.
+
+## Operator alerts — raised by the watcher, no model turn needed
+
+`monitor/watcher/_operator_alert.sh` (<your-org>/nexus-code#1548, #1533, #1534) is what the watcher uses when it alone knows the operator must act and no agent can take a turn. Keys today: `auth-expired` (the orchestrator is logged out — from the pane render or the typed `StopFailure` marker), `service-health:<name>` (an emit-only or flapping service is down while the emit route is unavailable), `auth-dialog-escaped` (an event: the watcher escaped an abandoned `/login`). Four legs, cheapest and most certain first, every one fail-open:
+
+1. **`monitor/.state/operator-alerts.jsonl`** — one JSON row per raise / reminder / clear and per leg outcome. Durable and greppable; the first place to look when asking "was the operator told, and how?".
+2. **the `watcher ALERT:` bell** via `_watcher_alert` — `watcher-alerts.log` + `watcher.log` + `sandbox-notify`. Attention.
+3. **`monitor/notify.sh --priority emergency --require-delivery`** — Pushover → ntfy → SMTP. Its record states what its rc proves: `0` is API acceptance, not device delivery; the off-terminal leg is UNVERIFIED until an operator confirms a push arrived.
+4. **a bot-authored GitHub issue `operator-alert: <key>`** on `github.repo`, @-pinging `github.user_login` — the one channel with observed delivery. One open issue per key while the condition stands; reminders comment on it; `clear` closes it.
+
+Cadence: one announcement, reminders every `monitor.watcher.operator_alert.reminder_seconds` (3600), one clear. **A flapping condition cannot flood the repo**: a `clear` finalises only after the condition has been absent for `operator_alert.clear_holddown_seconds` (300) — a raise inside the hold-down is recorded as a `flap` and neither re-rings nor re-files; a raise after the issue was closed REOPENS it rather than creating another; GitHub comments are capped at one per key per `operator_alert.comment_interval_seconds` (3600), while open/close state changes are never capped. GitHub being unreachable or rate-limiting the bot is recorded as `github-failed` with the reason; the record and the bell have already landed. Other knobs: `operator_alert.push_enabled`, `operator_alert.github_enabled`, `operator_alert.net_timeout_seconds` (each network leg is `timeout`-bounded and detached from the watcher loop). `NEXUS_NOTIFY_QUIET=1` disables both network legs.
 
 ## Trigger policy
 

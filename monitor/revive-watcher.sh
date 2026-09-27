@@ -181,8 +181,8 @@ fi
 NEXUS_ROOT="$NEXUS_ROOT" bash "$SVC_BIN" restart watcher
 rc=$?
 if (( rc == 0 )); then
-    _log "watcher revived (svc.sh restart watcher rc=0) — exactly ONE live watcher should now result (svc.sh restart is single-flight-locked + group-reaping, so never zero and never a duplicate). Verify: $NEXUS_ROOT/monitor/svc.sh status. Then re-arm the supervisor Monitor if its until-loop exited: $(_supervisor_monitor_command "$NEXUS_ROOT")"
+    _log "watcher revived (svc.sh restart watcher rc=0) — exactly ONE live watcher should now result (svc.sh restart is single-flight-locked + group-reaping, so never zero and never a duplicate). Verify: $NEXUS_ROOT/monitor/svc.sh status. If the supervisor is the fallback Monitor lease and its until-loop exited, re-arm: $(_supervisor_arm_instruction "$NEXUS_ROOT")"
 else
-    _log "watcher revive FAILED (svc.sh restart watcher rc=$rc) — watcher likely still DOWN. Re-arm the supervisor Monitor ($(_supervisor_monitor_command "$NEXUS_ROOT")); its next DOWN tick retries the revive. If it keeps failing, restart manually: $NEXUS_ROOT/monitor/svc.sh restart watcher. See skills/nexus.service-recovery."
+    _log "watcher revive FAILED (svc.sh restart watcher rc=$rc) — watcher likely still DOWN. Keep the supervisor armed ($(_supervisor_arm_instruction "$NEXUS_ROOT")); its next DOWN tick retries the revive. If it keeps failing, restart manually: $NEXUS_ROOT/monitor/svc.sh restart watcher. See skills/nexus.service-recovery."
 fi
 exit "$rc"

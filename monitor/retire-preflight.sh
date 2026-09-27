@@ -1138,6 +1138,50 @@ if [[ -n "$_sk_ng_bin" ]] && (( _sk_owed_rc != 0 )); then
     exit 1
 fi
 
+# _disp_append_only_release <report> <window> — check 1c release (c), see the
+# `second-pass` arm. Prints the release reason and returns 0 ONLY when the bytes
+# above the follow-up heading are bytes a verdict or a resolution covered.
+_DISP_FOLLOWUP_HEADING='## Follow-up records (no new claims)'
+_disp_append_only_release() {
+    local report="$1" win="$2" rp="" ln extra sha j covered src key
+    if   [[ -r "$report" ]]; then rp="$report"
+    elif [[ -n "${NEXUS_ROOT:-}" && -r "$NEXUS_ROOT/$report" ]]; then rp="$NEXUS_ROOT/$report"
+    fi
+    [[ -n "$rp" ]] || return 1
+    command -v sha256sum >/dev/null 2>&1 || return 1
+    ln=$(grep -n -x -F -e "$_DISP_FOLLOWUP_HEADING" "$rp" 2>/dev/null | sed -n '1s/:.*//p')
+    [[ "$ln" =~ ^[0-9]+$ ]] && (( ln > 1 )) || return 1
+    # NO other top-level section may follow. `grep -c` prints its own 0 at rc 1.
+    extra=$(tail -n "+$((ln + 1))" "$rp" | grep -cE '^#{1,2}([[:space:]]|$)')
+    [[ "$extra" == "0" ]] || return 1
+    key=$(wk_encode "$win")
+    covered=$( {
+        awk -F'\t' '$1 == "discharged" && $2 ~ /^[0-9a-f]{64}$/ { print $2 "\tverdict" }' \
+            "$STATE_DIR/skeptic/pending/.$key.ledger" 2>/dev/null
+        awk -F'\t' '$2 ~ /^[0-9a-f]{64}$/ { print $2 "\tresolution" }' \
+            "$STATE_DIR/skeptic/pending/.$key.disposition-cover" 2>/dev/null
+    } )
+    [[ -n "$covered" ]] || return 1
+    # The author may have left blank lines between the reviewed text and the
+    # heading; try the prefix with 0..3 trailing blank lines dropped. Anything
+    # else that differs is an EDIT, and an edit re-arms.
+    for j in 0 1 2 3; do
+        (( ln - 1 - j >= 1 )) || break
+        if (( j > 0 )); then
+            [[ -z "$(sed -n "$((ln - j))p" "$rp" | tr -d '[:space:]')" ]] || break
+        fi
+        sha=$(head -n "$((ln - 1 - j))" "$rp" | sha256sum | awk '{print $1}')
+        [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+        src=$(awk -F'\t' -v s="$sha" '$1 == s { print $2; exit }' <<<"$covered")
+        if [[ -n "$src" ]]; then
+            printf 'the report was amended after its release, but ONLY by appending under "%s": the %s bytes above it are byte-identical to what a recorded %s covered (sha %s…), and the tail opens no other section' \
+                "$_DISP_FOLLOWUP_HEADING" "$((ln - 1 - j))-line" "$src" "${sha:0:12}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---- check 1c: an outstanding `disposition: second-pass` ------------------
 # your-org/nexus-code#813. This gate decided retirement from PANE STATE and
 # OPERATOR ENGAGEMENT and never read the report the target had just filed. On
@@ -1345,6 +1389,29 @@ case "$disp_state" in
                     && _disp_released="a skeptic verdict reviewing this window was recorded at $_v_ts, after the report"
             fi
         fi
+        # (c) THE REPORT WAS AMENDED AFTER ITS RELEASE, AND THE AMENDMENT ONLY
+        #     APPENDED FOLLOW-UP RECORDS. (a) and (b) compare a release TIME
+        #     against the report's mtime, so ANY later write re-arms this gate —
+        #     correct for a new claim, and measured firing on nearly every worker
+        #     on 2026-09-17, each time for a worker appending "PR opened",
+        #     "skeptic round 2 closed" and the like, each costing a second
+        #     `ng skeptic resolve`.
+        #
+        #     IDENTITY, NOT TIME. The release carries over only when the bytes
+        #     BEFORE the sanctioned heading hash to a sha that a verdict or an
+        #     on-the-record resolution ACTUALLY COVERED — so an edit anywhere in
+        #     the reviewed text, the frontmatter included, fails the match and
+        #     re-arms exactly as before. And the appended tail may open NO other
+        #     `#`/`##` section: a new claim needs a new section, and a new
+        #     section is a new artefact. DEFAULT-DENY: every way this can fail to
+        #     establish itself (no heading, no sha tool, unreadable ledger, a
+        #     second heading) leaves the gate ARMED.
+        #
+        #     The heading is the AUTHOR's declaration, which is the trust this
+        #     gate already extends: `disposition:` itself is author-stated.
+        if [[ -z "$_disp_released" ]]; then
+            _disp_released=$(_disp_append_only_release "$disp_report" "$win_name") || _disp_released=""
+        fi
         if [[ -n "$_disp_released" ]]; then
             printf 'retire-preflight: %q asked for a second pass and it was satisfied — %s. Not blocking.\n' \
                 "$win_name" "$_disp_released" >&2
@@ -1358,6 +1425,10 @@ case "$disp_state" in
             printf '  EITHER spawn the next-pass skeptic (its verdict releases this gate), OR\n' >&2
             printf '  decline on the record:\n' >&2
             printf '    monitor/ng skeptic resolve %q --reason "<why no further pass>" --disposition\n' "$win_name" >&2
+            printf '  If this gate was ALREADY released and the report was only amended with follow-up\n' >&2
+            printf '  records, append them under the exact heading  %s\n' "$_DISP_FOLLOWUP_HEADING" >&2
+            printf '  leaving every reviewed byte above it untouched: the release then carries over.\n' >&2
+            printf '  A new CLAIM is a new artefact and is meant to re-arm this gate.\n' >&2
             emit 0 "$pane_state" "the target's own report states \`disposition: second-pass\` (report=$disp_report) and no further pass has been recorded — the reviewer is still owed a round, refusing kill; decline on the record with \`ng skeptic resolve <window> --reason … --disposition\`"
             exit 1
         fi
@@ -1371,6 +1442,26 @@ case "$disp_state" in
         exit 1
         ;;
 esac
+
+# ---- check 1c-delta: a resolution PROMISED a delta review -------------------
+# your-org/nexus-code#1573 instance 5. `ng skeptic resolve --delta-owed` records
+# that this window's next artefact must be reviewed. The marker is gone (the
+# resolution released it) and the report's disposition may be anything, so every
+# gate above can read clean while a recorded promise is outstanding — measured
+# on `killsafe`, whose never-reviewed kill-direction fixes read retire-eligible.
+# The record leaves only by being ARMED (the worker's wrap-up, which then shuts
+# check 1b) or WITHDRAWN (`resolve --withdraw-delta`). Presence is the refusal;
+# an unreadable record still refuses.
+_delta_owed_rec="$STATE_DIR/skeptic/pending/.$(wk_encode "$win_name").delta-owed"
+if [[ -e "$_delta_owed_rec" ]]; then
+    _delta_what=$(sed -n 's/^what=//p' "$_delta_owed_rec" 2>/dev/null | sed -n 1p)
+    printf 'retire-preflight: %q is OWED A DELTA REVIEW that the orchestrator recorded and that has not been requested:\n' "$win_name" >&2
+    printf '  what: %s\n' "${_delta_what:-<unreadable: $_delta_owed_rec>}" >&2
+    printf '  The worker'"'"'s next `ng wrap-up` arms it and files the spawn-skeptic request. To WITHDRAW the\n' >&2
+    printf '  promise on the record:  monitor/ng skeptic resolve %q --reason "<why no delta review after all>" --withdraw-delta\n' "$win_name" >&2
+    emit 0 "$pane_state" "a resolution recorded that a DELTA REVIEW is owed on this window (${_delta_what:-unreadable record}) and it has neither been armed nor withdrawn — a promised review must not silently evaporate, refusing kill"
+    exit 1
+fi
 
 # ---- check 1d: this window OWES somebody -----------------------------------
 # your-org/nexus-code#845. Every gate above asks a question ABOUT THIS WINDOW:

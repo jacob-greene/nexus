@@ -44,6 +44,23 @@ on:
       # real binary, so a change to spawn-worker.sh changes what this workflow
       # proves -- PF001 names it the moment it is left out.
       - 'monitor/spawn-worker.sh'
+      # <your-org>/nexus-code#1321: test-realmodel-trust-dialog.sh EXECUTES the real
+      # paste-followup.sh against the real dialog, and that script sources
+      # _pane-live.sh, _nexus-root.sh and config/load.sh — a change to any of
+      # them changes what this workflow proves. PF001 names them when left out.
+      - 'monitor/paste-followup.sh'
+      # THE confirmed-delivery primitive (<your-org>/nexus-code#1591): sourced by
+      # paste-followup.sh and by test-realmodel-paste-held.sh, the delivery-axis
+      # scenario this workflow runs. Found by the full local band (PF001): the
+      # workflow lint declares no population, so `guards-for-diff` could not
+      # select it.
+      - 'monitor/_paste-deliver.sh'
+      - 'monitor/_pane-live.sh'
+      - 'monitor/_nexus-root.sh'
+      - 'config/load.sh'
+      # <your-org>/nexus-code#1530: test-realmodel-overlimit.sh SOURCES its
+      # three-outcome renderer-scrape check from here.
+      - 'monitor/watcher/test-integration/_renderer_scrape_check.sh'
       # RETAINED, but D6's stated reason for them was WRONG (<your-org>/nexus-
       # code#765). D6 added these two as "the substrate every scenario runs
       # on". They are not the substrate of THIS workflow's scenarios: the eight
@@ -233,6 +250,18 @@ on:
       # Caught by PF001, not by me — the third time the derivation has known
       # about an edge the enumerated list did not.
       - 'monitor/watcher/_tmux-fixture.sh'
+      # <your-org>/nexus-code#1520 / #1548. `test-realmodel-auth-failure-hooks.sh`
+      # wires the REAL `turn-failure-emit.sh` and `stamp-clear.sh` as the
+      # StopFailure/Stop hooks of the real binary, so those two, the resolver
+      # both source (`_stamp_path.sh`) and the classifier the writer sources
+      # (`_cause_classify.sh`) are inside this workflow's execution closure: a
+      # change to the token table changes what this workflow proves. Caught by
+      # PF001 in the full local band — `guards-for-diff` could not see it
+      # (test-lint-workflows.sh declares no population).
+      - 'monitor/hooks/turn-failure-emit.sh'
+      - 'monitor/hooks/stamp-clear.sh'
+      - 'monitor/hooks/_stamp_path.sh'
+      - 'monitor/hooks/_cause_classify.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/cc-harness.yml'
@@ -378,13 +407,25 @@ jobs:
         # model request locally.
         run: |
           set -uo pipefail
-          mapfile -t tests < <(find monitor/watcher/test-integration \
-              -name 'test-realmodel-*.sh' -type f | sort)
+          # ASKED, NOT GLOBBED (<your-org>/nexus-code#1574 G1). --require-run below
+          # DECLARES every selected scenario measurable, and one is not on this
+          # backend: test-realmodel-longjob-wake.sh's dispatcher cannot arm under
+          # the mock. It used to stay green by leaving at `exit 0`, which
+          # --require-run cannot see. It now exits 69, so a bare `find` would turn
+          # this job permanently red; the selector excludes what DECLARES itself
+          # unmeasurable here and PRINTS each exclusion with its reason.
+          # Status FIRST, list second: `mapfile < <(…)` would discard the rc and
+          # read a failed selection as "no scenarios".
+          if ! monitor/cc-harness/realmodel-scenarios.sh --backend mock > "$RUNNER_TEMP/realmodel-scenarios.txt"; then
+            echo "::error::realmodel scenario selection failed (see the lines above)"
+            exit 1
+          fi
+          mapfile -t tests < "$RUNNER_TEMP/realmodel-scenarios.txt"
           if (( ${#tests[@]} == 0 )); then
             echo "::error::no realmodel scenarios found"
             exit 1
           fi
-          echo "Discovered ${#tests[@]} scenario(s)."
+          echo "Selected ${#tests[@]} scenario(s) measurable on the mock backend."
           # CCH_TUI is consumed by cch_setup, which writes it into the
           # harness's ISOLATED CLAUDE_CONFIG_DIR. Empty => leave the binary's
           # own default (no settings key written at all).
@@ -394,7 +435,19 @@ jobs:
           else
             echo "TUI mode under test: binary default (CCH_TUI unset)"
           fi
-          RUN_CC_HARNESS=1 bash monitor/watcher/run-tests.sh "${tests[@]}"
+          # --require-measured (<your-org>/nexus-code#1563). A realmodel scenario
+          # that RAN and could not exercise a discriminating sub-check exits 69.
+          # `cc-harness/gate.sh` reads that as UNMEASURED -> RED; run-tests.sh
+          # reads it as ENVSKIP -> reported, not red (#1283), which is right for
+          # the unit band and WRONG here: this job IS the measurement, and
+          # without the flag it closed `END rc=0 (COMPLETE and green)` with the
+          # renderer scrape unexercised.
+          # --require-run, not --require-measured (skeptic F2 on #1569): this
+          # step SETS RUN_CC_HARNESS=1, so a SKIP (exit 77) here is never "the
+          # gate did not take" — it is a missing tmux/node/python3/claude binary,
+          # an applicable scenario left unexercised, which gate.sh also reads as
+          # RED. --require-run reddens 77 AND 69.
+          RUN_CC_HARNESS=1 bash monitor/watcher/run-tests.sh --require-run "${tests[@]}"
 
       - name: collect pane captures on failure
         if: failure()

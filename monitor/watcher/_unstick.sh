@@ -58,24 +58,57 @@
 #
 # Three scenarios this defends against:
 #
-#   A) Permission prompt during normal run.
+#   A) Permission prompt during normal run — DETECTED, NEVER ANSWERED
+#      (your-org/nexus-code#1599).
 #      Even with `--dangerously-skip-permissions`, Claude Code still
-#      prompts on certain command shapes (paths outside the project,
-#      mount/dev commands, etc.). The prompt looks like:
+#      prompts on the command shapes the binary refuses to bypass:
+#
+#         Dangerous rm operation on possibly-empty variable path: "$M/$tag-work"
 #
 #         Do you want to proceed?
 #         ❯ 1. Yes
-#           2. Yes, and allow access to ...
-#           3. No
+#           2. No
 #
-#      The default-highlighted option is "1. Yes" — pressing Enter
-#      resumes. Continuous automation should not silently stall here,
-#      so the watcher sends Enter directly. Risk: that action grants
-#      whatever the prompted command was. Acceptable since the agent
-#      was launched with --dangerously-skip-permissions (the operator
-#      already opted into the bypass); the audit trail is the
-#      pre-action pane capture under $UNSTICK_DIR plus the
-#      $UNSTICK_LOG line.
+#      This case USED to press Enter, i.e. answer whatever option the
+#      binary highlighted — "Yes" — on the theory that the operator had
+#      already opted into the bypass. That theory inverts the population:
+#      in bypass mode the ordinary prompts never render, so what reaches
+#      a worker pane is exactly the class a human was meant to answer.
+#      It confirmed "Dangerous rm operation on possibly-empty variable
+#      path" in window `rtev` on 2026-09-19.
+#
+#      THE ALLOWLIST IS EMPTY, AND THAT IS A RULING FROM EVIDENCE, not a
+#      placeholder. Every pre-action audit this case ever wrote was read
+#      (61 captures under .state/unstick/*.permission.*.audit, 2026-04-28
+#      .. 2026-09-22, Claude Code up to 2.1.273; audit mtime = first
+#      sighting). 42 of 61 carry a danger marker, and 35 of 35 dated
+#      after 2026-06-08 do. The populations:
+#        - DANGER-MARKED: the
+#          `Dangerous rm|rmdir operation on …` family (possibly-empty
+#          variable path / critical path / working directory or its
+#          ancestor / statically-unresolvable target), `This command
+#          requires approval`, `… which is a sensitive file`.
+#        - 2 were not prompts at all: an operator window QUOTING the
+#          prompt text while discussing this case — and it got an Enter.
+#        - 17 UNMARKED "Bash command" prompts (2026-04-28..06-08): the approval
+#          grants the arbitrary command rendered above it — lockfile
+#          writes under ~/.claude, but also a credential written to disk.
+#          Nothing in the prompt text lets the watcher judge the COMMAND
+#          safe, and a pattern over command text is exactly the glob arm
+#          #1121 warns about.
+#      No benign prompt could be positively identified, so nothing is
+#      answered. `_unstick_permission_verdict` still classifies (the
+#      verdict names WHY in the log and the decision row), and it is
+#      DENY-FIRST: if an allow arm is ever added it must come after the
+#      danger arm, never before it (#1121).
+#
+#      Action: NO KEY. The pre-action capture is kept as the audit, one
+#      `case=A action=refused` line is logged per prompt instance, and a
+#      pending-decision record (`kind: permission_prompt`, the issue-129
+#      channel Case W also writes) surfaces it as an operator decision.
+#      The existing Stop hook resolves that record for hooked workers
+#      the moment the modal is gone; a hookless pane's record waits for
+#      the ack, like Case W's.
 #
 #   B) Rate-limit prompt (Claude.ai usage limit hit).
 #      Claude Code's rate-limit menu has the title "What do you want
@@ -90,6 +123,15 @@
 #           orchestrator (TARGET): Enter to dismiss the menu, then
 #           paste-buffer "Please continue with your task. The API
 #           rate limit has reset." + Enter.
+#           THAT DISMISS ENTER IS AN EQUALITY (your-org/nexus-code#1598):
+#           it is pressed only when a capture taken at that moment, on
+#           the exact target, reads a LIVE menu whose HIGHLIGHTED row is
+#           the Stop option. Detection itself requires a LIVE menu, so a
+#           pane that merely quotes the literals is not case B. See
+#           `_unstick_ratelimit_menu_verdict` for the measurement, the
+#           bundle citation and the stated fidelity limit. An ELAPSED
+#           reset epoch with nobody stuck is closed as a finished
+#           episode, so it cannot make the next one fire instantly.
 #        4. Inform the orchestrator with a heads-up paste containing
 #           the count of windows we just unstuck and a one-liner
 #           prompting `monitor/ng log-action ... --event
@@ -97,11 +139,13 @@
 #           on subsequent cycles to confirm the orchestrator is
 #           alive; if no ack lands within RATELIMIT_ACK_TIMEOUT_S the
 #           watcher logs `orchestrator-unresponsive` so the operator
-#           can intervene.
+#           can intervene. The heads-up presses NO blind pre-Enter, and
+#           is DEFERRED (parked in `ratelimit.headsup.pending`, retried
+#           each cycle) while the orchestrator's box already holds typed
+#           text or its menu's default is not the Stop option (#1598).
 #
-# Asymmetry: case A unsticks any non-watcher window directly with a
-# single keypress (no cascade — no follow-up needed for permission).
-# Case B fans out across every stuck window then sends a separate
+# Asymmetry: case A never sends a key — it surfaces the prompt as a
+# pending decision (#1599). Case B fans out across every stuck window then sends a separate
 # heads-up to the orchestrator; the watcher already captures every
 # pane each cycle, so making it the cascade actor is cheaper and more
 # direct than asking the orchestrator to tmux-walk its siblings.
@@ -134,8 +178,9 @@
 #   D) AskUserQuestion chip-bar dialog (dialog-guard).
 #      The orchestrator is paste-driven; any blocking modal that
 #      intercepts the watcher's paste-buffer push either corrupts
-#      dialog state, stalls the channel, or feeds Case A's auto-Enter
-#      into selecting whatever option happens to be index 1. The
+#      dialog state, or stalls the channel (it once also fed Case A's
+#      auto-Enter into selecting option 1; Case A sends no key since
+#      your-org/nexus-code#1599). The
 #      operator's verbatim constraint: "we cannot risk the orchestrator
 #      not being receptive for watcher prompt injections."
 #
@@ -205,11 +250,16 @@
 #        - `error`        — log a WARN line; otherwise the same as
 #                           `skip`. Surfaces the wedge in unstick
 #                           logs without auto-dismissing.
-#      Ordering: Case D is matched BEFORE Case A in
-#      `_handle_unstick_window` because Case A's `❯ N.` chevron
-#      pattern (the permission-prompt heuristic) would also match an
-#      AskUQ overlay's numbered options — running A first would
-#      silently auto-Enter the first option of the wrong dialog.
+#      Ordering: Case D is matched AFTER Case A in
+#      `_handle_unstick_window`. It used to be the other way round,
+#      because Case A pressed Enter and its `❯ N.` chevron pattern
+#      would have auto-Entered option 1 of an AskUQ overlay. Since
+#      #1599 Case A sends no key, and a LIVE permission prompt renders
+#      `Esc to cancel · Tab to amend` as its bottom row, which passes
+#      D's live-ness gate — so D-first sent Escape + a paste into a
+#      live permission prompt whenever the chip-bar literals were
+#      quoted above it (skeptic pass on #1626). See the ordering block
+#      in `_handle_unstick_window` for the rule and its stated cost.
 #
 #   W) Worker-blocked-question relay (your-org/your-nexus#180).
 #      The same AskUQ detection (shape + bottom-anchored live-ness
@@ -242,7 +292,9 @@
 #      scan cycles) means the overlay went away and came back, so the
 #      episode re-arms and the grace clock restarts. Single-shot per
 #      (window, fp): an existing record or `.handled.json` tombstone
-#      suppresses re-writes; a new question (new fp) re-arms. If the
+#      suppresses re-writes; a new question (new fp) re-arms, and so
+#      does a same-fp question after a > 90 s sighting gap, which also
+#      retires the previous instance's tombstone (as Case A does). If the
 #      orchestrator acks (rm) while the worker is STILL blocked on the
 #      same fp, the next scan re-writes the record — correct, because
 #      the question remains unanswered; the emit-level content-hash
@@ -261,6 +313,12 @@ source "$_unstick_module_dir/../_log-mode.sh"
 # LOUD instead.
 # shellcheck source=../_pane-live.sh
 [[ -r "$_unstick_module_dir/../_pane-live.sh" ]] && source "$_unstick_module_dir/../_pane-live.sh"
+# THE confirmed-delivery primitive (your-org/nexus-code#1591) — holds the tree's
+# one `tmux paste-buffer`. Explicit for the same reason as `_pane-live.sh`: this
+# module is sourced standalone by suites. Quiet at load, LOUD at use:
+# `_paste_line_to_window` refuses to paste when `pd_deliver` is not defined.
+# shellcheck source=../_paste-deliver.sh
+[[ -r "$_unstick_module_dir/../_paste-deliver.sh" ]] && source "$_unstick_module_dir/../_paste-deliver.sh"
 if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
     # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
     # tell a live pane from a corpse, and a paste into a corpse kills the
@@ -366,40 +424,225 @@ _unstick_stamp_machine_input() {
     _machine_input_stamp "$window" "$src"
 }
 
-# Send Enter to a permission-prompt window to accept the
-# default-highlighted "Yes". Idempotent across the per-prompt fp +
-# tries counter; backs off after one retry to avoid hammering an
-# unresponsive prompt.
+# THE DANGER VOCABULARY Claude Code renders above a non-bypassable permission
+# prompt (your-org/nexus-code#1599). Fixed strings, matched with -F: every one is
+# a harness string, so a reword upstream silently moves a prompt from `danger:`
+# to `unlisted` — which is still REFUSED (the allowlist is empty), so the drift
+# costs wording, never a keypress. That is why this list is on the collision
+# list in skills/nexus.cc-update/GUIDE.md rather than load-bearing for safety.
+# Measured from the 61 case-A audits described in the file header.
+_UNSTICK_PERMISSION_DANGER_MARKERS=(
+    'Dangerous '
+    'possibly-empty variable path'
+    'critical path'
+    'statically-unresolvable target'
+    'working directory or its ancestor'
+    'This command requires approval'
+    'which is a sensitive file'
+)
+
+# _unstick_permission_verdict  (pane on stdin) → one word on stdout
+#
+#   danger       a danger marker is on screen — never answered, by anyone but a human
+#   unlisted     no marker, and not on the allowlist — refused
+#
+# DENY-FIRST, and there is NO allow arm (see the Case A narrative for the
+# evidence that no benign prompt could be identified). If one is ever added it
+# goes BELOW the danger arm: a SAFE arm may not precede a DENY arm that could
+# fire on the same input (your-org/nexus-code#1121). The marker itself is
+# printed on a second line so the log and the decision row can name it.
+_unstick_permission_verdict() {
+    local pane m line
+    pane=$(cat)
+    for m in "${_UNSTICK_PERMISSION_DANGER_MARKERS[@]}"; do
+        line=$(grep -F -m1 -e "$m" <<<"$pane") || continue
+        printf 'danger\n%s\n' "$(sed 's/^[[:space:]│]*//; s/[[:space:]]*$//' <<<"$line")"
+        return 0
+    done
+    printf 'unlisted\n'
+}
+
+# Case A's detection predicate: the permission-prompt title AND a highlighted
+# numbered row, anywhere in the capture. PRESENCE, deliberately — see the
+# ordering block in `_handle_unstick_window` for why it is not live-gated. One
+# function so the one-line arm there can be mutation-gated as a unit.
+_unstick_pane_has_permission_prompt() {
+    grep -qE 'Do you want to proceed\?' <<<"$1" \
+        && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$1"
+}
+
+# Fingerprint of ONE permission prompt instance. `_unstick_fingerprint` keys on
+# the title + option rows only, and those are byte-identical across every
+# two-option prompt ("Do you want to proceed? ❯ 1. Yes 2. No" — the audits show
+# one fp, ca80bcd97f11, for 30+ unrelated prompts). As a decision-record key that
+# would make an ack of one prompt mute every later one in the window. So this
+# hashes the prompt BODY too: the dozen rows above the title (the command and the
+# danger line) through the option rows. The modal suspends the turn, so that
+# region is static across polls — EXCEPT for one glyph.
+#
+# THE BLINKING BULLET (skeptic pass on #1626, item 5). The pending tool call's
+# header row (`● Running S=…`) sits inside that dozen-row window for 20 of the 61
+# audits, and its leading `●` blinks: the same prompt captured bullet-on and
+# bullet-off hashed to 2fdedef677d9 and 2ad2cfce387a (the `ncbundle` audit), so
+# one prompt made two decision records and an ack of one left its twin standing.
+# The row cannot be DROPPED by a pattern, because its bullet-off rendering
+# (`  Running S=…`) carries no marker to recognise it by — so the glyph is
+# NORMALISED: a leading `●` (Linux) or `⏺` (macOS) becomes the space it blinks
+# to. Only column 0 is touched, so a bullet inside a row still distinguishes.
+#
+# THE AUTO-DENY COUNTDOWN (your-org/nexus-code#1632). From 2.1.281 the
+# dangerous-rm prompt paints `⚠ Claude Code will automatically deny this request
+# in 2:00, …` inside the same window, and the clock ticks every second: four
+# captures of one prompt 10 s apart hashed to four fps (ffccaff683d5,
+# 577372bca532, 018e04f35fdb, 33bd5eda473c), so a ~120 s prompt made 2–3
+# records at the live 60 s interval. Only the M:SS token is normalised; the row
+# itself stays in the hash, so a countdown prompt still differs from a
+# countdown-free one. On a hooked pane the prompt is DECIDED by
+# monitor/hooks/dangerous-rm-decide.sh, but the dialog still renders while the
+# hook waits (measured), so Case A sees it too and must key one record per
+# prompt; on a hookless pane the countdown runs to its own deny.
+_unstick_fingerprint_permission() {
+    awk '{ sub(/[[:space:]]+$/, ""); row[NR] = $0 }
+         { sub(/^(●|⏺)/, " ", row[NR]) }
+         { gsub(/deny this request in [0-9]+:[0-9]+/, "deny this request in M:SS", row[NR]) }
+         /Do you want to proceed\?/ { t = NR }
+         END {
+             if (!t) exit
+             lo = t - 12; if (lo < 1) lo = 1
+             hi = t + 6;  if (hi > NR) hi = NR
+             for (i = lo; i <= hi; i++) print row[i]
+         }' | sha1sum | cut -c1-12
+}
+
+# Case A (your-org/nexus-code#1599): a permission prompt is DETECTED and NEVER
+# ANSWERED. No key reaches the pane — not Enter, not Escape, not a digit. See the
+# Case A narrative for why the allowlist is empty.
+#
+# Per prompt instance (window, fp): keep the pre-action capture as the audit, log
+# ONE `case=A action=refused` line (a `.refused` marker dedups the per-cycle
+# re-detection), and surface it on the pending-decisions channel so it is an
+# operator decision rather than a silent skip.
+# Retire the ack tombstone of a PREVIOUS instance of a recurring prompt — shared
+# by Case A (a `.refused` sighting after a > 90 s gap) and Case W (a re-armed
+# first-seen episode). A `.handled.json` sibling makes every reader skip the
+# active record, so a tombstone left standing past the episode it acked mutes
+# every later instance of the same fingerprint forever (skeptic pass on #1626,
+# item 5 and its case-W residual). Callers decide WHEN a sighting is a new
+# instance; this only removes the tombstone and says so.
+_unstick_retire_tombstone() {  # <window> <fp> <case-letter> <noun>
+    local window="$1" fp="$2" case_l="$3" noun="$4"
+    local tomb="${STATE_DIR:-$(dirname "$UNSTICK_DIR")}/decisions/${window}.${fp}.handled.json"
+    if [[ -f "$tomb" ]] && rm -f "$tomb"; then
+        unstick_log "window=$window case=$case_l action=tombstone-retired fp=$fp — the $noun came back after its ack; surfacing it again"
+    fi
+    return 0
+}
+
 _act_permission() {
     local window="$1" pane="$2"
-    local case_key="permission"
-    local fp_file="$UNSTICK_DIR/${window}.${case_key}.fp"
-    local tries_file="$UNSTICK_DIR/${window}.${case_key}.tries"
-    local fp prev_fp tries
-    fp=$(printf '%s\n' "$pane" | _unstick_fingerprint)
-    prev_fp=""
-    [[ -f "$fp_file" ]] && prev_fp=$(<"$fp_file")
-    tries=0
-    [[ -f "$tries_file" ]] && tries=$(<"$tries_file")
-    if [[ "$fp" != "$prev_fp" ]]; then
-        tries=0
+    local fp verdict marker v
+    fp=$(printf '%s\n' "$pane" | _unstick_fingerprint_permission)
+    v=$(printf '%s\n' "$pane" | _unstick_permission_verdict)
+    verdict=$(sed -n 1p <<<"$v")
+    marker=$(sed -n 2p <<<"$v")
+    local audit="$UNSTICK_DIR/${window}.permission.${fp}.audit"
+    [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
+    local refused="$UNSTICK_DIR/${window}.permission.${fp}.refused"
+    # EPISODES, not fingerprints (skeptic pass on #1626, item 5). The `.refused`
+    # marker used to be written once and never cleared, and an ack-and-mute
+    # tombstone was honoured forever — so a prompt that was answered, went away
+    # and came BACK with the same fingerprint (a worker re-running the command it
+    # was refused) logged nothing and surfaced nothing: on a HOOKLESS pane, whose
+    # record no Stop hook ever resolves, that is a live prompt nobody is told
+    # about. The marker's mtime is now the last sighting (Case W's first-seen
+    # protocol, same 90 s: nine 10 s scan cadences): a sighting after a longer
+    # gap is a NEW instance — it is logged again, and a tombstone left by the ack
+    # of the PREVIOUS instance is retired, because a tombstone sibling makes every
+    # reader skip the active record (`_idle_probe.sh`, `ng decision-ack`).
+    # Error direction, stated: a watcher stalled > 90 s beside a prompt that never
+    # went away re-surfaces it once — noise, never a silent prompt.
+    local now last_seen episode=same
+    now=$(date +%s)
+    if [[ ! -f "$refused" ]]; then
+        episode=first
+    else
+        last_seen=$(stat -c %Y "$refused" 2>/dev/null || echo 0)
+        [[ "$last_seen" =~ ^[0-9]+$ ]] || last_seen=0
+        if (( now - last_seen > 90 )); then episode=recurred; fi
     fi
-    if (( tries >= 2 )); then
-        unstick_log "window=$window case=A action=skip-backoff fp=$fp tries=$tries"
+    : > "$refused"
+    if [[ "$episode" != same ]]; then
+        unstick_log "window=$window case=A action=refused verdict=$verdict fp=$fp audit=$(basename "$audit")${marker:+ marker=\"$marker\"}$([[ "$episode" == recurred ]] && printf ' episode=recurred gap=%ss' "$(( now - last_seen ))") — NO key: a permission prompt is an operator decision (your-org/nexus-code#1599)"
+    fi
+    [[ "$episode" == recurred ]] && _unstick_retire_tombstone "$window" "$fp" A "prompt"
+    _unstick_permission_relay "$window" "$pane" "$fp" "$verdict" "$marker" "$audit"
+    return 0
+}
+
+# Write the refused prompt to the pending-decisions channel — the SAME channel
+# and schema the Notification hook (hooks/decision-emit.sh) and Case W write, so
+# `render_pending_decisions` surfaces it with no new reader.
+#
+# `kind` is `permission_prompt` DELIBERATELY, and it SELECTS (checked, per
+# your-org/nexus-code#1050): hooks/decision-mark-unresolved.sh rules on it — Stop
+# means the modal is gone, so the row is stamped `resolved` instead of left loud
+# — and `render_pending_decisions` exempts only `idle_prompt` from operator-
+# engaged suppression, so this kind always surfaces. A new kind would take the
+# Stop hook's DEFAULT arm (`unresolved: true`) and nag after the prompt was gone.
+# `source` and `verdict` are new, additive fields no reader selects on.
+#
+# Cost, stated: a HOOKED worker also gets the hook's own row ("Claude needs your
+# permission") under a different fingerprint, so it shows two rows; this one is
+# the one that says what is being asked. Both resolve on Stop.
+#
+# Single-shot per (window, fp) while pending; a tombstone mutes it; a RESOLVED
+# record is rewritten, because the same prompt on screen again is a new instance
+# (decision-emit.sh's re-fire semantics).
+_unstick_permission_relay() {
+    local window="$1" pane="$2" fp="$3" verdict="$4" marker="$5" audit="$6"
+    local decisions_dir="${STATE_DIR:-$(dirname "$UNSTICK_DIR")}/decisions"
+    local dest="$decisions_dir/${window}.${fp}.json"
+    [[ -f "$decisions_dir/${window}.${fp}.handled.json" ]] && return 0
+    if ! command -v jq >/dev/null 2>&1; then
+        unstick_log "WARN window=$window case=A action=jq-missing fp=$fp (prompt refused, but NOT surfaced as a decision)"
+        return 1
+    fi
+    if [[ -f "$dest" ]] && ! jq -e '.resolved == true' "$dest" >/dev/null 2>&1; then
         return 0
     fi
-    local audit="$UNSTICK_DIR/${window}.${case_key}.${fp}.audit"
-    [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
-    if tmux send-keys -t "$window" Enter 2>/dev/null; then
-        printf '%s' "$fp" > "$fp_file"
-        printf '%d' "$(( tries + 1 ))" > "$tries_file"
-        _unstick_stamp_machine_input "$window" "unstick-permission"
-        local action_label="sent-Enter"
-        (( tries >= 1 )) && action_label="sent-Enter-retry"
-        unstick_log "window=$window case=A action=$action_label fp=$fp audit=$(basename "$audit")"
+    mkdir -p "$decisions_dir" 2>/dev/null || true
+    local why options excerpt
+    if [[ "$verdict" == danger ]]; then
+        why="danger marker: $marker"
     else
-        unstick_log "window=$window case=A action=send-keys-failed fp=$fp"
+        why="no danger marker, and the case-A allowlist is empty"
     fi
+    options=$(grep -E '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.' <<<"$pane")
+    # Line 1 is what the emit row shows (first non-empty line, 160 chars): lead
+    # with the refusal, so nobody reads the row as "please press Enter".
+    excerpt=$(printf 'Watcher REFUSED to answer a permission prompt (%s) — operator decision, see your-org/nexus-code#1599\n%s' "$why" "$options")
+    local tmp="$dest.tmp.$$"
+    if jq -nc \
+        --arg ts             "$(date -Is)" \
+        --arg window         "$window" \
+        --arg kind           "permission_prompt" \
+        --arg prompt_excerpt "$excerpt" \
+        --arg tool_context   "$pane" \
+        --arg fingerprint    "$fp" \
+        --arg source         "watcher-unstick-case-A" \
+        --arg verdict        "$verdict" \
+        '{ts: $ts, window: $window, session_id: "", kind: $kind,
+          prompt_excerpt: $prompt_excerpt, tool_context: $tool_context,
+          fingerprint: $fingerprint, source: $source, verdict: $verdict}' \
+        > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$dest" 2>/dev/null || { rm -f "$tmp"; return 1; }
+        unstick_log "window=$window case=A action=surfaced fp=$fp decision=$(basename "$dest") audit=$(basename "$audit")"
+    else
+        rm -f "$tmp"
+        unstick_log "WARN window=$window case=A action=record-write-failed fp=$fp"
+        return 1
+    fi
+    return 0
 }
 
 # Send Enter to a window wedged on a transient API-error chip. The
@@ -437,7 +680,10 @@ _act_api_error() {
     fi
     local audit="$UNSTICK_DIR/${window}.${case_key}.${fp}.audit"
     [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
-    if tmux send-keys -t "$window" Enter 2>/dev/null; then
+    # EXACT target, never the bare name: once the window is gone tmux resolves a
+    # bare `-t <name>` by unique PREFIX and this Enter submits whatever a live
+    # sibling (`<w>-skeptic`) holds in its input box (your-org/nexus-code#1524).
+    if tmux send-keys -t "$(_unstick_exact_target "$window")" Enter 2>/dev/null; then
         printf '%s' "$fp" > "$fp_file"
         printf '%s' "$now" > "$epoch_file"
         _unstick_stamp_machine_input "$window" "unstick-api-error"
@@ -525,7 +771,9 @@ _act_askuq() {
     # the in-flight turn; by construction that concern doesn't apply
     # here (the dialog itself blocks generation, so there's no
     # turn to abort).
-    if ! tmux send-keys -t "$window" Escape 2>/dev/null; then
+    # EXACT target (your-org/nexus-code#1524): a bare name resolves by unique
+    # PREFIX once the window is gone, and the Escape would abort a sibling's turn.
+    if ! tmux send-keys -t "$(_unstick_exact_target "$window")" Escape 2>/dev/null; then
         unstick_log "window=$window case=D action=escape-failed fp=$fp"
         return 1
     fi
@@ -581,6 +829,16 @@ _act_worker_askuq() {
     if (( now - last_seen > 90 )); then
         printf '%s' "$now" > "$first_file"
         unstick_log "window=$window case=W action=re-armed fp=$fp (sighting gap $(( now - last_seen ))s)"
+        # A re-armed episode is a NEW instance of the question, so the ack of
+        # the previous one no longer applies (Case A's recurrence rule, skeptic
+        # pass on #1626). Without this the grace elapsed into `skip-tombstone`
+        # on every later instance: a HOOKLESS worker's recurring AskUQ — whose
+        # record no Stop hook resolves — was never surfaced again. Retired HERE,
+        # at the gap, not at relay time: a tombstone written during a
+        # continuously-observed episode (acked while the overlay stayed up)
+        # still mutes it. Error direction as Case A's: a watcher stalled > 90 s
+        # beside an overlay that never went away re-surfaces it once.
+        _unstick_retire_tombstone "$window" "$fp" W "question"
         return 0
     fi
     touch "$first_file" 2>/dev/null || true
@@ -676,25 +934,65 @@ _handle_unstick_window() {
     # Never paste into the watcher's own pane.
     [[ "$window" == "${WATCHER_WINDOW:-watcher}" ]] && return 0
     local pane
-    pane=$(tmux capture-pane -t "$window" -p -S -25 2>/dev/null) || return 0
+    # EXACT target (your-org/nexus-code#1524). This READ decides which case
+    # fires, and the PATH-front tmux shim refuses mis-aimed ACTS but not reads:
+    # a bare name whose window is gone resolves by unique PREFIX, so a live
+    # sibling's pane would select the arm acted on under THIS window's name.
+    pane=$(tmux capture-pane -t "$(_unstick_exact_target "$window")" -p -S -25 2>/dev/null) || return 0
     [[ -z "$pane" ]] && return 0
 
-    # Order matters: rate-limit menu also contains numbered-option
-    # lines that overlap with the permission prompt regex, so check
-    # the rate-limit fingerprint first. Case D (AskUserQuestion
-    # chip-bar) MUST also be matched before Case A — Case A's
-    # `❯ N.` chevron pattern would otherwise auto-Enter the first
-    # option of an AskUQ overlay, silently mis-selecting whichever
-    # option happens to be highlighted. Case C (api-error chip) is
-    # disjoint from all menus (no `Type something.` / `Chat about
-    # this` / `What do you want to do?` / `Do you want to proceed?`
-    # text), so its position in the chain is incidental.
-    if grep -qE 'What do you want to do\?' <<<"$pane" \
-       && grep -qE 'Stop and wait for limit' <<<"$pane"; then
-        _record_ratelimit_seen "$window" "$pane"
-        printf 'ratelimit'
-        return 0
-    fi
+    # ORDER IS THE SAFETY PROPERTY HERE, and it is decided by one rule: no arm
+    # that SENDS A KEY may precede the arm that REFUSES, when both could fire on
+    # the same pane (your-org/nexus-code#1121). Case A sends no key since #1599,
+    # so it goes FIRST: before B (the cascade's dismiss Enter), before D (Escape
+    # + paste), before W (a different record kind) and before C (Enter). Placed
+    # first, its error direction is OVER-REFUSAL only — it can never answer.
+    #
+    # THIS USED TO SAY Case C is "disjoint from all menus, so its position in the
+    # chain is incidental". That was FALSE (skeptic pass on #1626, finding 1):
+    # the arms test PRESENCE in a 25-line capture, not exclusivity, so an
+    # api-error chip anywhere above a LIVE `Do you want to proceed?` made C claim
+    # the pane and press Enter — selecting the highlighted `❯ 1. Yes`. Measured
+    # on a real danger-audit capture: `case=C action=sent-Enter`, no case-A
+    # record. The same shape held for B (a QUOTED rate-limit menu above a live
+    # prompt reads LIVE to `_unstick_ratelimit_menu_verdict`: the live prompt
+    # replaces the REPL input row, so no input row follows the quoted title, and
+    # a quoted `❯ 1. Stop…` row reads stop-highlighted) and for D (a live
+    # permission prompt renders `Esc to cancel · Tab to amend` within its last
+    # three non-blank rows — 58 of the 61 audits — which satisfies D's
+    # bottom-anchored live-ness gate, so quoted chip-bar literals above it got
+    # Escape + a paste on the orchestrator, and a blocked_question row instead of
+    # a permission_prompt row elsewhere).
+    #
+    # D used to precede A for the opposite reason: A pressed Enter, and its `❯ N.`
+    # pattern would have auto-Entered option 1 of an AskUQ overlay. With A
+    # sending no key that reason is gone, and the ordering it forced is now the
+    # hazard. What remains is the over-refusal it costs, stated: A needs the
+    # literal `Do you want to proceed?` AND a `❯ N.` row anywhere in the capture,
+    # so a live AskUQ / rate-limit menu / api-error wedge whose capture ALSO
+    # carries that title — an AskUQ whose question is literally that sentence,
+    # or a pane quoting a permission prompt within 25 rows — is refused and
+    # surfaced as a permission_prompt decision instead of being dismissed or
+    # nudged. On the orchestrator that means an AskUQ stays up until someone
+    # answers; that is a liveness cost, never a key into a live prompt.
+    #
+    # Deliberately NOT narrowed with a live-ness gate of its own: a gate that
+    # missed a live prompt (a footer reworded upstream) would hand it to an arm
+    # that presses a key, which is the direction this ordering exists to close.
+    if _unstick_pane_has_permission_prompt "$pane"; then _act_permission "$window" "$pane"; printf 'permission'; return 0; fi
+    # LIVE, not merely present (your-org/nexus-code#1598): the two literals alone
+    # matched an agent whose tool call QUOTED them, and the watcher pressed
+    # Enter into that pane and into the orchestrator's. A quoted menu falls
+    # through to the cases below, exactly as a pane without the literals does.
+    # The rate-limit menu precedes D and C only by history; they are disjoint in
+    # what they send a key INTO only because A, above, has already taken every
+    # pane that carries a permission prompt.
+    case "$(printf '%s\n' "$pane" | _unstick_ratelimit_menu_verdict)" in
+        stop-highlighted|other-highlighted)
+            _record_ratelimit_seen "$window" "$pane"
+            printf 'ratelimit'
+            return 0 ;;
+    esac
     # AskUserQuestion chip-bar (Cases D + W). The detection is shared;
     # the WINDOW decides the action:
     #
@@ -742,14 +1040,17 @@ _handle_unstick_window() {
         printf 'api-error'
         return 0
     fi
-    if grep -qE 'Do you want to proceed\?' <<<"$pane" \
-       && grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$pane"; then
-        _act_permission "$window" "$pane"
-        printf 'permission'
-        return 0
-    fi
     return 0
 }
+
+# `unstick_log` dereferences $UNSTICK_LOG, which main.sh always sets — and which
+# is UNSET when this module is sourced standalone (suites, entry.sh). Under a
+# caller's `set -u` that is a fatal expansion, not a failed command, so
+# `|| true` cannot rescue it: the first cut of `_paste_line_to_window`'s logging
+# turned a DELIVERED paste into rc 1 by killing the subshell it ran in, caught
+# by test-paste-dead-pane-guard.sh's non-vacuity arm. Log only where there is a
+# log; the paste's return code never depends on it.
+_unstick_paste_note() { [[ -n "${UNSTICK_LOG:-}" ]] && unstick_log "$@"; return 0; }
 
 # Paste a single line of text to a tmux window via the paste-buffer
 # (avoids the send-keys per-character escaping pitfall). Mirrors the
@@ -782,32 +1083,171 @@ _paste_line_to_window() {
         fi
         return 1
     fi
-    local buf="nexus-unstick-$$-${RANDOM}-${RANDOM}"
     local tmpfile
-    tmpfile=$(mktemp)
+    tmpfile=$(mktemp) || return 1
     printf '%s' "$text" > "$tmpfile"
-    tmux send-keys -t "$window" i BSpace 2>/dev/null || true
-    tmux load-buffer -b "$buf" "$tmpfile" 2>/dev/null || { rm -f "$tmpfile"; return 1; }
-    rm -f "$tmpfile"
-    # BRACKETED (`-p`), as main.sh's emit paste and paste-followup.sh are.
-    # Unbracketed, a REPL that reads this line and the Enter below in ONE chunk
-    # takes the Enter as part of the paste, and the line sits UNSUBMITTED in the
-    # input box. Nothing here checks for that, and the pane then reads
+    # CONFIRMED DELIVERY (your-org/nexus-code#1591). This site used to paste,
+    # press Enter ONCE and return 0 — it checked NOTHING, so a line Claude Code
+    # held in the input box read as delivered, and the pane then read
     # `user-typing input=typed`, which the watcher treats as an operator draft.
-    # Measured on the real binary with a single line and no newline
-    # (your-org/nexus-code#1516). Bracketed, the Enter's CR arrives after
-    # ESC[201~ and is a keypress however the bytes are chunked.
-    tmux paste-buffer -p -b "$buf" -t "$window" 2>/dev/null || {
-        tmux delete-buffer -b "$buf" 2>/dev/null
+    # The whole sequence (normalise, VI-safe BRACKETED paste from a file, Enter,
+    # confirm against the target's transcript, Enter again only on positive
+    # `held` evidence) is monitor/_paste-deliver.sh; the `-p` rationale (#1516)
+    # lives there with the one paste-buffer call.
+    #
+    # EXACT target, never the bare name: tmux resolves a bare `-t <name>` by
+    # unique PREFIX once the window is gone, and this paste + Enter would land
+    # in a live sibling (your-org/nexus-code#1524).
+    # INLINE ON PURPOSE, not `_unstick_exact_target`: test-paste-deliver.sh (and any
+    # rig like it) extracts THIS FUNCTION ALONE out of the file and evals it, so it
+    # must not depend on a sibling helper. Replacing these lines with the helper
+    # broke ten of that suite's rows at 6ab73962 (tgt came back empty: rc 1, zero
+    # keys sent) while test-unstick.sh, which sources the whole file, stayed green.
+    local tgt=""
+    if declare -F resolve_window_id >/dev/null 2>&1; then
+        tgt=$(resolve_window_id "$window" 2>/dev/null || true)
+    fi
+    tgt="${tgt:-:=$window}"
+    # The orchestrator has no heartbeat/<window>.json — its session-id is the
+    # pin. An empty sid degrades to `unverifiable`, never to a wrong answer.
+    local sid=""
+    if [[ "$window" == "${TARGET:-orchestrator}" ]] && declare -F _respawn_read_pin_sid >/dev/null 2>&1; then
+        sid=$(_respawn_read_pin_sid)
+    fi
+    if [[ -z "$sid" ]] && declare -F se_session_id_for_window >/dev/null 2>&1; then
+        sid=$(se_session_id_for_window "$window" "${STATE_DIR:-}" 2>/dev/null) || sid=""
+    fi
+    local rc=0
+    if ! declare -F pd_deliver >/dev/null 2>&1; then
+        rm -f "$tmpfile"
+        printf '_unstick: monitor/_paste-deliver.sh is not loaded — refusing to paste into %q without the confirmed-delivery primitive (your-org/nexus-code#1591)\n' "$window" >&2
         return 1
-    }
-    sleep 0.1
-    tmux send-keys -t "$window" Enter 2>/dev/null || {
-        tmux delete-buffer -b "$buf" 2>/dev/null
-        return 1
-    }
-    tmux delete-buffer -b "$buf" 2>/dev/null || true
-    return 0
+    fi
+    pd_deliver "$tgt" "$window" "$tmpfile" "$sid"; rc=$?
+    rm -f "$tmpfile"
+    case "$rc" in
+        0)  [[ "$PD_OUTCOME" == submitted ]] \
+                || _unstick_paste_note "window=$window action=paste-line outcome=$PD_OUTCOME enter_retries=$PD_ENTER_RETRIES"
+            return 0 ;;
+        3)  # …EXCEPT `undecidable-box`: typed text is POSITIVELY in the input box
+            # and could not be shown to be ours, so no Enter was sent. That is not
+            # "could not confirm", it is "not delivered" — the first cut returned
+            # 0 for it, caught by test-paste-deliver.sh's U-longline row run
+            # against 71ecea4a (rc 0 with the line still held).
+            if [[ "$PD_OUTCOME" == undecidable-box ]]; then
+                _unstick_paste_note "window=$window action=paste-line outcome=NOT-DELIVERED:undecidable-box"
+                return 1
+            fi
+            # unverifiable / in-flight: nothing could confirm and nothing says
+            # the text is stuck. The historical answer, now SAID rather than
+            # assumed.
+            _unstick_paste_note "window=$window action=paste-line outcome=unconfirmed:$PD_OUTCOME${PD_UNVERIFIABLE_REASON:+ reason=\"$PD_UNVERIFIABLE_REASON\"}"
+            return 0 ;;
+        4)  _unstick_paste_note "window=$window action=paste-line outcome=NOT-SUBMITTED:$PD_OUTCOME enter_retries=$PD_ENTER_RETRIES"
+            return 1 ;;
+        *)  return 1 ;;
+    esac
+}
+
+# ---- case B's Enter is an EQUALITY, not a shape (your-org/nexus-code#1598) ----
+#
+# An Enter aimed at a select menu SELECTS ITS HIGHLIGHTED ROW, and an Enter aimed
+# at an input box SUBMITS WHATEVER IS IN IT. Case B used to press one BLIND, twice
+# per cascade: into every window it had classified, and into the orchestrator's
+# pane — the pane the operator types into — "to dismiss any menu (no-op if the
+# orchestrator wasn't stuck)". That is true of an EMPTY box only.
+#
+# MEASURED, 2026-09-19 15:36:43 PDT, on the live board (watcher at 17f1f926): a
+# worker's tool call QUOTED both menu literals; the two-grep detection classified
+# its pane as rate-limited, and because a `ratelimit.reset.epoch` written eleven
+# hours earlier for a window that had since gone was still on disk, the cascade
+# fired ONE SECOND later: a blind Enter and a paste into a busy worker, then a
+# blind Enter and a false heads-up into the orchestrator. The capture is
+# monitor/watcher/fixtures/ratelimit-quoted-realpane-273.txt.
+#
+# AND WHAT THE ENTER SELECTS IS UPSTREAM'S TO DECIDE. Read out of the Claude Code
+# 2.1.273 bundle, the menu's option list is
+#     Vo ? [...billing, stop, ...rest] : [stop, ...rest, ...billing]
+# with `Vo = P("tengu_jade_anvil_4", !1)`, a server-side flag whose client
+# default is false. With it on, the highlighted default is `Upgrade your plan` or
+# a usage-credits action, and a blind Enter selects THAT — the #1200 hazard (an
+# Enter into an overlay committed 325 MB), with a billing action as the default.
+#
+# So the Enter is pressed only when a capture taken AT THAT MOMENT, on the EXACT
+# target, positively reads `stop-highlighted`. Everything else gets no key and a
+# log line.
+#
+# _unstick_ratelimit_menu_verdict   (pane text on stdin) prints ONE of
+#   stop-highlighted   a LIVE menu whose highlighted row is the Stop option
+#   other-highlighted  a LIVE menu whose highlighted row is anything else
+#   quoted             the literals are on the pane, the menu is not live
+#   none               the literals are not both there
+#
+# LIVE means: after the LAST `What do you want to do?` there is a highlighted
+# option row (`❯ N. label`) and NO REPL input row. A live dialog REPLACES the
+# input box; a pane that merely displays the text keeps its box — `❯` followed by
+# a no-break space, bytes read off 2.1.273 and 2.1.278 — beneath it, busy or idle.
+#
+# FIDELITY, stated. The option ORDER above is a citation into the bundle. The
+# RENDERED shape of the live menu is a MODEL: the synthetic fixture plus the real
+# permission-prompt captures of the same Select component, because nobody can
+# produce a rate-limited account on demand.
+#
+# ERROR DIRECTION, CORRECTED (skeptic pastefusk F3). This block used to promise
+# that a wrong model reads `quoted` or `other-highlighted`, "never a wrong
+# Enter". THAT GUARANTEE WAS FALSE as written, and a false guarantee in a header
+# is worse than none: the REPL-row arm demanded the glyph at column 1 while the
+# option-row arm tolerated indentation, so a quoted menu with a one-space-
+# indented input row selected NEITHER arm and came back `stop-highlighted` —
+# measured at 3 send-keys into a pane that was only displaying the text. Both
+# arms now carry the same tolerance. What the direction claim rests on is
+# therefore narrower and stateable: any pane whose rendering still shows an
+# input row — at any indentation, with or without a box border — reads `quoted`,
+# and a shape that matches no arm at all reads `quoted` too, because `hl` stays
+# empty. A model error can still mis-read WHICH option is highlighted, and that
+# direction is `other-highlighted`: no Enter.
+# KNOWN BLIND SPOT, pre-existing and unchanged: under usage-based billing the
+# bundle labels the option `Stop`, without the literal this file keys on, so such
+# an account is never classified at all.
+_unstick_ratelimit_menu_verdict() {
+    LC_ALL=C awk '
+        { line[NR] = $0 }
+        index($0, "What do you want to do?") > 0 { title = NR }
+        index($0, "Stop and wait for limit") > 0 { stop = 1 }
+        END {
+            if (!title || !stop) { print "none"; exit }
+            hl = ""
+            for (i = title + 1; i <= NR; i++) {
+                if (line[i] ~ /^[ \t]*(\342\224\202)?[ \t]*\342\235\257[ \t]+[0-9]+\./) {
+                    if (hl == "") hl = line[i]
+                } else if (line[i] ~ /^[ \t]*(\342\224\202)?[ \t]*\342\235\257/) {
+                    # SAME leading-whitespace tolerance as the option-row arm
+                    # above (skeptic pastefusk F3). It demanded the glyph at
+                    # COLUMN 1, so a REPL input row indented by one space matched
+                    # NEITHER arm, the scan ran past it, and a QUOTED menu
+                    # returned stop-highlighted — a wrong Enter, measured at 3
+                    # send-keys into a pane that only displayed the text. A
+                    # safe-side arm must never be WIDER than the hazard-side arm
+                    # it is paired with (#1121). Order still separates them: the
+                    # option row is the more specific pattern and is tested first.
+                    print "quoted"; exit
+                }
+            }
+            if (hl == "") { print "quoted"; exit }
+            if (index(hl, "Stop and wait for limit") > 0) print "stop-highlighted"
+            else print "other-highlighted"
+        }'
+}
+
+# The EXACT tmux target for <window>: a resolved @id, else `:=<name>`. Never the
+# bare name — tmux resolves that by unique PREFIX once the window is gone, and the
+# key lands in a live sibling at rc 0 (your-org/nexus-code#1524).
+_unstick_exact_target() {
+    local window="$1" tgt=""
+    if declare -F resolve_window_id >/dev/null 2>&1; then
+        tgt=$(resolve_window_id "$window" 2>/dev/null || true)
+    fi
+    printf '%s' "${tgt:-:=$window}"
 }
 
 # Cascade the unstick to a single non-orchestrator window: Enter to
@@ -815,13 +1255,25 @@ _paste_line_to_window() {
 # continue. Returns 0 on success.
 _cascade_unstick_to_window() {
     local window="$1"
-    local pane
-    pane=$(tmux capture-pane -t "$window" -p -S -25 2>/dev/null) || return 1
+    local pane tgt verdict
+    tgt=$(_unstick_exact_target "$window")
+    # Re-read HERE, on the exact target: the detection that put this window on
+    # the list is up to one pd_deliver per earlier window old (~9 s each).
+    pane=$(tmux capture-pane -t "$tgt" -p -S -25 2>/dev/null) || return 1
     local fp
     fp=$(printf '%s\n' "$pane" | _unstick_fingerprint)
     local audit="$UNSTICK_DIR/${window}.ratelimit.${fp}.audit"
     [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
-    if ! tmux send-keys -t "$window" Enter 2>/dev/null; then
+    # A PERMISSION PROMPT ON THE RE-READ PANE OUTRANKS THE MENU VERDICT (#1626,
+    # the residual of your-org/nexus-code#1599): a quoted `❯ 1. Stop…` above a
+    # live prompt reads stop-highlighted, and the Enter would answer the prompt.
+    _unstick_pane_has_permission_prompt "$pane" && { unstick_log "window=$window case=B action=cascade-refused reason=permission-prompt fp=$fp audit=$(basename "$audit") — NO Enter: a live permission prompt is Case A's, never answered (your-org/nexus-code#1599)"; return 1; }
+    verdict=$(printf '%s\n' "$pane" | _unstick_ratelimit_menu_verdict)
+    if [[ "$verdict" != stop-highlighted ]]; then
+        unstick_log "window=$window case=B action=cascade-refused reason=${verdict:-unreadable} fp=$fp audit=$(basename "$audit") — NO Enter: it would select whatever is highlighted, or submit whatever is in the box (your-org/nexus-code#1598)"
+        return 1
+    fi
+    if ! tmux send-keys -t "$tgt" Enter 2>/dev/null; then
         unstick_log "window=$window case=B action=cascade-send-keys-failed fp=$fp"
         return 1
     fi
@@ -856,9 +1308,44 @@ _cascade_heads_up_orchestrator() {
         unstick_log "case=B action=heads-up-skip target=$target reason=window-missing"
         return 1
     fi
-    # Enter to dismiss any menu (no-op if the orchestrator wasn't stuck).
-    tmux send-keys -t "$target" Enter 2>/dev/null || true
-    sleep 0.1
+    # THE PRE-ENTER IS NO LONGER BLIND (your-org/nexus-code#1598). It used to be
+    # pressed unconditionally, "no-op if the orchestrator wasn't stuck" — true of
+    # an EMPTY box only, and this is the pane the operator types into. Now: a
+    # dismiss Enter only on a live menu whose highlighted row IS the Stop option,
+    # read at this moment on the exact target.
+    #
+    # rc 2 = DEFERRED, distinct from rc 1 = failed: the caller parks the heads-up
+    # in `ratelimit.headsup.pending` and `_retry_pending_heads_up` tries again
+    # each cycle. Two things defer it, and neither gets a key or a paste:
+    #   * a live menu with something ELSE highlighted — a human's decision;
+    #   * typed text ALREADY in the input box (`held` / `draft`). It cannot be
+    #     ours, we have pasted nothing yet; pasting would append the heads-up to
+    #     the operator's draft and the primitive's first Enter would submit both.
+    local tgt pane verdict
+    tgt=$(_unstick_exact_target "$target")
+    pane=$(tmux capture-pane -t "$tgt" -p -S -25 2>/dev/null) || pane=""
+    # Same guard as the cascade (#1626, residual of your-org/nexus-code#1599):
+    # a permission prompt on the orchestrator gets no pre-Enter and no paste.
+    # DEFERRED, not failed — it is a human's decision, and the retry owns it.
+    _unstick_pane_has_permission_prompt "$pane" && { [[ -n "${_UNSTICK_HEADSUP_QUIET:-}" ]] || unstick_log "case=B action=heads-up-deferred target=$target reason=permission-prompt n=$n — NO Enter, no paste: a live permission prompt is Case A's (your-org/nexus-code#1599)"; return 2; }
+    verdict=$(printf '%s\n' "$pane" | _unstick_ratelimit_menu_verdict)
+    case "$verdict" in
+        stop-highlighted)
+            tmux send-keys -t "$tgt" Enter 2>/dev/null || true
+            sleep 0.2 ;;
+        other-highlighted)
+            [[ -n "${_UNSTICK_HEADSUP_QUIET:-}" ]] \
+                || unstick_log "case=B action=heads-up-deferred target=$target reason=menu-other-highlighted n=$n — NO Enter: the menu's default is not the Stop option"
+            return 2 ;;
+    esac
+    if declare -F pd_pane_verdict >/dev/null 2>&1; then
+        case "$(pd_pane_verdict "$target")" in
+            held|draft)
+                [[ -n "${_UNSTICK_HEADSUP_QUIET:-}" ]] \
+                    || unstick_log "case=B action=heads-up-deferred target=$target reason=operator-draft n=$n — typed text is already in the input box; no key, no paste"
+                return 2 ;;
+        esac
+    fi
     local headsup
     headsup="Heads-up from watcher: rate limit reset; auto-unstuck ${n} agent window(s) (${windows[*]}). Verify each is making progress and re-dispatch if not. Then run: monitor/ng log-action monitor --event ratelimit-resume-ack --note \"saw heads-up\""
     if ! _paste_line_to_window "$target" "$headsup"; then
@@ -965,10 +1452,86 @@ _act_ratelimit() {
             n=$(( n + 1 ))
         fi
     done
-    _cascade_heads_up_orchestrator "$n" "${windows[@]}"
-    printf '%s\n' "$now" > "$cascade_file"
+    local hrc=0
+    _cascade_heads_up_orchestrator "$n" "${windows[@]}" || hrc=$?
+    if (( hrc == 2 )); then
+        # DEFERRED: no ack can be owed for a heads-up nobody has received, so the
+        # cascade marker (which starts the ack clock) is NOT written yet.
+        printf '%s\t%s\t%s\n' "$now" "$n" "${windows[*]}" > "$UNSTICK_DIR/ratelimit.headsup.pending"
+    else
+        printf '%s\n' "$now" > "$cascade_file"
+    fi
     rm -f "$reset_file" "$wait_file"
     unstick_log "case=B action=cascade-complete unstuck=$n total_windows=${#windows[@]} target=$target"
+}
+
+# Retry a heads-up `_cascade_heads_up_orchestrator` deferred (rc 2). Runs at the
+# top of every cycle. The give-up age is CHOSEN, not measured: 900 s is long
+# enough for an operator to finish a draft and short enough that a stale "I just
+# unstuck N windows" is not delivered into a board that has long since moved on.
+#
+# AN ABANDONED HEADS-UP ENDS THE EPISODE WITH THE ORCHESTRATOR UNINFORMED, and
+# `case=B action=heads-up-abandoned` IS that episode's terminal record — not
+# `orchestrator-unresponsive` (skeptic pastefusk F2, answered as a scoped
+# refusal rather than a code change).
+#
+# Why not simply write `ratelimit.cascade.epoch` on the abandon branches so the
+# ack machinery runs its course, as it did before this file grew a deferral:
+# that marker starts an ACK CLOCK, and `_check_orchestrator_ack` would then log
+# `orchestrator-unresponsive` for a heads-up NOBODY EVER SENT. That line names
+# the orchestrator as the faulty party; emitting it here would be a false
+# statement about it, and the operator-facing surface is exactly where a false
+# attribution costs the most. No ack can be owed for an undelivered message.
+#
+# So the reachability change is REAL and deliberate: for an episode whose
+# heads-up is abandoned, `orchestrator-unresponsive` is unreachable by
+# construction. The replacement signal is strictly more informative — it names
+# WHY the orchestrator was never told (`malformed-pending` / `deferred-too-long`,
+# with the age and the ceiling) instead of asserting that it failed to answer.
+_retry_pending_heads_up() {
+    local pending="$UNSTICK_DIR/ratelimit.headsup.pending"
+    [[ -f "$pending" ]] || return 0
+    local p_epoch="" p_n="" p_windows="" now max rc=0
+    IFS=$'\t' read -r p_epoch p_n p_windows < "$pending" || true
+    now=$(date +%s)
+    max="${RATELIMIT_HEADSUP_DEFER_MAX_S:-900}"
+    [[ "$max" =~ ^[0-9]+$ ]] || max=900
+    if ! [[ "$p_epoch" =~ ^[0-9]+$ && "$p_n" =~ ^[0-9]+$ ]]; then
+        unstick_log "case=B action=heads-up-abandoned reason=malformed-pending — the orchestrator was NEVER told about this cascade; this line is the episode's terminal record, and orchestrator-unresponsive will not fire for it"
+        rm -f "$pending"; return 0
+    fi
+    if (( now - p_epoch >= max )); then
+        unstick_log "case=B action=heads-up-abandoned reason=deferred-too-long age_s=$(( now - p_epoch )) max_s=$max n=$p_n windows=$p_windows — the orchestrator was NEVER told about this cascade; this line is the episode's terminal record, and orchestrator-unresponsive will not fire for it"
+        rm -f "$pending"; return 0
+    fi
+    local -a p_list=()
+    read -r -a p_list <<<"$p_windows"
+    # QUIET: the deferral was logged once, when it was parked.
+    local _UNSTICK_HEADSUP_QUIET=1
+    _cascade_heads_up_orchestrator "$p_n" "${p_list[@]}" || rc=$?
+    (( rc == 2 )) && return 0
+    # Delivered (0) or failed outright (1): either way it is no longer pending,
+    # and the ack clock starts now — the same marker the undeferred path writes.
+    rm -f "$pending"
+    printf '%s\n' "$now" > "$UNSTICK_DIR/ratelimit.cascade.epoch"
+    return 0
+}
+
+# A reset epoch that has ELAPSED while nobody is stuck belongs to a finished
+# episode. Left on disk it makes the NEXT episode cascade in the same second it
+# is detected — "the limit has reset" pasted into a pane that has just hit it
+# (measured 2026-09-19: written 04:08 for a window long gone, fired 15:36:44).
+# A FUTURE epoch is kept: one cycle with no stuck window can be a failed capture,
+# and an early clear would only push the cascade later.
+_ratelimit_episode_over() {
+    local reset_file="$UNSTICK_DIR/ratelimit.reset.epoch"
+    [[ -f "$reset_file" && ! -f "$UNSTICK_DIR/ratelimit.cascade.epoch" ]] || return 0
+    local e now
+    e=$(<"$reset_file"); now=$(date +%s)
+    if ! [[ "$e" =~ ^[0-9]+$ ]] || (( e <= now )); then
+        unstick_log "case=B action=episode-ended reason=no-stuck-window stale_reset_epoch=${e:-<empty>}"
+        rm -f "$reset_file" "$UNSTICK_DIR/ratelimit.last-wait.epoch"
+    fi
 }
 
 # Verify the orchestrator acknowledged the most recent cascade by
@@ -1013,6 +1576,7 @@ detect_and_unstick() {
     [[ "${AUTO_UNSTICK,,}" == "true" ]] || return 0
     command -v tmux >/dev/null 2>&1 || return 0
     _check_orchestrator_ack
+    _retry_pending_heads_up
     local windows
     windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null) || return 0
     local -a ratelimit_windows=()
@@ -1026,5 +1590,7 @@ detect_and_unstick() {
     done <<<"$windows"
     if (( ${#ratelimit_windows[@]} > 0 )); then
         _act_ratelimit "${ratelimit_windows[@]}"
+    else
+        _ratelimit_episode_over
     fi
 }

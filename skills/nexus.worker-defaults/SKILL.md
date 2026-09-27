@@ -288,15 +288,22 @@ a hook or your task prompt points you there.
     dir that fits. Keep it short: `/tmp/<brief>`, never the
     scratchpad — **for the SOCKET DIRECTORY ONLY.** `/tmp/c71780` and
     any short `TMUX_TMPDIR` you pick hold tmux sockets and nothing
-    else; everything else you write goes under the session scratchpad
-    (`$TMPDIR`) or inside your clone. Measured 2026-09-03: workers who
+    else; everything else you write goes under `$TMPDIR` (see the
+    `/tmp/c71780` bullet below for why it is safe to name now) or inside
+    your clone. Measured 2026-09-03: workers who
     read "put scratch in `/tmp/c71780`" literally left **16.5 GiB** of
     per-window payload in a directory whose short name exists for the
     108-byte `sun_path` limit, and `monitor/tmpfs-guard.sh --check`
     now goes UNHEALTHY above `monitor.tmpfs.max_c71780_payload_mib`
     (<your-org>/nexus-code#1422).
   - **Never hand-roll a mutation gate** — `monitor/mutation-gate.sh
-    --suite <f> --list`, then `--line N`. Commenting a line that
+    --suite <f> --list`, then `--line N`. **That form mutates the SUITE
+    and answers only "is this assertion REACHED". To ask "would my suite
+    CATCH A DEFECT", add `--subject <code-under-test>`** — the tracked
+    file is never edited, an inert mutant is refused rather than reported
+    `survived`, and `--mode if-true|if-false|subst` weakens a guard you
+    cannot delete. Write the flip set to a `--predict` file FIRST, with a
+    case that must NOT flip (`#1519`). Commenting a line that
     does not END a logical line does not delete it, it PROMOTES the
     next line to a standalone command; one such mutant executed
     `yes yes` and filled the sandbox-wide 378 GB `/tmp` to 8 KB
@@ -310,7 +317,13 @@ a hook or your task prompt points you there.
     `--allow-dirty` (`#1001`). Throwaway clones only.
 - **`ng send` returning `UNKNOWN` is not a licence to re-send** (a fallback fires only on rc 4);
   resolve it after the fact with `ng send <window> --check --last` (or `--list`, then `--check --nonce <hex>`).
-- **`sandbox-notify "<msg>"`** on blocker / ready / done.
+- **`sandbox-notify "<msg>"`** on blocker / ready / done. It delivers
+  ATTENTION, not content: the real tool discards its argument and emits
+  a bare BEL, so the operator learns that *something* happened, never
+  *what* (<your-org>/nexus-code`#1533`; measured: the tool assigns `msg`
+  once and never reads it). Your words reach only the notify wrapper's
+  decision log. Anything a human must READ goes in your report, on the
+  thread, or through `SendMessage`.
 - **You can reach the orchestrator mid-task — `SendMessage`.** Use it
   for a blocker, a scope question, or a finding that should not wait
   for your report; `sandbox-notify` has been observed missed, and
@@ -363,7 +376,14 @@ a hook or your task prompt points you there.
   Exactly two things re-invoke this agent when a wait ends: the Bash
   tool's `run_in_background` option (the harness re-invokes you when
   the job exits, which is what makes a typed rc actionable) and a
-  `Monitor` until-loop (for a condition rather than a job). A parked
+  `Monitor` until-loop (for a condition rather than a job). **Since
+  Claude Code 2.1.271 a `Monitor` re-invokes you on its condition OR
+  on its deadline, whichever comes first — at most 30 minutes (10 in
+  `-p` runs), enforced at arm time and at runtime. An expiry notice
+  means RE-ARM, not "done": it is an answer about the clock, never
+  about the condition** (<your-org>/nexus-code`#1540`, `#1549`). A wait
+  expected to outlive 30 minutes belongs to `ng longjob` (next bullet),
+  which survives the cap. A parked
   agent must be able to name what will RE-INVOKE it; if the answer is
   a status file, it is not parked — it is asleep. Measured: a skeptic
   `await` launched through `async-run.sh` expired cleanly (rc 4,
@@ -409,10 +429,19 @@ a hook or your task prompt points you there.
 - **`/tmp/c71780` holds SOCKETS ONLY** (<your-org>/nexus-code`#1422`).
   Its short name exists for the 107-byte `sun_path` limit and nothing
   else; it held 16.5 GiB of per-worker scratch because briefs handed it
-  out as general scratch. Scratch goes under the session scratchpad
-  (`$TMPDIR` / the directory your brief names) or inside your clone —
+  out as general scratch. Scratch goes under `$TMPDIR`, the directory
+  your brief names, or inside your clone —
   never under `/tmp/c71780`, which the tmpfs reaper deliberately never
   touches because live sockets are exactly what it must not delete.
+  **`$TMPDIR` is set for you, and you check it once** (<your-org>/nexus-code`#1628`):
+  Claude Code leaves TMPDIR UNSET, so `$TMPDIR/x` used to be `/x` at the
+  sandbox ROOT, at rc 0 (three stray writes in one session), and
+  `rm -rf $TMPDIR/foo` is `rm -rf /foo`. The nexus shell prelude now sets a
+  private per-user directory (`/tmp/claude-<uid>/tmp`, mode 0700) in every
+  agent shell whose TMPDIR is unset or empty, and warns on stderr when it
+  cannot. Run `echo "TMPDIR=[$TMPDIR]"` once; if it prints `[]`, stop and
+  say so rather than writing through it. In anything destructive, write
+  `"${TMPDIR:?}/<path>"`, which fails LOUD when empty.
 - **An orphan left by your OWN backgrounded Bash call is stopped
   with `TaskStop`, not with a signal — and the guard that refuses
   it is right.** Backgrounding makes that shell its own SESSION

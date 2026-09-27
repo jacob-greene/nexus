@@ -100,12 +100,10 @@ _GHSG_APPLIED='jq +(-r +)?"\\?\$[A-Za-z_]'
 _GHSG_OPTOUT='# jq-blind:'
 
 _ghsg_population_files() {
-    ( cd "$REPO_ROOT" && git ls-files -- monitor ) | while IFS= read -r f; do
-        [ -f "$REPO_ROOT/$f" ] || continue
-        if grep -qE "$_GHSG_STUBMAKER" "$REPO_ROOT/$f" 2>/dev/null; then
-            printf '%s\n' "$f"
-        fi
-    done
+    # One batched `grep -lE` (argument order kept) instead of a grep per file
+    # (bundle-0923). `xargs` execs the grep BINARY, never a shell function.
+    ( cd "$REPO_ROOT" && git ls-files -z -- monitor \
+        | xargs -0 -r grep -lE -e "$_GHSG_STUBMAKER" -- 2>/dev/null ) || true
 }
 
 # _ghsg_classify <absolute-path> -> OK | BLIND | EXEMPT | NA

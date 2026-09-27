@@ -108,6 +108,16 @@
 #                                           to stderr. Reads stdin when no
 #                                           pid arguments are given.
 #   proc-kill-authorized --quiet <pid>      no output; rc is the answer
+#   proc-kill-authorized --orphans …        OPT-IN, composes with the above:
+#                                           additionally authorise anything
+#                                           THIS SESSION LAUNCHED that is now
+#                                           reparented to init in a session
+#                                           whose leader is gone. That is a
+#                                           dead tool call's orphan AND a
+#                                           process that daemonized itself on
+#                                           purpose: OWNERSHIP BY LAUNCH, never
+#                                           intent (see "THE ORPHAN ARM").
+#                                           Without this flag nothing changes.
 #
 # Exit: 0 — every pid examined is authorised (and, under --filter, at
 #           least the examined set was resolvable)
@@ -165,6 +175,95 @@
 #                           <= 1. pid 1 is the namespace's init.
 #
 # ---------------------------------------------------------------------------
+# THE ORPHAN ARM — `--orphans`, opt-in (your-org/nexus-code#1543)
+# ---------------------------------------------------------------------------
+#
+# THE GAP. Every FOREGROUND Bash tool call is its own SESSION LEADER. A rig
+# that kills a parent before its grandchildren leaves loops reparented to init
+# in a session whose leader died with the call. Measured on this host:
+#
+#     orphan 13631  state S  ppid 1 (bwrap)  sid 13563   /proc/13563: GONE
+#     verdict: not-owned session-13563-is-not-ours-10329     (no hint at all)
+#
+# The refusal is correct by the session rule — and it left the agent that
+# provably started the process with NO sanctioned stop: no task id for
+# TaskStop (it was a foreground call), nothing for svc.sh, and `pkill -f` is
+# rightly forbidden. `_detached_hint` said nothing because its arms key on the
+# pid BEING a session leader; this one is a MEMBER of a dead leader's session.
+#
+# WHY THIS IS A SEPARATE, OPT-IN MODE AND NOT A WIDER DEFAULT. The session
+# predicate's strength is that it cannot produce a false PERMIT. Anything that
+# authorises across a session boundary gives that up and must earn it back
+# conjunct by conjunct — so the default path is byte-for-byte what it was, and
+# this arm runs only when the caller asked for it, only AFTER every deny arm
+# above it (`not-a-pid`, `caller-session-unknown`, `absent`, `unreadable`,
+# `self`), and is itself a CONJUNCTION OF EQUALITIES with a default-DENY: no
+# glob, no substring, no argv (#1121 — the hazard lives where arms are
+# patterns).
+#
+# `authorized` under `--orphans` requires ALL of:
+#
+#   O1  the CALLER has a CLAUDE_CODE_SESSION_ID of UUID shape. No identity on
+#       the left-hand side, no comparison.
+#   O2  the target's SESSION LEADER IS DEAD — /proc/<sid> does not exist. A
+#       live leader is a running tool call, a backgrounded task (TaskStop has
+#       the handle), a pane, or a service: never this arm's business. While any
+#       member of the session survives the kernel cannot recycle that number
+#       as a pid, so "no /proc/<sid>" is not a reuse race.
+#   O3  it is REPARENTED: walking ppid from the target, every hop stays inside
+#       that same session, none is a `claude`, and the walk ends at pid 1
+#       within 32 hops. A process whose parent is alive OUTSIDE the session is
+#       somebody's supervised child, not an orphan.
+#   O4  its ENVIRON carries CLAUDE_CODE_SESSION_ID, and EVERY occurrence equals
+#       the caller's. The harness sets this per agent for its tool shells
+#       (measured: this agent's own `claude` process carries none; its tool
+#       shell carries its own), it is a 122-bit random value, and environment
+#       is inherited only DOWNWARD — so a sibling agent's orphan carries the
+#       SIBLING's id and lands in the default-deny.
+#   O5  the CALLER has a numeric CLAUDE_PID that is ONE OF ITS OWN ANCESTORS,
+#       read from /proc (no incarnation on the left-hand side, no comparison:
+#       a caller without one is REFUSED, and one carrying an unrelated value is
+#       not believed), and
+#       its CLAUDE_PID is the caller's, or names a pid that is GONE (the
+#       incarnation that launched it — a respawned session keeps its id). A
+#       DIFFERENT, LIVE CLAUDE_PID is a second live incarnation of the same
+#       session id, and that one is refused.
+#   O6  the target is not itself a `claude`.
+#
+# THE TRUE EXTENT, which is WIDER than the case it was built for (skeptic F1 on
+# #1568 — measured on a live board). O1..O6 do not describe "a rig's orphan".
+# They describe ANYTHING this agent's session ever launched from a tool shell,
+# in ANY incarnation, that now sits reparented to init in a session whose leader
+# has exited. A DELIBERATELY DAEMONIZED process has exactly that shape: a
+# double-forking daemon leaves a dead session leader behind on purpose. Measured:
+# a `git-credential-cache--daemon` SHARED BY EVERY AGENT, carrying the
+# orchestrator's session id, is `authorized=1` under `--orphans` for the
+# orchestrator. The arm cannot tell an accident from a daemon, and it does not
+# claim to. A SESSION-LEADER test does not separate them either, and that was
+# MEASURED rather than assumed: that daemon (pid 3273, sid 1732, /proc/1732 gone)
+# is a NON-leader — it forks and lets its parent exit, it never calls setsid() —
+# which is the same cell a real #1543 orphan sits in (pid 13631, sid 13563). A
+# daemon that DOES setsid() is a leader and O2 already refuses it (T17 row 14).
+# `--orphans` is OWNERSHIP BY LAUNCH, and hole 1 above — ownership is
+# not intent — applies with more force here than anywhere else in this file.
+# Read what the pid IS before you kill it.
+#
+# WHAT IT STILL CANNOT TELL YOU, stated:
+#   * /proc/<pid>/environ is the EXEC-TIME environment, and a process may
+#     rewrite its own. The model here is ACCIDENT, not adversary — the same
+#     model as everything else in this file.
+#   * a child you started with a scrubbed environment (`env -i`) carries no
+#     evidence and is refused. False refusal, the safe direction.
+#   * a headless `claude` YOU launched from a tool call, and everything under
+#     it while it lives, is refused (O6, O3); its own tool calls' orphans carry
+#     ITS session id, not yours (O4).
+#   * holes 1 and 2 above (ownership is not intent; TOCTOU) apply unchanged.
+#
+# The default-mode refusal now SAYS when this arm would apply
+# (`ORPHAN-OF-YOURS`), so the two readings of `not-owned` are no longer
+# indistinguishable — without authorising anything.
+#
+# ---------------------------------------------------------------------------
 # IMPLEMENTATION NOTE — /proc/<pid>/stat MUST NOT be parsed by field index
 # ---------------------------------------------------------------------------
 #
@@ -193,6 +292,13 @@ _usage() {
 usage: proc-kill-authorized <pid> [<pid>…]
        proc-kill-authorized --filter [<pid>…]   # stdin when no pids given
        proc-kill-authorized --quiet <pid>
+       proc-kill-authorized --orphans …         # opt-in: also authorise anything THIS
+                                                # SESSION launched that is now reparented
+                                                # to init in a session whose leader is
+                                                # gone (#1543). That is a dead tool call's
+                                                # orphan AND a deliberately daemonized,
+                                                # possibly SHARED process: ownership by
+                                                # launch, never intent. Read its cmdline.
 
 Answers "may I kill this pid?" by SESSION OWNERSHIP, as an allowlist with a
 default-deny arm. Refuses anything it cannot positively attribute to the
@@ -370,6 +476,77 @@ _detached_hint() {
         "$pid" "$why"
 }
 
+# _comm_of <pid> -> echoes comm (the text between the FIRST "(" and the LAST ")").
+_comm_of() {
+    local line
+    { read -r line < "/proc/$1/stat"; } 2>/dev/null || return 1
+    [[ "$line" == *") "* ]] || return 1
+    line="${line%) *}"; printf '%s' "${line#*(}"
+}
+
+# _orphan_of_mine <pid> <sid> -> rc 0 iff O1..O6 ALL hold (see the header).
+# On rc 1, _ORPHAN_WHY names the FIRST conjunct that failed. Default-DENY: every
+# unreadable, unparseable or unexpected input returns 1.
+_ORPHAN_WHY=""
+_UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+_orphan_of_mine() {
+    local pid="$1" sid="$2" me="${CLAUDE_CODE_SESSION_ID:-}" cur pp csid comm hop ok=0
+    local entry have=0 tcp="" tcp_seen=0
+    _ORPHAN_WHY="O1-caller-has-no-uuid-session-id"
+    [[ "$me" =~ $_UUID_RE ]] || return 1
+    _ORPHAN_WHY="O2-session-leader-$sid-is-alive"
+    [[ "$sid" =~ ^[0-9]+$ ]] && (( sid > 1 )) || return 1
+    [[ -e "/proc/$sid" ]] && return 1
+    _ORPHAN_WHY="O3-not-reparented-to-init-inside-its-own-session"
+    cur="$pid"
+    for hop in $(seq 1 32); do
+        csid=$(_session_of "$cur") || return 1
+        [[ "$csid" == "$sid" ]] || return 1
+        comm=$(_comm_of "$cur") || return 1
+        case "$comm" in claude|claude.exe|claude-code) _ORPHAN_WHY="O6-a-claude-is-on-its-lineage"; return 1 ;; esac
+        pp=$(_ppid_of "$cur") || return 1
+        [[ "$pp" =~ ^[0-9]+$ ]] || return 1
+        if (( pp == 1 )); then ok=1; break; fi
+        (( pp > 1 )) || return 1
+        cur="$pp"
+    done
+    (( ok == 1 )) || return 1
+    _ORPHAN_WHY="O4-environ-unreadable-or-carries-no-matching-session-id"
+    [[ -r "/proc/$pid/environ" ]] || return 1
+    while IFS= read -r -d '' entry; do
+        case "$entry" in
+            CLAUDE_CODE_SESSION_ID=*)
+                [[ "${entry#CLAUDE_CODE_SESSION_ID=}" == "$me" ]] || return 1
+                have=1 ;;
+            CLAUDE_PID=*) tcp="${entry#CLAUDE_PID=}"; tcp_seen=$(( tcp_seen + 1 )) ;;
+        esac
+    done < <( { cat "/proc/$pid/environ"; } 2>/dev/null )
+    (( have == 1 )) || return 1
+    # O5 IS NOT OPTIONAL (skeptic F2 on #1568). The first cut ran this only when
+    # the CALLER had a CLAUDE_PID, so a caller without one skipped the conjunct
+    # entirely — measured: an orphan carrying a DIFFERENT, LIVE CLAUDE_PID came
+    # back authorized=1. A caller that cannot name its own incarnation cannot
+    # tell it from another live one; that is a refusal, not a pass.
+    _ORPHAN_WHY="O5-caller-has-no-numeric-CLAUDE_PID"
+    [[ "${CLAUDE_PID:-}" =~ ^[0-9]+$ ]] || return 1
+    # …AND IT MUST BE ONE OF THE CALLER'S OWN ANCESTORS (delta skeptic G5 on
+    # #1568). CLAUDE_PID is an environment variable, so the conjunct above
+    # trusted whatever the caller carried: a live, UNRELATED value X authorised
+    # any orphan stamped X (bounded to this session id, but not to this
+    # incarnation — which is the whole of what O5 claims). The harness's claude
+    # IS an ancestor of every tool shell it starts, and ancestry is read from
+    # /proc, not from the environment.
+    _ORPHAN_WHY="O5-caller-CLAUDE_PID-is-not-one-of-its-own-ancestors"
+    [[ "$_ancestors" == *" $CLAUDE_PID "* ]] || return 1
+    _ORPHAN_WHY="O5-launched-by-a-different-LIVE-claude-incarnation"
+    (( tcp_seen == 1 )) && [[ "$tcp" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$tcp" != "$CLAUDE_PID" ]]; then
+        [[ -e "/proc/$tcp" ]] && return 1
+    fi
+    _ORPHAN_WHY=""
+    return 0
+}
+
 # _verdict <pid> -> echoes "<kind> <detail>"; rc 0 only for `authorized`.
 _verdict() {
     local pid="$1" sid rc
@@ -401,6 +578,23 @@ _verdict() {
     esac
 
     if [[ "$sid" != "$MY_SESSION" ]]; then
+        # THE ORPHAN ARM (your-org/nexus-code#1543) — see the header. `self`
+        # is tested FIRST, in both modes' order: an ancestor is never an orphan,
+        # and no SAFE arm may precede a DENY arm that could fire on the same
+        # input (#1121). `_orphan_of_mine` is equalities only, default-deny.
+        if [[ "$_ancestors" != *" $pid "* ]] && _orphan_of_mine "$pid" "$sid"; then
+            if (( orphans == 1 )); then
+                printf 'authorized orphan-of-dead-session-%s-launched-by-this-claude-session' "$sid"
+                return 0
+            fi
+            # The hint states what was ESTABLISHED and nothing about HOW the pid
+            # came to be this way (skeptic F1 on #1568): the first wording said
+            # "what a FOREGROUND tool call left behind when its parent was killed"
+            # about a deliberately daemonized, SHARED git-credential-cache daemon.
+            printf 'not-owned session-%s-is-not-ours-%s LAUNCHED-BY-YOUR-SESSION (ORPHAN-OF-YOURS): established -- session %s has NO live leader, pid %s is reparented to init inside it, and its environ carries THIS agent'"'"'s CLAUDE_CODE_SESSION_ID. NOT established -- WHY. Two things look like this: what a foreground Bash tool call orphaned when a parent was killed before its children (your-org/nexus-code#1543; there is no TaskStop handle for that), and a process that DAEMONIZED ITSELF ON PURPOSE and may be SHARED with other agents (a git credential cache, an ssh-agent). Read its cmdline before anything else. --orphans authorises this shape for BOTH, so it is ownership by launch, never intent; if you do kill, kill BOTTOM-UP (children first)' \
+                "$sid" "$MY_SESSION" "$sid" "$pid"
+            return 1
+        fi
         local _hint; _hint=$(_detached_hint "$pid" "$sid")
         printf 'not-owned session-%s-is-not-ours-%s%s' "$sid" "$MY_SESSION" "$_hint"; return 1
     fi
@@ -416,11 +610,13 @@ _verdict() {
 
 mode=verdict
 quiet=0
+orphans=0
 declare -a pids=()
 while (( $# > 0 )); do
     case "$1" in
         --filter) mode=filter; shift ;;
         --quiet)  quiet=1;     shift ;;
+        --orphans) orphans=1;  shift ;;
         -h|--help) _usage ;;
         --) shift; while (( $# > 0 )); do pids+=("$1"); shift; done ;;
         # A NEGATIVE number is a pid-shaped argument, not a flag. Routing it

@@ -676,7 +676,10 @@ assert_contains "#615 …explaining that no DONE can arrive" "$out" "without clo
 rm -f "$SKST/skeptic/pending/w616"
 sk init w616 >/dev/null 2>&1
 out=$(sk await w616 --timeout 2 --interval 1); rc=$?
-assert_rc "#615 NEGATIVE CONTROL: no marker ever seen ⇒ timeout (4), NOT 11" "$rc" 4
+# 15 (NO-ROUND-OPEN), not 4: with no marker and nothing armed the timeout no
+# longer says "re-enter" (#1537/#1538/#1573). The control's POINT is unchanged
+# and is the line below — it is NOT 11, and no counterpart-finished claim is made.
+assert_rc "#615 NEGATIVE CONTROL: no marker ever seen ⇒ NO-ROUND-OPEN (15), NOT 11" "$rc" 15
 assert_not_contains "#615 …and no counterpart-finished claim is made" \
     "$out" "COUNTERPART-FINISHED"
 
@@ -710,23 +713,26 @@ mkdir -p "$SE_ST/heartbeat" "$WORK/cc/projects/proj"
 source "$REPO_ROOT/monitor/_submit_evidence.sh"
 
 # The sender (paste-followup.sh) and the watcher must not be able to
-# disagree about what a TUI submission IS. `_submit_evidence.sh` says in
-# a comment that its selector is kept byte-identical to
-# paste-followup.sh's — and a comment asserting a property nothing
-# checks is the exact defect this PR closes. So check it: extract both
-# selector bodies and compare. Diverge them and this fails.
-# The watcher's copy is read from the sourced variable (authoritative);
-# the sender's is sed-extracted from its single-quoted literal, minus
-# the `| 1` projection that is the only intended difference.
-pf_sel=$(sed -n "/^_JQ_SUBMISSION='/,/^| 1'\$/p" "$REPO_ROOT/monitor/paste-followup.sh" \
-    | sed "1d; /^| 1'\$/d")
-squash() { printf '%s' "$1" | tr -d '[:space:]'; }
-assert_eq "#607 the submission selector is IDENTICAL in sender and watcher" \
-    "$(squash "$_SE_JQ_SELECT")" "$(squash "$pf_sel")"
-# Guard the guard: an extraction that yielded nothing would make the
-# comparison above trivially true.
-assert_contains "#607 …and the comparison is non-vacuous" \
-    "$pf_sel" "promptSource"
+# disagree about what a TUI submission IS. This used to be TWO byte-identical
+# copies of one selector, with this test extracting both and comparing them.
+# your-org/nexus-code#1591 removed the sender's copy: paste-followup.sh now
+# confirms through monitor/_paste-deliver.sh, which reads `_SE_JQ_SELECT` from
+# _submit_evidence.sh — the watcher's own variable. So the property is now
+# STRUCTURAL, and what has to be checked is that it stays that way:
+#   (1) the sender carries no private selector that could drift;
+#   (2) the primitive really reads the shared variable (non-vacuous);
+#   (3) the sender really goes through the primitive.
+# Re-introduce a private copy, or stop reading the shared one, and this fails.
+pf_private=$(grep -cE "^_JQ_SUBMISSION=|^_JQ_SELECT=" "$REPO_ROOT/monitor/paste-followup.sh" || true)
+assert_eq "#607 the sender carries NO private copy of the submission selector" "$pf_private" "0"
+assert_contains "#607 …the confirmed-delivery primitive reads the watcher's selector, not its own" \
+    "$(grep -E '_SE_JQ_SELECT' "$REPO_ROOT/monitor/_paste-deliver.sh")" '$_SE_JQ_SELECT'
+assert_contains "#607 …and the sender confirms THROUGH that primitive" \
+    "$(grep -E 'pd_submit|pd_evidence_begin' "$REPO_ROOT/monitor/paste-followup.sh")" 'pd_submit'
+# Guard the guard: the shared selector must itself still be the promptSource
+# discriminator, or all three checks above are about nothing.
+assert_contains "#607 …and the shared selector is still the promptSource discriminator" \
+    "$_SE_JQ_SELECT" "promptSource"
 
 # No heartbeat ⇒ no session-id ⇒ nothing to read. That is `unknown`,
 # NOT `no`. Reporting `no` here is the #607 defect: the emit that

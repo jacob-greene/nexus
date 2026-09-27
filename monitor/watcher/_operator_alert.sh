@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# _operator_alert.sh — the TEXT-CARRYING, TURN-INDEPENDENT operator alert.
+# your-org/nexus-code#1548 (expiry arm alerted nobody for 7 h 22 m), #1533
+# (`sandbox-notify` delivers ONE BIT), #1534 (service-health has no alert path).
+#
+# ============================================================================
+# WHAT WAS MEASURED, AND WHY THIS IS A MODULE RATHER THAN A CALL
+# ============================================================================
+#
+# On 2026-09-17 the operator's login expired at 04:02:10 and every agent lost
+# the ability to take a turn for 7 h 24 m. The watcher DETECTED it in 41.4 s
+# (`auth-hold: EXPIRY observed`) and told the operator nothing for 7 h 22 m,
+# because the expiry arm's only outputs were a log line and — after its 7200 s
+# ceiling — 3364 more log lines. The one alert of the day fired at 11:24:55,
+# AFTER the operator had already opened `/login` by themselves.
+#
+# Three facts about the channels decided the shape of this file:
+#
+#   * `sandbox-notify` (via `_watcher_alert`) delivers ATTENTION, not CONTENT:
+#     the real tool assigns `msg` once and never reads it again (#1533). The
+#     words reach `watcher-alerts.log` and `watcher.log`; the operator hears a
+#     bell. It IS worth ringing — the `watcher ALERT:` prefix is measured to
+#     reach the notify wrapper's `critical` arm and RING (33 rings in 3 days,
+#     #1551) — but a bell cannot say "run /login".
+#   * `monitor/notify.sh` (Pushover → ntfy → SMTP) carries text off-terminal and
+#     needs no model turn. Its evidence is ONE probe returning `pushover ok`,
+#     which proves API acceptance and not that a device rendered it. UNVERIFIED
+#     as a delivery channel; carried here as a leg, never as the mechanism.
+#   * A GitHub issue authored by the BOT (installation token, a separate
+#     credential that kept working through the whole outage) reaches the
+#     operator through GitHub's own push channel — the one channel the
+#     operator is observed to answer daily. Text, durable, turn-independent.
+#
+# So an alert here is FOUR legs, cheapest and most certain first:
+#
+#   1. a DURABLE, GREPPABLE record — `$STATE_DIR/operator-alerts.jsonl`, one
+#      JSON line per raise / reminder / clear / leg outcome. This is the leg
+#      that cannot fail to reach the reader who comes looking afterwards, and
+#      it is the one #1548's forensics had to reconstruct from 3364 log lines.
+#   2. the watcher ALERT ring — `_watcher_alert` when the host defines it
+#      (alerts log + watcher log + the bell). Attention.
+#   3. a push — `monitor/notify.sh`, `--priority emergency` for `critical`.
+#      Off-terminal, unverified.
+#   4. a GitHub incident issue — `operator-alert: <key>`, one OPEN issue per
+#      key, re-used while open, closed by `clear`. Off-terminal, on the one
+#      channel with observed delivery.
+#
+# ============================================================================
+# FAIL-OPEN ON TELLING, NEVER ON THE CALLER (your-org/nexus-code#1553)
+# ============================================================================
+#
+# A notification path must never be able to break the thing it reports on. So:
+# every function here returns 0; every leg is `|| true`; the two NETWORK legs
+# run in a backgrounded, `timeout`-bounded subshell so the watcher's 5 s sync
+# task never waits on Pushover or GitHub; a missing `timeout` SKIPS the network
+# legs and says so in the record (a leg that could run unbounded is the #1553
+# F2 defect); and an unwritable state dir loses the record, not the bell.
+#
+# ============================================================================
+# CADENCE — one announcement, then reminders, then a clear (#976)
+# ============================================================================
+#
+# A 5 h over-limit hold once fired 20 critical bells, which is how an operator
+# learns to ignore the bell. Per KEY: the first `raise` announces (all legs);
+# a `raise` inside `MONITOR_OPERATOR_ALERT_REMINDER_SECONDS` (default 3600) of
+# the last announcement is a silent no-op — no record either, because the
+# callers run on 5 s cadences and a record per call is the 3364-line flood in
+# JSON; a `raise` past it is a REMINDER (record + bell + push, never a second
+# GitHub issue); `clear` removes the key, records the duration, sends a
+# `routine` push and closes the issue. Nothing rings on `clear`.
+#
+# A FLAPPING condition — raised, cleared, raised again every few minutes during
+# a partial outage — is the one shape in which "one issue per condition" could
+# become a flood on a real repo (an ISSUE-CREATING alert is the leg whose
+# failure mode is the loudest). Three defences, layered:
+#
+#   * a CLEAR HOLD-DOWN: `clear` does not finalise on the first call. It marks
+#     the stamp `pending` and finalises only when the caller keeps saying
+#     "absent" for MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS (default 300).
+#     A `raise` inside the hold-down CANCELS the pending clear and is recorded
+#     as a `flap` — no bell, no push, no GitHub write: from the operator's
+#     side the condition never cleared. Callers therefore call `clear` on EVERY
+#     cycle the condition is absent, not once on the transition.
+#   * ISSUE REUSE on the network side: a `began` first looks for an OPEN issue
+#     with the key's title, then for the most recently CLOSED one (a flap
+#     slower than the hold-down), which it REOPENS; it CREATES only when
+#     neither exists. So a key files at most one issue for as long as the
+#     closed one is findable (first page of closed issues by update time).
+#   * a COMMENT RATE CAP per key, MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS
+#     (default 3600): reminders and re-opens comment at most that often;
+#     state changes (close/reopen) are never capped, because an issue whose
+#     state disagrees with the condition is worse than a missing comment.
+#
+# GitHub being unreachable, rate-limiting the bot, or refusing the write is
+# recorded (`github-failed`, with the reason) and costs nothing else: the
+# durable record and the bell have already happened, the caller has returned.
+#
+# ============================================================================
+# INJECTION CONTRACTS (mirroring _auth_hold.sh / _over_limit.sh)
+# ============================================================================
+#
+#   _OPERATOR_ALERT_LOG_FN   one message → the watcher log. Default no-op.
+#   _OPERATOR_ALERT_BELL_FN  one message → the attention ring. Default resolves
+#                            `_watcher_alert` at CALL time when the host
+#                            defines it, else no-op.
+#   _OPERATOR_ALERT_PUSH_CMD the push executable; default
+#                            `$NEXUS_ROOT/monitor/notify.sh`. Tests point it at
+#                            a recorder.
+#   _OPERATOR_ALERT_CLEARED_FN  `<key> <first_epoch>` on the CLEAR TRANSITION —
+#                            the first "absent" call after a raise, i.e. the
+#                            call that STARTS the hold-down (or, with no
+#                            hold-down, the one that finalises). Once per
+#                            transition, never on the repeat calls inside the
+#                            hold-down. Default no-op; main.sh uses it to pull
+#                            the next emit forward (#1567 G2). `first_epoch`
+#                            may be empty, or (memo-only key) the LAST
+#                            announcement — a bound at or after the first raise.
+#
+# Knobs (each a value WE CHOSE, per the workspace rule on chosen parameters):
+#   MONITOR_OPERATOR_ALERT_PUSH_ENABLED     (true)   leg 3
+#   MONITOR_OPERATOR_ALERT_GITHUB_ENABLED   (true)   leg 4
+#   MONITOR_OPERATOR_ALERT_REMINDER_SECONDS (3600)   reminder cadence per key
+#   MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS (60)  bound on each network leg
+#
+# `NEXUS_NOTIFY_QUIET=1` (the test-harness hard-off the notify wrapper honours)
+# disables BOTH network legs here too, so a suite driving the real callers can
+# never page the operator or file an issue.
+
+_operator_alert_log_noop() { :; }
+_OPERATOR_ALERT_LOG_FN="${_OPERATOR_ALERT_LOG_FN:-_operator_alert_log_noop}"
+_operator_alert_bell_default() {
+    if declare -F _watcher_alert >/dev/null 2>&1; then
+        _watcher_alert "$1" || true
+    fi
+}
+_OPERATOR_ALERT_BELL_FN="${_OPERATOR_ALERT_BELL_FN:-_operator_alert_bell_default}"
+_operator_alert_cleared_noop() { :; }
+_OPERATOR_ALERT_CLEARED_FN="${_OPERATOR_ALERT_CLEARED_FN:-_operator_alert_cleared_noop}"
+
+# ---- paths ----------------------------------------------------------------
+_operator_alert_log_path()  { printf '%s/operator-alerts.jsonl' "${STATE_DIR:-.}"; }
+_operator_alert_dir()       { printf '%s/operator-alert' "${STATE_DIR:-.}"; }
+_operator_alert_stamp_path() { printf '%s/%s.stamp' "$(_operator_alert_dir)" "$1"; }
+
+# ---- knobs ----------------------------------------------------------------
+_operator_alert_int() { local v="$1" d="$2"; [[ "$v" =~ ^[0-9]+$ ]] || v="$d"; printf '%s' "$v"; }
+_operator_alert_reminder()    { _operator_alert_int "${MONITOR_OPERATOR_ALERT_REMINDER_SECONDS:-3600}" 3600; }
+_operator_alert_net_timeout() { _operator_alert_int "${MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS:-60}" 60; }
+_operator_alert_holddown()    { _operator_alert_int "${MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS:-300}" 300; }
+_operator_alert_comment_iv()  { _operator_alert_int "${MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS:-3600}" 3600; }
+_operator_alert_comment_stamp_path() { printf '%s/%s.ghcomment' "$(_operator_alert_dir)" "$1"; }
+# rc 0 iff a comment on <key>'s issue is allowed now; stamps when it is.
+_operator_alert_comment_allowed() {
+    local key="$1" f last now
+    f=$(_operator_alert_comment_stamp_path "$key"); now=$(date +%s)
+    last=$(cat "$f" 2>/dev/null); [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    local memo; memo=$(_operator_alert_memo_last "$key" comment); (( memo > last )) && last=$memo
+    (( now - last >= $(_operator_alert_comment_iv) )) || return 1
+    mkdir -p "$(dirname "$f")" 2>/dev/null || true
+    { printf '%s\n' "$now" > "$f"; } 2>/dev/null || true
+    # The memo is set UNCONDITIONALLY: an unwritable cap stamp must not turn
+    # the cap off (F2: 20 comments in 20 cycles).
+    _operator_alert_memo_set "$key" "$now" comment || true
+    return 0
+}
+_operator_alert_flag_on() {   # <value> → rc 0 unless an OFF spelling
+    case "${1:-true}" in false|0|no|off|FALSE|NO|OFF) return 1 ;; esac
+    return 0
+}
+_operator_alert_push_enabled()   { _operator_alert_flag_on "${MONITOR_OPERATOR_ALERT_PUSH_ENABLED:-true}"; }
+_operator_alert_github_enabled() { _operator_alert_flag_on "${MONITOR_OPERATOR_ALERT_GITHUB_ENABLED:-true}"; }
+_operator_alert_quiet() { [[ "${NEXUS_NOTIFY_QUIET:-0}" == "1" ]]; }
+
+# ---- the DEDUP STATE MUST SURVIVE THE DISK IT LIMITS (skeptic oplivesk F2) ----
+# The stamp lives in the state dir, and the state dir is exactly what fails in
+# the incidents this module exists for (a read-only project FS, ENOSPC).
+# Measured by the skeptic's rig: RO state dir, 20 cycles → 20 bells + 20
+# emergency pushes; a zero-byte unwritable stamp with the issue open → 20
+# pushes + 20 GitHub COMMENTS (720/h). So the last-announce time is ALSO kept
+# (a) in this process — the watcher's sync tasks share one bash — and (b) in a
+# fallback file under ${TMPDIR:-/tmp}, a different mount that stays writable
+# when the project FS does not (`_nexus_critical_alarm`'s precedent). Reads
+# take the MAX of all three; a raise that could persist nothing skips its
+# repeatable network legs.
+declare -gA _OPERATOR_ALERT_MEMO 2>/dev/null || true
+declare -gA _OPERATOR_ALERT_COMMENT_MEMO 2>/dev/null || true
+# NAMESPACED BY STATE DIR (skeptic oplivesk2 G1). $TMPDIR is shared by every
+# nexus instance on the host, and the first cut keyed the memo on the alert
+# key alone — so instance A's `auth-expired` memo made instance B's FIRST
+# raise of the same key read as "announced recently" and go SILENT. The
+# discriminator is a checksum of the INSTANCE — the state dir AND the nexus
+# root, so an unset or relative state dir cannot collapse two instances into
+# one namespace (two instances that genuinely share one absolute state dir
+# share their stamps too, and sharing the memo is then correct). Cached per
+# instance because `due` runs on a 5 s cadence and must not fork every time.
+_operator_alert_memo_ns() {
+    local sd="${STATE_DIR:-.}|${NEXUS_ROOT:-}"
+    if [[ "${_OPERATOR_ALERT_NS_FOR:-}" != "$sd" ]]; then
+        _OPERATOR_ALERT_NS=$(printf '%s' "$sd" | cksum 2>/dev/null | cut -d' ' -f1)
+        [[ "$_OPERATOR_ALERT_NS" =~ ^[0-9]+$ ]] || _OPERATOR_ALERT_NS=0
+        _OPERATOR_ALERT_NS_FOR="$sd"
+    fi
+    printf '%s' "$_OPERATOR_ALERT_NS"
+}
+_operator_alert_memo_path() { printf '%s/.nexus-operator-alert.%s.%s.%s' "${TMPDIR:-/tmp}" "$(_operator_alert_memo_ns)" "$2" "${1//[^A-Za-z0-9._-]/_}"; }
+_operator_alert_memo_last() {   # <key> [kind=raise] → max(in-process, tmp file), 0 when none
+    local key="$1" kind="${2:-raise}" a=0 b
+    local mk; mk="$(_operator_alert_memo_ns):$key"
+    if [[ "$kind" == comment ]]; then a="${_OPERATOR_ALERT_COMMENT_MEMO[$mk]:-0}"; else a="${_OPERATOR_ALERT_MEMO[$mk]:-0}"; fi
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+    b=$(cat "$(_operator_alert_memo_path "$key" "$kind")" 2>/dev/null); [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    (( b > a )) && a=$b
+    printf '%s' "$a"
+}
+_operator_alert_memo_set() {    # <key> <epoch> [kind] — rc 0 iff the tmp file took it
+    local key="$1" ts="$2" kind="${3:-raise}" f mk
+    mk="$(_operator_alert_memo_ns):$key"
+    if [[ "$kind" == comment ]]; then _OPERATOR_ALERT_COMMENT_MEMO[$mk]="$ts"; else _OPERATOR_ALERT_MEMO[$mk]="$ts"; fi
+    f=$(_operator_alert_memo_path "$key" "$kind")
+    { printf '%s\n' "$ts" > "$f"; } 2>/dev/null
+}
+_operator_alert_memo_clear() {  # <key>
+    local mk; mk="$(_operator_alert_memo_ns):$1"
+    unset "_OPERATOR_ALERT_MEMO[$mk]" "_OPERATOR_ALERT_COMMENT_MEMO[$mk]" 2>/dev/null || true
+    rm -f "$(_operator_alert_memo_path "$1" raise)" "$(_operator_alert_memo_path "$1" comment)" 2>/dev/null || true
+}
+
+# ---- when NOTHING can be persisted: a memo held by the KERNEL (#1567 G4) ----
+# The three stores above all fail together in one configuration: the state dir
+# AND $TMPDIR unwritable AND the caller in a SUBSHELL (service_health and the
+# self-heal loop guard both raise from async tasks), so the in-process memo dies
+# with the subshell. Then every cycle reads as a FIRST raise and runs the GitHub
+# leg — network-idempotent (it reuses the open issue), but one issue-list read
+# per cycle against the bot's rate limit during exactly the incident where the
+# token is needed elsewhere (~720/h at a 5 s cadence).
+#
+# No file can hold the fact, and a subshell cannot write its parent's memory,
+# so the fact is held by a PROCESS: the degraded attempt leaves a `sleep` whose
+# argv[0] names the instance and the key, living one reminder period. While it
+# lives, a first raise that could persist nothing skips the GitHub leg. It is in
+# the watcher's process group, so a watcher restart ends it and the new process
+# gets its own first attempt ("first attempt in the process").
+#
+# Matched on argv[0] EXACTLY, never by substring: an agent's argv IS its prompt,
+# and a prompt quoting this name must not read as the sentinel (#1073). argv[0]
+# of every agent is its binary. Error direction, stated: where /proc cannot be
+# read, or the sentinel cannot be forked, `alive` answers NO and the leg runs —
+# the pre-fix cost, never a silenced alert.
+_operator_alert_sentinel_name() {   # <key>
+    printf 'nexus-operator-alert-sentinel.%s.%s' "$(_operator_alert_memo_ns)" "${1//[^A-Za-z0-9._-]/_}"
+}
+_operator_alert_sentinel_alive() {   # <key> → rc 0 iff a live sentinel holds it
+    local want f a0
+    want=$(_operator_alert_sentinel_name "$1")
+    for f in /proc/[0-9]*/cmdline; do
+        { IFS= read -r -d '' a0 < "$f"; } 2>/dev/null || continue
+        [[ "$a0" == "$want" ]] && return 0
+    done
+    return 1
+}
+_operator_alert_sentinel_start() {   # <key>
+    local name; name=$(_operator_alert_sentinel_name "$1")
+    # CLOSE EVERY INHERITED FD ABOVE 2 before the exec (the #451/#468/#471
+    # fd-leak class). The watcher calls this from its MAIN process, holding the
+    # instance flock on INSTANCE_LOCK_FD: a sentinel that kept it pinned the lock
+    # for up to a reminder period after a crashed watcher, and the successor
+    # could not start (skeptic B1 on PR #1630, measured). A `sleep` needs no
+    # descriptor, so every one goes — not only the instance lock, and without
+    # depending on _lib.sh's _close_inherited_locks being loaded here.
+    local rem; rem=$(_operator_alert_reminder)
+    (
+        for _oa_fd in /proc/"$BASHPID"/fd/*; do
+            _oa_fd=${_oa_fd##*/}
+            [[ "$_oa_fd" =~ ^[0-9]+$ ]] && (( _oa_fd > 2 )) && eval "exec ${_oa_fd}>&-" 2>/dev/null
+        done
+        exec -a "$name" sleep "$rem"
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+}
+
+# A key names a CONDITION, and it becomes a filename and an issue title, so its
+# alphabet is fixed here rather than sanitised: a silently rewritten key is a
+# stamp that cannot be cleared by the caller that raised it.
+_operator_alert_key_ok() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9._:-]{0,63}$ ]]; }
+
+# ---- the durable record ---------------------------------------------------
+# One JSON line, escaped by hand (no jq on this path: the record is the leg
+# that must not depend on anything). Control characters are dropped, not
+# escaped — a message is prose, and a stray tab inside it is worth less than
+# a record that always parses.
+_operator_alert_json_str() {
+    printf '%s' "$1" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+# _operator_alert_record <event> <key> <k=v>… ; the trailing pairs are string
+# fields. Best-effort: an unwritable log never fails the caller.
+_operator_alert_record() {
+    local event="$1" key="$2"; shift 2
+    local path now iso line f k v
+    path=$(_operator_alert_log_path)
+    mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
+    now=$(date +%s); iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    line=$(printf '{"ts":%s,"iso":"%s","event":"%s","key":"%s"' \
+        "$now" "$iso" "$(_operator_alert_json_str "$event")" "$(_operator_alert_json_str "$key")")
+    for f in "$@"; do
+        k="${f%%=*}"; v="${f#*=}"
+        line="$line,\"$(_operator_alert_json_str "$k")\":\"$(_operator_alert_json_str "$v")\""
+    done
+    # Brace-grouped: a redirection failure is reported by the SHELL, not the
+    # command, so `cmd >> f 2>/dev/null` still prints it (#723). The record is
+    # best-effort and must be silent when it cannot land.
+    { printf '%s}\n' "$line" >> "$path"; } 2>/dev/null || true
+    return 0
+}
+
+# ---- board context, for callers composing a message ------------------------
+# The supervisor's arm state rides on every auth alert because it is the
+# exposure #1532 measured (7 h 13 m unarmed during the same outage) and the
+# operator cannot see it from a phone. Prints one clause or nothing.
+_operator_alert_context() {
+    local hb="${WATCHER_SUPERVISOR_HEARTBEAT:-}" stale="${MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS:-90}" age
+    [[ -n "$hb" ]] || return 0
+    declare -F _watcher_heartbeat_age >/dev/null 2>&1 || return 0
+    [[ "$stale" =~ ^[0-9]+$ ]] || stale=90
+    age=$(_watcher_heartbeat_age "$hb"); [[ "$age" =~ ^[0-9]+$ ]] || age=999999
+    if (( age <= stale )); then
+        printf 'watcher-supervisor: ARMED (heartbeat %ss ago).' "$age"
+    elif (( age >= 999999 )); then
+        printf 'watcher-supervisor: UNARMED (no heartbeat) — a watcher crash has no turn-independent revival until an orchestrator turn re-arms it.'
+    else
+        printf 'watcher-supervisor: UNARMED for %ss — a watcher crash has no turn-independent revival until an orchestrator turn re-arms it.' "$age"
+    fi
+}
+
+# ---- network legs (run in a backgrounded subshell) -------------------------
+_operator_alert_push_leg() {   # <key> <severity> <kind> <message>
+    local key="$1" severity="$2" kind="$3" msg="$4" cmd pri rc tmo
+    cmd="${_OPERATOR_ALERT_PUSH_CMD:-${NEXUS_ROOT:-}/monitor/notify.sh}"
+    [[ -x "$cmd" ]] || { _operator_alert_record push-skipped "$key" reason=no-notify-cmd cmd="$cmd"; return 0; }
+    case "$severity" in critical) pri=emergency ;; *) pri=routine ;; esac
+    [[ "$kind" == "clear" ]] && pri=routine
+    tmo=$(_operator_alert_net_timeout)
+    timeout "$tmo" "$cmd" "nexus operator-alert: $key ($kind)" "$msg" \
+        --priority "$pri" --require-delivery --quiet >/dev/null 2>&1
+    rc=$?
+    _operator_alert_record push "$key" kind="$kind" priority="$pri" rc="$rc" \
+        note="rc 0 = a backend ACCEPTED the message (API acceptance, not device delivery); 2 = no backend configured; 3 = every backend failed; 124 = timeout"
+    return 0
+}
+
+# One OPEN issue per key. REST list endpoint (immediately consistent), title
+# prefix match, first 5 pages — the same idempotency `_nexus_github_incident_escalate`
+# uses and for the same reason: the search index lags minutes and would
+# double-file. `began` files (or finds) the issue and comments nothing;
+# `continues` comments a reminder on it; `clear` comments and closes.
+_operator_alert_github_leg() {   # <key> <severity> <kind> <message>
+    local key="$1" severity="$2" kind="$3" msg="$4"
+    local root="${NEXUS_ROOT:-}" cfg repo login mint tok tmo title num page page_json found count body resp
+    cfg="$root/config/load.sh"
+    command -v gh >/dev/null 2>&1 || { _operator_alert_record github-skipped "$key" reason=no-gh; return 0; }
+    command -v jq >/dev/null 2>&1 || { _operator_alert_record github-skipped "$key" reason=no-jq; return 0; }
+    repo="${MONITOR_REPO:-}"
+    [[ -n "$repo" || ! -x "$cfg" ]] || repo=$("$cfg" github.repo 2>/dev/null)
+    login="${MONITOR_USER_LOGIN:-}"
+    [[ -n "$login" || ! -x "$cfg" ]] || login=$("$cfg" github.user_login 2>/dev/null)
+    [[ -n "$repo" && -n "$login" ]] || { _operator_alert_record github-skipped "$key" reason=no-repo-or-login; return 0; }
+    mint="${NEXUS_MINT_TOKEN_BIN:-$root/monitor/mint-token.sh}"
+    [[ -f "$mint" ]] || { _operator_alert_record github-skipped "$key" reason=no-mint; return 0; }
+    tmo=$(_operator_alert_net_timeout)
+    tok=$(NEXUS_ROOT="$root" timeout "$tmo" bash "$mint" 2>/dev/null) || tok=""
+    [[ -n "$tok" ]] || { _operator_alert_record github-failed "$key" reason=mint-failed; return 0; }
+    title="operator-alert: $key"
+    # The OPEN issue for this key, walking up to 5 pages; a list failure is a
+    # network failure and is recorded, never mistaken for "no issue".
+    num=""; page=1; list_ok=1
+    while (( page <= 5 )); do
+        page_json=$(GH_TOKEN="$tok" timeout "$tmo" gh api \
+            "/repos/$repo/issues?state=open&per_page=100&page=$page" 2>/dev/null) || { list_ok=0; break; }
+        found=$(printf '%s' "$page_json" | jq -r --arg t "$title" \
+            '[.[] | select(.pull_request == null) | select((.title // "") == $t) | .number] | first // empty' 2>/dev/null)
+        if [[ -n "$found" ]]; then num="$found"; break; fi
+        count=$(printf '%s' "$page_json" | jq -r 'length' 2>/dev/null)
+        [[ "$count" =~ ^[0-9]+$ ]] || { list_ok=0; break; }
+        (( count < 100 )) && break
+        (( page++ ))
+    done
+    if (( ! list_ok )); then
+        _operator_alert_record github-failed "$key" kind="$kind" reason=list-failed \
+            note="GitHub unreachable, rate-limited or refusing; the record and the bell already happened"
+        return 0
+    fi
+    case "$kind" in
+        began)
+            if [[ -n "$num" ]]; then
+                _operator_alert_record github "$key" kind="$kind" action=reused issue="$num"
+                return 0
+            fi
+            # A flap slower than the hold-down: the issue was CLOSED moments
+            # ago. REOPEN it rather than file a second one — the closed list
+            # by update time, first page, is where it sits.
+            page_json=$(GH_TOKEN="$tok" timeout "$tmo" gh api \
+                "/repos/$repo/issues?state=closed&sort=updated&direction=desc&per_page=100" 2>/dev/null) || page_json=""
+            found=$(printf '%s' "$page_json" | jq -r --arg t "$title" \
+                '[.[] | select(.pull_request == null) | select((.title // "") == $t) | .number] | first // empty' 2>/dev/null)
+            if [[ -n "$found" ]]; then
+                if GH_TOKEN="$tok" timeout "$tmo" gh api -X PATCH "/repos/$repo/issues/$found" \
+                    -f state=open >/dev/null 2>&1; then
+                    _operator_alert_record github "$key" kind="$kind" action=reopened issue="$found"
+                    if _operator_alert_comment_allowed "$key"; then
+                        GH_TOKEN="$tok" timeout "$tmo" gh api -X POST "/repos/$repo/issues/$found/comments" \
+                            -f "body=@$login re-raised — $msg" >/dev/null 2>&1 || true
+                    else
+                        _operator_alert_record github-comment-capped "$key" kind="$kind" issue="$found"
+                    fi
+                else
+                    _operator_alert_record github-failed "$key" kind="$kind" reason=reopen-failed issue="$found"
+                fi
+                return 0
+            fi
+            body=$(printf '@%s — **%s**\n\n%s\n\n<sub>Auto-filed by the watcher (%s). One issue per condition: closed automatically when the condition clears, reopened if it returns. Record: `monitor/.state/operator-alerts.jsonl` key=`%s`.</sub>' \
+                "$login" "$msg" "$(_operator_alert_context)" "$severity" "$key")
+            resp=$(GH_TOKEN="$tok" timeout "$tmo" gh api -X POST "/repos/$repo/issues" \
+                -f "title=$title" -f "body=$body" 2>/dev/null) || resp=""
+            num=$(printf '%s' "$resp" | jq -r '.number // empty' 2>/dev/null)
+            if [[ -n "$num" ]]; then
+                _operator_alert_comment_allowed "$key" >/dev/null   # the body counts as the first comment
+                _operator_alert_record github "$key" kind="$kind" action=filed issue="$num"
+            else
+                _operator_alert_record github-failed "$key" kind="$kind" reason=create-failed
+            fi
+            ;;
+        continues)
+            [[ -n "$num" ]] || { _operator_alert_record github-skipped "$key" kind="$kind" reason=no-open-issue; return 0; }
+            if ! _operator_alert_comment_allowed "$key"; then
+                _operator_alert_record github-comment-capped "$key" kind="$kind" issue="$num"; return 0
+            fi
+            GH_TOKEN="$tok" timeout "$tmo" gh api -X POST "/repos/$repo/issues/$num/comments" \
+                -f "body=@$login still standing — $msg" >/dev/null 2>&1 \
+                && _operator_alert_record github "$key" kind="$kind" action=reminded issue="$num" \
+                || _operator_alert_record github-failed "$key" kind="$kind" reason=comment-failed issue="$num"
+            ;;
+        clear)
+            [[ -n "$num" ]] || { _operator_alert_record github-skipped "$key" kind="$kind" reason=no-open-issue; return 0; }
+            if _operator_alert_comment_allowed "$key"; then
+                GH_TOKEN="$tok" timeout "$tmo" gh api -X POST "/repos/$repo/issues/$num/comments" \
+                    -f "body=✅ cleared — $msg" >/dev/null 2>&1 || true
+            fi
+            # The close is a STATE change and is never capped.
+            GH_TOKEN="$tok" timeout "$tmo" gh api -X PATCH "/repos/$repo/issues/$num" \
+                -f state=closed >/dev/null 2>&1 \
+                && _operator_alert_record github "$key" kind="$kind" action=closed issue="$num" \
+                || _operator_alert_record github-failed "$key" kind="$kind" reason=close-failed issue="$num"
+            ;;
+    esac
+    return 0
+}
+
+# Both network legs, detached. `timeout` is REQUIRED for a bounded leg: absent,
+# both are skipped and the record says why (#1553 F2: a notifier that ran
+# unbounded when `timeout` was off PATH).
+_operator_alert_network() {   # <key> <severity> <kind> <message>
+    local key="$1" severity="$2" kind="$3" msg="$4" do_push=0 do_gh=0
+    _operator_alert_push_enabled   && do_push=1
+    _operator_alert_github_enabled && do_gh=1
+    if _operator_alert_quiet; then
+        _operator_alert_record network-skipped "$key" kind="$kind" reason=NEXUS_NOTIFY_QUIET
+        return 0
+    fi
+    (( do_push || do_gh )) || return 0
+    if ! command -v timeout >/dev/null 2>&1; then
+        _operator_alert_record network-skipped "$key" kind="$kind" reason=no-timeout-on-PATH
+        return 0
+    fi
+    # `_OPERATOR_ALERT_NETWORK_SYNC=1` runs the legs INLINE — a test seam, so a
+    # suite can assert on the recorders deterministically. Production is
+    # detached: the caller is a 5 s watcher task and must never wait on a
+    # network round trip (the bound is `timeout`, the isolation is the fork).
+    if [[ "${_OPERATOR_ALERT_NETWORK_SYNC:-0}" == "1" ]]; then
+        (( do_push )) && _operator_alert_push_leg   "$key" "$severity" "$kind" "$msg"
+        (( do_gh ))   && _operator_alert_github_leg "$key" "$severity" "$kind" "$msg"
+        return 0
+    fi
+    (
+        (( do_push )) && _operator_alert_push_leg   "$key" "$severity" "$kind" "$msg"
+        (( do_gh ))   && _operator_alert_github_leg "$key" "$severity" "$kind" "$msg"
+        exit 0
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+}
+
+# ---- the verbs ------------------------------------------------------------
+#
+#   _operator_alert raise <key> <critical|warning> <message>
+#   _operator_alert clear <key> <message>
+#   _operator_alert notify <key> <critical|warning> <message>
+#   _operator_alert standing <key>          rc 0 iff the key is raised
+#   _operator_alert due <key>               rc 0 iff a raise NOW would announce
+#                                           (no stamp, or past the reminder) —
+#                                           so a 5 s caller can skip composing
+#                                           a message it will not send
+#   _operator_alert since <key>             prints the first-raised epoch
+#
+# `raise`/`clear` bracket a STANDING CONDITION (a stamp, reminders, one issue).
+# `notify` is an EVENT — something that happened once and is over (the
+# watcher sent Escape into an abandoned login): record + log + bell + push,
+# no stamp, no reminders, no issue to close.
+#
+# Always returns 0 from raise/clear/notify. `critical` rings the bell and
+# pushes at emergency priority; `warning` records, pushes routine and files
+# the issue but does NOT ring — the bell is for conditions where a human must
+# act now.
+_operator_alert() {
+    local verb="${1:-}"; shift || true
+    case "$verb" in
+        raise)    _operator_alert_raise "$@" ;;
+        clear)    _operator_alert_clear "$@" ;;
+        notify)   _operator_alert_notify "$@" ;;
+        standing) _operator_alert_key_ok "${1:-}" || return 1
+                  [[ -f "$(_operator_alert_stamp_path "$1")" ]] && return 0
+                  (( $(_operator_alert_memo_last "$1") > 0 )) ;;
+        due)      _operator_alert_due "${1:-}" ;;
+        since)    _operator_alert_key_ok "${1:-}" || return 1
+                  [[ -f "$(_operator_alert_stamp_path "$1")" ]] || return 1
+                  cut -f1 "$(_operator_alert_stamp_path "$1")" 2>/dev/null ;;
+        *)        return 2 ;;
+    esac
+}
+
+# `due` MUST answer 0 while a clear is PENDING (skeptic oplivesk F1). Every
+# production caller is `due && raise`; the first cut answered from `last`
+# alone, so inside the reminder window it said "not due", `raise` was never
+# reached, the flap cancellation below never ran, and the pending clear
+# finalised ACROSS a condition that was present. Measured by the skeptic's
+# rig, 10 fast flaps: due-gated 4 bells / 7 pushes / 3 close+reopen / 0 flap
+# records, against 1 / 1 / 0 / 9 through a direct raise. The suite's flap
+# section called `raise` directly, which is exactly why it could not see it.
+_operator_alert_due() {
+    local key="${1:-}" stamp last pending memo
+    _operator_alert_key_ok "$key" || return 1
+    stamp=$(_operator_alert_stamp_path "$key")
+    last=0; pending=""
+    if [[ -f "$stamp" ]]; then
+        { IFS=$'\t' read -r _ last _ pending < "$stamp"; } 2>/dev/null || true
+        [[ "$pending" =~ ^[0-9]+$ ]] && return 0
+    fi
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    memo=$(_operator_alert_memo_last "$key"); (( memo > last )) && last=$memo
+    (( last > 0 )) || return 0
+    (( $(date +%s) - last >= $(_operator_alert_reminder) ))
+}
+
+_operator_alert_raise() {
+    local key="${1:-}" severity="${2:-critical}" msg="${3:-}"
+    local stamp first last count now kind reminder
+    _operator_alert_key_ok "$key" || { "$_OPERATOR_ALERT_LOG_FN" "operator-alert: REFUSED raise — bad key '${key}'"; return 0; }
+    [[ -n "$msg" ]] || msg="(no message)"
+    case "$severity" in critical|warning) ;; *) severity=critical ;; esac
+    now=$(date +%s)
+    stamp=$(_operator_alert_stamp_path "$key")
+    reminder=$(_operator_alert_reminder)
+    first=""; last=""; count=0; local pending=""
+    if [[ -f "$stamp" ]]; then
+        { IFS=$'\t' read -r first last count pending < "$stamp"; } 2>/dev/null || true
+        [[ "$first" =~ ^[0-9]+$ ]] || first="$now"
+        [[ "$last"  =~ ^[0-9]+$ ]] || last=0
+        [[ "$count" =~ ^[0-9]+$ ]] || count=0
+        if [[ "$pending" =~ ^[0-9]+$ ]]; then
+            # A clear was pending and the condition is BACK: a FLAP. Cancel the
+            # pending clear; from the operator's side nothing changed, so no
+            # leg fires. Recorded, so a flapping condition is visible in the
+            # ledger even though it never rings twice.
+            { printf '%s\t%s\t%s\t\n' "$first" "$last" "$count" > "$stamp"; } 2>/dev/null || true
+            _operator_alert_record flap "$key" pending_s="$(( now - pending ))" standing_s="$(( now - first ))"
+            "$_OPERATOR_ALERT_LOG_FN" "operator-alert: FLAP key=${key} — cleared ${pending}s ago, back again; the pending clear is cancelled (no re-ring, no re-file)"
+            pending=""
+        fi
+        kind=continues
+    else
+        first="$now"; kind=began
+    fi
+    # F2: the last announcement is the MAX of the stamp and the memos, so a
+    # stamp that is absent, zero-byte or unwritable cannot reset the cadence.
+    local memo_last; memo_last=$(_operator_alert_memo_last "$key")
+    if (( memo_last > last )); then
+        last=$memo_last
+        kind=continues            # announced before, whatever the stamp says
+    fi
+    # Inside the reminder window: SILENT. No record — see the cadence note.
+    if [[ "$kind" == continues ]] && (( now - last < reminder )); then return 0; fi
+    count=$(( count + 1 ))
+    mkdir -p "$(dirname "$stamp")" 2>/dev/null || true
+    { printf '%s\t%s\t%s\t\n' "$first" "$now" "$count" > "$stamp"; } 2>/dev/null || true
+    # Did ANY persistent store take it? Read the stamp back rather than trust
+    # the write's status (a zero-byte unwritable file "succeeds" at nothing).
+    local persisted=0 _rb=""
+    { IFS=$'\t' read -r _ _rb _ _ < "$stamp"; } 2>/dev/null || true
+    [[ "$_rb" == "$now" ]] && persisted=1
+    _operator_alert_memo_set "$key" "$now" && persisted=1
+    local standing_for=$(( now - first ))
+    _operator_alert_record raise "$key" severity="$severity" kind="$kind" \
+        standing_s="$standing_for" n="$count" message="$msg"
+    if [[ "$kind" == began ]]; then
+        "$_OPERATOR_ALERT_LOG_FN" "operator-alert: RAISED key=${key} severity=${severity} — ${msg} [record: $(_operator_alert_log_path)]"
+    else
+        "$_OPERATOR_ALERT_LOG_FN" "operator-alert: REMINDER #${count} key=${key} severity=${severity} standing for ${standing_for}s — ${msg}"
+    fi
+    if [[ "$severity" == critical ]]; then
+        "$_OPERATOR_ALERT_BELL_FN" "$msg" || true
+    fi
+    if (( persisted )); then
+        _operator_alert_network "$key" "$severity" "$kind" "$msg"
+    elif [[ "$kind" == began ]] && _operator_alert_sentinel_alive "$key"; then
+        # A degraded attempt already ran within the reminder period and could
+        # remember it only in its sentinel (#1567 G4): the issue it filed or
+        # found is still there, so the list read would buy nothing.
+        _operator_alert_record network-skipped "$key" kind="$kind" reason=nothing-persisted-attempted
+    elif [[ "$kind" == began ]]; then
+        # Nothing could be persisted, not even under $TMPDIR, so a caller in a
+        # SUBSHELL would re-announce every cycle. The GitHub leg is idempotent
+        # over the network (it reuses the open issue and comments nothing on
+        # reuse), so it runs ONCE per sentinel lifetime; the PUSH is the
+        # repeatable leg, so it does not run at all.
+        _operator_alert_sentinel_start "$key"
+        _operator_alert_record network-degraded "$key" kind="$kind" reason=nothing-persisted note="push skipped; github leg runs once per reminder period (sentinel)"
+        MONITOR_OPERATOR_ALERT_PUSH_ENABLED=false _operator_alert_network "$key" "$severity" "$kind" "$msg"
+    else
+        _operator_alert_record network-skipped "$key" kind="$kind" reason=nothing-persisted
+    fi
+    return 0
+}
+
+_operator_alert_notify() {
+    local key="${1:-}" severity="${2:-critical}" msg="${3:-}"
+    _operator_alert_key_ok "$key" || { "$_OPERATOR_ALERT_LOG_FN" "operator-alert: REFUSED notify — bad key '${key}'"; return 0; }
+    [[ -n "$msg" ]] || msg="(no message)"
+    case "$severity" in critical|warning) ;; *) severity=critical ;; esac
+    _operator_alert_record notify "$key" severity="$severity" message="$msg"
+    "$_OPERATOR_ALERT_LOG_FN" "operator-alert: NOTIFY key=${key} severity=${severity} — ${msg}"
+    if [[ "$severity" == critical ]]; then
+        "$_OPERATOR_ALERT_BELL_FN" "$msg" || true
+    fi
+    # An event files no issue: push only.
+    MONITOR_OPERATOR_ALERT_GITHUB_ENABLED=false _operator_alert_network "$key" "$severity" event "$msg"
+    return 0
+}
+
+_operator_alert_clear() {
+    local key="${1:-}" msg="${2:-cleared}" stamp first last count pending now dur holddown
+    _operator_alert_key_ok "$key" || return 0
+    stamp=$(_operator_alert_stamp_path "$key")
+    if [[ ! -f "$stamp" ]]; then
+        # No stamp. Either nothing is standing, or the raise could only be
+        # remembered in the memo (F2: an unwritable state dir). A memo-only
+        # key cannot carry a pending mark, so it clears at once.
+        local memo_first; memo_first=$(_operator_alert_memo_last "$key")
+        (( memo_first > 0 )) || return 0
+        _operator_alert_memo_clear "$key"
+        _operator_alert_record clear "$key" duration_s=-1 message="$msg" note="memo-only key (the stamp was never persistable)"
+        "$_OPERATOR_ALERT_LOG_FN" "operator-alert: CLEARED key=${key} (memo-only) — ${msg}"
+        "$_OPERATOR_ALERT_CLEARED_FN" "$key" "$memo_first" || true
+        return 0
+    fi
+    { IFS=$'\t' read -r first last count pending < "$stamp"; } 2>/dev/null || first=""
+    now=$(date +%s)
+    holddown=$(_operator_alert_holddown)
+    if (( holddown > 0 )); then
+        if ! [[ "$pending" =~ ^[0-9]+$ ]]; then
+            # First "absent" after a raise: START the hold-down, finalise
+            # nothing. The caller says "absent" again every cycle.
+            { printf '%s\t%s\t%s\t%s\n' "$first" "${last:-$now}" "${count:-1}" "$now" > "$stamp"; } 2>/dev/null || true
+            _operator_alert_record clear-pending "$key" holddown_s="$holddown"
+            # THE transition (#1567 G2): the condition just went absent. Fired
+            # here, not at finalisation, because the hold-down is for the
+            # OPERATOR's channel (no close/reopen churn); a caller that wants to
+            # act on recovery should not wait 300 s to learn of it. A flap back
+            # cancels the pending clear and the next first-absent fires again.
+            "$_OPERATOR_ALERT_CLEARED_FN" "$key" "$first" || true
+            return 0
+        fi
+        (( now - pending >= holddown )) || return 0    # still inside the hold-down
+    fi
+    if [[ "$first" =~ ^[0-9]+$ ]]; then dur=$(( now - first )); else dur=-1; fi
+    rm -f "$stamp" 2>/dev/null || true
+    _operator_alert_memo_clear "$key"
+    _operator_alert_record clear "$key" duration_s="$dur" message="$msg" \
+        holddown_s="$holddown"
+    "$_OPERATOR_ALERT_LOG_FN" "operator-alert: CLEARED key=${key} after ${dur}s — ${msg}"
+    _operator_alert_network "$key" warning clear "$msg (stood for ${dur}s)"
+    # With no hold-down this finalising call IS the transition; with one, the
+    # transition already fired when the hold-down started.
+    (( holddown > 0 )) || "$_OPERATOR_ALERT_CLEARED_FN" "$key" "$first" || true
+    return 0
+}

@@ -32,7 +32,8 @@
 # rc 0 (#1002). Ad-hoc probes use the same helper, or --keep-prefix above.
 #
 # Exit: 0 = green (safe to promote, WITHIN the stated coverage boundary)
-#       1 = red   (a scenario failed or was skipped — do NOT promote)
+#       1 = red   (a scenario failed, was skipped, or exited 69 UNMEASURED —
+#                 a discriminating sub-check never ran, #1530 — do NOT promote)
 #       3 = UNATTRIBUTABLE (your-org/nexus-code#1259) — the gate could not
 #           establish WHICH TREE it gated, so the verdict below is not a
 #           claim about the candidate and must not be recorded as one.
@@ -459,11 +460,31 @@ _gate_stamp_tree() {
     #
     # WHAT IS MEASURED, and it is the LINT CHANNEL only. The gate runs
     # `lint-no-mass-kill.sh` and `lint-no-tmux-server-kill.sh`, and BOTH
-    # enumerate with `shf_find0` -- a `find` FILESYSTEM WALK, not
-    # `git ls-files`. So an untracked file planted under the scanned tree IS
-    # read; a planted untracked mass-kill takes the lint rc 0 -> rc 1 and it
-    # names the file. In THAT channel the direction is fail-CLOSED: untracked
-    # can only turn a green RED.
+    # enumerate with `shf_find0`. So an untracked file planted under the
+    # scanned tree IS read; a planted untracked mass-kill takes the lint
+    # rc 0 -> rc 1 and it names the file. In THAT channel the direction is
+    # fail-CLOSED: untracked can only turn a green RED.
+    #
+    # CORRECTED (your-org/nexus-code#1588, skeptic testinfra2sk F4 on PR 1593).
+    # This paragraph used to rest that on `shf_find0` being "a `find`
+    # FILESYSTEM WALK, not `git ls-files`". It no longer is: inside a work
+    # tree it enumerates `git ls-files --cached --others --exclude-standard`.
+    # The conclusion above SURVIVES, because `--others` keeps an untracked
+    # plant. What did NOT survive #1588 was the wider reading: an untracked
+    # plant that is also GITIGNORED was read by neither lint, and the root
+    # `.gitignore` ignores `bin/`, `logs/`, `nexus/`, `_ignore/` and `.config/`
+    # UNANCHORED, so `monitor/cc-harness/bin/x.sh` was a blind spot.
+    #
+    # SETTLED (your-org/nexus-code#1594 item 1): both lints now pass
+    # `shf_find0 … ignored-under-monitor`, which adds the ignored files under
+    # the repo's `monitor/` (still minus `_SHF_PRUNE_DIRS`, so runtime
+    # `monitor/.state` stays out). Each lint's `--selftest` plants an ignored
+    # `bin/k.sh` in a real git fixture and fails if it is not read, and this
+    # gate runs both selftests first. So an ignored plant UNDER `monitor/` is
+    # fail-CLOSED again. The boundary is deliberate and stated: an ignored
+    # plant OUTSIDE `monitor/` is still NOT read — outside it the ignored set
+    # of a primary is `work/` and `reports/`, whose scanning was #1588 — and
+    # neither lint's target is outside `monitor/` anyway.
     #
     # THE RESIDUAL, AND IT RUNS THE OTHER WAY. `gate-coverage.sh` reads the
     # filesystem by GLOB in at least two more places, and there an untracked
@@ -545,6 +566,25 @@ _gate_stamp_tree() {
     echo "    untrack: $untracked (untracked porcelain entries — audit only, see #1320)"
     echo "    subject: ${GATE_TREE_SUBJECT_PATH}@$blob"
     echo "=== gated-tree: head=$head ref=$ref dirty=$dirty dirty_tracked=$dirty_tracked untracked=$untracked subject_path=${GATE_TREE_SUBJECT_PATH} subject_blob=$blob ==="
+    # WHICH tracked files (your-org/nexus-code#1475). `dirty_tracked=1` alone
+    # made the bump refusal say "Commit or stash" to an unattended routine
+    # without naming a file, so every fire re-derived the same one-line
+    # `git status` by hand. A SEPARATE line, deliberately: the `gated-tree:`
+    # line above is parsed key=value by `_gate_log_tree_field` and by
+    # test-cc-gate.sh, and a path list (which may hold spaces) does not belong
+    # in it. Porcelain v1 paths are `${line:3}` (a rename reads `old -> new`).
+    # The cap of 10 is CHOSEN: enough to name the usual one or two edits, short
+    # enough for a notification; the remainder is counted, never dropped.
+    if [[ "$dirty_tracked" == "1" ]]; then
+        local _trk_line _trk_list='' _trk_n=0
+        while IFS= read -r _trk_line; do
+            [[ -n "$_trk_line" ]] || continue
+            _trk_n=$((_trk_n + 1))
+            (( _trk_n <= 10 )) && _trk_list+="${_trk_list:+, }${_trk_line:3}"
+        done <<<"$st_trk"
+        (( _trk_n > 10 )) && _trk_list+=" +$((_trk_n - 10)) more"
+        echo "=== gated-tree-tracked: $_trk_list ==="
+    fi
     if [[ "$dirty_tracked" == "1" ]]; then
         echo "gate.sh: NOTE — the gated tree has TRACKED modifications, so head=$head does not identify what ran." >&2
     elif [[ "$dirty_tracked" == "unknown" ]]; then
@@ -682,6 +722,15 @@ gate_prod_scenarios=(
         # and pins the exact fields gh-write-guard.sh / bash-footgun-guard.sh
         # parse. Carries its own negative controls (see the file header).
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh"
+        # The AUTH-FAILURE hooks (PR 1566, `monitor/hooks/turn-failure-emit.sh`).
+        # THE THIRD INSTANCE of the hazard the comment below describes, and the
+        # first to get past its ratchet (your-org/nexus-code#1592): the scenario
+        # file and its `gated` row in gate-coverage.tsv landed; THIS LINE did
+        # not. The on-disk ⇔ tsv check was satisfied, so every GREEN from then
+        # on printed `scenarios gated=9` beside a tally of 8 and credited
+        # turn-failure-emit.sh as a DRIVEN surface that no gated run had touched.
+        # gate-coverage.sh R4b now refuses a `gated` row that is not in this list.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-auth-failure-hooks.sh"
         # Production KEYBOARD MODE (your-org/nexus-code#724). Every nexus agent
         # runs `editorMode: "vim"`; until #724 the harness seeded none, so the
         # gate validated a mode no worker is in. This list is HARDCODED, so a
@@ -714,6 +763,36 @@ gate_prod_scenarios=(
         # decides. Control arm inside: key absent + env unset must still
         # paint the dialog, so a green here cannot be "the gate is gone".
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh"
+        # THE DELIVERY AXIS (your-org/nexus-code#1591). Until this entry NO gated
+        # scenario pasted anything: the coverage line read `delivery 0/2`, and
+        # the 2.1.277 review step — a prompt carrying an invisible character is
+        # HELD on the first Enter — was found by an ad-hoc evaluator probe, not
+        # by the gate, which was GREEN 8/8 on the release that broke the
+        # watcher's emit paste. Drives production `_paste_to_target_unlocked`
+        # through monitor/_paste-deliver.sh with emit-shaped bodies and asserts
+        # `reported delivered ==> a request reached the backend AND the
+        # transcript recorded it`: version- and flag-agnostic, so it is green
+        # on a build with no review step and RED on one that holds without the
+        # confirm-and-second-Enter. Carries a negative control (Enter withheld).
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-paste-held.sh"
+        # THE RESPAWN HALF OF THE DELIVERY AXIS (your-org/nexus-code#1622): the
+        # path where nothing supervises the Enter, because the orchestrator is
+        # the thing being respawned. Drives production `_respawn_orchestrator`
+        # into a real pane and asserts no INDETERMINATE reading reaches its
+        # verify window, a DROPPED Enter is recovered exactly once, and an
+        # operator draft in the same window is not submitted.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-respawn-verify.sh"
+        # THE DANGEROUS-RM PROMPT (your-org/nexus-code#1632). Shown even under
+        # --dangerously-skip-permissions (a bypass-immune check), auto-denied
+        # after 2 minutes from 2.1.281, and DECIDED in production by the
+        # PermissionRequest hook monitor/hooks/dangerous-rm-decide.sh: denied in
+        # the orchestrator, forwarded to the orchestrator for a worker. Found by
+        # a hand-driven evaluator probe, never by the gate, until this entry.
+        # Wires the REAL hook: the deny message reaches the model, an answer
+        # from `ng decision-answer` decides a worker's request, no answer is a
+        # deny inside the countdown, and a non-rm Bash prompt and a Write prompt
+        # still prompt with the hook wired (must not flip).
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-dangerous-rm-decide.sh"
 )
 
 if [[ -n "${CCH_GATE_SCENARIOS:-}" ]]; then
@@ -729,6 +808,30 @@ fi
 # scenario means the candidate was NOT exercised, which is exactly the
 # green-via-skip failure this gate exists to prevent (a prior gate printed
 # GREEN with every scenario skipped for lack of node — your-org/your-nexus#236).
+#
+# AND 69 IS NOT A FAILURE EITHER — it is UNMEASURED (your-org/nexus-code#1530).
+# A scenario exits 69 (ENVSKIP, #1283) when it RAN, its other assertions held,
+# and a DISCRIMINATING sub-check could not be exercised on this host:
+# test-realmodel-overlimit.sh does so when the real TUI never paints the
+# failed-turn frame, which leaves the renderer scrape — what production reads
+# WITHOUT a stamp, the surface this gate exists to measure — untouched. Before
+# this arm that scenario printed a `note:` and exited 0, so the gate could go
+# GREEN on the stamp path alone. It is RED, counted with the skips because the
+# consequence is the same one ("candidate NOT validated"), and NAMED apart from
+# them because the remedy is not: a skip means fix the harness's prerequisites,
+# an unmeasured sub-check means re-run, or read the scenario's ENV line.
+#
+# `_gate_classify_rc` is a function so test-cc-gate.sh can drive it without a
+# gate run. Literal equality over disjoint values with a default-DENY arm (an
+# rc nobody taught it is a FAILURE, never a pass), so arm order decides nothing.
+_gate_classify_rc() {   # <rc> -> pass | skip | unmeasured | fail
+    case "$1" in
+        0)  echo pass ;;
+        77) echo skip ;;
+        69) echo unmeasured ;;
+        *)  echo fail ;;
+    esac
+}
 passed=0; failed=0; skipped=0
 failed_names=(); skipped_names=()
 for s in "${scenarios[@]}"; do
@@ -737,12 +840,15 @@ for s in "${scenarios[@]}"; do
     CLAUDE_BIN="$claude_bin" RUN_CC_HARNESS=1 CCH_GATE=1 \
         _gate_run_teed "$GATE_SCEN_TRANSCRIPT" bash "$s"
     scen_rc=$?
-    case "$scen_rc" in
-        0)  passed=$((passed+1)) ;;
-        77) echo "  >> SKIPPED: $(basename "$s") (candidate not exercised)" >&2
-            skipped=$((skipped+1)); skipped_names+=("$(basename "$s")") ;;
-        *)  echo "  >> FAILED: $(basename "$s") (rc=$scen_rc)" >&2
-            failed=$((failed+1)); failed_names+=("$(basename "$s")") ;;
+    case "$(_gate_classify_rc "$scen_rc")" in
+        pass) passed=$((passed+1)) ;;
+        skip) echo "  >> SKIPPED: $(basename "$s") (candidate not exercised)" >&2
+              skipped=$((skipped+1)); skipped_names+=("$(basename "$s")") ;;
+        unmeasured)
+              echo "  >> UNMEASURED: $(basename "$s") (rc=69 — it ran, and a discriminating sub-check could NOT be exercised on this host; the candidate is NOT validated on that surface)" >&2
+              skipped=$((skipped+1)); skipped_names+=("$(basename "$s")[UNMEASURED]") ;;
+        *)    echo "  >> FAILED: $(basename "$s") (rc=$scen_rc)" >&2
+              failed=$((failed+1)); failed_names+=("$(basename "$s")") ;;
     esac
 done
 
@@ -754,7 +860,7 @@ rc=0
 echo
 echo "=== tally: ${passed} passed / ${failed} failed / ${skipped} skipped (of ${#scenarios[@]}) ==="
 (( failed  > 0 )) && echo "    failed:  ${failed_names[*]}" >&2
-(( skipped > 0 )) && echo "    skipped: ${skipped_names[*]} — a skip is RED (candidate not validated)" >&2
+(( skipped > 0 )) && echo "    skipped: ${skipped_names[*]} — a skip is RED (candidate not validated); an entry marked [UNMEASURED] ran and could not exercise a discriminating sub-check (#1530)" >&2
 
 # The un-conflated assertion counts (your-org/nexus-code#1019). Quote
 # `scenario=` as candidate coverage; `lint=` is the safety pre-flight's own

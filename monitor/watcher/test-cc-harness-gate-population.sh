@@ -329,6 +329,31 @@ if (( GCOV_RC == 3 )) && grep -qF 'reason=gated_but_undeclared scenario=test-rea
     ok "a scenario in the gate list with no declaration → REFUSED"
 else bad "gated-but-undeclared" "rc=$GCOV_RC out=$out"; fi
 
+# C4b — THE CONVERSE (your-org/nexus-code#1592): a row DECLARED `gated` that the
+# gate does NOT dispatch is refused. C4 asks "is everything that RUNS declared";
+# nothing asked whether everything DECLARED gated is RUN, which is how PR 1566
+# landed a scenario and its row without the gate.sh list entry and stayed green
+# — `gated=9` beside a tally of 8, crediting a surface no gated run touched.
+# MF_OK declares alpha AND beta gated; only alpha is dispatched here.
+run_gcov "$MF_OK" "$FX/pane-states.sh" "$FX/harness" "$FX/scen" test-realmodel-alpha.sh; out="$GCOV_OUT"
+if (( GCOV_RC == 3 )) && grep -qF 'reason=declared_gated_but_not_dispatched scenario=test-realmodel-beta.sh' <<<"$out"; then
+    ok "a row declared gated that the gate never dispatches → REFUSED, naming it"
+else bad "declared-gated-but-not-dispatched" "rc=$GCOV_RC out=$out"; fi
+# …and it names ONLY the undispatched one: alpha IS dispatched and must not be accused.
+if ! grep -qF 'reason=declared_gated_but_not_dispatched scenario=test-realmodel-alpha.sh' <<<"$out"; then
+    ok "…and a row that IS dispatched is not accused (the rule is per-row, not per-manifest)"
+else bad "declared-gated converse over-fires" "out=$out"; fi
+
+# …and an ABSENT list is not an EMPTY dispatch. `gcov_report` with no scenario
+# arguments (band D's real-tree mode) cannot compare declared against
+# dispatched, and must SAY so rather than either refusing every gated row or
+# passing in silence.
+run_gcov "$MF_OK" "$FX/pane-states.sh" "$FX/harness" "$FX/scen"; out="$GCOV_OUT"
+if ! grep -qF 'reason=declared_gated_but_not_dispatched' <<<"$out" \
+   && grep -qF 'dispatch-parity UNCHECKED' <<<"$out"; then
+    ok "with NO list supplied the converse is reported UNCHECKED — not refused, and not silently passed"
+else bad "absent list read as empty dispatch" "rc=$GCOV_RC out=$out"; fi
+
 # C5 — DRIFT, the other direction: the manifest may not name a member the
 # derived vocabulary does not have. A manifest that claims coverage of a state
 # the tool does not have has drifted, and its other claims are then unbacked.
@@ -527,7 +552,7 @@ else bad "override cannot disable coverage" "gated='$gated_n' out=$(grep -E 'gat
 # This suite exists because a gate rendered a verdict over a population it had
 # not measured. A suite that silently stopped running arms would do the same
 # thing one level up, so the total is pinned rather than merely printed.
-EXPECTED_ASSERTIONS=38   # +3: your-org/nexus-code#1486 — an exempt row must be OWNED
+EXPECTED_ASSERTIONS=41   # +3: your-org/nexus-code#1486 — an exempt row must be OWNED; +3: #1592 — declared-gated must be DISPATCHED (C4b x2, absent-list x1)
                          # (refusal + the tracker-ref and until:-date controls)
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} + 1 ))
 if (( TOTAL_ASSERTIONS == EXPECTED_ASSERTIONS )); then

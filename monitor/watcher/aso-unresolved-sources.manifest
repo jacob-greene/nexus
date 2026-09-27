@@ -32,6 +32,9 @@ watcher/test-run-tests-accounting-verdict.sh	<(sed
 watcher/test-skeptic-channel.sh	$1
 watcher/test-skeptic-channel.sh	$1
 watcher/test-skeptic-channel.sh	$1
+watcher/test-skeptic-round-identity.sh	$1
+watcher/test-skeptic-round-identity.sh	$1
+watcher/test-skeptic-round-identity.sh	$1
 watcher/test-spawn-pathfront.sh	.zshrc\n
 watcher/test-tmux-window-resolver.sh	$1
 watcher/test-tmux-window-resolver.sh	$1

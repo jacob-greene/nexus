@@ -25,7 +25,8 @@ SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 # reports dir instead of the fixture's.
 #
 # Every nexus-spawned agent has NEXUS_ROOT exported, and CI does not: its
-# cell is literally named `unit suite (NEXUS_ROOT unset)`. That single
+# unit cells run under `env -u NEXUS_ROOT -u NEXUS_LOCALS` (a cell once
+# literally named `unit suite (NEXUS_ROOT unset)`, folded in by #1474). That single
 # variable is #655's "dev red locally / green in CI", measured:
 #
 #     test-spawn-worker.sh          75 pass / 24 fail  ->  101 / 0
@@ -1410,6 +1411,34 @@ _o1153=$("$SCRIPT" -n dolimeth -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>
 assert_eq "#1153 CONTROL: a plain window name is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
 _o1153=$("$SCRIPT" -n dolimeth-sk -c "$WORKDIR" -p "$PROMPT_FILE" --skeptic-role --skeptic-target dolimeth --print-prompt 2>&1 >/dev/null)
 assert_eq "#1153 CONTROL: the same name WITH --skeptic-role is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
+
+# ---- your-org/nexus-code#1601: the stale spawn-tempfile BACKSTOP ------------
+# Only the launcher removes spawn-prompt-*/spawn-launcher-*; a stubbed tmux (as
+# here) or a guard-refused launcher never runs it, and 922 such files once sat
+# in /tmp. A spawn now sweeps OTHER spawns' leftovers — but only what it can
+# attribute on every axis (shape, owner, age > 24 h, not open). One plant per
+# axis; the removals are the positive control that the sweep ran at all.
+echo '=== #1601: a spawn sweeps stale, unattributable-to-anything-live spawn tempfiles ==='
+_d1601="$SPAWN_TMP"
+_old1601=( "$_d1601/spawn-launcher-oldwin.4242.sh" "$_d1601/spawn-prompt-oldwin.4242.txt" "$_d1601/spawn-launcher-oldwin.4242.sh.keep" )
+for _f in "${_old1601[@]}"; do : > "$_f"; done
+: > "$_d1601/spawn-launcher-youngwin.4243.sh"                       # young
+: > "$_d1601/spawn-launcher-heldwin.4244.sh"                        # old, but OPEN in a live process
+: > "$_d1601/spawn-launcher-notes.md"                               # old, not a shape this tool writes
+: > "$WORK/link-target"; ln -s "$WORK/link-target" "$_d1601/spawn-launcher-linkwin.4245.sh"   # old SYMLINK
+touch -d '3 days ago' "${_old1601[@]}" "$_d1601/spawn-launcher-heldwin.4244.sh" "$_d1601/spawn-launcher-notes.md"
+touch -h -d '3 days ago' "$_d1601/spawn-launcher-linkwin.4245.sh"
+sleep 600 < "$_d1601/spawn-launcher-heldwin.4244.sh" & _hold1601=$!
+PATH="$STUB_BIN:$PATH" "$SCRIPT" -n sweep-win -c "$WORKDIR" -p "$PROMPT_FILE" >/dev/null 2>&1
+assert_eq "#1601 REMOVED: an old launcher no launcher ever ran" "$( [[ -e "${_old1601[0]}" ]] && echo present || echo gone )" "gone"
+assert_eq "#1601 REMOVED: …its prompt"                          "$( [[ -e "${_old1601[1]}" ]] && echo present || echo gone )" "gone"
+assert_eq "#1601 REMOVED: …and its trust-retry .keep sibling"   "$( [[ -e "${_old1601[2]}" ]] && echo present || echo gone )" "gone"
+assert_eq "#1601 KEPT: a YOUNG launcher (it may be about to run)" "$( [[ -e "$_d1601/spawn-launcher-youngwin.4243.sh" ]] && echo present || echo gone )" "present"
+assert_eq "#1601 KEPT: an old launcher still OPEN in a live process" "$( [[ -e "$_d1601/spawn-launcher-heldwin.4244.sh" ]] && echo present || echo gone )" "present"
+assert_eq "#1601 KEPT: an old file whose NAME is not a shape spawn-worker writes" "$( [[ -e "$_d1601/spawn-launcher-notes.md" ]] && echo present || echo gone )" "present"
+assert_eq "#1601 KEPT: an old SYMLINK with a launcher's name" "$( [[ -L "$_d1601/spawn-launcher-linkwin.4245.sh" ]] && echo present || echo gone )" "present"
+kill "$_hold1601" 2>/dev/null; wait "$_hold1601" 2>/dev/null
+rm -f "$_d1601"/spawn-launcher-sweep-win.*.sh "$_d1601"/spawn-prompt-sweep-win.*.txt
 
 # ---- summary ----------------------------------------------------------
 

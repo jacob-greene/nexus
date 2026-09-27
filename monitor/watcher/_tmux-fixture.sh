@@ -124,12 +124,20 @@ nx_tmux_fixture_init() {
     # TMUX_TMPDIR is itself too long (a scratchpad path) — fall back to the
     # short pin rather than inherit the defect.
     local probe_root="$root/tt-$$/tmux-$(id -u)/nexus-test-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    # The fallback root is OURS when this call creates it, and then it is ours
+    # to remove (your-org/nexus-code#1601): the trap below removed only
+    # `<root>/tt-$$`, so every run under a long ambient TMUX_TMPDIR left an EMPTY
+    # `/tmp/tmux-th-<uid>-<pid>` behind — 95 of them in /tmp on 2026-09-21. It
+    # is removed with `rmdir`, which refuses a non-empty directory, so a root
+    # something else has since put files in is left alone.
+    local own_root=''
     if (( ${#probe_root} > 100 )); then
         if declare -F tmux_socket_short_tmpdir >/dev/null 2>&1; then
             root="$(tmux_socket_short_tmpdir "$$")"
         else
             root="/tmp/tmux-th-$(id -u)-$$"
         fi
+        [[ -d "$root" ]] || own_root="$root"
     fi
     NX_TMUX_TMPDIR="$root/tt-$$"
     mkdir -p "$NX_TMUX_TMPDIR" || return 1
@@ -139,8 +147,22 @@ nx_tmux_fixture_init() {
     # no longer reaps it. Chain its removal onto the EXIT trap where the shared
     # helper offers a chainer (never clobber the suite's own trap); a run under
     # run-tests.sh is reaped by the runner's per-suite TMUX_TMPDIR regardless.
+    #
+    # …AND STOP THE SERVERS FIRST, IN THE SAME HANDLER (your-org/nexus-code#1576).
+    # This `rm -rf` deletes the SOCKETS. `th_trap_exit` APPENDS, so handlers run
+    # in REGISTRATION order — and this one is registered at init, BEFORE any
+    # session cleanup a suite registers afterwards. `test-tmux-selection-restore.sh`
+    # did exactly that: its trap ran `rm -rf $WORK` (the shim), then this `rm`
+    # (the socket), and only THEN `cleanup_sessions`, which by that point could
+    # address nothing, listed nothing and killed nothing. Each run left a
+    # `tmux: server` that is its own session leader with its socket already
+    # unlinked: unaddressable, and refused `not-owned` by proc-kill-authorized.
+    # Measured on the reporting host 2026-09-19: 57 of them alive at once.
+    #
+    # Whoever deletes the socket directory is the last party who can reach the
+    # servers in it, and the only one who knows ALL of them. So it stops them.
     if declare -F th_trap_exit >/dev/null 2>&1; then
-        th_trap_exit "rm -rf $(printf '%q' "$NX_TMUX_TMPDIR") 2>/dev/null || true"
+        th_trap_exit "nx_tmux_fixture_stop_servers; rm -rf $(printf '%q' "$NX_TMUX_TMPDIR") 2>/dev/null${own_root:+; rmdir $(printf '%q' "$own_root") 2>/dev/null} || true"
     fi
     # Fail LOUD rather than emit false FAILs later: a socket path that cannot
     # fit is not a test result, it is an unusable fixture.
@@ -150,6 +172,34 @@ nx_tmux_fixture_init() {
             "${#probe}" "$probe" >&2
         return 1
     fi
+    return 0
+}
+
+# nx_tmux_fixture_stop_servers — end every tmux server whose socket lives under
+# THIS process's private socket directory, while those sockets still exist.
+#
+# Idempotent, and safe to call explicitly before a suite's summary so the suite
+# can then ASSERT the server is gone (an EXIT trap cannot be asserted on).
+#
+# SCOPE IS PROVEN FROM THE PATH, NOT ASSUMED FROM THE ENVIRONMENT. It acts only
+# on a directory shaped `<root>/tt-<this pid>` — what `nx_tmux_fixture_init`
+# creates — so a clobbered or inherited `NX_TMUX_TMPDIR` cannot aim it at a
+# shared socket directory, and it names each socket with `-S` on the SAME
+# command as `kill-server` (lint-no-tmux-server-kill.sh rule 1): never PATH's
+# `tmux`, never `$TMUX`, never TMUX_TMPDIR scoping. A socket FILE physically
+# inside this pid's private directory can only belong to a server this process
+# started there — including one named `default`, which under a private
+# TMUX_TMPDIR is private, not the operator's.
+nx_tmux_fixture_stop_servers() {
+    local dir="${NX_TMUX_TMPDIR:-}" real sock
+    [[ -n "$dir" && -d "$dir" ]] || return 0
+    case "$dir" in */tt-"$$") ;; *) return 0 ;; esac
+    real=$(nx_real_tmux_bin 2>/dev/null) || return 0
+    [[ -n "$real" && -x "$real" ]] || return 0
+    for sock in "$dir"/tmux-*/*; do
+        [[ -S "$sock" ]] || continue
+        env -u TMUX "$real" -S "$sock" kill-server >/dev/null 2>&1 || true
+    done
     return 0
 }
 

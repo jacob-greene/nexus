@@ -107,7 +107,7 @@ UNITS="$WORK/units.sh"
 : > "$UNITS"
 FNS=(_pane_comm_is_shell _pane_ticks_to_epoch _pane_cmd_is_protocol_wait
      _pane_cmd_descriptor _pane_asyncrun_refs _pane_asyncrun_ref_is_died
-     _pane_root_payload _pane_payload_is_pure_wait _pane_background_shells)
+     _pane_root_payload _pane_payload_is_pure_wait _pane_cmd_is_longjob_dispatch _pane_background_shells)
 for fn in "${FNS[@]}"; do
     sed -n "/^${fn}() {/,/^}/p" "$HELPER" >> "$UNITS"
     printf '\n' >> "$UNITS"
@@ -369,8 +369,17 @@ echo "=== E2: the REAL emitter x the gate — a login frame on the heartbeat rou
 # was green only on a synthetic line the emitter could not produce. These cases
 # feed the REAL emitter (login capture + heartbeat idle + the bg overrides, the
 # exact drive w239sk used) and pass its OWN output to the gate. The orchestrator
-# permanently holds the supervisor Monitor, so on the heartbeat route it reads
-# working-background: this is the case, not an edge (#1520 arms the route).
+# permanently holds the supervisor Monitor, so on the heartbeat route it USED TO
+# read working-background: that was your-org/nexus-code#1521 — a fresh
+# `idle_prompt` stamp outranking a dialog the hook cannot see — and it is fixed:
+# the heartbeat route now defers to the renderer whenever the pane contradicts
+# `idle`, so a login MENU reads `blocked` on both routes and the code-paste step
+# (no REPL row) reads `empty` over a live claude. The property these cases pin is
+# unchanged and is asserted the same way: the emitter's OWN line for a login
+# frame is never restart-eligible, and it still carries `auth=login` — the label
+# the veto keys on, now a second line of defence behind the state. E2c is driven
+# against the suite's live L1 tree (`--pane-pid`), because with no pane pid a
+# row-less capture reaches the one door to `absent`, a fixture-mode artefact.
 _e2_now=$(date +%s)
 _e2_hb="$WORK/e2-hb.json"; printf '{"state":"idle_prompt","last_activity":%s,"last_turn_end":%s}\n' "$_e2_now" "$_e2_now" > "$_e2_hb"
 _e2_hb2="$WORK/e2-hb2.json"; printf '{"state":"idle_prompt","last_activity":%s,"last_turn_end":%s,"scheduled_wakeup_at":%s}\n' "$_e2_now" "$_e2_now" "$(( _e2_now + 600 ))" > "$_e2_hb2"
@@ -389,12 +398,12 @@ e2() {   # e2 <label> <want-state> <want-auth> <want-gate-rc> <fixture> <hb-file
     ck "$label: the gate on the emitter's OWN line" "$rc" "$wrc"
 }
 if [[ -r "$_e2_login" && -r "$_e2_paste" && -r "$_e2_busyq" ]]; then
-    e2 "E2a login menu + heartbeat idle + quiescent bg shell → working-background carries auth=login, NOT a boundary" \
-       working-background login 1 "$_e2_login" "$_e2_hb" --bg-shells 1 --bg-cpu 2 --bg-quiesce 1
-    e2 "E2b login menu + scheduled wakeup → working-self-paced carries auth=login, NOT a boundary" \
-       working-self-paced login 1 "$_e2_login" "$_e2_hb2"
-    e2 "E2c code-paste step + heartbeat idle + quiescent bg shell → auth=login, NOT a boundary" \
-       working-background login 1 "$_e2_paste" "$_e2_hb" --bg-shells 1 --bg-cpu 2 --bg-quiesce 1
+    e2 "E2a login menu + heartbeat idle + quiescent bg shell → blocked (the pane outranks the stamp, #1521) and carries auth=login, NOT a boundary" \
+       blocked login 1 "$_e2_login" "$_e2_hb" --bg-shells 1 --bg-cpu 2 --bg-quiesce 1
+    e2 "E2b login menu + scheduled wakeup → blocked (#1521) and carries auth=login, NOT a boundary" \
+       blocked login 1 "$_e2_login" "$_e2_hb2"
+    e2 "E2c code-paste step + heartbeat idle + a live claude → empty (no REPL row, #1521) and carries auth=login, NOT a boundary" \
+       empty login 1 "$_e2_paste" "$_e2_hb" --pane-pid "$L1_PID"
     # CONTROL (w237sk D2's own false positive): a BUSY, row-less pane QUOTING a
     # login literal must stay UNLABELLED — narrowing the exclusion must not bring
     # it back. The busy fixture holds no login text of its own (w239sk delta:

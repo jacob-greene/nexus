@@ -62,8 +62,12 @@ WORK=$(mktemp -d -t nexus-phantom-XXXXXX)
 # Track every pid we spawn (supervisors, stub servers, sleepers) so cleanup
 # never has to pattern-match (self-kill hazard). Identity-verified kills only.
 SPAWNED_PIDS=()
+SPAWNED_GROUPS=()   # self-grouped plants (T5's `timeout`): killed as a GROUP, so no child is orphaned
 cleanup() {
     local pid pf
+    for pid in "${SPAWNED_GROUPS[@]:-}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] && kill -KILL -- "-$pid" 2>/dev/null || true
+    done
     for pid in "${SPAWNED_PIDS[@]:-}"; do
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         kill -KILL "$pid" 2>/dev/null || true
@@ -354,5 +358,103 @@ assert_not_contains "T3 nothing was pruned" "$(cat "$T3/sup.log")" "pruned"
 assert_eq "T3 server still healthy alongside supervisor" "$("$HEALTH" "$T3" >/dev/null 2>&1; echo $?)" "0"
 kill -KILL "$T3SUP" 2>/dev/null
 kill -KILL "$T3SRV" 2>/dev/null
+
+# ============================================================================
+echo '=== T4 (F5, #1594): the token-mismatch proof consults only the record on OUR port ==='
+# `_token_mismatch_proven` read EVERY jpserver record, so a FOREIGN serving
+# record (its own token, not the file's) proved a "mismatch" while our own
+# server was merely warming — and the fast bail fired on a warming server.
+# Driven on the functions EXTRACTED VERBATIM from the supervisor, so this
+# cannot drift from the code it judges; real stub servers answer the probes.
+_tmp_src=$(awk '/^(runtime_dir|record_field|record_is_serving|_token_mismatch_proven)\(\) \{/,/^}/' "$SUP")
+assert_eq "T4 CONTROL: all four functions were really extracted" \
+    "$(grep -cE '^(runtime_dir|record_field|record_is_serving|_token_mismatch_proven)\(\) \{' <<<"$_tmp_src")" "4"
+T4="$WORK/t4"; T4RT="$T4/.jupyter/share/jupyter/runtime"; mkdir -p "$T4RT"
+T4FPORT=$(free_port); T4OPORT=$(free_port)
+python3 "$STUBS/stub-server.py" "$T4FPORT" foreigntok >/dev/null 2>&1 &
+SPAWNED_PIDS+=("$!")
+# OUR server is WARMING: it holds a token nobody is told, so it answers 403 to
+# the one in its record — exactly what a warming jupyter shows.
+python3 "$STUBS/stub-server.py" "$T4OPORT" not-yet-ready >/dev/null 2>&1 &
+SPAWNED_PIDS+=("$!")
+printf '{"pid": 1, "port": %s, "token": "foreigntok", "secure": false}\n' "$T4FPORT" > "$T4RT/jpserver-foreign.json"
+printf '{"pid": 2, "port": %s, "token": "filetok", "secure": false}\n' "$T4OPORT" > "$T4RT/jpserver-ours.json"
+printf 'PORT=%s\nSCHEME=http\n' "$T4OPORT" > "$T4/.jupyter/labsh-service.env"
+t4_run() {  # t4_run <fn-call…> — run in the project, as the supervisor does
+    ( cd "$T4" && PROJECT_DIR="$T4" ENV_FILE=".jupyter/labsh-service.env" \
+        bash -c "$_tmp_src"'
+"$@" && echo 0 || echo 1' _ "$@" ) 2>/dev/null
+}
+wait_for "T4 PRECONDITION: the foreign server is up" 10 -- \
+    curl -fs -o /dev/null -H 'Authorization: token foreigntok' "http://127.0.0.1:$T4FPORT/api/status"
+assert_eq "T4 PRECONDITION: the FOREIGN record really is serving (else the row below proves nothing)" \
+    "$(t4_run record_is_serving "$T4RT/jpserver-foreign.json")" "0"
+assert_eq "T4 PRECONDITION: OUR record is NOT serving (warming, 403)" \
+    "$(t4_run record_is_serving "$T4RT/jpserver-ours.json")" "1"
+assert_eq "T4 a foreign serving record on ANOTHER port does not prove a mismatch while ours warms" \
+    "$(t4_run _token_mismatch_proven filetok)" "1"
+# CONTROL: OUR port's record serving with a token that is not the file's — a
+# real rotation — must still be proven, or the guard above is merely a mute.
+T4RPORT=$(free_port)
+python3 "$STUBS/stub-server.py" "$T4RPORT" oldtok >/dev/null 2>&1 &
+SPAWNED_PIDS+=("$!")
+printf '{"pid": 3, "port": %s, "token": "oldtok", "secure": false}\n' "$T4RPORT" > "$T4RT/jpserver-rotated.json"
+printf 'PORT=%s\nSCHEME=http\n' "$T4RPORT" > "$T4/.jupyter/labsh-service.env"
+wait_for "T4 CONTROL: our rotated server is up" 10 -- \
+    curl -fs -o /dev/null -H 'Authorization: token oldtok' "http://127.0.0.1:$T4RPORT/api/status"
+assert_eq "T4 CONTROL: OUR port's record serving a token that is not the file's IS a proven mismatch" \
+    "$(t4_run _token_mismatch_proven filetok)" "0"
+rm -f "$T4/.jupyter/labsh-service.env"
+assert_eq "T4 no env file (our port unknown) = cannot tell, never a proof" \
+    "$(t4_run _token_mismatch_proven filetok)" "1"
+
+# ============================================================================
+# F6 (#1594): a predecessor's orphaned periodic hook is reaped at startup. The
+# plants are ORPHANS on purpose — launched from a subshell that exits, so init
+# reaps them and "gone" is never a zombie of ours — which is also exactly the
+# shape a KILLed supervisor leaves behind.
+proc_live() {  # proc_live <pid> — present and not a zombie
+    local st; st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    st=${st##*) }; [[ "${st%% *}" != Z ]]
+}
+plant_orphan() {  # plant_orphan <dir> <cmd…> — prints the orphan's pid
+    local d="$1"; shift
+    ( cd "$d" && { "$@" >/dev/null 2>&1 </dev/null & echo $!; } )
+}
+echo '=== T5 (F6, #1594): a still-VALID pgid file left by a killed supervisor is reaped before the first round ==='
+T5="$WORK/t5"; mkdir -p "$T5/.jupyter"
+T5T=$(plant_orphan "$T5" timeout 600 sleep 600)
+SPAWNED_GROUPS+=("$T5T")
+wait_for "T5 PRECONDITION: the plant is a self-grouped \`timeout\` (the identity the reaper accepts)" 10 -- \
+    bash -c '[[ "$(cat /proc/$1/comm)" == timeout && "$(ps -o pgid= -p "$1" | tr -d " ")" == "$1" ]]' _ "$T5T"
+T5C=""; for _i in $(seq 1 40); do T5C=$(ps -o pid= --ppid "$T5T" 2>/dev/null | tr -d ' '); [[ -n "$T5C" ]] && break; sleep 0.25; done
+printf '%s\n' "$T5T" > "$T5/.jupyter/labsh-periodic.pgid"
+"$SUP" "$T5" >"$T5/sup.log" 2>&1 &
+T5SUP=$!; SPAWNED_PIDS+=("$T5SUP")
+wait_for_log "T5 the startup reap is LOGGED" "$DL" "$T5/sup.log" "an orphaned periodic hook left by a previous supervisor (process group $T5T)"
+wait_for "T5 the orphaned \`timeout\` is GONE" "$DL" -- bash -c '! { st=$(cat /proc/$1/stat 2>/dev/null) && st=${st##*) } && [[ ${st%% *} != Z ]]; }' _ "$T5T"
+wait_for "T5 …and so is the hook under it (the whole group)" "$DL" -- bash -c '[[ -n "$1" ]] && ! { st=$(cat /proc/$1/stat 2>/dev/null) && st=${st##*) } && [[ ${st%% *} != Z ]]; }' _ "$T5C"
+kill -KILL "$T5SUP" 2>/dev/null
+kill -KILL -- "-$T5T" 2>/dev/null   # a regression leaves a 600 s group behind
+
+echo '=== T6 (F6 control): a RECYCLED pgid (a live non-`timeout` in the same dir) is left alone ==='
+T6="$WORK/t6"; mkdir -p "$T6/.jupyter"
+# SELF-GROUPED (`setsid`), in the SAME directory: only the `comm` check can
+# refuse it. A plain background `sleep` would also fail the group-leader check,
+# and a control two guards defend cannot show that either one works.
+T6S=$(plant_orphan "$T6" setsid sleep 600)
+SPAWNED_PIDS+=("$T6S")
+wait_for "T6 PRECONDITION: the plant is self-grouped, in this dir, and NOT a \`timeout\`" 10 -- \
+    bash -c '[[ "$(cat /proc/$1/comm)" == sleep && "$(ps -o pgid= -p "$1" | tr -d " ")" == "$1" && "$(readlink /proc/$1/cwd)" == "$2" ]]' _ "$T6S" "$(cd "$T6" && pwd -P)"
+printf '%s\n' "$T6S" > "$T6/.jupyter/labsh-periodic.pgid"
+"$SUP" "$T6" >"$T6/sup.log" 2>&1 &
+T6SUP=$!; SPAWNED_PIDS+=("$T6SUP")
+# Anchor AFTER the reap point: the start line is logged only once startup has
+# passed it, so the absence below is observed, not sampled early.
+wait_for_log "T6 supervisor passed the startup reap point" "$DL" "$T6/sup.log" "starting labsh server"
+assert_eq "T6 the recycled pid's process is still alive" "$(proc_live "$T6S" && echo alive || echo dead)" "alive"
+assert_not_contains "T6 no reap was logged" "$(cat "$T6/sup.log")" "(process group $T6S)"
+kill -KILL "$T6SUP" 2>/dev/null
+kill -KILL "$T6S" 2>/dev/null
 
 th_summary_and_exit

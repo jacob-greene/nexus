@@ -172,8 +172,8 @@ standing directive, stricter than the GUIDE's interactive table):
     verdict is **needs-review**, not SAFE. On a host where VI mode IS
     reached, `2c-vi` has a `gate` route (`test-realmodel-vimode` in your
     gate log, mapped since `<your-org>/nexus-code#867`), so this does not
-    strand you at needs-review; `2c-paste` has no scenario and is
-    `empirical` with a control, or needs-review. Note `apply.sh` does
+    strand you at needs-review; likewise `2c-paste` has a `gate` route
+    (`test-realmodel-paste-held`, mapped since `<your-org>/nexus-code#1614`). Note `apply.sh` does
     **not** check this: it accepts `source-inspection` for these keys at
     exit 0. The rule binds you.
   - **An opaque changelog is an ABSENCE of evidence, not a clean
@@ -200,6 +200,7 @@ standing directive, stricter than the GUIDE's interactive table):
           --changelog-evidence <the CHANGELOG.md you fetched this session> \
           --changelog-ledger <one line per entry: verbatim quote + disposition> \
           --changelog-dispositioned <release>=<N>   # one per release in the delta
+          --opaque-disposition <ver>=accepted:'<reason>'   # one per OPAQUE release, if any
 
   `--surfaces-clear` is NOT a bare attestation any more, and the script
   will refuse (exit 3) without the per-surface labels. For EVERY surface
@@ -208,10 +209,11 @@ standing directive, stricter than the GUIDE's interactive table):
 
   - `gate` — a cc-harness scenario covered it. Cross-checked against the
     scenario names in your gate log, so it cannot be claimed loosely.
-    Payable for exactly the keys `_surface_gate_scenarios` maps
-    (`monitor/cc-auto-update-apply.sh:670-678`): **2a, 2b, 2c-vi, 2d**.
-    `2c-vi` is paid by `test-realmodel-vimode` (`<your-org>/nexus-code#867`).
-    Nothing in the harness covers `2c-paste` or `2e`.
+    Payable for exactly the keys `_surface_gate_scenarios` maps (in
+    `monitor/cc-auto-update-apply.sh`): **2a, 2b, 2c-vi, 2c-paste, 2d**.
+    `2c-vi` is paid by `test-realmodel-vimode` (`<your-org>/nexus-code#867`),
+    `2c-paste` by `test-realmodel-paste-held` (`<your-org>/nexus-code#1614`).
+    Nothing in the harness covers `2e`.
   - `empirical` — you drove a probe against the candidate binary AND
     showed the probe can go RED. Requires
     `--negative-control <surface>=<what you broke and what failed>`.
@@ -289,20 +291,27 @@ standing directive, stricter than the GUIDE's interactive table):
   **The RELEASE SET comes from the npm registry, not from the changelog's
   headers** (`<your-org>/nexus-code#1007`): every version the registry
   publishes in `(installed, candidate]`. A published release with **no
-  `## <version>` section** in the fetched changelog is an OPAQUE release
-  and is refused with its own code, **exit 8**, naming the version. It
-  used to vanish from the set instead — `2.1.242` (2026-08-25) was
-  published and sectionless, and "406 of 406" read GREEN over it. Nothing
-  you pass clears exit 8; the evidence does not exist upstream. Do not
-  route around it: record it and stop — the daily fire retries and clears
-  when the section appears. **The refusal is BOUNDED, not terminal**:
-  after `defer_streak_cap` consecutive refusals on the same opaque set
-  (default 3, floor 2) `apply.sh` itself escalates the operator —
-  sandbox-notify plus a comment on the tracking issue naming the
-  candidate and the release(s) — and keeps refusing. Delay, then
-  surface; never auto-proceed. You do not need to post that comment
-  yourself; if you surface anything, make it a finding about upstream's
-  changelog, not a request to bypass the check. A registry that cannot be
+  `## <version>` section** in the fetched changelog is an OPAQUE release.
+  It used to vanish from the set — `2.1.242` (2026-08-25) was published
+  and sectionless, and "406 of 406" read GREEN over it — so `apply.sh`
+  now names it and refuses **exit 8** until YOU disposition it
+  (`<your-org>/nexus-code#1526`; operator, 2026-09-25: *"There is real
+  damage in not updating too and we should only prevent it if we have
+  evidence it breaks the nexus."*). Judge each opaque release per GUIDE
+  Step 1 "Dispositioning an OPAQUE release" — publish date, what
+  superseded it and how fast, deprecation, the GREEN gate on the
+  candidate binary that contains it, whether any nexus surface depends on
+  it — and pass one flag per release:
+
+      --opaque-disposition <ver>=accepted:'<your reasoning>'
+      --opaque-disposition <ver>=blocked:'<the EVIDENCE it breaks the nexus>'
+
+  Accept unless you found evidence of breakage; absence of information is
+  the condition you are judging, not evidence. No disposition is exit 8
+  again (silence never clears); `blocked` is exit 8 and belongs in a
+  `block` verdict or a compat PR. No human is asked to disposition it and
+  you should not ask one. Put the same judgment in your ledger and
+  report. A registry that cannot be
   fetched or read, or that does not list the candidate, refuses (exit 3)
   rather than falling back to the headers. A header for a version the
   registry does NOT publish is dropped from the set with a `WARN` naming

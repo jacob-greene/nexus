@@ -65,6 +65,18 @@ assert_eq "elapsed 25m00s of 40m ceiling (62% used)" "$out" "elapsed 25m00s of 4
 out=$(NEXUS_DIAG_NOW=2701 bash "$B" --elapsed 2700 0)
 assert_contains "past the ceiling reads over 100%, not clamped (the number is the finding)" "$out" "(100% used)"
 
+echo "== 4b. --run-bound: the band stops INSIDE the job, below the ceiling (#1474)"
+out=$(NEXUS_DIAG_NOW=1100 bash "$B" --run-bound 3600 1000); rc=$?
+assert_eq "rc 0" "$rc" "0"
+assert_eq "3600 ceiling, 100 elapsed, default 360 reserve -> 3140" "$out" "3140"
+out=$(NEXUS_DIAG_NOW=1100 bash "$B" --run-bound 3600 1000 600)
+assert_eq "an explicit reserve is honoured (3600-100-600 = 2900)" "$out" "2900"
+out=$(NEXUS_DIAG_NOW=9999 bash "$B" --run-bound 3600 0)
+assert_eq "no time left prints 1, NEVER 0 (\`timeout 0\` would DISABLE the bound)" "$out" "1"
+out=$(NEXUS_DIAG_NOW=1 bash "$B" --run-bound 3600 x 2>/dev/null); rc=$?
+assert_eq "a non-numeric start -> rc 2" "$rc" "2"
+assert_eq "…with nothing on stdout (a refusal is not a bound)" "$out" ""
+
 echo "== 5. tests.yml: the ceiling the budget is derived from IS the job's timeout-minutes"
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' 2>/dev/null; then
     th_skip "tests.yml structure" "python3 with PyYAML unavailable — section 5 asserted nothing"
@@ -87,6 +99,23 @@ for name, job in (wf.get('jobs') or {}).items():
     elapsed = any('ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"' in r for r in runs)
     derives = any('ci-diag-budget.sh "$JOB_CEILING_S" "$JOB_START_S"' in r for r in runs)
     const = any('DIAG_BUDGET_S="${NEXUS_DIAG_BUDGET_S' in r for r in runs)
+    # #1474: the band's run step is BOUNDED below the ceiling and teed to a
+    # log, and an always() step reads that log through ci-band-verdict.sh,
+    # keyed on the band step's own id and run_rc output.
+    band_steps = [st for st in steps if 'run-tests.sh --jobs' in str(st.get('run') or '')]
+    bounded = int(bool(band_steps) and all(
+        'ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S"' in str(st.get('run'))
+        and 'timeout --signal=TERM --kill-after=' in str(st.get('run'))
+        and '| tee "' in str(st.get('run'))
+        and 'echo "run_rc=$rc" >> "$GITHUB_OUTPUT"' in str(st.get('run'))
+        and st.get('id') for st in band_steps))
+    ids = [st.get('id') for st in band_steps]
+    reader = int(len(ids) == 1 and bool(ids[0]) and any(
+        'bash monitor/watcher/ci-band-verdict.sh' in str(st.get('run') or '')
+        and str(st.get('if') or '').startswith('always()')
+        and '${{ steps.%s.outputs.run_rc }}' % ids[0] in str((st.get('env') or {}).get('RUN_RC', ''))
+        for st in steps))
+    scrub = int(any('env -u NEXUS_ROOT -u NEXUS_LOCALS' in str(st.get('run')) for st in band_steps))
     # The INVOCATION, not a mention: the report step echoes the band's name
     # in prose, and a mention must not satisfy a structural claim.
     gate = any('bash monitor/nexus-root-sensitivity.sh band' in r for r in runs)
@@ -94,12 +123,13 @@ for name, job in (wf.get('jobs') or {}).items():
     # `|`-separated, NOT tab: `read` with IFS=tab collapses a run of tabs (an
     # EMPTY field shifts every later column left — measured, the first cut
     # read timeout-minutes as the ceiling for every job with no env block).
-    print('|'.join(str(x) for x in [name, ceil, tm if tm is not None else '', rec, first_real, int(runs_band), int(elapsed), int(derives), int(const), int(gate), int(attribute)]))
+    print('|'.join(str(x) for x in [name, ceil, tm if tm is not None else '', rec, first_real, int(runs_band), int(elapsed), int(derives), int(const), int(gate), int(attribute), bounded, reader, scrub]))
 PY
 )
-n_ceil=0; n_band=0; gate_jobs=()
+n_ceil=0; n_band=0; gate_jobs=(); seen_clean_env=0
 for row in "${rows[@]}"; do
-    IFS='|' read -r name ceil tm rec first runs_band elapsed derives const gate attribute <<<"$row"
+    IFS='|' read -r name ceil tm rec first runs_band elapsed derives const gate attribute bounded reader scrub <<<"$row"
+    [[ "$name" == clean-env ]] && seen_clean_env=1
     if [[ -n "$ceil" ]]; then
         n_ceil=$(( n_ceil + 1 ))
         [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
@@ -112,6 +142,8 @@ for row in "${rows[@]}"; do
         assert_eq "unit job '$name': declares JOB_CEILING_S (the budget/elapsed lines need it)" "$([[ -n "$ceil" ]] && echo 1 || echo 0)" "1"
         assert_eq "unit job '$name': prints its elapsed time against the ceiling (#1443 remedy 1)" "$elapsed" "1"
         assert_eq "unit job '$name': no CONSTANT diagnostics budget survives (#1442)" "$const" "0"
+        assert_eq "unit job '$name': the band is bounded BELOW the ceiling (--run-bound + timeout), teed, rc recorded (#1474)" "$bounded" "1"
+        assert_eq "unit job '$name': an always() step reads the band log through ci-band-verdict.sh (#1474)" "$reader" "1"
     fi
     (( gate )) && gate_jobs+=("$name")
     if [[ "$name" == inherited-root ]]; then
@@ -123,6 +155,10 @@ assert_eq "at least one job declares a ceiling (the section is not vacuous)" "$(
 assert_eq "at least one job runs the band" "$(( n_band > 0 ))" "1"
 assert_eq "exactly ONE job runs the decoy band, and it is its own job (#1384): ${gate_jobs[*]:-none}" "${#gate_jobs[@]}" "1"
 assert_eq "…named inherited-root-gate" "${gate_jobs[0]:-}" "inherited-root-gate"
+# #1474 item 13: the clean-env job is gone and its scrub lives in the unit cells.
+assert_eq "no 'clean-env' job (dropped by #1474 item 13)" "$seen_clean_env" "0"
+assert_eq "the 'unit' matrix job scrubs NEXUS_ROOT and NEXUS_LOCALS explicitly (the guarantee clean-env carried)" \
+    "$(printf '%s\n' "${rows[@]}" | awk -F'|' '$1=="unit"{print $14}')" "1"
 # The diagnostics step exists only in the matrix job; it must derive, not assume.
 assert_eq "the 'unit' matrix job derives its diagnostics budget through the script" \
     "$(printf '%s\n' "${rows[@]}" | awk -F'|' '$1=="unit"{print $8}')" "1"

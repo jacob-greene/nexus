@@ -321,9 +321,16 @@ jq_loud=(
     monitor/lit.sh
     monitor/nexus-root-sensitivity.sh
     monitor/resolve-settings.sh
+    monitor/skeptic-channel.sh
     monitor/watcher/_gh_stub.sh
     monitor/worker-health.sh
 )
+# `monitor/skeptic-channel.sh` — a NEW jq dependency, recorded as a DECISION
+# (your-org/nexus-code#1536). Its one gate is `window <target>`, which reads the
+# spawn provenance records to say whether a skeptic window exists. LOUD: without
+# jq it warns and `return 3` — COULD NOT TELL — and never degrades to "none",
+# because a false "no skeptic window" is the documented trigger for a DUPLICATE
+# spawn, which is the defect the verb exists to remove.
 # `monitor/watcher/_gh_stub.sh` — a NEW jq dependency, recorded as a DECISION
 # rather than a manifest bump (your-org/nexus-code#932, #1125). It arrives with
 # the `gh` test double that APPLIES the caller's `--jq` through REAL jq instead
@@ -402,6 +409,11 @@ jq_fallback=(
     monitor/hooks/notify-permission.sh  # if -z: `case` glob on the raw payload
     monitor/retire-preflight.sh     # else: sed-extracts the same session_id
     monitor/window-session-id.sh    # documented fallback, on empty AND on absent
+    # your-org/nexus-code#1520: `_auth_hold_tf_field` / `_auth_hold_turn_failure_gate`
+    # read the one-line `turn-failure/<target>.json` the hook writes with `jq -c`;
+    # else: `sed -n '1s/…/'` extracts the same scalar fields (recovery, category,
+    # ts, last_msg) — the same fallback shape `_idle_turn_failure_field` uses.
+    monitor/watcher/_auth_hold.sh
 )
 # DEGRADES — the manifest. Derived by SUBTRACTION from the measured population
 # rather than re-listed, so the two can never disagree: anything not declared
@@ -461,6 +473,17 @@ expected_jq=(
     # means matching the property — a jq gate whose failure arm does not fail
     # loudly — which changes this suite's declared boundary and belongs there,
     # not on #665's PR.
+    #
+    # your-org/nexus-code#1591. A DECISION, same class and same argument as
+    # `_submit_evidence.sh` directly below. `pd_evidence_begin` needs jq to
+    # read the target's transcript; without it the confirmed-delivery primitive
+    # reports `unverifiable` (PD_UNVERIFIABLE_REASON names jq), its callers
+    # answer rc 3 / fall back to the rendering check, and the ONE thing that
+    # needs no jq — the pane positively reading "the text is still in the box"
+    # — still earns the second Enter. Designed, announced and three-valued, but
+    # it is "jq absent changes behaviour", which is what this manifest tracks.
+    # (C order: `_p` sorts before `_s`.)
+    monitor/_paste-deliver.sh
     monitor/_submit_evidence.sh
     monitor/cc-auto-update-apply.sh
     # your-org/nexus-code#1448. A DECISION, and it belongs in DEGRADES rather
@@ -482,6 +505,13 @@ expected_jq=(
     monitor/guard-block.sh.in
     monitor/hooks/async-launch-detect.sh
     monitor/hooks/bash-footgun-guard.sh
+    # your-org/nexus-code#1632. A DECISION: without jq the PermissionRequest
+    # hook cannot read tool_name/permission_mode/command, so it answers
+    # NOTHING and the dangerous-rm prompt is shown exactly as before #1632
+    # (refused by Case A, auto-denied after 2 min from 2.1.281). It degrades
+    # toward the PROMPT, never toward an allow — pinned by
+    # test-dangerous-rm-decide-hook.sh `ctl.fail.nojq`.
+    monitor/hooks/dangerous-rm-decide.sh
     monitor/hooks/decision-emit.sh
     monitor/hooks/decision-mark-unresolved.sh
     monitor/hooks/gh-write-guard.sh
@@ -536,6 +566,13 @@ expected_jq=(
     # GitHub escalation and its recovery close-comment. The failure mode is
     # that the durable GitHub record of an outage is never written.
     monitor/watcher/_lib.sh
+    # your-org/nexus-code#1548. ONE site, in `_operator_alert_github_leg`: the
+    # GitHub issue leg is SKIPPED without jq and the skip is RECORDED
+    # (`github-skipped reason=no-jq` in operator-alerts.jsonl) — announced in
+    # the durable record, not on stderr, so not LOUD; the other three legs
+    # (record, bell, push) do not need jq and still fire. Manifest because the
+    # behaviour changes: a jq-less host never files the off-terminal issue.
+    monitor/watcher/_operator_alert.sh
     # your-org/nexus-code#1129 — THE DECISION THIS ASSERTION EXISTS TO FORCE.
     # It arrived with #1101's `066d514` and has been unclassified since, which
     # is what kept this suite (and `test-public-mirror-overlay-drift.sh`, which

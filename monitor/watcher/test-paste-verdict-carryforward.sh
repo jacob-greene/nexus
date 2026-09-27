@@ -121,10 +121,28 @@ if [[ "$cmd" == "list-windows" ]]; then
     exit 0
 fi
 printf '%s\n' "$*" >> "$ACTIONS"
+# THE RECORD CARRIES WHAT WAS PASTED (your-org/nexus-code#1591, skeptic pastesk
+# F1): delivery evidence is content-matched now — a transcript record counts
+# only if it CONTAINS a needle from this paste — so a stand-in for Claude Code
+# has to record the payload it was handed, as the real one does, and not a fixed
+# string. The payload arrives as a FILE (`load-buffer -b <buf> <file>`, #1590).
+if [[ "$cmd" == "load-buffer" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
+    cat -- "${!#}" > "${MOCK_TRANSCRIPT}.payload" 2>/dev/null
+fi
 if [[ "$cmd" == "send-keys" && "${!#}" == "Enter" \
       && "${MOCK_NO_SUBMIT:-0}" != "1" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
-    printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the follow-up"}}\n' \
-        >> "$MOCK_TRANSCRIPT"
+    if [[ -s "${MOCK_TRANSCRIPT}.payload" ]]; then
+        # JSON-escaped in PURE BASH, never `jq`: test-tmux-shim-gate3-safety.sh
+        # default-denies any external in a planted tmux stub that it cannot prove
+        # never reaches a real tmux, and it is right to (#1105).
+        _p=$(cat -- "${MOCK_TRANSCRIPT}.payload"; printf x); _p=${_p%x}
+        _p=${_p//\\/\\\\}; _p=${_p//\"/\\\"}; _p=${_p//$'\n'/\\n}; _p=${_p//$'\t'/\\t}; _p=${_p//$'\r'/\\r}
+        printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"%s"}}\n' "$_p" \
+            >> "$MOCK_TRANSCRIPT"
+    else
+        printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the follow-up"}}\n' \
+            >> "$MOCK_TRANSCRIPT"
+    fi
 fi
 exit 0
 STUB

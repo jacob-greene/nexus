@@ -109,7 +109,7 @@ UNITS="$WORK/units.sh"
 : > "$UNITS"
 FNS=(_pane_comm_is_shell _pane_ticks_to_epoch _pane_cmd_is_protocol_wait
      _pane_cmd_descriptor _pane_asyncrun_refs _pane_asyncrun_ref_is_died
-     _pane_background_shells)
+     _pane_root_payload _pane_payload_is_pure_wait _pane_cmd_is_longjob_dispatch _pane_background_shells)
 for fn in "${FNS[@]}"; do
     sed -n "/^${fn}() {/,/^}/p" "$HELPER" >> "$UNITS"
     printf '\n' >> "$UNITS"

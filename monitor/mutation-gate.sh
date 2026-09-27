@@ -4,6 +4,19 @@
 #
 #   monitor/mutation-gate.sh --suite <path> --list
 #   monitor/mutation-gate.sh --suite <path> --line N [--mode delete|duplicate]
+#   monitor/mutation-gate.sh --suite <path> --subject <path> --list
+#   monitor/mutation-gate.sh --suite <path> --subject <path> --line N \
+#           [--mode delete|duplicate|if-true|if-false|subst --from S --to R] \
+#           [--predict F] [--record TSV]
+#   monitor/mutation-gate.sh --provenance TSV --suite <path> [--labels-from F]
+#
+# TWO DIFFERENT QUESTIONS, AND UNTIL `#1519` THIS TOOL COULD ASK ONLY THE FIRST.
+# Read section (7) below before you cite a mutation round in a report.
+#
+#   --suite alone        mutates THE SUITE. Answers: "is this assertion REACHED —
+#                        does removing it change the verdict?"
+#   --suite + --subject  mutates THE CODE UNDER TEST and runs the suite against
+#                        it. Answers: "would this suite CATCH A DEFECT here?"
 #
 # ---------------------------------------------------------------------------
 # WHY THIS FILE EXISTS AT ALL
@@ -142,8 +155,9 @@
 # at rc 3.
 #
 # EXIT CODES: 0 killed-by-assertion · 4 survived · 5 killed-unattributable /
-# inconclusive · 3 REFUSED · 2 usage. Non-zero is not "failure" here; read the
-# verdict line.
+# inconclusive · 3 REFUSED · 2 usage · 6 a verdict WAS rendered and the
+# registered `--predict` was REFUTED (section 8). Non-zero is not "failure"
+# here; read the verdict line.
 #
 # ---------------------------------------------------------------------------
 # (4) WHAT YOU RECORD IS NOT WHAT YOU CHECKED — REPORT THE DIFF, NOT A HASH
@@ -225,6 +239,108 @@
 # fire.
 #
 # ---------------------------------------------------------------------------
+# (7) MUTATING THE SUITE IS NOT MUTATING THE SUBJECT (your-org/nexus-code#1519)
+# ---------------------------------------------------------------------------
+#
+# For its first life this tool took `--suite` only and mutated AND ran the same
+# file. That answers "is this assertion REACHED". It cannot answer "would this
+# suite catch a defect in the code under test" — and that second question is
+# what "I mutation-tested my suite" is read to mean in a report.
+#
+# WHAT EVERY SUITE-MUTATION RESULT ESTABLISHES, AND WHAT IT DOES NOT. A
+# `killed-by-assertion` from a `--suite`-only round shows that the assertion
+# executes and that the suite's verdict depends on it. It does NOT show that
+# the assertion would FAIL if the code were wrong, because the code was never
+# changed. The measured gap (`#1518`, a hand-rolled subject sweep over
+# `_auth_hold.sh`): three assertions were green FOR THE WRONG REASON — each
+# NAMED one guard and was in fact DEFENDED BY A DIFFERENT ONE. A fresh-hold
+# assertion used an age the grace guard already refused, so deleting the escape
+# threshold left it green. Every one of those assertions was reached, so a
+# suite-mutation round reports every one of them load-bearing. Any report that
+# cites a `--suite`-only round as evidence that a suite "catches defects"
+# inherited a claim the instrument could not support; the honest reading is
+# "the assertions are reached".
+#
+# SUBJECT MODE, AND THE THREE WAYS IT WOULD OTHERWISE LIE:
+#
+#   (a) THE TRACKED FILE IS NEVER EDITED. A subject is production code; the
+#       watcher may be sourcing it. Both arms run in THROWAWAY COPIES of the
+#       working tree (`git ls-files -co --exclude-standard`: tracked plus
+#       untracked-unignored, WORKING-TREE content, so an uncommitted suite is
+#       included), each made its own git repository so a population guard's
+#       `git ls-files` answers about the COPY. The baseline arm is the positive
+#       control for the copy: a suite that cannot go green there is REFUSED.
+#       BOUNDARY: GITIGNORED files are NOT copied (the WORKTREE-BLIND-SPOT,
+#       `#1150`). A fixture-gated sub-check that skips in BOTH arms cannot
+#       flip, so the error direction is FALSE SURVIVORS — this under-claims
+#       coverage, never over-claims it. The count of uncopied ignored paths is
+#       printed on every run.
+#
+#   (b) AN INERT MUTANT READS AS `survived`. A suite that resolves its subject
+#       through `$NEXUS_ROOT`, an absolute path or an installed copy never
+#       reads the mutated file; the suite stays green and the tool would report
+#       "nothing asserts this line" about a line the suite never saw. So a
+#       LOAD WITNESS — one `echo x >> <file>` line — is planted at the top of the
+#       subject copy in BOTH arms (identical, so the arms still differ only by
+#       the mutation). An empty baseline witness is a REFUSAL (rc 3) before the
+#       mutant is even built: the suite does not execute this copy of the
+#       subject. It proves the FILE was executed, not that LINE N was reached —
+#       deliberately: a suite that never reaches line N would not catch a
+#       defect there, so `survived` is the correct verdict for it.
+#       `--no-load-witness` exists for a subject whose CONTENT a suite pins
+#       (a hash, a header lint); a survivor is then `survived-unwitnessed`,
+#       rc 5, never evidence.
+#
+#   (c) DELETING AN `if` IS A SYNTAX KILL, which says nothing. The realistic
+#       mutant for a guard is to WEAKEN it: `--mode if-true` / `--mode if-false`
+#       rewrite the condition of a single-line `if …; then` / `elif …; then`
+#       and leave the line's structure alone, so nothing is promoted (the
+#       `#1032` hazard needs a line to DISAPPEAR). `if-true` is the EAGER
+#       direction, `if-false` the lazy one; a guard wants both.
+#       A COMPOUND condition spans lines, and the if-* modes refuse it. For
+#       that, `--mode subst --from S --to R` rewrites text INSIDE one line
+#       (`streak >= CAP` -> `streak >= 1`) and is accepted only when the new
+#       line provably has the old line's structure: same first and last word,
+#       and the same count of every character that quotes, groups, joins or
+#       continues. Strict on purpose — `&&` -> `||` is refused.
+#
+# A MUTANT THAT LANDS ON A COMMENT is refused by the same predicate as in suite
+# mode ("already a comment"): a pattern that matched a comment MENTIONING a call
+# rather than the call is a mutant that changes nothing and a green that means
+# nothing — a predicate keyed on a STRING meeting the description of the thing.
+#
+# ---------------------------------------------------------------------------
+# (8) THE FLIP SET, THE PREDICTION, AND PROVENANCE (your-org/nexus-code#1510)
+# ---------------------------------------------------------------------------
+#
+# A verdict line says THAT a suite reddened; the FLIP SET says WHICH cases did
+# — every label that printed `PASS:` at baseline and `FAIL:` in the mutant.
+# Printed on every kill, with the cases that VANISHED (ran at baseline, never
+# ran in the mutant) beside it, because a case that did not run is not a case
+# that passed.
+#
+# `--predict F` registers a prediction BEFORE the run: `+text` names a case
+# that must flip, `-text` one that must NOT. It is a prediction of a SET, so it
+# is EXHAUSTIVE: a case that flipped and that no `+` line names is UNPREDICTED,
+# and refutes the prediction exactly as a `+` that did not flip does. Without it a survivor is trivially
+# rationalised after the fact, and a round that kills everything is as
+# uninformative as one that kills nothing — so a prediction with no `-` line is
+# called out. Every line must match a baseline case (a typo'd prediction is a
+# vacuous one: REFUSED). A refuted prediction exits 6: the verdict stands, and
+# the author's model of their own suite was wrong, which is the finding.
+#
+# `--record TSV` appends one row per flipped case (and one for a survivor),
+# with the prediction snapshot's blob hash, so "written before the run" is a
+# checkable column rather than a sentence.
+# `--provenance TSV --suite S` then reads it back against the suite's CURRENT
+# cases: `GUARDED` (a recorded kill at the current suite and subject blobs),
+# `GUARDED-STALE` (killed once, but the suite or subject has changed since),
+# `NEVER-KILLED`. That is the distinction `#1510` found missing: a case that
+# survived ten mutants and a case added yesterday both print `PASS`, and cases
+# added AFTER a round inherit its green without earning it. Exit 0 only when
+# every case is GUARDED; 4 otherwise.
+#
+# ---------------------------------------------------------------------------
 # COVERAGE BOUNDARY, one sentence, on the axis the MECHANISM varies on —
 # WHICH SHELL CONSTRUCTS CONTINUE A LOGICAL LINE: the predicate recognises
 # completeness by scanning tokens against an enumerated list, so a construct
@@ -249,22 +365,34 @@ MIN_FREE_MB=1024
 # move" but "did it move by more than this mutant could possibly have written".
 MAX_DROP_MB=256
 MATCH='^[[:space:]]*(assert_[a-z_]+|ok|bad|no|pass|fail)[[:space:]]'
+MATCH_SET=0
 WORKDIR=""
 KEEP_WORKDIR=0
+# Subject mode, prediction and provenance (sections 7 and 8 of the header).
+SUBJECT=""; PREDICT=""; RECORD=""; PROVENANCE=""; LABELS_FROM=""; LOAD_WITNESS=1
+SUBST_FROM=""; SUBST_TO=""; SUBST_TO_SET=0
 
 die() { printf 'mutation-gate.sh: %s\n' "$*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --suite)    SUITE="${2:?--suite needs a path}"; shift 2 ;;
+        --subject)  SUBJECT="${2:?--subject needs a path}"; shift 2 ;;
+        --predict)  PREDICT="${2:?--predict needs a file}"; shift 2 ;;
+        --record)   RECORD="${2:?--record needs a tsv path}"; shift 2 ;;
+        --provenance) PROVENANCE="${2:?--provenance needs a tsv path}"; shift 2 ;;
+        --labels-from) LABELS_FROM="${2:?--labels-from needs a captured suite stdout}"; shift 2 ;;
+        --no-load-witness) LOAD_WITNESS=0; shift ;;
         --line)     LINE="${2:?--line needs an integer}"; shift 2 ;;
-        --mode)     MODE="${2:?--mode needs delete|duplicate}"; shift 2 ;;
+        --mode)     MODE="${2:?--mode needs delete|duplicate|if-true|if-false|subst}"; shift 2 ;;
+        --from)     SUBST_FROM="${2:?--from needs the text to replace}"; shift 2 ;;
+        --to)       [ $# -ge 2 ] || die "--to needs the replacement text"; SUBST_TO="$2"; SUBST_TO_SET=1; shift 2 ;;
         --list)     DO_LIST=1; shift ;;
         --cap-kb)   CAP_KB="${2:?}"; shift 2 ;;
         --timeout)  TIMEOUT_S="${2:?}"; shift 2 ;;
         --min-free-mb) MIN_FREE_MB="${2:?}"; shift 2 ;;
         --max-drop-mb) MAX_DROP_MB="${2:?}"; shift 2 ;;
-        --match)    MATCH="${2:?}"; shift 2 ;;
+        --match)    MATCH="${2:?}"; MATCH_SET=1; shift 2 ;;
         --workdir)  WORKDIR="${2:?}"; shift 2 ;;
         --keep-workdir) KEEP_WORKDIR=1; shift ;;
         --run-bounded) RUN_BOUNDED="${2:?--run-bounded needs a script}"; shift 2 ;;
@@ -278,12 +406,44 @@ mutation-gate.sh — run ONE mutation experiment against ONE suite, safely.
 
   mutation-gate.sh --suite <path> --list
   mutation-gate.sh --suite <path> --line N [--mode delete|duplicate]
+  mutation-gate.sh --suite <path> --subject <path> --list
+  mutation-gate.sh --suite <path> --subject <path> --line N [--mode M] [--predict F] [--record TSV]
+  mutation-gate.sh --provenance TSV --suite <path> [--labels-from F]
   mutation-gate.sh --run-bounded <script>        # exercise the BOUND alone
 
-  --list            eligible candidate lines (complete logical lines only)
-  --line N          mutate line N
+TWO QUESTIONS. `--suite` alone mutates the SUITE: "is this assertion REACHED?"
+`--suite` + `--subject` mutates the CODE UNDER TEST and runs the suite against
+it: "would this suite CATCH A DEFECT here?" Only the second supports the claim
+"my suite is load-bearing" (your-org/nexus-code#1519). The tracked subject is
+never edited: both arms run in throwaway copies of the working tree.
+
+  --list            eligible candidate lines (complete logical lines only), and
+                    the single-line `if`/`elif` lines the if-* modes accept
+  --line N          mutate line N (of the subject when --subject is given)
   --mode M          delete (comment out, default) | duplicate
-  --match RE        which lines --list offers (default: assertion-shaped)
+                    | if-true | if-false   force a single-line `if …; then`
+                    condition (eager / lazy). Deleting an `if` is a syntax
+                    kill; weakening it is the realistic mutant.
+                    | subst --from S --to R   rewrite text INSIDE the line —
+                    for a compound condition spanning lines. Refused unless
+                    the line keeps its first/last word and the count of every
+                    quoting, grouping, joining and continuation character.
+  --subject P       the code under test. Must be a SHELL file in the same
+                    repository as the suite.
+  --no-load-witness do not plant the load witness in the subject copy. A
+                    survivor is then `survived-unwitnessed` (rc 5): it cannot
+                    be told from a mutant the suite never read.
+  --predict F       a prediction written BEFORE the run. One per line:
+                    `+text` a case (label substring) that must flip,
+                    `-text` a case that must NOT. EXHAUSTIVE: a flipped case
+                    no `+` line names is UNPREDICTED. Refuted -> exit 6.
+  --record TSV      append provenance rows (one per flipped case)
+  --provenance TSV  report which of the suite's CURRENT cases a recorded round
+                    has ever killed: GUARDED | GUARDED-STALE | NEVER-KILLED
+  --labels-from F   with --provenance: read the cases from a captured suite
+                    stdout instead of running the suite
+  --match RE        which lines --list offers (default: assertion-shaped for a
+                    suite, every eligible line for a subject)
   --cap-kb N        per-file size cap for the mutant   (default 262144 = 256 MB)
   --timeout S       wall-clock ceiling per run          (default 300)
   --min-free-mb N   halt if the filesystem drops below  (default 1024)
@@ -299,9 +459,16 @@ EXIT CODES — non-zero is not "failure"; read the VERDICT line.
   3  REFUSED                line not safely mutable, the baseline was not green,
                             EITHER ARM SKIPPED (rc 77 — it did not run), or the two
                             arms are indistinguishable (same rc, no declared
-                            assertion total on either side). A refusal is an
+                            assertion total on either side). In subject mode also:
+                            the suite never EXECUTED the copy of the subject (an
+                            inert mutant), the subject is not a shell file, or a
+                            --predict line names no baseline case. A refusal is an
                             honest "no answer"; it is never a kill.
+  6  PREDICTION REFUTED     a verdict was rendered (printed above) and the
+                            registered --predict did not hold. The finding is
+                            about the AUTHOR'S MODEL of the suite.
   2  usage
+  --provenance: 0 every current case GUARDED · 4 some NEVER-KILLED or STALE · 3 REFUSED
 
 THE TWO PROPERTIES, AND WHY BOTH. (1) The predicate refuses any line that is
 not a complete logical line — commenting one PROMOTES the next line to a
@@ -319,16 +486,84 @@ if [ -z "$RUN_BOUNDED" ]; then
     [ -n "$SUITE" ] || die "--suite is required"
     [ -r "$SUITE" ] || die "suite not readable: $SUITE"
 fi
-case "$MODE" in delete|duplicate) ;; *) die "--mode must be delete or duplicate" ;; esac
+case "$MODE" in delete|duplicate|if-true|if-false|subst) ;; *) die "--mode must be delete, duplicate, if-true, if-false or subst" ;; esac
+if [ "$MODE" = subst ]; then
+    [ -n "$SUBST_FROM" ] && [ "$SUBST_TO_SET" = 1 ] || die "--mode subst needs --from TEXT and --to TEXT"
+    case "$SUBST_FROM$SUBST_TO" in *$'\n'*) die "--from/--to must each be a single line" ;; esac
+else
+    [ -z "$SUBST_FROM" ] && [ "$SUBST_TO_SET" = 0 ] || die "--from/--to only make sense with --mode subst"
+fi
 for v in CAP_KB TIMEOUT_S MIN_FREE_MB MAX_DROP_MB; do
     eval "x=\$$v"
     case "$x" in ''|*[!0-9]*) die "--${v,,} must be a non-negative integer (got '$x')" ;; esac
 done
+[ -z "$PREDICT" ] || [ -r "$PREDICT" ] || die "--predict file not readable: $PREDICT"
+[ -z "$LABELS_FROM" ] || [ -n "$PROVENANCE" ] || die "--labels-from only makes sense with --provenance"
+[ -z "$LABELS_FROM" ] || [ -r "$LABELS_FROM" ] || die "--labels-from file not readable: $LABELS_FROM"
+
+# Every git call drops an ambient GIT_DIR/GIT_WORK_TREE, as repo-root.sh does:
+# an exported pair would redirect `-C` to a repository that is not the one
+# under the directory named.
+mg_git() { env -u GIT_DIR -u GIT_WORK_TREE git "$@"; }
 
 if [ -n "$SUITE" ]; then
     SUITE_ABS=$(cd "$(dirname "$SUITE")" && pwd)/$(basename "$SUITE")
     SUITE_DIR=$(dirname "$SUITE_ABS")
 fi
+
+# ---------------------------------------------------------------------------
+# SUBJECT MODE — resolve the repository both files live in (section 7).
+#
+# `git -C <dir>` on a directory that is not its own repository WALKS UP and
+# answers about the enclosing one at rc 0 (CLAUDE.md, the walk-up trap). That
+# is tolerable HERE for a stated reason, not by luck: the answer is used only
+# as the root to COPY, and both the suite and the subject must then be found
+# INSIDE that copy — a walked-up root whose ignore rules exclude them (every
+# `work/<project>` under a nexus) yields a copy that lacks them, and that is a
+# refusal below, not a wrong answer. `repo-root.sh` still gets the last word.
+# ---------------------------------------------------------------------------
+TOP=""; SUBJECT_ABS=""; SUBJ_REL=""; SUITE_REL=""
+mg_resolve_top() {   # <abs path of a file> -> the PHYSICAL toplevel, or empty
+    local d; d=$(cd "$(dirname "$1")" && pwd -P) || return 1
+    mg_git -C "$d" rev-parse --show-toplevel 2>/dev/null
+}
+mg_rel() {   # <abs file> <top> -> repo-relative path, or empty when outside
+    local d f; d=$(cd "$(dirname "$1")" && pwd -P) || return 1
+    f="$d/$(basename "$1")"
+    case "$f" in "$2"/*) printf '%s' "${f#"$2"/}" ;; *) printf '' ;; esac
+}
+if [ -n "$SUBJECT" ]; then
+    [ -n "$SUITE" ] || die "--subject needs --suite: the subject is mutated, the SUITE is what is run against it"
+    [ -r "$SUBJECT" ] && [ -f "$SUBJECT" ] || die "subject not a readable file: $SUBJECT"
+    SUBJECT_ABS=$(cd "$(dirname "$SUBJECT")" && pwd -P)/$(basename "$SUBJECT")
+    TOP=$(mg_resolve_top "$SUBJECT_ABS") || TOP=""
+    [ -n "$TOP" ] || die "subject is not inside a git repository: $SUBJECT_ABS"
+    SUBJ_REL=$(mg_rel "$SUBJECT_ABS" "$TOP")
+    SUITE_REL=$(mg_rel "$SUITE_ABS" "$TOP")
+    [ -n "$SUBJ_REL" ]  || die "subject resolves outside its own repository root ($TOP)"
+    [ -n "$SUITE_REL" ] || die "the suite is not in the subject's repository ($TOP) — both arms run in a copy of ONE tree"
+    [ "$SUBJ_REL" != "$SUITE_REL" ] || die "--subject and --suite are the same file; drop --subject to mutate the suite"
+    # The logical-line predicate below is a SHELL predicate. Applied to Python
+    # or awk it would pronounce lines safe on rules that do not hold there.
+    # shellcheck source=shell-files.sh
+    . "$_here/shell-files.sh"
+    if ! shf_is_shell "$SUBJECT_ABS"; then
+        printf 'mutation-gate.sh: REFUSED — the subject is not a SHELL file (class: %s).\n' "$(shf_class "$SUBJECT_ABS" 2>/dev/null || echo '?')" >&2
+        printf '  The complete-logical-line predicate is a shell predicate; on another language it\n' >&2
+        printf '  would call a line safe by rules that do not apply. No mutant was built.\n' >&2
+        exit 3
+    fi
+    [ "$MATCH_SET" = 1 ] || MATCH='.'
+elif [ -n "$SUITE" ] && [ -z "$RUN_BOUNDED" ]; then
+    # Suite mode and --provenance want the suite's repo-relative name for the
+    # ledger; outside any repository it stays the basename.
+    TOP=$(mg_resolve_top "$SUITE_ABS") || TOP=""
+    [ -z "$TOP" ] || SUITE_REL=$(mg_rel "$SUITE_ABS" "$TOP")
+    [ -n "$SUITE_REL" ] || SUITE_REL=$(basename "$SUITE_ABS")
+    case "$MODE" in if-true|if-false|subst) die "--mode $MODE needs --subject: a suite has no guard to weaken" ;; esac
+fi
+# The file whose line is mutated, and whose lines --list offers.
+TARGET_ABS="${SUBJECT_ABS:-${SUITE_ABS:-}}"
 # The workdir is OURS unless the caller named one, and ours is removed on
 # EXIT. This trap is installed on the line after the allocation, not at the
 # apply step 300 lines below where it used to live — that trap removed only
@@ -338,6 +573,35 @@ fi
 # (96 of a 400-dir sample held a complete baseline+mutant capture set). A
 # caller-supplied --workdir is kept — it asked for the captures — and so is
 # ours under --keep-workdir, which prints the path so a reader can find it.
+# BACKSTOP for a workdir whose run was SIGKILLed (your-org/nexus-code#1601).
+# The EXIT trap below fires on TERM/INT/HUP (measured) but nothing survives
+# KILL — `timeout -k`'s escalation, an OOM kill — and 1,098 `mutgate-*` sat in
+# /tmp on 2026-09-21, all older than 24 h. Each run therefore removes OTHER
+# runs' leftovers, and only what it can attribute on every axis:
+#   name   exactly `mutgate-<pid>`; a real directory, never a symlink; this uid;
+#   age    mtime older than 24 h (CHOSEN: the tmpfs-guard reap window);
+#   owner  the pid in the name is NOT alive — a live pid may be the run, and a
+#          recycled one cannot be told from it, so both are refused;
+#   intent no `.kept` marker, which --keep-workdir writes: kept captures stay.
+# The walk is bounded (10 s, CHOSEN) and a sweep that cannot finish removes
+# nothing more; it never fails the gate.
+mg_sweep_stale_workdirs() {
+    local dir="${TMPDIR:-/tmp}" d base pid
+    [ -d "$dir" ] || return 0
+    while IFS= read -r -d '' d; do
+        base=${d##*/}
+        [[ "$base" =~ ^mutgate-([0-9]+)$ ]] || continue
+        pid=${BASH_REMATCH[1]}
+        [ -d "$d" ] && [ ! -L "$d" ] || continue
+        [ -e "$d/.kept" ] && continue
+        kill -0 "$pid" 2>/dev/null && continue
+        [ -d "/proc/$pid" ] && continue      # alive but not ours to signal: still alive
+        rm -rf -- "$d" 2>/dev/null || true
+    done < <(timeout -k 2 10 find "$dir" -mindepth 1 -maxdepth 1 -type d -name 'mutgate-*' \
+                 -user "$(id -u)" -mmin +1440 -print0 2>/dev/null)
+    return 0
+}
+mg_sweep_stale_workdirs
 WORKDIR_OWNED=0
 if [ -z "$WORKDIR" ]; then
     WORKDIR="${TMPDIR:-/tmp}/mutgate-$$"
@@ -347,8 +611,12 @@ mkdir -p "$WORKDIR" || die "cannot create workdir: $WORKDIR"
 MUT=""
 mg_cleanup() {
     [ -n "$MUT" ] && rm -f -- "$MUT"
+    # The subject-mode tree copies are scaffolding, not captures: removed even
+    # from a caller-named --workdir, unless the caller asked to keep everything.
+    [ "$KEEP_WORKDIR" = 1 ] || rm -rf -- "${WORKDIR:?}/t0" "${WORKDIR:?}/t1" "${WORKDIR:?}/tmp"
     if [ "$WORKDIR_OWNED" = 1 ]; then
         if [ "$KEEP_WORKDIR" = 1 ]; then
+            : > "$WORKDIR/.kept" 2>/dev/null   # exempts it from mg_sweep_stale_workdirs
             printf 'mutation-gate.sh: captures kept at %s\n' "$WORKDIR" >&2
         else
             rm -rf -- "$WORKDIR"
@@ -362,12 +630,34 @@ free_mb() { df -P -m -- "$FS_TARGET" | awk 'NR==2{print $4}'; }
 
 mg_run() {   # <script> <capture-base> -> rc; writes <base>.out/<base>.err
     local script="$1" base="$2" rc
+    # THE SUITE'S TMPDIR IS OURS, NOT THE CALLER'S (your-org/nexus-code#1601).
+    # A suite that stubs tmux leaves spawn-worker.sh's `spawn-prompt-*` and
+    # `spawn-launcher-*` in ${TMPDIR:-/tmp} BY CONSTRUCTION: only the launcher
+    # removes them, and a stubbed `send-keys` never runs it. run-tests.sh hands
+    # every suite a private, reaped TMPDIR (#1481); this gate ran the suite TWICE
+    # per invocation in the caller's, usually /tmp, and on 2026-09-21 /tmp held
+    # 922 such files plus 1,098 `mutgate-*` — a depth-1 population that made
+    # `tmpfs-guard.sh --check`, and so `svc.sh status`, stop returning.
+    # ONE path for every run, deliberately: a per-run path would put a varying
+    # string into any label that echoes a tmp path, and the label-keyed diff
+    # below would read it as LOST+NEW. NOT emptied between runs, so the
+    # free-space backstop still sees whatever the baseline and mutant wrote; it
+    # goes with the workdir scaffolding in mg_cleanup. TMUX_TMPDIR is left alone
+    # — its length budget is sun_path's, and it is not what leaked.
+    # If it cannot be created the run falls back to the inherited TMPDIR: the
+    # old leak, never a refused gate over scratch placement.
+    local run_tmp="${TMPDIR:-/tmp}"
+    mkdir -p "$WORKDIR/tmp" 2>/dev/null && run_tmp="$WORKDIR/tmp"
     # `ulimit -f` is in 1024-byte units on this bash (measured), and is an
     # RLIMIT, so it is inherited by every child and grandchild the mutant
     # spawns. `timeout` covers the hole `ulimit -f` cannot: a mutant writing to
     # a PIPE is not bounded by a file-size limit (measured).
-    timeout -k 10 "$TIMEOUT_S" \
-        bash -c 'ulimit -f "$1" || exit 90; shift; exec bash "$@"' _ "$CAP_KB" "$script" \
+    # `ulimit -c 0`: a mutant the file cap kills dies of SIGXFSZ, and SIGXFSZ
+    # DUMPS CORE — into the CWD, i.e. the repository root. Measured on two clean
+    # clones after a full band: an untracked 64 KB `core` "from 'yes yes'" in
+    # each, and every later run-log header in those trees read `dirty=yes`.
+    TMPDIR="$run_tmp" timeout -k 10 "$TIMEOUT_S" \
+        bash -c 'ulimit -c 0; ulimit -f "$1" || exit 90; shift; exec bash "$@"' _ "$CAP_KB" "$script" \
         >"$base.out" 2>"$base.err"
     rc=$?
     printf '%s' "$rc"
@@ -452,6 +742,9 @@ mg_assertions() {
     local f="$1" n
     n=$(sed -n 's/.*=== summary: \([0-9][0-9]*\) passed.*/\1/p' "$f" | tail -1)
     [ -n "$n" ] || n=$(sed -n 's/.*ALL TESTS PASSED (\([0-9][0-9]*\) assertions.*/\1/p' "$f" | tail -1)
+    # The bare hand-rolled footer, `N passed, M failed` alone on a line — what
+    # test-cc-auto-update.sh (the largest suite here) prints.
+    [ -n "$n" ] || n=$(sed -n 's/^\([0-9][0-9]*\) passed, [0-9][0-9]* failed$/\1/p' "$f" | tail -1)
     printf '%s' "${n:-?}"
 }
 
@@ -488,8 +781,8 @@ fi
 # A line is `yes` only when EVERY condition below holds. Anything the scanner
 # cannot reason about is `no`, with the reason named — a refusal a human can
 # act on beats a silent acceptance nobody can audit.
-mg_eligible() {
-    awk '
+mg_eligible() {   # <file> [ifmode=0|1|2]   1 = the if-* modes, 2 = subst
+    awk -v ifmode="${2:-0}" '
     function ends_with(s, t) { return substr(s, length(s) - length(t) + 1) == t }
     # Count quote characters that are not backslash-escaped. Crude on purpose:
     # it OVER-counts inside single quotes, which produces a REFUSAL, never an
@@ -540,8 +833,26 @@ mg_eligible() {
             ok = 0; reason = "opens a heredoc"
         }
 
+        # THE if-* MODES ASK A DIFFERENT QUESTION (section 7c). They do not
+        # REMOVE the line, they rewrite its condition in place, so the line
+        # need not END a logical line — it must be exactly one single-line
+        # `if …; then` / `elif …; then`, whose structure survives the rewrite.
+        # Everything else below still applies: a line the previous one
+        # continues into, or one with unbalanced quoting, is not one condition.
+        # SUBST (ifmode 2) rewrites text INSIDE a line and removes nothing. The
+        # line may be any part of a multi-line construct — that is the point, a
+        # compound condition spans lines — so none of the completeness rules
+        # below apply to it. What must hold instead is that the rewrite leaves
+        # the line'"'"'s STRUCTURE alone, and that is checked on the old and new
+        # text together, at the apply step, where both exist.
+        if (ok && ifmode == 2) { print NR "\t" "yes" "\t" ""; prev = s; next }
+        if (ok && ifmode) {
+            if (s !~ /^(if|elif)[ \t]+[^ \t].*;[ \t]*then$/) {
+                ok = 0; reason = "not a single-line `if …; then` / `elif …; then` (the if-* modes rewrite one condition in place)"
+            }
+        }
         # The line itself must END a logical line.
-        if (ok) {
+        if (ok && !ifmode) {
             # BREAK on the first match, and the list is ordered LONGEST FIRST.
             # Without the break the LAST match won, so `&&` was reported as
             # `continuation token: &` — a correct refusal naming the wrong token,
@@ -551,9 +862,15 @@ mg_eligible() {
         }
         # …and it must BEGIN one: the previous meaningful line must not have
         # continued into it. This is the rule that would have stopped #1032.
+        # In the if-* modes only a BACKSLASH predecessor refuses: the line is
+        # rewritten, never removed, so a block opener (`{`, `then`, `do`) or a
+        # list operator above it promotes nothing — whereas after a backslash
+        # the `if` is an ARGUMENT of the command above, not a condition.
         if (ok && prev != "") {
-            for (i = 1; i <= n_cont; i++)
+            for (i = 1; i <= n_cont; i++) {
+                if (ifmode && cont[i] != "\\") continue
                 if (ends_with(prev, cont[i])) { ok = 0; reason = "continues the previous line (which ends with " cont[i] ")"; break }
+            }
         }
         # Unbalanced quoting means the logical line spans further than this one.
         if (ok && unescaped(s, "\"") % 2 == 1)   { ok = 0; reason = "odd number of unescaped double quotes" }
@@ -578,40 +895,562 @@ mg_eligible() {
     }' "$1"
 }
 
+# ---------------------------------------------------------------------------
+# CASE LABELS, THE FLIP SET, THE PREDICTION, THE LEDGER (section 8).
+# ---------------------------------------------------------------------------
+# A case is a line `  PASS: <label>` — what `_test_helpers.sh` prints for every
+# assertion, and what most hand-rolled suites print too. A suite that prints no
+# such line has NO cases this tool can name; that is said, never papered over.
+mg_labels() {   # <captured stdout> -> SORTED PASS labels, duplicates KEPT
+    # A multiset on purpose: `comm` pairs duplicate lines, so a label printed
+    # twice at baseline and once in the mutant still shows up as one loss.
+    sed -n 's/^[[:space:]]*PASS: //p' "$1" | LC_ALL=C sort
+}
+# mg_flipset <base.out> <mut.out> <mut.err>
+#   -> $WORKDIR/flipped    labels, one per line (what --predict and --record read)
+#      $WORKDIR/flipped.ev the same, as `<evidence>\t<label>`
+#      $WORKDIR/vanished   stopped passing, and NOTHING accounts for them
+#      $WORKDIR/relabelled stopped printing that label; a near-identical PASS appeared
+#      $WORKDIR/unmatched  FAIL lines that were paired with no case
+#
+# THE PRIMARY SIGNAL IS "STOPPED PASSING" — the multiset difference of the PASS
+# labels — because it needs nothing from the FAIL text. The FAIL lines are the
+# EVIDENCE for how each loss happened, in decreasing strength:
+#
+#   named    the mutant printed `FAIL: <that label>`, alone or followed by
+#            ` — detail`. Every `_test_helpers.sh` assertion reports this way.
+#   prefix   a FAIL line shares its LONGEST common prefix with that label —
+#            uniquely, and at least 8 characters or the label's whole case id
+#            (up to its first `:`). For suites whose `fail` text is
+#            free-form — `pass "#1492 O1: under the cap …"` beside
+#            `fail "#1492 O1: the bound fired early"` — the case id is the prefix.
+#   count    no FAIL line names or prefixes it, but there are at least as many
+#            unpaired FAIL lines as unexplained losses: every loss has a failure
+#            to account for it, though not WHICH.
+#
+# and two outcomes that are NOT flips:
+#
+#   relabelled  a PASS label that embeds a VALUE (`pre-streak=2`) prints
+#               different text in the mutant while still passing. Paired to the
+#               new label by the same prefix rule.
+#   vanished    stopped passing and nothing accounts for it: fewer FAIL lines
+#               than losses, so the case most likely never RAN (an abort, a
+#               conditional). Not a pass, and not a flip.
+#
+# `index(line, L " — ") == 1` rather than a substr() by length: the dash is
+# multibyte, and awk counts bytes or characters depending on build and locale;
+# a whole-string index is correct under both.
+mg_flipset() {
+    mg_labels "$1" > "$WORKDIR/base.labels.all"
+    mg_labels "$2" > "$WORKDIR/mut.labels.all"
+    LC_ALL=C sort -u "$WORKDIR/base.labels.all" > "$WORKDIR/base.labels"
+    LC_ALL=C comm -23 "$WORKDIR/base.labels.all" "$WORKDIR/mut.labels.all" > "$WORKDIR/notpassed"
+    LC_ALL=C comm -13 "$WORKDIR/base.labels.all" "$WORKDIR/mut.labels.all" > "$WORKDIR/newlabels"
+    cat "$2" "$3" | sed -n 's/^[[:space:]]*FAIL: //p' > "$WORKDIR/mut.fails"
+    : > "$WORKDIR/flipped.ev"; : > "$WORKDIR/vanished"; : > "$WORKDIR/relabelled"; : > "$WORKDIR/unmatched"
+    awk -v F_EV="$WORKDIR/flipped.ev" -v F_VAN="$WORKDIR/vanished" \
+        -v F_REL="$WORKDIR/relabelled" -v F_UNM="$WORKDIR/unmatched" '
+        function cpl(a, b,   i, n) {
+            n = (length(a) < length(b)) ? length(a) : length(b)
+            for (i = 1; i <= n; i++) if (substr(a, i, 1) != substr(b, i, 1)) break
+            return i - 1
+        }
+        # pair(src, nsrc, used, tag): pair src lines with still-unexplained
+        # losses by longest common prefix, GLOBALLY BEST FIRST.
+        #
+        # Not "each src line takes its best loss, in file order". That greedy
+        # form was the first cut, and the first real run CROSS-PAIRED two cases:
+        # `#1113: a PR under active review…` got the FAIL line of
+        # `#1113: an unparseable updated-at…` and vice versa, because the FAIL
+        # that came first shared 10 characters with the WRONG label and 8 with
+        # its own, and took the 10. The flip SET was right; the evidence printed
+        # beside it named the wrong failure. Taking the longest pair anywhere
+        # first gives `…an unparseable` its 22-character match before the
+        # 8-character one is considered.
+        #
+        # ENOUGH PREFIX: 8 characters, or the label'"'"'s whole case id when that is
+        # shorter — everything up to and including its first `:` (`FF-O1:`), which
+        # is what a suite with free-form FAIL text keeps constant between its
+        # `pass` and its `fail`. A top pair TIED with another pair that shares its
+        # src line or its label is AMBIGUOUS: that src line is left unpaired (it
+        # still counts toward the COUNT evidence) rather than guessed.
+        function pair(src, nsrc, used, tag,   j, i, c, best, bj, bi, tie, need, t, skip) {
+            while (1) {
+                best = 0; bj = 0; bi = 0
+                for (j = 1; j <= nsrc; j++) {
+                    if (used[j] || skip[j]) continue
+                    for (i = 1; i <= nnp; i++) {
+                        if (ev[i] != "") continue
+                        c = cpl(src[j], np[i])
+                        if (c > best) { best = c; bj = j; bi = i }
+                    }
+                }
+                if (!bj) break
+                need = 8; t = index(np[bi], ":"); if (t >= 3 && t < 8) need = t
+                if (best < need) break
+                tie = 0
+                for (j = 1; j <= nsrc; j++) {
+                    if (used[j] || skip[j]) continue
+                    for (i = 1; i <= nnp; i++) {
+                        if (ev[i] != "" || (j == bj && i == bi)) continue
+                        if ((j == bj || i == bi) && cpl(src[j], np[i]) == best) tie = 1
+                    }
+                }
+                if (tie) { skip[bj] = 1; continue }
+                ev[bi] = tag; with[bi] = src[bj]; used[bj] = 1
+            }
+        }
+        FILENAME == ARGV[1] { np[++nnp] = $0; next }
+        FILENAME == ARGV[2] { fl[++nfl] = $0; next }
+        FILENAME == ARGV[3] { nw[++nnw] = $0; next }
+        END {
+            for (i = 1; i <= nnp; i++)
+                for (j = 1; j <= nfl; j++)
+                    if (!fu[j] && (fl[j] == np[i] || index(fl[j], np[i] " — ") == 1)) { ev[i] = "named"; fu[j] = 1; break }
+            pair(fl, nfl, fu, "prefix")
+            pair(nw, nnw, nu, "relabelled")
+            rem_np = 0; for (i = 1; i <= nnp; i++) if (ev[i] == "") rem_np++
+            rem_fl = 0; for (j = 1; j <= nfl; j++) if (!fu[j]) rem_fl++
+            if (rem_np > 0 && rem_fl >= rem_np) {
+                for (i = 1; i <= nnp; i++) if (ev[i] == "") ev[i] = "count"
+                for (j = 1; j <= nfl; j++) fu[j] = 1
+            }
+            for (i = 1; i <= nnp; i++) {
+                if (ev[i] == "relabelled")  print np[i] "\t" with[i] > F_REL
+                else if (ev[i] == "")       print np[i] > F_VAN
+                else                        print ev[i] "\t" np[i] "\t" with[i] > F_EV
+            }
+            for (j = 1; j <= nfl; j++) if (!fu[j]) print fl[j] > F_UNM
+        }' "$WORKDIR/notpassed" "$WORKDIR/mut.fails" "$WORKDIR/newlabels"
+    cut -f2 "$WORKDIR/flipped.ev" | LC_ALL=C sort -u > "$WORKDIR/flipped"
+}
+mg_print_flipset() {
+    local n_f n_v n_u n_r ev label with
+    n_f=$(grep -c . "$WORKDIR/flipped.ev"); n_v=$(grep -c . "$WORKDIR/vanished")
+    n_u=$(grep -c . "$WORKDIR/unmatched");  n_r=$(grep -c . "$WORKDIR/relabelled")
+    printf '  flip set — %s case(s) PASSED at baseline and did not in the mutant:\n' "$n_f"
+    while IFS=$'\t' read -r ev label with; do
+        case "$ev" in
+            named)  printf '    FLIPPED: %s\n' "$label" ;;
+            prefix) printf '    FLIPPED: %s\n               [paired by PREFIX with: FAIL: %s]\n' "$label" "$with" ;;
+            count)  printf '    FLIPPED: %s\n               [by COUNT only: as many unpaired FAIL lines as unexplained losses]\n' "$label" ;;
+        esac
+    done < "$WORKDIR/flipped.ev"
+    if [ "$n_r" -gt 0 ]; then
+        printf '  %s case(s) changed their LABEL and still pass (a value embedded in the text):\n' "$n_r"
+        while IFS=$'\t' read -r label with; do printf '    RELABELLED: %s\n                -> %s\n' "$label" "$with"; done < "$WORKDIR/relabelled"
+    fi
+    if [ "$n_v" -gt 0 ]; then
+        printf '  %s case(s) stopped passing and NOTHING accounts for them — most likely they never RAN (not a pass, not a flip):\n' "$n_v"
+        sed 's/^/    VANISHED: /' "$WORKDIR/vanished"
+    fi
+    if [ "$n_u" -gt 0 ]; then
+        printf '  %s FAIL line(s) were paired with no baseline case:\n' "$n_u"
+        sed 's/^/    UNMATCHED: /' "$WORKDIR/unmatched"
+    fi
+}
+# mg_predict_check -> rc 0 refutes nothing, rc 1 REFUTED; prints one line per prediction.
+PREDICTION_STATE=none
+PREDICT_SHA='-'
+# THE PREDICTION IS SNAPSHOTTED BEFORE EITHER ARM RUNS, AND ONLY THE SNAPSHOT
+# IS EVER READ (skeptic finding F1 on #1558). The first cut re-read the file
+# from disk after the mutant arm, so a prediction rewritten mid-run was
+# reported "registered before the run … confirmed" and recorded as such — the
+# pre-registration the ledger column claims was not enforced by anything.
+# Before EITHER arm, not merely before the mutant: the suite under test can
+# write files, and a suite that rewrote its own prediction during the baseline
+# arm would otherwise be validated against the rewrite. The snapshot's blob
+# hash is printed and recorded (ledger column 13), so a row can be checked
+# against the file an author kept.
+# AND THE SNAPSHOT IS HELD IN MEMORY, NOT READ BACK FROM THE WORKDIR (skeptic
+# round 2, G1). The first snapshot was a FILE under $WORKDIR — the directory
+# the suite's tree copies live in — so a suite that wrote `../../predict.snap`
+# turned a wrong prediction into "confirmed", and the tool then blamed the
+# author's file for having changed. A hash that is not BOUND to what is
+# evaluated is a caption. So: the content lives in a variable from the moment
+# it is taken; the file copy exists only so the run can be audited afterwards;
+# and if that file no longer hashes to the recorded blob at finish, something
+# wrote into this tool's own workdir during the run — the run is REFUSED, not
+# scored. A failed hash is a refusal too: `-` would be an unauditable row
+# wearing a column's name.
+# READ THE FILE ONCE (skeptic round 3, G8). The G1 fix read `--predict` TWICE
+# — `grep` for the text, then `cp` for the file that gets hashed — so the hash
+# bound the SECOND read while the verdict used the first. With a process
+# substitution or a FIFO those are different bytes: measured, `--predict
+# <(printf …)` scored "confirmed" beside the EMPTY blob, and a FIFO fed the
+# right prediction then a wrong one scored "confirmed" beside the wrong one's
+# blob — round-2's artefact, reached by a new path. So: ONE copy, and both the
+# text and the hash come from that copy. An EMPTY copy is refused here: the
+# vacuity refusal downstream would catch it too, but a zero-byte snapshot is a
+# registration that registered nothing, and saying so at the source is cheaper.
+PREDICT_TEXT=""
+mg_predict_snapshot() {
+    cp -- "$PREDICT" "$WORKDIR/predict.snap" || die "cannot snapshot --predict file $PREDICT"
+    if [ ! -s "$WORKDIR/predict.snap" ]; then
+        printf 'mutation-gate.sh: REFUSED — the --predict snapshot is EMPTY (%s read as zero bytes); a prediction that registers nothing cannot be recorded as pre-registered.\n' "$PREDICT" >&2
+        exit 3
+    fi
+    PREDICT_TEXT=$(grep -v -E '^[[:space:]]*(#|$)' -- "$WORKDIR/predict.snap") || PREDICT_TEXT=""
+    PREDICT_SHA=$(mg_git hash-object -- "$WORKDIR/predict.snap" 2>/dev/null) || PREDICT_SHA=""
+    [[ "$PREDICT_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+        printf 'mutation-gate.sh: REFUSED — could not hash the --predict snapshot (%s); a prediction that cannot be bound to a blob cannot be recorded as pre-registered.\n' "$PREDICT" >&2
+        exit 3
+    }
+}
+mg_predict_lines() { printf '%s\n' "$PREDICT_TEXT" | grep -v -E '^[[:space:]]*$'; }
+# mg_predict_intact -> rc 0, or REFUSES (exit 3) when the snapshot file no
+# longer hashes to the blob recorded before the run.
+mg_predict_intact() {
+    local now
+    now=$(mg_git hash-object -- "$WORKDIR/predict.snap" 2>/dev/null) || now=""
+    [ "$now" = "$PREDICT_SHA" ] && return 0
+    printf 'mutation-gate.sh: REFUSED — the prediction SNAPSHOT in this tool'"'"'s workdir was altered during the run (blob %s at registration, %s now).\n' "$PREDICT_SHA" "${now:-unhashable}" >&2
+    printf '  Something the run executed wrote into %s. The verdict was computed but is NOT\n' "$WORKDIR" >&2
+    printf '  scored and NOT recorded: a run that can reach the instrument'"'"'s own state is not\n' >&2
+    printf '  a run whose prediction outcome means anything (skeptic G1 on #1558).\n' >&2
+    exit 3
+}
+mg_predict_validate() {   # every line must name a baseline case, BEFORE the mutant runs
+    local line sign text n_minus=0
+    # AN EMPTY PREDICTION IS REFUSED, NOT VALIDATED VACUOUSLY (your-org/nexus-code
+    # #1564 G12). Validation below is PER LINE, so a file of comments and blanks
+    # — non-empty on disk, which is all the snapshot check sees — validated with
+    # zero iterations, and on a SURVIVING mutant `mg_predict_check` then found
+    # nothing refuted and the ledger recorded `survived … confirmed`: a
+    # pre-registered prediction that predicted nothing, scored as correct.
+    if [ -z "$(mg_predict_lines)" ]; then
+        printf 'mutation-gate.sh: REFUSED — the --predict file holds NO prediction lines (only comments/blanks).\n' >&2
+        printf '  Every LINE is validated, so an empty prediction validates vacuously and a surviving\n' >&2
+        printf '  mutant then scores `confirmed`. Write at least one `+label` or `-label` (#1564 G12).\n' >&2
+        return 3
+    fi
+    while IFS= read -r line; do
+        sign=${line:0:1}; text=${line:1}
+        case "$sign" in
+            +) ;;
+            -) n_minus=$((n_minus+1)) ;;
+            *) printf 'mutation-gate.sh: REFUSED — --predict line is neither `+text` nor `-text`: %s\n' "$line" >&2; return 3 ;;
+        esac
+        [ -n "$text" ] || { printf 'mutation-gate.sh: REFUSED — --predict line has an EMPTY label (it would match every case): %s\n' "$line" >&2; return 3; }
+        if ! grep -qF -- "$text" "$WORKDIR/base.labels"; then
+            printf 'mutation-gate.sh: REFUSED — --predict line names NO baseline case: %s\n' "$line" >&2
+            printf '  A prediction about a case that does not exist is vacuous: `-text` would be\n' >&2
+            printf '  "confirmed" by an absence. The baseline printed %s case label(s).\n' "$(grep -c . "$WORKDIR/base.labels")" >&2
+            return 3
+        fi
+    done < <(mg_predict_lines)
+    if [ "$n_minus" -eq 0 ]; then
+        printf '  NOTE: the prediction names no case that must NOT flip. A round that kills\n'
+        printf '        everything is as uninformative as one that kills nothing (#1519).\n'
+    fi
+    return 0
+}
+mg_predict_check() {
+    local line sign text refuted=0
+    while IFS= read -r line; do
+        sign=${line:0:1}; text=${line:1}
+        if [ "$sign" = + ]; then
+            if grep -qF -- "$text" "$WORKDIR/flipped"; then printf '    confirmed  %s\n' "$line"
+            else printf '    REFUTED    %s  (predicted to flip; did not)\n' "$line"; refuted=1; fi
+        else
+            if grep -qF -- "$text" "$WORKDIR/flipped"; then
+                printf '    REFUTED    %s  (predicted NOT to flip; it did)\n' "$line"; refuted=1
+            elif grep -qF -- "$text" "$WORKDIR/vanished"; then
+                printf '    REFUTED    %s  (predicted NOT to flip; it NEVER RAN in the mutant, so it was not evaluated)\n' "$line"; refuted=1
+            else printf '    confirmed  %s\n' "$line"; fi
+        fi
+    done < <(mg_predict_lines)
+    # THE PREDICTION IS OF A SET, SO IT IS EXHAUSTIVE. A flipped case that no `+`
+    # line covers is a member the author did not foresee — and it was measured
+    # on this tool's own first dogfood round: four cases flipped, two were named,
+    # and a lenient check printed `confirmed` over a model that was half wrong.
+    local label covered
+    while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        covered=0
+        while IFS= read -r line; do
+            [ "${line:0:1}" = + ] || continue
+            case "$label" in *"${line:1}"*) covered=1; break ;; esac
+        done < <(mg_predict_lines)
+        if [ "$covered" = 0 ]; then printf '    UNPREDICTED  %s  (flipped; no `+` line names it)\n' "$label"; refuted=1; fi
+    done < "$WORKDIR/flipped"
+    return "$refuted"
+}
+# mg_finish <verdict-rc> — the prediction and the ledger, then exit. EVERY
+# verdict that was actually rendered leaves through here; refusals do not.
+mg_blob() { [ -f "$1" ] && mg_git hash-object -- "$1" 2>/dev/null || printf '%s' '-'; }
+mg_finish() {
+    local rc="$1" verdict="$2" head_sha label
+    if [ -n "$PREDICT" ]; then
+        mg_predict_intact
+        printf 'PREDICTION (registered before the run: %s, snapshot blob %s):\n' "$PREDICT" "$PREDICT_SHA"
+        if [ -f "$PREDICT" ] && [ "$(mg_git hash-object -- "$PREDICT" 2>/dev/null)" != "$PREDICT_SHA" ]; then
+            printf '  NOTE: %s CHANGED while the run was in progress. The snapshot taken before either\n' "$PREDICT"
+            printf '        arm ran is what was evaluated and recorded; the file on disk is not.\n'
+        fi
+        if mg_predict_check; then PREDICTION_STATE=confirmed; printf '  PREDICTION: confirmed\n'
+        else PREDICTION_STATE=refuted; printf '  PREDICTION: REFUTED — the verdict above stands; the model of the suite did not.\n'; fi
+    else
+        printf '  no --predict was registered before this run: a survivor (or a kill) is\n'
+        printf '  trivially rationalised after the fact. Write the flip set down FIRST.\n'
+    fi
+    if [ -n "$RECORD" ]; then
+        head_sha=$( [ -n "$TOP" ] && mg_git -C "$TOP" rev-parse HEAD 2>/dev/null || printf '%s' '-')
+        if [ ! -s "$RECORD" ]; then
+            printf '# mutation provenance ledger (your-org/nexus-code#1510). Append-only; written by\n# monitor/mutation-gate.sh --record, read by --provenance. One row per FLIPPED case.\n' >> "$RECORD"
+            printf '# utc\tverdict\tsuite\tsuite_blob\tsubject\tsubject_blob\tline\tmode\tline_text\tcase\thead\tprediction\tpredict_blob\n' >> "$RECORD"
+        fi
+        mg_record_row() {
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$verdict" "$SUITE_REL" "$(mg_blob "$SUITE_ABS")" \
+                "${SUBJ_REL:--}" "$( [ -n "$SUBJECT_ABS" ] && mg_blob "$SUBJECT_ABS" || printf '%s' '-')" \
+                "$LINE" "$MODE" "$(sed -n "${LINE}p" "$TARGET_ABS" | tr '\t' ' ' | sed -E 's/^ +//')" \
+                "$1" "$head_sha" "$PREDICTION_STATE" "$PREDICT_SHA" >> "$RECORD"
+        }
+        if [ "$verdict" = killed-by-assertion ] && [ -s "$WORKDIR/flipped" ]; then
+            while IFS= read -r label; do mg_record_row "$label"; done < "$WORKDIR/flipped"
+        else
+            # A survivor, or a kill no case label accounts for: recorded, against
+            # NO case (`-`), so "this line was tried and killed nothing" is on file.
+            mg_record_row '-'
+        fi
+        printf '  recorded to %s\n' "$RECORD"
+    fi
+    [ "$PREDICTION_STATE" = refuted ] && exit 6
+    exit "$rc"
+}
+
+# Taken HERE — after the workdir exists and before any arm, the --provenance
+# run included, runs.
+[ -z "$PREDICT" ] || mg_predict_snapshot
+
+# ---------------------------------------------------------------------------
+# --provenance TSV --suite S [--labels-from F]   (section 8)
+# ---------------------------------------------------------------------------
+if [ -n "$PROVENANCE" ]; then
+    [ -r "$PROVENANCE" ] || { printf 'mutation-gate.sh: REFUSED — provenance ledger not readable: %s\n' "$PROVENANCE" >&2; exit 3; }
+    if [ -n "$LABELS_FROM" ]; then
+        cp -- "$LABELS_FROM" "$WORKDIR/prov.out"
+    else
+        echo "=== running $SUITE_ABS once to read its CURRENT cases ==="
+        prov_rc=$(mg_run "$SUITE_ABS" "$WORKDIR/prov")
+        if [ "$prov_rc" -ne 0 ]; then
+            printf 'mutation-gate.sh: REFUSED — the suite did not run green (rc %s); its case list is not trustworthy.\n' "$prov_rc" >&2
+            exit 3
+        fi
+    fi
+    mg_labels "$WORKDIR/prov.out" | LC_ALL=C sort -u > "$WORKDIR/prov.labels"
+    n_cases=$(grep -c . "$WORKDIR/prov.labels")
+    if [ "$n_cases" -eq 0 ]; then
+        printf 'mutation-gate.sh: REFUSED — the suite printed no `PASS: <label>` line, so it has no case this tool can name.\n' >&2
+        exit 3
+    fi
+    cur_suite_blob=$(mg_blob "$SUITE_ABS")
+    n_guarded=0; n_stale=0; n_never=0
+    while IFS= read -r label; do
+        # The newest killing row for (suite, case). Tab-separated; `case` is
+        # column 10. Matched by EQUALITY on both keys, never by pattern.
+        row=$(awk -F'\t' -v s="$SUITE_REL" -v c="$label" \
+              '$0 !~ /^#/ && $2 == "killed-by-assertion" && $3 == s && $10 == c { r = $0 } END { if (r != "") print r }' "$PROVENANCE")
+        if [ -z "$row" ]; then
+            printf 'NEVER-KILLED   %s\n' "$label"; n_never=$((n_never+1)); continue
+        fi
+        IFS=$'\t' read -r r_utc _ _ r_sblob r_subj r_jblob r_line r_mode _ _ _ _ <<<"$row"
+        cur_subj_blob='-'
+        [ "$r_subj" = '-' ] || cur_subj_blob=$(mg_blob "$TOP/$r_subj")
+        if [ "$r_sblob" = "$cur_suite_blob" ] && [ "$r_jblob" = "$cur_subj_blob" ]; then
+            printf 'GUARDED        %s   [%s %s:%s %s]\n' "$label" "$r_utc" "$r_subj" "$r_line" "$r_mode"; n_guarded=$((n_guarded+1))
+        else
+            printf 'GUARDED-STALE  %s   [%s %s:%s %s — the %s changed since]\n' "$label" "$r_utc" "$r_subj" "$r_line" "$r_mode" \
+                "$( [ "$r_sblob" != "$cur_suite_blob" ] && [ "$r_jblob" != "$cur_subj_blob" ] && printf 'suite AND subject' \
+                    || { [ "$r_sblob" != "$cur_suite_blob" ] && printf 'suite' || printf 'subject'; } )"
+            n_stale=$((n_stale+1))
+        fi
+    done < "$WORKDIR/prov.labels"
+    printf '=== provenance: %s case(s) — %s GUARDED, %s GUARDED-STALE, %s NEVER-KILLED (ledger %s) ===\n' \
+        "$n_cases" "$n_guarded" "$n_stale" "$n_never" "$PROVENANCE"
+    printf '    GREEN is not GUARDED: a NEVER-KILLED case passes and has never been shown able to fail (#1510).\n'
+    [ "$n_stale" -eq 0 ] && [ "$n_never" -eq 0 ] && exit 0
+    exit 4
+fi
+
 if [ "$DO_LIST" -eq 1 ]; then
-    printf '# eligible mutation candidates in %s\n' "$SUITE_ABS"
+    printf '# eligible mutation candidates in %s\n' "$TARGET_ABS"
     printf '# (a line is listed only if it matches --match AND is a complete logical line)\n'
     n=0
     while IFS=$'\t' read -r ln verdict reason; do
         [ "$verdict" = yes ] || continue
-        text=$(sed -n "${ln}p" "$SUITE_ABS")
+        text=$(sed -n "${ln}p" "$TARGET_ABS")
         grep -qE "$MATCH" <<<"$text" || continue
         printf '%s\t%s\n' "$ln" "$text"; n=$((n+1))
-    done < <(mg_eligible "$SUITE_ABS")
+    done < <(mg_eligible "$TARGET_ABS")
     printf '# %d eligible line(s)\n' "$n"
-    [ "$n" -gt 0 ] || { printf 'mutation-gate.sh: REFUSED — no eligible line (a zero here is a MEASURED answer, not a green light).\n' >&2; exit 3; }
+    n_if=0
+    if [ -n "$SUBJECT_ABS" ]; then
+        printf '# single-line `if`/`elif` conditions (--mode if-true | if-false):\n'
+        while IFS=$'\t' read -r ln verdict reason; do
+            [ "$verdict" = yes ] || continue
+            printf '%s\t%s\n' "$ln" "$(sed -n "${ln}p" "$TARGET_ABS")"; n_if=$((n_if+1))
+        done < <(mg_eligible "$TARGET_ABS" 1)
+        printf '# %d if-line(s)\n' "$n_if"
+    fi
+    [ $(( n + n_if )) -gt 0 ] || { printf 'mutation-gate.sh: REFUSED — no eligible line (a zero here is a MEASURED answer, not a green light).\n' >&2; exit 3; }
     exit 0
 fi
 
 [ -n "$LINE" ] || die "--line is required (or --list)"
 case "$LINE" in ''|*[!0-9]*) die "--line must be an integer" ;; esac
 
-TOTAL=$(wc -l < "$SUITE_ABS")
+TOTAL=$(wc -l < "$TARGET_ABS")
 [ "$LINE" -ge 1 ] && [ "$LINE" -le "$TOTAL" ] || die "--line $LINE is outside 1..$TOTAL"
 
 # ---------------------------------------------------------------------------
-# ELIGIBILITY — refuse before anything is written.
+# ELIGIBILITY — refuse before anything is written. Judged on the ORIGINAL
+# target (the suite, or the subject under --subject), never on a copy.
 # ---------------------------------------------------------------------------
-elig=$(mg_eligible "$SUITE_ABS" | awk -F'\t' -v L="$LINE" '$1==L{print $2 "\t" $3}')
+IFMODE=0; case "$MODE" in if-true|if-false) IFMODE=1 ;; subst) IFMODE=2 ;; esac
+elig=$(mg_eligible "$TARGET_ABS" "$IFMODE" | awk -F'\t' -v L="$LINE" '$1==L{print $2 "\t" $3}')
 if [ "${elig%%$'\t'*}" != yes ]; then
-    printf 'mutation-gate.sh: REFUSED — line %s of %s is not safely mutable.\n' "$LINE" "$SUITE_ABS" >&2
+    printf 'mutation-gate.sh: REFUSED — line %s of %s is not safely mutable (mode=%s).\n' "$LINE" "$TARGET_ABS" "$MODE" >&2
     printf '  reason : %s\n' "${elig#*$'\t'}" >&2
-    printf '  line   : %s\n' "$(sed -n "${LINE}p" "$SUITE_ABS")" >&2
+    printf '  line   : %s\n' "$(sed -n "${LINE}p" "$TARGET_ABS")" >&2
     printf '  why    : commenting a line that does not END a logical line promotes the NEXT\n' >&2
     printf '           line to a standalone command. One such mutant synthesized `yes yes`\n' >&2
     printf '           and filled a shared 378 GB tmpfs (your-org/nexus-code#1032).\n' >&2
-    printf '  next   : %s --suite %q --list\n' "$0" "$SUITE_ABS" >&2
+    if [ -n "$SUBJECT_ABS" ]; then
+        printf '           A comment or blank line changes nothing, and a green after it means nothing.\n' >&2
+        printf '  next   : %s --suite %q --subject %q --list\n' "$0" "$SUITE_ABS" "$SUBJECT_ABS" >&2
+    else
+        printf '  next   : %s --suite %q --list\n' "$0" "$SUITE_ABS" >&2
+    fi
     exit 3
+fi
+
+# SUBST: build the new line and REFUSE unless it provably has the old line's
+# structure. The `#1032` hazard needs a line to disappear or to change how it
+# joins its neighbours; so the rewrite must keep the first and last word, and
+# must keep the COUNT of every character that opens, closes, quotes, joins or
+# continues. That is deliberately STRICT — `&&` -> `||` is refused — because a
+# refusal costs a reworded mutant and an acceptance could cost the node.
+# Judged HERE, on the text alone, before a tree is copied or a baseline run: a
+# refusal knowable from two strings must not cost two suite runs.
+# The classic operators pass: `>=` -> `>`, `-ge` -> `-gt`, a name -> a literal.
+SUBST_NEW=""
+if [ "$MODE" = subst ]; then
+    subst_old=$(sed -n "${LINE}p" "$TARGET_ABS")
+    subst_refuse() {
+        printf 'mutation-gate.sh: REFUSED — --mode subst on line %s: %s\n' "$LINE" "$1" >&2
+        printf '  line   : %s\n  --from : %s\n  --to   : %s\n' "$subst_old" "$SUBST_FROM" "$SUBST_TO" >&2
+        exit 3
+    }
+    case "$subst_old" in *"$SUBST_FROM"*) ;; *) subst_refuse "the --from text does not occur on the line" ;; esac
+    subst_pre=${subst_old%%"$SUBST_FROM"*}; subst_suf=${subst_old#*"$SUBST_FROM"}
+    case "$subst_suf" in *"$SUBST_FROM"*) subst_refuse "the --from text occurs MORE THAN ONCE; which one is the mutant?" ;; esac
+    # Assembled by concatenation, never `${old/from/to}`: under bash 5.2's
+    # patsub_replacement an `&` in the replacement is the MATCH, not a literal.
+    SUBST_NEW="$subst_pre$SUBST_TO$subst_suf"
+    [ "$SUBST_NEW" != "$subst_old" ] || subst_refuse "--to equals --from; the mutant would be inert"
+    subst_words() { awk '{ print $1 "\t" $NF }' <<<"$1"; }
+    [ "$(subst_words "$subst_old")" = "$(subst_words "$SUBST_NEW")" ] \
+        || subst_refuse "the rewrite changes the line's FIRST or LAST word (what it is, or how it joins the next line)"
+    # `$` is deliberately NOT here: it opens nothing on its own (`$(` is caught by
+    # `(`, `${` by `{`, `$'` by `'`), and a name -> literal rewrite drops one.
+    for subst_ch in '"' "'" '`' '(' ')' '{' '}' '[' ']' '\' ';' '&' '|' '<' '>' '#'; do
+        subst_a=${subst_old//[!"$subst_ch"]/}; subst_b=${SUBST_NEW//[!"$subst_ch"]/}
+        [ "${#subst_a}" -eq "${#subst_b}" ] \
+            || subst_refuse "the rewrite changes how many \`$subst_ch\` the line carries (${#subst_a} -> ${#subst_b}); its structure would not be the old line's"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# SUBJECT MODE: build the two throwaway trees (section 7a) and plant the load
+# witness (7b). Suite mode runs the tracked suite in place, as it always has.
+# ---------------------------------------------------------------------------
+BASE_SCRIPT="$SUITE_ABS"      # what the baseline arm executes
+WITNESS_OFF=0                 # lines the witness pushed the subject down by
+T0=""; T1=""
+if [ -n "$SUBJECT_ABS" ]; then
+    # The verdict line is kept WHATEVER the rc: repo-root.sh exits 1 on every
+    # `verdict=no`, and `|| rr=""` here threw its answer away — so a linked
+    # worktree, which it names correctly, was reported as "gave no answer".
+    rr=$(bash "$_here/repo-root.sh" "$TOP" 2>/dev/null); : "rc $? is carried by the verdict line"
+    # A LINKED WORKTREE IS ACCEPTED (skeptic round 3, infra note). repo-root.sh
+    # answers `verdict=no kind=linked-worktree` for one, correctly for ITS
+    # question — the git dir belongs to the main repository, so a write there
+    # would land elsewhere. THIS tool only reads the working tree (`ls-files`
+    # runs fine in a worktree) and never writes to the git dir, so that kind is
+    # a legitimate root here and the workaround of a fresh clone is not needed.
+    # THE KIND IS ASKED FOR, not globbed out of the verdict line (#1564 G13). That
+    # line also carries `top=` and `gitdir=` PATHS, so `*kind=linked-worktree*`
+    # accepted any refused tree whose path merely contained the text.
+    # `repo-root.sh --kind` prints the one field; both accepting tests below are
+    # EQUALITY on a field, so no input matches an accept and the refusal (#1121).
+    rr_kind=$(bash "$_here/repo-root.sh" --kind "$TOP" 2>/dev/null); : "rc $? is carried by the kind"
+    rr_ok=0
+    case "$rr" in "verdict=yes "*) rr_ok=1 ;; esac
+    [ "$rr_kind" = linked-worktree ] && rr_ok=1
+    if [ "$rr_ok" -ne 1 ]; then
+        printf 'mutation-gate.sh: REFUSED — %s is not its own repository root (%s).\n' "$TOP" "${rr:-repo-root.sh gave no answer}" >&2
+        printf '  The tree to copy could not be established; no mutant was built.\n' >&2
+        exit 3
+    fi
+    # Short, EQUAL-LENGTH names: the arms must not differ in path length, which
+    # a suite binding a socket under its own tree would feel.
+    T0="$WORKDIR/t0"; T1="$WORKDIR/t1"
+    mkdir -p "$T0" || die "cannot create $T0"
+    # WORKING-TREE content of every tracked and untracked-unignored file. tar,
+    # not a cp loop: ~1000 files, one process. `--ignore-failed-read` because a
+    # tracked file DELETED in the working tree is listed and is not there.
+    if ! ( cd "$TOP" && mg_git ls-files -co --exclude-standard -z \
+             | tar --null --ignore-failed-read -T - -cf - 2>"$WORKDIR/tar.err" ) \
+         | tar -xf - -C "$T0" 2>>"$WORKDIR/tar.err"; then
+        printf 'mutation-gate.sh: REFUSED — could not copy the working tree of %s:\n' "$TOP" >&2
+        tail -n 5 "$WORKDIR/tar.err" >&2
+        exit 3
+    fi
+    if [ ! -f "$T0/$SUBJ_REL" ] || [ ! -f "$T0/$SUITE_REL" ]; then
+        printf 'mutation-gate.sh: REFUSED — the copy of %s lacks the %s.\n' "$TOP" \
+            "$( [ -f "$T0/$SUBJ_REL" ] && printf 'suite (%s)' "$SUITE_REL" || printf 'subject (%s)' "$SUBJ_REL" )" >&2
+        printf '  Only tracked and untracked-UNIGNORED files are copied; a gitignored path is\n' >&2
+        printf '  not (and a walked-up repository root ignores every tree beneath it).\n' >&2
+        exit 3
+    fi
+    n_ignored=$(cd "$TOP" && mg_git status --porcelain --ignored 2>/dev/null | grep -c '^!!')
+    printf '  tree   : %s copied (%s files); %s gitignored path(s) NOT copied — a sub-check\n' \
+        "$TOP" "$(cd "$T0" && find . -type f | grep -c .)" "$n_ignored"
+    printf '           gated on one skips in BOTH arms and cannot flip (false SURVIVORS only).\n'
+    # THE LOAD WITNESS. One line, identical in both arms. After a shebang when
+    # there is one — line 1 must stay the interpreter line — else at the top;
+    # either way it lands where a new logical line begins.
+    if [ "$LOAD_WITNESS" = 1 ]; then
+        # `echo x`, not `: >>`: an append of NOTHING leaves a zero-byte file, and the
+        # check below is `-s`. A builtin, so it costs no fork in a hot subject.
+        wline=$(printf 'echo x >> %q' "$WORKDIR/witness")
+        if [ "$(head -c 2 "$T0/$SUBJ_REL")" = '#!' ]; then
+            awk -v w="$wline" 'NR==1{print; print w; next} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
+        else
+            awk -v w="$wline" 'NR==1{print w} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
+        fi
+        if [ "$(( $(wc -l < "$T0/$SUBJ_REL") + 1 ))" -ne "$(wc -l < "$WORKDIR/subj.inst")" ]; then
+            printf 'mutation-gate.sh: REFUSED — planting the load witness did not add exactly one line.\n' >&2; exit 3
+        fi
+        cat "$WORKDIR/subj.inst" > "$T0/$SUBJ_REL"    # cat, not mv: keep the mode bits
+        WITNESS_OFF=1
+    fi
+    # Its own repository, so `git ls-files` in a population guard answers about
+    # the COPY. `-c` for identity and hooks: NEVER the operator's global config
+    # (#1244), and no hook of theirs runs on a throwaway commit.
+    if ! ( cd "$T0" && mg_git init -q . \
+             && mg_git add -A . \
+             && mg_git -c user.name=mutation-gate -c user.email=mutation-gate@invalid \
+                       -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+                       commit -q -m 'mutation-gate: throwaway copy' ) >"$WORKDIR/init.out" 2>&1; then
+        printf 'mutation-gate.sh: REFUSED — could not make the tree copy a repository:\n' >&2
+        tail -n 5 "$WORKDIR/init.out" >&2
+        exit 3
+    fi
+    cp -a "$T0" "$T1" || die "cannot copy $T0 to $T1"
+    BASE_SCRIPT="$T0/$SUITE_REL"
 fi
 
 # ---------------------------------------------------------------------------
@@ -621,8 +1460,9 @@ fi
 # ---------------------------------------------------------------------------
 free_before=$(free_mb)
 
-echo "=== baseline: $SUITE_ABS (unmutated) ==="
-base_rc=$(mg_run "$SUITE_ABS" "$WORKDIR/baseline")
+echo "=== baseline: $BASE_SCRIPT (unmutated) ==="
+: > "$WORKDIR/witness"
+base_rc=$(mg_run "$BASE_SCRIPT" "$WORKDIR/baseline")
 base_bound=$(mg_classify_bound "$base_rc")
 if [ -n "$base_bound" ]; then
     printf 'mutation-gate.sh: REFUSED — the UNMUTATED suite hit a bound (%s).\n' "$base_bound" >&2
@@ -685,47 +1525,103 @@ if [ "$base_rc" -ne 0 ]; then
 fi
 base_assert=$(mg_assertions "$WORKDIR/baseline.out")
 printf '  baseline rc=%s  declared assertions=%s\n' "$base_rc" "$base_assert"
+mg_labels "$WORKDIR/baseline.out" > "$WORKDIR/base.labels"
+
+# THE INERT-MUTANT REFUSAL (section 7b), at the EARLIEST point the truth is
+# known: the baseline ran green and never executed this copy of the subject, so
+# the mutant arm could only ever report `survived` about a file the suite does
+# not read. Refused BEFORE the mutant is built.
+if [ -n "$SUBJECT_ABS" ] && [ "$LOAD_WITNESS" = 1 ] && [ ! -s "$WORKDIR/witness" ]; then
+    printf 'mutation-gate.sh: REFUSED — the suite ran GREEN and NEVER EXECUTED the copy of the subject.\n' >&2
+    printf '  subject: %s   (copy: %s)\n' "$SUBJ_REL" "$T0/$SUBJ_REL" >&2
+    printf '  A mutation there would be INERT, and an inert mutant reads exactly like a\n' >&2
+    printf '  survivor. Either this suite does not exercise this subject at all, or it\n' >&2
+    printf '  resolves it from somewhere else — an exported NEXUS_ROOT (currently: %s), an\n' "${NEXUS_ROOT:-unset}" >&2
+    printf '  absolute path, an installed copy. If the suite reads the subject WITHOUT\n' >&2
+    printf '  executing it (a lint, a hash), use --no-load-witness and read the caveat.\n' >&2
+    exit 3
+fi
+if [ -n "$PREDICT" ]; then
+    mg_predict_validate || exit 3
+fi
 
 # ---------------------------------------------------------------------------
-# APPLY — to a COPY beside the original, so the tracked file is never edited.
-# Beside it, not in $TMPDIR: a suite resolves its fixtures from
+# APPLY. Suite mode: to a COPY beside the original, so the tracked file is
+# never edited. Beside it, not in $TMPDIR: a suite resolves its fixtures from
 # `dirname "${BASH_SOURCE[0]}"`, and moving it would change what is under test.
 # The name begins with a dot so no `test-*.sh` glob can pick it up.
+# Subject mode: to the subject inside the SECOND tree copy, at the line the
+# witness pushed it to; the suite that runs is that tree's own.
 # ---------------------------------------------------------------------------
-MUT="$SUITE_DIR/.mutgate-$$-$(basename "$SUITE_ABS")"
-# Removed by mg_cleanup (installed beside the workdir allocation above).
+if [ -n "$SUBJECT_ABS" ]; then
+    PRISTINE="$T0/$SUBJ_REL"; MUTFILE="$T1/$SUBJ_REL"; MUT_SCRIPT="$T1/$SUITE_REL"
+else
+    MUT="$SUITE_DIR/.mutgate-$$-$(basename "$SUITE_ABS")"
+    # Removed by mg_cleanup (installed beside the workdir allocation above).
+    PRISTINE="$SUITE_ABS"; MUTFILE="$MUT"; MUT_SCRIPT="$MUT"
+fi
+MLINE=$(( LINE + WITNESS_OFF ))
+# The line about to be mutated must be the line that was judged eligible — the
+# witness offset is arithmetic, and arithmetic about line numbers is how a
+# mutant lands one row off and reports on its neighbour (#1163).
+if [ "$(sed -n "${MLINE}p" "$PRISTINE")" != "$(sed -n "${LINE}p" "$TARGET_ABS")" ]; then
+    printf 'mutation-gate.sh: REFUSED — line %s of the copy is not line %s of the target. Nothing was tested.\n' "$MLINE" "$LINE" >&2
+    exit 3
+fi
 
 case "$MODE" in
-  delete)    awk -v L="$LINE" 'NR==L{ printf "# %s\n", $0; next } { print }' "$SUITE_ABS" > "$MUT" ;;
-  duplicate) awk -v L="$LINE" 'NR==L{ print; print; next } { print }'        "$SUITE_ABS" > "$MUT" ;;
+  subst)     SUBST_NEW="$SUBST_NEW" awk -v L="$MLINE" 'NR==L{ print ENVIRON["SUBST_NEW"]; next } { print }' "$PRISTINE" > "$WORKDIR/mutfile" ;;
+  delete)    awk -v L="$MLINE" 'NR==L{ printf "# %s\n", $0; next } { print }' "$PRISTINE" > "$WORKDIR/mutfile" ;;
+  duplicate) awk -v L="$MLINE" 'NR==L{ print; print; next } { print }'        "$PRISTINE" > "$WORKDIR/mutfile" ;;
+  if-true|if-false)
+             awk -v L="$MLINE" -v V="${MODE#if-}" '
+                 NR==L { match($0, /^[ \t]*/); ind = substr($0, 1, RLENGTH)
+                         kw = ($0 ~ /^[ \t]*elif[ \t]/) ? "elif" : "if"
+                         print ind kw " " V "; then"; next }
+                 { print }' "$PRISTINE" > "$WORKDIR/mutfile" ;;
 esac
-chmod --reference="$SUITE_ABS" "$MUT" 2>/dev/null || chmod +x "$MUT"
+if [ -n "$SUBJECT_ABS" ]; then
+    cat "$WORKDIR/mutfile" > "$MUTFILE"           # cat, not mv: keep the mode bits
+else
+    cat "$WORKDIR/mutfile" > "$MUTFILE"
+    chmod --reference="$SUITE_ABS" "$MUT" 2>/dev/null || chmod +x "$MUT"
+fi
 
 # PROVE THE MUTATION APPLIED (#938). An INERT mutant and a genuinely surviving
 # one produce byte-identical output — green suite, "SURVIVED" — so a sweep that
 # does not check this can report a coverage hole that does not exist, or miss
 # one that does.
-if cmp -s "$SUITE_ABS" "$MUT"; then
+if cmp -s "$PRISTINE" "$MUTFILE"; then
     printf 'mutation-gate.sh: REFUSED — the mutation did not change the file. Nothing was tested.\n' >&2
     exit 3
 fi
-changed=$(diff <(cat "$SUITE_ABS") <(cat "$MUT") | grep -c '^[<>]')
-mut_line=$(sed -n "${LINE}p" "$MUT")
+changed=$(diff <(cat "$PRISTINE") <(cat "$MUTFILE") | grep -c '^[<>]')
+mut_line=$(sed -n "${MLINE}p" "$MUTFILE")
 case "$MODE" in
   delete)
     case "$mut_line" in
       '#'*) : ;;
-      *) printf 'mutation-gate.sh: REFUSED — line %s of the mutant is not a comment: %s\n' "$LINE" "$mut_line" >&2; exit 3 ;;
+      *) printf 'mutation-gate.sh: REFUSED — line %s of the mutant is not a comment: %s\n' "$MLINE" "$mut_line" >&2; exit 3 ;;
     esac
     [ "$changed" -eq 2 ] || { printf 'mutation-gate.sh: REFUSED — expected exactly one changed line, diff shows %s\n' "$changed" >&2; exit 3; } ;;
   duplicate)
     [ "$changed" -eq 1 ] || { printf 'mutation-gate.sh: REFUSED — expected exactly one added line, diff shows %s\n' "$changed" >&2; exit 3; } ;;
+  subst)
+    [ "$mut_line" = "$SUBST_NEW" ] || { printf 'mutation-gate.sh: REFUSED — line %s of the mutant is not the rewritten line: %s\n' "$MLINE" "$mut_line" >&2; exit 3; }
+    [ "$changed" -eq 2 ] || { printf 'mutation-gate.sh: REFUSED — expected exactly one changed line, diff shows %s\n' "$changed" >&2; exit 3; } ;;
+  if-true|if-false)
+    if ! grep -qE "^[[:space:]]*(if|elif) ${MODE#if-}; then\$" <<<"$mut_line"; then
+        printf 'mutation-gate.sh: REFUSED — line %s of the mutant is not the forced condition: %s\n' "$MLINE" "$mut_line" >&2; exit 3
+    fi
+    [ "$changed" -eq 2 ] || { printf 'mutation-gate.sh: REFUSED — expected exactly one changed line, diff shows %s\n' "$changed" >&2; exit 3; } ;;
 esac
-printf '  mutation applied and verified at line %s (mode=%s)\n' "$LINE" "$MODE"
+printf '  mutation applied and verified at line %s of %s (mode=%s)\n' "$LINE" "${SUBJ_REL:-the suite}" "$MODE"
+# REPORT THE DIFF, NOT A HASH (section 4): this is the edit a reproducer needs.
+diff <(cat "$PRISTINE") <(cat "$MUTFILE") | grep '^[<>]' | sed 's/^/    /'
 
 # A mutant that does not PARSE is a kill for a reason having nothing to do with
 # the assertion. Caught here so it is reported as such rather than counted.
-if ! bash -n "$MUT" 2>"$WORKDIR/parse.err"; then
+if ! bash -n "$MUTFILE" 2>"$WORKDIR/parse.err"; then
     printf 'VERDICT: killed-unattributable (the mutant does not parse)\n'
     printf '  %s\n' "$(head -2 "$WORKDIR/parse.err" | tr '\n' ' ')"
     printf '  A syntax kill says nothing about the assertion. Not evidence.\n'
@@ -733,7 +1629,8 @@ if ! bash -n "$MUT" 2>"$WORKDIR/parse.err"; then
 fi
 
 echo "=== mutant ==="
-mut_rc=$(mg_run "$MUT" "$WORKDIR/mutant")
+: > "$WORKDIR/witness"
+mut_rc=$(mg_run "$MUT_SCRIPT" "$WORKDIR/mutant")
 mut_bound=$(mg_classify_bound "$mut_rc")
 free_after=$(free_mb)
 
@@ -819,11 +1716,32 @@ if [ "$mut_rc" -eq "$base_rc" ] && [ "$base_assert" = '?' ] && [ "$mut_assert" =
     exit 3
 fi
 
+mg_flipset "$WORKDIR/baseline.out" "$WORKDIR/mutant.out" "$WORKDIR/mutant.err"
+
 if [ "$mut_rc" -eq 0 ]; then
+    if [ -n "$SUBJECT_ABS" ] && [ "$LOAD_WITNESS" = 0 ]; then
+        printf 'VERDICT: survived-unwitnessed\n'
+        printf '  The suite stayed green, and with --no-load-witness this tool cannot tell a\n'
+        printf '  suite that does not catch the defect from a suite that never READ the\n'
+        printf '  mutated file. NOT evidence of a coverage gap, and not evidence against one.\n'
+        mg_finish 5 survived-unwitnessed
+    fi
+    if [ -n "$SUBJECT_ABS" ] && [ ! -s "$WORKDIR/witness" ]; then
+        printf 'mutation-gate.sh: REFUSED — the MUTANT arm never executed the subject copy, though the baseline did.\n' >&2
+        printf '  The two arms took different paths to the subject; a green here is not a survivor.\n' >&2
+        exit 3
+    fi
     printf 'VERDICT: survived\n'
-    printf '  The mutation was PROVEN applied (diff checked above) and the suite still\n'
-    printf '  passed — so nothing in it asserts what line %s asserts.\n' "$LINE"
-    exit 4
+    if [ -n "$SUBJECT_ABS" ]; then
+        printf '  The mutation was PROVEN applied (diff above), the suite PROVABLY executed the\n'
+        printf '  mutated subject (load witness), and it still passed — so this suite would NOT\n'
+        printf '  catch this defect at %s:%s. Either nothing reaches the line, or what reaches\n' "$SUBJ_REL" "$LINE"
+        printf '  it is defended by a DIFFERENT guard (the #1519 shape). Both are coverage gaps.\n'
+    else
+        printf '  The mutation was PROVEN applied (diff checked above) and the suite still\n'
+        printf '  passed — so nothing in it asserts what line %s asserts.\n' "$LINE"
+    fi
+    mg_finish 4 survived
 fi
 
 # KILLED. Now say WHY, which is the whole of (3).
@@ -873,10 +1791,12 @@ if [ -n "$witness" ]; then
         printf '  count guard of the suite under a spelling this tool did not recognise —\n'
         printf '  the discrimination is by STRING and is therefore incomplete.\n'
     fi
-    exit 0
+    mg_print_flipset
+    mg_finish 0 killed-by-assertion
 fi
 printf 'VERDICT: killed-unattributable (rc %s, no witness)\n' "$mut_rc"
 printf '  The suite reddened and the harness cannot name WHICH assertion did it.\n'
 printf '  #1032 round 2 produced exactly this: a red whose assertion total was\n'
 printf '  16 before and 16 after, i.e. the count guard was never reached.\n'
-exit 5
+mg_print_flipset
+mg_finish 5 killed-unattributable

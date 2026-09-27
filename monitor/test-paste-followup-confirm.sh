@@ -92,16 +92,31 @@ mkdir -p "$STATE_DIR/heartbeat" "$STATE_DIR/user-prompt" "$PROJ_DIR" "$BIN"
 #   STUB_APPEND_KIND      typed | queued | system | sdk | sidechain | toolresult
 #   STUB_NOISE_ON_ENTER   append a tool_result line on every Enter (busy turn)
 #   STUB_STAMP_ON_ENTER   which Enter writes an advanced UserPromptSubmit stamp
+#   STUB_BOX_CLEARS_ON_ENTER  which Enter empties the input box WITHOUT writing a
+#                         record (the Enter took; nothing can confirm it)
 cat > "$BIN/tmux" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
 counter="$STUB_ENTER_COUNT_FILE"
 
+# The pasted payload as a JSON string body. PURE BASH, never `jq`:
+# test-tmux-shim-gate3-safety.sh default-denies any external in a planted tmux
+# stub that it cannot prove never reaches a real tmux, and it is right to (#1105).
+payload_json() {
+    local _p
+    _p=$(cat -- "$STUB_TRANSCRIPT.payload" 2>/dev/null; printf x); _p=${_p%x}
+    _p=${_p//\\/\\\\}; _p=${_p//\"/\\\"}; _p=${_p//$'\n'/\\n}; _p=${_p//$'\t'/\\t}; _p=${_p//$'\r'/\\r}
+    printf '%s' "$_p"
+}
+
 emit_line() {
     local kind="$1"
     case "$kind" in
-      typed)   printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"the follow-up"}}\n' ;;
-      queued)  printf '{"type":"user","promptSource":"queued","message":{"role":"user","content":"the follow-up"}}\n' ;;
+      # typed / queued are Claude Code recording THIS paste, so they carry what
+      # was pasted (your-org/nexus-code#1591, skeptic pastesk F1: delivery
+      # evidence is content-matched, and a fixed string is not this paste).
+      typed)   printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"%s"}}\n' "$(payload_json)" ;;
+      queued)  printf '{"type":"user","promptSource":"queued","message":{"role":"user","content":"%s"}}\n' "$(payload_json)" ;;
       system)  printf '{"type":"user","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>done</task-notification>"}}\n' ;;
       sdk)     printf '{"type":"user","promptSource":"sdk","message":{"role":"user","content":"subagent turn"}}\n' ;;
       sidechain) printf '{"type":"user","isSidechain":true,"message":{"role":"user","content":"sidechain prompt"}}\n' ;;
@@ -138,6 +153,13 @@ case "${1:-}" in
           [[ "${STUB_NOISE_ON_ENTER:-0}" == "1" ]] && emit_line toolresult >> "$STUB_TRANSCRIPT"
           if [[ "${STUB_SUBMIT_ON_ENTER:-0}" != "0" && "$n" == "${STUB_SUBMIT_ON_ENTER}" ]]; then
               emit_line "${STUB_APPEND_KIND:-typed}" >> "$STUB_TRANSCRIPT"
+              : > "$STUB_TRANSCRIPT.submitted"   # the box is empty from here on
+          elif [[ "${STUB_BOX_CLEARS_ON_ENTER:-0}" != "0" && "$n" == "${STUB_BOX_CLEARS_ON_ENTER}" ]]; then
+              # The Enter TOOK — the box empties — but no record this case can
+              # read is written. "Unverifiable" is about what can be CONFIRMED,
+              # not about text still sitting in the box; without this knob the
+              # held stand-in would turn every such case into a positive hold.
+              : > "$STUB_TRANSCRIPT.submitted"
           fi
           if [[ "${STUB_STAMP_ON_ENTER:-0}" != "0" && "$n" == "${STUB_STAMP_ON_ENTER}" ]]; then
               printf '%s\t%s\n' "$(( $(date +%s) + 1 ))" "$STUB_SID" \
@@ -145,11 +167,35 @@ case "${1:-}" in
           fi
       fi
       exit 0 ;;
+  load-buffer) cat -- "${!#}" > "$STUB_TRANSCRIPT.payload" 2>/dev/null; exit 0 ;;   # the payload is a FILE (#1590)
+  capture-pane)
+      # A held paste shows its payload in the box: the retry Enter is an
+      # EQUALITY on that row now, never blind (your-org/nexus-code#1591).
+      if [[ -s "$STUB_TRANSCRIPT.payload" && ! -e "$STUB_TRANSCRIPT.submitted" ]]; then
+          IFS= read -r _first < "$STUB_TRANSCRIPT.payload" || true
+          printf '\342\235\257\302\240%s\n' "$_first"
+      fi
+      exit 0 ;;
   set-buffer|paste-buffer|delete-buffer) exit 0 ;;
   *) exit 0 ;;
 esac
 STUB
 chmod +x "$BIN/tmux"
+
+# WHAT A HELD PASTE LOOKS LIKE (your-org/nexus-code#1591; the orchestrator's
+# direction after skeptic pastesk's A4). A retry Enter is no longer BLIND: it
+# needs the pane to read `user-typing input=typed` AND the box's first row to BE
+# this payload. So a stand-in for a pane that swallowed the Enter has to show
+# what the real one shows — the payload, sitting in the box.
+cat > "$BIN/pane-state-held" <<'PSH'
+#!/usr/bin/env bash
+if [[ -s "${STUB_TRANSCRIPT:-/nonexistent}.payload" && ! -e "${STUB_TRANSCRIPT}.submitted" ]]; then
+    echo "state=user-typing active=0 input=typed"
+else
+    echo "state=idle active=0 input=blank"
+fi
+PSH
+chmod +x "$BIN/pane-state-held"
 
 # A transcript that ALREADY contains a submitted prompt and some tool
 # results. A correct implementation baselines and looks only at what is
@@ -167,6 +213,7 @@ seed_heartbeat() {
         "$(date +%s)" "$sid" "$WINDOW" > "$STATE_DIR/heartbeat/$WINDOW.json"
 }
 reset_case() {
+    rm -f "$TRANSCRIPT.payload" "$TRANSCRIPT.submitted"
     rm -f "$STATE_DIR/user-prompt/$WINDOW" "$STATE_DIR/heartbeat/$WINDOW.json" \
           "$STATE_DIR/machine-input.tsv" "$WORK/enters"
     printf '0' > "$WORK/enters"
@@ -183,6 +230,8 @@ run_paste() {
         NEXUS_STATE_DIR="$STATE_DIR" \
         NEXUS_CC_HOME="$CC_HOME" \
         PASTE_NG_BIN=/bin/true \
+        STUB_BOX_CLEARS_ON_ENTER="${STUB_BOX_CLEARS_ON_ENTER:-0}" \
+        NEXUS_PASTE_PANE_STATE_BIN="$BIN/pane-state-held" PD_HELD_CHECK_SECONDS=0.2 \
         PASTE_CONFIRM_TIMEOUT_SECONDS="${TIMEOUT_S:-2}" \
         PASTE_CONFIRM_POLL_SECONDS=0.05 \
         STUB_WINDOW="$WINDOW" \
@@ -267,7 +316,7 @@ assert_not_contains "does not report submitted" "$OUT" ": submitted"
 echo "## 7. no heartbeat → exit 3, 'unconfirmed', reason named"
 reset_case
 rm -f "$STATE_DIR/heartbeat/$WINDOW.json"
-STUB_SUBMIT_ON_ENTER=0 run_paste OUT RC
+STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 run_paste OUT RC
 assert_eq       "exit code is 3"        "$RC" "3"
 assert_contains "says unconfirmed"      "$OUT" "submission unconfirmed"
 assert_contains "names the reason"      "$OUT" "no session-id"
@@ -277,7 +326,7 @@ assert_not_contains "never claims delivery" "$OUT" "delivered"
 echo "## 8. session-id with no transcript → exit 3"
 reset_case
 seed_heartbeat "99999999-9999-9999-9999-999999999999"
-STUB_SUBMIT_ON_ENTER=0 run_paste OUT RC
+STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 run_paste OUT RC
 assert_eq       "exit code is 3"   "$RC" "3"
 assert_contains "names the reason" "$OUT" "no transcript for session"
 
@@ -286,7 +335,7 @@ assert_contains "names the reason" "$OUT" "no transcript for session"
 # establish a negative, so we must not assert one.
 echo "## 9. turn in flight (tool_results appended, no submission) → exit 3"
 reset_case
-STUB_SUBMIT_ON_ENTER=0 STUB_NOISE_ON_ENTER=1 run_paste OUT RC
+STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 STUB_NOISE_ON_ENTER=1 run_paste OUT RC
 assert_eq       "exit code is 3"          "$RC" "3"
 assert_contains "says a turn is in flight" "$OUT" "turn is in flight"
 assert_not_contains "not an established negative" "$OUT" "pasted (NOT submitted) to"
@@ -294,7 +343,7 @@ assert_not_contains "not an established negative" "$OUT" "pasted (NOT submitted)
 # ── 10. The other evidence surface: the UserPromptSubmit hook stamp ──────
 echo "## 10. hook stamp advances (transcript inert) → exit 0"
 reset_case
-STUB_SUBMIT_ON_ENTER=0 STUB_STAMP_ON_ENTER=1 run_paste OUT RC
+STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 STUB_STAMP_ON_ENTER=1 run_paste OUT RC
 assert_eq       "exit code is 0"    "$RC" "0"
 assert_contains "reports submitted" "$OUT" "submitted"
 
@@ -303,7 +352,7 @@ assert_contains "reports submitted" "$OUT" "submitted"
 # session is not evidence about ours.
 echo "## 11. hook stamp from another session must NOT confirm"
 reset_case
-STUB_SID="another-session-id" STUB_SUBMIT_ON_ENTER=0 STUB_STAMP_ON_ENTER=1 run_paste OUT RC
+STUB_SID="another-session-id" STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 STUB_STAMP_ON_ENTER=1 run_paste OUT RC
 assert_eq           "exit code is 4"            "$RC" "4"
 assert_not_contains "does not report submitted" "$OUT" ": submitted"
 
@@ -320,7 +369,7 @@ ROT
 chmod +x "$BIN/rotate-hb"
 ( sleep 0.4; "$BIN/rotate-hb" ) &
 _rot=$!
-STUB_SUBMIT_ON_ENTER=0 run_paste OUT RC
+STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 run_paste OUT RC
 wait "$_rot" 2>/dev/null || true
 assert_eq       "exit code is 3"        "$RC" "3"
 assert_contains "names the session churn" "$OUT" "session-id changed under us"

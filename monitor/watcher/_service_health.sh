@@ -171,6 +171,56 @@ _sh_svc_bin() {
 : "${MONITOR_SERVICE_HEALTH_FLAP_CEILING:=3}"
 : "${MONITOR_SERVICE_HEALTH_DEFAULT_POLICY:=auto-restart}"
 : "${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:=1800}"
+
+# ---- operator alert when the emit route is UNAVAILABLE (your-org/nexus-code#1534)
+#
+# This module's ENTIRE report route is the watcher emit — a paste into the
+# orchestrator's pane. Measured on `dev` 353867a0: 0 hits for any alert
+# helper in this file, against 7 in main.sh. So an `emit-only` or `flapping`
+# escalation that lands while that route is known-unavailable — an auth hold
+# (emits WITHHELD, up to 7200 s), a logged-out orchestrator, an over-limit
+# hold, an absent target — reaches NOBODY: no paste, no bell, no record but
+# an archive file. That is #592's shape (a blackout on the only channel) on a
+# path with no channel-independent leg at all.
+#
+# Two injected seams, defaults inert so the module stays sourceable alone:
+#
+#   _SERVICE_HEALTH_ROUTE_BLOCKED_FN  rc 0 iff the emit route is known-unavailable,
+#                                     printing a one-clause REASON on stdout.
+#                                     main.sh wires the four conditions above.
+#   _SERVICE_HEALTH_OPERATOR_ALERT_FN `<raise|clear> <key> [<severity>] <msg>`,
+#                                     main.sh wires `_operator_alert`
+#                                     (`_operator_alert.sh`: durable record +
+#                                     bell + push + GitHub issue, fail-open).
+#
+# Fires ONLY when both obtain — an escalation the orchestrator can read is the
+# orchestrator's to judge, and ringing the operator's phone for every
+# emit-only service on a healthy board is the flood #976 measured. Keyed per
+# service (`service-health:<name>`); the primitive owns dedup and reminders,
+# so this is called on every tick the pair holds, and CLEARED on recovery or
+# on reclassification to a finding (the service is alive either way).
+_sh_route_blocked_noop() { return 1; }
+_sh_operator_alert_noop() { [[ "${1:-}" == standing ]] && return 1; return 0; }
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN="${_SERVICE_HEALTH_ROUTE_BLOCKED_FN:-_sh_route_blocked_noop}"
+_SERVICE_HEALTH_OPERATOR_ALERT_FN="${_SERVICE_HEALTH_OPERATOR_ALERT_FN:-_sh_operator_alert_noop}"
+
+_sh_operator_alert_key() { printf 'service-health:%s' "$1"; }
+
+# _sh_operator_alert_step <name> <status> <policy> <first_iso> <note>
+_sh_operator_alert_step() {
+    local name="$1" status="$2" policy="$3" first_iso="$4" note="$5" reason
+    case "$status" in emit-only|flapping) ;; *) return 0 ;; esac
+    reason=$("$_SERVICE_HEALTH_ROUTE_BLOCKED_FN") || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$(_sh_operator_alert_key "$name")" || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$(_sh_operator_alert_key "$name")" critical \
+        "service '${name}' is DOWN (since ${first_iso}, status ${status}, policy ${policy}) and the watcher CANNOT tell the orchestrator: ${reason:-the emit route is unavailable}. ${note}. Nobody in-band can act on this until the orchestrator can take a turn; look at monitor/svc.sh status and \`ng service-incident ${name}\`."
+    return 0
+}
+_sh_operator_alert_clear() {   # <name> <why> — a no-op unless the key is standing
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$(_sh_operator_alert_key "$1")" || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" clear "$(_sh_operator_alert_key "$1")" "service '$1' $2"
+    return 0
+}
 [[ "$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS" =~ ^[0-9]+$ ]] \
     || MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
 [[ "$MONITOR_SERVICE_HEALTH_GRACE_SECONDS" =~ ^[0-9]+$ ]] \
@@ -334,10 +384,42 @@ _SH_HEALTH_DETAIL=""
 _SH_FINDING_KEY=""
 _SH_FINDING_BAND=""
 _SH_FINDING_BODY=""
+# ---- THE CHECK IS BOUNDED, AND A CHECK THAT DOES NOT FINISH IS *UNKNOWN*
+# (your-org/nexus-code#1601). This run had no time limit. On 2026-09-21
+# `tmpfs-guard.sh --check` walked a /tmp of 15,234 depth-1 entries and did not
+# return for minutes; this function runs every service's check SERIALLY in one
+# tick, so one hung check stopped the WHOLE tick — every other service went
+# unwatched, with nothing in any log saying so.
+#
+# THE DIRECTION IS CHOSEN FROM THE CALLER, not from symmetry. The one caller
+# (`_service_health_check_tick`) reads any non-zero, non-FINDING rc as DOWN,
+# and DOWN is what walks a service through grace into `svc.sh restart`. A
+# timeout reported as a failure would therefore RESTART a service whose only
+# fault was a slow probe — and the incident that opened #1601 had every
+# service healthy. Reported as healthy it would CLEAR a real incident on no
+# evidence. So it is neither: `_SH_HEALTH_TIMED_OUT=1`, a FLAG beside the rc
+# rather than a reserved rc value (a healthcheck may exit any code, 124
+# included), and the tick leaves that service's recorded state exactly as it
+# was — no grace clock started, no restart, no recovery, no finding cleared.
+#
+# TIMED OUT = the status SET (124, or 137 after `-k`) AND the wall clock having
+# reached the bound; a check's own `exit 124` inside the bound stays a failure.
+# Same rule as svc.sh's `_svc_row_health`.
+#
+# MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS — CHOSEN default 60: half the
+# service_health task's default 120 s cadence, and ~40x the tmpfs guard's
+# measured 1.6 s on this host. A check that needs longer than that on a
+# watcher tick reads UNKNOWN, which is the honest answer about it.
+_SH_HEALTH_TIMED_OUT=0
+_SH_HEALTH_BOUND=60
 _sh_service_healthy() {
     local workdir="$1" health="$2"
     _SH_HEALTH_DETAIL=""
+    _SH_HEALTH_TIMED_OUT=0
     _SH_FINDING_KEY=""; _SH_FINDING_BAND=""; _SH_FINDING_BODY=""
+    local bound="${MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS:-60}" t0=$SECONDS
+    [[ "$bound" =~ ^[1-9][0-9]*$ ]] || bound=60
+    _SH_HEALTH_BOUND="$bound"   # read by the tick's UNKNOWN alert text (#1631)
     # ONE run — no extra probe (the #431/#434 sshd-starvation history forbids
     # double-probing). Inside $(...), `2>&1 1>/dev/null` routes fd2 to the capture
     # pipe and then fd1 to /dev/null, so stdout is dropped exactly as before and
@@ -353,9 +435,41 @@ _sh_service_healthy() {
     # never restarts, and logs no fault. Measured on bash 4.4.20; the full shape
     # matrix is in bootstrap-recover.sh's `_recover_service_healthy`, which
     # carries the identical (deliberately replicated) call site. Keep in step.
-    local err rc
-    err=$( ( cd "$workdir" 2>/dev/null && bash <(printf '%s' "$health") ) 2>&1 1>/dev/null )
-    rc=$?
+    # `timeout` without --foreground signals its whole process group, so the
+    # check's children (the guard's `find`) go with it rather than outliving
+    # the tick. Its argv is `timeout -k 2 <n> bash /dev/fd/N` — no pattern.
+    #
+    # stderr goes to a TEMP FILE, not a capture pipe (your-org/nexus-code#1631).
+    # `$( … 2>&1 1>/dev/null )` returns only when EVERY holder of the pipe's
+    # write end has exited, and a `setsid`/`&` grandchild of the check is
+    # outside timeout's process group, survives the kill, and holds it: the
+    # bound was not a hard total. Measured on this host with the check
+    # `setsid sleep 15 & sleep 30` and a 1 s bound: the pipe form returned
+    # after 15 s, the file form after 1 s. A file has no reader waiting for
+    # EOF, so the tick returns when `timeout` does. STATED LIMIT: the detached
+    # grandchild itself still runs to completion — it is merely no longer
+    # able to hold the tick. If mktemp fails, fall back to the pipe form (the
+    # pre-#1631 behaviour: correct verdicts, a soft bound) — so a read-only or
+    # full filesystem degrades the bound, never the verdict (the #473 concern
+    # bootstrap-recover.sh records against a temp-file variant). The file goes
+    # in the service-health state dir when it is writable, NOT /tmp: #1601's
+    # own incident was a /tmp swollen past 15,000 entries.
+    local err rc errf errd="${SERVICE_HEALTH_STATE_DIR:-}"
+    [[ -n "$errd" && -d "$errd" && -w "$errd" ]] || errd="${TMPDIR:-/tmp}"
+    if errf=$(mktemp "$errd/.health-err.XXXXXX" 2>/dev/null) && [[ -n "$errf" ]]; then
+        ( cd "$workdir" 2>/dev/null && timeout -k 2 "$bound" bash <(printf '%s' "$health") ) 2>"$errf" 1>/dev/null
+        rc=$?
+        err=$(cat "$errf" 2>/dev/null)
+        rm -f "$errf" 2>/dev/null
+    else
+        err=$( ( cd "$workdir" 2>/dev/null && timeout -k 2 "$bound" bash <(printf '%s' "$health") ) 2>&1 1>/dev/null )
+        rc=$?
+    fi
+    if (( rc == 124 || rc == 137 )) && (( SECONDS - t0 >= bound )); then
+        _SH_HEALTH_TIMED_OUT=1
+        _SH_HEALTH_DETAIL="healthcheck did not finish within ${bound}s — health UNKNOWN, neither healthy nor down (your-org/nexus-code#1601)"
+        return "$rc"
+    fi
     if (( rc != 0 )) && [[ -n "$err" ]]; then
         # Select the VERDICT line by CONTENT, not by POSITION. The failing
         # healthcheck's verdict is not reliably first or last: remote-ssh-health.sh
@@ -560,6 +674,15 @@ _sh_labsh_build_in_progress() {
 # no .state behind (that invariant is what keeps the emit loop quiet), and a
 # service still below the surfacing threshold is not yet an incident.
 _sh_inconsistent_file() { printf '%s/%s.inconsistent' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+
+# Consecutive-UNKNOWN counter (your-org/nexus-code#1631). A SIDECAR for the
+# same reason as the one above, and a second one: `status` in the .state file
+# SELECTS (the emit loop, the incident arms), so an UNKNOWN must never become a
+# status value, and a hung check on a healthy service must still leave no
+# .state behind. `count=<n>` consecutive timed-out ticks, `since=<epoch>` /
+# `since_iso=` of the first. Removed on every tick whose check FINISHES.
+_sh_unknown_file() { printf '%s/%s.unknown' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_unknown_alert_key() { printf 'service-health-unknown:%s' "$1"; }
 
 # Evidence marker written by `svc.sh restart <name>` (see _record_restart_marker
 # there): `actor=<watcher|operator>` + the epoch it happened. This is what lets
@@ -888,6 +1011,13 @@ _service_health_check_tick() {
     [[ "$ceiling" =~ ^[0-9]+$ ]] || ceiling=3
     [[ "$incon_polls" =~ ^[1-9][0-9]*$ ]] || incon_polls=3
     [[ "$incon_renag" =~ ^[1-9][0-9]*$ ]] || incon_renag=21600
+    # Consecutive UNKNOWN (timed-out) ticks before the operator is alerted
+    # (your-org/nexus-code#1631). CHOSEN default 3: ~6 min at the 120 s
+    # cadence — one slow tick is noise (a loaded host, a big /tmp walk), three
+    # in a row means the watcher has been blind to this service long enough
+    # that a real outage behind it would already have passed grace.
+    local unknown_ticks="${MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS:-3}"
+    [[ "$unknown_ticks" =~ ^[1-9][0-9]*$ ]] || unknown_ticks=3
 
     local now; now="$(_sh_now)"
     local name workdir launch health logfile policy
@@ -916,6 +1046,49 @@ _service_health_check_tick() {
         # the incident machine — no grace, no restart, no DOWN); else down.
         local hrc=0 is_finding=0
         _sh_service_healthy "$workdir" "$health" || hrc=$?
+        # UNKNOWN — the check did not finish within its bound. Leave every
+        # record for this service exactly as it was: see `_SH_HEALTH_TIMED_OUT`
+        # for why this is neither the healthy arm nor the down arm.
+        #
+        # A STANDING UNKNOWN ESCALATES (your-org/nexus-code#1631). The
+        # `continue` below skips every status and supervisor arm, so a check
+        # that times out on EVERY tick left the service at its last status —
+        # typically `healthy` — forever, with a log line as the only record.
+        # Count consecutive UNKNOWN ticks in a sidecar; at `unknown_ticks`
+        # raise a WARNING operator alert (not critical: nothing is known to be
+        # down — what is known is that the watcher cannot see). Still no
+        # restart and no state change: the alert is the whole escalation.
+        local unk_file; unk_file="$(_sh_unknown_file "$name")"
+        if (( _SH_HEALTH_TIMED_OUT )); then
+            local unk_n=0 unk_since="" unk_since_iso=""
+            unk_n=$(_sh_field "$unk_file" count 2>/dev/null || echo 0)
+            [[ "$unk_n" =~ ^[0-9]+$ ]] || unk_n=0
+            unk_since=$(_sh_field "$unk_file" since 2>/dev/null || echo "")
+            unk_since_iso=$(_sh_field "$unk_file" since_iso 2>/dev/null || echo "")
+            if (( unk_n == 0 )) || [[ ! "$unk_since" =~ ^[0-9]+$ ]]; then
+                unk_since="$now"; unk_since_iso="$(_sh_iso)"
+            fi
+            unk_n=$(( unk_n + 1 ))
+            printf 'count=%s\nsince=%s\nsince_iso=%s\n' "$unk_n" "$unk_since" "$unk_since_iso" \
+                > "$unk_file" 2>/dev/null || true
+            _sh_log "service '$name' health UNKNOWN this tick ($unk_n consecutive): $_SH_HEALTH_DETAIL; state left as '${prev_status:-none}' (no grace, no restart, no recovery)"
+            if (( unk_n >= unknown_ticks )); then
+                local unk_key; unk_key="$(_sh_unknown_alert_key "$name")"
+                "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$unk_key" \
+                    && "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$unk_key" warning \
+                        "service '${name}' health has been UNKNOWN for ${unk_n} consecutive watcher ticks (since ${unk_since_iso:-@$unk_since}): its healthcheck did not finish within ${_SH_HEALTH_BOUND}s on any of them. Last recorded status: '${prev_status:-healthy (no incident record)}'. The watcher does NOT restart, recover or open an incident on an unknown verdict, so nothing in-band is acting on this; run the service's healthcheck by hand and look at monitor/svc.sh status."
+            fi
+            continue
+        fi
+        # The check FINISHED, whatever its verdict: the UNKNOWN run is over.
+        # Clear on every such tick while the key stands — the primitive holds
+        # a clear down (300 s) and finalises only when the caller keeps saying
+        # "absent", so this is re-asserted rather than sent once.
+        rm -f "$unk_file" 2>/dev/null || true
+        if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$(_sh_unknown_alert_key "$name")"; then
+            "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" clear "$(_sh_unknown_alert_key "$name")" \
+                "service '${name}' healthcheck finished again (health is known)"
+        fi
         if (( hrc == SH_RC_FINDING )); then
             is_finding=1
             hrc=0
@@ -930,6 +1103,16 @@ _service_health_check_tick() {
             local was_incident=0
             [[ -n "$prev_status" && "$prev_status" != "healthy" && "$prev_status" != "recovered" \
                && "$prev_status" != "inconsistent" && "$prev_status" != "reconciled" ]] && was_incident=1
+            # Re-assert the clear on EVERY healthy tick while an operator alert
+            # is standing for this service (#1534): the primitive holds a
+            # clear down and finalises only when the caller keeps saying
+            # "absent" past the hold-down, so a flapping service never
+            # re-files, re-rings or re-opens on each toggle. The TRANSITION
+            # tick is left to the arms below, which name the cause (recovered
+            # by whom / reclassified); this is the steady-state re-assertion.
+            if (( ! was_incident )); then
+                _sh_operator_alert_clear "$name" "healthy on this tick"
+            fi
 
             # The finding is noted BEFORE the transition arms decide what to
             # say, because the finding sidecar's existence is what tells a
@@ -973,6 +1156,7 @@ _service_health_check_tick() {
             # line. This generalises to EVERY service adopting SH_RC_FINDING,
             # which is why it is fixed at the mechanism.
             if (( was_incident )) && (( is_finding )); then
+                _sh_operator_alert_clear "$name" "reclassified to a finding (alive)"
                 _sh_record_event "$name" reclassified \
                     "healthcheck vocabulary changed (non-zero -> ${SH_RC_FINDING} FINDING) while the condition it reports is PRESENT; status was ${prev_status} since ${first_iso}. NOT a recovery: nothing was restored and no restart is indicated."
                 _sh_log "service '$name' incident RECLASSIFIED as a FINDING (was ${prev_status}) — the condition did not clear; the healthcheck's vocabulary did"
@@ -1094,6 +1278,7 @@ _service_health_check_tick() {
                 # A health incident just closed; let its breadcrumb surface
                 # alone. Supervisor consistency is judged from the next tick.
                 rm -f "$incon_file" "$mk" 2>/dev/null || true
+                _sh_operator_alert_clear "$name" "recovered (${recovered_by})"
                 continue
             fi
 
@@ -1364,6 +1549,7 @@ _service_health_check_tick() {
             "workdir=${workdir}" \
             "logfile=${logfile}" \
             "note=${note}"
+        _sh_operator_alert_step "$name" "$status" "$policy" "$first_iso" "$note"
     done < <(_sh_parse_registry)
     return 0
 }

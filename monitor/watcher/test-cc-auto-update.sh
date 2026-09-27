@@ -79,7 +79,8 @@
 #         stands, restart NOT even detached, NO kill, rc 21.
 #   apply: restart-orchestrator verb (the detached second half, tested
 #   directly + synchronously)
-#    19.  watchdog never arms → NO kill, rc 22.
+#    19.  watchdog window GONE before arming → NO kill, rc 22 (cause asserted).
+#    19c. watchdog alive but never arms → ARM_WAIT timeout, NO kill, rc 22.
 #    20.  orchestrator busy past the idle cap → FORCE-restart: kill
 #         issued, outcome safe-bumped-restart-forced, rc 0 (the operator
 #         decision — replaces the old rc-20 defer).
@@ -112,7 +113,7 @@
 #    H5.  detached restart honours a pre-existing hold (rc 25, no kill).
 #    H6.  SIGTERM'd detached restart WRITES the hold (abort stays aborted).
 #   deployment gate (nexus-code#512)
-#    G1.  open restart-path PR → defer (rc 30, nothing mutated).
+#    G1.  open restart-path PR → NOTED, not a veto (rc 0; #1526 follow-up).
 #    G2.  PR probe failure → defer (fail-safe), distinct detail.
 #    G3.  live agent windows: the COUNT is RECORDED, never a veto (the
 #         max_live_windows arm was removed 2026-09-12, operator decision —
@@ -260,7 +261,40 @@ gp_handle "$@"
 PASS=0
 FAIL=0
 pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
-fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
+# A FAIL PRINTS WHAT THE PRODUCER SAID (your-org/nexus-code#1561).
+#
+# Every `restart-orchestrator` invocation below used to end `>/dev/null 2>&1`.
+# `cmd_restart_orchestrator` explains each of its exits with a distinctive
+# `note "ABORT restart: …"` line, and the suite threw that line away — so it
+# could report THAT a restart scenario failed and never WHY. For H7 (#1560),
+# an INTERMITTENT red, that cost an evening: the only route to the reason was
+# re-running until it failed again under a hand-modified harness, and a
+# modified harness is not the configuration that failed.
+#
+# Each invocation now appends to `$ROOT/producer.log` (both streams: a bash
+# error inside the producer — `command not found`, an unbound variable — is
+# exactly the thing a `note` cannot report). A scenario's ROOT is private to
+# it, so the log a FAIL prints is the log of the scenario that failed. The
+# product's own `apply.log` is printed beside it when present: it survives a
+# producer whose stdout was lost, and DISAGREEMENT between the two is itself
+# a finding.
+#
+# `FAIL:` stays the FIRST line and the log follows, indented and labelled, so
+# run-tests.sh's by-shape assertion scan (#1561) still finds the assertion and
+# nothing in a log line can be mistaken for one (the indent + `|` prefix keeps
+# a producer line that happens to say `FAIL:` out of the `^\s*FAIL:` shape).
+_PRODUCER_LOG_TAIL=40
+_dump_producer_log() {
+    local root="${ROOT:-}" f
+    [[ -n "$root" ]] || return 0
+    for f in "$root/producer.log" "$root/monitor/.state/cc-auto-update/apply.log" "$root/calls.log"; do
+        [[ -s "$f" ]] || continue
+        printf '      | --- %s (last %d of %d lines) ---\n' \
+            "${f#"$root"/}" "$_PRODUCER_LOG_TAIL" "$(wc -l < "$f")" >&2
+        tail -n "$_PRODUCER_LOG_TAIL" -- "$f" | sed 's/^/      | /' >&2
+    done
+}
+fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); _dump_producer_log; }
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -775,10 +809,22 @@ auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
 printf 'candidate=2.1.258\ndecision=safe-refused\ndate=x\ndetail=gate-evidence:gated-tree-dirty\n' > "$auto/last-eval"
 printf '%s\t2.1.258\tsafe-refused\tgate-evidence:gated-tree-dirty\n' "2026-09-02T04:22:33-07:00" > "$auto/decisions.tsv"
 FETCH_VERSION="2.1.258"
+# #1475: capture the tick's `log` line — for gated-tree-dirty it must name the
+# remedy (a local tracked edit) and NOT call it "a defect in the gate". Any
+# pre-existing `log` is saved and restored around the capture.
+_saved_log=$(declare -f log 2>/dev/null || true)
+log() { printf '%s\n' "$*" >> "$ROOT/tick.log"; }
 NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
+unset -f log; [[ -n "$_saved_log" ]] && eval "$_saved_log"
 [[ "$(grep -c 'safe-refused-unapplied' "$auto/decisions.tsv" 2>/dev/null)" == 1 ]] \
     && pass "#1400: a safe-refused last-eval is SURFACED by the tick (audit row + notify)" \
     || fail "#1400: safe-refused went dark — rows: $(grep -c safe-refused-unapplied "$auto/decisions.tsv" 2>/dev/null)"
+if grep -qF 'tracked edit(s) in the live clone block the bump' "$ROOT/tick.log" 2>/dev/null \
+   && ! grep -qF 'defect in the gate' "$ROOT/tick.log" 2>/dev/null; then
+    pass "#1475: the tick names a dirty gated tree as a local edit, NOT 'a defect in the gate'"
+else
+    fail "#1475: tick surfacing of gated-tree-dirty — got: $(cat "$ROOT/tick.log" 2>/dev/null)"
+fi
 NEXUS_TEST_NOW=$(epoch_at 05:30) run_tick "$ROOT" fetch_ok
 [[ "$(grep -c 'safe-refused-unapplied' "$auto/decisions.tsv" 2>/dev/null)" == 1 ]] \
     && pass "#1400: …once per day, not once per tick" \
@@ -791,6 +837,27 @@ NEXUS_TEST_NOW=$(epoch_on 1 05:00) run_tick "$ROOT" fetch_ok
 grep -q 'safe-refused-repeat' "$auto/decisions.tsv" 2>/dev/null \
     && pass "#1400: the SAME reason twice running escalates as a standing defect (safe-refused-repeat)" \
     || fail "#1400: identical second refusal not escalated: $(tail -2 "$auto/decisions.tsv")"
+# 10o. your-org/nexus-code#1526 — an UNDISPOSITIONED OPAQUE RELEASE is the
+#      evaluating agent's call, not a gate defect: the tick keeps the audit row
+#      but says no human action is requested, and does not blame the gate.
+ROOT="$WORK/r10o"; make_root "$ROOT" "2.1.150"
+SPAWN_LOG="$ROOT/spawned.log"; make_spawn_stub "$ROOT/spawn" "$SPAWN_LOG"
+CC_AUTO_SPAWN_CMD="$ROOT/spawn"
+auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
+printf 'candidate=2.1.258\ndecision=safe-refused\ndate=x\ndetail=changelog-completeness:opaque-release=2.1.242\n' > "$auto/last-eval"
+printf '%s\t2.1.258\tsafe-refused\tchangelog-completeness:opaque-release=2.1.242\n' "2026-09-02T04:22:33-07:00" > "$auto/decisions.tsv"
+FETCH_VERSION="2.1.258"
+_saved_log=$(declare -f log 2>/dev/null || true)
+log() { printf '%s\n' "$*" >> "$ROOT/tick.log"; }
+NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
+unset -f log; [[ -n "$_saved_log" ]] && eval "$_saved_log"
+if [[ "$(grep -c 'safe-refused-unapplied' "$auto/decisions.tsv" 2>/dev/null)" == 1 ]] \
+   && grep -qF 'no human action is requested' "$ROOT/tick.log" 2>/dev/null \
+   && ! grep -qF 'defect in the gate' "$ROOT/tick.log" 2>/dev/null; then
+    pass "#1526: the tick records an undispositioned opaque release (audit row) as the agent's to clear, NOT 'a defect in the gate'"
+else
+    fail "#1526: tick surfacing of an opaque refusal — rows=$(grep -c safe-refused-unapplied "$auto/decisions.tsv" 2>/dev/null) log: $(cat "$ROOT/tick.log" 2>/dev/null)"
+fi
 # CONTROL: a block outcome is NOT surfaced by this arm (it has its own path)
 ROOT="$WORK/r10n2"; make_root "$ROOT" "2.1.150"
 SPAWN_LOG="$ROOT/spawned.log"; make_spawn_stub "$ROOT/spawn" "$SPAWN_LOG"
@@ -1141,16 +1208,34 @@ EOF
     # the CANDIDATE unconditionally — which is the #1002 drifted shape
     # (binary ahead of the pin), refused before any verdict since then.
     make_pin_following_claude "$root" "$floor"
+    # THE KILL IS RECORDED AS `kill-window -t :=orchestrator` (your-org/nexus-code#1524):
+    # the apply script names the EXACT window (`:=`), because a bare name resolves
+    # by unique PREFIX once the target is gone. Every `grep -q "kill-window -t
+    # :=orchestrator"` below keys on that spelling — and so must every `! grep`:
+    # a negative assertion left on the OLD spelling would pass vacuously.
     # tmux stub: records calls. For the name→index resolver's format
     # (`#{window_name}|#{window_index}`) it maps orchestrator → index 2;
     # for the watchdog-existence probe (`#W`) it prints nothing (so the
     # stale-watchdog cleanup is skipped). kill-window etc. are no-ops.
-    cat > "$root/tmux" <<EOF
+    # QUOTED delimiter, and NOTHING interpolated (your-org/nexus-code#1555). This
+    # stub used to be written through `<<EOF`, so bash command-substituted the
+    # backticked words in the comments below when the FIXTURE WAS WRITTEN: it
+    # tried to run a program named after tmux's list-windows verb, deleted the
+    # text from the stub at rc 0, and put one `command not found` line on
+    # stderr per fixture root — on GREEN runs too, where nothing reads stderr
+    # (486 lines from three passing runs). On a RED run those lines landed
+    # AFTER the failing assertion and filled run-tests.sh's 20-line failure
+    # tail exactly, evicting it (#1561, and the reason #1560 took an evening).
+    # The one value the old form interpolated was the calls-log path, which the
+    # stub now derives from its own location: `make_apply_root` always writes
+    # the stub and `calls.log` side by side in "$root".
+    [[ "$calls" == "$root/calls.log" ]] || { echo "make_apply_root: tmux stub assumes calls.log beside it" >&2; exit 97; }
+    cat > "$root/tmux" <<'EOF'
 #!/usr/bin/env bash
-echo "tmux \$*" >> "$calls"
-case "\$1" in
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+case "$1" in
   list-windows)
-    case "\$*" in
+    case "$*" in
       *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
       # The window-selection capture (your-org/nexus-code#1528) asks for the
       # whole board with `list-windows -a -F 'session_id|window_id|name|active'`;
@@ -1158,7 +1243,7 @@ case "\$1" in
       # needs to watch being dropped. Ahead of the names-only arm, which would
       # otherwise match this format's `#{window_name}` and answer a bare name
       # (an unparseable row: the capture then writes nothing).
-      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' '\$0|@1|orchestrator|1' ;;
+      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' '$0|@1|orchestrator|1' ;;
       # The deployment gate enumerates the board with the plain name
       # format and REFUSES an empty answer (your-org/nexus-code#1113):
       # a tmux reporting no windows at all has malfunctioned, and this
@@ -1292,6 +1377,33 @@ SURF_OK="--surface-evidence 2a=gate --surface-evidence 2b=gate \
 # own behaviours are exercised explicitly in the G-cases below.
 # CC_AUTO_INVARIANT_TRIES=1 bounds the post-restart invariant's settle
 # loop so a fixture never waits out the production 5×2s window.
+# tmux_stub_with_watchdog <root> — `make_apply_root`'s tmux, plus the restart
+# watchdog's window ON THE BOARD, as a real spawn leaves it. `make_apply_root`'s
+# own stub lists `orchestrator` alone, and the arm-wait loop reads a non-empty
+# listing that omits the watchdog as evidence of absence — so every scenario
+# built on it leaves the restart verb through `watchdog-window-vanished` on
+# iteration ZERO, whatever its comment says it tests (your-org/nexus-code#1560;
+# skeptic F1 on #1569 found test 19 claiming the never-armed arm that way).
+# A scenario that means to reach the ARM-WAIT itself calls this.
+tmux_stub_with_watchdog() {
+    local root="$1"
+    cat > "$root/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+case "$1" in
+  list-windows)
+    case "$*" in
+      *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
+      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' '$0|@1|orchestrator|1' ;;
+      *'#{window_name}'*) printf '%s\n' orchestrator cc-restart-watchdog ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+    chmod +x "$root/tmux"
+}
+
 apply_env() {
     local root="$1"
     echo NEXUS_ROOT="$root" \
@@ -1325,7 +1437,7 @@ if (( rc == 0 )); then pass "safe run exits 0"; else fail "safe run rc=$rc: $(ta
     && pass "local pin written to candidate" || fail "local pin wrong/missing"
 seq=$(grep -v '^pane-state\|^tmux list-windows' "$ROOT/calls.log" | tr '\n' '|')
 case "$seq" in
-    "install|watcher-restart|spawn -n cc-restart-watchdog"*"|tmux kill-window -t orchestrator|")
+    "install|watcher-restart|spawn -n cc-restart-watchdog"*"|tmux kill-window -t :=orchestrator|")
         pass "safe ordering: install → watcher-restart → watchdog spawn → kill" ;;
     *)  fail "safe ordering wrong: $seq" ;;
 esac
@@ -1375,7 +1487,7 @@ env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=12 bash "$APPLY" safe \
 rc=$?
 # Sample the kill evidence AT the instant of return — before any polling.
 kill_at_return=0
-grep -q "kill-window -t orchestrator" "$ROOT/calls.log" 2>/dev/null && kill_at_return=1
+grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" 2>/dev/null && kill_at_return=1
 fg_ok=0
 (( rc == 0 )) && (( kill_at_return == 0 )) \
     && grep -q $'\tsafe-bumped-restart-handoff\t' "$auto/decisions.tsv" 2>/dev/null \
@@ -1388,7 +1500,7 @@ fg_ok=0
 # th_deadline; a polled wait this generous does not need scaling.)
 killed=0
 for _ in $(seq 1 300); do
-    if grep -q "kill-window -t orchestrator" "$ROOT/calls.log" 2>/dev/null \
+    if grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" 2>/dev/null \
        && grep -q $'\tsafe-bumped-restart-forced\t' "$auto/decisions.tsv" 2>/dev/null; then
         killed=1; break
     fi
@@ -1554,10 +1666,14 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
     && pass "#867 CONTROL: 2c-vi=gate without the scenario in the log is refused" \
     || fail "#867: 2c-vi=gate accepted with no scenario evidence"
 
-# (f4) THE OTHER HALF STAYS UNPAYABLE. 2c-paste has no scenario and must not
-#      acquire one by association — the halves keep separate labels, which is
-#      the entire point of splitting 2c. Adding 2c-paste to the map would be
-#      the 2.1.222 mistake in the other direction.
+# (f4) THE HALVES DO NOT PAY FOR EACH OTHER. Until your-org/nexus-code#1614
+#      2c-paste had no scenario at all and this case pinned the policy refusal
+#      ("cannot be cleared by 'gate'"). It now maps to
+#      test-realmodel-paste-held, so what must still hold is the property the
+#      split exists for: a gate log that ran ONLY the vimode scenario cannot
+#      clear 2c-paste by association. The asserted reason is therefore the
+#      SCENARIO-EVIDENCE refusal naming the paste scenario — not the old
+#      no-scenario one, which would now mean the map entry is missing.
 ROOT="$WORK/a13f4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 # THIS CASE WAS INERT (your-org/nexus-code#1131 residual 2). It passed
 # `--gate-evidence "$ROOT/gate-vi.log"` while `gate-vi.log` was only ever
@@ -1584,10 +1700,11 @@ out=$(env $(apply_env "$ROOT") bash "$APPLY" safe \
     --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
     $(cl_ok) 2>&1)
 rc=$?
-if (( rc == 3 )) && grep -q "surface 2c-paste cannot be cleared by 'gate'" <<<"$out"; then
-    pass "#867/#1131: 2c-paste=gate is refused BY THE POLICY, and the reason says so"
+if (( rc == 3 )) && grep -q "surface 2c-paste claims 'gate' but the gate evidence .* shows none of: test-realmodel-paste-held" <<<"$out" \
+   && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]]; then
+    pass "#1614/#1131: 2c-paste=gate is refused when the paste scenario did not run (vimode alone does not pay for it), and the reason says so"
 else
-    fail "#1131 (f4) still not exercising the 2c-paste policy: rc=$rc reason=$(grep -m1 REFUSED <<<"$out")"
+    fail "#1614 (f4) 2c-paste=gate not refused for the missing paste scenario: rc=$rc reason=$(grep -m1 REFUSED <<<"$out")"
 fi
 # NEGATIVE CONTROL on the repair: the file the case now depends on must be
 # the thing that changed. With it removed, the refusal reverts to the
@@ -1602,12 +1719,33 @@ out=$(env $(apply_env "$ROOT") bash "$APPLY" safe \
     $(cl_ok) 2>&1)
 rc=$?
 if (( rc == 3 )) && grep -q 'gate evidence file missing' <<<"$out" \
-   && ! grep -q "surface 2c-paste cannot be cleared by 'gate'" <<<"$out"; then
+   && ! grep -q "surface 2c-paste claims 'gate'" <<<"$out"; then
     pass "#1131 CONTROL: without the fixture the refusal is the INERT one — the two are distinguishable"
 else
     fail "#1131 control: removing gate-vi.log did not revert the reason (rc=$rc) — the assertion above may still be inert"
 fi
 mv "$ROOT/gate-vi.log.hidden" "$ROOT/gate-vi.log"
+
+# (f5) #1614: 2c-paste=gate IS PAYABLE when test-realmodel-paste-held ran —
+#      the accept half of the pair whose refuse half is (f4) above, mirroring
+#      (f2)/(f3) for 2c-vi. Both halves claimed `gate` in one call, each paid
+#      by its OWN scenario line, so the case also shows the two map entries
+#      are independent rather than one satisfying both.
+ROOT="$WORK/a13f5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+sed 's|--- test-realmodel-idle-busy.sh ---|--- test-realmodel-idle-busy.sh ---\n--- test-realmodel-vimode.sh ---\n--- test-realmodel-paste-held.sh ---|' \
+    "$ROOT/gate.log" > "$ROOT/gate-paste.log"
+grep -q 'test-realmodel-paste-held' "$ROOT/gate-paste.log" \
+    || fail "#1614 fixture: the paste-held scenario line was not planted (the case below proves nothing)"
+out=$(env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate-paste.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=gate --surface-evidence 2c-vi=gate \
+    --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
+    $(cl_ok) 2>&1)
+rc=$?
+(( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+    && pass "#1614: 2c-paste=gate is payable when test-realmodel-paste-held ran" \
+    || fail "#1614: 2c-paste=gate refused despite the paste scenario (rc=$rc): $(grep -m1 'REFUSED' <<<"$out")"
 
 # (g) unknown class → refused (typo / invented vocabulary).
 ROOT="$WORK/a13g"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
@@ -2366,21 +2504,27 @@ rc=$?
     && pass "#1007 (r4) delta membership is semver: published 2.1.1000 is above the candidate, not an opaque release inside it" \
     || fail "#1007 (r4) lexical ordering put 2.1.1000 inside the delta (rc=$rc): $(tail -1 "$ROOT/out.log")"
 
-# ===== #1007 follow-up: exit 8 is BOUNDED — delay, then SURFACE ==============
+# ===== #1007 follow-up, reshaped by #1526: the AGENT dispositions an opaque release
 #
-# On its own the opaque-release refusal is terminal: a permanently sectionless
-# release would pin the fleet forever, against the operator directive behind
-# GATE_DEFER_STREAK_CAP ("a very busy board should only DELAY the update and
-# not PREVENT it", 2026-09-10). So after CAP consecutive refusals on the same
-# opaque set the operator is ESCALATED — notify + a comment on the cc-update
-# tracking issue carrying the candidate, the version(s) and, verbatim,
-# "upstream shipped no parseable sections; this needs a human disposition."
-# — and the refusal CONTINUES: exit 8, outcome safe-refused, unchanged. Never
-# auto-proceed, never delay-then-forget. The knob is REUSED, so its floor (2)
-# and loud clamp apply, with one divergence: 0 disables the override bound
-# but cannot disable the escalation — a refusal nobody is told about is the
-# forbidden outcome — so 0 escalates at the floor.
-OPAQUE_SENTENCE='upstream shipped no parseable sections; this needs a human disposition.'
+# An opaque release (published, inside the delta, no `## <ver>` section) used
+# to be cleared only by a HUMAN: exit 8 on every fire, and after CAP
+# consecutive refusals a notify + tracking-issue comment asking for "a human
+# disposition". Operator decision 2026-09-25 (#1526): "The update should happen
+# automatically after a green gate and agent judgment without operator
+# intervention … we should only prevent it if we have evidence it breaks the
+# nexus." So the evaluating agent passes
+# `--opaque-disposition <ver>=accepted:<reason>` (proceeds, recorded as an
+# `opaque-release-accepted` row) or `<ver>=blocked:<evidence>` (exit 8). With
+# NO disposition it is still exit 8 — silence never clears — but the message
+# addresses the AGENT, and nothing is posted or notified to a human; after CAP
+# consecutive undispositioned refusals a `changelog-opaque-undispositioned`
+# ledger row marks the standing omission. The knob keeps its floor (2), its
+# loud clamp, and `0` still marks at the floor.
+#
+# The human-channel seams (tracking-issue comment, gate-issue filer) and a
+# PATH-front sandbox-notify stay WIRED in every fire below, so a regression
+# that re-adds a human escalation shows up as a post or a notify line.
+OPAQUE_AGENT_MSG='YOU, the evaluating agent, must judge it'
 make_opaque_root() {   # <root> — registry publishes 2.1.158, changelog has no section for it
     local root="$1"
     make_apply_root "$root" "2.1.150" "2.1.160"
@@ -2389,172 +2533,265 @@ make_opaque_root() {   # <root> — registry publishes 2.1.158, changelog has no
     reg_json 2.1.150 2.1.155 2.1.160 > "$root/registry-plain.json"
     printf '#!/usr/bin/env bash\ncat "%s/registry-plain.json"\n' "$root" > "$root/fetch-registry-plain"
     chmod +x "$root/fetch-registry-plain"
-    # the tracking-issue COMMENT seam: records <repo> <issue>, then the body
+    # the old human channels, stubbed so any post is RECORDED
     cat > "$root/comment-cmd" <<EOF
 #!/usr/bin/env bash
-[[ -n "\${COMMENT_RC:-}" ]] && exit "\$COMMENT_RC"
 printf 'COMMENT %s %s\n' "\$1" "\$2" >> "$root/comments.log"
-cat "\$3" >> "$root/comments.log"
 echo "https://github.com/\$1/issues/\$2#issuecomment-99"
 EOF
-    chmod +x "$root/comment-cmd"
-    # the CREATE/ADOPT seam (the defect filer's), for the no-tracking-issue path
     cat > "$root/issue-cmd" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$1" >> "$root/filed.log"
 echo "https://github.com/your-org/nexus-code/issues/4343"
 EOF
-    chmod +x "$root/issue-cmd"
+    mkdir -p "$root/nbin"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/notify.log"\n' "$root" > "$root/nbin/sandbox-notify"
+    chmod +x "$root/comment-cmd" "$root/issue-cmd" "$root/nbin/sandbox-notify"
 }
-# opaque_fire [ENV=val…] — one `safe` fire on $ROOT with the opaque registry,
-# the tracking issue configured through the seam, both post seams stubbed.
-# Extra env assignments go before the command. Output APPENDS to out.log.
+# opaque_fire [ENV=val…] [-- extra safe args…] — one `safe` fire on $ROOT with
+# the opaque registry and every human channel wired. Output APPENDS to out.log.
 opaque_fire() {
-    env $(apply_env "$ROOT") CC_AUTO_TRACKING_ISSUE='your-org/nexus-code#1234' \
-        CC_AUTO_ISSUE_COMMENT_CMD="$ROOT/comment-cmd" CC_AUTO_GATE_ISSUE_CMD="$ROOT/issue-cmd" "$@" \
+    local -a envs=() extra=()
+    while (( $# > 0 )); do
+        if [[ "$1" == -- ]]; then shift; extra=("$@"); break; fi
+        envs+=("$1"); shift
+    done
+    env $(apply_env "$ROOT") PATH="$ROOT/nbin:$PATH" CC_AUTO_TRACKING_ISSUE='your-org/nexus-code#1234' \
+        CC_AUTO_ISSUE_COMMENT_CMD="$ROOT/comment-cmd" CC_AUTO_GATE_ISSUE_CMD="$ROOT/issue-cmd" \
+        ${envs[@]+"${envs[@]}"} \
         bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
-        $(cl_ok) >> "$ROOT/out.log" 2>&1
+        $(cl_ok) ${extra[@]+"${extra[@]}"} >> "$ROOT/out.log" 2>&1
 }
-# Both counters print 0 for a MISSING file: `grep -c` on a file that does not
-# exist prints NOTHING (not 0) and exits 2, so a bare `|| true` would hand an
-# EMPTY string to a `== 0` comparison and fail it — measured on (o6), where
-# the failed post writes no comments.log. Assign, then validate the SHAPE
+# Counters print 0 for a MISSING file: `grep -c` on a file that does not exist
+# prints NOTHING and exits 2, so assign, then validate the SHAPE
 # (count-fallback-lint: never `|| echo 0` onto a grep -c that may have printed).
-esc_rows() { local n; n=$(grep -c $'\tchangelog-opaque-escalation\t' "$(CL_DEC "$1")" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
-comment_posts() { local n; n=$(grep -c '^COMMENT ' "$1/comments.log" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
+mark_rows() { local n; n=$(grep -c $'\tchangelog-opaque-undispositioned\t' "$(CL_DEC "$1")" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
+acc_rows()  { local n; n=$(grep -c $'\topaque-release-accepted\t' "$(CL_DEC "$1")" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
+# no_human <root> — rc 0 iff NO human escalation happened: no comment, no
+# filed issue, and no notify line carrying the removed escalation's text. The
+# generic #1400 safe-refused notify (record_outcome, every refusal kind) is
+# NOT this escalation and still fires; so the notify check is on the old
+# escalation's words, and a positive control below proves notify.log is live.
+no_human() { [[ ! -e "$1/comments.log" && ! -e "$1/filed.log" ]] \
+    && ! grep -qiE 'human disposition|opaque-release escalation|ESCALATION \(opaque' "$1/notify.log" 2>/dev/null; }
+# bumped <root> — the bump path was REACHED, not merely rc 0: the pin moved,
+# the install and the watcher restart ran.
+bumped() { [[ "$(cat "$1/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+    && grep -qx 'install' "$1/calls.log" && grep -qx 'watcher-restart' "$1/calls.log"; }
+not_bumped() { [[ ! -e "$1/monitor/.state/cc-version-local" ]] && ! grep -qx 'install' "$1/calls.log"; }
 
-# (o1) N-1 consecutive opaque refusals (default cap 3 → two fires) → refused
-#      both times, NOT escalated: no escalation row, no comment, no sentence.
+# (o1) N-1 consecutive UNDISPOSITIONED refusals (default cap 3 → two fires):
+#      both rc 8, the message tells the AGENT what to do, no mark row, and no
+#      human channel is touched.
 ROOT="$WORK/a1007o1"; make_opaque_root "$ROOT"
 opaque_fire; rc1=$?
 opaque_fire; rc2=$?
-if (( rc1 == 8 && rc2 == 8 )) && [[ "$(esc_rows "$ROOT")" == 0 ]] \
-   && [[ ! -e "$ROOT/comments.log" && ! -e "$ROOT/filed.log" ]] \
-   && ! grep -qF -- "$OPAQUE_SENTENCE" "$ROOT/out.log"; then
-    pass "#1007 (o1) two consecutive opaque refusals under cap 3: both rc 8, NOT escalated (no row, no comment, no sentence)"
+if (( rc1 == 8 && rc2 == 8 )) && [[ "$(mark_rows "$ROOT")" == 0 ]] && no_human "$ROOT" \
+   && grep -qF -- "$OPAQUE_AGENT_MSG" "$ROOT/out.log" \
+   && grep -qF -- '--opaque-disposition <ver>=accepted:<reason>' "$ROOT/out.log" \
+   && grep -qF -- 'no human disposition is needed or requested' "$ROOT/out.log"; then
+    pass "#1526 (o1) undispositioned opaque release: rc 8 twice, agent-directed message naming --opaque-disposition, no human channel, no mark yet"
 else
-    fail "#1007 (o1) escalated early or wrong rc (rc1=$rc1 rc2=$rc2 rows=$(esc_rows "$ROOT") comments=$(comment_posts "$ROOT"))"
+    fail "#1526 (o1) wrong (rc1=$rc1 rc2=$rc2 marks=$(mark_rows "$ROOT")): $(grep -F 'REFUSED (exit 8' "$ROOT/out.log" | tail -1 | cut -c1-200)"
 fi
+# An UNDISPOSITIONED opaque refusal pages NOBODY — not even the generic #1400
+# safe-refused notify, whose "a defect in the gate" text is wrong here: the
+# disposition is the evaluating agent's (operator, 2026-09-25).
+! grep -q '#1400' "$ROOT/notify.log" 2>/dev/null \
+    && pass "#1526 (o1) the generic #1400 safe-refused notify does NOT fire for an undispositioned opaque release" \
+    || fail "#1526 (o1) an undispositioned opaque refusal paged a human: $(tail -1 "$ROOT/notify.log")"
+# POSITIVE CONTROL on the same stub: a BLOCKED disposition (the agent found
+# evidence of breakage) is a real refusal and still reaches the notify stub —
+# so the absence above is a statement about the opaque arm, not a dead stub.
+ROOT="$WORK/a1007o1c"; make_opaque_root "$ROOT"
+opaque_fire -- --opaque-disposition 2.1.158=blocked:hook-schema-change-breaks-pretooluse
+grep -q '#1400' "$ROOT/notify.log" 2>/dev/null \
+    && pass "#1526 (o1) POSITIVE CONTROL: a blocked disposition still reaches the notify stub (#1400), so the no-page check above can fail" \
+    || fail "#1526 (o1) notify stub recorded nothing for a blocked disposition — the no-page check is vacuous"
+ROOT="$WORK/a1007o1"
 grep -q 'opaque-release streak: 2 consecutive' "$ROOT/out.log" \
-    && pass "#1007 (o1) …and the streak is counted in the log (2 consecutive)" \
-    || fail "#1007 (o1) streak not counted: $(grep -F 'opaque-release streak' "$ROOT/out.log" | tail -1)"
+    && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-release=2.1.158$' "$(CL_DEC "$ROOT")" \
+    && pass "#1526 (o1) …the streak is counted (2) and the refusal detail is the pre-#1526 token (the #1400 nag keys on it)" \
+    || fail "#1526 (o1) streak/detail wrong: $(grep -F 'opaque-release streak' "$ROOT/out.log" | tail -1)"
 
-# (o2) the Nth (third) → ESCALATED once: notify + tracking-issue comment
-#      naming candidate + version + the verbatim sentence; exit still 8,
-#      outcome row still safe-refused.
+# (o2) the Nth (third) → a mark ROW, still rc 8, outcome unchanged, still
+#      nobody but the ledger is told.
 opaque_fire; rc3=$?
 DEC="$(CL_DEC "$ROOT")"
-if (( rc3 == 8 )) && [[ "$(esc_rows "$ROOT")" == 1 ]] && [[ "$(comment_posts "$ROOT")" == 1 ]] \
-   && grep -q '^COMMENT your-org/nexus-code 1234$' "$ROOT/comments.log" \
-   && grep -qF '2.1.160' "$ROOT/comments.log" && grep -qF '2.1.158' "$ROOT/comments.log" \
-   && grep -qF -- "$OPAQUE_SENTENCE" "$ROOT/comments.log"; then
-    pass "#1007 (o2) the 3rd consecutive refusal ESCALATES once: comment on your-org/nexus-code#1234 names 2.1.160, 2.1.158 and the verbatim sentence; rc still 8"
+if (( rc3 == 8 )) && [[ "$(mark_rows "$ROOT")" == 1 ]] && no_human "$ROOT" \
+   && grep -q $'\tchangelog-opaque-undispositioned\t.*streak=3 streak_at=3 defer_cap=3 defer_cap_clamped=0' "$DEC" \
+   && grep -q 'STANDING (opaque release, undispositioned)' "$ROOT/out.log"; then
+    pass "#1526 (o2) the 3rd consecutive undispositioned refusal writes ONE mark row (streak, bound, reused cap) and posts/notifies nothing"
 else
-    fail "#1007 (o2) escalation wrong (rc=$rc3 rows=$(esc_rows "$ROOT") comments=$(comment_posts "$ROOT")): $(tail -2 "$ROOT/comments.log" 2>/dev/null | cut -c1-120)"
+    fail "#1526 (o2) mark wrong (rc=$rc3 marks=$(mark_rows "$ROOT") comments=$(cat "$ROOT/comments.log" 2>/dev/null | wc -l) filed=$(cat "$ROOT/filed.log" 2>/dev/null | wc -l))"
 fi
-[[ "$(tail -1 "$DEC" | cut -f3)" != "safe-bumped"* ]] \
-    && [[ "$(awk -F'\t' '$3=="safe-refused"' "$DEC" | wc -l)" == 3 ]] \
+[[ "$(awk -F'\t' '$3=="safe-refused"' "$DEC" | wc -l)" == 3 ]] \
     && grep -q '^decision=safe-refused$' "$ROOT/monitor/.state/cc-auto-update/last-eval" \
-    && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
-    && pass "#1007 (o2) …outcome token unchanged (3 safe-refused rows, last-eval safe-refused), pin untouched — surfaced, never auto-proceeded" \
-    || fail "#1007 (o2) the escalation changed the outcome: $(cut -f3,4 "$DEC" | tail -3 | tr '\n' ' ')"
-grep -qF -- "$OPAQUE_SENTENCE" "$ROOT/out.log" && grep -q 'ESCALATION (opaque release' "$ROOT/out.log" \
-    && pass "#1007 (o2) …and the notify text (with the sentence) is in the apply log" \
-    || fail "#1007 (o2) the sentence is missing from the apply log"
-grep -q $'\tchangelog-opaque-escalation\t.*streak=3 escalate_at=3 defer_cap=3 defer_cap_clamped=0' "$DEC" \
-    && pass "#1007 (o2) …the escalation row carries streak, bound and the reused cap" \
-    || fail "#1007 (o2) escalation row fields wrong: $(grep -F 'opaque-escalation' "$DEC" | tail -1)"
-
-# (o2b) the 4th → still refused, notify/row again, but the issue post is NOT
-#       repeated inside the cooldown (one comment per opaque set per week).
+    && not_bumped "$ROOT" \
+    && pass "#1526 (o2) …outcome token unchanged (3 safe-refused rows, last-eval safe-refused), pin untouched — silence never clears" \
+    || fail "#1526 (o2) the mark changed the outcome: $(cut -f3,4 "$DEC" | tail -3 | tr '\n' ' ')"
 opaque_fire; rc4=$?
-(( rc4 == 8 )) && [[ "$(esc_rows "$ROOT")" == 2 ]] && [[ "$(comment_posts "$ROOT")" == 1 ]] \
-    && grep -q 'already posted' "$ROOT/out.log" \
-    && grep -q 'count=2' "$ROOT/monitor/.state/cc-auto-update/opaque-escalations/2.1.158" \
-    && pass "#1007 (o2b) the 4th refusal re-notifies (2 rows) but does NOT re-post the comment (cooldown; repeat counted 2)" \
-    || fail "#1007 (o2b) repeat handling wrong (rc=$rc4 rows=$(esc_rows "$ROOT") comments=$(comment_posts "$ROOT"))"
+(( rc4 == 8 )) && [[ "$(mark_rows "$ROOT")" == 2 ]] && no_human "$ROOT" \
+    && pass "#1526 (o2b) the 4th refusal marks again (2 rows), still no human channel" \
+    || fail "#1526 (o2b) wrong (rc=$rc4 marks=$(mark_rows "$ROOT"))"
 
-# (o3) RESET: a non-opaque refusal in between breaks the streak. cap=2 (the
-#      floor) so the difference is observable in two fires: opaque, then a
-#      ledger-short refusal against the PLAIN registry (rc 3, detail
-#      changelog-completeness), then opaque → streak 1, no escalation.
+# (o3) RESET: a non-opaque refusal in between breaks the streak (cap 2).
 ROOT="$WORK/a1007o3"; make_opaque_root "$ROOT"
 grep -v 'teleport' "$ROOT/ledger.md" > "$ROOT/ledger-short.md"
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2
 env $(apply_env "$ROOT") CC_AUTO_REGISTRY_FETCH_CMD="$ROOT/fetch-registry-plain" CC_AUTO_GATE_DEFER_STREAK_CAP=2 \
-    CC_AUTO_TRACKING_ISSUE='your-org/nexus-code#1234' CC_AUTO_ISSUE_COMMENT_CMD="$ROOT/comment-cmd" \
+    PATH="$ROOT/nbin:$PATH" \
     bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
     --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger-short.md" \
     --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=2 >> "$ROOT/out.log" 2>&1
 rcm=$?
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2; rc3=$?
-if (( rcm == 3 && rc3 == 8 )) && [[ "$(esc_rows "$ROOT")" == 0 ]] && [[ ! -e "$ROOT/comments.log" ]] \
+if (( rcm == 3 && rc3 == 8 )) && [[ "$(mark_rows "$ROOT")" == 0 ]] \
    && grep -q 'opaque-release streak: 1 consecutive' "$ROOT/out.log"; then
-    pass "#1007 (o3) a non-opaque refusal in between RESETS the streak (1, not 2) — no escalation at cap 2"
+    pass "#1526 (o3) a non-opaque refusal in between RESETS the streak (1, not 2) — no mark at cap 2"
 else
-    fail "#1007 (o3) streak did not reset (rcm=$rcm rc3=$rc3 rows=$(esc_rows "$ROOT")): $(grep -F 'opaque-release streak' "$ROOT/out.log" | tail -1)"
+    fail "#1526 (o3) streak did not reset (rcm=$rcm rc3=$rc3 marks=$(mark_rows "$ROOT")): $(grep -F 'opaque-release streak' "$ROOT/out.log" | tail -1)"
 fi
-# (o3b) CONTROL: the same two opaque fires WITHOUT the interruption escalate.
+# (o3b) CONTROL: the same two opaque fires WITHOUT the interruption mark.
 ROOT="$WORK/a1007o3b"; make_opaque_root "$ROOT"
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2
-[[ "$(esc_rows "$ROOT")" == 1 ]] && [[ "$(comment_posts "$ROOT")" == 1 ]] \
-    && pass "#1007 (o3b) CONTROL: two uninterrupted opaque refusals at cap 2 escalate (the reset in o3 is real)" \
-    || fail "#1007 (o3b) CONTROL did not escalate (rows=$(esc_rows "$ROOT") comments=$(comment_posts "$ROOT"))"
+[[ "$(mark_rows "$ROOT")" == 1 ]] && no_human "$ROOT" \
+    && pass "#1526 (o3b) CONTROL: two uninterrupted undispositioned refusals at cap 2 mark (the reset in o3 is real)" \
+    || fail "#1526 (o3b) CONTROL did not mark (marks=$(mark_rows "$ROOT"))"
 
-# (o4) THE REUSED KNOB'S FLOOR AND CLAMP. cap=1 is clamped to the floor 2
-#      (zero delay is not a bound): fire 1 no escalation, fire 2 escalates,
-#      and the row says the cap was clamped. cap=0 disables the deployment
-#      gate's OVERRIDE bound but cannot disable this surfacing: escalates
-#      at the floor too.
+# (o4) THE REUSED KNOB'S FLOOR AND CLAMP: cap=1 clamps to 2; cap=0 cannot
+#      switch the mark off (marks at the floor).
 ROOT="$WORK/a1007o4"; make_opaque_root "$ROOT"
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=1
-r1=$(esc_rows "$ROOT")
+r1=$(mark_rows "$ROOT")
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=1
-[[ "$r1" == 0 ]] && [[ "$(esc_rows "$ROOT")" == 1 ]] \
-    && grep -q $'\tchangelog-opaque-escalation\t.*escalate_at=2 defer_cap=2 defer_cap_clamped=1' "$(CL_DEC "$ROOT")" \
-    && pass "#1007 (o4) cap=1 is CLAMPED to the floor 2: no escalation on the 1st, escalation on the 2nd, row says defer_cap_clamped=1" \
-    || fail "#1007 (o4) clamp not honoured (r1=$r1 rows=$(esc_rows "$ROOT")): $(grep -F 'opaque-escalation' "$(CL_DEC "$ROOT")" | tail -1)"
+[[ "$r1" == 0 ]] && [[ "$(mark_rows "$ROOT")" == 1 ]] \
+    && grep -q $'\tchangelog-opaque-undispositioned\t.*streak_at=2 defer_cap=2 defer_cap_clamped=1' "$(CL_DEC "$ROOT")" \
+    && pass "#1526 (o4) cap=1 is CLAMPED to the floor 2: no mark on the 1st, a mark on the 2nd, row says defer_cap_clamped=1" \
+    || fail "#1526 (o4) clamp not honoured (r1=$r1 marks=$(mark_rows "$ROOT")): $(grep -F 'opaque-undispositioned' "$(CL_DEC "$ROOT")" | tail -1)"
 ROOT="$WORK/a1007o4z"; make_opaque_root "$ROOT"
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=0
-r1=$(esc_rows "$ROOT")
+r1=$(mark_rows "$ROOT")
 opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=0
-[[ "$r1" == 0 ]] && [[ "$(esc_rows "$ROOT")" == 1 ]] \
-    && grep -q $'\tchangelog-opaque-escalation\t.*escalate_at=2 defer_cap=0' "$(CL_DEC "$ROOT")" \
-    && pass "#1007 (o4) cap=0 cannot DISABLE the escalation: escalates at the floor (2) while the override bound stays off (defer_cap=0)" \
-    || fail "#1007 (o4) cap=0 disabled the surfacing (r1=$r1 rows=$(esc_rows "$ROOT"))"
+[[ "$r1" == 0 ]] && [[ "$(mark_rows "$ROOT")" == 1 ]] \
+    && grep -q $'\tchangelog-opaque-undispositioned\t.*streak_at=2 defer_cap=0' "$(CL_DEC "$ROOT")" \
+    && pass "#1526 (o4) cap=0 cannot switch the mark off: marks at the floor (2) while the override bound stays off (defer_cap=0)" \
+    || fail "#1526 (o4) cap=0 disabled the mark (r1=$r1 marks=$(mark_rows "$ROOT"))"
 
-# (o5) NO tracking issue configured → the escalation files/adopts an issue on
-#      the gate repo through the defect filer's seam, once, keyed on the set.
+# (o5) NO tracking issue configured: the old fallback FILED an issue on the
+#      gate repo. Now nothing is filed either way.
 ROOT="$WORK/a1007o5"; make_opaque_root "$ROOT"
 for _ in 1 2; do
-    env $(apply_env "$ROOT") CC_AUTO_GATE_DEFER_STREAK_CAP=2 CC_AUTO_GATE_ISSUE_CMD="$ROOT/issue-cmd" \
-        CC_AUTO_ISSUE_COMMENT_CMD="$ROOT/comment-cmd" \
+    env $(apply_env "$ROOT") PATH="$ROOT/nbin:$PATH" CC_AUTO_GATE_DEFER_STREAK_CAP=2 \
+        CC_AUTO_GATE_ISSUE_CMD="$ROOT/issue-cmd" CC_AUTO_ISSUE_COMMENT_CMD="$ROOT/comment-cmd" \
         bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
         $(cl_ok) >> "$ROOT/out.log" 2>&1
 done
-filed=$(grep -c '^opaque-release-2.1.158$' "$ROOT/filed.log" 2>/dev/null) || filed=0
-(( filed == 1 )) && [[ ! -e "$ROOT/comments.log" ]] && [[ "$(esc_rows "$ROOT")" == 1 ]] \
-    && grep -q $'\tchangelog-opaque-escalation-posted\t.*where=your-org/nexus-code (new/adopted issue' "$(CL_DEC "$ROOT")" \
-    && pass "#1007 (o5) no tracking issue → files/adopts ONE issue on the gate repo (key opaque-release-2.1.158), no comment attempted" \
-    || fail "#1007 (o5) fallback filing wrong (filed=$filed comments=$(comment_posts "$ROOT") rows=$(esc_rows "$ROOT"))"
+no_human "$ROOT" && [[ "$(mark_rows "$ROOT")" == 1 ]] \
+    && ! grep -q 'changelog-opaque-escalation' "$(CL_DEC "$ROOT")" \
+    && pass "#1526 (o5) no tracking issue → still NO issue filed, no escalation row; the ledger mark alone" \
+    || fail "#1526 (o5) a human channel was used (filed=$(cat "$ROOT/filed.log" 2>/dev/null) marks=$(mark_rows "$ROOT"))"
 
-# (o6) THE POSTER'S OWN FAILURE IS VISIBLE AND RETRIED. The comment seam
-#      fails → rc still 8, escalation row present, an UNPOSTED row names it,
-#      no breadcrumb is written; the next fire (still past the bound) retries
-#      and, on success, posts.
-ROOT="$WORK/a1007o6"; make_opaque_root "$ROOT"
-opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2
-opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2 COMMENT_RC=1; rcf=$?
-(( rcf == 8 )) && [[ "$(esc_rows "$ROOT")" == 1 ]] && [[ "$(comment_posts "$ROOT")" == 0 ]] \
-    && grep -q $'\tchangelog-opaque-escalation-UNPOSTED\t' "$(CL_DEC "$ROOT")" \
-    && [[ ! -e "$ROOT/monitor/.state/cc-auto-update/opaque-escalations/2.1.158" ]] \
-    && pass "#1007 (o6) a failed post is recorded UNPOSTED, writes no breadcrumb, and does not change exit 8" \
-    || fail "#1007 (o6) failed post mishandled (rc=$rcf rows=$(esc_rows "$ROOT") comments=$(comment_posts "$ROOT"))"
-opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2
-[[ "$(comment_posts "$ROOT")" == 1 ]] && [[ -f "$ROOT/monitor/.state/cc-auto-update/opaque-escalations/2.1.158" ]] \
-    && pass "#1007 (o6) …and the next fire RETRIES the post and succeeds" \
-    || fail "#1007 (o6) the failed post was not retried (comments=$(comment_posts "$ROOT"))"
+# (o6) ACCEPTED + GREEN gate → PROCEEDS. The bump path is REACHED (pin,
+#      install, watcher restart), the acceptance is recorded as its own row
+#      carrying the reason, the opaque release is out of the per-entry
+#      accounting (3 of 3 across 2 releases, as with no opaque release at all),
+#      and the summary names it.
+ROOT="$WORK/a1526o6"; make_opaque_root "$ROOT"
+opaque_fire CC_AUTO_RESTART_INLINE=1 -- --opaque-disposition '2.1.158=accepted:superseded by 2.1.159 in 4h, not deprecated; gate GREEN on the 2.1.160 binary'
+rc=$?
+DEC="$(CL_DEC "$ROOT")"
+if (( rc == 0 )) && bumped "$ROOT" && no_human "$ROOT"; then
+    pass "#1526 (o6) opaque release ACCEPTED by agent disposition + GREEN gate → rc 0 and the bump path REACHED (pin 2.1.160, install, watcher restart)"
+else
+    fail "#1526 (o6) accepted disposition did not proceed (rc=$rc pin=$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null) calls=$(tr '\n' ' ' < "$ROOT/calls.log" | cut -c1-80)): $(grep REFUSED "$ROOT/out.log" | tail -1 | cut -c1-200)"
+fi
+[[ "$(acc_rows "$ROOT")" == 1 ]] \
+    && grep -q $'\topaque-release-accepted\trelease=2.1.158 reason=superseded by 2.1.159 in 4h, not deprecated; gate GREEN on the 2.1.160 binary$' "$DEC" \
+    && grep -q $'\tchangelog-completeness\t.*dispositioned 3 of 3 entries across 2 release.*opaque release(s) accepted by agent disposition: 2.1.158' "$DEC" \
+    && grep -q 'OPAQUE RELEASE ACCEPTED by the evaluating agent.s disposition: 2.1.158' "$ROOT/monitor/.state/cc-auto-update/apply.log" \
+    && pass "#1526 (o6) …recorded: an opaque-release-accepted row with the reason, the completeness row names it, and the apply log carries it" \
+    || fail "#1526 (o6) acceptance not recorded: $(cut -f3,4 "$DEC" | grep -i 'opaque\|completeness' | tr '\n' ' ' | cut -c1-300)"
+
+# (o7) BLOCKED on evidence → refused rc 8 with its own detail; NOT counted
+#      as an undispositioned streak (a judgment made, not one skipped).
+ROOT="$WORK/a1526o7"; make_opaque_root "$ROOT"
+opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2 -- --opaque-disposition '2.1.158=blocked:tarball diff removes the --resume flag the orchestrator respawn uses'
+opaque_fire CC_AUTO_GATE_DEFER_STREAK_CAP=2 -- --opaque-disposition '2.1.158=blocked:tarball diff removes the --resume flag the orchestrator respawn uses'
+rc=$?
+(( rc == 8 )) && not_bumped "$ROOT" && [[ "$(mark_rows "$ROOT")" == 0 ]] && [[ "$(acc_rows "$ROOT")" == 0 ]] \
+    && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-release-blocked=2.1.158$' "$(CL_DEC "$ROOT")" \
+    && grep -qF 'evidence: tarball diff removes the --resume flag' "$ROOT/out.log" \
+    && pass "#1526 (o7) blocked:<evidence> → rc 8, detail opaque-release-blocked=2.1.158, evidence in the log, pin untouched, no undispositioned mark" \
+    || fail "#1526 (o7) blocked disposition wrong (rc=$rc marks=$(mark_rows "$ROOT")): $(tail -2 "$(CL_DEC "$ROOT")" | cut -f3,4 | tr '\n' ' ')"
+
+# (o8) SHAPE: an empty / whitespace / punctuation-only reason, an unknown
+#      verdict, a missing verdict, a non-version key, a duplicate → rc 3,
+#      detail opaque-disposition-malformed, nothing applied.
+ok8=1; bad8=""; o8n=0
+for d in '2.1.158=accepted:' '2.1.158=accepted:   ' '2.1.158=accepted: - .' '2.1.158=maybe:it is fine' \
+         '2.1.158=accepted' 'latest=accepted:fine' '2.1.158'; do
+    ROOT="$WORK/a1526o8-$((++o8n))"; make_opaque_root "$ROOT"
+    opaque_fire -- --opaque-disposition "$d"; rc=$?
+    if ! { (( rc == 3 )) && not_bumped "$ROOT" \
+           && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-disposition-malformed$' "$(CL_DEC "$ROOT")"; }; then
+        ok8=0; bad8+=" [$d rc=$rc]"
+    fi
+done
+ROOT="$WORK/a1526o8dup"; make_opaque_root "$ROOT"
+opaque_fire -- --opaque-disposition '2.1.158=accepted:fine' --opaque-disposition '2.1.158=blocked:not fine'; rc=$?
+(( rc == 3 )) && not_bumped "$ROOT" || { ok8=0; bad8+=" [duplicate rc=$rc]"; }
+(( ok8 == 1 )) \
+    && pass "#1526 (o8) malformed dispositions (empty/blank/punctuation reason, unknown or missing verdict, bad key, duplicate) → rc 3, nothing applied" \
+    || fail "#1526 (o8) a malformed disposition was not refused as such:$bad8"
+
+# (o9) A disposition for a release that is NOT opaque in this delta is
+#      REFUSED (rc 3, opaque-disposition-outside-set), not ignored — beside a
+#      valid acceptance, and on a delta with no opaque release at all.
+ROOT="$WORK/a1526o9"; make_opaque_root "$ROOT"
+opaque_fire -- --opaque-disposition '2.1.158=accepted:fine' --opaque-disposition '2.1.155=accepted:has a section'; rc=$?
+ROOT2="$WORK/a1526o9b"; make_opaque_root "$ROOT2"
+ROOT="$ROOT2" opaque_fire CC_AUTO_REGISTRY_FETCH_CMD="$ROOT2/fetch-registry-plain" -- --opaque-disposition '2.1.158=accepted:fine'
+rcb=$?
+(( rc == 3 && rcb == 3 )) && not_bumped "$WORK/a1526o9" && not_bumped "$ROOT2" \
+    && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-disposition-outside-set$' "$(CL_DEC "$WORK/a1526o9")" \
+    && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-disposition-outside-set$' "$(CL_DEC "$ROOT2")" \
+    && pass "#1526 (o9) a disposition naming a non-opaque release is REFUSED rc 3 (outside-set) — beside a valid one, and on a delta with none" \
+    || fail "#1526 (o9) outside-set disposition not refused (rc=$rc rcb=$rcb)"
+
+# (o10) TWO opaque releases, only ONE dispositioned → rc 8 naming only the
+#       undispositioned one; CONTROL: both accepted → proceeds.
+ROOT="$WORK/a1526o10"; make_opaque_root "$ROOT"
+reg_json 2.1.150 2.1.155 2.1.157 2.1.158 2.1.160 > "$ROOT/registry.json"
+opaque_fire -- --opaque-disposition '2.1.158=accepted:fine'; rc=$?
+(( rc == 8 )) && not_bumped "$ROOT" && [[ "$(acc_rows "$ROOT")" == 0 ]] \
+    && grep -q $'\tsafe-refused\tchangelog-completeness:opaque-release=2.1.157$' "$(CL_DEC "$ROOT")" \
+    && pass "#1526 (o10) two opaque releases, one dispositioned → rc 8 naming only 2.1.157, nothing accepted or applied" \
+    || fail "#1526 (o10) partial disposition wrong (rc=$rc): $(tail -1 "$(CL_DEC "$ROOT")" | cut -f3,4)"
+ROOT="$WORK/a1526o10b"; make_opaque_root "$ROOT"
+reg_json 2.1.150 2.1.155 2.1.157 2.1.158 2.1.160 > "$ROOT/registry.json"
+opaque_fire CC_AUTO_RESTART_INLINE=1 -- --opaque-disposition '2.1.158=accepted:fine' --opaque-disposition '2.1.157=accepted:also fine'; rc=$?
+(( rc == 0 )) && bumped "$ROOT" && [[ "$(acc_rows "$ROOT")" == 2 ]] \
+    && pass "#1526 (o10b) CONTROL: both opaque releases accepted → rc 0, bumped, two acceptance rows" \
+    || fail "#1526 (o10b) CONTROL wrongly refused (rc=$rc acc=$(acc_rows "$ROOT")): $(grep REFUSED "$ROOT/out.log" | tail -1 | cut -c1-200)"
+
+# (o11) An acceptance does NOT bypass the gate: stale gate evidence with a
+#       valid acceptance is still rc 3, and no acceptance row is written.
+ROOT="$WORK/a1526o11"; make_opaque_root "$ROOT"
+touch -d '8 hours ago' "$ROOT/gate.log"
+opaque_fire -- --opaque-disposition '2.1.158=accepted:fine'; rc=$?
+(( rc == 3 )) && not_bumped "$ROOT" && [[ "$(acc_rows "$ROOT")" == 0 ]] \
+    && pass "#1526 (o11) accepted disposition + stale gate evidence → rc 3, no acceptance row: the disposition clears ONLY the opaque arm" \
+    || fail "#1526 (o11) acceptance leaked past the gate check (rc=$rc acc=$(acc_rows "$ROOT"))"
+
+# (o12) A --changelog-dispositioned count for the accepted opaque release is
+#       refused with a pointer to --opaque-disposition (it has no entries).
+ROOT="$WORK/a1526o12"; make_opaque_root "$ROOT"
+opaque_fire -- --opaque-disposition '2.1.158=accepted:fine' --changelog-dispositioned 2.1.158=0; rc=$?
+(( rc == 3 )) && not_bumped "$ROOT" && grep -q 'names an OPAQUE release' "$ROOT/out.log" \
+    && pass "#1526 (o12) --changelog-dispositioned for an accepted opaque release → rc 3, pointing at --opaque-disposition" \
+    || fail "#1526 (o12) count for an opaque release mishandled (rc=$rc)"
 
 # 14. stale gate evidence
 ROOT="$WORK/a14"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
@@ -2570,7 +2807,7 @@ env $(apply_env "$ROOT") INSTALL_RC=1 bash "$APPLY" safe \
 rc=$?
 if (( rc == 4 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
    && ! grep -q "watcher-restart" "$ROOT/calls.log" \
-   && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+   && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log"; then
     pass "install failure → rc 4, pin rolled back, nothing restarted"
 else
     fail "install-failure handling wrong (rc=$rc)"
@@ -2601,7 +2838,7 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
     --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 if (( rc == 21 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local")" == "2.1.160" ]] \
-   && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+   && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log"; then
     pass "stale pin → bump stands, restart aborted (rc 21, no kill)"
 else
     fail "stale-pin handling wrong (rc=$rc)"
@@ -2614,16 +2851,247 @@ echo "== apply: restart-orchestrator (detached second half) =="
 # pin_of <root> reads the fixture's pinned sid.
 pin_of() { cat "$1/monitor/.state/orchestrator-session-id"; }
 
-# 19. watchdog never arms → NO kill, rc 22
+# 19. the watchdog window is GONE before arming → NO kill, rc 22, and the
+#     cause is `watchdog-window-vanished`.
+#
+#     THIS USED TO BE CALLED "watchdog never arms", AND IT NEVER TESTED THAT
+#     (skeptic F1 on your-org/nexus-code#1569). `make_apply_root`'s tmux omits
+#     the watchdog window, so the verb leaves through the GONE arm on iteration
+#     zero — the same fixture fact behind #1560 — and rc 22 alone cannot tell
+#     the two exit-22 arms apart: deleting the GONE arm's exit falls through to
+#     the timeout and is STILL rc 22 (measured by the skeptic, 354/354 green).
+#     So the CAUSE is asserted, here and in 19c.
 ROOT="$WORK/a19"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
 printf '#!/usr/bin/env bash\necho "spawn $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/spawn"
 chmod +x "$ROOT/spawn"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-(( rc == 22 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
-    && pass "watchdog never armed → no kill (rc 22)" \
-    || fail "unarmed-watchdog handling wrong (rc=$rc)"
+(( rc == 22 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
+    && pass "watchdog window gone before arming → no kill (rc 22)" \
+    || fail "vanished-watchdog handling wrong (rc=$rc)"
+if grep -q $'\twatchdog-window-vanished' "$auto/decisions.tsv" && ! grep -q 'watchdog-never-armed' "$auto/decisions.tsv"; then
+    pass "19 …through the GONE arm: cause watchdog-window-vanished, recorded at waited=0"
+else
+    fail "19 the rc-22 abort did not record cause watchdog-window-vanished"
+fi
+
+# 19c. the watchdog is ALIVE ON THE BOARD and never writes its marker → the
+#      ARM_WAIT timeout aborts: NO kill, rc 22, cause `watchdog-never-armed`.
+#      The arm test 19's old name claimed. Unguarded, a watchdog that is alive
+#      but never arms would hold the single-flight lock FOREVER and nothing
+#      here would notice — so the verb runs under `timeout`, and a wait that
+#      does not end is rc 124, a FAIL, rather than a hung suite.
+ROOT="$WORK/a19c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+printf '#!/usr/bin/env bash\necho "spawn $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/spawn"
+chmod +x "$ROOT/spawn"
+tmux_stub_with_watchdog "$ROOT"
+a19c_t0=$SECONDS
+timeout 45 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+# A PASS LABEL IS A NAME, NOT A MEASUREMENT (your-org/nexus-code#1574 nit). This
+# label carried its own wall time, so it relabelled between runs under load
+# (`2s` -> `3s`, seen in a mutation round at d58bc49a) and any reader that PAIRS
+# cases by label — mutation-gate's flip set, its provenance ledger — saw a case
+# vanish and another appear. The number is still printed, on a line of its own.
+printf '  note: 19c abort took %ss\n' "$(( SECONDS - a19c_t0 ))"
+(( rc == 22 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
+    && pass "19c watchdog alive but never armed → the ARM_WAIT timeout aborts, no kill (rc 22)" \
+    || fail "19c never-armed handling wrong (rc=$rc after $(( SECONDS - a19c_t0 ))s; 124 = the wait never ended)"
+if grep -q $'\twatchdog-never-armed' "$auto/decisions.tsv" && ! grep -q 'watchdog-window-vanished' "$auto/decisions.tsv"; then
+    pass "19c …through the TIMEOUT arm: cause watchdog-never-armed, not the GONE arm"
+else
+    fail "19c the rc-22 abort did not record cause watchdog-never-armed"
+fi
+
+# ================= #1627: the restart watchdog is retired without an agent =====
+#
+# The watchdog window used to be retired by NOTHING between update runs: its
+# brief names no tracking issue, so it never wrapped up, and the cleanup loop
+# never saw it (verified 11:34 on 2026-09-22, retired by hand ~20 h later).
+# `restart-orchestrator` now hands the retirement to a detached
+# `retire-watchdog`, which retires through `ng retire-window` once the loop has
+# recorded SUCCESS for THIS attempt. The launch is observed through the seam
+# CC_AUTO_WATCHDOG_RETIRE_LAUNCH_CMD; the verb is driven directly.
+#
+# PREDICTED FLIPS (mutation gate, #1627): delete the `_launch_watchdog_retire`
+# call → W1a, W1c and W3 go red; W1b (the attempt file and the prompt agree)
+# and W2 (an abort before the kill launches nothing) must NOT flip. Force the
+# verified-attempt test TRUE in the verb → R2 and R3 flip (an unverified or
+# foreign-verified watchdog retired); R1 and the identity exits R4-R7 must NOT.
+echo "== #1627: the restart watchdog retires itself =="
+ROOT="$WORK/aw1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+printf '#!/usr/bin/env bash\necho "retire-launch $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/retire-launch"
+chmod +x "$ROOT/retire-launch"
+env $(apply_env "$ROOT") CC_AUTO_WATCHDOG_RETIRE_LAUNCH_CMD="$ROOT/retire-launch" bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+aw1_att=$(tr -d '[:space:]' < "$auto/watchdog-attempt" 2>/dev/null)
+aw1_prompt=$(sed -n "s/.*WATCHDOG_ATTEMPT='\([^']*\)'.*/\1/p" "$auto/watchdog-prompt.md" 2>/dev/null)
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
+   && grep -qxF -- "retire-launch --attempt $aw1_att" "$ROOT/calls.log"; then
+    pass "W1a a restart that reached the kill hands the watchdog's retirement off, bound to its attempt"
+else
+    fail "W1a no retire hand-off after the kill (rc=$rc attempt='$aw1_att'): $(grep -F retire-launch "$ROOT/calls.log" | tr '\n' ' ')"
+fi
+if [[ -n "$aw1_att" && "$aw1_att" == "$aw1_prompt" ]]; then
+    pass "W1b the hand-off's attempt is the one rendered into the watchdog's loop command (watchdog-attempt == WATCHDOG_ATTEMPT)"
+else
+    fail "W1b attempt mismatch: watchdog-attempt='$aw1_att' prompt='$aw1_prompt'"
+fi
+# W1c: `retire-launch` must follow the kill, never precede it — a watchdog is
+# retired only after it had something to watch.
+aw1_seq=$(grep -E '^(tmux kill-window -t :=orchestrator|retire-launch)' "$ROOT/calls.log" | cut -d' ' -f1 | tr '\n' ' ')
+[[ "$aw1_seq" == "tmux retire-launch " ]] \
+    && pass "W1c the hand-off comes AFTER the orchestrator kill" \
+    || fail "W1c kill/hand-off order wrong: [$aw1_seq]"
+
+# W2: a restart that aborts before the kill (the watchdog vanished, case 19's
+# shape) launches NOTHING — MUST NOT FLIP when the launch is deleted.
+ROOT="$WORK/aw2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash\necho "spawn $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/spawn"; chmod +x "$ROOT/spawn"
+printf '#!/usr/bin/env bash\necho "retire-launch $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/retire-launch"; chmod +x "$ROOT/retire-launch"
+env $(apply_env "$ROOT") CC_AUTO_WATCHDOG_RETIRE_LAUNCH_CMD="$ROOT/retire-launch" bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+(( rc == 22 )) && ! grep -qF retire-launch "$ROOT/calls.log" \
+    && pass "W2 an abort before the kill (rc 22) hands off no retirement" \
+    || fail "W2 abort path launched a retire (rc=$rc): $(grep -F retire-launch "$ROOT/calls.log" | tr '\n' ' ')"
+
+# W3: TWO BOARDS. With the tmux seam overridden and no retire seam, the default
+# `ng retire-window` would address the DEFAULT server — the operator's real
+# board — so the hand-off is refused, and says so. Every fixture root that
+# reaches the kill takes this arm.
+ROOT="$WORK/aw3"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+(( rc == 0 )) && grep -q 'watchdog auto-retire NOT launched' "$ROOT/producer.log" \
+   && ! grep -q 'auto-retire handed off' "$ROOT/producer.log" \
+    && pass "W3 an overridden tmux seam with the DEFAULT retire command launches nothing, and says why (#1550 class)" \
+    || fail "W3 two-boards guard missing (rc=$rc): $(grep -F 'auto-retire' "$ROOT/producer.log" | tr '\n' ' ')"
+
+# W4: the stale-watchdog kill names the EXACT window (your-org/nexus-code#1524):
+# a bare name resolves by prefix once the window is gone.
+# The stub answers the stale-watchdog probe's `-F '#W'` with a prior watchdog
+# (and nothing else differs from make_apply_root's), so the kill is reached.
+ROOT="$WORK/aw4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+# A WHOLE stub, not a wrapper around make_apply_root's: test-tmux-shim-gate3-safety
+# must be able to PROVE every planted tmux a mock, and an `exec` of another file
+# is not provable (#1105).
+cat > "$ROOT/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+case "$1" in
+  list-windows)
+    case "$*" in
+      *'-F #W'*) printf '%s\n' orchestrator cc-restart-watchdog ;;
+      *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
+      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' '$0|@1|orchestrator|1' ;;
+      *'#{window_name}'*) printf '%s\n' orchestrator ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$ROOT/tmux"
+timeout 45 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+if grep -qxF 'tmux kill-window -t :=cc-restart-watchdog' "$ROOT/calls.log" \
+   && ! grep -qxF 'tmux kill-window -t cc-restart-watchdog' "$ROOT/calls.log"; then
+    pass "W4 the prior attempt's watchdog is killed by EXACT name (:=), never by bare name"
+else
+    fail "W4 stale-watchdog kill spelling: $(grep -F 'kill-window' "$ROOT/calls.log" | tr '\n' ' ')"
+fi
+
+# ---- the verb: retire-watchdog --------------------------------------------
+# A tmux stub whose board is RW_BOARD (id<TAB>name rows); RW_BOARD_RC fails it.
+# A retire stub that records its args and answers from a queue of rcs.
+rw_root() {   # rw_root <dir> → a root with the two stubs and a state dir
+    local d="$1"
+    mkdir -p "$d/monitor/.state/cc-auto-update"
+    : > "$d/calls.log"
+    cat > "$d/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+[[ "$1" == list-windows ]] || exit 0
+[[ -n "${RW_BOARD_RC:-}" ]] && exit "$RW_BOARD_RC"
+printf '%b' "${RW_BOARD:-}"
+EOF
+    cat > "$d/retire" <<'EOF'
+#!/usr/bin/env bash
+d="${BASH_SOURCE[0]%/*}"
+echo "retire $*" >> "$d/calls.log"
+q="$d/retire-rcs"; rc=0
+if [[ -s "$q" ]]; then rc=$(sed -n 1p "$q"); sed -i 1d "$q"; fi
+echo "retire-window: preflight said rc $rc"
+exit "$rc"
+EOF
+    chmod +x "$d/tmux" "$d/retire"
+}
+rw_run() {    # rw_run <dir> [args…] → RW_RC
+    local d="$1"; shift
+    env NEXUS_ROOT="$d" NEXUS_STATE_DIR="$d/monitor/.state" CC_AUTO_TMUX="$d/tmux" \
+        CC_AUTO_WATCHDOG_RETIRE_CMD="$d/retire" CC_AUTO_WATCHDOG_RETIRE_POLL_SECONDS=1 \
+        CC_AUTO_WATCHDOG_RETIRE_WAIT_SECONDS="${RW_WAIT:-3}" \
+        RW_BOARD="${RW_BOARD:-}" ${RW_BOARD_RC:+RW_BOARD_RC=$RW_BOARD_RC} \
+        timeout 30 bash "$APPLY" retire-watchdog "$@" >>"$d/producer.log" 2>&1
+    RW_RC=$?
+}
+rw_verified() { printf 'attempt=%s\ncandidate=2.1.160\nverified_at=now\n' "$2" > "$1/monitor/.state/restart-watchdog-verified"; }
+RW_BOARD_STD='@3|orchestrator\n@7|cc-restart-watchdog\n'
+rw_calls() { grep -c '^retire ' "$1/calls.log"; }
+
+D="$WORK/rw1"; rw_root "$D"; rw_verified "$D" A1
+printf 'A1\n' > "$D/monitor/.state/cc-auto-update/watchdog-attempt"
+RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @7
+if (( RW_RC == 0 )) && (( $(rw_calls "$D") == 1 )) && grep -q '^retire cc-restart-watchdog --reason .*attempt A1' "$D/calls.log"; then
+    pass "R1 verified for THIS attempt, window present as the id it was launched for → retired through the retire verb, once"
+else
+    fail "R1 rc=$RW_RC calls=$(rw_calls "$D"): $(tail -n 2 "$D/producer.log" | tr '\n' ' ')"
+fi
+D="$WORK/rw2"; rw_root "$D"
+RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @7
+if (( RW_RC == 1 )) && (( $(rw_calls "$D") == 0 )) && grep -q 'LEFT in place' "$D/producer.log"; then
+    pass "R2 no verified marker → never retired; the bound expires loudly (rc 1, window LEFT)"
+else
+    fail "R2 an unverified watchdog was retired, or the bound was silent (rc=$RW_RC calls=$(rw_calls "$D"))"
+fi
+D="$WORK/rw3"; rw_root "$D"; rw_verified "$D" B2
+RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @7
+(( RW_RC == 1 )) && (( $(rw_calls "$D") == 0 )) \
+    && pass "R3 a SUCCESS recorded for ANOTHER attempt does not retire this one's window" \
+    || fail "R3 retired on a foreign attempt's success (rc=$RW_RC calls=$(rw_calls "$D"))"
+D="$WORK/rw4"; rw_root "$D"; rw_verified "$D" A1
+printf 'B2\n' > "$D/monitor/.state/cc-auto-update/watchdog-attempt"
+RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @7
+(( RW_RC == 0 )) && (( $(rw_calls "$D") == 0 )) && grep -q 'superseded by B2' "$D/producer.log" \
+    && pass "R4 superseded (a later restart owns the name) → stands down without acting" \
+    || fail "R4 superseded handling (rc=$RW_RC calls=$(rw_calls "$D"))"
+D="$WORK/rw5"; rw_root "$D"; rw_verified "$D" A1
+RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @9
+(( RW_RC == 0 )) && (( $(rw_calls "$D") == 0 )) && grep -q 'no longer window @9' "$D/producer.log" \
+    && pass "R5 the name now belongs to a DIFFERENT window id → not acting (#1524: a name is not a target)" \
+    || fail "R5 id-mismatch handling (rc=$RW_RC calls=$(rw_calls "$D"))"
+D="$WORK/rw6"; rw_root "$D"; rw_verified "$D" A1
+RW_BOARD='@3|orchestrator\n@8|cc-restart-watchdog-sk\n' rw_run "$D" --attempt A1 --window-id @7
+(( RW_RC == 0 )) && (( $(rw_calls "$D") == 0 )) && grep -q 'already gone' "$D/producer.log" \
+    && pass "R6 window absent from a non-empty board (a PREFIX sibling present) → already gone, nothing retired" \
+    || fail "R6 absent-window handling (rc=$RW_RC calls=$(rw_calls "$D"))"
+D="$WORK/rw7"; rw_root "$D"; rw_verified "$D" A1
+RW_BOARD_RC=1 rw_run "$D" --attempt A1 --window-id @7
+(( RW_RC == 1 )) && (( $(rw_calls "$D") == 0 )) && ! grep -q 'already gone' "$D/producer.log" \
+    && pass "R7 a board that cannot be READ is neither present nor gone → nothing retired, nothing concluded" \
+    || fail "R7 unreadable-board handling (rc=$RW_RC calls=$(rw_calls "$D"))"
+D="$WORK/rw8"; rw_root "$D"; rw_verified "$D" A1; printf '1\n1\n0\n' > "$D/retire-rcs"
+RW_WAIT=10 RW_BOARD="$RW_BOARD_STD" rw_run "$D" --attempt A1 --window-id @7
+(( RW_RC == 0 )) && (( $(rw_calls "$D") == 3 )) && (( $(grep -c 'retire-window refused' "$D/producer.log") == 1 )) \
+    && pass "R8 a retire-gate REFUSAL (agent still busy) is retried, never overridden: refused twice, retired on the third poll, one note per distinct refusal" \
+    || fail "R8 refusal handling (rc=$RW_RC calls=$(rw_calls "$D") notes=$(grep -c 'retire-window refused' "$D/producer.log"))"
 
 # 19b. flock-fd hardening (class your-org/nexus-code#494; caught on PR #1425
 #      by monitor/watcher/test-flock-fd-cloexec.sh, NOT by the author). The
@@ -2660,7 +3128,7 @@ else
     kill "$(cat "$CTL_PID" 2>/dev/null)" 2>/dev/null || true
 
     env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-        --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+        --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
     rc=$?
     # The verb must have TAKEN the lock (file exists, spawn + pane-state both
     # ran, never-armed rc 22 as in 19) — otherwise "free" is vacuous.
@@ -2684,13 +3152,76 @@ ROOT="$WORK/a20"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=busy active=1"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "busy past idle cap → FORCE-restart (rc 0, kill issued, outcome forced)"
 else
     fail "force-restart-on-cap wrong (rc=$rc)"
+fi
+
+# 20p. THE DUPLICATE-CLAIMANT PANE-PID GUARD (your-org/nexus-code#1400) had NO
+#      test (merge4sk G5 on #1568): the default stub answers no `#{pane_pid}`,
+#      so in every fixture the guard DISARMED itself and the unconditional kill
+#      ran — and #1568's re-spelling of its two reads to `:=` could be reverted
+#      invisibly. This stub answers the pane pid ONLY for the exact spelling
+#      `-t :=orchestrator`, from a counter (baseline, then re-read); a BARE
+#      `-t orchestrator` gets a constant SIBLING pid, which is what a prefix
+#      redirect returns once the exact window is gone (#1524). So:
+#        20p1  stable pid       -> the guard ARMS (logged) and the kill is issued;
+#        20p2  pid CHANGED      -> REFUSED, rc 23, NO kill, outcome recorded.
+#      PREDICTED FLIPS: revert either read to a bare `-t "$TARGET_WINDOW"` and
+#      20p1's "armed" and 20p2 both go red (bare reads agree on the sibling's
+#      pid: 20p2 kills); delete the re-read comparison and 20p2 goes red alone.
+g5_stub() {   # <root> <second-read-pid>
+    cat > "$1/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+case "$1" in
+  list-windows)
+    case "$*" in
+      *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
+      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' '$0|@1|orchestrator|1' ;;
+      *'#{window_name}'*) printf '%s\n' orchestrator ;;
+    esac
+    exit 0 ;;
+  display-message)
+    case "$*" in
+      *'-t :=orchestrator #{pane_pid}'*)
+        ctr="${BASH_SOURCE[0]%/*}/pid.ctr"
+        n=$(cat "$ctr" 2>/dev/null || echo 0); echo $(( n + 1 )) > "$ctr"
+        if (( n == 0 )); then echo 4242; else cat "${BASH_SOURCE[0]%/*}/pid.second"; fi ;;
+      *'-t orchestrator #{pane_pid}'*) echo 7777 ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+    printf '%s\n' "$2" > "$1/pid.second"
+    chmod +x "$1/tmux"
+}
+ROOT="$WORK/a20p1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; g5_stub "$ROOT" 4242
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
+   && grep -rqF "baseline pane pid for orchestrator = 4242" "$ROOT/producer.log" "$ROOT/monitor/.state" 2>/dev/null \
+   && ! grep -rqF "DISARMED for this run" "$ROOT/producer.log" "$ROOT/monitor/.state" 2>/dev/null; then
+    pass "G5 pane-pid guard ARMS on an exact-name read (baseline 4242 logged, not DISARMED) and a stable pid lets the kill run (rc 0)"
+else
+    fail "G5 pane-pid guard did not arm on a readable :=orchestrator pid, or the kill did not run (rc=$rc)"
+fi
+ROOT="$WORK/a20p2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; g5_stub "$ROOT" 5353
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+if (( rc == 23 )) && ! grep -q "kill-window" "$ROOT/calls.log" \
+   && grep -q $'\tsafe-bumped-restart-refused\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" \
+   && grep -qF "duplicate-claimant base_pane_pid=4242 now=5353" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
+    pass "G5 pane pid CHANGED between baseline and re-read (4242 -> 5353) → REFUSED (rc 23, no kill, duplicate-claimant recorded)"
+else
+    fail "G5 a replaced orchestrator (pane pid 4242 -> 5353) was not refused (rc=$rc) — the duplicate-claimant guard would decapitate the replacement"
 fi
 
 # 20b. pane-state UNREADABLE (empty stdout + exit 2 — the literal
@@ -2702,7 +3233,7 @@ printf '#!/usr/bin/env bash\necho "pane-state $*" >> "%s"\necho "usage: pane-sta
     "$ROOT/calls.log" > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
 # "no wait" is asserted as an INVOCATION COUNT, not a wall-clock ceiling
 # (your-org/nexus-code#557). The old form timed the run and required
@@ -2715,7 +3246,7 @@ rc=$?
 # IDLE_WAIT=2/POLL=1) — discriminated by count with no timing margin at
 # all, and strictly more precise than the clock ever was.
 ps_calls=$(grep -c '^pane-state ' "$ROOT/calls.log" 2>/dev/null) || ps_calls=0
-if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 23 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && (( ps_calls == 1 )) \
    && grep -q $'\tsafe-bumped-restart-aborted\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "unreadable pane-state → fail-loud (rc 23, no kill, probed once — no poll loop)"
@@ -2735,9 +3266,9 @@ exit 0
 EOF
 chmod +x "$ROOT/tmux"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 23 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && ! grep -q '^pane-state' "$ROOT/calls.log"; then
     pass "unresolvable target window → fail-loud (rc 23, no kill, no poll)"
 else
@@ -2756,9 +3287,9 @@ ROOT="$WORK/a20d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=empty active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 23 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q "never-resolved-empty-at-cap" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "ALL-empty wait → cap refuses the force (rc 23, no kill) — never-resolved guard"
 else
@@ -2779,9 +3310,9 @@ else echo "state=empty active=1 window=2 name=orchestrator"; fi
 EOF
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "busy-once-then-empty → resolved_seen latched, cap force-fires (rc 0)"
 else
@@ -2800,9 +3331,9 @@ ROOT="$WORK/a20e-auth"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=idle active=1 window=2 name=orchestrator overlay=login auth=login"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 23 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q "auth-login-at-cap" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" \
    && grep -q $'\tsafe-bumped-restart-aborted\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "idle + auth=login for the whole wait → login wins: rc 23, no kill, auth-login-at-cap (not forced)"
@@ -2819,9 +3350,9 @@ ROOT="$WORK/a20f-auth"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=idle active=1 window=2 name=orchestrator auth=expired"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && ! grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "idle + auth=expired → still a boundary: clean (non-forced) restart, kill issued"
 else
@@ -2837,9 +3368,9 @@ ROOT="$WORK/a20g-auth-nohold"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=idle active=1 window=2 name=orchestrator overlay=login auth=login"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") MONITOR_AUTH_HOLD_ENABLED=false bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" \
    && ! grep -q "auth-login-at-cap" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "idle + auth=login with the auth hold DISABLED → no clock bounds the login, so the cap FORCES (rc 0, kill) rather than aborting unbounded"
@@ -2854,9 +3385,9 @@ ROOT="$WORK/a20h-auth-hold-1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=idle active=1 window=2 name=orchestrator overlay=login auth=login"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") MONITOR_AUTH_HOLD_ENABLED=1 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 23 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q "auth-login-at-cap" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "auth hold spelled '1' is ON for apply.sh too → abort (rc 23, no kill), agreeing with _auth_hold_active"
 else
@@ -2872,9 +3403,9 @@ ROOT="$WORK/ae1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=working-background active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restarted\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" \
    && ! grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "Monitor-handle working-background → turn boundary, CLEAN restart (rc 0, not forced)"
@@ -2889,9 +3420,9 @@ ROOT="$WORK/ae2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=working-background active=1 window=2 name=orchestrator bg_shells=1 bg_reliable=1 bg_cpu=42 bg_oldest_start=1"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "shell-driven working-background (bg_cpu=) → NOT eligible, waits, forces at cap"
 else
@@ -2909,12 +3440,12 @@ restart_outcome() {   # restart_outcome <tag> <pane-line> → sets RO_RC, RO_CLE
     printf '#!/usr/bin/env bash\necho "%s"\n' "$2" > "$root/pane-state"
     chmod +x "$root/pane-state"
     env $(apply_env "$root") bash "$APPLY" restart-orchestrator \
-        --candidate 2.1.160 --sid "$(pin_of "$root")" >/dev/null 2>&1
+        --candidate 2.1.160 --sid "$(pin_of "$root")" >>"$root/producer.log" 2>&1
     RO_RC=$?
     RO_CLEAN=0; RO_FORCED=0
     grep -q $'\tsafe-bumped-restarted\t' "$root/monitor/.state/cc-auto-update/decisions.tsv" && RO_CLEAN=1
     grep -q $'\tsafe-bumped-restart-forced\t' "$root/monitor/.state/cc-auto-update/decisions.tsv" && RO_FORCED=1
-    grep -q "kill-window -t orchestrator" "$root/calls.log" || RO_RC="$RO_RC-nokill"
+    grep -q "kill-window -t :=orchestrator" "$root/calls.log" || RO_RC="$RO_RC-nokill"
 }
 E3_LINE='state=working-background active=0 window=2 name=orchestrator input=ghost bg_shells=1 bg_reliable=1 bg_cpu=2 bg_oldest_start=1 bg_infra=0 bg_stale=0 bg_cmd=zsh:until_/x/monitor/watcher-supe bg_cpu_bp=0 bg_wedged=0 bg_members=1 bg_quiesce=1'
 restart_outcome ae3 "$E3_LINE"
@@ -2932,7 +3463,10 @@ wd_env=$(sed -n "s/.*WATCHDOG_ATTEMPT='\([^']*\)'.*/\1/p" "$wdp" 2>/dev/null | s
 wd_arg=$(sed -n "s/.*--attempt '\([^']*\)'.*/\1/p" "$wdp" 2>/dev/null | sort -u)
 if [[ -n "$wd_env" && "$wd_env" == "$wd_arg" && "$wd_env" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] \
    && ! grep -q '{{' "$wdp"; then
-    pass "E3b the rendered watchdog prompt carries one attempt nonce ($wd_env) in the loop AND the --verify-only command"
+    # The nonce is per-run; in the label it made E3b a different case every
+    # time (same defect as 19c above, #1574). Printed beside the verdict instead.
+    printf '  note: E3b attempt nonce %s\n' "$wd_env"
+    pass "E3b the rendered watchdog prompt carries one attempt nonce in the loop AND the --verify-only command"
 else
     fail "E3b watchdog prompt attempt wiring wrong: env=[$wd_env] arg=[$wd_arg] unrendered=$(grep -c '{{' "$wdp" 2>/dev/null)"
 fi
@@ -2989,11 +3523,11 @@ esac
 EOF
 chmod +x "$ROOT/tmux" "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
 if (( rc == 0 )) && grep -q '^pane-state 3$' "$ROOT/calls.log" \
    && grep -q '^pane-state 2$' "$ROOT/calls.log" \
-   && grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+   && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log"; then
     pass "index re-resolved per poll → follows orchestrator 3→2, then kills (rc 0)"
 else
     fail "index re-resolution wrong (rc=$rc, probes: $(grep '^pane-state' "$ROOT/calls.log" | tr '\n' ','))"
@@ -3007,9 +3541,9 @@ ROOT="$WORK/a20f"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 slug=$(printf '%s' "$ROOT" | sed 's|[^a-zA-Z0-9]|-|g')
 printf '{"version":"2.1.160"}\n' >> "$ROOT/projects/$slug/$(pin_of "$ROOT").jsonl"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 24 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 24 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-noop\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "already-on-candidate (self-respawned) → no-op (rc 24, no kill)"
 else
@@ -3024,9 +3558,9 @@ ROOT="$WORK/a20g"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 SID="$(pin_of "$ROOT")"
 rm -f "$ROOT/monitor/.state/orchestrator-session-id"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$SID" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$SID" >>"$ROOT/producer.log" 2>&1
 rc=$?
-(( rc == 21 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+(( rc == 21 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
     && pass "detached verb: pin went stale → abort (rc 21, no kill)" \
     || fail "detached stale-pin handling wrong (rc=$rc)"
 
@@ -3047,9 +3581,9 @@ echo "state=busy active=1"
 EOF
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 21 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 21 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q "pin-stale-at-fire" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
     pass "pin goes stale DURING the wait → fire-time re-check aborts (rc 21, no kill)"
 else
@@ -3129,9 +3663,9 @@ ROOT="$WORK/h5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
 _cc_auto_write_restart_hold "$auto" "do not restart" "" "2.1.160"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 25 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 25 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-held\t' "$auto/decisions.tsv"; then
     pass "detached restart honours the hold (rc 25, no kill)"
 else
@@ -3146,7 +3680,7 @@ auto="$ROOT/monitor/.state/cc-auto-update"
 printf '#!/usr/bin/env bash\necho "state=busy active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=60 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1 &
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1 &
 h6_pid=$!
 sleep 2
 kill -TERM "$h6_pid" 2>/dev/null
@@ -3154,7 +3688,7 @@ wait "$h6_pid" 2>/dev/null; rc=$?
 if (( rc == 25 )) && [[ -f "$auto/restart-hold" ]] \
    && grep -q '^until_version=2\.1\.160$' "$auto/restart-hold" \
    && grep -q "sigterm-hold-written" "$auto/decisions.tsv" \
-   && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+   && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log"; then
     pass "SIGTERM'd detached restart writes the hold (until_version=candidate, rc 25, no kill)"
 else
     fail "SIGTERM-hold wrong (rc=$rc, hold=$( [[ -f $auto/restart-hold ]] && echo yes || echo no ))"
@@ -3170,22 +3704,64 @@ ROOT="$WORK/h7"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"
 printf '#!/usr/bin/env bash\necho "spawn $*" >> "%s"\nexit 0\n' "$ROOT/calls.log" > "$ROOT/spawn"   # never arms
 chmod +x "$ROOT/spawn"
+# THE WATCHDOG WINDOW MUST BE ON THE BOARD, OR THERE IS NO ARM-WAIT TO TERM
+# (your-org/nexus-code#1560 — the mechanism, MEASURED, not read).
+#
+# `make_apply_root`'s tmux answers the names listing with `orchestrator` alone.
+# The arm-wait loop's first act (#1400 ccwatch item 3) is to ask whether the
+# watchdog window is still listed; a NON-EMPTY listing that omits it is
+# evidence of absence, so the producer aborted on iteration ZERO — `ABORT
+# restart: watchdog window … is GONE before arming (waited 0s of 60s)`, exit 22
+# — and its EXIT trap dropped the capture. This scenario's
+# `CC_AUTO_ARM_WAIT_SECONDS=60` never waited for anything.
+#
+# Measured on the unmodified fixture with the TERM withheld (2026-09-18, load
+# 42 on 36 cpus): capture first seen at 313 ms, last seen at 502 ms, producer
+# exited 22 BY ITSELF at 533 ms. The capture lived 189 ms and the poll below
+# samples every 250 ms, so H7 passed only when a sample happened to land inside
+# the window and the TERM then beat the self-abort — and otherwise reported
+# exactly `seen=0` with `rc=22`, in ~0.5 s or never: BIMODAL, which is why a
+# wider poll could not help (0/12 at 120 s was chance, as #1560 said). A slower
+# runner stretches the poll period past the window and it fails every time
+# (5/5 in CI). It was never load, bash, or the product.
+#
+# So this fixture puts the watchdog on the board, as the real spawn does, and
+# the producer genuinely parks in the arm-wait until the TERM.
+tmux_stub_with_watchdog "$ROOT"
 h7_cap="$ROOT/monitor/.state/tmux-selection-capture"
 env $(apply_env "$ROOT") CC_AUTO_ARM_WAIT_SECONDS=60 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1 &
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1 &
 h7_pid=$!
-h7_seen=0
+h7_seen=0; h7_t0=$SECONDS
 for _i in $(seq 1 40); do [[ -f "$h7_cap" ]] && { h7_seen=1; break; }; sleep 0.25; done
+# Whether the producer is STILL RUNNING when the poll gives up separates "it
+# never reached the capture" from "it came and went" (#1560: failing runs
+# reported rc=22, an exit the source places AFTER a 60 s arm-wait). Measured
+# here, before the TERM, because afterwards both read as "exited".
+h7_alive=no; kill -0 "$h7_pid" 2>/dev/null && h7_alive=yes
 # POSITIVE CONTROL first: the fixture must REACH the capture, or the absence
 # below is a false zero.
 if (( h7_seen == 1 )) && grep -q '^prior|\$0|@1|1$' "$h7_cap"; then
     pass "H7 control: the capture is written before the arm-wait (prior row present)"
 else
-    fail "H7 control: capture not written within 10 s (seen=$h7_seen) — the drop below is unmeasured"
+    fail "H7 control: capture not written within 10 s (seen=$h7_seen, producer alive=$h7_alive after $(( SECONDS - h7_t0 ))s, iterations=$_i) — the drop below is unmeasured"
+fi
+# SECOND CONTROL — the one that FAILS on the old fixture, every time rather than
+# one run in six: the producer must be PARKED in the arm-wait, i.e. still alive
+# and still holding its capture well past the ~0.5 s at which the old fixture's
+# producer had already aborted itself. Without this a TERM that merely WON A
+# RACE against a self-abort is indistinguishable from a TERM during the wait,
+# and that race is what H7 was unknowingly measuring (#1560).
+sleep 2
+if kill -0 "$h7_pid" 2>/dev/null && [[ -f "$h7_cap" ]] \
+   && ! grep -q 'GONE before arming' "$ROOT/producer.log"; then
+    pass "H7 control: 2 s on, the producer is still PARKED in the arm-wait holding its capture (#1560)"
+else
+    fail "H7 control: the producer did not park in the arm-wait (alive=$(kill -0 "$h7_pid" 2>/dev/null && echo yes || echo no), capture=$([[ -f $h7_cap ]] && echo present || echo absent)) — the TERM below races a self-abort (#1560)"
 fi
 kill -TERM "$h7_pid" 2>/dev/null
 wait "$h7_pid" 2>/dev/null; rc=$?
-if (( rc == 25 )) && [[ ! -f "$h7_cap" ]] && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+if (( rc == 25 )) && [[ ! -f "$h7_cap" ]] && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log"; then
     pass "H7 SIGTERM before the kill (rc 25) drops the selection capture (F1)"
 else
     fail "H7 leftover capture after a TERMed restart (rc=$rc, capture=$([[ -f $h7_cap ]] && echo present || echo absent))"
@@ -3195,13 +3771,72 @@ fi
 ROOT="$WORK/h7b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 h7b_cap="$ROOT/monitor/.state/tmux-selection-capture"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
-if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q '^prior|\$0|@1|1$' "$h7b_cap" && grep -q '^post|\$0|@1$' "$h7b_cap"; then
     pass "H7b a restart that reached the kill leaves the capture (prior + post rows) for the respawn"
 else
     fail "H7b capture after a completed restart wrong (rc=$rc, capture=$([[ -f $h7b_cap ]] && cat "$h7b_cap" | tr '\n' ' ' || echo absent))"
+fi
+
+# H7c. (your-org/nexus-code#1562) A FAILED selection capture is NON-FATAL and
+#      NOT SILENT. The three capture calls used to end `|| true`: a failed
+#      capture deletes its file and returned a status nothing read, so the
+#      restart log said nothing and the operator landed on the wrong window
+#      with no line anywhere explaining why. Here tmux answers the capture's
+#      format with a NAMES-ONLY row (the shape the pre-#1528 fixture printed),
+#      which the capture must refuse. Asserted: the restart still completes
+#      (rc 0, the kill happens), no capture is left, and the log names the
+#      step, the rc and the REJECTED ROW — not a guessed "tmux would not answer".
+ROOT="$WORK/h7c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+h7c_cap="$ROOT/monitor/.state/tmux-selection-capture"
+cat > "$ROOT/tmux" <<'EOF'
+#!/usr/bin/env bash
+echo "tmux $*" >> "${BASH_SOURCE[0]%/*}/calls.log"
+case "$1" in
+  list-windows)
+    case "$*" in
+      *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
+      *'#{session_id}|#{window_id}|#{window_name}|#{window_active}'*) printf '%s\n' orchestrator ;;   # unparseable: a bare name
+      *'#{window_name}'*) printf '%s\n' orchestrator ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$ROOT/tmux"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+if (( rc == 0 )) && grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" && [[ ! -f "$h7c_cap" ]]; then
+    pass "H7c a failed selection capture does not block the restart (rc 0, kill reached, no capture left)"
+else
+    fail "H7c a failed capture changed the restart (rc=$rc, capture=$([[ -f $h7c_cap ]] && echo present || echo absent))"
+fi
+if grep -q 'selection capture (initial) FAILED rc=3' "$auto/apply.log" \
+   && grep -q 'selection capture (refresh) FAILED rc=3' "$auto/apply.log" \
+   && grep -q 'bad-row=orchestrator' "$auto/apply.log"; then
+    pass "H7c …and it is NOT silent: the restart log names the step, the rc and the rejected row (#1562)"
+else
+    fail "H7c a failed selection capture left no reason in the restart log (#1562)"
+fi
+if grep -q 'selection capture (post-kill) FAILED rc=1' "$auto/apply.log" \
+   && ! grep -q 'tmux would not answer' "$auto/apply.log"; then
+    pass "H7c the post-kill step reports 'no capture to append to' (rc 1), and no line GUESSES a tmux outage"
+else
+    fail "H7c post-kill note wrong, or a line still guesses 'tmux would not answer' for a rejected row"
+fi
+# MUST-NOT-FLIP: H7b's restart, whose capture WORKED, logs no failure line. A
+# reason that leaked from an earlier failure, or a note on every rc, would
+# turn the new line into noise nobody reads — which is how #1555 began.
+if [[ -f "$WORK/h7b/monitor/.state/cc-auto-update/apply.log" ]] \
+   && ! grep -q 'selection capture (.*) FAILED' "$WORK/h7b/monitor/.state/cc-auto-update/apply.log" \
+   && grep -q 'window selection captured for the respawn to restore' "$WORK/h7b/monitor/.state/cc-auto-update/apply.log"; then
+    pass "H7c control: a restart whose capture WORKED (H7b) logs the capture and no FAILED line"
+else
+    fail "H7c control: H7b's log carries a selection-capture FAILED line, or never logged its capture"
 fi
 
 # ===== restart-outcome marker + abort-streak escalation (nexus-code#511) ====
@@ -3238,7 +3873,7 @@ ROOT="$WORK/m1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"
 _nonresolving_tmux "$ROOT"
 env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
 if (( rc == 23 )) && [[ -f "$auto/restart-outcome" ]] \
    && grep -q '^outcome=safe-bumped-restart-aborted$' "$auto/restart-outcome" \
@@ -3257,11 +3892,11 @@ grep -q $'\trestart-abort-escalation\t' "$auto/decisions.tsv" \
 # M2. consecutive same-cause aborts INCREMENT the streak; crossing the
 #     threshold shouts exactly once (a restart-abort-escalation audit row).
 env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # streak 2
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1   # streak 2
 grep -q '^abort_streak=2$' "$auto/restart-outcome" \
     && pass "second same-cause abort → streak 2" || fail "streak did not reach 2"
 env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # streak 3 → escalate
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1   # streak 3 → escalate
 if grep -q '^abort_streak=3$' "$auto/restart-outcome" \
    && grep -q $'\trestart-abort-escalation\t' "$auto/decisions.tsv" \
    && [[ "$(grep -c $'\trestart-abort-escalation\t' "$auto/decisions.tsv")" == "1" ]]; then
@@ -3285,7 +3920,7 @@ exit 0
 EOF
 chmod +x "$ROOT/tmux"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 rc=$?
 if (( rc == 0 )) && grep -q '^outcome=safe-bumped-restarted$' "$auto/restart-outcome" \
    && grep -q '^abort_streak=0$' "$auto/restart-outcome"; then
@@ -3300,9 +3935,9 @@ ROOT="$WORK/m4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"
 _nonresolving_tmux "$ROOT"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # target-window, streak 1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1   # target-window, streak 1
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # target-window, streak 2
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1   # target-window, streak 2
 grep -q '^abort_streak=2$' "$auto/restart-outcome" || fail "M4 setup: streak != 2"
 # Now a resolving tmux but an UNREADABLE pane-state → a different abort cause.
 cat > "$ROOT/tmux" <<EOF
@@ -3319,7 +3954,7 @@ chmod +x "$ROOT/tmux"
 printf '#!/usr/bin/env bash\necho "usage: pane-state.sh <window-index>" >&2\nexit 2\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
-    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
 if grep -q '^cause=pane-state-unreadable$' "$auto/restart-outcome" \
    && grep -q '^abort_streak=1$' "$auto/restart-outcome"; then
     pass "a different abort cause resets the streak to 1 (no false escalation)"
@@ -3363,9 +3998,14 @@ rc=$?
 
 echo "== deployment gate =="
 
-# G1. an open PR touching the watcher restart path DEFERS the apply:
-#     rc 30, NOTHING mutated (no pin, no install), outcome safe-deferred
-#     with the PR pinned in the detail.
+# G1. an open PR touching the watcher restart path is NOTED, NOT A VETO
+#     (your-org/nexus-code#1526 follow-up). Until 2026-09-25 this case
+#     asserted rc 30 / deferred-pending-PR503: the arm deferred on the proxy
+#     alone. Now the bump proceeds (rc 0, the bump path REACHED), the hit is a
+#     `restart-path-pr-noted` row and rides the deployment-gate row as
+#     restart_path_prs=PR503. The activity stub answers nothing, so the hit's
+#     age is unknown and it is recorded as live — the old fail-closed input,
+#     which now closes nothing.
 ROOT="$WORK/g1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/watcher/launcher.sh\\n503\\tmonitor/README.md\\n"\n' > "$ROOT/gate-prs"
 chmod +x "$ROOT/gate-prs"
@@ -3373,12 +4013,14 @@ env $(apply_env "$ROOT") CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" bash "$APPLY" safe
     --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
-if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
-   && ! grep -q '^install$' "$ROOT/calls.log" \
-   && grep -q "deferred-pending-PR503" "$auto/decisions.tsv"; then
-    pass "open restart-path PR → apply deferred (rc 30, nothing mutated, PR recorded)"
+if (( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+   && grep -q '^install$' "$ROOT/calls.log" && grep -q '^watcher-restart$' "$ROOT/calls.log" \
+   && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=live' "$auto/decisions.tsv" \
+   && grep -q $'\tdeployment-gate\t.*restart_path_prs=PR503' "$auto/decisions.tsv" \
+   && ! grep -q 'deferred-pending' "$auto/decisions.tsv"; then
+    pass "#1526 open restart-path PR → NOTED, not a veto: rc 0, bump reached, noted row + restart_path_prs=PR503"
 else
-    fail "PR-gate defer wrong (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1)"
+    fail "#1526 restart-path PR still vetoes or is unrecorded (rc=$rc): $(cut -f3,4 "$auto/decisions.tsv" 2>/dev/null | grep -i 'restart-path\|deferred\|deployment-gate' | tail -2 | tr '\n' ' ')"
 fi
 
 # G2. the PR probe FAILING is an INSTRUMENT FAILURE, not a verdict
@@ -3682,39 +4324,72 @@ EOF
         || fail "D13: tmux enumeration $mode — wrong outcome or a confident zero (rc=$rc): $(gate_row "$ROOT")"
 done
 
-# G1b–G1d. your-org/nexus-code#1414 — the restart-path arm has a RECENCY BOUND
-#          of its own. A stalled cosmetic PR on svc.sh (5.9 days untouched)
-#          blocked a fully-evidenced bump forever while arm 3 aged it out.
+# G1b–G1d, G1f. The restart-path arm since the #1526 follow-up: RECORDED, never
+#          a veto. #1414 gave it a recency bound (a stalled cosmetic svc.sh PR,
+#          5.9 days untouched, blocked a fully-evidenced bump forever); with the
+#          veto gone the bound only decides which way a hit is RECORDED —
+#          live (restart_path_prs=PR…) or aged out (stale-restart-path-pr=…).
+#          Every case sets its activity stub OUTSIDE arm 2b's window (2h) where
+#          it means to show arm 2 alone; G1c is the one inside it.
 ROOT="$WORK/g1b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/svc.sh\\n"\n' > "$ROOT/gate-prs"
 printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 503 "%s"\n' "$(date -Is -d '10 days ago')" > "$ROOT/gate-act"
 chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act" CC_AUTO_RESTART_INLINE=1)
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+(( rc == 0 )) && gate_applied "$ROOT" \
    && grep -q "stale-restart-path-pr=PR503" "$auto/decisions.tsv" \
-   && grep -q "restart-path-pr-aged-out" "$auto/decisions.tsv" \
-    && pass "#1414: a restart-path PR untouched for 10 days no longer blocks — and the exemption is RECORDED as its own audit row (the notify rides the same arm)" \
-    || fail "#1414: stale restart-path PR still blocks (rc=$rc): $(grep -E 'safe-(deferred|applied)' "$auto/decisions.tsv" 2>/dev/null | tail -1)"
-# G1c. POTENCY — the same PR touched a minute ago still defers.
+   && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=aged-out age=' "$auto/decisions.tsv" \
+   && [[ "$(gate_row "$ROOT")" == *"restart_path_prs=none"* ]] \
+   && ! grep -q "restart-path-pr-aged-out" "$auto/decisions.tsv" \
+    && pass "#1414/#1526: a restart-path PR untouched 10 days → applies; recorded as an aged-out NOTED row (the old aged-out row and notify folded in), restart_path_prs=none" \
+    || fail "#1414/#1526: aged-out restart-path PR wrong (rc=$rc): $(cut -f3,4 "$auto/decisions.tsv" 2>/dev/null | grep -i 'restart-path\|deferred' | tail -2 | tr '\n' ' ')"
+# G1f. TONIGHT'S SHAPE (2026-09-25, 2.1.282 held on PR1634) minus the recency:
+#      an open restart-path PR touched 3 h ago — inside the 7-day restart
+#      window, so LIVE, but outside arm 2b's 2 h active-review window. Before
+#      the #1526 follow-up this was rc 30 deferred-pending-PR503; now it
+#      proceeds with the hit NOTED as live.
+ROOT="$WORK/g1f"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/svc.sh\\n"\n' > "$ROOT/gate-prs"
+printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 503 "%s"\n' "$(date -Is -d '3 hours ago')" > "$ROOT/gate-act"
+chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
+rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act" CC_AUTO_RESTART_INLINE=1)
+auto="$ROOT/monitor/.state/cc-auto-update"
+(( rc == 0 )) && gate_applied "$ROOT" && grep -q '^watcher-restart$' "$ROOT/calls.log" \
+   && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=live' "$auto/decisions.tsv" \
+   && [[ "$(gate_row "$ROOT")" == *"restart_path_prs=PR503"* ]] \
+   && ! grep -q 'safe-deferred' "$auto/decisions.tsv" \
+    && pass "#1526 G1f: a LIVE restart-path PR (3 h old, outside 2b's window) → applies (bump + watcher restart reached), hit NOTED as live" \
+    || fail "#1526 G1f: live restart-path PR still defers or is unrecorded (rc=$rc): $(cut -f3,4 "$auto/decisions.tsv" 2>/dev/null | grep -i 'restart-path\|deferred' | tail -2 | tr '\n' ' ')"
+# G1c. The same PR touched a minute ago DOES defer — but by ARM 2b (active
+#      review, the bounded #1492 delay), not by the restart-path arm. Until the
+#      #1526 follow-up this case was arm 2's potency control
+#      (deferred-pending-PR503); it now pins that arm 2b still catches the
+#      fresh-activity shape and that the restart-path hit is merely noted.
 ROOT="$WORK/g1c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/svc.sh\\n"\n' > "$ROOT/gate-prs"
 printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 503 "%s"\n' "$(date -Is -d '60 seconds ago')" > "$ROOT/gate-act"
 chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act")
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 30 )) && gate_unmutated "$ROOT" && grep -q "deferred-pending-PR503" "$auto/decisions.tsv" \
-    && pass "#1414 POTENCY: a LIVE restart-path PR still defers (the arm reads the timestamp)" \
-    || fail "#1414: live restart-path PR cleared (rc=$rc)"
-# G1d. FAIL-CLOSED — the activity probe failing leaves every hit LIVE.
+(( rc == 30 )) && gate_unmutated "$ROOT" && grep -q $'\tsafe-deferred\tpr-under-active-review=PR503' "$auto/decisions.tsv" \
+   && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=live' "$auto/decisions.tsv" \
+   && ! grep -q "deferred-pending" "$auto/decisions.tsv" \
+    && pass "#1526 G1c: a restart-path PR touched 60 s ago defers via ARM 2b (pr-under-active-review), the restart-path hit only noted" \
+    || fail "#1526 G1c: fresh restart-path PR — wrong arm or no defer (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1 | cut -f4 | cut -c1-120)"
+# G1d. The activity probe failing: the hit's age is unknown, so it is recorded
+#      LIVE (never guessed stale) — and, with no veto, nothing defers. Arm 2b
+#      degrades to UNMEASURED on the same failure and continues (#1492).
 ROOT="$WORK/g1d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/svc.sh\\n"\n' > "$ROOT/gate-prs"
 chmod +x "$ROOT/gate-prs"
-rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD=false)
+rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD=false CC_AUTO_RESTART_INLINE=1)
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 30 )) && gate_unmutated "$ROOT" && grep -q "deferred-pending-PR503" "$auto/decisions.tsv" \
-    && pass "#1414: an unanswerable age is NOT 'stale' — the hit stays live (fail-closed)" \
-    || fail "#1414: activity-probe failure exempted a restart-path PR (rc=$rc)"
+(( rc == 0 )) && gate_applied "$ROOT" \
+   && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=live' "$auto/decisions.tsv" \
+   && [[ "$(gate_row "$ROOT")" == *"restart_path_prs=PR503"* && "$(gate_row "$ROOT")" == *"active_review_prs=UNMEASURED"* ]] \
+    && pass "#1526 G1d: activity probe down → the hit is recorded LIVE (an unknown age is not 'stale'), arm 2b UNMEASURED, and the bump proceeds" \
+    || fail "#1526 G1d: activity-probe failure mishandled (rc=$rc): $(gate_row "$ROOT" | cut -c1-200)"
 # G1e. your-org/nexus-code#1400 (apply side): the SECOND identical safe-refused
 #      is named a repeat in the audit row.
 ROOT="$WORK/g1e"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
@@ -4269,14 +4944,18 @@ rc=$(gate_run "$ROOT" CC_AUTO_GATE_DEFER_STREAK_ALERT=3 CC_AUTO_RESTART_INLINE=1
 #    and (O5) that an unreadable age fails toward DEFER. A test that only
 #    proves the hatch opens is a test of the half that is safe to get wrong.
 #
-#    A restart-path PR is the PROXY arm used to drive it: it is the arm that
-#    produced 5 of this nexus's 10 recorded deferrals.
+#    make_gate_restart_pr drives it through ARM 2b (active review): its PR is
+#    touched "now". It used to drive the RESTART-PATH arm, which produced 5 of
+#    this nexus's 10 recorded deferrals; since the #1526 follow-up that arm
+#    records and never defers, so the same stub's restart-path hit is only
+#    noted and the deferral every case below relies on comes from 2b — the
+#    one remaining `_gate_defer` arm.
 make_gate_restart_pr() {   # $1=root — one open PR touching a GATE_RESTART_PATHS file
     printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "monitor/watcher/main.sh"\n' > "$1/gate-pr"
     printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "$(date -Is)"\n' > "$1/gate-act"
     chmod +x "$1/gate-pr" "$1/gate-act"
 }
-gate_run_proxy() {   # $1=root, rest=env — drive the restart-path arm
+gate_run_proxy() {   # $1=root, rest=env — drive the proxy arm (2b; see above)
     local root="$1"; shift
     gate_run "$root" CC_AUTO_GATE_PR_CMD="$root/gate-pr" \
              CC_AUTO_GATE_PR_ACTIVITY_CMD="$root/gate-act" "$@"
@@ -4314,6 +4993,13 @@ done
 (( o1ok == 1 )) && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
     && pass "#1492 O1: under the cap a proxy arm still DEFERS (4 fires, nothing bumped, no override row)" \
     || fail "#1492 O1: the bound fired early or the gate mutated below the cap (rc=$rc)"
+# …and the counter those four fires left is 4: one bump per fire ACROSS fires.
+# The companion of O10 below (your-org/nexus-code#1602), which pins one bump
+# per fire WITHIN a fire — a fix that memoised too hard (never re-reading the
+# file) would pass O10 and fail here.
+[[ "$(tr -dc '0-9' < "$auto/gate-defer-streak" 2>/dev/null)" == 4 ]] \
+    && pass "#1602 O1b: four single-defer fires leave the streak at exactly 4 — one bump per fire across fires" \
+    || fail "#1602 O1b: four single-defer fires left streak=$(cat "$auto/gate-defer-streak" 2>/dev/null || echo absent), expected 4"
 
 # O2. At the cap the proxy arm's veto expires. Until 2026-09-12 the DIRECT
 #     board-not-quiet arm ran after it and still deferred (the load-bearing
@@ -4361,7 +5047,16 @@ make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
 auto="$ROOT/monitor/.state/cc-auto-update"
 rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
 (( rc == 30 )) || fail "#1492 O4 setup: first fire should defer (rc=$rc)"
-# Backdate the streak start past the age bound.
+# Backdate the streak start past the age bound. 90000 s is CHOSEN, not a default
+# and not derived from anything the gate ships: it is the bound (86400) plus a
+# 3600 s margin, and THAT MARGIN IS THIS CASE'S CLOCK RESOLUTION — it detects a
+# clock error larger than an hour and no smaller one. Stated because the number
+# was recoverable only by subtracting two literals a reader had to notice were
+# related (rtev skeptic, delta 6), and because a value nobody chose deliberately
+# is the one nobody re-derives. Widening the margin buys sensitivity to smaller
+# clock errors and costs nothing here; narrowing it toward 86400 sharpens this
+# case AND silently weakens the claim recorded on O5 below, so the two move
+# together.
 printf '%s\n' "$(( $(date +%s) - 90000 ))" > "$auto/gate-defer-streak-since"
 rm -f "$ROOT/monitor/.state/cc-version-local"
 rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400 CC_AUTO_RESTART_INLINE=1)
@@ -4380,20 +5075,221 @@ rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_M
 # O5. AN UNREADABLE AGE MUST NOT TRIP THE OVERRIDE. "I could not tell how long
 #     this has been blocked" is not "long enough" — the same rule this gate
 #     already applies to an unparseable PR timestamp.
+#
+#     THE BOUND MUST BE ONE THE WALL CLOCK CANNOT REACH (your-org/nexus-code#1570).
+#     This case ran at MAX_AGE_SECONDS=1, fired the gate twice and read only the
+#     SECOND rc. `_gate_defer` stamps `-since` with one `date +%s` and reads the
+#     age with another; when a second boundary falls between the two, the FIRST
+#     fire sees age=1 >= 1 and the override trips — CORRECTLY, the streak is one
+#     second old. The pin moves, the second fire is an already-pinned no-op at
+#     rc 0, and this case printed "opened the hatch" about a path it never
+#     reached: a red meaning "the safety override opened", in the dangerous
+#     direction, from a test parameter. Measured at d58bc49a, load ~27/36:
+#       * the subject's own bump+age pair, 2000 fresh streaks: age>=1 in 17
+#         (0.85%) — so roughly one execution in 120 went red by itself;
+#       * skewing the age reader's clock by 1 s (`mutation-gate.sh --subject`,
+#         prediction registered first) flips EXACTLY this case, with that
+#         message, and nothing else among 359 assertions.
+#     86400 is CHOSEN, not inherited: it is O4's bound, and no run of this suite
+#     lasts a day.
+#     AND WHAT STILL CONSTRAINS THE CLOCK AFTER THIS CHANGE IS O4, NOT THIS CASE
+#     (rtev skeptic, delta 6 — the claim was right, the stated grounds did not
+#     reach it). Raising this bound 1 -> 86400 removes O5 from the clock axis
+#     entirely: its asserted path plants `not-an-epoch`, whose empty digit string
+#     fails `_gate_defer_streak_age`'s shape check and RETURNS BEFORE `now` is
+#     ever read, so no clock skew reaches it at any magnitude. The mutation
+#     evidence cited for "no potency lost" (a `tr` axis kill, and a 1 s skew
+#     surviving) does not speak to the clock either. O4 does, with the 3600 s
+#     resolution named above. So: tighten O4's back-date toward its bound and
+#     this suite's clock coverage degrades with nothing else moving — which is
+#     exactly the coupling a correct claim with the wrong grounds would have
+#     hidden. Nothing is relaxed by it — a defect that reads garbage as a
+#     number yields an epoch near 0, an age near 1.8e9 s, and trips any bound.
+#     And the first fire is now ASSERTED, as O4's is, so a setup that did not
+#     defer is reported as setup and never again as the hatch opening.
 ROOT="$WORK/o5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
 make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
 auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=1)
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
+(( rc == 30 )) || fail "#1492 O5 setup: first fire should defer (rc=$rc)"
 printf 'not-an-epoch\n' > "$auto/gate-defer-streak-since"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=1)
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
+# THE MESSAGE REPORTS WHAT WAS OBSERVED. The old text named a cause ("'could not
+# tell' became 'long enough'") that this arm cannot establish: rc alone does not
+# say WHICH fire cleared the gate, and that is how #1570 read as a product
+# regression for a day.
 (( rc == 30 )) && gate_unmutated "$ROOT" \
     && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
     && pass "#1492 O5: an unreadable streak age does NOT trip the override — it defers (rc=30)" \
-    || fail "#1492 O5: 'could not tell' became 'long enough' and opened the hatch (rc=$rc)"
+    || fail "#1492 O5: the gate did not defer on an unreadable streak age (rc=$rc; override row: $(grep -c 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null || true); -since now: $(cut -c1-40 "$auto/gate-defer-streak-since" 2>/dev/null | tr -d '\n'))"
+
+# O5b. A DATE-ONLY STAMP DOES NOT TRIP THE OVERRIDE (your-org/nexus-code#1603).
+#      End to end, because the issue's trip was DERIVED (the age the function
+#      returned vs the bound), not demonstrated. `tr -dc '0-9'` used to launder
+#      `2026-09-19` into the epoch 20260919 (1970-08-23), an age of ~56 years
+#      that clears the production bound: the second fire overrode and the pin
+#      moved. Same shape as O5, so it inherits O5's reasoning about the bound
+#      (86400, which no run reaches); only the planted bytes differ, and they
+#      are the one input O5's `not-an-epoch` could never have caught — it has
+#      no digits to launder.
+ROOT="$WORK/o5b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
+make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
+auto="$ROOT/monitor/.state/cc-auto-update"
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
+(( rc == 30 )) || fail "#1603 O5b setup: first fire should defer (rc=$rc)"
+printf '2026-09-19\n' > "$auto/gate-defer-streak-since"
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
+(( rc == 30 )) && gate_unmutated "$ROOT" \
+    && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
+    && pass "#1603 O5b: a date-only streak stamp does NOT trip the override — it defers (rc=30)" \
+    || fail "#1603 O5b: a date-only streak stamp opened the override (rc=$rc; override rows: $(grep -c 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null || true))"
+
+# O5c. THE AGE READER, ROW BY ROW (your-org/nexus-code#1603). Every row of the
+#      issue's measured table plus the edges the fix adds, driven through the
+#      SUBJECT'S OWN FUNCTION TEXT — extracted from $APPLY, not re-typed, so a
+#      mutation of the file reaches it. A full gate run per row would cost ~2
+#      gate fires each for a question about one pure function (#1474 is why
+#      this suite counts seconds). O5b above is the end-to-end witness that
+#      the reader's answer is what the override actually consumes.
+#      "empty" is the SAFE answer: the caller reads it as "age bound not met".
+age_fn=$(awk '/^_gate_defer_streak_age\(\) \{/,/^}/' "$APPLY")
+if [[ "$age_fn" != *'_gate_defer_streak_age()'* ]]; then
+    fail "#1603 O5c fixture: could not extract _gate_defer_streak_age from $APPLY (every row below would pass on an absent function)"
+else
+    o5c_age() {   # $1 = stamp bytes for printf %b ('' = empty file)
+        local d="$WORK/o5c"; mkdir -p "$d"
+        printf '%b' "$1" > "$d/gate-defer-streak-since"
+        AUTO_DIR="$d" bash -c "$age_fn"$'\n''_gate_defer_streak_age'
+    }
+    o5c_now=$(date +%s)
+    # POSITIVE CONTROLS FIRST — a reader that returns empty for EVERYTHING
+    # passes every refusal row, so the refusals mean nothing until these hold.
+    o5c_real=$(o5c_age "$(( o5c_now - 1000 ))\n")
+    [[ "$o5c_real" =~ ^[0-9]+$ ]] && (( o5c_real >= 1000 && o5c_real < 1100 )) \
+        && pass "#1603 O5c: a real epoch 1000 s old reads as ~1000 s (positive control)" \
+        || fail "#1603 O5c: a real epoch 1000 s old read as '${o5c_real}'"
+    o5c_real=$(o5c_age '1789000000\n')
+    [[ "$o5c_real" =~ ^[0-9]+$ ]] && (( o5c_real == o5c_now - 1789000000 || o5c_real == o5c_now + 1 - 1789000000 )) \
+        && pass "#1603 O5c: the issue's real-epoch row (1789000000) still yields its age — it trips, CORRECTLY" \
+        || fail "#1603 O5c: 1789000000 read as '${o5c_real}'"
+    o5c_real=$(o5c_age "  $(( o5c_now - 1000 ))  \n\n")
+    [[ "$o5c_real" =~ ^[0-9]+$ ]] \
+        && pass "#1603 O5c: surrounding whitespace is stripped — only the bytes between are validated" \
+        || fail "#1603 O5c: a whitespace-padded real epoch read as '${o5c_real}'"
+    # REFUSALS — each must read EMPTY. The date-only row is the one that
+    # FLIPS: it read ~1.77e9 s before the fix.
+    while IFS='|' read -r o5c_stamp o5c_why; do
+        o5c_out=$(o5c_age "$o5c_stamp")
+        [[ -z "$o5c_out" ]] \
+            && pass "#1603 O5c: $o5c_why reads EMPTY (cannot trip)" \
+            || fail "#1603 O5c: $o5c_why read as age '${o5c_out}' — a non-epoch became a trippable age"
+    done <<'O5C'
+2026-09-19\n|a date-only stamp 2026-09-19 (the row that TRIPPED)
+2026-09-19T16:28:00-07:00\n|a full ISO timestamp
+not-an-epoch\n|a non-numeric stamp
+|an empty file
+20260919\n|a digits-only date 20260919 (below the 2020 sanity floor)
+1500000000\n|a well-formed epoch before the 2020 sanity floor
+01789000000\n|a leading-zero stamp (bash arithmetic would read it as octal)
+1789 000000\n|a stamp with interior whitespace
+1789000000\n1789000001\n|a two-line stamp
+99999999999999999999999\n|a 23-digit stamp (would wrap int64 silently)
+O5C
+fi
+
+# O5d. A DATE-ONLY STREAK COUNT DOES NOT TRIP THE OVERRIDE (your-org/nexus-code#1603,
+#      skeptic item 7 on #1626). The age stamp stopped laundering its bytes;
+#      its sibling, the COUNT, still read through `tr -dc '0-9'`, so a
+#      hand-typed `2026-09-19` in `gate-defer-streak` became 20260919 — at or
+#      above any cap — and the next deferral overrode. End to end at the
+#      production-shaped cap 3, with no `-since` (the bump writes a fresh one,
+#      so the AGE bound cannot be what fires). O2 is the positive control: a
+#      REAL streak at the cap does override.
+ROOT="$WORK/o5d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
+make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
+auto="$ROOT/monitor/.state/cc-auto-update"
+gate_seed_streak "$ROOT" "2026-09-19"
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3)
+(( rc == 30 )) && gate_unmutated "$ROOT" \
+    && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
+    && [[ "$(cat "$auto/gate-defer-streak" 2>/dev/null)" == 1 ]] \
+    && pass "#1603 O5d: a date-only streak COUNT does NOT trip the override — it defers and restarts the streak at 1" \
+    || fail "#1603 O5d: a date-only streak count opened the override or kept its value (rc=$rc; streak now: $(cat "$auto/gate-defer-streak" 2>/dev/null || echo absent))"
+
+# O5e. THE COUNT READER, ROW BY ROW — the O5c method, on
+#      `_gate_defer_streak_bump` extracted from $APPLY. The answer is the
+#      streak the bump RECORDS for this fire: a readable count N gives N+1;
+#      anything else must give 1 (a new streak), never a large number.
+bump_fn=$(awk '/^_gate_defer_streak_bump\(\) \{/,/^}/' "$APPLY")
+if [[ "$bump_fn" != *'_gate_defer_streak_bump()'* ]]; then
+    fail "#1603 O5e fixture: could not extract _gate_defer_streak_bump from $APPLY (every row below would pass on an absent function)"
+else
+    o5e_bump() {   # $1 = count bytes for printf %b ('' = empty file)
+        local d="$WORK/o5e"; rm -rf "$d"; mkdir -p "$d"
+        printf '%b' "$1" > "$d/gate-defer-streak"
+        AUTO_DIR="$d" bash -c "_gate_defer_run_streak=''"$'\n'"$bump_fn"$'\n''_gate_defer_streak_bump; printf "%s" "$_gate_defer_run_streak"'
+    }
+    # POSITIVE CONTROLS FIRST — a reader that restarts EVERY streak passes
+    # every refusal row below, so those mean nothing until these hold.
+    while IFS='|' read -r o5e_count o5e_want o5e_why; do
+        o5e_out=$(o5e_bump "$o5e_count")
+        [[ "$o5e_out" == "$o5e_want" ]] \
+            && pass "#1603 O5e: $o5e_why continues the streak (positive control)" \
+            || fail "#1603 O5e: $o5e_why recorded streak '${o5e_out}', expected $o5e_want"
+    done <<'O5E_OK'
+2\n|3|a real count 2
+  5  \n\n|6|a whitespace-padded count 5
+999999\n|1000000|a six-digit count (the bound, inclusive)
+O5E_OK
+    # REFUSALS — each must restart at 1. The date-only row is the one that
+    # FLIPS: it recorded 20260920 before the fix.
+    while IFS='|' read -r o5e_count o5e_why; do
+        o5e_out=$(o5e_bump "$o5e_count")
+        [[ "$o5e_out" == 1 ]] \
+            && pass "#1603 O5e: $o5e_why restarts the streak at 1 (cannot trip)" \
+            || fail "#1603 O5e: $o5e_why recorded streak '${o5e_out}' — a non-count became a trippable streak"
+    done <<'O5E_BAD'
+2026-09-19\n|a date-only count 2026-09-19 (the row that TRIPPED)
+20260919\n|a digits-only date 20260919 (over the six-digit bound)
+1234567\n|a seven-digit count
+03\n|a leading-zero count (bash arithmetic would read it as octal)
+2 3\n|a count with interior whitespace
+2\n3\n|a two-line count
+not-a-count\n|a non-numeric count
+|an empty file
+O5E_BAD
+fi
+
+# O10. ONE BUMP PER GATE RUN, WITHIN A FIRE (your-org/nexus-code#1602). The
+#      memo in `_gate_defer_streak_bump` was assigned inside `$(…)`, so it
+#      never reached the parent and the SECOND `_gate_defer` of a fire bumped
+#      again. Two defers in one fire WERE reachable here: both proxy arms hit
+#      (restart-path PR 991 and active-review PR 991). SINCE THE #1526
+#      FOLLOW-UP THEY ARE NOT: the restart-path arm records and never calls
+#      `_gate_defer`, so 2b is the only deferring arm and one fire can bump at
+#      most once by construction. The memo fix stays; this case now pins the
+#      reachable shape — seed 2, cap 3: exactly ONE override row, at streak=3,
+#      and the restart-path hit only NOTED. If a second deferring arm is ever
+#      added, restore the two-row form.
+ROOT="$WORK/o10"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
+make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
+auto="$ROOT/monitor/.state/cc-auto-update"
+gate_seed_streak "$ROOT" 2
+rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3 CC_AUTO_RESTART_INLINE=1)
+o10_rows=$(grep -F 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null)
+o10_n=$(grep -c . <<<"$o10_rows")
+o10_3=$(grep -c 'streak=3 ' <<<"$o10_rows")
+(( rc == 0 )) && [[ -n "$o10_rows" ]] && (( o10_n == 1 && o10_3 == 1 )) \
+    && grep -q $'\trestart-path-pr-noted\tpr=PR991' "$auto/decisions.tsv" \
+    && pass "#1602/#1526 O10: one deferring arm per fire now — ONE override row at streak=3 from a seed of 2; the restart-path hit only noted" \
+    || fail "#1602/#1526 O10: expected rc 0 and 1 override row at streak=3; got rc=$rc rows=$o10_n at-3=$o10_3: $(tr '\n' ' ' <<<"$o10_rows")"
 
 # O6. THE STREAK IS GLOBAL, NOT PER-ARM — pin the consequence, since it is the
-#     one that surprises. A streak earned on the RESTART-PATH arm expires the
-#     ACTIVE-REVIEW arm on that arm's FIRST EVER fire. Deliberate (the board
+#     one that surprises. A streak earned on ANOTHER arm expires the
+#     ACTIVE-REVIEW arm on that arm's FIRST EVER fire. (The seed below stood
+#     for restart-path deferrals; since the #1526 follow-up that arm no longer
+#     defers, so the seed stands for whatever produced the streak — the file
+#     carries no arm, which is the property pinned.) Deliberate (the board
 #     demonstrably hops between arms and a per-arm counter would never reach a
 #     cap) but untested until the w231sk skeptic pass asked for it: a doctrine
 #     that is per-arm and a counter that is global is exactly the kind of
@@ -4412,7 +5308,7 @@ rm -f "$ROOT/monitor/.state/cc-version-local"
 rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3 CC_AUTO_RESTART_INLINE=1)
 (( rc == 0 )) && [[ -f "$ROOT/monitor/.state/cc-version-local" ]] \
     && grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1492 O6: the streak is GLOBAL — 2 deferrals on the restart-path arm expire the active-review arm on its first fire (pre-streak=$o6_pre, rc=0, pin moved)" \
+    && pass "#1492 O6: the streak is GLOBAL — a seeded streak of 2 expires the active-review arm on its first fire (pre-streak=$o6_pre, rc=0, pin moved)" \
     || fail "#1492 O6: cross-arm streak behaviour is not what the doctrine says (pre-streak=$o6_pre rc=$rc)"
 
 # O7. A PIN THAT MOVES ENDS THE STREAK, WHICHEVER PATH MOVED IT. `--no-restart`
@@ -4532,7 +5428,7 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
 rc=$?
 kill "$g4_p1" "$g4_p2" 2>/dev/null; wait "$g4_p1" "$g4_p2" 2>/dev/null
 auto="$ROOT/monitor/.state/cc-auto-update"
-if (( rc == 31 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+if (( rc == 31 )) && ! grep -q "kill-window -t :=orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-invariant-violated\t' "$auto/decisions.tsv"; then
     pass "duplicate watcher groups post-restart → invariant violation (rc 31, no Step 5b)"
 else
@@ -4885,7 +5781,11 @@ if make_gate_clone "$ROOT" 5; then
        && grep -q "checked out on $_g5a_head, not dev" <<<"$out" \
        && grep -q 'align monitor.integration_branch' <<<"$out" \
        && ! grep -q 'git checkout' <<<"$out"; then
-        pass "#1529 mismatch NOTE fires (HEAD=$_g5a_head, measured dev) and prescribes no checkout"
+        # The branch name is git's init.defaultBranch — `master` on one host,
+        # `main` on another — so it rides on a note, not in the label (#1574:
+        # a label is a name, and a label that varies by host re-pairs cases).
+        printf '  note: #1529 fixture HEAD branch %s\n' "$_g5a_head"
+        pass "#1529 mismatch NOTE fires (fixture HEAD is not the measured dev) and prescribes no checkout"
     else
         # `grep -m2`, NOT `grep … | head -2`: the latter is a new early-exit
         # reader (#622/#682) and would move the checked population in
@@ -5501,8 +6401,16 @@ sed -i 's/ dirty_tracked=0 / dirty_tracked=1 /' "$ROOT/gate.log"
 # would leave dirty_tracked=0 and this case would pass for the wrong reason.
 grep -q ' dirty_tracked=1 ' "$ROOT/gate.log" \
     || fail "#1320 t22 fixture not applied -- the case below would prove nothing"
-env $(apply_env "$ROOT") bash "$APPLY" safe --candidate 2.1.160 \
-    --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
+# your-org/nexus-code#1475: gate.sh now names the tracked files on a SEPARATE
+# `gated-tree-tracked:` line, and the refusal and its notification must carry
+# them instead of blaming the gate. A PATH-front `sandbox-notify` stub records
+# the notification text (the suite-wide NEXUS_NOTIFY_QUIET silences the real one).
+printf '=== gated-tree-tracked: CLAUDE.md, monitor/t22-edited.sh ===\n' >> "$ROOT/gate.log"
+mkdir -p "$ROOT/nbin"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s/notify.log"\n' "$ROOT" > "$ROOT/nbin/sandbox-notify"
+chmod +x "$ROOT/nbin/sandbox-notify"
+env $(apply_env "$ROOT") PATH="$ROOT/nbin:$PATH" bash "$APPLY" safe --candidate 2.1.160 \
+    --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) > "$ROOT/out.log" 2>&1
 rc=$?
 # EXACT match, not a PREFIX (#1320 skeptic Q2): `gate-evidence:gated-tree-dirty`
 # is a proper prefix of `gate-evidence:gated-tree-dirty-field-missing`, so the
@@ -5511,6 +6419,24 @@ if (( rc == 3 )) && grep -qE 'gate-evidence:gated-tree-dirty([^-]|$)' "$auto/dec
     pass "#1320 a TRACKED modification (dirty_tracked=1) still REFUSES the bump"
 else
     fail "#1320 tracked-dirty must refuse: rc=$rc row=$(tail -1 "$auto/decisions.tsv" 2>/dev/null)"
+fi
+# The ledger detail is UNCHANGED (it selects: the #1400 streak keys on it) —
+# the file list rides in the note and the notification only.
+if [[ "$(awk -F'\t' '$3=="safe-refused"{d=$4} END{print d}' "$auto/decisions.tsv" 2>/dev/null)" == "gate-evidence:gated-tree-dirty" ]]; then
+    pass "#1475 the ledger detail stays exactly gate-evidence:gated-tree-dirty (no path list in a SELECTING field)"
+else
+    fail "#1475 ledger detail changed: $(tail -1 "$auto/decisions.tsv" 2>/dev/null)"
+fi
+if grep -qF 'edit(s) block the bump: CLAUDE.md, monitor/t22-edited.sh' "$ROOT/out.log"; then
+    pass "#1475 the refusal NAMES the tracked files"
+else
+    fail "#1475 refusal does not name the files: $(grep -F REFUSED "$ROOT/out.log" | tail -1)"
+fi
+if [[ -s "$ROOT/notify.log" ]] && grep -qF 'monitor/t22-edited.sh' "$ROOT/notify.log" \
+   && ! grep -qF 'defect in the gate' "$ROOT/notify.log"; then
+    pass "#1475 the notification names the files and does NOT call a local edit 'a defect in the gate'"
+else
+    fail "#1475 notification: $(cat "$ROOT/notify.log" 2>/dev/null || echo '<none sent>')"
 fi
 
 # (t23) THE DEADLOCK CASE, end to end. `dirty=1 untracked=21 dirty_tracked=0`
@@ -5538,7 +6464,9 @@ echo "== #1438: --no-restart / --no-orchestrator-restart × gate × reconcile ×
 #     skipped. The deferring input is a LIVE RESTART-PATH PR (the D13 change of
 #     2026-09-12 removed the live-window count arm this case used to lean on —
 #     3 agents > max 2 no longer defers anything, so it can no longer tell a
-#     skipped gate from a cleared one).
+#     skipped gate from a cleared one). Since the #1526 follow-up the
+#     restart-path hit is only NOTED; the deferral comes from arm 2b, because
+#     the same PR is touched "now" (pr-under-active-review=PR991).
 h1438_pr_stubs() {   # $1=root — one open PR touching a GATE_RESTART_PATHS file, touched now
     printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "monitor/watcher/main.sh"\n' > "$1/h1438-pr"
     printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "$(date -Is)"\n' > "$1/h1438-act"

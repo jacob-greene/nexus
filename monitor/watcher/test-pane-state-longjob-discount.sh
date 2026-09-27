@@ -95,6 +95,26 @@ ledger "win-ljw" $(( NOW - 10 )) 0 $$ "$MYST" "other-window"
 [[ "$(state_of)" == working-background ]] && ok "F2: a win- ledger naming ANOTHER window (a foreign dispatcher's file) → NOT discounted" || bad "F2 foreign: $(state_of)"
 ledger "win-ljw" $(( NOW - 10 )) 0
 
+echo "=== #1542: the win- key is ENCODED by its writer, so the reader must encode it too ==="
+# longjob-watch.sh writes the spool under `win-$(_wk_encode "$win")`; pane-state
+# read `win-$win` RAW. For a name inside [A-Za-z0-9_-] the two agree, which is
+# why every case above passed and why it never fired on the board. PREDICTED FLIP
+# for "revert the reader to the raw key": the first row goes working-background;
+# the two controls do not move.
+jq -n --argjson now "$NOW" '{window:"lj.w", state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
+rm -rf "$NEXUS_STATE_DIR/longjob"
+ledger "win-lj%2Ew" $(( NOW - 10 )) 0 $$ "$MYST" "lj.w"
+[[ "$(state_of)" == idle ]] && ok "#1542: window 'lj.w', no session_id → the ledger under the ENCODED key win-lj%2Ew is found → idle" || bad "#1542 encoded key: $(state_of)"
+rm -rf "$NEXUS_STATE_DIR/longjob"
+ledger "win-lj.w" $(( NOW - 10 )) 0 $$ "$MYST" "lj.w"
+[[ "$(state_of)" == working-background ]] && ok "#1542 control: a ledger under the RAW spelling is one no writer produces → NOT discounted (one spelling, the writer's)" || bad "#1542 raw key: $(state_of)"
+rm -rf "$NEXUS_STATE_DIR/longjob"
+ledger "win-lj%2Ew" $(( NOW - 10 )) 0 $$ "$MYST" "other"
+[[ "$(state_of)" == working-background ]] && ok "#1542 control: the encoded key still must NAME this window (a foreign dispatcher's file is not ours)" || bad "#1542 foreign under encoded key: $(state_of)"
+rm -rf "$NEXUS_STATE_DIR/longjob"
+jq -n --argjson now "$NOW" '{window:"ljw", state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
+ledger "win-ljw" $(( NOW - 10 )) 0
+
 echo "=== the discount is at most ONE handle ==="
 sed 's/1 monitor/2 monitor/g' "$FIX" > "$WORK/two.ansi"
 out=$("$PS" --fixture "$WORK/two.ansi" --name ljw --heartbeat-file "$HB" --now "$NOW" --heartbeat-staleness 100000 --heartbeat-turn-end-staleness 100000 --heartbeat-async-staleness 100000 2>/dev/null | sed -n 's/^state=\([^ ]*\).*/\1/p' | head -1)
@@ -124,8 +144,20 @@ echo "=== the PROCESS-TREE channel: the dispatcher's root is EXCLUDED from the c
 jq -n --arg s "$SID" --argjson now "$NOW" '{window:"ljw", session_id:$s, state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
 rm -rf "$NEXUS_STATE_DIR/longjob"
 _pt_ok=0; _pt_h_dir="$WORK/hbin"; mkdir -p "$_pt_h_dir"; _PT_ROOTS=()
-# BOTTOM-UP: a parent killed first reparents its children to init, out of reach.
-_pt_killtree() { local p="$1" k; for k in $(pgrep -P "$p" 2>/dev/null); do _pt_killtree "$k"; done; kill "$p" 2>/dev/null; }
+# BOTTOM-UP: a parent killed first reparents its children to init, out of reach —
+# and out of reach for good: a foreground tool call is its own session, so what
+# it orphans is refused by proc-kill-authorized as not-owned (your-org/nexus-code#1543).
+# FROZEN FIRST, top-down: a poll loop that is merely killed bottom-up re-forks a
+# child between the walk and its own kill (the real dispatcher below forks a
+# `sleep` per poll); a STOPPED process cannot fork, so the second walk is
+# complete. SIGKILL, because a stopped process does not act on SIGTERM.
+_pt_tree() { local p="$1" k; printf '%s\n' "$p"; for k in $(pgrep -P "$p" 2>/dev/null); do _pt_tree "$k"; done; }
+_pt_killtree() {
+    local p
+    for p in $(_pt_tree "$1"); do kill -STOP "$p" 2>/dev/null; done
+    for p in $(_pt_tree "$1" | tac); do kill -KILL "$p" 2>/dev/null; done
+    wait "$1" 2>/dev/null
+}
 _pt_cleanup() { local p; for p in "${_PT_ROOTS[@]:-}"; do [[ -n "$p" ]] && _pt_killtree "$p"; done; }
 trap 'declare -F _pt_cleanup >/dev/null && _pt_cleanup; rm -rf "$WORK"' EXIT
 _pt_st() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
@@ -135,6 +167,15 @@ _pt_spawn() {   # <script for the fake claude> → sets _pt_claude
     "$_pt_h_dir/claude" -c "$1" >/dev/null 2>&1 &
     _pt_claude=$!; _PT_ROOTS+=("$_pt_claude")
 }
+# EXTENDING THIS FILE? Read a /proc file INSIDE A BRACE GROUP that carries the suppression:
+#     $( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null )
+# Redirections run left to right, so in the obvious spelling (the `<` first, `2>/dev/null` last) a pid
+# that vanished mid-walk prints the very `No such file` diagnostic the suppression was meant to catch
+# (your-org/nexus-code#1305). The grouped form is this repo's standard because it is ORDER-INDEPENDENT:
+# "put 2>/dev/null first" is a rule somebody can get backwards, a brace group cannot be written in the
+# wrong order. This file grew four leaking sites BY IMITATION — two from the bundle that created it, two
+# from the next author copying them — and `test-proc-redirect-order.sh` is a ratchet on the construct:
+# it counts instances and cannot tell you what to write. This note can.
 _pt_find_disp() {   # <claude pid> → the INNER dispatcher bash: a grandchild, under a wrapper shell
     local w d i
     for i in $(seq 1 80); do
@@ -164,6 +205,11 @@ if (( _pt_ok == 1 )); then
     ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d1" "$_pt_s1"
     out=$(_pt_run "$_pt_c1")
     [[ "$out" == state=idle* ]] && ok "K1 PRODUCTION SHAPE: the ledger names the GRANDCHILD dispatcher (pid + start ticks), armed, 0 active → idle" || bad "K1: $out"
+    # #1546 (sk3 N1): THE VERDICT MUST NOT DESTROY THE EVIDENCE THAT PRODUCED IT.
+    # This `idle` exists BECAUSE a root was excluded, and the line said nothing.
+    [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* && "$out" != *"bg_shells="* && "$out" != *"bg_cpu="* ]] \
+        && ok "#1546: the idle line the exclusion DECIDED carries bg_longjob=1 — and no bg_shells=/bg_cpu= (nothing for a reader keyed on those to select)" \
+        || bad "#1546 idle record: $out"
     ledger "sid-$SID" $(( NOW - 10 )) 0 "$$" "$MYST"
     out=$(_pt_run "$_pt_c1")
     [[ "$out" == state=working-background* && "$out" == *"bg_shells=1"* && "$out" == *"bg_longjob=0"* ]] \
@@ -183,6 +229,14 @@ if (( _pt_ok == 1 )); then
     [[ "$out" == state=working-background* && "$out" != *"bg_shells="* && "$out" != *"bg_cpu="* ]] \
         && ok "active>0: working-background with NO bg_shells/bg_cpu on the line — the idle probe never ages a Monitor-style wait out (pre-fix: bg_shells=1 bg_cpu=…, the shell grace cap)" \
         || bad "active>0 semantics: $out"
+    [[ "$out" == *" bg_longjob=1"* && "$out" == *" bg_longjob_watches=1"* ]] \
+        && ok "#1546: the Monitor-held line records the excluded root AND the live-watch count holding it (bg_longjob=1 bg_longjob_watches=1)" \
+        || bad "#1546 monitor-held record: $out"
+    # The READER AUDIT for this line is executed further down, inside rig 2, where
+    # both production readers are ALREADY lifted by name — a second lift here would
+    # add two process-substitution `source` tokens that
+    # test-ambient-shell-option-scope.sh cannot resolve, and its manifest is a ratchet.
+    _1546_mon_line="$out"
     sed 's/1 monitor//g' "$FIX" > "$WORK/nofoot.ansi"
     out=$(_PT_FIX="$WORK/nofoot.ansi" _pt_run "$_pt_c1")
     [[ "$out" == state=working-background* && "$out" != *"bg_shells="* ]] \
@@ -200,14 +254,20 @@ if (( _pt_ok == 1 )); then
     [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=1"* && "$(_pt_field "$out" bg_cmd)" == *sleep_30* ]] \
         && ok "K2: dispatcher + ONE real shell → working-background bg_shells=1 (the real one) bg_longjob=1, and bg_cmd NAMES the real shell" \
         || bad "K2: $out"
+    [[ "$out" == state=working-background* && "$out" != *"bg_longjob_kept="* ]] \
+        && ok "#1627 control: the real shell kept beside an EXCLUDED dispatcher is not a dispatcher → no bg_longjob_kept" \
+        || bad "#1627 K2 control: $out"
 
     echo "--- K3: a STATIC real shell beside the churning dispatcher reads STATIC (#1460) ---"
     mkfifo "$WORK/fifo"
     _pt_spawn "$_PT_DISP & bash -c 'read x < $WORK/fifo; true' & sleep 240"; _pt_c3="$_pt_claude"
     _pt_d3=$(_pt_find_disp "$_pt_c3"); ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d3" "$(_pt_st "$_pt_d3")"
     a=$(_pt_run "$_pt_c3"); sleep 2.5; b=$(_pt_run "$_pt_c3")
+    # The digest is per-run, so it rides on a note, never in the label (#1574:
+    # a label that changes between runs re-pairs cases in mutation-gate).
+    printf '  note: K3 bg_members digest %s\n' "$(_pt_field "$a" bg_members)"
     [[ "$a" == *"bg_shells=1 "* && -n "$(_pt_field "$a" bg_members)" && "$(_pt_field "$a" bg_members)" == "$(_pt_field "$b" bg_members)" ]] \
-        && ok "K3: bg_members identical across two samples 2.5 s apart ($(_pt_field "$a" bg_members)) — the dispatcher's per-poll sleep is not a member (pre-fix: CHANGED every sample)" \
+        && ok "K3: bg_members identical across two samples 2.5 s apart — the dispatcher's per-poll sleep is not a member (pre-fix: CHANGED every sample)" \
         || bad "K3 members: '$(_pt_field "$a" bg_members)' vs '$(_pt_field "$b" bg_members)' | $a"
     [[ "$(_pt_field "$a" bg_cmd)" == *read_x* ]] && ok "K3: bg_cmd names the blocked shell, not the dispatcher" || bad "K3 bg_cmd: $(_pt_field "$a" bg_cmd)"
 
@@ -244,8 +304,19 @@ if (( _pt_ok == 1 )); then
         [[ "$_sh" =~ ^[0-9]+$ && "$_inf" =~ ^[0-9]+$ ]] && (( _sh - _inf <= 0 )) && (( _inf >= 1 )) \
             && ok "rig 2: the idle probe's case (b0) predicate holds — task_shells = $_sh − $_inf ≤ 0 with infra ≥ 1, read through its own _idle_pane_line_field" \
             || bad "rig 2 b0: bg_shells=$_sh bg_infra=$_inf"
+        # #1546 READER AUDIT, EXECUTED on the Monitor-held line captured above:
+        # cc-update separates the Monitor flavour from the shell flavour by the
+        # PRESENCE of `bg_cpu=`, and both readers take `active=` — one of them
+        # unanchored and greedy, so a field ENDING in `active=` would silently
+        # become the window-active flag.
+        [[ "$(_restart_line_field "$_1546_mon_line" active)" == 0 && "$(_idle_pane_line_field "$_1546_mon_line" active)" == 0 ]] \
+            && ok "#1546: both production readers still read the WINDOW's active=0 off the Monitor-held line (the new field does not end in 'active=')" \
+            || bad "#1546 active= reader: restart='$(_restart_line_field "$_1546_mon_line" active)' idle-probe='$(_idle_pane_line_field "$_1546_mon_line" active)' | $_1546_mon_line"
+        [[ -z "$(_idle_pane_line_field "$_1546_mon_line" bg_shells)" && -z "$(_restart_line_field "$_1546_mon_line" bg_cpu)" ]] \
+            && ok "#1546: …and neither reads a bg_shells or a bg_cpu off it" \
+            || bad "#1546 bg readers: $_1546_mon_line"
     else
-        bad "rig 2: a consumer function could not be lifted by name (renamed?) — the two assertions above it did not run"
+        bad "rig 2: a consumer function could not be lifted by name (renamed?) — the two assertions above it AND the #1546 reader audit did not run"
     fi
 
     echo "--- K4 (sk2 F2): the root must be a shell BELOW claude; a launcher shell ABOVE claude vouches for nothing ---"
@@ -267,6 +338,175 @@ if (( _pt_ok == 1 )); then
     else
         bad "K4: the rig did not come up (pane=$_pt_p4 launcher=$_pt_l4 claude=$_pt_c5) — the F2 case is unmeasured"
     fi
+    echo "--- #1547 (sk3 D3): hop 1 is the DISPATCHER, and the dispatcher is a SHELL ---"
+    # A ledger pid that is not a shell — what a dispatcher that EXEC'd into
+    # something else would look like (pid and ticks kept). PREDICTED FLIP for
+    # "delete the hop-1 shell check": this row goes `idle`; nothing else moves.
+    _pt_spawn "bash -c 'sleep 300; true' & sleep 240"; _pt_c6="$_pt_claude"; _pt_x6=""
+    for _i in $(seq 1 80); do
+        for _w in $(pgrep -P "$_pt_c6" -x bash 2>/dev/null); do
+            for _k in $(pgrep -P "$_w" -x sleep 2>/dev/null); do [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == "sleep 300 " ]] && _pt_x6="$_k"; done
+        done
+        [[ -n "$_pt_x6" ]] && break; sleep 0.25
+    done
+    if [[ -n "$_pt_x6" ]]; then
+        ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_x6" "$(_pt_st "$_pt_x6")"
+        out=$(_pt_run "$_pt_c6")
+        [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=0"* ]] \
+            && ok "#1547 D3: the ledger names a live NON-shell (comm sleep) under a wrapper shell → nothing excluded → working-background bg_shells=1 (pre-fix: idle)" \
+            || bad "#1547 D3: $out"
+    else
+        bad "#1547 D3: the rig did not come up — the case is unmeasured"
+    fi
+
+    echo "--- #1544 (sk3 F1, rig 4) KILL DIRECTION: a root that holds a CO-TENANT is never excluded ---"
+    # A tool shell that runs a dispatcher AND real work: `… dispatch & sleep 600`.
+    # The ledger names that dispatcher. Excluding its root WHOLE removed the
+    # `sleep 600` with it: `idle` over live work. PREDICTED FLIP for "delete the
+    # co-tenant loop": both rows go `idle`; K1 (a wrapper with no co-tenant)
+    # stays `idle` either way, which is what makes it the control.
+    _pt_spawn "bash -c 'bash -c \"while :; do sleep 1; done\" & sleep 600; true' & sleep 240"; _pt_c7="$_pt_claude"
+    if _pt_d7=$(_pt_find_disp "$_pt_c7"); then
+        ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d7" "$(_pt_st "$_pt_d7")"
+        out=$(_pt_run "$_pt_c7")
+        [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=0"* && "$(_pt_field "$out" bg_cmd)" != "-" ]] \
+            && ok "#1544 rig 4: dispatcher + 'sleep 600' in ONE tool shell, ledger armed, 0 active → working-background bg_shells=1 bg_longjob=0 (pre-fix: idle over the live job)" \
+            || bad "#1544 rig 4: $out"
+    else
+        bad "#1544 rig 4: the rig did not come up — the KILL-DIRECTION case is unmeasured"
+    fi
+    # The co-tenant one level ABOVE the dispatcher's parent: every chain node up
+    # to the root is examined, not only the first.
+    _pt_spawn "bash -c 'bash -c \"bash -c \\\"while :; do sleep 1; done\\\"; true\" & sleep 600; true' & sleep 240"; _pt_c8="$_pt_claude"; _pt_d8=""
+    for _i in $(seq 1 80); do
+        for _w in $(pgrep -P "$_pt_c8" -x bash 2>/dev/null); do for _m in $(pgrep -P "$_w" -x bash 2>/dev/null); do for _k in $(pgrep -P "$_m" -x bash 2>/dev/null); do
+            [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == *"sleep 1;"* ]] && _pt_d8="$_k"
+        done; done; done
+        [[ -n "$_pt_d8" ]] && break; sleep 0.25
+    done
+    if [[ -n "$_pt_d8" ]]; then
+        ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d8" "$(_pt_st "$_pt_d8")"
+        out=$(_pt_run "$_pt_c8")
+        [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=0"* ]] \
+            && ok "#1544: the co-tenant sits TWO levels above the dispatcher (at the root, not at its parent) → still working-background" \
+            || bad "#1544 deep co-tenant: $out"
+    else
+        bad "#1544 deep co-tenant: the rig did not come up — unmeasured"
+    fi
+
+    echo "--- #1565 KILL DIRECTION: work forked UNDER a dispatcher that exec's — the REAL \`dispatch\`, the \`exec\` spelling ---"
+    # `sleep 600 & exec bash longjob-watch.sh dispatch`: `exec` keeps the pid, so
+    # the `sleep 600` becomes the DISPATCHER'S OWN CHILD. The dispatcher is then
+    # the root, there is no chain above it for the #1544 co-tenant loop to walk,
+    # and the pane read `idle` — kill-authorised — over the live job (measured at
+    # 02406fec with this rig's shape: idle, bk_pane_kill_authorized rc 0, 3 reads).
+    # The REAL script is used because the fix has two halves and a planted ledger
+    # tests only the reader: `cmd_dispatch` must RECORD `born_ticks`, and
+    # `_pane_longjob_root` must refuse a root whose dispatcher has a child at or
+    # before it.
+    #
+    # PREDICTED FLIP SET for "delete the born_ticks loop from _pane_longjob_root":
+    # E1 and E1b and S-old go `idle`. MUST NOT FLIP: E2 (an exec'd dispatcher
+    # with NO pre-exec child stays `idle`), S-young, S-legacy, and K1 above (a
+    # ledger with no `born_ticks` at all is read as it always was).
+    _LJ="$REPO_ROOT/monitor/longjob-watch.sh"
+    _lj_case() {   # <sid> <payload> → sets _lj_claude, _lj_hb, _lj_now; rc 1 when the dispatcher never armed
+        local sid="$1" payload="$2" led i
+        _lj_hb="$NEXUS_STATE_DIR/heartbeat/lj-$sid.json"; _lj_now=$(date -u +%s)
+        jq -n --arg s "$sid" --argjson now "$_lj_now" '{window:"ljw", session_id:$s, state:"idle", last_activity:$now, external_waits:[]}' > "$_lj_hb"
+        env -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW -u NEXUS_LONGJOB_KEY -u NEXUS_LONGJOB_SESSION_ID \
+            NEXUS_ROOT="$REPO_ROOT" CLAUDE_CODE_SESSION_ID="$sid" NEXUS_LONGJOB_WINDOW=ljw \
+            MONITOR_LONGJOB_POLL_SECONDS=5 MONITOR_LONGJOB_ENABLED=true _LJ="$_LJ" \
+            "$_pt_h_dir/claude" -c "$payload & sleep 240" >/dev/null 2>&1 &
+        _lj_claude=$!; _PT_ROOTS+=("$_lj_claude")
+        led="$NEXUS_STATE_DIR/longjob/sid-$sid/dispatcher.json"
+        for i in $(seq 1 160); do
+            [[ "$(jq -r '.service // ""' "$led" 2>/dev/null)" == polling ]] && { sleep 1; return 0; }
+            sleep 0.25
+        done
+        return 1
+    }
+    _lj_read() { _pt_run "$_lj_claude" --heartbeat-file "$_lj_hb" --now "$(date -u +%s)"; }
+    if _lj_case "e1e1e1e1-0000-4000-8000-000000001565" "bash -c 'sleep 600 & exec bash \$_LJ dispatch'"; then
+        _e1_led="$NEXUS_STATE_DIR/longjob/sid-e1e1e1e1-0000-4000-8000-000000001565/dispatcher.json"
+        _e1_bt=$(jq -r '.born_ticks // ""' "$_e1_led"); _e1_ps=$(jq -r '.pid_start // ""' "$_e1_led")
+        printf '  note: #1565 born_ticks %s pid_start %s\n' "$_e1_bt" "$_e1_ps"   # per-run: a note, not the label (#1574)
+        [[ "$_e1_bt" =~ ^[0-9]+$ && "$_e1_ps" =~ ^[0-9]+$ ]] && (( _e1_bt > _e1_ps )) \
+            && ok "#1565: the real dispatcher RECORDS born_ticks, and it is LATER than pid_start — exec kept the start ticks, which is why pid_start cannot date a pre-exec child" \
+            || bad "#1565 born_ticks: born_ticks='$_e1_bt' pid_start='$_e1_ps'"
+        out=$(_lj_read)
+        [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=0"* ]] \
+            && ok "#1565 E1: 'sleep 600 & exec … dispatch', armed, 0 active → working-background bg_shells=1 bg_longjob=0 (pre-fix: idle over the live job)" \
+            || bad "#1565 E1: $out"
+    else
+        bad "#1565 E1: the real dispatcher never armed — the KILL-DIRECTION case is unmeasured"
+    fi
+    if _lj_case "e1b1e1b1-0000-4000-8000-000000001565" "bash -c '(while :; do sleep 2; done) & exec bash \$_LJ dispatch'"; then
+        out=$(_lj_read)
+        [[ "$out" == state=working-background* && "$out" == *"bg_longjob=0"* ]] \
+            && ok "#1565 E1b: the pre-exec child is a SUBSHELL LOOP whose own children churn → still working-background (the child is dated, not named)" \
+            || bad "#1565 E1b: $out"
+    else
+        bad "#1565 E1b: the real dispatcher never armed — unmeasured"
+    fi
+    if _lj_case "e2e2e2e2-0000-4000-8000-000000001565" "bash -c 'exec bash \$_LJ dispatch'"; then
+        out=$(_lj_read); sleep 6; out2=$(_lj_read)
+        [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* && "$out2" == state=idle* ]] \
+            && ok "#1565 E2 MUST-NOT-FLIP: an exec'd dispatcher with NO pre-exec child → idle bg_longjob=1, on two reads 6 s apart (its per-poll sleep is YOUNGER than born_ticks across a re-fork)" \
+            || bad "#1565 E2: '$out' then '$out2'"
+        [[ "$out" == state=idle* && "$out" != *"bg_longjob_kept="* ]] \
+            && ok "#1627 MUST-NOT-FLIP: the ONE excluded dispatcher is not also recorded as kept" \
+            || bad "#1627 E2 kept: $out"
+    else
+        bad "#1565 E2: the real dispatcher never armed — the must-not-flip control is unmeasured"
+    fi
+
+    echo "--- #1627: a SECOND real dispatcher under the SAME live claude (refused by #1544) ---"
+    # The ledger names the first; the second waits, alive and polling nothing,
+    # for as long as the first lives — so its root stays a counted shell and the
+    # pane reads working-background for the life of the session, with nothing
+    # on the line to say why. THE VERDICT IS DELIBERATELY UNCHANGED (a verdict
+    # change keyed on argv would be the #1544 kill-direction hazard again); the
+    # line now RECORDS the cause. PREDICTED FLIP for "delete the kept-root
+    # bookkeeping": the kept row goes red; the verdict row and the E2/K2
+    # controls do not move.
+    if _lj_case "d2d2d2d2-0000-4000-8000-000000001627" "bash -c 'bash \$_LJ dispatch' & sleep 3; bash -c 'bash \$_LJ dispatch'"; then
+        _d2_ev="$NEXUS_STATE_DIR/longjob/sid-d2d2d2d2-0000-4000-8000-000000001627/events.log"
+        for _i in $(seq 1 80); do grep -q $'\trefused\t' "$_d2_ev" 2>/dev/null && break; sleep 0.25; done
+        out=$(_lj_read)
+        if grep -q $'\trefused\t' "$_d2_ev" 2>/dev/null; then
+            [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *" bg_longjob=1"* ]] \
+                && ok "#1627: the refused second dispatcher stays a counted shell → working-background bg_shells=1 bg_longjob=1 (verdict unchanged: never idle over an unidentified process)" \
+                || bad "#1627 verdict: $out"
+            [[ "$out" == *" bg_longjob_kept=1"* ]] \
+                && ok "#1627: …and the line RECORDS why: bg_longjob_kept=1 (one counted root holds a dispatcher the exclusion did not remove)" \
+                || bad "#1627 kept record: $out"
+        else
+            bad "#1627: the second dispatcher never logged its refusal — the case is unmeasured"
+        fi
+    else
+        bad "#1627: the first real dispatcher never armed — the case is unmeasured"
+    fi
+    # The READER alone, on the K1 tree (wrapper → fake dispatcher → a `sleep 1`
+    # it re-forks), with a PLANTED born_ticks: independent of the real script's
+    # timing, and the only way to stage "older" deterministically.
+    jq -n --arg s "$SID" --argjson now "$NOW" '{window:"ljw", session_id:$s, state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
+    _lj_plant() { ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d1" "$_pt_s1"; jq --arg bt "$1" '.born_ticks=$bt' "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json" > "$WORK/l.tmp" && mv "$WORK/l.tmp" "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json"; }
+    _lj_plant 4611686018427387904
+    out=$(_pt_run "$_pt_c1")
+    [[ "$out" == state=working-background* && "$out" == *"bg_longjob=0"* ]] \
+        && ok "#1565 S-old: born_ticks LATER than every child's start (each child predates the dispatcher's birth) → nothing excluded → working-background" \
+        || bad "#1565 S-old: $out"
+    _lj_plant "$_pt_s1"
+    out=$(_pt_run "$_pt_c1")
+    [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* ]] \
+        && ok "#1565 S-young MUST-NOT-FLIP: born_ticks = the dispatcher's own start, every child younger → idle (the per-poll sleep is not a co-tenant)" \
+        || bad "#1565 S-young: $out"
+    _lj_plant "not-a-number"
+    out=$(_pt_run "$_pt_c1")
+    [[ "$out" == state=idle* ]] \
+        && ok "#1565 S-legacy MUST-NOT-FLIP: a born_ticks that is not a number is read as a ledger that predates the field → idle, as before (stated error direction: no board-wide freeze)" \
+        || bad "#1565 S-legacy: $out"
     _pt_cleanup
 else
     printf '  SKIP: no pgrep or no /proc — the process-tree cases are unmeasured here\n'

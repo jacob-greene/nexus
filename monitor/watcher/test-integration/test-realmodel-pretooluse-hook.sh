@@ -68,8 +68,8 @@
 # the gate goes back to being decorative.
 #
 # Gated on RUN_CC_HARNESS=1 (+ node + a resolvable claude binary);
-# self-skips cleanly (exit 77 under CCH_GATE=1 — a skip is RED for the
-# gate, never a silent pass). See monitor/cc-harness/README.md.
+# self-skips with exit 77, whoever the caller is (#1574 G1) — a skip is RED
+# for the gate, never a silent pass. See monitor/cc-harness/README.md.
 
 set -uo pipefail
 _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -83,8 +83,13 @@ cch_skip_if_disabled
 # the gate), never a pass.
 if ! command -v jq >/dev/null 2>&1; then
     echo "skipped: $(basename "$0") (jq not on PATH — needed to parse the hook payload)"
-    [[ "${CCH_GATE:-0}" == "1" ]] && exit 77
-    exit 0
+    # EXIT 77, UNCONDITIONALLY (your-org/nexus-code#1574 G1). This arm used to
+    # `exit 0` unless CCH_GATE=1 — the form `cch_skip_if_disabled` retired under
+    # #568 A6, which says `CCH_GATE` "no longer changes the exit code". It was a
+    # straggler of that migration: a scenario that declined to run and reported
+    # PASS, which `run-tests.sh --require-run` cannot see, because that flag
+    # counts rc 77 and rc 69 and an rc 0 is in neither count.
+    exit 77
 fi
 
 cch_setup

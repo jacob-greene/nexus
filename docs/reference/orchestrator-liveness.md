@@ -175,7 +175,8 @@ starvation, or a config where the clamp had to decline),
 `_v2_task_orchestrator_liveness` consults
 [`monitor/pane-state.sh`](worker-states.md) and routes the verdict
 through the pure function `_orchestrator_idle_pane_guard(verdict,
-pane_state, override_count, max_overrides)`. It gates **only**
+pane_state, override_count, max_overrides, pane_line)` — the fifth argument
+is the raw `pane-state.sh` line, read for the `retrying=` field (#1559). It gates **only**
 `respawn reason=dead-threshold` — a `resubmit-failed` respawn has
 already proven non-responsiveness via the re-paste probe (a healthy
 orchestrator would have gone `busy` on the re-paste) and is **never**
@@ -185,6 +186,7 @@ suppressed:
 |---|---|---|
 | `idle`, `empty` (budget available) | **suppress** | process alive, not visibly wedged; let the next paste reset the clock. `empty` is process-anchored to "claude alive, renderer transient" (a dead process emits `absent`, never `empty`) — it is the documented fresh-resume quirk this incident's own post-respawn probes showed. |
 | `idle`/`empty`, budget **exhausted** | **escalate** | an alive pane permanently parked at idle, never advancing a signal across `idle_pane_override_max` consecutive cycles, is *itself* a wedge. Honor the respawn. |
+| `busy` **with `retrying=k/N` on the line** (budget available) | **suppress** | the harness is re-sending (a transport or auth retry, #1552/#1554): alive, backend unreachable. A respawn INTO an outage discards context and cannot reach the backend either (#1559). Same override budget as `idle`. |
 | `busy`, `blocked`, `user-typing`, `absent`, `working-*`, … | **proceed** | a genuine wedge surfaces as one of these (frozen spinner=busy, overlay=blocked, dropped-Enter text=user-typing, dead=absent). |
 | errored / no state token / unknown | **proceed** | fail TOWARD respawn (recoverable, `mode=resume` preserves the session) rather than suppression (risk: dead forever). |
 | non-`dead-threshold` respawn (e.g. `resubmit-failed`) | **proceed** | already a proven wedge; out of the guard's scope. |
@@ -229,6 +231,36 @@ is coherent. Either way the real
 wedge-recovery path (waiting → unstick → one-shot re-submit, all
 firing well before the deadline) is unaffected — the deadline is only
 the absolute backstop.
+
+## The auth gate (<your-org>/nexus-code#1518, #1517, #1520, #1548)
+
+Before the wedge detector runs, `_orchestrator_auth_blocked` asks whether
+the orchestrator is on a login surface. Three arms, all SAFE-side (they
+suppress; none triggers a remedy), so their order cannot shadow a deny:
+
+| arm | `ORCH_AUTH_BLOCK_KIND` | sensor | bounded by |
+|---|---|---|---|
+| a `/login` dialog is up and emits are held | `hold` | `_auth_hold_active` (the hold row) | the hold's own ceiling (7200 s, fails open) |
+| the orchestrator's last turn failed with `recovery=operator` | `turn-failure` | `turn-failure/<target>.json`, written by the orchestrator's `StopFailure` hook ~1 s after the failed turn, typed `auth` by `_cause_classify.sh` | `monitor.watcher.turn_failure_gate_seconds` (600) from the marker's `ts`; every failed turn refreshes it, a successful turn's `Stop` clears it |
+| the pane renders the logged-out error | `expired` | `pane-state.sh`'s `auth=expired` (bottom 15 rows) | the expiry ceiling (7200 s, fails open; the ceiling line logs once, then at a backoff) |
+
+The verdict is `healthy reason=auth-<kind>` and it NAMES the channel that
+told the operator, per kind — the `hold` arm rang the bell once when it
+engaged; `expired` and `turn-failure` raise the operator alert
+`auth-expired` (durable record + bell + push + GitHub issue; see
+`docs/operating/notifications.md`). It is the one `healthy` that is not
+health, so it is logged on entry, at a doubling backoff capped at 3600 s,
+and on release.
+
+**Why the typed marker is a gate and not a trigger.** #1548's skeptic
+measured (F2) that with the false `recovered` removed, an auth outage
+reaches `respawn reason=resubmit-failed` at `grace_s` = 120 s — and the
+idle-pane guard gates only `dead-threshold`. Read as a gate, the marker is
+itself the guard on that path: after a resubmit fails, the fresh marker
+makes the next tick `healthy reason=auth-turn-failure`, the step wrapper
+clears the resubmit marker, and the episode resets. Only `category=auth`
+gates; `transient`, `config` and `conversation` keep the ladder's existing
+remedies (an operator decision recorded on the bundle PR).
 
 ## Verdict logging
 

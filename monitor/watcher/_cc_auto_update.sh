@@ -210,6 +210,23 @@ _cc_auto_surface_safe_refused() {
         kind="safe-refused-repeat"
         msg="cc-auto-update: SAME safe-refused reason ${n_same} fires running (${detail:-no detail}) for ${last_cand:-$candidate} — a STANDING defect in the gate, not a transient tree state; the pin has been stale that many days (#1400)"
     fi
+    # A dirty gated tree is the gate WORKING, not a defect in it
+    # (your-org/nexus-code#1475): the cause is a local tracked edit in the live
+    # clone and the remedy is the operator's. last-eval carries no file list, so
+    # point at the command that names them; the apply-side refusal note (and its
+    # notification) carry the list itself.
+    if [[ "$detail" == "gate-evidence:gated-tree-dirty" ]]; then
+        msg="cc-auto-update: candidate ${last_cand:-$candidate} evaluated SAFE but NOT applied (same-reason streak ${n_same}) — tracked edit(s) in the live clone block the bump (${detail}); see \`git status --porcelain --untracked-files=no\`, then stash (and keep it stashed until the next fire) or commit and push (#1475)"
+    fi
+    # An UNDISPOSITIONED OPAQUE RELEASE is not a gate defect and not the
+    # operator's to fix (your-org/nexus-code#1526): the evaluating agent clears
+    # it with --opaque-disposition. Audit row and log line stay; no page.
+    if [[ "$detail" == changelog-completeness:opaque-release=* ]]; then
+        msg="cc-auto-update: candidate ${last_cand:-$candidate} awaits the evaluating agent's opaque-release disposition (${detail}; same-reason streak ${n_same}) — no human action is requested (#1526)"
+        _cc_auto_log_decision "$dir" "${last_cand:-$candidate}" "$kind" "${detail:-} same-reason-streak=$n_same"
+        declare -F log >/dev/null 2>&1 && log "$msg"
+        return 0
+    fi
     _cc_auto_log_decision "$dir" "${last_cand:-$candidate}" "$kind" "${detail:-} same-reason-streak=$n_same"
     declare -F log >/dev/null 2>&1 && log "$msg"
     command -v sandbox-notify >/dev/null 2>&1 && sandbox-notify "$msg" || true

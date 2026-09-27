@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# cch:mock-backend=unmeasurable  the dispatcher is a plugin monitor; the host arms it only when GrowthBook serves tengu_amber_sentinel=true, and under the mock backend GrowthBook is OFF (your-org/nexus-code#1535)
 # monitor/watcher/test-integration/test-realmodel-longjob-wake.sh — the REAL
 # Claude Code binary, booted with the longjob-watch dispatcher plugin against
 # the auth-free mock backend, is WOKEN by each event the dispatcher emits —
@@ -34,7 +35,9 @@ _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../cc-harness/_lib.sh
 . "$_self_dir/../../cc-harness/_lib.sh"
 cch_skip_if_disabled
-command -v jq >/dev/null 2>&1 || { echo "skipped: $(basename "$0") (jq not on PATH)"; [[ "${CCH_GATE:-0}" == "1" ]] && exit 77; exit 0; }
+# Exit 77 unconditionally (#1574 G1): the `exit 0 unless CCH_GATE` form is the
+# one `cch_skip_if_disabled` retired under #568 A6.
+command -v jq >/dev/null 2>&1 || { echo "skipped: $(basename "$0") (jq not on PATH)"; exit 77; }
 cch_setup
 PASS=0; FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
@@ -97,10 +100,22 @@ if (( rc != 0 )) && [[ "$st" == *"dispatcher=absent"* ]] && (( $(footer_mon "$ID
     # dispatcher cannot arm here whatever this scenario does. Say so and skip;
     # the arming/delivery claims are measured by the hermetic REAL-AUTH probes
     # on your-org/nexus-code#1535 and the recipe in skills/nexus.cc-update/GUIDE.md 2g.
-    echo "skipped: $(basename "$0") — plugin monitor NOT armed under the mock backend (GrowthBook off → tengu_amber_sentinel default false); the real-binary wake is measured by the real-auth probes on your-org/nexus-code#1535"
+    # EXIT 69, NOT 0 AND NOT 77 (your-org/nexus-code#1574 G1). This scenario RAN:
+    # the real binary booted to idle with --plugin-dir (asserted above), and the
+    # discriminating contract — three wakes, no re-arm — could NOT be exercised
+    # on this backend. That is the ENVSKIP class by definition (#1283, #1530),
+    # and it used to leave by `exit 0`: measured by the #1569 delta skeptic under
+    # `--require-run`, `PASS … 144.14s assertions: ?` and `END rc=0 (COMPLETE and
+    # green)` with the whole wake contract unexercised. 77 would be wrong the
+    # other way: this is not "not applicable", a boot assertion was measured.
+    # A caller that declares every selected scenario MEASURABLE must therefore
+    # not select this one under the mock backend — which is what the header's
+    # `cch:mock-backend=unmeasurable` line is for (realmodel-scenarios.sh).
+    printf '=== summary: %d passed, %d failed — and the WAKE CONTRACT is UNMEASURED ===\n' "$PASS" "$FAIL"
+    echo "ENV: plugin monitor NOT armed under the mock backend (GrowthBook off → tengu_amber_sentinel default false), so no wake could be delivered; the real-binary wake is measured by the real-auth probes on your-org/nexus-code#1535. Exit 69 — not a pass, not a product failure." >&2
     cch_teardown
-    [[ "${CCH_GATE:-0}" == "1" ]] && exit 77
-    exit 0
+    (( FAIL > 0 )) && exit 1
+    exit 69
 fi
 (( rc == 0 )) && [[ "$st" == *"dispatcher=armed"* ]] && ok "A: dispatcher ledger ARMED with zero model turns ($(wakes) requests carrying an event so far)" || bad "A: status rc=$rc: $st"
 (( $(footer_mon "$IDX_A") >= 1 )) && ok "A: footer shows the host-armed monitor ($(footer_mon "$IDX_A") monitor)" || bad "A: footer shows no monitor"

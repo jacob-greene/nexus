@@ -173,9 +173,19 @@ _nrc_population() {
 #     (the measured reason is at NRC_DERIVE_FROM; sk2 P-B is that boundary);
 #   * a `source` whose path is split from it by a line continuation, built by
 #     `eval`, or reached through a function that sources its argument;
-#   * a whole-line comment is skipped; a `source …` inside a string or a
-#     trailing comment on a code line IS matched — an OVER-count, which can
-#     only widen the guard.
+#   * forms `pat` does not spell, measured in this tree (your-org/nexus-code#1545):
+#     an ENV-PREFIXED sourcing (`NEXUS_X=1 . "$D/x.sh"` — install-shell-hook.sh,
+#     watcher/launcher.sh), a PARAMETER-EXPANSION prefix
+#     (`"${BASH_SOURCE[0]%/*}/x.sh"` — watcher/_lib.sh), a quote closed before
+#     the slash (`"$D"/x.sh`), `command source`/`builtin .`, and a case arm
+#     `x) . "…" ;;`. NONE of these is silent any more for a NRC_DERIVE_FROM
+#     file: the LOOSE CENSUS below counts them and the suite asserts
+#     loose == derived + bare-variable, so an underived sourcing goes RED;
+#   * a whole-line comment is skipped. A `source …` inside a STRING is matched
+#     only where it sits in command position after `;`/`&`/`|`/`(`/`{` or a
+#     keyword — after a plain word it is not (the earlier claim that any
+#     in-string sourcing is matched was measured false by bundle-2609sk3); a
+#     match there is an OVER-count, which can only widen the guard.
 _nrc_direct_sources() {
     local _py
     _py=$(cat <<'PYEOF'
@@ -192,24 +202,53 @@ try:
         lines = fh.read().split('\n')
 except OSError:
     sys.exit(0)
+# THE LOOSE CENSUS (your-org/nexus-code#1545). `pat` above is a list of
+# SPELLINGS, and a list of spellings is exactly the thing that misses the next
+# one: an env-prefixed `NEXUS_X=1 . "$D/x.sh"` and a `"${BASH_SOURCE[0]%/*}/x.sh"`
+# prefix were both measured deriving NOTHING while a forbidden form in the
+# helper stayed GREEN. So a second, deliberately LOOSE scan counts every
+# sourcing-shaped token — `source`/`.` not glued to a word, path, quote or `)`,
+# followed by an argument that starts `$`, `/`, `~` or names a `.sh` — and the
+# suite asserts loose == derived + bare-variable per NRC_DERIVE_FROM file. The
+# class is then LOUD the day a new form is written, whatever the form: extend
+# `pat`, or name the helper in NRC_NAMED and let a bare-variable spelling carry
+# it. Errs toward RED: prose shaped like a sourcing over-counts and fails the
+# ratchet, which a reader resolves by looking; it never silently passes one.
+census = len(sys.argv) > 3 and sys.argv[3] == 'census'
+loose = re.compile(r'''(?<![\w./$'"`)-])(?:source|\.)[ \t]+["']?(?:\$|/|~|[\w./-]+\.sh\b)''')
+bare = re.compile(r'''(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:source|\.)\s+"?\$\{?\w+\}?"?\s*(?=$|[;&|)#])''')
 d = os.path.dirname(f)
 out = []
-for line in lines:
+n_loose = n_derived = n_bare = 0
+unacc = []
+for i, line in enumerate(lines, 1):
     if line.lstrip().startswith('#'):
         continue
+    l_here = len(loose.findall(line))
+    d_here = 0
     for m in pat.finditer(line):
         suf = m.group(1).lstrip('/')
         for base in (d, os.path.join(d, '..'), '.'):
             cand = os.path.normpath(os.path.join(base, suf))
             if os.path.isfile(os.path.join(root, cand)):
+                d_here += 1
                 if cand not in out:
                     out.append(cand)
                 break
-for c in out:
-    print(c)
+    b_here = len(bare.findall(line))
+    n_loose += l_here; n_derived += d_here; n_bare += b_here
+    if l_here != d_here + b_here:
+        unacc.append('%d: %s' % (i, line.strip()[:120]))
+if census:
+    print('loose=%d derived=%d bare=%d' % (n_loose, n_derived, n_bare))
+    for u in unacc:
+        print('unaccounted ' + u)
+else:
+    for c in out:
+        print(c)
 PYEOF
 )
-    python3 -c "$_py" "$1" "$2"
+    python3 -c "$_py" "$1" "$2" "${3:-}"
 }
 
 # shellcheck disable=SC1091
@@ -404,6 +443,31 @@ for _h in i j k; do printf 'x=1\n' > "$_dr/lib/$_h.sh"; done
 printf '_d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\n[[ -r "$_d/../lib/i.sh" ]] && %s "$_d/../lib/i.sh"\nif [[ -r "$_d/../lib/j.sh" ]]; then %s "$_d/../lib/j.sh"; fi\n# then %s "$_d/../lib/k.sh"\n' source . . > "$_dr/a/y.sh"
 assert_eq "derivation: a GUARDED one-line sourcing (after \`&&\`, after \`then\`) is found; a whole-line comment is not" \
     "$(_nrc_direct_sources "$_dr" a/y.sh | tr '\n' ' ')" "lib/i.sh lib/j.sh "
+
+echo "=== population: the LOOSE CENSUS makes an underived sourcing RED (your-org/nexus-code#1545) ==="
+# Every NRC_DERIVE_FROM file, live: each sourcing-shaped token is accounted for
+# by a derived literal path or a bare variable. A new spelling `pat` does not
+# know is an unaccounted line here, named, the day it is written.
+_census_bad=""
+for _f in "${NRC_DERIVE_FROM[@]}"; do
+    _c=$(_nrc_direct_sources "$_repo_root" "$_f" census)
+    grep -q '^loose=' <<<"$_c" || _census_bad+="$_f:no-census "
+    grep -q '^unaccounted ' <<<"$_c" && _census_bad+="$_f:$(grep '^unaccounted ' <<<"$_c" | tr '\n' ' ')"
+done
+assert_eq "live: every sourcing in a NRC_DERIVE_FROM file is derived or bare-variable (loose == derived + bare)" "$_census_bad" ""
+# The control: the existing fixture carries one derived and one bare-variable
+# sourcing, and must balance — a census that flagged EVERYTHING would pass the
+# plants below vacuously.
+assert_eq "census control: a derived + a bare-variable sourcing balance (loose=2 derived=1 bare=1)" \
+    "$(_nrc_direct_sources "$_dr" a/x.sh census | tr '\n' ' ')" "loose=2 derived=1 bare=1 "
+# The two measured in-tree idioms the derivation cannot spell, planted. Sourcing
+# words passed as printf ARGUMENTS for the same aso-manifest reason as above.
+printf '_d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)\nNEXUS_X=1 %s "$_d/../lib/h.sh"\n' . > "$_dr/a/envpre.sh"
+assert_eq "plant: an ENV-PREFIXED sourcing is unaccounted (derivation misses it; the census does not)" \
+    "$(_nrc_direct_sources "$_dr" a/envpre.sh census | grep -c '^unaccounted ')|$(_nrc_direct_sources "$_dr" a/envpre.sh | tr -d '\n')" "1|"
+printf '%s "${BASH_SOURCE[0]%%/*}/../lib/h.sh"\n' source > "$_dr/a/pexp.sh"
+assert_eq "plant: a \${BASH_SOURCE[0]%/*} prefix sourcing is unaccounted (derivation misses it; the census does not)" \
+    "$(_nrc_direct_sources "$_dr" a/pexp.sh census | grep -c '^unaccounted ')|$(_nrc_direct_sources "$_dr" a/pexp.sh | tr -d '\n')" "1|"
 
 echo "=== the live tree: zero violations, every rule ==="
 out=$(nrc_scan "$_repo_root"); rc=$?
@@ -624,7 +688,7 @@ chmod 600 "$root/monitor/cc-auto-update-prompt.md"
 assert_eq "an unreadable population file: rc 98" "$rc" "98"
 assert_contains "…and the refusal names the file" "$(cat "$WORK/unread.err")" "could not read monitor/cc-auto-update-prompt.md"
 
-_EXPECTED_ASSERTIONS=71   # count=exact (summary-honesty): every assertion above, once
+_EXPECTED_ASSERTIONS=75   # +4 your-org/nexus-code#1545 (loose census: live, control, two plants); count=exact (summary-honesty): every assertion above, once
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; _th_pass

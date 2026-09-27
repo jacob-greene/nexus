@@ -10,6 +10,12 @@
 #   monitor/watcher/run-tests.sh --profile      # print per-file wall-time
 #   monitor/watcher/run-tests.sh --failed-only  # re-run last run's failures
 #   monitor/watcher/run-tests.sh --keep-logs DIR # persist per-test stdout/stderr
+#   monitor/watcher/run-tests.sh --require-run  # a SKIP (77) AND an ENVSKIP (69) are
+#                                               # RED: every selected test is declared
+#                                               # applicable (the cc-harness CI job)
+#   monitor/watcher/run-tests.sh --require-measured # an ENVSKIP (exit 69) is RED
+#                                               # here: for a caller whose run IS
+#                                               # the measurement (#1563, below)
 #   monitor/watcher/run-tests.sh --timeout 600  # per-test ceiling, +15s KILL
 #                                               # grace; rc=124 (TERM) or 137
 #                                               # (KILL). Tallied + printed as
@@ -37,6 +43,17 @@
 #   2  usage error (bad flag, unwritable --state, …)
 #   3  INCOMPLETE and RESUMABLE — --max-seconds stopped this invocation, or a
 #      ledger still holds unrecorded tests. Repeat the same command.
+#   5  NOT A VERDICT — THE TREE CHANGED DURING THE RUN (your-org/nexus-code#1586).
+#      Every suite reads its files from the working tree AT THE MOMENT IT
+#      STARTS, so a band launched from a clone that is being edited tests
+#      commit A for the early suites and commit B for the late ones, and a
+#      half-written file for whichever started in between. Such a result is
+#      evidence for NEITHER tree, so 5 OUTRANKS 0, 1 and 3 alike: a red from a
+#      mixed tree is no more a finding than a green from one. HEAD and the
+#      CONTENT of every tracked-and-modified path are compared start to end;
+#      the paths that moved are named. Run the band from a detached worktree
+#      you never edit. (An UNTRACKED path appearing or changing is reported
+#      loudly and does NOT void the verdict — see `_rt_tree_table`.)
 #   4  NOT A VERDICT — one or more DISPATCH CHILDREN were killed by a signal,
 #      so this run measured a SUBSET (your-org/nexus-code#1083). A signal is an
 #      environment event, not a test result; the pass count and the failure
@@ -48,17 +65,41 @@
 #      TWO BOUNDARIES, both stated because the first draft of this line was
 #      honest and false (#1135 skeptic F3, F4):
 #
-#      (a) PARALLEL ARM ONLY. The traps live in the `xargs` child, which
-#          exists only at `--jobs > 1`. At `--jobs 1` `run_one` executes in
-#          this shell, there is no child to trap, and exit 4 is STRUCTURALLY
-#          UNREACHABLE — so #1083's rc conflation persists there, undeclared
-#          until now. Measured with the same fixture that yields exit 4 at
-#          `--jobs 4`: at `--jobs 1` the runner is itself in the signal's path
-#          and dies **rc=143**, printing no banner and no summary at all. That
-#          arm has no truncation to fix (no `xargs` means no batch to abort),
-#          but a caller reading this contract must not infer that a serial run
-#          distinguishes an environment event from a test result. It does not,
-#          and under a direct signal it does not report anything either.
+#      (a) THE CHILD TRAPS ARE PARALLEL-ARM ONLY. They live in the `xargs`
+#          child, which exists only at `--jobs > 1`; at `--jobs 1` `run_one`
+#          executes in this shell and there is no child to trap.
+#
+#          THE RUNNER ITSELF NOW TRAPS TERM/INT/HUP, in BOTH arms
+#          (your-org/nexus-code#1474). It did not, and what that cost was
+#          measured at `d5874b26`, six 4-second fixtures, runner TERMed at 6 s:
+#
+#            --jobs 1   runner rc=143; the log holds 1 PASS line, 0 FAIL lines,
+#                       no summary, no banner.
+#            --jobs 4   runner rc=143 — and the DISPATCH CHILDREN LIVED ON as
+#                       orphans and kept APPENDING `PASS` lines after the runner
+#                       was dead: the log ended with a PASS line for 6 of 6
+#                       tests, 0 FAIL lines, and no summary. A KILLED run whose
+#                       log reads as a complete green — the local form of CI's
+#                       cancelled band — plus a leaked batch still burning CPU.
+#
+#          WHAT THE TRAP DOES AND DOES NOT DO. bash runs a trap only when the
+#          foreground command RETURNS, so:
+#            * a GROUP signal (`timeout`, Slurm, a harness stop) also reaches
+#              the children; they record themselves and exit 90, the dispatch
+#              ends, and the runner — now alive to do it — prints the
+#              `#1083` banner and exits 4 instead of dying silent;
+#            * a signal to the RUNNER PID ALONE is DEFERRED to the next test
+#              boundary. `--jobs 1` stops there and exits 4 with the shortfall
+#              named. `--jobs N` has one boundary, the end of the batch: the
+#              sweep COMPLETES (no orphans), a NOTE says the signal was
+#              deferred, and the verdict is the complete one. To stop a
+#              parallel run promptly, signal its process GROUP.
+#          SIGKILL cannot be trapped. For that there is the END MARKER: a run
+#          that reaches its own VERDICT prints `=== run-tests: END rc=… ===`
+#          as its LAST line, from the exit code it CHOSE (never from `$?` —
+#          see `_rt_on_exit`), and the header says so up front. A log without
+#          it is a run that was killed or is still going, and its PASS lines
+#          are a SUBSET, whatever their number.
 #
 #      (b) "DISPATCH CHILD", NOT "TEST PROCESS". A TEST killed by a signal
 #          returns 128+N to `run_one`, which records it as FAIL (or TIMEOUT
@@ -154,6 +195,36 @@ export _RT_REPO_ROOT
 _state_dir="${NEXUS_TEST_STATE_DIR:-$HOME/.cache/nexus-test-runner}"
 mkdir -p "$_state_dir"
 _failures_file="$_state_dir/last-failures.txt"
+# Where a RED's full stdout/stderr is kept when --keep-logs was not given
+# (your-org/nexus-code#1561; see `_rt_retain_failed_logs`). Created lazily, by
+# the first red — a green run leaves nothing behind.
+RT_FAILED_LOGS_DIR="$_state_dir/failed-logs/$(date +%Y%m%dT%H%M%S)-$$"
+export RT_FAILED_LOGS_DIR
+# THE CEILING-OVERRIDES FILE, RESOLVED ONCE, HERE, AS AN ABSOLUTE PATH
+# (your-org/nexus-code#1474). `_rt_ceiling_for` found it through
+# `dirname "${BASH_SOURCE[0]}"`, and under `--jobs > 1` that function runs as an
+# EXPORTED function inside an xargs `bash -c` child, where BASH_SOURCE[0] is
+# EMPTY: the path became `./ceiling-overrides.tsv`, the file was not found, and
+# the function returned the run ceiling — silently. So every override row was
+# INERT in every parallel run, i.e. in every CI band and every local band.
+# Measured on the first full band of this change (jobs 4, --timeout 600):
+# `TIMEOUT test-guards-for-diff.sh 600.05s (ceiling 600s …)` against a row of
+# 3600; a second bundle's band lost the same suite the same night and
+# attributed it to its own --timeout flag. The probe that "verified" the rows
+# passed `_RT_CEILING_FILE` explicitly — it supplied the thing that was missing.
+#
+# ASSIGNED, NEVER INHERITED, AND LOUD WHEN UNREADABLE (skeptic F3 on #1569). The
+# first cut used `:=`, so a nested runner of ANOTHER tree silently took the
+# outer tree's rows through the exported internal name. `_RT_CEILING_FILE` is
+# now this run's own, always; a caller that means to supply a file says so with
+# `NEXUS_TEST_CEILING_FILE`. And an unreadable file is SAID: `_rt_ceiling_for`
+# answers it by returning the run ceiling, which is the right behaviour and was
+# a SILENT one — the very shape of the defect above, still armed for the next
+# trigger.
+_RT_CEILING_FILE="${NEXUS_TEST_CEILING_FILE:-$_self_dir/ceiling-overrides.tsv}"
+export _RT_CEILING_FILE
+find "$_state_dir/failed-logs" -mindepth 1 -maxdepth 1 -type d -mtime +7 \
+    -exec rm -rf -- {} + 2>/dev/null || true
 
 filter=""
 list_only=0
@@ -166,6 +237,35 @@ tally_file=""
 resume=0
 max_seconds=0
 require_ci_parity="${NEXUS_TEST_REQUIRE_CI_PARITY:-0}"
+# --require-measured (your-org/nexus-code#1563). EXIT 69 IS A FIELD THAT
+# SELECTS, AND ITS READERS DISAGREED. `cc-harness/gate.sh` reads a scenario's 69
+# as UNMEASURED -> RED: an unexercised surface does not promote a pin. This
+# runner reads the same 69 as ENVSKIP -> reported, NOT red (#1283), and that is
+# RIGHT for the band: an ENVSKIP accuses nothing, and reddening it in the runner
+# would recreate #1283 on every loaded node. But `.github/workflows/
+# cc-harness.yml` runs the SAME `test-realmodel-*.sh` THROUGH this runner, so
+# that job ended `END rc=0 (COMPLETE and green)` with the renderer scrape
+# unmeasured — the one reader for which "could not measure" IS the failure.
+#
+# So the CALLER says which run this is. Default: #1283's contract, unchanged.
+# With this flag an ENVSKIP makes the run RED (exit 1, the code every caller
+# already reads as "do not merge"), named as such, never as a FAIL.
+#
+# WHAT IT DOES NOT TOUCH: SKIP (exit 77) stays non-red under the flag. 77 is
+# "NOT APPLICABLE HERE — the gate did not take" (RUN_CC_HARNESS unset, a
+# platform the scenario does not target); 69 is "APPLICABLE, RAN, AND COULD NOT
+# MEASURE". A caller that demands measurement is demanding it of what applies.
+require_measured="${NEXUS_TEST_REQUIRE_MEASURED:-0}"
+# --require-run (skeptic F2 on #1569). The paragraph above is true of the UNIT
+# band and FALSE for the flag's one real caller. `cc-harness.yml` SETS
+# RUN_CC_HARNESS=1, so a 77 there is never "the gate did not take": it is
+# `cch_skip_if_disabled` finding no tmux, node, python3 or claude binary — an
+# APPLICABLE scenario that went UNEXERCISED — and `gate.sh` reads any skip as
+# RED. Measured by the skeptic: every realmodel scenario SKIP, 0 assertions,
+# `END rc=0 (COMPLETE and green)` under --require-measured. So a caller that
+# has itself declared every selected test applicable says --require-run: a SKIP
+# is RED too. It implies --require-measured. The unit band passes neither.
+require_run="${NEXUS_TEST_REQUIRE_RUN:-0}"
 explicit_files=()
 
 while (( $# > 0 )); do
@@ -177,6 +277,8 @@ while (( $# > 0 )); do
         --failed-only|-f) failed_only=1; shift ;;
         --jobs|-j)       jobs="$2"; shift 2 ;;
         --jobs=*)        jobs="${1#--jobs=}"; shift ;;
+        --require-measured) require_measured=1; shift ;;
+        --require-run)      require_run=1; require_measured=1; shift ;;
         --keep-logs)     keep_logs_dir="$2"; shift 2 ;;
         --keep-logs=*)   keep_logs_dir="${1#--keep-logs=}"; shift ;;
         --timeout)       per_test_timeout="$2"; shift 2 ;;
@@ -211,14 +313,78 @@ while (( $# > 0 )); do
     esac
 done
 
-if ! [[ "$jobs" =~ ^[0-9]+$ ]] || (( jobs < 1 )); then
-    printf 'run-tests.sh: --jobs must be a positive integer (got %q)\n' "$jobs" >&2
+# A DECIMAL IS NOT `^[0-9]+$` IN BASH ARITHMETIC (your-org/nexus-code#1618). bash
+# reads a leading-zero literal as OCTAL, so that pattern admits two values it
+# cannot use as written: `010` is silently EIGHT, and `08`/`09` are an arithmetic
+# ERROR — which inside `(( … ))` is a FALSE test (the branch is skipped, the run
+# carries on) and inside `$(( … ))` KILLS this non-interactive shell outright.
+# Measured under bash 4.4.20:
+#
+#     F=08; (( 30 >= F ))    -> "value too great for base", branch NOT taken
+#     h=08; x=$(( 5 + h ))   -> the whole shell exits rc 1
+#
+# `_rt_is_decimal` is the shape every value that reaches arithmetic from the
+# ENVIRONMENT or the COMMAND LINE is checked against. `0` alone, or no leading
+# zero. It is deliberately NOT a `10#` at the point of use: a use-site `10#` has
+# to be remembered at EVERY use, and the sweep below found five sites for one of
+# these values. A value refused at the door cannot reach any of them.
+#
+# THE SWEEP (#1616 asked for it; #1618 did it). Every `(( ))`/`$(( ))` in this
+# file whose operand arrives from the environment or argv, and its disposition:
+#
+#   --jobs                        (( jobs < 1 )), NEXUS_TEST_JOBS, xargs -P    REFUSE, exit 2 (below)
+#   --timeout / NEXUS_TEST_TIMEOUT  (( per_test_timeout > 0 )) and, exported as
+#                                 PER_TEST_TIMEOUT, run_one's `timeout` gate,
+#                                 the ceiling-% gate, --profile, _rt_ceiling_for REFUSE, exit 2 (below)
+#   --max-seconds                 the budget test in the dispatch loop          REFUSE, exit 2 (below)
+#   NEXUS_TEST_REQUIRE_CI_PARITY  (( require_ci_parity ))                       REFUSE, exit 2 (below)
+#   NEXUS_TEST_REQUIRE_MEASURED   (( require_measured == 1 ))                   REFUSE, exit 2 (below)
+#   NEXUS_TEST_REQUIRE_RUN        (( require_run == 1 ))                        REFUSE, exit 2 (below)
+#   NEXUS_TEST_NPROC_HEADROOM     $(( _hi + _headroom ))                        FALL BACK to 2048, said
+#   NEXUS_TEST_DEADLINE_SCALE     (( NEXUS_TEST_DEADLINE_SCALE >= 1 ))          IGNORED + unset, said
+#   NEXUS_ASSERT_ACCOUNTING_FLOOR (( _n_pass_files >= … ))                      FALL BACK to 20, said
+#   ceiling-overrides.tsv col 2   (( cand > run_ceiling )) in _rt_ceiling_for   row IGNORED (inline shape)
+#
+# NOT members, checked: TMUX_SUN_PATH_MAX is assigned by the sourced
+# `_tmux_socket.sh`, not read from the environment; NEXUS_CEILING_ADJACENT_PCT
+# reaches only `awk -v`, whose numbers are decimal; SECONDS is bash's own.
+#
+# WHY THE REQUIRE-FLAGS REFUSE rather than fall back: each is a switch a caller
+# sets to make the run STRICTER, so any fallback is the fail-OPEN direction —
+# `08` is an arithmetic error and the gate is silently off. And a word is worse:
+# `NEXUS_TEST_REQUIRE_RUN=yes` is read by `(( require_run == 1 ))` as a VARIABLE
+# NAME, which under `set -u` aborts the runner AFTER every suite has run, with
+# no END marker (#1616's shape, measured: `yes: unbound variable`, rc 127). Only
+# `0` and `1` are accepted because the readers disagree about the rest —
+# `(( require_ci_parity ))` treats `2` as ON, `(( require_run == 1 ))` as OFF.
+#
+# AT MOST 18 DIGITS — a CHOSEN bound (your-org/nexus-code#1618 residual, PR
+# #1626 skeptic). Bash arithmetic is signed 64-bit and WRAPS silently, rc 0:
+# `NEXUS_TEST_TIMEOUT=18446744073709551616` (2^64) reads as 0, which DISABLES
+# the per-test timeout, and a 19-digit `9999999999999999999` reads NEGATIVE.
+# 18 digits (< 10^18 < 2^63) is the widest length EVERY value of which is
+# representable, so no string this admits can wrap; 19 digits is where some
+# values do. No value here needs more (10^18 s is ~3e10 years).
+_rt_is_decimal() { [[ "${1-}" =~ ^(0|[1-9][0-9]{0,17})$ ]]; }
+if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'run-tests.sh: --jobs must be a positive decimal integer, no leading zero (got %q; your-org/nexus-code#1618)\n' "$jobs" >&2
     exit 2
 fi
-if ! [[ "$per_test_timeout" =~ ^[0-9]+$ ]] || ! [[ "$max_seconds" =~ ^[0-9]+$ ]]; then
-    printf 'run-tests.sh: --timeout / --max-seconds must be non-negative integers\n' >&2
+if ! _rt_is_decimal "$per_test_timeout" || ! _rt_is_decimal "$max_seconds"; then
+    printf 'run-tests.sh: --timeout / --max-seconds (and NEXUS_TEST_TIMEOUT) must be non-negative decimal integers, no leading zero, at most 18 digits (got %q / %q; your-org/nexus-code#1618)\n' \
+        "$per_test_timeout" "$max_seconds" >&2
     exit 2
 fi
+# (The CLI flags only ever assign `1`, so a bad value here came from the env.)
+for _rt_flag in require_ci_parity:NEXUS_TEST_REQUIRE_CI_PARITY require_measured:NEXUS_TEST_REQUIRE_MEASURED require_run:NEXUS_TEST_REQUIRE_RUN; do
+    _rt_fvar="${_rt_flag%%:*}"
+    if [[ ! "${!_rt_fvar}" =~ ^[01]$ ]]; then
+        printf 'run-tests.sh: %s=%q is not 0 or 1 — refusing rather than guess whether a STRICTER run was asked for (your-org/nexus-code#1618)\n' \
+            "${_rt_flag#*:}" "${!_rt_fvar}" >&2
+        exit 2
+    fi
+done
+unset _rt_flag _rt_fvar
 if (( resume )) && [[ -z "$tally_file" ]]; then
     printf 'run-tests.sh: --resume requires --state <file> (the ledger to resume from)\n' >&2
     exit 2
@@ -470,6 +636,50 @@ if [[ -n "$tally_file" ]]; then
     touch "$tally_file" || { printf 'run-tests.sh: cannot write --state %q\n' "$tally_file" >&2; exit 2; }
 fi
 
+# THE SELECTION ROOTS, ONE DEFINITION (your-org/nexus-code#1620). Each root is a
+# DIRECTORY walked at depth 1 for `test-*.sh`; the census below derives
+# "reachable" from THIS array, so a root added here is a root the census knows
+# about, and there is no second list to drift from it.
+_monitor_dir=$(cd "$_self_dir/.." && pwd) || _monitor_dir=""
+_RT_SUITE_ROOTS=("$_self_dir")
+[[ -n "$_monitor_dir" ]] && _RT_SUITE_ROOTS+=("$_monitor_dir")
+_RT_SUITE_ROOTS+=("$_self_dir/test-integration")
+# `monitor/cc-harness/` (your-org/nexus-code#1620). It held ONE tracked suite,
+# `test-cc-harness-gate-coverage-trackedness.sh` — executable, helper-sourcing,
+# 8 assertions, no env gate, PASSES — which no band had ever selected: it was
+# absent from every band log, not as a row, not as a SKIP, not in any census, so
+# `selected=494 reported=494` was true and complete about a population one short
+# of the 495 tracked. Enumerated in suite-declarations.manifest and PROTECTED in
+# the honesty manifest, i.e. accounted for by every registry, and never run —
+# because every registry answers about index visibility and none about EXECUTION.
+# Made a root rather than moved: it is the directory its subject lives in and the
+# natural home for the next harness suite. The census below is the general fix;
+# this line only makes today's census come out empty.
+[[ -n "$_monitor_dir" ]] && _RT_SUITE_ROOTS+=("$_monitor_dir/cc-harness")
+_rt_root_suites() {
+    # Roots, in _RT_SUITE_ROOTS order (watcher, monitor, test-integration,
+    # cc-harness), each at depth 1:
+    #   monitor/ (your-org/nexus-code#484) — several tests for non-watcher
+    #   scripts live one directory up (test-retire-preflight.sh,
+    #   test-interactive-sessions.sh, the #507/#484 regression suites). Nothing
+    #   globbed them, so CI ran none of them: a regression test nobody runs is
+    #   not a regression test, it is a claim of protection that was never
+    #   established. The dir is RESOLVED rather than globbed as `$_self_dir/..`,
+    #   so the `<parent>/<basename>` suffix the --filter and --keep-logs paths
+    #   derive reads `monitor/test-x.sh`, not `../test-x.sh`.
+    #   test-integration/ — each file self-skips when RUN_INTEGRATION is unset,
+    #   so the default fast loop pays one ~50 ms `bash -c '<skip>'` per file
+    #   rather than the multi-second tmux bring-up; discoverable via --list /
+    #   --filter without anyone remembering the subdirectory path.
+    local d t
+    for d in "${_RT_SUITE_ROOTS[@]}"; do
+        for t in "$d"/test-*.sh; do
+            [[ -f "$t" ]] || continue
+            printf '%s\n' "$t"
+        done
+    done
+}
+
 # Build the test list. Explicit paths win; otherwise glob test-*.sh.
 if (( ${#explicit_files[@]} > 0 )); then
     tests=("${explicit_files[@]}")
@@ -480,38 +690,7 @@ elif (( failed_only )); then
     fi
     mapfile -t tests < "$_failures_file"
 else
-    mapfile -t tests < <(
-        for t in "$_self_dir"/test-*.sh; do
-            [[ -f "$t" ]] || continue
-            printf '%s\n' "$t"
-        done
-        # Pull in the monitor/-level suites (your-org/nexus-code#484).
-        # Several tests for non-watcher scripts live one directory up —
-        # test-retire-preflight.sh, test-interactive-sessions.sh, and the
-        # two #507/#484 regression suites. Nothing globbed them, so CI ran
-        # none of them: a regression test nobody runs is not a regression
-        # test, it is a claim of protection that was never established.
-        # Resolve the dir rather than globbing `$_self_dir/..`, so the
-        # `<parent>/<basename>` suffix the --filter and --keep-logs paths
-        # derive reads `monitor/test-x.sh`, not `../test-x.sh`.
-        _monitor_dir=$(cd "$_self_dir/.." && pwd) || _monitor_dir=""
-        if [[ -n "$_monitor_dir" ]]; then
-            for t in "$_monitor_dir"/test-*.sh; do
-                [[ -f "$t" ]] || continue
-                printf '%s\n' "$t"
-            done
-        fi
-        # Pull in the integration suite too. Each file self-skips
-        # when RUN_INTEGRATION is unset, so the default fast loop
-        # pays one ~50 ms `bash -c '<skip>'` per file rather than
-        # the multi-second tmux bring-up. Discoverable via --list
-        # / --filter without forcing operators to remember the
-        # subdirectory path.
-        for t in "$_self_dir"/test-integration/test-*.sh; do
-            [[ -f "$t" ]] || continue
-            printf '%s\n' "$t"
-        done
-    )
+    mapfile -t tests < <(_rt_root_suites)
 fi
 
 # Apply --filter substring after path resolution. Matches against
@@ -832,7 +1011,12 @@ _rt_ceiling_for() {
         /^[[:space:]]*#/ { next }
         NF >= 2 && $1 == b { print $2; exit }
     ' "$file" 2>/dev/null)
-    [[ "$cand" =~ ^[0-9]+$ ]] || { printf '%s' "$run_ceiling"; return 0; }
+    # Inline, not `_rt_is_decimal`: this runs in the parallel arm's fresh
+    # `bash -c`, where a merely-defined helper is `command not found` (see the
+    # export block). No leading zero (your-org/nexus-code#1618): `0600` compared
+    # as octal 384 in `(( cand > run_ceiling ))`, and `0900` was an arithmetic
+    # error, i.e. a FALSE test — the override silently not applied.
+    [[ "$cand" =~ ^(0|[1-9][0-9]*)$ ]] || { printf '%s' "$run_ceiling"; return 0; }
     (( cand > run_ceiling )) && { printf '%s' "$cand"; return 0; }
     printf '%s' "$run_ceiling"
 }
@@ -1380,20 +1564,176 @@ _rt_resource_note() {
 # one that is provably silent rather than merely cluttered. If a suite is ever
 # found in that residual, widen this to print both labelled tails.
 _rt_failure_tail() {
-    local log_base="$1" n=20
+    local log_base="$1" n=20 who="${2:-}"
+    # THE ASSERTION LINES FIRST, WHEREVER THEY ARE (your-org/nexus-code#1561).
+    # See `_rt_failure_assertions` for why a tail alone is not a diagnosis.
+    _rt_failure_assertions "$log_base" "$who"
     if [[ -s "$log_base.err" ]]; then
-        tail -n "$n" -- "$log_base.err" 2>/dev/null | sed 's/^/    /'
+        _rt_tail_labelled "$log_base.err" stderr "$n" "$who"
         return
     fi
     if [[ -s "$log_base.out" ]]; then
         # Say WHICH stream this is. The reader who has to triage a red should
         # never have to guess whether an empty stderr meant "silent test" or
         # "runner looked in the wrong place" — that ambiguity is #752 itself.
-        printf '    (stderr empty — stdout tail follows)\n'
-        tail -n "$n" -- "$log_base.out" 2>/dev/null | sed 's/^/    /'
+        printf '    %s(stderr empty — stdout tail follows)\n' "${who:+$who: }"
+        _rt_tail_labelled "$log_base.out" stdout "$n" "$who"
         return
     fi
-    printf '    (test emitted nothing on either stream)\n'
+    printf '    %s(test emitted nothing on either stream)\n' "${who:+$who: }"
+}
+
+# A TAIL SAYS HOW MUCH IT LEFT OUT (your-org/nexus-code#1561). A fixed-length
+# tail with no count reads as "this is what the test said"; with more lines
+# above it than in it, it is "this is the LAST thing the test said", which is
+# a different claim. Printing `last N of M` is what lets a reader see that the
+# assertion they are looking for may be in the M-N lines they were not shown.
+#
+# AND EVERY TAIL LINE CARRIES ITS SUITE TOO (your-org/nexus-code#1571 F4, the
+# residual). e34a03ba gave the failing-ASSERTION lines a `<suite>:` prefix and
+# left the tail bare. Measured at d58bc49a, two planted reds at `--jobs 2`: the
+# two blocks interleaved LINE BY LINE — FAIL row, FAIL row, header, header —
+# and the six tail lines that followed had no owner. They read as attributable
+# only because the fixture had put its own name in its text; a real suite's
+# stderr does not. With up to 20 lines from each of N concurrent reds shuffled
+# together, the tail is evidence nobody can act on, and it is the ONLY evidence
+# for a suite whose failure is not spelled `FAIL:` (the under-selection
+# `_rt_failure_assertions` discloses).
+#
+# `<suite>|` and not `<suite>:<line>:` — a tail line's number within the tail is
+# not a line number in the log, and a reader who opened the kept log at it
+# would land on the wrong line. The header already says `last N of M`. A
+# `while read`, not `sed "s/^/$who/"`: a suite name is DATA (see above).
+# `who` empty (a caller that has no suite name) prints exactly the old form.
+# AN UNTERMINATED FINAL LINE IS A LINE (your-org/nexus-code#1571 F4, regression
+# caught by the rtev skeptic). Two independent off-by-one bugs that AGREED with
+# each other, which is why reading the output could not find them:
+#
+#   `while IFS= read -r line` DROPS a final line with no trailing newline — read
+#   assigns the text and THEN returns non-zero at EOF, so the loop exits before
+#   the body runs for it. The `tail | sed` form this replaced printed that line
+#   (garbled into the next output, i.e. VISIBLY wrong). So the F4 fix moved this
+#   from failing LOUDLY to failing SILENTLY, which is the wrong direction in this
+#   repo's own terms. `|| [[ -n "$line" ]]` runs the body once more when read hit
+#   EOF with text in hand.
+#
+#   `wc -l` counts NEWLINES, not lines, so the HEADER missed the same line. Both
+#   numbers came from one blind spot: measured on `a\nb\nCRASH` the header said
+#   `all 2 line(s)` and the body printed 2, against 3 true lines — a reader
+#   checking the header against what they can see got a FALSE CONFIRMATION. That
+#   is the cross-check-that-agrees-with-itself shape, and fixing the loop ALONE
+#   would have left the header under-counting by one instead. `awk END{NR}`
+#   counts a final partial line as a record: 3.
+#
+# Why this line is the expensive one to drop: a tail exists to show what a suite
+# said LAST before it failed, and an unterminated final write is exactly what a
+# process killed mid-write, or a `printf` with no `\n`, leaves behind.
+#
+# `_rt_failure_assertions` needs neither fix: its pipeline starts from
+# `printf '%s\n' "$hits"`, which terminates every line by construction.
+_rt_tail_labelled() {
+    local file="$1" stream="$2" n="$3" who="${4:-}" total line
+    total=$(awk 'END{print NR}' "$file" 2>/dev/null) || total=''
+    [[ "$total" =~ ^[0-9]+$ ]] || total='?'
+    if [[ "$total" == '?' ]] || (( total > n )); then
+        printf '    --- %s%s: last %s of %s lines ---\n' "${who:+$who: }" "$stream" "$n" "$total"
+    elif [[ -n "$who" ]]; then
+        # A short stream printed no header at all, so under interleaving its
+        # lines had no neighbour to borrow an owner from. With a suite name the
+        # header is always printed; it costs one line per red.
+        printf '    --- %s: %s: all %s line(s) ---\n' "$who" "$stream" "$total"
+    fi
+    tail -n "$n" -- "$file" 2>/dev/null \
+        | while IFS= read -r line || [[ -n "$line" ]]; do printf '    %s%s\n' "${who:+$who| }" "$line"; done
+}
+
+# A FAILING SUITE CAN EVICT ITS OWN ASSERTION (your-org/nexus-code#1561).
+#
+# The tail above is a PROXY for "show what the test said about its failure",
+# and it is a positional one: it shows the END of the stream. A suite's
+# `fail()` writes WHEN the assertion runs; anything the suite writes to the
+# same stream afterwards pushes that line up and, past `n` lines, out. Measured
+# on the promotion of 2026-09-17: test-cc-auto-update.sh wrote its H7 FAIL
+# line, then 19 lines of #1555's `list-windows: command not found` plus one
+# unrelated `:672` line — exactly 20 — so every red anyone read, locally, in a
+# skeptic's isolated rep and in the public CI log, showed noise where the
+# assertion should have been. It was attributed from pass/fail COUNTS, twice,
+# wrongly (#1560).
+#
+# So the assertion lines are printed BY SHAPE, from BOTH streams, regardless of
+# position, each with its line number (which is also what tells a reader how
+# far above the tail it sat). Widening `n` is not the fix: any fixed `n` is
+# evicted by n+1 trailing lines, and the tail length is not a property anyone
+# checks.
+#
+# ERROR DIRECTION, stated because this is a predicate over text: it selects the
+# failure half of `_rt_assertion_line_count`'s shape (`FAIL:`, `not ok`, ✗, ×).
+# It UNDER-selects a suite that announces a failure in some other spelling —
+# that suite still gets the tail, i.e. exactly the pre-#1561 behaviour — and it
+# OVER-selects a suite that ECHOES a specimen `FAIL:` line as data. Both are
+# disclosed by the header's count; neither can hide a line the tail would have
+# shown. The cap bounds a suite that fails thousands of assertions, and says
+# how many it dropped, FIRST lines kept: the first failure is usually the
+# cause and the rest its consequences.
+# EVERY LINE CARRIES ITS SUITE (your-org/nexus-code#1571 F4). Under `--jobs > 1`
+# each child writes its block to the shared stdout in PIECES, so two concurrent
+# reds interleave: measured at `--jobs 2`, two headers and then `1:  FAIL: …`
+# beside `4:  ✗ …` with nothing to say whose they were. The interleaving is
+# older than these lines, but these are the ones whose whole purpose is
+# diagnosis-from-the-log, so they are the ones that must survive it. Written
+# `<suite>:<line>:<text>`, the `grep -Hn` shape a reader already parses.
+# (Buffering each child's block into one write would attribute the FAIL row and
+# the tails too; it was NOT done here because the child's TERM trap fires while
+# `run_one` is on the stack, and a buffered block is one more thing that trap
+# would have to flush. The kept full logs are per suite and unaffected.)
+_rt_failure_assertions() {
+    local log_base="$1" who="${2:-}" cap=40 f stream hits total line
+    for stream in err out; do
+        f="$log_base.$stream"
+        [[ -s "$f" ]] || continue
+        hits=$(grep -anEi '^[[:space:]]*(\[?not ok\b|X?FAIL[[:space:]]*[:.)-]|✗|×)' -- "$f" 2>/dev/null) || continue
+        [[ -n "$hits" ]] || continue
+        total=$(printf '%s\n' "$hits" | wc -l)
+        printf '    --- %s%s failing-assertion line(s) on std%s, by line number (#1561) ---\n' \
+            "${who:+$who: }" "$total" "$stream"
+        # `sed -n 1,Np`, not `head`: an early-exiting reader SIGPIPEs its producer.
+        # A `while read`, not `sed "s/^/$who:/"` or `awk -v`: a suite name is
+        # DATA, and both of those would interpret characters in it.
+        printf '%s\n' "$hits" | sed -n "1,${cap}p" | cut -c1-400 \
+            | while IFS= read -r line; do printf '    %s%s\n' "${who:+$who:}" "$line"; done
+        if (( total > cap )); then
+            printf '    … and %s more (first %s shown)\n' "$(( total - cap ))" "$cap"
+        fi
+    done
+}
+
+# THE FULL LOG OF A RED IS KEPT, ALWAYS (your-org/nexus-code#1561).
+#
+# Without --keep-logs the per-test `.out`/`.err` live in the run's tempdir and
+# die with it, so the ONLY record of a red is whatever the summary chose to
+# print — and the evening lost on #1560 ended only when someone re-ran the
+# suite by hand with a full log. A red is rare and its log is small; keeping it
+# costs nothing and removes the re-run, which for an INTERMITTENT red is the
+# expensive part (the re-run passes).
+#
+# Scoped per RUN (`$RT_FAILED_LOGS_DIR` carries the runner's pid and start
+# time) because `$_state_dir` defaults to a path under $HOME that every clone
+# on this host shares: a fixed `<suite>.err` would be overwritten by a sibling
+# worker's run of the same suite, and a reader would open ANOTHER tree's log
+# under this run's FAIL row. Run dirs older than 7 days are pruned at startup.
+_rt_retain_failed_logs() {
+    local log_base="$1" test_path="$2" parent name dest
+    [[ -n "${KEEP_LOGS_DIR:-}" ]] && return 0      # already durable; the caller prints that path
+    [[ -n "${RT_FAILED_LOGS_DIR:-}" ]] || return 0
+    name=$(basename "$test_path"); parent=$(basename "$(dirname "$test_path")")
+    dest="$RT_FAILED_LOGS_DIR/${parent}__${name}"
+    if mkdir -p "$RT_FAILED_LOGS_DIR" 2>/dev/null \
+       && cp -- "$log_base.out" "$dest.out" 2>/dev/null \
+       && cp -- "$log_base.err" "$dest.err" 2>/dev/null; then
+        printf '    full logs (kept): %s.{out,err}\n' "$dest"
+    else
+        printf '    full logs NOT kept: could not write %s — re-run with --keep-logs DIR\n' "$dest"
+    fi
 }
 
 run_one() {
@@ -1477,6 +1817,22 @@ run_one() {
     # heredoc-supplied `source /dev/stdin`, and a hook stub given a payload.
     # A suite needing input still supplies its own (`< fixture`); a redirect
     # here does not prevent that.
+    # THIS RUNNER'S CALLER-FACING INPUTS ARE NOT THE SUITE'S ENVIRONMENT
+    # (your-org/nexus-code#1571 F5 — the CLASS, at the one funnel). e34a03ba gave
+    # nesting suites `th_scrub_inherited_runner_env` to opt into; measured at
+    # 4a2bc49b, ONE suite had opted in. Sixteen runner-nesting suites under an
+    # outer `--keep-logs DIR`: DIR ended with 226 files where 32 are the suites'
+    # own — 194 fixture logs written by NESTED runners, from 14+ nested parents,
+    # 26 of them under the very `watcher__` prefix the outer run uses, so a
+    # nested fixture sharing a basename with a real suite overwrites that
+    # suite's kept log. That is how `#1569` got tests green alone and red in-band.
+    # The helper's own comment rejects a per-invocation `env -u` INSIDE a suite,
+    # because it would erase what the suite set on purpose. Here the suite has
+    # not started: there is nothing of its own to erase. `run_one` still reads
+    # these itself (it is the runner); only the exec below loses them.
+    # A plain exported STRING, because an array does not cross `xargs … bash -c`.
+    local _rt_scrub=() _rt_v
+    for _rt_v in ${_RT_SUITE_ENV_SCRUB:-}; do _rt_scrub+=(-u "$_rt_v"); done
     start_ns=$(date +%s%N)
     # Per-suite ceiling (your-org/nexus-code#992). `PER_TEST_TIMEOUT` stays the
     # run's default; this suite's effective ceiling may be RAISED by a measured
@@ -1573,11 +1929,13 @@ run_one() {
         # ignores that. rc=124 is timeout's TERM verdict, 137 the
         # KILL escalation — both are TIMEOUT, never a pass.
         NEXUS_TEST_SUITE="$suite_tag" TMPDIR="$_rt_tmp" TMUX_TMPDIR="$_rt_tt" \
+        env "${_rt_scrub[@]}" \
         timeout -k 15 "$PER_TEST_TIMEOUT" "${TEST_INTERPRETER:-bash}" "$test_path" \
             </dev/null >"$log_base.out" 2>"$log_base.err"
         rc=$?
     else
         NEXUS_TEST_SUITE="$suite_tag" TMPDIR="$_rt_tmp" TMUX_TMPDIR="$_rt_tt" \
+        env "${_rt_scrub[@]}" \
         "${TEST_INTERPRETER:-bash}" "$test_path" </dev/null >"$log_base.out" 2>"$log_base.err"
         rc=$?
     fi
@@ -1863,6 +2221,28 @@ run_one() {
                 printf '  PASS  %-45s  %6ss %s\n' "$name" "$wall" "$ann"
             fi
             unset _skipped_cases
+            # A FILE THAT DECLINED TO RUN AND LEFT BY `exit 0` (your-org/nexus-code
+            # #1574 G1). The repo's self-skip banner is `skipped: <own basename> …`
+            # (SLOW_TESTS / RUN_INTEGRATION / RUN_CC_HARNESS gates print it), and
+            # leaving by 0 is by design in the fast loop. It is NOT by design
+            # under --require-run, whose caller has declared every selected test
+            # applicable: that flag counts rc 77 and rc 69, an rc 0 is in neither
+            # count, and four realmodel sites stayed green that way. Recorded
+            # here, judged in the verdict section; the ROW is not changed, so no
+            # reader of `  PASS  <name>` has anything new to parse.
+            #
+            # ERROR DIRECTION of this predicate over text: it UNDER-selects a
+            # suite that declines in some other spelling (nothing is worse than
+            # before), and it OVER-selects a suite that ECHOES the banner for its
+            # OWN basename as data and then really runs — under --require-run
+            # only, and loudly. Anchored at column 0 and keyed on the file's own
+            # name, so a suite quoting ANOTHER file's banner is not selected.
+            # ENVIRON, not `awk -v`: a suite name is DATA, and -v would
+            # interpret backslashes in it.
+            if [[ "$(_RT_BANNER="skipped: $name" awk 'index($0, ENVIRON["_RT_BANNER"]) == 1 { c++ } END { print c + 0 }' \
+                        "$log_base.out" 2>/dev/null)" =~ ^[1-9][0-9]*$ ]]; then
+                printf '%s\n' "$test_path" >> "$out_file.selfskipped"
+            fi
             # Per-job sidecar for the no-ledger path, mirroring .caseskipped.
             # Three files, not one with a sentinel: the footer asks three
             # different questions (how many assertions ran; how many suites
@@ -2044,6 +2424,7 @@ run_one() {
                 printf '      of this sweep.\n'
             fi
             _rt_resource_note "$log_base"
+            _rt_retain_failed_logs "$log_base" "$test_path"
             printf '%s\n' "$test_path" >> "$out_file.failed"
             printf '%s\n' "$test_path" >> "$out_file.timedout"
             ;;
@@ -2058,10 +2439,11 @@ run_one() {
             # errored silently into 2>/dev/null and printed nothing, which
             # is why CI failures looked output-less.) Which STREAM to read is
             # `_rt_failure_tail`'s problem, not this arm's — see #752 there.
-            _rt_failure_tail "$log_base"
+            _rt_failure_tail "$log_base" "$name"
             if [[ -n "${KEEP_LOGS_DIR:-}" ]]; then
                 printf '    full logs: %s.{out,err}\n' "$log_base"
             fi
+            _rt_retain_failed_logs "$log_base" "$test_path"
             ;;
     esac
     # The margin, printed beside the row it qualifies (#992). Emitted for any
@@ -2180,6 +2562,28 @@ export -f _rt_resource_note
 # this function at all. The coverage is test-run-tests-bounded.sh T7, which
 # runs its failing fixtures at --jobs 1 AND --jobs 2 for exactly this reason.
 export -f _rt_failure_tail
+# ONE NAME PER `export -f` LINE, on purpose: test-run-tests-false-pass.sh derives
+# the list of helpers it must scrub from `^export -f NAME` and reads the FIRST
+# name on a line. Four names on one line left three un-scrubbed (caught by that
+# suite in the first full band of this change).
+export -f _rt_failure_assertions
+# What `run_one` removes from a SUITE's environment — see the block there. The
+# keep-list is `_test_helpers.sh`'s, for its reasons (NEXUS_TEST_JOBS,
+# NEXUS_TEST_DEADLINE_SCALE, NEXUS_TEST_STATE_DIR and the three suite gates pass
+# through). A HAND-KEPT LIST IS A DENYLIST, so test-run-tests-bounded.sh T7m
+# derives the runner's inputs from this file and reds on one that is in
+# neither list: adding an input is then a decision somebody has to make.
+# ITS REACH IS THE DERIVATION'S, NOT THIS FILE'S (rtev skeptic, delta 2):
+# `th_runner_env_inputs` matches six NAME FAMILIES, so an input named outside
+# them — NEXUS_ASSERT_ACCOUNTING_FLOOR (the sharpest: it sets the
+# broken-accounting FLOOR below, an inherited value WINS under its `:=`, and
+# raising it suppresses that detector), NEXUS_CEILING_ADJACENT_PCT,
+# NEXUS_TMUX_SOCKET_CHECK, NEXUS_KNOWN_LOCAL_RED — is invisible to that
+# ratchet and reds nothing.
+# Under-covering, the safe direction; said because the lines above implied wider.
+export _RT_SUITE_ENV_SCRUB='KEEP_LOGS_DIR NEXUS_TEST_REQUIRE_MEASURED NEXUS_TEST_REQUIRE_RUN NEXUS_TEST_CEILING_FILE _RT_CEILING_FILE'
+export -f _rt_tail_labelled
+export -f _rt_retain_failed_logs
 # NEW CALLEES OF run_one MUST BE EXPORTED TOO, or the PARALLEL arm silently
 # loses them. `xargs … bash -c` gets a FRESH shell, so a helper that is merely
 # defined in this file is `command not found` there — and both of these fail
@@ -2204,7 +2608,101 @@ export -f run_one
 
 # Common temp dir for per-run outputs.
 run_dir=$(mktemp -d -t nexus-test-runner-XXXXXX)
-trap 'rm -rf "$run_dir"' EXIT
+
+# THE RUNNER'S OWN SIGNALS, AND THE END MARKER (your-org/nexus-code#1474) —
+# the exit-4 note in the header is the contract; this is the mechanism.
+#
+# The handler only RECORDS. It cannot do more: bash defers a trap until the
+# foreground command returns, so by the time this runs the dispatch has either
+# ended (a group signal killed it) or is at a test boundary. The serial loop
+# reads the flag and stops; the verdict section reads it and refuses to call a
+# partial sweep a result. First signal wins — the second is usually the
+# escalation of the first, and the first is the cause.
+_rt_runner_signal=""; _rt_runner_signal_at=""
+_rt_on_runner_signal() {
+    [[ -n "$_rt_runner_signal" ]] && return 0
+    _rt_runner_signal="$1"; _rt_runner_signal_at=$(date +%H:%M:%S 2>/dev/null || echo '?')
+}
+trap '_rt_on_runner_signal TERM' TERM
+trap '_rt_on_runner_signal INT'  INT
+trap '_rt_on_runner_signal HUP'  HUP
+# THE END MARKER IS PRINTED ONLY FROM AN EXIT CODE THE RUNNER CHOSE — never
+# from `$?`. The first cut read `$?` in the EXIT trap, and that is a
+# manufactured success waiting to happen: bash RUNS the EXIT trap when an
+# UNTRAPPED fatal signal kills it, with `$?` still holding the last completed
+# command's status. Measured on this host (bash 4.4.20), a script with an EXIT
+# trap, signalled while it waits on a child:
+#
+#     TERM -> the trap prints rc=0, the process then dies 143
+#     PIPE -> rc=0, dies 141        USR1 -> rc=0, dies 138        HUP -> rc=0, dies 129
+#
+# So a runner killed by SIGPIPE (its reader went away) or SIGUSR1 would have
+# closed its log with "END rc=0 (COMPLETE and green)" — in the one tool whose
+# job is to stop a killed run reading as a result. It was caught by a REFUTED
+# PREDICTION: a mutant deleting the TERM trap was predicted to lose the END
+# line, and did not. Hence `_rt_exit`: the verdict section names its code, the
+# trap prints THAT, and an exit that named none says it ended WITHOUT a
+# verdict — in words that deliberately do not resemble the marker.
+#
+# Armed by `_rt_run_started`, set when the `=== running N tests` header prints:
+# `--list` and the usage exits are not runs and end with nothing.
+_rt_run_started=0
+_rt_final_rc=""
+# THE ONE FUNNEL every verdict leaves by — which is why the tree re-check lives
+# here and not at one of the ~dozen call sites (#1586). A verdict that is about
+# to be 0, 1 or 3 is first asked whether it still describes ONE tree. 4 and the
+# abort codes are already "not a verdict" and are left alone.
+_rt_exit() {
+    local rc="$1"
+    case "$rc" in
+        0|1|3)
+            if (( _rt_run_started )) && ! _rt_tree_drift_check; then
+                rc=5
+            fi ;;
+    esac
+    _rt_final_rc="$rc"; exit "$rc"
+}
+_rt_on_exit() {
+    local what
+    if (( _rt_run_started )); then
+        if [[ -n "$_rt_final_rc" ]]; then
+            case "$_rt_final_rc" in
+                # (#1563, #1558 round-2 G5) "green" with uncovered ground says so
+                # IN the marker: it is the one line a reader of a truncated log
+                # is guaranteed to have, and `COMPLETE and green` beside an
+                # unmeasured scenario is the sentence #1563 was filed about.
+                0)  what='COMPLETE and green'
+                    if (( ${_rt_n_env_declined:-0} > 0 )); then
+                        what+=" — ${_rt_n_env_declined} ENV-DECLINED, no verdict about them"
+                    fi ;;
+                # A TIMEOUT IS NOT A FAILED ASSERTION, AND THE MARKER SAYS WHICH
+                # (your-org/nexus-code#1474, the local form). CI's cancelled band
+                # "renders as a verdict while carrying none"; here the same thing
+                # is a suite that ran out of its ceiling — the row says `NOT a
+                # pass`, but this line, the ONE a reader of a truncated or
+                # summarised log is guaranteed to have, said `COMPLETE and RED`
+                # exactly as it does for a broken assertion. So a band red ONLY
+                # by time read as a regression in the tree. rc 0 already
+                # discloses its ENV-DECLINED the same way. BYTE-IDENTICAL when
+                # nothing timed out, so no reader of the plain red marker moves.
+                1)  what='COMPLETE and RED'
+                    if (( ${_rt_n_timed_out:-0} > 0 )); then
+                        what+=" — ${_rt_n_timed_out} TIMED OUT (no verdict about them), ${_rt_n_assert_failed:-?} failed"
+                    fi ;;
+                3)  what='INCOMPLETE — budget stop, resume with the same command' ;;
+                4)  what='NOT A VERDICT — interrupted by a signal; the PASS lines above are a SUBSET' ;;
+                5)  what='NOT A VERDICT — the tree CHANGED during the run; this result describes no single tree' ;;
+                97) what='ABORTED — the runner refused to write its sidecars' ;;
+                *)  what='ABORTED' ;;
+            esac
+            printf '=== run-tests: END rc=%s (%s) ===\n' "$_rt_final_rc" "$what"
+        else
+            printf '=== run-tests: STOPPED WITHOUT REACHING A VERDICT — killed by a signal the runner does not trap, or aborted before its verdict section. The PASS lines above are a SUBSET. ===\n'
+        fi
+    fi
+    rm -rf "$run_dir"
+}
+trap _rt_on_exit EXIT
 
 # --- command_not_found_handle disarm (your-org/nexus-code#479 / #480) -----
 # On the sandbox hosts BASH_ENV reaches (directly, or via the
@@ -2287,7 +2785,18 @@ fi
 # bash's EAGAIN retry backoff to crawl. Opt out with NEXUS_TEST_NPROC_GUARD=off.
 if [[ "${NEXUS_TEST_NPROC_GUARD:-on}" != "off" ]]; then
     _headroom="${NEXUS_TEST_NPROC_HEADROOM:-2048}"
-    if [[ "$_headroom" =~ ^[0-9]+$ ]]; then
+    # SHAPE, not `^[0-9]+$` (your-org/nexus-code#1618): `08` passed that and then
+    # KILLED the runner at `$(( _hi + _headroom ))` below — an arithmetic error in
+    # `$(( ))` exits a non-interactive shell — and `010` silently meant 8. A
+    # malformed value used to skip the guard with NOTHING said, which is the
+    # worst of the three outcomes (no containment AND no record); it now falls
+    # back to the default, on stderr, so the run stays contained.
+    if ! _rt_is_decimal "$_headroom"; then
+        printf 'run-tests.sh: NEXUS_TEST_NPROC_HEADROOM=%q is not a decimal integer (no leading zero) — using 2048 (your-org/nexus-code#1618).\n' \
+            "$_headroom" >&2
+        _headroom=2048
+    fi
+    if _rt_is_decimal "$_headroom"; then
         _cur_tasks=$(ps -eLo pid= 2>/dev/null | grep -c .)
         [[ "$_cur_tasks" =~ ^[0-9]+$ ]] && (( _cur_tasks > 0 )) || _cur_tasks=64
         # The probe MUST actually fork, and that is harder than it looks.
@@ -2316,17 +2825,86 @@ if [[ "${NEXUS_TEST_NPROC_GUARD:-on}" != "off" ]]; then
               _pr=$(/bin/echo ok) || exit 1
               [ "$_pr" = ok ] ) 2>/dev/null
         }
-        _lo=0; _hi=""
+        # THE SAME SEARCH, IN ONE HELPER PROCESS (your-org/nexus-code#1474, the
+        # w232 cost plan's item 1 as re-specified by its skeptic, F-2).
+        #
+        # Every FAILING `_probe_ok` above costs ~15 s, and none of it is work:
+        # bash answers a refused fork with its own EAGAIN retry backoff
+        # (1+2+4+8 s) before giving up. The search fails about three probes on
+        # its way to the floor, so EVERY runner invocation paid 45 s before its
+        # first test — measured here 2026-09-18, one trivial fixture, load 34 on
+        # 36 cpus: 45.79 s with the guard, 0.41 s with it off. A suite that
+        # nests the runner pays that per nested call (test-run-tests-bounded.sh
+        # makes ~25 of them), which is where the unit band's growth into its
+        # ceiling was actually going — not into tests.
+        #
+        # Forking the probe through another interpreter cannot help: bash must
+        # fork to exec it, and that fork happens AFTER `ulimit -Su` lowered the
+        # limit (measured by w232sk: 15.00 / 15.01 / 15.00 s for bash, perl and
+        # python forms). What works is forking the helper ONCE, at the ambient
+        # limit, and having IT lower its own soft limit and `fork()` directly —
+        # a refused fork is then one EAGAIN, not a backoff. Same seed, same
+        # doubling, same 32-wide bisection, same "a child must really exist"
+        # discipline (#597): the helper waits for the child it forked.
+        #
+        # THE SHELL PROBE STAYS, as the fallback when python3 is absent or the
+        # helper answers anything but a number — a guard that silently
+        # disengages because an optional interpreter is missing would be the
+        # #863 defect. The banner names which instrument produced the floor.
+        _lo=0; _hi=""; _probe_by=shell
         _cand=$(( _cur_tasks > 64 ? _cur_tasks : 64 ))
-        for _i in 1 2 3 4 5 6 7 8; do
-            if _probe_ok "$_cand"; then _hi=$_cand; break; fi
-            _lo=$_cand; _cand=$(( _cand * 2 ))
-        done
-        if [[ -n "$_hi" ]]; then
-            while (( _hi - _lo > 32 )); do
-                _mid=$(( (_lo + _hi) / 2 ))
-                if _probe_ok "$_mid"; then _hi=$_mid; else _lo=$_mid; fi
+        if [[ "${NEXUS_TEST_NPROC_PROBE:-helper}" == helper ]] && command -v python3 >/dev/null 2>&1; then
+            _hfloor=$(python3 -c '
+import os, resource, sys
+cand = int(sys.argv[1])
+soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+def ok(n):
+    try:
+        resource.setrlimit(resource.RLIMIT_NPROC, (n, hard))
+    except (ValueError, OSError):
+        return False
+    try:
+        pid = os.fork()
+    except OSError:
+        return False
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return True
+lo, hi = 0, None
+for _ in range(8):
+    if ok(cand):
+        hi = cand
+        break
+    lo, cand = cand, cand * 2
+if hi is None:
+    print("none")
+    sys.exit(0)
+while hi - lo > 32:
+    mid = (lo + hi) // 2
+    if ok(mid):
+        hi = mid
+    else:
+        lo = mid
+print(hi)
+' "$_cand" 2>/dev/null) || _hfloor=""
+            if [[ "$_hfloor" =~ ^[0-9]+$ ]]; then _hi=$_hfloor; _probe_by=helper
+            elif [[ "$_hfloor" == none ]]; then _probe_by=helper
+            fi
+        fi
+        if [[ "$_probe_by" == shell ]]; then
+            for _i in 1 2 3 4 5 6 7 8; do
+                if _probe_ok "$_cand"; then _hi=$_cand; break; fi
+                _lo=$_cand; _cand=$(( _cand * 2 ))
             done
+            if [[ -n "$_hi" ]]; then
+                while (( _hi - _lo > 32 )); do
+                    _mid=$(( (_lo + _hi) / 2 ))
+                    if _probe_ok "$_mid"; then _hi=$_mid; else _lo=$_mid; fi
+                done
+            fi
+        fi
+        if [[ -n "$_hi" ]]; then
             _nproc_cap=$(( _hi + _headroom ))
             _hard=$(ulimit -Hu 2>/dev/null || echo unlimited)
             # Only ever LOWER the limit (raising needs privilege and is not
@@ -2360,8 +2938,8 @@ if [[ "${NEXUS_TEST_NPROC_GUARD:-on}" != "off" ]]; then
             # was reported as a result.
             if [[ "$_hard" == unlimited ]] || (( _nproc_cap < _hard )); then
                 if ulimit -Su "$_nproc_cap" 2>/dev/null; then
-                    printf '=== nproc guard: RLIMIT_NPROC capped at %d (probed task floor %d + headroom %d; tasks != processes, #506) ===\n' \
-                        "$_nproc_cap" "$_hi" "$_headroom"
+                    printf '=== nproc guard: RLIMIT_NPROC capped at %d (probed task floor %d + headroom %d; tasks != processes, #506; probe=%s) ===\n' \
+                        "$_nproc_cap" "$_hi" "$_headroom" "$_probe_by"
                 else
                     # SAY SO. A guard that declines to engage and prints nothing
                     # is indistinguishable from one that engaged — and the whole
@@ -2390,10 +2968,51 @@ if [[ "${NEXUS_TEST_NPROC_GUARD:-on}" != "off" ]]; then
                 "$(ulimit -Hu 2>/dev/null || echo unlimited)" >&2
         fi
     fi
-    unset _cur_tasks _headroom _nproc_cap _hard _lo _hi _cand _mid _i
+    unset _cur_tasks _headroom _nproc_cap _hard _lo _hi _cand _mid _i _hfloor _probe_by
     unset -f _probe_ok 2>/dev/null || true
 fi
 
+# THE FILE IS CHECKED FOR WHAT IT DOES, NOT FOR WHETHER IT CAN BE OPENED
+# (your-org/nexus-code#1574 G2). `#1569` made an UNREADABLE file loud. But the
+# defect that motivated it was rows that are INERT, and `[[ -r ]]` passes every
+# one of these in silence — after which `_rt_ceiling_for` returns the run
+# ceiling without a word:
+#     an EMPTY file · a DIRECTORY · a row typed with SPACES instead of a tab ·
+#     a two-column CRLF row (`1200<CR>` is not a number) · a non-numeric ceiling
+# The file is hand-maintained TSV, so the space-delimited row is the realistic
+# one. Failure direction is a false RED — a TIMEOUT that is not a verdict.
+#
+# …AND IT IS SAID TWICE (G3). The line below prints before dispatch, which in a
+# 487-suite band is thousands of lines above the TIMEOUT row it explains and in
+# neither that row nor the summary. `_rt_ceiling_note` is repeated in the
+# verdict section, beside the rows it is about.
+_rt_ceiling_note=""
+if [[ ! -r "$_RT_CEILING_FILE" ]]; then
+    _rt_ceiling_note="ceiling overrides: $_RT_CEILING_FILE is NOT READABLE — every suite runs at the run ceiling; a slow suite with a row WILL be TIMEOUT-killed, and that TIMEOUT is not a verdict (#1474)"
+    printf '=== %s ===\n' "$_rt_ceiling_note" >&2
+else
+    # One awk pass: `OK <n>` then one `INERT <lineno>: <text>` per offender.
+    # No `-v`: nothing here is caller data. A directory or an unreadable-after-
+    # all file makes awk fail, which leaves `_rt_ceil_scan` empty -> zero rows.
+    _rt_ceil_scan=$(awk -F'\t' '
+        /^[[:space:]]*(#|$)/ { next }
+        { c = $2; sub(/\r$/, "", c) }
+        NF >= 2 && $1 != "" && c ~ /^[0-9]+$/ && $2 == c { ok++; next }
+        { printf "INERT %d: %s\n", NR, substr($0, 1, 120) }
+        END { printf "OK %d\n", ok + 0 }
+    ' "$_RT_CEILING_FILE" 2>/dev/null) || _rt_ceil_scan=""
+    _rt_ceil_ok=$(sed -n 's/^OK \([0-9][0-9]*\)$/\1/p' <<<"$_rt_ceil_scan")
+    _rt_ceil_inert=$(grep -a '^INERT ' <<<"$_rt_ceil_scan" | sed 's/^INERT //' || true)
+    if [[ -n "$_rt_ceil_inert" ]]; then
+        _rt_ceiling_note="ceiling overrides: $_RT_CEILING_FILE has $(grep -c . <<<"$_rt_ceil_inert") INERT row(s) — not \`<suite><TAB><seconds>\`, so the suite they name runs at the RUN ceiling and a TIMEOUT there is not a verdict (#1574)"
+        printf '=== %s ===\n' "$_rt_ceiling_note" >&2
+        sed 's/^/===   line /' <<<"$_rt_ceil_inert" >&2
+    elif [[ ! "$_rt_ceil_ok" =~ ^[0-9]+$ ]] || (( _rt_ceil_ok == 0 )); then
+        _rt_ceiling_note="ceiling overrides: $_RT_CEILING_FILE parsed to ZERO usable rows (empty, a directory, or not TSV) — every suite runs at the run ceiling; a TIMEOUT on a slow suite is not a verdict (#1574)"
+        printf '=== %s ===\n' "$_rt_ceiling_note" >&2
+    fi
+    unset _rt_ceil_scan _rt_ceil_ok _rt_ceil_inert
+fi
 # run_one reads these from the environment (it also runs inside xargs
 # children under --jobs).
 export PER_TEST_TIMEOUT="$per_test_timeout"
@@ -2483,7 +3102,19 @@ export NEXUS_TEST_JOBS="$jobs"
 # rather than looking identical to one that set it deliberately.
 _eff_cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 [[ "$_eff_cpus" =~ ^[0-9]+$ ]] && (( _eff_cpus >= 1 )) || _eff_cpus=1
-if [[ "${NEXUS_TEST_DEADLINE_SCALE:-}" =~ ^[0-9]+$ ]] \
+# A MALFORMED SCALE IS UNSET, SO THIS HEADER AND THE SUITES AGREE
+# (your-org/nexus-code#1618). `08` passed `^[0-9]+$` here and then errored in
+# `(( … >= 1 ))`, so the header said `derived` — while `th_deadline` in each suite
+# reads the same exported string by its OWN rule and did something else. The
+# runner cannot fix the suites' reading, but it can decline to hand them a value
+# it would not use itself: the value is named, and removed from their
+# environment, so "derived" is then true of every suite too.
+if [[ -n "${NEXUS_TEST_DEADLINE_SCALE:-}" ]] && ! _rt_is_decimal "$NEXUS_TEST_DEADLINE_SCALE"; then
+    printf 'run-tests.sh: NEXUS_TEST_DEADLINE_SCALE=%q is not a decimal integer (no leading zero) — IGNORED and unset for the suites, so the scale is derived (your-org/nexus-code#1618).\n' \
+        "$NEXUS_TEST_DEADLINE_SCALE" >&2
+    unset NEXUS_TEST_DEADLINE_SCALE
+fi
+if _rt_is_decimal "${NEXUS_TEST_DEADLINE_SCALE:-}" \
    && (( NEXUS_TEST_DEADLINE_SCALE >= 1 )); then
     _eff_scale="${NEXUS_TEST_DEADLINE_SCALE} (explicit)"
 else
@@ -2571,7 +3202,270 @@ _rt_tree_line() {
     fi
     printf 'ref=%s branch=%s dirty=%s worktree=%s\n' "$sha" "$branch" "$dirty" "$wt"
 }
-printf '=== tree: %s ===\n' "$(_rt_tree_line)"
+_rt_tree_out=$(_rt_tree_line)
+printf '=== tree: %s ===\n' "$_rt_tree_out"
+
+# THE UNREACHABLE-SUITE CENSUS (your-org/nexus-code#1620). Every reporting path in
+# this runner — the rows, the SKIPPED section, the accounting census, the
+# `selected == reported` identity band-verdict.sh checks — is DOWNSTREAM OF
+# SELECTION, so a tracked suite that no root walks could not be mentioned by any
+# of them: `selected=494 reported=494` was true and complete about the 494, and
+# the 495th appeared ZERO times in the log. Found only because two independent
+# counts of one population disagreed by one. So the runner now asks the question
+# no registry asks — IS THIS SUITE EVER SELECTED BY ANYTHING? — by enumerating
+# the TRACKED `test-*.sh` (basename semantics, as the corpus count above: git's
+# pathspec `*` crosses `/`, #1111) and naming every one whose directory is not a
+# root in `_RT_SUITE_ROOTS`.
+#
+# REACHABLE IS A PROPERTY OF THE ROOTS, NOT OF THIS RUN'S SELECTION. A `--filter`
+# run legitimately selects a subset; a suite it filtered out is still walked by a
+# root and is NOT unreachable, so it is never named here. The census line carries
+# the run's own `selected` beside the root numbers, labelled, so the two cannot be
+# read as one another.
+#
+# TAKEN ONLY WHEN THE ROOTS WERE WALKED. Explicit paths and --failed-only select
+# by list, not by root; the line says NOT TAKEN and why, never a zero.
+#
+# GATED ON THE SAME PREDICATE AS THE TREE LINE: the census runs only when that
+# line printed a 40-hex ref, i.e. `_RT_REPO_ROOT` is its OWN repository root (or
+# linked worktree) per repo-root.sh. `git -C` on anything else WALKS UP (#1196)
+# and would census the ENCLOSING repository — for a runner copied into a fixture
+# under a checkout, a confident answer about the wrong tree. And a POSITIVE
+# CONTROL before any zero is believed: this runner itself must be in the tracked
+# list it read, or the list is not about this tree (an untracked copy) and the
+# census is NOT TAKEN rather than reported as "0 unreachable".
+#
+# WHY RED, NOT A WARNING. A warning is a line in a log of thousands, and #1620 is
+# precisely the case nobody reads for; the question is who pays. CI builds the
+# merge ref, so the band that goes red is the one on the PR that ADDED the
+# unreachable suite — its author, at the moment the fix is one line (add a root,
+# or move the file). With cc-harness a root, the census is EMPTY today, so no
+# existing band changes verdict. rc 1, not a new code: 1 already means "do not
+# merge" to every caller (see the accounting arm's reasoning at the end), and
+# band-verdict.sh reads an rc-1 log with no FAIL row as a row-less red and says
+# "read the lines above the END marker", which is where the census prints (its
+# sentence now names this census too; its classification is unchanged). A census that could NOT BE TAKEN is not red: it is named on the
+# line, and a tarball run has no tracked set to be unreachable from.
+#
+# DECLARED EXCLUSIONS, NEVER SILENT ONES (your-org/nexus-code#1620 skeptic item 9).
+# With no exclusion mechanism at all, a tracked `test-*.sh` that is DELIBERATELY
+# unwalked — a fixture or stub a suite executes, e.g. a staged
+# `monitor/watcher/fixtures/test-fixture.sh` (that directory already holds
+# stubs) — reddened every root-walking run, `--filter` runs of unrelated suites
+# included; measured rc 1. The remedy is a TRACKED MANIFEST,
+# `census-exclusions.manifest` beside this runner, one `path|reason` row per
+# excluded file, and deliberately NOT a structural rule such as "anything under
+# a fixtures/ directory": a structural rule IS the invisible exclusion #1078 and
+# #1620 are about — it admits every future file that happens to land there,
+# including a real suite misplaced into it, and no row anywhere says so. A row
+# names ONE path, so the list grows only by a reviewed line in a diff. And the
+# manifest cannot rot into a blind spot, because every row is re-checked on
+# every census and each failure is RED, named with its manifest line:
+#   REFUSED  a row with no `|`, an empty path, an EMPTY REASON, or a path that
+#            already has a row — not applied, so its file stays unreachable.
+#   STALE    a row whose path is NOT a tracked `test-*.sh` (deleted, moved,
+#            never added — the row would silently pre-exclude whatever lands at
+#            that path next), or IS walked by a root (the row excludes nothing
+#            and misdescribes the file as unrun).
+#   and the manifest must itself be TRACKED when present, or its rows would
+#   exist on this machine and not on CI: a green here, a red there.
+# An exclusion is VISIBLE: `excluded=N` sits on the census line, the arithmetic
+# `tracked = walked-by-a-root + excluded + UNREACHABLE` is closed, and every
+# excluded path is printed with its reason directly under that line on every
+# run, green or red. An ABSENT manifest means zero exclusions — the fail-closed
+# direction (it can only leave more files unreachable), so it needs no refusal.
+_rt_unreachable=()
+_rt_excluded=()
+_rt_census_defects=()
+_rt_census_line=''
+_RT_CENSUS_EXCL_REL=monitor/watcher/census-exclusions.manifest
+_rt_census() {
+    local root="${_RT_REPO_ROOT:-}" d rp rel f base out rc n_tracked=0 n_walked=0 self_seen=0 excl_seen=0
+    local mf ln=0 row ep er
+    local -A reach=() suite=() erow=()
+    if (( ${#explicit_files[@]} > 0 )); then
+        _rt_census_line='NOT TAKEN — explicit paths were given, so no root was walked'; return 0
+    fi
+    if (( failed_only )); then
+        _rt_census_line='NOT TAKEN — --failed-only re-runs a recorded list, so no root was walked'; return 0
+    fi
+    if [[ ! "$_rt_tree_out" =~ ^ref=[0-9a-f]{40}[[:space:]] ]]; then
+        _rt_census_line="NOT TAKEN — no tracked set to compare against: ${_rt_tree_out}"; return 0
+    fi
+    for d in "${_RT_SUITE_ROOTS[@]}"; do
+        rp=$(cd "$d" 2>/dev/null && pwd -P) || continue
+        [[ "$rp" == "$root" ]] && { reach['.']=1; continue; }   # '.', not '': an EMPTY key is a bad subscript
+        [[ "$rp" == "$root"/* ]] && reach["${rp#"$root"/}"]=1
+    done
+    # The producer's status is READ, not lost behind a pipe or `< <(…)`.
+    out=$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$root" ls-files -z 2>/dev/null | tr '\0' '\n'; exit "${PIPESTATUS[0]}")
+    rc=$?
+    if (( rc != 0 )); then
+        _rt_census_line="NOT TAKEN — \`git ls-files\` failed (rc $rc) in $root"; return 0
+    fi
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        [[ "$f" == monitor/watcher/run-tests.sh ]] && self_seen=1
+        [[ "$f" == "$_RT_CENSUS_EXCL_REL" ]] && excl_seen=1
+        base=${f##*/}
+        [[ "$base" == test-*.sh ]] || continue
+        n_tracked=$(( n_tracked + 1 ))
+        rel=.; [[ "$f" == */* ]] && rel=${f%/*}
+        if [[ -n "${reach[$rel]+set}" ]]; then n_walked=$(( n_walked + 1 )); suite["$f"]=walked
+        else suite["$f"]=unreach; fi
+    done <<<"$out"
+    if (( ! self_seen )); then
+        _rt_unreachable=()
+        _rt_census_line="NOT TAKEN — this runner is not in the tracked list of $root, so that list is not about this tree"
+        return 0
+    fi
+    # The exclusions, read only once the tracked list is known to be THIS tree's.
+    mf="$root/$_RT_CENSUS_EXCL_REL"
+    if [[ -e "$mf" ]]; then
+        if (( ! excl_seen )); then
+            _rt_census_defects+=("EXCLUSIONS REFUSED: $_RT_CENSUS_EXCL_REL exists but is NOT TRACKED — its rows would not exist on CI; \`git add\` it or remove it (no row applied)")
+        elif [[ ! -r "$mf" ]]; then
+            _rt_census_defects+=("EXCLUSIONS REFUSED: $_RT_CENSUS_EXCL_REL is not readable (no row applied)")
+        else
+            while IFS= read -r row || [[ -n "$row" ]]; do   # `|| -n`: an unterminated last row is still a row
+                ln=$(( ln + 1 ))
+                [[ "$row" =~ ^[[:space:]]*(#|$) ]] && continue
+                if [[ "$row" != *'|'* ]]; then
+                    _rt_census_defects+=("EXCLUSION REFUSED (manifest line $ln): no \`|\` — a row is \`path|reason\`: $row"); continue
+                fi
+                ep=${row%%|*}; er=${row#*|}
+                ep="${ep#"${ep%%[![:space:]]*}"}"; ep="${ep%"${ep##*[![:space:]]}"}"
+                er="${er#"${er%%[![:space:]]*}"}"; er="${er%"${er##*[![:space:]]}"}"
+                if [[ -z "$ep" ]]; then
+                    _rt_census_defects+=("EXCLUSION REFUSED (manifest line $ln): empty path"); continue
+                fi
+                if [[ -z "$er" ]]; then
+                    _rt_census_defects+=("EXCLUSION REFUSED (manifest line $ln): $ep has NO REASON — an exclusion must say why the file is never run"); continue
+                fi
+                if [[ -n "${erow[$ep]+set}" ]]; then
+                    _rt_census_defects+=("EXCLUSION REFUSED (manifest line $ln): $ep already excluded at line ${erow[$ep]}"); continue
+                fi
+                erow["$ep"]=$ln
+                case "${suite[$ep]-}" in
+                    unreach) suite["$ep"]=excluded; _rt_excluded+=("$ep — $er") ;;
+                    walked)  _rt_census_defects+=("STALE EXCLUSION (manifest line $ln): $ep is WALKED by a root — the row excludes nothing; delete it") ;;
+                    *)       _rt_census_defects+=("STALE EXCLUSION (manifest line $ln): $ep is not a tracked test-*.sh — deleted, moved or never added; delete the row before something new lands at that path") ;;
+                esac
+            done < "$mf"
+        fi
+    fi
+    # Unreachable = tracked, not walked, not (validly) excluded. In `ls-files`
+    # order, so the RED list reads as it always has.
+    while IFS= read -r f; do
+        [[ -n "$f" && "${suite[$f]-}" == unreach ]] && _rt_unreachable+=("$f")
+    done <<<"$out"
+    _rt_census_line=$(printf 'tracked=%d walked-by-a-root=%d excluded=%d UNREACHABLE=%d; this run selected=%d%s' \
+        "$n_tracked" "$n_walked" "${#_rt_excluded[@]}" "${#_rt_unreachable[@]}" "${#all_selected[@]}" \
+        "$( [[ -n "$filter" ]] && printf " (by --filter %q — a suite filtered OUT is walked, NOT unreachable)" "$filter" )")
+}
+_rt_census
+
+# THE TREE, AS CONTENT — so the END can ask whether it is still the same one
+# (your-org/nexus-code#1586). The line above has said WHICH tree since #1465,
+# but `dirty=yes` is a BOOLEAN: a tree dirty at the start and DIFFERENTLY dirty
+# at the end prints the identical header, and nothing re-read it anyway.
+#
+# `_rt_tree_table` prints one row per thing that can move under a running band:
+#     HEAD <sha>
+#     T <blob> <path>    every TRACKED path that differs from HEAD, staged or
+#                        not, keyed by the blob of its CURRENT content
+#                        (`DELETED` when it is gone)
+#     U <blob> <path>    every UNTRACKED, non-ignored path
+# `git hash-object`, not sha256sum: git is already this block's dependency and
+# hashing does not write to the object store without `-w`. Paths are read
+# newline-delimited; a path git has to C-quote hashes as `UNREADABLE` at BOTH
+# ends, so it cannot manufacture a drift (nor detect one — stated, not hidden).
+#
+# WHY `U` ROWS DO NOT VOID THE VERDICT — WE CHOSE THIS, it is not a convention.
+# Suites in this repo PLANT files in the tree while they run
+# (test-guards-for-diff.sh is one), and a suite that leaks a plant would
+# otherwise turn an hour-long band into NOT A VERDICT for a reason unrelated to
+# what was tested. Comparing only START against END already hides a plant that
+# was removed; a `U` row that still differs at the end is named in a loud NOTE,
+# and the reader decides — because an UNTRACKED suite edited mid-band IS a mixed
+# tree, and this rule errs toward MISSING that case. `git add` the suite first
+# and it becomes a `T` row, which voids. The direction is stated on purpose.
+_rt_tree_table() {
+    local root="${_RT_REPO_ROOT:-}" sha p h
+    [[ -n "$root" && -d "$root" ]] && command -v git >/dev/null 2>&1 || return 1
+    _rt_tg() { env -u GIT_DIR -u GIT_WORK_TREE git -C "$root" "$@"; }
+    sha=$(_rt_tg rev-parse HEAD 2>/dev/null) || return 1
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf 'HEAD %s\n' "$sha"
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ -e "$root/$p" ]]; then h=$(_rt_tg hash-object -- "$p" 2>/dev/null) || h=UNREADABLE
+        else h=DELETED; fi
+        printf 'T %s %s\n' "$h" "$p"
+    done < <(_rt_tg diff HEAD --name-only 2>/dev/null | LC_ALL=C sort)
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        h=$(_rt_tg hash-object -- "$p" 2>/dev/null) || h=UNREADABLE
+        printf 'U %s %s\n' "$h" "$p"
+    done < <(_rt_tg ls-files --others --exclude-standard 2>/dev/null | LC_ALL=C sort)
+    return 0
+}
+# Taken only where the tree line above produced a real ref: an UNKNOWN tree has
+# no identity to lose, and saying so beats a drift check against nothing.
+_rt_tree_start=""
+_rt_tree_known=0
+case "$(_rt_tree_line)" in
+    ref=UNKNOWN*) ;;
+    *) if _rt_tree_start=$(_rt_tree_table); then _rt_tree_known=1; fi ;;
+esac
+
+# _rt_tree_drift_check -> rc 0 the verdict still describes ONE tree; rc 1 it
+# does not (banner printed). Idempotent: `_rt_exit` is reached once, but a
+# second call must not print a second banner.
+_rt_tree_checked=0
+_rt_tree_drift_check() {
+    (( _rt_tree_known )) || return 0
+    (( _rt_tree_checked )) && return 0
+    _rt_tree_checked=1
+    local end moved_hard moved_soft
+    end=$(_rt_tree_table) || {
+        printf '\nTREE IDENTITY UNREADABLE AT END — it was readable at the start (your-org/nexus-code#1586).\n'
+        printf '  The start/end comparison could not be made, so this verdict is NOT established to describe one tree.\n'
+        return 1
+    }
+    [[ "$end" == "$_rt_tree_start" ]] && return 0
+    # Rows present on one side only, by class. `comm` on two sorted streams.
+    moved_hard=$(comm -3 <(printf '%s\n' "$_rt_tree_start" | grep -aE '^(HEAD|T) ' | LC_ALL=C sort) \
+                         <(printf '%s\n' "$end"            | grep -aE '^(HEAD|T) ' | LC_ALL=C sort) | tr -d '\t')
+    moved_soft=$(comm -3 <(printf '%s\n' "$_rt_tree_start" | grep -aE '^U ' | LC_ALL=C sort) \
+                         <(printf '%s\n' "$end"            | grep -aE '^U ' | LC_ALL=C sort) | tr -d '\t')
+    if [[ -n "$moved_soft" ]]; then
+        printf '\nNOTE — UNTRACKED paths appeared, vanished or changed during the run (your-org/nexus-code#1586):\n'
+        printf '%s\n' "$moved_soft" | awk '{ $1=""; $2=""; sub(/^  /,""); print "    " $0 }' | LC_ALL=C sort -u
+        printf '  The verdict STANDS: suites plant files while they run, and a leaked plant is not a mixed tree.\n'
+        printf '  But if one of these is a SUITE or a file a suite reads, this band tested more than one version of it —\n'
+        printf '  `git add` it before a band and it is compared as tracked content, which DOES void the verdict.\n'
+    fi
+    [[ -n "$moved_hard" ]] || return 0
+    printf '\nTREE CHANGED DURING RUN — this verdict describes no single tree (your-org/nexus-code#1586).\n'
+    printf '  Every suite reads its files when IT starts, so suites that began before the change tested one\n'
+    printf '  tree and suites that began after it tested another. The result above is evidence for NEITHER.\n'
+    printf '  What moved (rows present at only one end; `HEAD` = a commit/checkout, `T` = tracked content):\n'
+    printf '%s\n' "$moved_hard" | sed 's/^/    /'
+    printf '  Re-run from a detached worktree you never edit: `git worktree add --detach <dir> <sha>`.\n'
+    return 1
+}
+# SAID UP FRONT, because the reader of a killed log never reaches a footer that
+# could say it (your-org/nexus-code#1474): what makes this log a verdict is its
+# LAST line. An absence cannot announce itself; the promise of a presence can.
+# THE PROMISE MUST NOT SPELL THE MARKER. The first cut quoted it, so a KILLED
+# log "contained" the marker — in its own header — and `grep` for it said the
+# run had ended: a description of the thing matching the predicate for the
+# thing, inside the fix for an absence that reads as a pass. Caught by the
+# SIGKILL control in test-run-tests-runner-signal.sh. So it is DESCRIBED here,
+# and a reader tests the LAST LINE (`tail -n 1`), anchored, never the body.
+printf '=== this log is a VERDICT only if it ENDS with the runner-s closing marker (its last line: the word END, then the exit code); without it the run was KILLED or is still going, and the PASS lines are a SUBSET ===\n'
+_rt_run_started=1
 
 start_ns=$(date +%s%N)
 budget_stopped=0
@@ -2586,7 +3480,13 @@ dispatch_rc=0
 
 if (( jobs > 1 )); then
     # Parallel: xargs gives us bounded concurrency without extra deps.
-    if (( ${#tests[@]} > 0 )); then
+    # A signal that arrived BEFORE the batch started (a loaded host can spend
+    # seconds between the header and here) must not be answered by starting the
+    # batch: nothing is dispatched, and the verdict section reports every
+    # selected test unreported (your-org/nexus-code#1474).
+    if [[ -n "$_rt_runner_signal" ]]; then
+        :
+    elif (( ${#tests[@]} > 0 )); then
         # CHECK mktemp, do not inline it into the argument list (#857). An
         # unchecked `$(mktemp …)` collapses to the empty string on failure and
         # hands run_one a base that resolves to the CHILD'S cwd. Inlined here
@@ -2657,6 +3557,10 @@ else
     _budget_t0=$SECONDS
     for t in "${tests[@]:-}"; do
         [[ -n "$t" ]] || continue
+        # A signal to the runner is handled HERE, at the test boundary bash
+        # deferred it to (#1474). Not `budget_stopped`: that is a resumable,
+        # intended stop (exit 3); this is an environment event (exit 4).
+        [[ -z "$_rt_runner_signal" ]] || break
         if (( max_seconds > 0 )) && (( SECONDS - _budget_t0 >= max_seconds )); then
             budget_stopped=1
             break
@@ -2669,7 +3573,7 @@ else
         if [[ -z "$_out" ]]; then
             printf 'run-tests.sh: mktemp failed in %s — aborting.\n' "$run_dir" >&2
             printf '  Refusing to write sidecars into %s (your-org/nexus-code#857)\n' "$PWD" >&2
-            exit 97
+            _rt_exit 97
         fi
         run_one "$t" "$_out"
     done
@@ -2677,6 +3581,14 @@ fi
 
 end_ns=$(date +%s%N)
 total=$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN{printf "%.2f", (e-s)/1e9}')
+
+# Said BEFORE the accounting below, because it is the CAUSE of whatever
+# shortfall that accounting is about to report: without this line an
+# `ACCOUNTING INCOMPLETE` banner sends the reader looking for a broken mktemp.
+if [[ -n "$_rt_runner_signal" ]]; then
+    printf '::error::THE RUNNER RECEIVED SIG%s at %s. What follows is the accounting of whatever had finished by then (your-org/nexus-code#1474).\n' \
+        "$_rt_runner_signal" "$_rt_runner_signal_at"
+fi
 
 # Aggregate failure + timeout lists across the per-job files.
 failed_paths=()
@@ -2918,6 +3830,7 @@ if [[ -n "$tally_file" ]]; then
     # this gate — the same direction `nocount` and `vacuous` already err in, and
     # said here so an empty list is not read as "none found".
     falsepass_paths=()
+    ledger_failed_paths=()
     for t in "${all_selected[@]}"; do
         st=$(awk -F'\t' -v p="$t" '$1==p{s=$2} END{print s}' "$tally_file")
         cs=$(awk -F'\t' -v p="$t" '$1==p{s=$4} END{print s}' "$tally_file")
@@ -2943,8 +3856,11 @@ if [[ -n "$tally_file" ]]; then
         fi
         case "$st" in
             PASS)    n_pass=$(( n_pass + 1 )) ;;
-            FAIL)    n_fail=$(( n_fail + 1 )) ;;
-            TIMEOUT) n_timeout=$(( n_timeout + 1 )) ;;
+            # The ledger's CURRENT failing set, kept as a list: the local gate
+            # partitions THIS (the whole sweep) under --state, never this
+            # invocation's sidecars (skeptic G2 on your-org/nexus-code#1558).
+            FAIL)    n_fail=$(( n_fail + 1 )); ledger_failed_paths+=("$t") ;;
+            TIMEOUT) n_timeout=$(( n_timeout + 1 )); ledger_failed_paths+=("$t") ;;
             SKIP)    n_skip=$(( n_skip + 1 )); skipped_paths+=("$t") ;;
             # ENVSKIP is counted SEPARATELY and never folded into SKIP
             # (your-org/nexus-code#1283) — folding them would re-merge at the
@@ -3302,6 +4218,39 @@ _n_pass_files=$(( _guard_assert_lines + _guard_nocount ))
 # count `test-integration/_harness.sh` and `stub-claude.sh`, which are a shared
 # library and a shim rather than suites; your-org/nexus-code#1111.)
 : "${NEXUS_ASSERT_ACCOUNTING_FLOOR:=20}"
+# `:=` GUARDS UNSET, NOT SHAPE (your-org/nexus-code#1616). A leaked NON-NUMERIC
+# value survives the default-assign and then reaches `(( … ))` below, where bash
+# treats the string as a VARIABLE NAME, finds it unset, and under `set -u` aborts
+# the runner — killing the run before any verdict, with no END marker and no row
+# for the suite that was executing. Reproduced in isolation:
+#
+#     bash -c 'set -u; F=SENT; : "${F:=20}"; n=30; (( n >= F ))'
+#       -> bash: SENT: unbound variable
+#
+# Found by the rtev skeptic while measuring a bundle claim; it is PRE-EXISTING on
+# dev and scoped OUT of its verdict, fixed here because this bundle already edits
+# this file and because "the run dies with no verdict" is precisely the shape
+# band-verdict.sh was added to DETECT — detecting it and also preventing it belongs
+# in one change. An emptiness check is a presence test wearing a validity test's
+# name: validate the SHAPE. Same remedy as `_gate_defer_streak_age`'s
+# `[[ "$t" =~ ^[0-9]+$ ]]` guard, which is the in-tree precedent.
+#
+# FALLING BACK rather than refusing, deliberately: this floor only decides whether
+# an ACCOUNTING DIAGNOSTIC fires, so an unusable value must not be able to stop a
+# run that is otherwise fine — the failure direction that matters here is exactly
+# the one the defect produces. The override is named on stderr so it is not silent.
+#
+# AND `^[0-9]+$` WAS ITSELF IMPRECISE ABOUT SHAPE (your-org/nexus-code#1618) — the
+# class re-instantiated one level down by the commit closing it. It admitted a
+# leading zero, which bash arithmetic reads as OCTAL: `010` made the floor EIGHT
+# (fires early, harmless), and `08` made `(( n >= 08 ))` an arithmetic ERROR,
+# which is a FALSE test — the detector SKIPPED, the fail-OPEN direction #1616
+# exists to close. `_rt_is_decimal` rejects both into the same fallback.
+if ! _rt_is_decimal "$NEXUS_ASSERT_ACCOUNTING_FLOOR"; then
+    printf 'run-tests.sh: NEXUS_ASSERT_ACCOUNTING_FLOOR=%q is not a non-negative integer — using 20 (your-org/nexus-code#1616).\n' \
+        "$NEXUS_ASSERT_ACCOUNTING_FLOOR" >&2
+    NEXUS_ASSERT_ACCOUNTING_FLOOR=20
+fi
 if (( _n_pass_files >= NEXUS_ASSERT_ACCOUNTING_FLOOR \
       && _guard_nocount >= _n_pass_files )); then
     printf '::error::ASSERTION ACCOUNTING IS BROKEN — all %d passing file(s) THIS INVOCATION measured read as `?`.\n' \
@@ -3551,9 +4500,56 @@ fi
 # The verdict (exit code) is UNCHANGED by this block — a row changes what is
 # printed, never whether the run is red. DIFF THE SETS, NEVER THE COUNTS.
 _klr_manifest="${NEXUS_KNOWN_LOCAL_RED:-$(dirname "${BASH_SOURCE[0]}")/known-local-red.tsv}"
-if (( ${#failed_paths[@]} > 0 )) && [[ -r "$_klr_manifest" ]]; then
+# NOT EVALUATED ON AN INCOMPLETE RUN (skeptic F2 on your-org/nexus-code#1558).
+# This block used to run before the exit-4 / exit-3 arms, so a run cut short
+# by a signal (or stopped by its budget) printed `LOCAL GATE: … CLEAR for the
+# local gate. The run is still RED (exit 1)` about the SUBSET it had measured —
+# a clearance over tests that never reported, with the wrong exit code in the
+# sentence, one line above the run's own NOT A VERDICT. A failing set from a
+# partial run is a lower bound; a subset of a lower bound is not a clearance.
+#
+# THE EXIT CLASS IS DECIDED ONCE, HERE, AND BOTH READERS USE IT (skeptic G11,
+# your-org/nexus-code#1564). This block used to RE-DERIVE "is this run a
+# complete verdict" from its own copy of the conditions the exit section tests
+# further down, and the two drifted in the way two copies do: a run whose
+# ACCOUNTING BROKE (a refused mktemp, a lost sidecar — exit 1, and its failing
+# set is missing whatever verdicts were lost) was outside this predicate
+# entirely, so it still got its partial failing set partitioned and could print
+# `CLEAR for the local gate`. Same precedence as the exit contract below:
+# signalled > broken > incomplete > complete.
+_rt_run_class=complete; _rt_incomplete_why=""
+if [[ -n "$tally_file" ]]; then _rt_short=$n_unrecorded; else _rt_short=$(( ${n_dispatched:-0} - ${n_accounted:-0} )); fi
+if (( n_signalled > 0 )); then
+    _rt_run_class=signalled-children
+    _rt_incomplete_why="$n_signalled dispatch child(ren) killed by a signal"
+elif [[ -n "$_rt_runner_signal" ]] && (( _rt_short > 0 )); then
+    _rt_run_class=signalled-runner
+    _rt_incomplete_why="the runner received SIG$_rt_runner_signal with $_rt_short test(s) unreported"
+elif (( ${_accounting_broken:-0} > 0 )); then
+    _rt_run_class=accounting-broken
+    _rt_incomplete_why="the run's ACCOUNTING BROKE, so verdicts were lost and the failing set is missing them"
+elif (( budget_stopped )); then
+    _rt_run_class=incomplete
+    _rt_incomplete_why="the --max-seconds budget stopped this invocation"
+elif [[ -n "$tally_file" ]] && (( n_unrecorded > 0 )); then
+    # Under a ledger, the sweep is incomplete while rows are still unrecorded —
+    # with or without a budget stop (skeptic G4 on #1558).
+    _rt_run_class=incomplete
+    _rt_incomplete_why="$n_unrecorded selected test(s) not yet run in the ledger"
+fi
+# THE SET THE GATE PARTITIONS: under --state it is the LEDGER's current
+# FAIL/TIMEOUT rows — the whole sweep, including invocations resumed past —
+# never this invocation's sidecars, which on a `--resume` leg omit every red
+# an earlier leg recorded (skeptic G2: a resumed run cleared "1 of 1" while
+# the ledger held an UNEXPLAINED red from the leg before).
+if [[ -n "$tally_file" ]]; then _klr_set=( "${ledger_failed_paths[@]}" ); else _klr_set=( "${failed_paths[@]}" ); fi
+if [[ "$_rt_run_class" != complete ]] && (( ${#_klr_set[@]} > 0 )); then
+    echo
+    printf 'LOCAL GATE: NOT EVALUATED — this run is INCOMPLETE (%s). Its failing set is a LOWER BOUND, and a subset of a lower bound is not a clearance.\n' \
+        "$_rt_incomplete_why"
+elif (( ${#_klr_set[@]} > 0 )) && [[ -r "$_klr_manifest" ]]; then
     _klr_known=(); _klr_unexplained=()
-    for f in "${failed_paths[@]}"; do
+    for f in "${_klr_set[@]}"; do
         _klr_tag="$(basename "$(dirname "$f")")/$(basename "$f")"
         _klr_row=$(awk -F'\t' -v t="$_klr_tag" '$0 !~ /^[[:space:]]*(#|$)/ && $1 == t { print; exit }' "$_klr_manifest")
         if [[ -n "$_klr_row" ]]; then
@@ -3565,7 +4561,7 @@ if (( ${#failed_paths[@]} > 0 )) && [[ -r "$_klr_manifest" ]]; then
     echo
     if (( ${#_klr_known[@]} > 0 )); then
         printf 'KNOWN-LOCAL-RED (%d of %d failures are in %s — inherited, NOT evidence about your diff; each row names the issue that expires it):\n' \
-            "${#_klr_known[@]}" "${#failed_paths[@]}" "${_klr_manifest#"$PWD"/}"
+            "${#_klr_known[@]}" "${#_klr_set[@]}" "${_klr_manifest#"$PWD"/}"
         for _klr_row in "${_klr_known[@]}"; do
             IFS=$'\t' read -r _klr_s _klr_c _klr_i _klr_r <<<"$_klr_row"
             printf '  %-52s %-10s %-7s %s\n' "$_klr_s" "$_klr_c" "$_klr_i" "$_klr_r"
@@ -3573,16 +4569,16 @@ if (( ${#failed_paths[@]} > 0 )) && [[ -r "$_klr_manifest" ]]; then
     fi
     if (( ${#_klr_unexplained[@]} > 0 )); then
         printf 'UNEXPLAINED (%d of %d failures are NOT in the known-local-red set — these block the push):\n' \
-            "${#_klr_unexplained[@]}" "${#failed_paths[@]}"
+            "${#_klr_unexplained[@]}" "${#_klr_set[@]}"
         for f in "${_klr_unexplained[@]}"; do printf '  %s\n' "$f"; done
         printf 'LOCAL GATE: BLOCKED — failing set is NOT a subset of the known-local-red set (%d unexplained).\n' \
             "${#_klr_unexplained[@]}"
     else
         printf 'LOCAL GATE: failing set ⊆ known-local-red set (%d of %d) — CLEAR for the local gate. The run is still RED (exit 1):\n' \
-            "${#_klr_known[@]}" "${#failed_paths[@]}"
+            "${#_klr_known[@]}" "${#_klr_set[@]}"
         echo "  a row in the manifest changes what is printed, never the verdict, and CI never reads it."
     fi
-elif (( ${#failed_paths[@]} > 0 )); then
+elif (( ${#_klr_set[@]} > 0 )); then
     echo
     printf 'known-local-red manifest not readable at %s — every failure above is UNCLASSIFIED (your-org/nexus-code#1445).\n' "$_klr_manifest"
 fi
@@ -3669,16 +4665,37 @@ esac
 # SIGNALLED BEATS EVERYTHING (your-org/nexus-code#1083). Placed above the
 # incomplete/red arms deliberately — see the PRECEDENCE paragraph in the exit
 # contract above. The banner naming each killed test has already printed.
-if (( n_signalled > 0 )); then
+if [[ "$_rt_run_class" == signalled-children ]]; then
     echo
     printf 'NOT A VERDICT: %d test process(es) were killed by a signal; this run measured a SUBSET.\n' \
         "$n_signalled"
     echo "The pass count and the failure list are both LOWER BOUNDS. Re-run before reading"
     echo "either as evidence. Exit 4 (your-org/nexus-code#1083)."
-    exit 4
+    _rt_exit 4
 fi
-if { (( budget_stopped )) || { [[ -n "$tally_file" ]] && (( n_unrecorded > 0 )); }; } \
-   && (( ${_accounting_broken:-0} == 0 )); then
+# THE RUNNER ITSELF WAS SIGNALLED (your-org/nexus-code#1474). Two outcomes, and
+# only the shortfall decides between them — never the signal alone:
+#   * tests are UNREPORTED -> the sweep was cut short. Exit 4, same contract and
+#     same precedence as above: the signal is the cause, the accounting
+#     shortfall (and any `--state` remainder) is its symptom.
+#   * every selected test reported -> the signal was deferred past the end of
+#     the batch and cost nothing. The verdict below is the COMPLETE one, and
+#     saying so is the whole job: a reader who sent that TERM must not conclude
+#     from a normal exit that it never arrived.
+if [[ -n "$_rt_runner_signal" ]]; then
+    if [[ "$_rt_run_class" == signalled-runner ]]; then
+        echo
+        printf 'NOT A VERDICT: the runner received SIG%s at %s and stopped with %d of %d selected test(s) UNREPORTED.\n' \
+            "$_rt_runner_signal" "$_rt_runner_signal_at" "$_rt_short" "${#tests[@]}"
+        echo "The pass count and the failure list are both LOWER BOUNDS. Re-run before reading"
+        echo "either as evidence. Exit 4 (your-org/nexus-code#1474)."
+        _rt_exit 4
+    fi
+    echo
+    printf 'NOTE: the runner received SIG%s at %s and DEFERRED it — every one of the %d selected test(s) still reported, so the verdict below is COMPLETE. (To stop a parallel run promptly, signal its process GROUP.)\n' \
+        "$_rt_runner_signal" "$_rt_runner_signal_at" "${#tests[@]}"
+fi
+if [[ "$_rt_run_class" == incomplete ]]; then
     echo
     # THE HARDCODED ZERO (found sweeping the #1031/#997 class; the sharpest
     # non-filed member of it). This argument used to be
@@ -3706,22 +4723,98 @@ if { (( budget_stopped )) || { [[ -n "$tally_file" ]] && (( n_unrecorded > 0 ));
         "$( if [[ -n "$tally_file" ]]; then printf '%d' "$n_unrecorded"
             else printf '%d' "$(( ${n_dispatched:-0} - ${n_accounted:-0} ))"; fi )"
     echo "Resume with the SAME command (add --state <file> --resume if you had none) until exit != 3."
-    exit 3
+    _rt_exit 3
+fi
+# THE CEILING NOTE, AGAIN, WHERE A BAND READER IS LOOKING (#1574 G3): beside
+# the verdict, not thousands of lines above it. Printed on every road to a
+# verdict below, whatever that verdict is — it qualifies a TIMEOUT row.
+if [[ -n "${_rt_ceiling_note:-}" ]]; then
+    echo
+    printf 'NOTE (said at startup too): %s\n' "$_rt_ceiling_note"
+fi
+# ENV-DECLINED, counted ONCE for both paths (#1563): the ledger arm's
+# `n_envskip` is the whole sweep; without a ledger the `.envskip` sidecars are
+# this invocation, which is then the whole run.
+if [[ -n "$tally_file" ]]; then _rt_n_env_declined=$n_envskip
+else _rt_n_env_declined=${#envskip_rows[@]}; fi
+if [[ -n "$tally_file" ]]; then _rt_n_skipped=$n_skip
+else _rt_n_skipped=${#skipped_rows[@]}; fi
+# TIMED OUT vs FAILED, for the END marker (#1474). Without a ledger the TIMEOUT
+# arm writes BOTH `.failed` and `.timedout`, so `failed_paths` is the union and
+# the assertion failures are the difference; the ledger keeps them apart.
+if [[ -n "$tally_file" ]]; then _rt_n_timed_out=${n_timeout:-0}; _rt_n_assert_failed=${n_fail:-0}
+else _rt_n_timed_out=${#timedout_paths[@]}
+     _rt_n_assert_failed=$(( ${#failed_paths[@]} - ${#timedout_paths[@]} )); fi
+# THE UNREACHABLE-SUITE CENSUS, printed beside the verdict where a band reader
+# looks (your-org/nexus-code#1620; computed after the tree header, above).
+echo
+printf '=== suite census (#1620): %s ===\n' "$_rt_census_line"
+# Every declared exclusion, on EVERY run, green or red — an exclusion that only
+# printed when something else went wrong would be the invisible one again.
+for _f in "${_rt_excluded[@]}"; do printf '    EXCLUDED: %s\n' "$_f"; done
+if (( ${#_rt_census_defects[@]} > 0 )); then
+    printf 'RED: %d defect(s) in the census exclusions (%s) — a row that cannot be applied, or no\n' "${#_rt_census_defects[@]}" "$_RT_CENSUS_EXCL_REL"
+    printf '  longer describes the tree, is a blind spot waiting for a file (your-org/nexus-code#1620):\n'
+    for _f in "${_rt_census_defects[@]}"; do printf '    %s\n' "$_f"; done
+fi
+if (( ${#_rt_unreachable[@]} > 0 )); then
+    printf 'RED: %d TRACKED test suite(s) are walked by NO selection root, so no band has ever run them\n' "${#_rt_unreachable[@]}"
+    printf '  and no row, SKIP or census above could mention them (your-org/nexus-code#1620). Add the\n'
+    printf '  directory to _RT_SUITE_ROOTS in run-tests.sh, move the file under an existing root, or — for\n'
+    printf '  a fixture/stub that is deliberately never run — declare it as `path|reason` in %s:\n' "$_RT_CENSUS_EXCL_REL"
+    for _f in "${_rt_unreachable[@]}"; do printf '    UNREACHABLE: %s\n' "$_f"; done
+fi
+# Both reds print before either exits, so one run names every census defect.
+if (( ${#_rt_census_defects[@]} + ${#_rt_unreachable[@]} > 0 )); then _rt_exit 1; fi
+(( require_run == 1 )) && require_measured=1
+# DECLINED AT EXIT 0 (#1574 G1) — see the PASS arm. Read from THIS invocation's
+# sidecars in both arms; under --resume an earlier invocation's are not seen, so
+# a resumed sweep UNDER-reports this (the direction `nocount`, `vacuous` and
+# `falsepass` already err in). The one --require-run caller keeps no ledger.
+_rt_selfskipped=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && _rt_selfskipped+=("$line")
+done < <(find "$run_dir" -name '*.selfskipped' -exec cat {} + 2>/dev/null | sort -u)
+if (( require_run == 1 && ${#_rt_selfskipped[@]} > 0 )); then
+    echo
+    printf 'RED under --require-run: %d selected test(s) DECLINED TO RUN AND EXITED 0 — reported PASS above.\n' "${#_rt_selfskipped[@]}"
+    printf '  Each printed its own `skipped: <name>` banner. This caller declared every selected\n'
+    printf '  test APPLICABLE, so that PASS is an exit status, not coverage (your-org/nexus-code#1574).\n'
+    printf '  Make the file exit 77 (not applicable) or 69 (ran, could not measure), or do not select it:\n'
+    for _f in "${_rt_selfskipped[@]}"; do printf '    %s\n' "$_f"; done
+    _rt_exit 1
+fi
+if (( require_run == 1 && _rt_n_skipped > 0 )); then
+    echo
+    printf 'RED under --require-run: %d selected test(s) DECLINED TO RUN (SKIP, exit 77).\n' "$_rt_n_skipped"
+    printf '  This caller declared every selected test APPLICABLE, so a skip is an unexercised\n'
+    printf '  surface, not a gate that did not take (your-org/nexus-code#1563). The SKIPPED list\n'
+    printf '  above names them and their reasons.\n'
+    _rt_exit 1
+fi
+if (( require_measured == 1 && _rt_n_env_declined > 0 )); then
+    echo
+    printf 'RED under --require-measured: %d scenario(s) RAN AND COULD NOT MEASURE (ENVSKIP, exit 69).\n' "$_rt_n_env_declined"
+    printf '  Not a FAIL of the code under test, and not a pass: this caller declared the run\n'
+    printf '  to BE the measurement, so an unexercised surface is the failure (your-org/nexus-code#1563).\n'
+    printf '  The ENV-DECLINED list above names them and their reasons. SKIP (exit 77, not\n'
+    printf '  applicable here) is unaffected.\n'
+    _rt_exit 1
 fi
 if [[ -n "$tally_file" ]]; then
     (( n_fail == 0 && n_timeout == 0 && ${_assert_harness_broken:-0} == 0 \
        && ${_accounting_broken:-0} == 0 && ${_vacuous_pass:-0} == 0 \
-       && ${_false_pass:-0} == 0 )) && exit 0
-    exit 1
+       && ${_false_pass:-0} == 0 )) && _rt_exit 0
+    _rt_exit 1
 fi
-(( ${#failed_paths[@]} > 0 )) && exit 1
-(( ${_assert_harness_broken:-0} > 0 )) && exit 1
+(( ${#failed_paths[@]} > 0 )) && _rt_exit 1
+(( ${_assert_harness_broken:-0} > 0 )) && _rt_exit 1
 # A PASS THAT ASSERTS NOTHING IS RED (your-org/nexus-code#1145), and 1 for the
 # same reason the accounting breakdown is: 1 already means "do not merge" to
 # every caller, and the cost of being wrong here is a green that should have
 # been red.
-(( ${_vacuous_pass:-0} > 0 )) && exit 1
-(( ${_false_pass:-0} > 0 )) && exit 1
+(( ${_vacuous_pass:-0} > 0 )) && _rt_exit 1
+(( ${_false_pass:-0} > 0 )) && _rt_exit 1
 # ACCOUNTING BREAKDOWN IS RED (your-org/nexus-code#877), and it is deliberately
 # 1 rather than a new code. 1 already means "do not merge this" to every caller
 # — `tests.yml`, `ci-signal.yml`, the slow band, and any human reading a red X —
@@ -3731,5 +4824,5 @@ fi
 # live instruction, `tests-slow-integration.yml` treats it as "budget exhausted,
 # the ledger is PARTIAL, resume" — and resuming does not repair a broken
 # mktemp, so reusing it would emit a false diagnosis and invite a retry loop.
-(( ${_accounting_broken:-0} > 0 )) && exit 1
-exit 0
+(( ${_accounting_broken:-0} > 0 )) && _rt_exit 1
+_rt_exit 0

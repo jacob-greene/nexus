@@ -290,7 +290,13 @@ mkdir -p "$mfd"
 for i in \$(seq 1 64); do dd if=/dev/zero of="$mfd/f\$i" bs=1M count=1 2>/dev/null; done
 MANY
 chmod +x "$WORK/many.sh"
-rb=$("$GATE" --run-bounded "$WORK/many.sh" --cap-kb 1024 --timeout 60 --max-drop-mb 0 2>&1); rb_rc=$?
+# `--workdir` UNDER $WORK, so the filesystem the tool WATCHES is the one the
+# fixture WRITES to. The tool's default workdir follows $TMPDIR while this
+# suite's $WORK is pinned to /tmp; under run-tests.sh they coincide, under a
+# Slurm job (`TMPDIR=/loc/scratch/<job>`) they do not, and the 64 MB then land
+# on a filesystem `df` is not looking at: measured 2026-09-17, drop 0 MB, three
+# reds — a fixture-placement artefact reading as "the drop check does not fire".
+rb=$("$GATE" --run-bounded "$WORK/many.sh" --cap-kb 1024 --timeout 60 --max-drop-mb 0 --workdir "$WORK/rb-wd" 2>&1); rb_rc=$?
 mf_n=$(ls "$mfd" 2>/dev/null | grep -c .)
 assert_eq       "§6c control: all 64 files were written, each within the 1 MB cap" "$mf_n" "64"
 assert_eq       "§6c the df DROP check halts (exit 5) where the size cap did not"  "$rb_rc" "5"

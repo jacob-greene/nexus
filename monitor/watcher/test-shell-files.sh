@@ -498,4 +498,172 @@ else
     assert_eq "both-shell: …and the SAME 3 under zsh — counts agree" "$_shf_nz" "$_shf_nb"
 fi
 
+# ── shf_find0 ENUMERATES THE REPOSITORY, NOT THE DIRECTORY (#1588) ──────────
+#
+# `shf_find0` used to be a bare `find` walk. Rooted at a PRIMARY nexus it
+# classified every file of every analysis tree under `work/`, and
+# `ng guards-for-diff` refused on every primary-clone wrap-up. It now asks git,
+# and keeps the walk as a fallback — because a git-ONLY enumerator returns
+# NOTHING, at rc 0, for two ordinary fixture shapes. Each arm is pinned here
+# with a case that must flip and a case that must not.
+echo '=== shf_find0: the git arm excludes ignored trees; the walk survives where git would say nothing (#1588) ==='
+_sf_list() { shf_find0 "$1" "${2:-shell}" | tr '\0' '\n' | sed "s|^$1/||" | sort | tr '\n' ' '; }
+
+_PRIM="$TMP/prim"; mkdir -p "$_PRIM/monitor/pipwrap" "$_PRIM/work/proj-1/scripts" "$_PRIM/scratch" "$_PRIM/monitor/.state"
+git -C "$_PRIM" init -q >/dev/null 2>&1
+th_require_fixture_repo "$_PRIM"
+printf '*\n!.gitignore\n'      > "$_PRIM/work/.gitignore"      # the primary's own rule, verbatim
+printf '/scratch/\n'           > "$_PRIM/.gitignore"
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/tracked.sh"
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/pipwrap/pip"
+ln -s pip "$_PRIM/monitor/pipwrap/pip3"
+git -C "$_PRIM" add -A >/dev/null 2>&1
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/written-not-committed.sh"   # untracked, NOT ignored
+printf '#!/usr/bin/env bash\n' > "$_PRIM/work/proj-1/scripts/run.sh"         # the #1588 population
+printf '#!/usr/bin/env bash\n' > "$_PRIM/scratch/in-ignored-root.sh"
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/.state/runtime.sh"
+
+# MUST FLIP under the old walk: the planted analysis tree is NOT in the answer.
+assert_not_contains "git arm: an IGNORED work/<project> tree is not enumerated" \
+    "$(_sf_list "$_PRIM")" "work/proj-1"
+# MUST NOT FLIP: what the walk found that the repository really owns.
+assert_contains "git arm: a TRACKED shell file is enumerated"                       "$(_sf_list "$_PRIM")" "monitor/tracked.sh"
+assert_contains "git arm: a written-but-UNCOMMITTED file is enumerated (working-tree population, #1054)" \
+    "$(_sf_list "$_PRIM")" "monitor/written-not-committed.sh"
+assert_contains "git arm: an extensionless shebang file is enumerated"              "$(_sf_list "$_PRIM")" "monitor/pipwrap/pip "
+assert_not_contains "git arm: a tracked SYMLINK is not enumerated twice through its target (find -type f parity)" \
+    "$(_sf_list "$_PRIM")" "pip3"
+assert_not_contains "git arm: a _SHF_PRUNE_DIRS component is pruned from a path string too" \
+    "$(_sf_list "$_PRIM")" ".state/"
+assert_eq "git arm: the whole answer, pinned — 3 files and nothing else" \
+    "$(_sf_list "$_PRIM")" "monitor/pipwrap/pip monitor/tracked.sh monitor/written-not-committed.sh "
+assert_eq "git arm: a SUBDIRECTORY root keeps the caller's prefix (consumers strip \"\$ROOT/\")" \
+    "$(_sf_list "$_PRIM/monitor")" "pipwrap/pip tracked.sh written-not-committed.sh "
+assert_eq "git arm: a trailing slash on the root does not print a doubled slash" \
+    "$(shf_find0 "$_PRIM/monitor/" shell | tr '\0' '\n' | grep -c '//' || true)" "0"
+
+# THE SILENT ZERO A GIT-ONLY ENUMERATOR WOULD HAND THESE TWO ROOTS. Both hold a
+# shell file; git lists nothing for either, at rc 0.
+assert_eq "precondition: git itself lists NOTHING under a root its repository ignores" \
+    "$(git -C "$_PRIM/scratch" ls-files --cached --others --exclude-standard | grep -c . || true)" "0"
+assert_eq "fallback: a root IGNORED by its enclosing repository is WALKED, not answered with zero" \
+    "$(_sf_list "$_PRIM/scratch")" "in-ignored-root.sh "
+_NOGIT="$TMP/nogit"; mkdir -p "$_NOGIT/sub"; printf '#!/bin/sh\n' > "$_NOGIT/sub/plain-dir.sh"
+assert_eq "precondition: the plain-directory fixture is inside NO work tree" \
+    "$(git -C "$_NOGIT" rev-parse --is-inside-work-tree 2>/dev/null || echo no)" "no"
+assert_eq "fallback: a root in NO repository is WALKED" "$(_sf_list "$_NOGIT")" "sub/plain-dir.sh "
+
+# A `git ls-files` that DIES must not leave a truncated, plausible population
+# at rc 0 (#928, #935 mode 2). A PATH-front `git` that answers the two
+# pre-checks and then fails the listing is the smallest honest way to get there.
+mkdir -p "$TMP/gitshim"
+cat > "$TMP/gitshim/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == ls-files ]] && exit 128; done
+exec "$(type -P git)" "\$@"
+SHIM
+chmod +x "$TMP/gitshim/git"
+_sf_err=$( { PATH="$TMP/gitshim:$PATH" shf_find0 "$_PRIM" shell >/dev/null; } 2>&1 )
+_sf_rc=$( PATH="$TMP/gitshim:$PATH" shf_find0 "$_PRIM" shell >/dev/null 2>&1; echo $? )
+assert_eq       "a FAILED git listing is rc 3, not a quiet short population" "$_sf_rc" "3"
+assert_contains "…and says the population is TRUNCATED"                      "$_sf_err" "TRUNCATED"
+
+# zsh parity for the GIT arm. The both-shell case above runs over a plain
+# directory and so only ever exercises the walk.
+if _sf_zsh=$(type -P zsh 2>/dev/null) && [[ -n "$_sf_zsh" ]]; then
+    _sf_cnt='n=0; while IFS= read -r -d "" f; do n=$((n+1)); done < <(shf_find0 "$2" shell); echo "$n"; echo survived'
+    assert_eq "both-shell, git arm: zsh enumerates the same 3 — and the CALLING shell survives shf_find0's subshell exit" \
+        "$("$_sf_zsh" -c ". \"\$1\"; $_sf_cnt" _ "$LIB" "$_PRIM" | tr '\n' ' ')" "3 survived "
+else
+    th_skip "both-shell, git arm" "zsh is not installed — the git arm's zsh parity is UNMEASURED"
+fi
+
+# ── THE KILL GUARDS' OPT-IN: ignored files under monitor/ (#1594 item 1) ────
+#
+# The git arm drops ignored files, and the root `.gitignore` ignores `bin/`,
+# `logs/`, `.config/` … UNANCHORED, so `monitor/logs/k.sh` holding a mass-kill
+# was invisible to both kill lints. They now pass `ignored-under-monitor`.
+# The default must not move, and the opt-in must not reopen #1588: `work/`
+# stays out, and `.state` stays pruned even though it is now ignored too.
+echo '=== shf_find0 ignored-under-monitor: the kill guards read ignored monitor/ files; #1588 does not regress (#1594) ==='
+_sf_list_opt() { shf_find0 "$1" "${2:-shell}" ignored-under-monitor | tr '\0' '\n' | sed "s|^$1/||" | sort | tr '\n' ' '; }
+printf 'logs/\n.state/\n' >> "$_PRIM/.gitignore"
+mkdir -p "$_PRIM/monitor/logs" "$_PRIM/monitor/newdir/logs"
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/logs/k.sh"
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/newdir/logs/deep.sh"   # ignored, inside an UNTRACKED dir
+printf '#!/usr/bin/env bash\n' > "$_PRIM/monitor/logs/tracked-anyway.sh"
+git -C "$_PRIM" add -f monitor/logs/tracked-anyway.sh >/dev/null 2>&1
+assert_eq "precondition: git reports monitor/logs/k.sh as IGNORED" \
+    "$(git -C "$_PRIM" check-ignore monitor/logs/k.sh)" "monitor/logs/k.sh"
+
+# MUST FLIP without the fix (the opt-in did not exist; a third arg was ignored).
+assert_contains "opt-in: an ignored monitor/logs/k.sh IS enumerated" \
+    "$(_sf_list_opt "$_PRIM")" "monitor/logs/k.sh"
+assert_contains "opt-in: an ignored file inside an UNTRACKED directory is enumerated (the ls-files --directory silent zero)" \
+    "$(_sf_list_opt "$_PRIM")" "monitor/newdir/logs/deep.sh"
+assert_contains "opt-in: a SUBDIRECTORY root below monitor/ sees it too, with the caller's prefix" \
+    "$(_sf_list_opt "$_PRIM/monitor")" "logs/k.sh"
+# MUST NOT FLIP.
+assert_not_contains "default: the same ignored file is NOT enumerated without the opt-in" \
+    "$(_sf_list "$_PRIM")" "monitor/logs/k.sh"
+assert_not_contains "opt-in: work/<project> is STILL not enumerated (#1588 must not regress)" \
+    "$(_sf_list_opt "$_PRIM")" "work/proj-1"
+assert_not_contains "opt-in: an IGNORED .state is still pruned (runtime state, not code)" \
+    "$(_sf_list_opt "$_PRIM")" ".state/"
+assert_eq "opt-in: a TRACKED file under an ignored dir is listed ONCE, not twice" \
+    "$(shf_find0 "$_PRIM" shell ignored-under-monitor | tr '\0' '\n' | grep -c '/tracked-anyway\.sh$' || true)" "1"
+assert_eq "opt-in: the whole answer, pinned" \
+    "$(_sf_list_opt "$_PRIM")" \
+    "monitor/logs/k.sh monitor/logs/tracked-anyway.sh monitor/newdir/logs/deep.sh monitor/pipwrap/pip monitor/tracked.sh monitor/written-not-committed.sh "
+_sf_orc=$( shf_find0 "$_PRIM" shell no-such-option >/dev/null 2>&1; echo $? )
+assert_eq "an UNKNOWN option is refused at rc 2, not silently ignored" "$_sf_orc" "2"
+# The opt-in's own git call failing must be as loud as the listing's. The shim
+# fails only the `--stdin` form: `_shf_git_enumerable`'s own `check-ignore -q .`
+# must still answer, or the root goes to the WALK and this case measures nothing.
+mkdir -p "$TMP/gitshim-ci"
+cat > "$TMP/gitshim-ci/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == --stdin ]] && exit 128; done
+exec "$(type -P git)" "\$@"
+SHIM
+chmod +x "$TMP/gitshim-ci/git"
+_sf_rc=$( PATH="$TMP/gitshim-ci:$PATH" shf_find0 "$_PRIM" shell ignored-under-monitor >/dev/null 2>&1; echo $? )
+assert_eq "opt-in: a FAILED git check-ignore is rc 3, not a quiet short population" "$_sf_rc" "3"
+if _sf_zsh=$(type -P zsh 2>/dev/null) && [[ -n "$_sf_zsh" ]]; then
+    _sf_cnt='n=0; while IFS= read -r -d "" f; do n=$((n+1)); done < <(shf_find0 "$2" shell ignored-under-monitor); echo "$n"'
+    assert_eq "both-shell, opt-in: zsh enumerates the same 6" \
+        "$("$_sf_zsh" -c ". \"\$1\"; $_sf_cnt" _ "$LIB" "$_PRIM")" "6"
+else
+    th_skip "both-shell, opt-in" "zsh is not installed — the opt-in's zsh parity is UNMEASURED"
+fi
+
+# THE LINT, not just the enumerator: lint-no-mass-kill.sh run on a real git
+# fixture whose `bin/` is ignored must go RED on the ignored plant. This case
+# lives HERE rather than in the lint's own --selftest because the lint is in the
+# cc-update gated population, where `test-cc-update-no-remote-code.sh` forbids a
+# `git init` (git-verb-denied) — the selftest first carried it and turned that
+# suite red. The same holds for lint-no-tmux-server-kill.sh, below.
+_sf_lf="$TMP/lintfix"; mkdir -p "$_sf_lf"
+if git -C "$_sf_lf" init -q 2>/dev/null; then
+    mkdir -p "$_sf_lf/monitor/cc-harness/bin"
+    printf 'bin/\n' > "$_sf_lf/.gitignore"
+    printf '#!/usr/bin/env bash\npkill -f "node_modules/.bin/claude"\n' > "$_sf_lf/monitor/cc-harness/bin/k.sh"
+    _sf_lout=$(bash "$REPO_ROOT/monitor/cc-harness/lint-no-mass-kill.sh" "$_sf_lf/monitor/cc-harness" 2>&1); _sf_lrc=$?
+    assert_eq "lint-no-mass-kill: an untracked AND gitignored plant under monitor/ turns the lint RED (#1594)" "$_sf_lrc" "1"
+    assert_contains "lint-no-mass-kill: …and names the ignored file" "$_sf_lout" "/bin/k.sh:"
+else
+    th_skip "lint-no-mass-kill ignored-plant case" "git init failed — case NOT run"
+fi
+_sf_tf="$TMP/lintfix-tmux"; mkdir -p "$_sf_tf"
+if git -C "$_sf_tf" init -q 2>/dev/null; then
+    mkdir -p "$_sf_tf/monitor/bin"
+    printf 'bin/\n' > "$_sf_tf/.gitignore"
+    printf '#!/usr/bin/env bash\ntmux kill-server\n' > "$_sf_tf/monitor/bin/k.sh"
+    _sf_tout=$(bash "$REPO_ROOT/monitor/cc-harness/lint-no-tmux-server-kill.sh" "$_sf_tf/monitor" 2>&1); _sf_trc=$?
+    assert_eq "lint-no-tmux-server-kill: an untracked AND gitignored plant under monitor/ turns the lint RED (#1594)" "$_sf_trc" "1"
+    assert_contains "lint-no-tmux-server-kill: …and names the ignored file under its rule" "$_sf_tout" ":rule1-killserver-unscoped:"
+else
+    th_skip "lint-no-tmux-server-kill ignored-plant case" "git init failed — case NOT run"
+fi
+
 th_summary_and_exit

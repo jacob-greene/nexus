@@ -8,7 +8,8 @@
 # Run it on a clean checkout of the source branch (e.g. `dev`). It:
 #   - applies block-level OVERLAY transforms (pre-scrub) from the optional
 #     overlay/manifest.tsv, for public rewrites too semantic for line-wise
-#     substitution (missing manifest = no-op),
+#     substitution (missing manifest = no-op), and installs mirror-only FILES
+#     (`file` rows) carried in source under overlay/files/ (#1557),
 #   - scrubs every tracked file by type (.md/.yml -> angle, else bare),
 #   - scrubs tracked symlink TARGETS by rewriting the LINK (never writing
 #     through it, which would corrupt the target file),
@@ -103,7 +104,7 @@ EXIT CODES
   0  built; run leak-gate.sh next
   2  mapping not readable / unknown flag
   3  an excluded path survived the drop — never ship on this
-  4  overlay anchor missing or drifted
+  4  overlay anchor missing or drifted, or an overlay `file` row refused
   5  a path rename did not take
   6  DRY RUN — nothing was modified, and you did not pass --yes
   7  REFUSED — the working tree has uncommitted changes
@@ -198,12 +199,14 @@ if [ "$ASSUME_YES" != 1 ]; then
     _bg_ren_n=0
     [ -r "$OVERLAY_DIR/renames.tsv" ] && \
         _bg_ren_n=$(grep -v '^[[:space:]]*#' "$OVERLAY_DIR/renames.tsv" | awk -F'\t' '$1=="rename"' | wc -l)
-    _bg_blk_n=0
+    _bg_blk_n=0; _bg_file_n=0
     [ -r "$OVERLAY_MANIFEST" ] && \
-        _bg_blk_n=$(grep -v '^[[:space:]]*#' "$OVERLAY_MANIFEST" | awk -F'\t' '$1=="block"' | wc -l)
+        _bg_blk_n=$(grep -v '^[[:space:]]*#' "$OVERLAY_MANIFEST" | awk -F'\t' '$1=="block"' | wc -l) && \
+        _bg_file_n=$(grep -v '^[[:space:]]*#' "$OVERLAY_MANIFEST" | awk -F'\t' '$1=="file"' | wc -l)
     {
         echo "build.sh: DRY RUN — nothing has been modified. Target: $root"
         echo "  would apply   : $_bg_blk_n overlay block(s)"
+        echo "  would install : $_bg_file_n overlay file(s)"
         echo "  would scrub   : $_bg_files tracked file(s) IN PLACE (of which $_bg_syms symlink(s) rewritten by TARGET, not written through)"
         echo "  would DELETE  : $_bg_excl_n excluded path(s) —"
         printf '%s\n' "$_bg_excl" | sed 's/^/                  rm -rf /'
@@ -293,12 +296,66 @@ apply_overlay_block() {
       echo "build.sh: overlay END anchor gone from $target: /$end/ — block over-ran (drifted?)" >&2; exit 4; }
   fi
 }
+# MIRROR-ONLY FILES (your-org/nexus-code#1557). A file that exists ONLY in the
+# published tree is outside the population of every source-side lint, so each
+# new source-side rule silently widened what the mirror could get wrong (TD001,
+# then AU001, two syncs apart). The remedy is to carry such files IN SOURCE,
+# under overlay/files/ (which `exclude` keeps out of the output, like the rest
+# of overlay/), and install them here, pre-scrub, at their public path. Then the
+# published tree IS the build output and a source-side suite
+# (test-public-mirror-overlay-files.sh) lints them continuously.
+#
+# The installed file is `git add`ed so the scrub loop below (which iterates the
+# INDEX) scrubs it like any other file, and so `git write-tree` publishes it.
+#
+# A TARGET THAT ALREADY EXISTS IN SOURCE IS REFUSED. A mirror-only file must not
+# shadow a source file: that would be an overlay replacing a whole file with no
+# anchor to drift-check, i.e. a silent fork. Use a `block` row for that.
+FILE_TARGETS=()
+apply_overlay_file() {
+  local target="$1" src="$2" extra="$3"
+  [ -n "$target" ] && [ -n "$src" ] && [ -z "$extra" ] || {
+    echo "build.sh: malformed overlay file row (need exactly: file<TAB>TARGET<TAB>SOURCE): target='$target' source='$src'" >&2; exit 4; }
+  case "/$target/" in
+    //*|*/../*|*/./*) echo "build.sh: overlay file TARGET must be a relative path inside the tree: $target" >&2; exit 4;;
+  esac
+  # A TARGET inside an `exclude` path would be installed and then dropped — a
+  # row that ships nothing. Refuse it here, by name, rather than leave it to the
+  # exclude drop (which refuses too, but as "excluded path survived", exit 3).
+  local ex
+  while IFS= read -r ex; do
+    [ -n "$ex" ] || continue
+    case "$target" in "$ex"|"$ex"/*)
+      echo "build.sh: overlay file TARGET $target is inside the excluded path $ex — it would never ship" >&2; exit 4;;
+    esac
+  done < <(awk -F'\t' '$1=="exclude"{print $2}' "$MAP")
+  local srcpath="$OVERLAY_DIR/$src"
+  [ -f "$srcpath" ] && [ ! -L "$srcpath" ] || {
+    echo "build.sh: overlay file SOURCE missing (or not a regular file): $srcpath" >&2; exit 4; }
+  if [ -e "$target" ] || [ -L "$target" ] || git ls-files --error-unmatch -- "$target" >/dev/null 2>&1; then
+    echo "build.sh: overlay file TARGET already exists in source: $target — refusing to shadow a source file (use a block row)" >&2; exit 4
+  fi
+  mkdir -p -- "$(dirname -- "$target")" && cp -- "$srcpath" "$target" || {
+    echo "build.sh: could not install overlay file $src -> $target" >&2; exit 4; }
+  git add -- "$target" >/dev/null 2>&1
+  git ls-files --error-unmatch -- "$target" >/dev/null 2>&1 || {
+    echo "build.sh: overlay file installed but NOT in the index (gitignored?): $target — it would be neither scrubbed nor published" >&2; exit 4; }
+  FILE_TARGETS+=("$target")
+}
 if [ -r "$OVERLAY_MANIFEST" ]; then
   while IFS=$'\t' read -r kind target start end repl; do
-    [ "${kind:-}" = "block" ] || continue
-    case "$kind" in \#*) continue;; esac
-    apply_overlay_block "$target" "$start" "$end" "$repl"
-    echo "build.sh: overlay applied to $target" >&2
+    case "${kind:-}" in
+      block)
+        apply_overlay_block "$target" "$start" "$end" "$repl"
+        echo "build.sh: overlay applied to $target" >&2 ;;
+      file)
+        # file<TAB>TARGET<TAB>SOURCE — SOURCE lands in `start`; anything in
+        # `end`/`repl` means the row has extra fields and is refused.
+        apply_overlay_file "$target" "$start" "$end$repl"
+        echo "build.sh: overlay file installed at $target" >&2 ;;
+      consumer|"") ;;   # consumer rows are read by the drift guard, not here
+      *) echo "build.sh: unknown overlay manifest verb '$kind' — refusing rather than skipping a row (a misspelt \`file\` would silently not ship)" >&2; exit 4 ;;
+    esac
   done < <(grep -v '^[[:space:]]*#' "$OVERLAY_MANIFEST")
 fi
 
@@ -380,7 +437,11 @@ done
 #    exclude path, so re-reading it here (after it is dropped) would fail.
 for ex in "${EXCL[@]}"; do
   [ -n "$ex" ] || continue
-  git rm -rq --cached --ignore-unmatch -- "$ex" >/dev/null 2>&1
+  # -f: an excluded file carrying a STAGED change (a caller that `git add`s an
+  # uncommitted overlay edit, as the dictionary-coverage suite does) that the
+  # scrub loop then rewrote differs from both HEAD and the worktree, and plain
+  # `git rm --cached` refuses it — exit 3 below, on a correct build (#1557).
+  git rm -rqf --cached --ignore-unmatch -- "$ex" >/dev/null 2>&1
   rm -rf -- "$ex"
 done
 
@@ -435,4 +496,16 @@ for i in "${!RN_FROM[@]}"; do
 done
 [ "$rn_bad" -eq 0 ] || { echo "build.sh: $rn_bad rename(s) did not take; refusing to proceed." >&2; exit 5; }
 
-echo "build.sh: scrub applied; excluded paths dropped + verified absent; ${#RN_TO[@]} path rename(s) applied + verified. Run leak-gate.sh next."
+# 6. FAIL LOUD if an installed overlay FILE did not survive to the output — a
+#    rename moving it (an `exclude` covering it is refused at install) would
+#    drop it silently, and the mirror would lose the file this row ships.
+file_bad=0
+for t in ${FILE_TARGETS[@]+"${FILE_TARGETS[@]}"}; do
+  if [ ! -f "$t" ] || ! git ls-files --error-unmatch -- "$t" >/dev/null 2>&1; then
+    echo "build.sh: FATAL — overlay file absent from the output: $t (excluded or renamed away?)" >&2
+    file_bad=$((file_bad+1))
+  fi
+done
+[ "$file_bad" -eq 0 ] || { echo "build.sh: $file_bad overlay file(s) did not survive; refusing to proceed." >&2; exit 4; }
+
+echo "build.sh: scrub applied; excluded paths dropped + verified absent; ${#RN_TO[@]} path rename(s) applied + verified; ${#FILE_TARGETS[@]} overlay file(s) installed + verified. Run leak-gate.sh next."

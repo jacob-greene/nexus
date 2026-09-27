@@ -196,8 +196,16 @@ _SHF_PRUNE_DIRS=( .git node_modules .state .venv __pycache__ )
 # large — `read` still stops at the first newline, so the exposure is one
 # pathological FIRST LINE rather than a whole file. Measured over the 724 files
 # under `monitor/` at `bbf8985b`, the longest first line is 297 bytes.
-shf_interpreter() {   # <path>
+# The classifier's two readers exist twice: the printing form (`shf_interpreter`,
+# `shf_class`) for callers, and a `_var` form that sets `_SHF_INTERP` /
+# `_SHF_CLS` instead of printing. shf_find0 calls the `_var` form because a
+# `$(…)` per file is a FORK per file — two for an extensionless script — and
+# that fork was most of every sweeping lint's cost (measured at load ~50: the
+# ~720-file `monitor/` population took 4.0 s to enumerate, nearly all of it in
+# subshells). The printing forms are thin wrappers, so there is ONE classifier.
+_shf_interp_var() {   # <path> -> sets _SHF_INTERP; rc 1 (and empty) for none
     local first='' word='' tok rest saw_env=0
+    _SHF_INTERP=''
     IFS= read -r first < "$1" 2>/dev/null
     first=${first:0:200}
     case "$first" in '#!'*) ;; *) return 1 ;; esac
@@ -252,12 +260,17 @@ shf_interpreter() {   # <path>
         break
     done
     [[ -n "$word" ]] || return 1
-    printf '%s' "$word"
+    _SHF_INTERP=$word
+}
+shf_interpreter() {   # <path>
+    _shf_interp_var "$1" || return 1
+    printf '%s' "$_SHF_INTERP"
 }
 
 # The class of one file: shell | python | perl | awk | "" (rc 1 for none).
-shf_class() {   # <path>
+_shf_class_var() {   # <path> -> sets _SHF_CLS; rc 1 (and empty) for none
     local p="$1" base interp
+    _SHF_CLS=''
     [[ -f "$p" ]] || return 1
     base=${p##*/}
 
@@ -280,36 +293,43 @@ shf_class() {   # <path>
 
     # Arm 1 — extension.
     case "$base" in
-        *.sh|*.bash|*.zsh|*.ksh) printf 'shell'; return 0 ;;
-        *.py)                    printf 'python'; return 0 ;;
-        *.pl|*.pm)               printf 'perl';   return 0 ;;
-        *.awk)                   printf 'awk';    return 0 ;;
+        *.sh|*.bash|*.zsh|*.ksh) _SHF_CLS=shell; return 0 ;;
+        *.py)                    _SHF_CLS=python; return 0 ;;
+        *.pl|*.pm)               _SHF_CLS=perl;   return 0 ;;
+        *.awk)                   _SHF_CLS=awk;    return 0 ;;
     esac
 
     # Arm 3 — a shell startup file, sourced by NAME and so carrying neither an
     # extension nor a shebang. Checked before arm 2 only because it is a cheap
     # string test; the two cannot both match.
     case "$_SHF_STARTUP_NAMES" in
-        *" $base "*) printf 'shell'; return 0 ;;
+        *" $base "*) _SHF_CLS=shell; return 0 ;;
     esac
 
     # Arm 2 — shebang. The self-maintaining arm: this is what covers an
     # extensionless executable added tomorrow, with nobody remembering.
-    interp=$(shf_interpreter "$p") || return 1
-    case "$_SHF_SHELL_INTERP" in *" $interp "*) printf 'shell';  return 0 ;; esac
-    case "$_SHF_PY_INTERP"    in *" $interp "*) printf 'python'; return 0 ;; esac
-    case "$_SHF_PERL_INTERP"  in *" $interp "*) printf 'perl';   return 0 ;; esac
-    case "$_SHF_AWK_INTERP"   in *" $interp "*) printf 'awk';    return 0 ;; esac
+    _shf_interp_var "$p" || return 1
+    interp=$_SHF_INTERP
+    case "$_SHF_SHELL_INTERP" in *" $interp "*) _SHF_CLS=shell;  return 0 ;; esac
+    case "$_SHF_PY_INTERP"    in *" $interp "*) _SHF_CLS=python; return 0 ;; esac
+    case "$_SHF_PERL_INTERP"  in *" $interp "*) _SHF_CLS=perl;   return 0 ;; esac
+    case "$_SHF_AWK_INTERP"   in *" $interp "*) _SHF_CLS=awk;    return 0 ;; esac
     return 1
 }
 
-shf_is_shell()  { [[ "$(shf_class "$1")" == shell ]]; }
+shf_class() {   # <path>
+    _shf_class_var "$1" || return 1
+    printf '%s' "$_SHF_CLS"
+}
+
+shf_is_shell()  { _shf_class_var "$1" && [[ "$_SHF_CLS" == shell ]]; }
 
 # Any interpreted script. The broader class exists for text-regex lints
 # (`lint-no-mass-kill.sh`) whose ban is language-independent — a `killall` is a
 # `killall` in perl too — as distinct from scanners that parse shell syntax.
 shf_is_script() {
-    case "$(shf_class "$1")" in shell|python|perl) return 0 ;; *) return 1 ;; esac
+    _shf_class_var "$1" || return 1
+    case "$_SHF_CLS" in shell|python|perl) return 0 ;; *) return 1 ;; esac
 }
 
 # Whether a class string is wanted under a filter.
@@ -328,14 +348,188 @@ _shf_wanted() {   # <class> <filter>
 # hazard the moment a path contains whitespace. Symlinks are excluded by
 # `-type f` — `pipwrap/pip3` is a symlink to `pipwrap/pip` and scanning both
 # would double-report every hit in it.
-shf_find0() {   # <root> [class-filter=shell]
-    local root="$1" filter="${2:-shell}" f cls d
+#
+# THE POPULATION IS THE REPOSITORY'S OWN FILES, NOT WHATEVER SITS UNDER <root>
+# (your-org/nexus-code#1588). This used to be a bare `find` walk pruned by
+# `_SHF_PRUNE_DIRS` alone, and that list has no `work/`. In a clone that is
+# harmless: `work/` holds one `.gitignore`. In a PRIMARY nexus `work/` holds
+# every analysis tree the operator has — 1,143 directories when measured — and
+# a consumer rooted at the repo root (`tee-reopen-lint.sh`) classified every
+# file in all of them. Measured 2026-09-19 at `17f1f926` on a fixture with 400
+# planted `work/proj-N/` trees (2,401 files): that lint's population went
+# 715 -> 1,915 and its probe 4.9 s -> 17.5 s; in the real primary it hit the
+# selector's 180 s bound with ZERO lines, so `ng guards-for-diff` REFUSED on
+# every primary-clone wrap-up. `#1487` was the same defect in another probe,
+# fixed at that one call site — which is why the fix now lives HERE, where
+# every consumer inherits it.
+#
+# So: ask git. `--cached --others --exclude-standard` is "tracked, plus written
+# and not yet committed, minus ignored" — the WORKING-TREE reading the
+# `--population` protocol specifies (guard-populations.manifest: a file written
+# and not yet committed is legitimately in a population), and it never descends
+# an ignored directory, so its cost does not grow with `work/`.
+#
+# AND THE WALK STAYS, AS A FALLBACK, BECAUSE GIT-ONLY WOULD BE A SILENT ZERO.
+# Fixture roots are routinely plain directories, and two shapes make git answer
+# NOTHING at rc 0 for a directory full of files:
+#   * <root> is not inside any work tree  -> `git` errors, no list;
+#   * <root> is inside one but IGNORED by it (a scratch dir under an ignored
+#     path) -> measured on git 2.17.1: `ls-files --others` prints 0 lines.
+# `_shf_git_enumerable` tests for exactly those two and sends them to the walk.
+# It does NOT use `--is-inside-work-tree` alone, which certifies a walked-up
+# ENCLOSING repository as fine (your-org/nexus-code#1196) — the ignore check is
+# what makes the walk-up case safe rather than merely detected.
+_shf_git_enumerable() {   # <root> -> rc 0 iff git can enumerate <root> faithfully
+    [ -d "$1" ] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    [ "$(git -C "$1" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] || return 1
+    # rc 0 = ignored, 1 = NOT ignored, 128 = could not tell. Only a positive
+    # "not ignored" selects git; "ignored" AND "could not tell" take the walk.
+    # The status is captured on the same line as the command that sets it —
+    # anything between the two is a write to `$?` (your-org/nexus-code#1202).
+    local ign=0
+    git -C "$1" check-ignore -q . >/dev/null 2>&1 || ign=$?
+    if [ "$ign" -ne 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# One repo-relative path -> rc 0 iff a `_SHF_PRUNE_DIRS` name is one of its
+# components. The walk prunes those by `-name` at any depth; the git arm has
+# to say the same thing about a path string or the two arms disagree.
+_shf_pruned_component() {   # <relative-path>
+    local d
+    for d in "${_SHF_PRUNE_DIRS[@]}"; do
+        case "/$1" in */"$d"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# THE OPT-IN: `shf_find0 <root> <filter> ignored-under-monitor`
+# (your-org/nexus-code#1594 item 1).
+#
+# The git arm above answers "tracked, plus untracked, MINUS IGNORED", and that
+# minus is right for every consumer that asks about the repository's code. It
+# is wrong for exactly two: the KILL GUARDS (`cc-harness/lint-no-mass-kill.sh`,
+# `lint-no-tmux-server-kill.sh`). A kill guard exists to catch what nobody
+# reviewed, and an ignored path is unreviewed by definition. The root
+# `.gitignore` carries UNANCHORED `bin/`, `logs/`, `nexus/`, `_ignore/` and
+# `.config/`, so `monitor/cc-harness/bin/x.sh` or `monitor/logs/x.sh` holding
+# `pkill -f claude` was invisible to both guards the cc-update gate runs.
+#
+# So a caller may opt in to the ignored files too — but ONLY those under
+# `monitor/` (measured from the REPOSITORY root, not from <root>). Outside
+# `monitor/` the ignored set of a primary nexus is `work/` and `reports/`,
+# which is precisely the population #1588 removed; that must not come back
+# through this door, and the default (no third argument) is unchanged.
+#
+# `_SHF_PRUNE_DIRS` STILL APPLIES, AND `.state` IN PARTICULAR STAYS PRUNED.
+# `monitor/.state/` is runtime state written by the nexus's own services, not
+# code anyone runs as a script: measured in the operator's primary 2026-09-24,
+# 30,676 ignored files under `monitor/.state`, against 4 ignored entries
+# anywhere else under `monitor/`. Classifying those is the #1588 cost again
+# (a cold `git ls-files --ignored` over them took 22 s before classification),
+# and the walk arm has always pruned it, so the two arms keep agreeing.
+#
+# HOW: a pruned `find` walk of the `monitor/` scope — the very walk the
+# fallback arm below has always done, with the same `_SHF_PRUNE_DIRS` — piped
+# through ONE `git check-ignore -z --stdin`, which keeps only the ignored
+# paths. `check-ignore` never reports a TRACKED file, so nothing the first
+# `ls-files` already listed comes out twice. Measured on the same primary:
+# 0.03 s, 3 ignored files, none of them under `.state`.
+#
+# NOT `ls-files --others --ignored --directory`, which looks like the cheap way
+# to prune and is a SILENT ZERO. Measured on git 2.17.1 (this host): with an
+# UNTRACKED directory `monitor/new/` holding an untracked `a.sh` and an ignored
+# `bin/k.sh`, `--directory` omits `monitor/new/bin/k.sh` with or without
+# `--no-empty-directory` — and it omits an all-ignored `monitor/cc-harness/`
+# without that flag — while the plain form lists it. The plain form, in turn,
+# descends `.state` (30,676 files) and pathspec `:(exclude)` does not stop the
+# descent, only the printing.
+_SHF_OPT_IGNORED_MONITOR=ignored-under-monitor
+
+# NUL-separated, <root>-RELATIVE paths of the ignored files under the repo's
+# `monitor/` that lie beneath <root>. rc != 0 iff git failed (`check-ignore`
+# exits 1 for "none ignored", which is an answer, and 128 for "could not
+# tell"). A `find` that cannot read a subdirectory degrades exactly as the
+# fallback walk does.
+_shf_ignored_under_monitor0() {   # <root>
+    local root="$1" pfx scope sub rc
     local -a prune=()
+    pfx=$(git -C "$root" rev-parse --show-prefix 2>/dev/null) || return 1
+    case "$pfx" in
+        monitor/*)  scope=$root ;;              # <root> is monitor/ or below it
+        '')         scope=$root/monitor ;;      # <root> is the repo top
+        *)          return 0 ;;                 # <root> is elsewhere: nothing to add
+    esac
+    [ -d "$scope" ] || return 0
+    for sub in "${_SHF_PRUNE_DIRS[@]}"; do prune+=( -name "$sub" -o ); done
+    # The status is read on the line that sets it: the pipeline's status is
+    # `check-ignore`'s, its last command, which is the one that can fail.
+    find "$scope" \( "${prune[@]}" -false \) -prune -o -type f -print0 2>/dev/null \
+      | while IFS= read -r -d '' sub; do printf '%s\0' "${sub#"$root"/}"; done \
+      | git -C "$root" check-ignore -z --stdin 2>/dev/null; rc=$?
+    [ "$rc" -le 1 ]
+}
+
+shf_find0() {   # <root> [class-filter=shell] [ignored-under-monitor]
+    local root="$1" filter="${2:-shell}" opt="${3:-}" f d rel prev='' failed=0
+    local -a prune=()
+    case "$opt" in
+        ''|"$_SHF_OPT_IGNORED_MONITOR") ;;
+        *)  printf 'shf_find0: unknown option %s (only %s is defined)\n' "$opt" "$_SHF_OPT_IGNORED_MONITOR" >&2
+            return 2 ;;
+    esac
+    # `find dir/` prints `dir/x`; a git-relative path joined onto `dir/` would
+    # print `dir//x`, and consumers strip the root with `${f#"$ROOT"/}`.
+    [ "$root" != / ] && root=${root%/}
+
+    if _shf_git_enumerable "$root"; then
+        # The sentinel is how a FAILED `git ls-files` stays visible: a pipeline
+        # reports its LAST command's status, so without it a git that died
+        # half-way would leave a truncated, plausible population at rc 0
+        # (your-org/nexus-code#928, #935 mode 2).
+        #
+        # The consumer is an EXPLICIT SUBSHELL `( … )`, never `{ …; }`: zsh runs
+        # the LAST element of a pipeline in the CURRENT shell, so an `exit`
+        # inside braces would terminate the CALLER — and this file is sourced
+        # by zsh callers on purpose (test-shell-files.sh pins the parity).
+        #
+        # The opt-in's producer appends to the same stream; its own git failure
+        # emits the same sentinel, so a truncation there is just as loud.
+        { git -C "$root" ls-files -z --cached --others --exclude-standard 2>/dev/null \
+            || printf 'SHF-GIT-LS-FILES-FAILED\0'
+          if [ -n "$opt" ]; then
+              _shf_ignored_under_monitor0 "$root" || printf 'SHF-GIT-LS-FILES-FAILED\0'
+          fi; } \
+          | ( while IFS= read -r -d '' rel; do
+                  if [ "$rel" = SHF-GIT-LS-FILES-FAILED ]; then failed=1; continue; fi
+                  # An unmerged path is listed once per stage, adjacently.
+                  [ "$rel" = "$prev" ] && continue
+                  prev=$rel
+                  _shf_pruned_component "$rel" && continue
+                  f="$root/$rel"
+                  # `find -type f` excluded symlinks for free; `[[ -f ]]` in
+                  # shf_class FOLLOWS them, and `pipwrap/pip3` -> `pip` would
+                  # be scanned twice.
+                  [ -L "$f" ] && continue
+                  _shf_class_var "$f" || continue
+                  _shf_wanted "$_SHF_CLS" "$filter" && printf '%s\0' "$f"
+              done
+              if [ "$failed" = 1 ]; then
+                  printf 'shf_find0: `git ls-files` FAILED under %s — this population is TRUNCATED, not complete.\n' "$root" >&2
+                  exit 3
+              fi
+              exit 0 )
+        return $?
+    fi
+
     for d in "${_SHF_PRUNE_DIRS[@]}"; do prune+=( -name "$d" -o ); done
     find "$root" \( "${prune[@]}" -false \) -prune -o -type f -print0 2>/dev/null \
       | while IFS= read -r -d '' f; do
-            cls=$(shf_class "$f") || continue
-            _shf_wanted "$cls" "$filter" && printf '%s\0' "$f"
+            _shf_class_var "$f" || continue
+            _shf_wanted "$_SHF_CLS" "$filter" && printf '%s\0' "$f"
         done
 }
 
@@ -417,8 +611,26 @@ fi
 # and says so on STDERR at rc 0. Callers that must not go quietly blind check
 # stderr, not just rc (undefined-helper-lint.sh:382 does; copy that shape).
 _SHF_QUOTES_AWK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher/_shell_quotes.awk"
-shf_strip_heredocs() {
-    local f="$1"
+shf_strip_heredocs() { _shf_heredoc_view strip "$1"; }
+
+# shf_expanding_heredoc_bodies <file> — `<line>TAB<text>` for every BODY line of
+# a heredoc whose delimiter is UNQUOTED, i.e. the lines the shell EXPANDS
+# (parameter, arithmetic and COMMAND substitution) before the text is written
+# anywhere (your-org/nexus-code#1555). It is the COMPLEMENT of the view above
+# and deliberately the SAME parser in another mode, not a second one: the
+# arithmetic-shift and quoted-`<<` traps that parser's header records are
+# exactly the ones a fresh scanner walks into (measured while writing this — a
+# naive `<<WORD` regex enrolled 425 lines across 16 files, 423 of them prose).
+#
+# FAIL DIRECTION: on an unterminated heredoc the parser concludes it mis-parsed.
+# The strip view answers by emitting the file UNSTRIPPED (over-report); this
+# view cannot over-report usefully, so it emits NOTHING on stdout, says so on
+# stderr and returns 3 — a caller that treats an empty answer as "no expanding
+# heredocs" without reading rc is making the silent-zero mistake on purpose.
+shf_expanding_heredoc_bodies() { _shf_heredoc_view bodies "$1"; }
+
+_shf_heredoc_view() {
+    local _mode="$1" f="$2"
     [[ -r "$f" ]] || return 1
     # The quote state machine is SHARED with uncounted-abort-lint.sh
     # (`_shell_quotes.awk`). It used to be inline here and a second, wrong copy
@@ -426,8 +638,8 @@ shf_strip_heredocs() {
     # real code between them. One machine, two callers, is the point.
     local _q; _q="$(cat "$_SHF_QUOTES_AWK" 2>/dev/null)" || return 1
     [[ -n "$_q" ]] || return 1
-    awk "$_q"'
-    function push(d, dash_) { n++; delim[n] = d; dsh[n] = dash_ }
+    awk -v mode="$_mode" "$_q"'
+    function push(d, dash_, quoted_) { n++; delim[n] = d; dsh[n] = dash_; qtd[n] = quoted_ }
     function scan(s,   i, L, j, d, dash_, q, arith, c2, c1, qm) {
         L = length(s); i = 1; arith = 0
         # Quote state from the SHARED machine. A `<<` inside a quoted string is
@@ -452,7 +664,7 @@ shf_strip_heredocs() {
                 j = i + 2; dash_ = 0
                 if (substr(s, j, 1) == "-") { dash_ = 1; j++ }
                 while (substr(s, j, 1) == " " || substr(s, j, 1) == "\t") j++
-                q = substr(s, j, 1); d = ""
+                q = substr(s, j, 1); d = ""; isq = (q == "\"" || q == "'"'"'" || q == "\\")
                 if (q == "\"" || q == "'"'"'") {
                     j++
                     while (j <= L && substr(s, j, 1) != q) { d = d substr(s, j, 1); j++ }
@@ -463,7 +675,7 @@ shf_strip_heredocs() {
                 }
                 # Letter-or-underscore initial: rejects the numeric delimiter a
                 # left shift like `(o1 << 24)` would otherwise manufacture.
-                if (d ~ /^[A-Za-z_][A-Za-z0-9_]*$/) push(d, dash_)
+                if (d ~ /^[A-Za-z_][A-Za-z0-9_]*$/) push(d, dash_, isq)
                 i = j; continue
             }
             i++
@@ -475,8 +687,10 @@ shf_strip_heredocs() {
             t = $0
             if (dsh[1]) sub(/^\t+/, "", t)
             if (t == delim[1]) {
-                for (k = 1; k < n; k++) { delim[k] = delim[k+1]; dsh[k] = dsh[k+1] }
+                for (k = 1; k < n; k++) { delim[k] = delim[k+1]; dsh[k] = dsh[k+1]; qtd[k] = qtd[k+1] }
                 n--
+            } else if (!qtd[1]) {
+                nb++; bline[nb] = NR; btext[nb] = $0    # a body line the shell EXPANDS
             }
             out[NR] = ""        # body AND terminator are data, never code
             next
@@ -488,10 +702,15 @@ shf_strip_heredocs() {
     END {
         if (n > 0) {
             printf("shf_strip_heredocs: %s: heredoc `%s` unterminated at EOF — ", FILENAME, delim[1]) > "/dev/stderr"
+            if (mode == "bodies") {
+                printf("mis-parse suspected, emitting NOTHING (rc 3): an empty answer here is NOT \"none\"\n") > "/dev/stderr"
+                exit 3
+            }
             printf("mis-parse suspected, emitting the file UNSTRIPPED\n") > "/dev/stderr"
             for (k = 1; k <= NR; k++) print raw[k]
             exit 0
         }
+        if (mode == "bodies") { for (k = 1; k <= nb; k++) printf("%d\t%s\n", bline[k], btext[k]); exit 0 }
         for (k = 1; k <= NR; k++) print out[k]
     }
     ' "$f"

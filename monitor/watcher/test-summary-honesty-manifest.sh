@@ -437,10 +437,12 @@ assert_eq "AXIS B: (( _ran == _EXPECTED_ASSERTIONS )) is exact (leading undersco
 declare -a _NON_SUITE_PATHS=(
     'monitor/watcher/test-integration/_harness.sh'
     'monitor/watcher/test-integration/stub-claude.sh'
+    'monitor/watcher/test-integration/_renderer_scrape_check.sh'
 )
 declare -a _NON_SUITE_WHY=(
     'sourced library — builds the integration fixture; runs no assertions of its own'
     'a stub `claude` binary the integration scenarios exec; not a test'
+    'sourced library — the three-outcome renderer-scrape check test-realmodel-overlimit.sh calls (#1530); its own assertions live in test-realmodel-overlimit-unmeasured.sh'
 )
 _is_non_suite() {   # <path> -> rc 0 if DECLARED a non-suite above
     local p="$1" d
@@ -505,6 +507,23 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # the correct response to that red was to RAISE the suite to the protected
 # form rather than record it as unprotected — a lint whose own green cannot
 # say how much it asserted is the shape its sibling manifest exists to name.
+#
+# ONE ENTRANT at the your-org/nexus-code#1474 seam:
+# `test-band-verdict.sh` is a NEW suite and enters fully protected (ledger=yes
+# via `th_summary_and_exit`, count=exact via EXPECTED_ASSERTIONS), written in the
+# protected form from the start. Like `test-population-primary-shape.sh` below,
+# its count guard reddened it on its first complete run — 29 asserted against 30
+# declared, the author's miscount — so the pin fired before the suite was ever
+# committed, which is the only evidence that a count guard is load-bearing that
+# costs nothing to collect. Mutation-tested on both axes per the rule above;
+# measurements in the rtev report.
+#
+# ONE ENTRANT at the your-org/nexus-code#1588 seam:
+# `test-population-primary-shape.sh` is a NEW suite and enters fully protected
+# (ledger=yes via `th_summary_and_exit`, count=exact via EXPECTED_ASSERTIONS),
+# written in the protected form from the start. Its count guard reddened it on
+# its first complete run (16 asserted, 17 declared — the author's miscount),
+# which is the pin doing its job before the suite was ever committed.
 #
 # EACH APPEND IS MUTATION-TESTED, because a row added to a pin is a claim that
 # the pin would notice its loss, and an untested row is a claim nobody checked.
@@ -770,12 +789,61 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 #            KILLED, 41 passed 2 failed, naming `::ledger=no::count=exact`.
 #   axis B — the exact `==` census comparison weakened to `-ge`;
 #            KILLED, 41 passed 2 failed, naming `::ledger=yes::count=floor`.
+# ONE ENTRANT RECORDED at the skeptic round-identity change (your-org/nexus-code
+# #1537, #1538, #1573). A new suite for `await`'s exit vocabulary, `skeptic-arm`
+# opening the round, `release`, `--delta-owed` and the ledger rotation, written
+# `ledger=yes count=exact` from the start; the guard reddened `CORPUS SURPLUS:
+# 490 enumerated, 489 pinned` and named it on the unrecorded-protection arm.
+#
+#     monitor/watcher/test-skeptic-round-identity.sh
+#
+# Mutation-tested per the rule above, in place at the staged tree on top of
+# `efd4e3a8` and restored byte-identically (`cmp`); baseline 43 passed, 0 failed.
+# Both proven APPLIED (`git diff --numstat` = `1 1`) and PARSING (`bash -n`):
+#   axis A — the trailing `th_summary_and_exit` REPLACED by `exit 0`;
+#            KILLED, 41 passed 2 failed, naming `::ledger=no::count=exact`
+#            (as predicted).
+#   axis B — the exact `!=` census comparison weakened to `<`;
+#            KILLED, 41 passed 2 failed, naming `::ledger=yes::count=none`.
+#            PREDICTED `count=floor` and that was WRONG: the classifier reads a
+#            `<` comparison as no census at all, the same `count=none` recorded
+#            for an earlier entrant above. Killed either way; the miss is kept.
+# your-org/nexus-code#1591 — TWO ENTRANTS, both BORN protected (ledger=yes,
+# count=exact) rather than recorded on the opt-out list:
+#   monitor/watcher/test-paste-deliver.sh
+#   monitor/watcher/test-integration/test-realmodel-paste-held.sh
+# test-paste-deliver.sh's first cut hand-rolled its counters and summary; the
+# ratchet named it `ledger=no::count=none` and the header's instruction for an
+# author adding a suite — route it through th_summary_and_exit and give it an
+# exact count guard, do NOT append a line — was followed instead.
+# your-org/nexus-code#1618 + #1620 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-run-tests-shape-census.sh, the runner's
+# leading-zero shape sweep and its unreachable-suite census.
+# your-org/nexus-code#1613 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-resume-env-strip.sh, the tool-shell
+# strip of the resume-picker thresholds.
+# your-org/nexus-code#1628 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-agent-tmpdir.sh, the agent-shell TMPDIR
+# guarantee.
+# your-org/nexus-code#1622 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-integration/test-realmodel-respawn-verify.sh,
+# the orchestrator-respawn verify stage against the real binary.
+# your-org/nexus-code#1496 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-claude-md-fallback-collapse.sh, the
+# executor of CLAUDE.md's FALLBACK-COLLAPSE block.
+# your-org/nexus-code#1557 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-public-mirror-overlay-files.sh, the
+# overlay `file` verb and the source-side lint of carried mirror-only workflows.
+# your-org/nexus-code#1532 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-watcher-supervise-probe.sh, the watcher
+# supervisor as a persistent longjob watch.
 PROTECTED='monitor/cc-harness/test-cc-harness-gate-coverage-trackedness.sh
 monitor/test-obligations.sh
 monitor/test-window-key.sh
 monitor/watcher/test-absent-evidence-precedence.sh
 monitor/watcher/test-agent-delivery-latency-envelope.sh
 monitor/watcher/test-agent-delivery.sh
+monitor/watcher/test-agent-tmpdir.sh
 monitor/watcher/test-argloop-progress-guard.sh
 monitor/watcher/test-assert-bot-author-generic-optin.sh
 monitor/watcher/test-assertion-ledger.sh
@@ -785,6 +853,7 @@ monitor/watcher/test-async-run-cancel.sh
 monitor/watcher/test-async-run.sh
 monitor/watcher/test-auth-hold.sh
 monitor/watcher/test-awk-v-escape-lint.sh
+monitor/watcher/test-band-verdict.sh
 monitor/watcher/test-backtick-label-lint.sh
 monitor/watcher/test-cc-auto-update-default-docs.sh
 monitor/watcher/test-cc-harness-gate-population.sh
@@ -793,6 +862,7 @@ monitor/watcher/test-cc-surface-dedup.sh
 monitor/watcher/test-cc-update-no-remote-code.sh
 monitor/watcher/test-changelog-merge-union.sh
 monitor/watcher/test-ci-band-coverage.sh
+monitor/watcher/test-ci-band-verdict.sh
 monitor/watcher/test-claude-md-ancestor-timeline.sh
 monitor/watcher/test-claude-md-arm-order-shadowing.sh
 monitor/watcher/test-claude-md-backtick-substitution.sh
@@ -800,6 +870,7 @@ monitor/watcher/test-claude-md-count-provenance.sh
 monitor/watcher/test-claude-md-count-vs-list.sh
 monitor/watcher/test-claude-md-dash-pattern-option.sh
 monitor/watcher/test-claude-md-entry-budget.sh
+monitor/watcher/test-claude-md-fallback-collapse.sh
 monitor/watcher/test-claude-md-fromisoformat.sh
 monitor/watcher/test-claude-md-grep-bre-dialect.sh
 monitor/watcher/test-claude-md-grep-h-order.sh
@@ -817,8 +888,10 @@ monitor/watcher/test-claude-md-python-backref-escape.sh
 monitor/watcher/test-claude-md-repo-walkup.sh
 monitor/watcher/test-claude-md-shell-wrapped-coreutil.sh
 monitor/watcher/test-claude-md-shopt-dynamic-scope.sh
+monitor/watcher/test-claude-md-tmux-socket-selection.sh
 monitor/watcher/test-claude-md-worktree-blind-spot.sh
 monitor/watcher/test-claude-md-zsh-path-tie.sh
+monitor/watcher/test-dangerous-rm-decide-hook.sh
 monitor/watcher/test-declare-no-wait.sh
 monitor/watcher/test-delivery-resolvers-primary-root.sh
 monitor/watcher/test-early-exit-pipefail-axis.sh
@@ -839,10 +912,15 @@ monitor/watcher/test-gh-stub-contract.sh
 monitor/watcher/test-gh-write-guard.sh
 monitor/watcher/test-grep-delegation-arms.sh
 monitor/watcher/test-guard-positive-controls.sh
+monitor/watcher/test-guards-for-diff-sweepers.sh
 monitor/watcher/test-helper-honesty.sh
+monitor/watcher/test-heredoc-backtick-lint.sh
 monitor/watcher/test-hook-matcher-body-coherence.sh
 monitor/watcher/test-idle-wrapup-scan-scope.sh
 monitor/watcher/test-input-box-chrome.sh
+monitor/watcher/test-integration/test-realmodel-dangerous-rm-decide.sh
+monitor/watcher/test-integration/test-realmodel-paste-held.sh
+monitor/watcher/test-integration/test-realmodel-respawn-verify.sh
 monitor/watcher/test-integration/test-realmodel-trust-dialog.sh
 monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh
 monitor/watcher/test-issue-ref.sh
@@ -850,6 +928,7 @@ monitor/watcher/test-knob-default-agrees.sh
 monitor/watcher/test-merge-ref-base.sh
 monitor/watcher/test-mutation-gate-bounds.sh
 monitor/watcher/test-mutation-gate-did-not-run.sh
+monitor/watcher/test-mutation-gate-subject.sh
 monitor/watcher/test-nexus-client-port-derivation.sh
 monitor/watcher/test-ng-flag-order.sh
 monitor/watcher/test-ng-identity-dashboard-sync.sh
@@ -871,16 +950,21 @@ monitor/watcher/test-pane-state-resolver-precondition.sh
 monitor/watcher/test-pane-state-restart-quiescence.sh
 monitor/watcher/test-pane-state-wrapped-idle.sh
 monitor/watcher/test-paste-dead-pane-guard-arms.sh
+monitor/watcher/test-paste-deliver.sh
 monitor/watcher/test-paste-followup-receipt-and-usage.sh
+monitor/watcher/test-population-primary-shape.sh
 monitor/watcher/test-proc-exists-authorized.sh
 monitor/watcher/test-proc-kill-authorized.sh
 monitor/watcher/test-proc-redirect-order.sh
 monitor/watcher/test-provenance-harness-field.sh
 monitor/watcher/test-public-mirror-build-entry-guard.sh
 monitor/watcher/test-public-mirror-dictionary-coverage.sh
+monitor/watcher/test-public-mirror-leak-gate-commit.sh
 monitor/watcher/test-public-mirror-overlay-drift.sh
+monitor/watcher/test-public-mirror-overlay-files.sh
 monitor/watcher/test-public-mirror-symlink-target.sh
 monitor/watcher/test-public-mirror-sync-base.sh
+monitor/watcher/test-realmodel-overlimit-unmeasured.sh
 monitor/watcher/test-recover-pidfile-sync.sh
 monitor/watcher/test-registry-unreadable-refusal.sh
 monitor/watcher/test-remote-client-helper.sh
@@ -896,11 +980,14 @@ monitor/watcher/test-request-filed-by.sh
 monitor/watcher/test-request-reply-skeptic-ledger.sh
 monitor/watcher/test-request-state-field.sh
 monitor/watcher/test-requests-emit-handling.sh
+monitor/watcher/test-resume-env-strip.sh
 monitor/watcher/test-retire-preflight-audit-scope.sh
 monitor/watcher/test-run-tests-accounting-verdict.sh
 monitor/watcher/test-run-tests-empty-outfile.sh
 monitor/watcher/test-run-tests-false-pass.sh
 monitor/watcher/test-run-tests-header-ref.sh
+monitor/watcher/test-run-tests-runner-signal.sh
+monitor/watcher/test-run-tests-shape-census.sh
 monitor/watcher/test-self-fix-tracker-search.sh
 monitor/watcher/test-send-check-last.sh
 monitor/watcher/test-send-check-queued-receipt.sh
@@ -911,6 +998,7 @@ monitor/watcher/test-session-name-from-window.sh
 monitor/watcher/test-skeptic-answer-body-fidelity.sh
 monitor/watcher/test-skeptic-arm-recording.sh
 monitor/watcher/test-skeptic-evidence-class-agreement.sh
+monitor/watcher/test-skeptic-round-identity.sh
 monitor/watcher/test-skeptic-self-spawn.sh
 monitor/watcher/test-skeptic-spawn-origin-key.sh
 monitor/watcher/test-skeptic-verdict-evidence.sh
@@ -942,7 +1030,8 @@ monitor/watcher/test-uncounted-abort-lint.sh
 monitor/watcher/test-upload-asset-positional.sh
 monitor/watcher/test-upload-asset-root-pinning.sh
 monitor/watcher/test-v2-task-rc-propagation.sh
-monitor/watcher/test-verify-worker-started.sh'
+monitor/watcher/test-verify-worker-started.sh
+monitor/watcher/test-watcher-supervise-probe.sh'
 
 _corpus_verdict() {   # <scanned> <indep> <pinned> -> rc 0 sound, rc 1 + reason
     local scanned="$1" indep="$2" pinned="$3"

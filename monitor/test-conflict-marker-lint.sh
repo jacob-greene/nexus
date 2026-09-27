@@ -83,6 +83,17 @@ PASS=0; FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 
+# --- population (your-org/nexus-code#1301) ---------------------------------
+# The scan below reads EVERY tracked file, so an edit anywhere can join this
+# lint's population. `_cml_files` is the ONE enumerator: section 3 scans what it
+# returns and `gp_population` declares what it returns, so the index and the
+# scan cannot drift apart. `gp_handle` EXITS on --population, so it sits above
+# the first line of output.
+_cml_files() { git -C "$REPO_ROOT" ls-files -z 2>/dev/null; }
+. "$_test_dir/_guard_population.sh"
+gp_population() { _cml_files | tr '\0' '\n'; }
+gp_handle "$@"
+
 # --- marker construction ---------------------------------------------------
 # Build every 7-character run at runtime, so the executable patterns are
 # unambiguous. NOTE the trailing comments on the four assignments below ARE
@@ -183,7 +194,7 @@ _expect_no_match "a marker inside backticks in prose"       "history was \`${M_B
 cd "$REPO_ROOT" || { bad "chdir" "cannot cd to $REPO_ROOT"; }
 
 files=()
-while IFS= read -r -d '' f; do files+=("$f"); done < <(git ls-files -z 2>/dev/null)
+while IFS= read -r -d '' f; do files+=("$f"); done < <(_cml_files)
 
 # Enumeration honesty (your-org/nexus-code#721): a count behind a claim is
 # sanity-checked, because an empty enumeration reads as "the population is

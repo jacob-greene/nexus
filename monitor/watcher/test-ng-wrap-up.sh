@@ -2358,6 +2358,105 @@ run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
 assert_eq       "#815 F6 CONTROL: unsuperseded resolution still suppresses" "$rc" "0"
 assert_contains "#815 F6 CONTROL: …with the banner"  "$stdout" "ALREADY RESOLVED"
 
+# ══ your-org/nexus-code#1619: a settlement is about a SUBJECT, not a window ══
+#
+# #815 made a resolved gate refuse to re-arm, keyed on the WINDOW — so round 1's
+# resolution bound every later round. A second round of new work on a NEW report
+# got "ALREADY RESOLVED — NOT RE-ARMING": no marker, no `armed` row, no request,
+# rc 0, and the round-2 verdict then recorded `unmatched-subject`. Three cases,
+# all driven through the REAL `ng skeptic resolve`:
+#   (A) new deliverable after the resolve   -> ARMS (marker + armed row + request)
+#   (B) the same deliverable re-wrapped     -> declines, and TELLS the orchestrator
+#   (C) the #815 loop: the same report AMENDED after the resolve (a new sha, the
+#       same deliverable) -> declines; the loop cannot re-block the worker, and
+#       re-running identical bytes files NO second adjudication request.
+count_adj_reqs() {  # adjudication requests for a window, any state
+    shopt -s nullglob
+    local -a f=("$REQ_DIR"/*-"$1"-rearm-declined-*.md)
+    shopt -u nullglob
+    printf '%s' "${#f[@]}"
+}
+sk1619_round1() {   # sk1619_round1 <window> <report> — arm, then resolve
+    local w="$1" r="$2"
+    export MOCK_TMUX=1 MOCK_TMUX_WINDOW="$w"
+    run_ng stdout stderr rc wrap-up 77 "$r" --repo override-org/override-repo \
+        --skeptic-decision require --skeptic-rationale "round one of real work"
+    assert_file_exists "#1619 [$w] round 1 armed" "$SK_PENDING/$w"
+    run_ng stdout stderr rc skeptic resolve "$w" \
+        --reason "round one reviewed and its findings fixed; gate settled"
+    assert_eq "#1619 [$w] resolve exits 0" "$rc" "0"
+}
+
+echo '=== #1619 A: a NEW deliverable after a resolved round ARMS ==='
+reset_mocks
+R1619A1="$FAKE_NEXUS/reports/nexus_2026-09-22_100000_round-one.md"
+R1619A2="$FAKE_NEXUS/reports/nexus_2026-09-22_110000_round-two.md"
+write_report "$R1619A1"; write_report "$R1619A2"
+printf '\nround two: differential-abundance equivalence, new code.\n' >> "$R1619A2"
+sk1619_round1 sk1619a "$R1619A1"
+# Round 1's spawn-skeptic request was adjudicated (a reviewer ran). Without this
+# the request inbox's own idempotence (an UNRESOLVED request for this window is
+# already queued) answers `skipped (already filed)`, which is not this case.
+for _f in "$REQ_DIR"/*-sk1619a-skeptic-d*.new.md; do [[ -e "$_f" ]] && mv "$_f" "${_f%.new.md}.done.md"; done
+_n_before=$(count_spawn_reqs)
+run_ng stdout stderr rc wrap-up 77 "$R1619A2" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "round two of new work"
+assert_eq          "#1619 A new-subject wrap-up exits 0" "$rc" "0"
+assert_file_exists "#1619 A the gate is ARMED for the new round" "$SK_PENDING/sk1619a"
+assert_contains    "#1619 A …and says it is a NEW SUBJECT" "$stdout" "THIS IS A NEW SUBJECT"
+assert_not_contains "#1619 A …not the window-keyed refusal" "$stdout" "ALREADY RESOLVED"
+assert_eq          "#1619 A a spawn-skeptic request IS filed" \
+                   "$(count_spawn_reqs)" "$(( _n_before + 1 ))"
+assert_contains    "#1619 A …and the wrap-up says so" "$stdout" "spawn-skeptic request: filed"
+_sha_a2=$(sha256sum < "$R1619A2" | awk '{print $1}')
+assert_contains    "#1619 A the arm is RECORDED against the new subject (a verdict can attribute)" \
+                   "$(awk -F'\t' '$1=="armed"{print $2}' "$SK_PENDING/.sk1619a.ledger")" "$_sha_a2"
+assert_contains    "#1619 A the new-subject arm is logged" \
+                   "$(cat "$STATE_DIR/action-log.jsonl" 2>/dev/null)" "skeptic-rearm-new-subject"
+
+echo '=== #1619 B: the SAME deliverable after the resolve declines — LOUDLY, to the orchestrator ==='
+reset_mocks
+R1619B="$FAKE_NEXUS/reports/nexus_2026-09-22_120000_same.md"
+write_report "$R1619B"
+sk1619_round1 sk1619b "$R1619B"
+_n_before=$(count_spawn_reqs)
+run_ng stdout stderr rc wrap-up 77 "$R1619B" --repo override-org/override-repo \
+    --no-comment --skeptic-decision require --skeptic-rationale "nothing new since"
+assert_eq       "#1619 B same-subject wrap-up exits 0 (the hand-off itself is not refused)" "$rc" "0"
+if [[ -e "$SK_PENDING/sk1619b" ]]; then
+    printf '  FAIL: #1619 B re-armed a settled, unchanged deliverable\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: #1619 B no marker for a covered deliverable\n'; PASS=$(( PASS + 1 ))
+fi
+assert_eq       "#1619 B no spawn-skeptic request" "$(count_spawn_reqs)" "$_n_before"
+assert_contains "#1619 B the decline names the subject it judged covered" "$stdout" "covered (same-bytes)"
+assert_contains "#1619 B the decline FILES an adjudication request" "$stdout" "adjudication request: filed"
+assert_eq       "#1619 B exactly one adjudication request on disk" "$(count_adj_reqs sk1619b)" "1"
+assert_contains "#1619 B …of the adjudication kind" \
+                "$(cat "$REQ_DIR"/*-sk1619b-rearm-declined-*.md 2>/dev/null)" "kind: skeptic-rearm-declined"
+
+echo '=== #1619 C: the #815 loop stays closed — an AMENDED report after the resolve ==='
+reset_mocks
+R1619C="$FAKE_NEXUS/reports/nexus_2026-09-22_130000_amended.md"
+write_report "$R1619C"
+sk1619_round1 sk1619c "$R1619C"
+_n_before=$(count_spawn_reqs)
+printf '\n## Follow-up\nfindings written up as the orchestrator asked.\n' >> "$R1619C"
+for _i in 1 2; do
+    run_ng stdout stderr rc wrap-up 77 "$R1619C" --repo override-org/override-repo \
+        --no-comment --skeptic-decision require --skeptic-rationale "record findings"
+    assert_eq "#1619 C wrap-up $_i exits 0" "$rc" "0"
+    if [[ -e "$SK_PENDING/sk1619c" ]]; then
+        printf '  FAIL: #1619 C wrap-up %s RE-BLOCKED the worker (the #815 loop)\n' "$_i" >&2; FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: #1619 C wrap-up %s did not re-arm\n' "$_i"; PASS=$(( PASS + 1 ))
+    fi
+done
+assert_contains "#1619 C the amendment is the SAME deliverable, revised" "$stdout" "covered (revised-bytes)"
+assert_eq       "#1619 C no spawn-skeptic request" "$(count_spawn_reqs)" "$_n_before"
+assert_contains "#1619 C the identical re-run does NOT re-file" "$stdout" "skipped (already filed"
+assert_eq       "#1619 C one adjudication request for identical bytes, ever" "$(count_adj_reqs sk1619c)" "1"
+
 # ══ your-org/nexus-code#825: the chain-event probe must FAIL CLOSED ════════
 #
 # `_skeptic_last_chain_event_epoch` returned 0 on three could-not-determine
@@ -3258,9 +3357,14 @@ assert_file_exists "F1 step 2: still armed after re-wrapping R2" "$SK984_PENDING
 export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-wf1"
 F1_REV="$FAKE_NEXUS/reports/nexus_2026-05-13_120000_f1-rev.md"
 write_report "$F1_REV"; printf '\nreviewer\n' >> "$F1_REV"
+# `--skeptic-subject "$F1_R1"`: with TWO arms outstanding a verdict naming no
+# artefact would record `sha=-`, which the reviewed window can then satisfy by
+# no route — so it is REFUSED since merge4sk (your-org/nexus-code#1580) and the
+# reviewer must say what it read. Saying so is also what this fixture's own
+# comment already claims ("it reviewed R1"); the property below is unchanged.
 run_ng stdout stderr rc wrap-up 977 "$F1_REV" --repo override-org/override-repo \
     --skeptic-role --skeptic-target wf1 --skeptic-depth 1 \
-    --skeptic-verdict credible --skeptic-findings 0
+    --skeptic-verdict credible --skeptic-findings 0 --skeptic-subject "$F1_R1"
 assert_eq "F1 step 3: the verdict wrap-up exits 0" "$rc" "0"
 # THE PROPERTY. R2 was never reviewed by anyone; a record naming it is a claim
 # nobody made, and it is the claim that later suppresses R2's validation.
@@ -3309,6 +3413,13 @@ f1b_round() {   # f1b_round <report> <n>
     export MOCK_TMUX=1 MOCK_TMUX_WINDOW="wf1b"
     run_ng stdout stderr rc wrap-up 977 "$1" --repo override-org/override-repo \
         --no-comment --skeptic-decision require --skeptic-rationale "round $2 of the repeat case"
+    # The reviewer's report must POST-DATE the round it discharges (skprotosk F5
+    # on your-org/nexus-code#1580: a verdict wrap-up whose report predates the
+    # newest arm is refused, so a retained skeptic re-running round 1's wrap-up
+    # cannot discharge round 2). One reviewer file serves both rounds here, so
+    # re-stamp it after each arm — the bytes are irrelevant to the property
+    # under test, which is the counter reset.
+    sleep 1; touch "$F1B_REV"
     export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-wf1b$2"
     run_ng stdout stderr rc wrap-up 977 "$F1B_REV" --repo override-org/override-repo \
         --skeptic-role --skeptic-target wf1b --skeptic-depth 1 \
@@ -4397,6 +4508,8 @@ cat > "$GFD_STUB" <<'GFD'
 #!/usr/bin/env bash
 # a selector stand-in: two selected guards, exit 0
 [[ "${1:-}" == --quiet ]] || exit 9
+# your-org/nexus-code#1588: a refusing selector names its probe on STDERR.
+[[ -n "${GFD_STUB_ERR:-}" ]] && printf '%s\n' "$GFD_STUB_ERR" >&2
 printf 'bash monitor/watcher/test-ng-wrap-up.sh\nbash monitor/watcher/test-never-mentioned-guard.sh\n'
 exit "${GFD_STUB_RC:-0}"
 GFD
@@ -4420,6 +4533,38 @@ reset_mocks; : > "$BODY_CAPTURE"
 GFD_STUB_RC=3 NG_GUARDS_FOR_DIFF_BIN="$GFD_STUB" run_ng stdout stderr rc wrap-up 42 "$GUARD_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture" --guards --strict-guards
 assert_eq       "#1459 selector exit 3: not a refusal"                  "$rc" "0"
 assert_contains "#1459 selector exit 3: named as NOT a clearance"      "$stderr" "NOT a clearance"
+# ---- your-org/nexus-code#1588: a selector that COULD NOT ANSWER ----------
+# Three primary-clone wrap-ups printed "a population probe errored" and exited
+# 0 — under --strict-guards too — and none could say WHICH probe, because the
+# selector's stderr went to /dev/null. Two properties, pinned separately: the
+# probe is NAMED, and strict FAILS CLOSED on every "no selection" outcome.
+echo '=== #1588: a refusing selector NAMES its probe; --strict-guards refuses when the selector cannot answer ==='
+_GFD_REFUSAL='guards-for-diff: REFUSED — monitor/watcher/test-planted-probe.sh --population failed (rc 124).'
+reset_mocks; : > "$BODY_CAPTURE"
+GFD_STUB_RC=2 GFD_STUB_ERR="$_GFD_REFUSAL" NG_GUARDS_FOR_DIFF_BIN="$GFD_STUB" run_ng stdout stderr rc wrap-up 42 "$GUARD_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture" --guards
+assert_eq       "#1588 selector exit 2, advisory: still exit 0 (advisory stays advisory)" "$rc" "0"
+assert_contains "#1588 selector exit 2: the failing probe is NAMED"      "$stderr" "monitor/watcher/test-planted-probe.sh --population failed (rc 124)"
+assert_contains "#1588 selector exit 2: still says nothing is clear"      "$stderr" "nothing here is clear"
+# A refusal with an EMPTY stderr must say so rather than print a bare header.
+reset_mocks; : > "$BODY_CAPTURE"
+GFD_STUB_RC=2 NG_GUARDS_FOR_DIFF_BIN="$GFD_STUB" run_ng stdout stderr rc wrap-up 42 "$GUARD_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture" --guards
+assert_contains "#1588 selector exit 2, silent selector: says it wrote NOTHING" "$stderr" "wrote NOTHING to stderr"
+# Strict fails CLOSED. One row per class of "no selection": the selector's own
+# refusal (2), the DEFAULT timeout status (124), a HARDENED timeout status the
+# old `124|137` arm did not list (143, #1248), and an unknown code (9).
+for _gfd_rc in 2 124 143 9; do
+    reset_mocks; : > "$BODY_CAPTURE"
+    GFD_STUB_RC=$_gfd_rc GFD_STUB_ERR="$_GFD_REFUSAL" NG_GUARDS_FOR_DIFF_BIN="$GFD_STUB" run_ng stdout stderr rc wrap-up 42 "$GUARD_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture" --guards --strict-guards
+    assert_eq       "#1588 selector exit $_gfd_rc --strict-guards: REFUSED (rc 1), not waved through" "$rc" "1"
+    assert_contains "#1588 selector exit $_gfd_rc --strict-guards: says the selection is unestablished" "$stderr" "REFUSED under --strict-guards"
+    assert_not_contains "#1588 selector exit $_gfd_rc --strict-guards: nothing was posted" "$(cat "$GH_CAPTURE" 2>/dev/null)" "/issues/42/comments"
+done
+# …and the SAME codes without --strict-guards do not refuse: the fix must not
+# turn an advisory into a gate for everybody.
+reset_mocks; : > "$BODY_CAPTURE"
+GFD_STUB_RC=124 NG_GUARDS_FOR_DIFF_BIN="$GFD_STUB" run_ng stdout stderr rc wrap-up 42 "$GUARD_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture" --guards
+assert_eq       "#1588 selector exit 124, advisory: exit 0"               "$rc" "0"
+assert_contains "#1588 selector exit 124: named as a wrapper status, UNMEASURED" "$stderr" "UNMEASURED, not clear"
 # Not forced and the report is not under the primary corpus: the pre-flight
 # does not run at all (a fixture report must never pay the selector).
 reset_mocks; : > "$BODY_CAPTURE"
@@ -4560,6 +4705,97 @@ run_ng stdout stderr rc wrap-up 4041 "$REPORT" \
 unset MOCK_ISSUE_404
 assert_eq "#1491 CONTROL: --no-comment skips the target probe entirely" \
     "$(grep -cE -- '-X GET /repos/[^ ]+/issues/4041$' "$GH_CAPTURE" || true)" "0"
+
+# ══ your-org/nexus-code#1608: the author can SEE what will travel ═══════════
+echo '=== #1608: --dry-run composes BOTH bodies and writes NOTHING ==='
+reset_mocks
+: > "$UPLOAD_CAPTURE"; : > "$GH_CAPTURE"
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="dry1608"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo \
+    --trigger-comment 7777 --skeptic-decision require --skeptic-rationale "would arm" --dry-run
+assert_eq       "#1608 --dry-run exits 0" "$rc" "0"
+assert_contains "#1608 says it is a dry run" "$stdout" "DRY RUN (--dry-run)"
+assert_contains "#1608 shows the composed link-comment teaser (first sentence)" "$stdout" \
+                "Implemented ng wrap-up so workers can hand off in one verb."
+assert_contains "#1608 …with the asset URL as a placeholder, not a fabricated link" "$stdout" \
+                "Full report: <asset-url: assigned at upload>"
+assert_eq       "#1608 NOTHING uploaded" "$(wc -c < "$UPLOAD_CAPTURE" | tr -d ' ')" "0"
+assert_not_contains "#1608 NOTHING posted or rocketed" "$(cat "$GH_CAPTURE")" "/comments"
+assert_not_contains "#1608 NOTHING logged" "$(cat "$STATE_DIR/action-log.jsonl" 2>/dev/null)" '"event":"wrap-up"'
+if [[ -e "$STATE_DIR/skeptic/pending/dry1608" ]]; then
+    printf '  FAIL: #1608 a dry run ARMED the skeptic gate (#1370)\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: #1608 a dry run arms no skeptic gate\n'; PASS=$(( PASS + 1 ))
+fi
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+
+echo '=== #1608 (skeptic item 6): --dry-run moves NOTHING in the state tree — the #1370 record store included ==='
+# The block above checks named surfaces (upload, comment, log, marker). The
+# skeptic measured the claim the way it is WORDED — "writes nothing" — by
+# diffing the WHOLE state tree around a dry run, and found the #1370 wrapper
+# had written a record, repointed `last` at it and pruned, all before the verb
+# parsed `--dry-run`. So: a whole-tree snapshot that SEES the record store —
+# files by content, symlinks by TARGET (that is where `last` lives, and a
+# `-type f` walk is blind to it), directories by name — excluding only the
+# usage-telemetry tap, which fires on every verb including `help`.
+_snap1608() {
+    ( cd "$STATE_DIR" && find . ! -name 'ng-usage.jsonl' \
+        \( -type l -printf 'l %p -> %l\n' -o -type d -printf 'd %p\n' \
+           -o -type f -printf 'f %p ' -exec sha256sum {} \; \) | LC_ALL=C sort )
+}
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="dry1608b"
+K1608=$(wk_encode dry1608b)
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision deny --skeptic-rationale "real run before the preview"
+assert_eq "#1608 PRECONDITION: the REAL run before the preview succeeds" "$rc" "0"
+assert_contains "#1608 PRECONDITION: …and is the record \`last\` names" \
+    "$(cat "$STATE_DIR/wrap-up-output/$K1608/last" 2>/dev/null)" "real run before the preview"
+_before1608=$(_snap1608)
+assert_contains "#1608 PRECONDITION: the snapshot SEES the record store (not a blind instrument)" \
+    "$_before1608" "l ./wrap-up-output/$K1608/last -> "
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo \
+    --trigger-comment 7777 --skeptic-decision require --skeptic-rationale "would arm" --dry-run
+assert_eq "#1608 the dry run itself exits 0" "$rc" "0"
+_after1608=$(_snap1608)
+assert_eq "#1608 THE PROPERTY: --dry-run left the WHOLE state tree identical (record store, \`last\`, every file)" \
+    "$( [[ "$_after1608" == "$_before1608" ]] && echo identical || echo CHANGED)" "identical"
+if [[ "$_after1608" != "$_before1608" ]]; then
+    diff <(printf '%s\n' "$_before1608") <(printf '%s\n' "$_after1608") | sed 's/^/    /' >&2
+fi
+run_ng stdout stderr rc wrap-up --last
+assert_eq       "#1608 --last after a dry run exits 0" "$rc" "0"
+assert_contains "#1608 --last replays the prior REAL run" "$stdout" "real run before the preview"
+assert_not_contains "#1608 …not the preview" "$stdout" "DRY RUN (--dry-run)"
+
+# CONTROL: the token is a CANDIDATE, not a verdict. As the VALUE of a value
+# flag it is not the flag, the verb runs for real, and its record must land
+# and become `last` — the staged path has to hand it over, not drop it.
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision deny --skeptic-rationale --dry-run
+assert_eq "#1608 CONTROL: \`--dry-run\` as a flag VALUE runs the real hand-off" "$rc" "0"
+assert_contains "#1608 CONTROL: …which published" "$stdout" "uploaded: https://"
+assert_contains "#1608 CONTROL: …and its record was stored and is \`last\`" \
+    "$(cat "$STATE_DIR/wrap-up-output/$K1608/last" 2>/dev/null)" "--skeptic-rationale --dry-run"
+assert_contains "#1608 CONTROL: …with its rc footer" \
+    "$(cat "$STATE_DIR/wrap-up-output/$K1608/last" 2>/dev/null)" "rc: 0"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+
+echo '=== #1608: --dry-run with --reply-to shows the FULL Summary the requester would get ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up "$REPORT" --reply-to req-1608-x --dry-run
+assert_eq       "#1608 channel dry run exits 0" "$rc" "0"
+assert_contains "#1608 names the channel body" "$stdout" "[--reply-to req-1608-x channel body]"
+assert_contains "#1608 …which is the WHOLE Summary, second sentence included" "$stdout" \
+                "folds upload + comment + rocket + log into a single call."
+
+echo '=== #1608: the SUCCESS path prints the body it published ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_eq       "#1608 success exits 0" "$rc" "0"
+assert_contains "#1608 the published body is shown" "$stdout" "--- published comment body ---"
+assert_contains "#1608 …and it is the composed teaser" "$stdout" \
+                "  | Implemented ng wrap-up so workers can hand off in one verb."
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

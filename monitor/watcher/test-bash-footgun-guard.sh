@@ -784,6 +784,45 @@ win tmux-pin-3
 run '{"tool_name":"Bash","tool_input":{"command":"env -u TMUX tmux -L probe kill-session -t t"}}'
 assert_silent "pinned AND targeted stays clean"
 
+echo '=== a BARE WINDOW NAME is not a target: tmux resolves it by PREFIX (your-org/nexus-code#1524) ==='
+# Strings handed to the guard, as everywhere in this suite — nothing here runs
+# tmux. The premise (a bare `-t w1` with only `w1-sk` present acts on `w1-sk` at
+# rc 0, for every verb below) was measured on private servers and is asserted
+# against a REAL server in test-tmux-shim.sh.
+win tmux-prefix-1
+run '{"tool_name":"Bash","tool_input":{"command":"tmux kill-window -t w239"}}'
+assert_ctx "a bare-NAME kill-window fires" "[tmux-target-prefix]"
+assert_ctx "  …names the mechanism" "UNIQUE PREFIX"
+assert_ctx "  …and the exact form that works for EVERY verb" ":=<name>"
+win tmux-prefix-2
+run '{"tool_name":"Bash","tool_input":{"command":"tmux send-keys -t w239 Enter"}}'
+assert_ctx "a bare-NAME send-keys fires (a mis-aimed Enter submits the box of the sibling)" "[tmux-target-prefix]"
+win tmux-prefix-3
+run '{"tool_name":"Bash","tool_input":{"command":"tmux paste-buffer -b b1 -t '"'"'w239'"'"'"}}'
+assert_ctx "a QUOTED bare name still fires" "[tmux-target-prefix]"
+win tmux-prefix-4
+run '{"tool_name":"Bash","tool_input":{"command":"tmux kill-window -t 0:w239"}}'
+assert_ctx "the session:NAME spelling redirects too, and fires" "[tmux-target-prefix]"
+# BOTH DIRECTIONS: every form that cannot prefix-redirect stays clean.
+win tmux-prefix-ok-1
+run '{"tool_name":"Bash","tool_input":{"command":"tmux kill-window -t @3125"}}'
+assert_silent "an @id target stays clean"
+win tmux-prefix-ok-2
+run '{"tool_name":"Bash","tool_input":{"command":"tmux send-keys -t :=w239 Enter"}}'
+assert_silent "the prescribed exact form stays clean"
+win tmux-prefix-ok-3
+run '{"tool_name":"Bash","tool_input":{"command":"tmux kill-window -t \"$WID\""}}'
+assert_silent "a variable target stays clean (its value is not knowable from the string)"
+win tmux-prefix-ok-4
+run '{"tool_name":"Bash","tool_input":{"command":"tmux send-keys -t %5 Enter"}}'
+assert_silent "a %pane-id target stays clean"
+win tmux-prefix-ok-5
+run '{"tool_name":"Bash","tool_input":{"command":"env -u TMUX tmux -L priv kill-window -t w1"}}'
+assert_silent "a PINNED private server is the business of the agent that pinned it"
+win tmux-prefix-ok-6
+run '{"tool_name":"Bash","tool_input":{"command":"tmux display-message -p -t w239 \"#{window_id}\""}}'
+assert_silent "a READ is not an act (the row covers kills, respawns, keystrokes and pastes)"
+
 echo '=== the four verbs dedup INDEPENDENTLY (your-org/nexus-code#951 F2) ==='
 # One shared tag would spend the family's single warning on whichever verb fired
 # first: a worker warned about kill-server at hour 1 got NOTHING when it later
@@ -1307,6 +1346,70 @@ win eqh-wc
 run '{"tool_name":"Bash","tool_input":{"command":"grep -rn foo src/ | wc -l"}}'
 assert_silent "grep -r | wc consumes everything by design and stays SILENT"
 
+# ── your-org/nexus-code#1610: `find -newerXt <time string>` under a wrapped find ──
+# Two agents in one hour read `-newermt '-90 minutes'` → 0 (rc 1, bfs behind a
+# shell function) as an absence and published it. The row is CONDITIONAL, so the
+# message must carry the DIFFERENTIAL (the self-validating check) and not only a
+# `whence -w` type check, which `bash -c`/`zsh -c` defeat.
+echo '=== #1610: find -newerXt <time string> WARNS, conditionally ==='
+win fnt-real
+run '{"tool_name":"Bash","tool_input":{"command":"find monitor/.state/skeptic -name '"'"'req-*'"'"' -newermt '"'"'-90 minutes'"'"' 2>/dev/null"}}'
+assert_ctx "the measured 16:45 shape (-newermt '-90 minutes') WARNS" "[find-newer-time]"
+assert_ctx "  …and hands over the DIFFERENTIAL, run directly" "SETTLE IT FOR YOUR SHELL WITH THE DIFFERENTIAL"
+assert_ctx "  …and warns that bash -c / zsh -c cannot see the wrapper" "NOT under \`bash -c\`/\`zsh -c\`"
+assert_ctx "  …and names the dialect-free remedy" "\`-mmin -N\`"
+assert_ctx "  …and stays CONDITIONAL (never asserts the reader is exposed)" "CONDITIONALLY, depending on YOUR shell"
+win fnt-newerct
+run '{"tool_name":"Bash","tool_input":{"command":"find . -maxdepth 3 -newerct '"'"'12 hours ago'"'"' -type f"}}'
+assert_ctx "the -newerct sibling (inode-change time string) WARNS" "[find-newer-time]"
+# CONTROLS — the remedy and the reference-FILE forms carry no time string.
+win fnt-mmin
+run '{"tool_name":"Bash","tool_input":{"command":"find monitor/.state/skeptic -name '"'"'req-*'"'"' -mmin -90"}}'
+assert_silent "the prescribed remedy (-mmin -90) stays SILENT"
+win fnt-newer-file
+run '{"tool_name":"Bash","tool_input":{"command":"find . -newer ref.txt -type f"}}'
+assert_silent "-newer <file> (a reference FILE, dialect-neutral) stays SILENT"
+win fnt-newerma
+run '{"tool_name":"Bash","tool_input":{"command":"find . -newerma ref.txt"}}'
+assert_silent "-newerma <file> (the XY form taking a FILE) stays SILENT"
+
+# ── your-org/nexus-code#1628: an UNGUARDED recursive rm under $TMPDIR ──
+# Claude Code leaves TMPDIR unset, so `rm -rf $TMPDIR/foo` was `rm -rf /foo`.
+# The row fires on the bare `$TMPDIR/` / `${TMPDIR}/` argument of a recursive
+# rm, and never on the `:?` / `:-` forms its own message prescribes.
+echo '=== #1628: rm -r under an unguarded $TMPDIR WARNS ==='
+win tdr-bare
+run '{"tool_name":"Bash","tool_input":{"command":"rm -rf $TMPDIR/foo"}}'
+assert_ctx "rm -rf \$TMPDIR/foo WARNS" "[tmpdir-rm-unguarded]"
+assert_ctx "  …and names the loud form" '${TMPDIR:?TMPDIR is unset}'
+win tdr-braced
+run '{"tool_name":"Bash","tool_input":{"command":"cd x && rm -fr \"${TMPDIR}/v3\""}}'
+assert_ctx "a braced, quoted \${TMPDIR}/v3 after && WARNS" "[tmpdir-rm-unguarded]"
+win tdr-long
+run '{"tool_name":"Bash","tool_input":{"command":"rm --recursive \"$TMPDIR/y\""}}'
+assert_ctx "rm --recursive \"\$TMPDIR/y\" WARNS" "[tmpdir-rm-unguarded]"
+win tdr-guarded
+run '{"tool_name":"Bash","tool_input":{"command":"rm -rf \"${TMPDIR:?}/foo\""}}'
+assert_silent "the prescribed \${TMPDIR:?}/foo stays SILENT"
+win tdr-default
+run '{"tool_name":"Bash","tool_input":{"command":"rm -rf \"${TMPDIR:-/tmp}/foo\""}}'
+assert_silent "a defaulted \${TMPDIR:-/tmp}/foo stays SILENT"
+win tdr-nonrec
+run '{"tool_name":"Bash","tool_input":{"command":"rm $TMPDIR/file.txt"}}'
+assert_silent "a NON-recursive rm \$TMPDIR/file stays SILENT"
+# The first cut required `/` right after the name, so a closing quote before it
+# defeated the row — including `"${TMPDIR}"/*`, which is `rm -r /*` when empty
+# (skeptic on PR #1630).
+win tdr-quote-glob
+run '{"tool_name":"Bash","tool_input":{"command":"rm -r \"${TMPDIR}\"/*"}}'
+assert_ctx "rm -r \"\${TMPDIR}\"/* (quote BEFORE the slash) WARNS" "[tmpdir-rm-unguarded]"
+win tdr-empty-default
+run '{"tool_name":"Bash","tool_input":{"command":"rm -rf ${TMPDIR:-}/x"}}'
+assert_ctx "an EMPTY default \${TMPDIR:-}/x WARNS" "[tmpdir-rm-unguarded]"
+win tdr-nearname
+run '{"tool_name":"Bash","tool_input":{"command":"rm -rf \"$TMPDIRX\"/y"}}'
+assert_silent "a different variable \$TMPDIRX stays SILENT"
+
 # 206 -> 226: +14 for #1447 (four firing spellings with three message-content
 # pins, four allowlist controls, one row-deleted potency control) and +6 for
 # #1446 (three firing shapes with one message pin, three bounded-form controls).
@@ -1322,7 +1425,13 @@ assert_silent "grep -r | wc consumes everything by design and stays SILENT"
 # blob control; marker-file scope, fail-closed unknown window + its read-only
 # control, the no-marker control, and the no-marker-no-window residual).
 # 252 -> 254: +2 for w241sk round 3 (the @{u} / @{upstream} blob spellings).
-_EXPECTED_ASSERTIONS=254
+# 266 -> 275: +9 for #1610 (the find-newer-time row: two firing shapes with
+# four message-content pins, three silent controls).
+# 275 -> 282: +7 for #1628 (the tmpdir-rm-unguarded row: three firing shapes
+# with one message pin, three silent controls incl. its own prescribed form).
+# 282 -> 285: +3 for the #1630 skeptic (quote-before-slash and empty-default
+# shapes fire; a near-name variable stays silent).
+_EXPECTED_ASSERTIONS=285
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; PASS=$((PASS+1))

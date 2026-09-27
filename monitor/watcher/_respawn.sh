@@ -59,6 +59,12 @@ _respawn_dir=${_respawn_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/nu
 # anything — `_respawn_spawn_window` checks `declare -F` before calling it.
 # shellcheck source=../_tmux-window.sh
 [[ -r "$_respawn_dir/../_tmux-window.sh" ]] && source "$_respawn_dir/../_tmux-window.sh"
+# THE confirmed-delivery primitive (your-org/nexus-code#1591), which holds the
+# tree's one `tmux paste-buffer`. Explicit for the same reason as the two above;
+# quiet at load, LOUD at use — `_respawn_paste_prompt_file` refuses to paste
+# when `pd_paste_file` is not defined, rather than hand-rolling a second site.
+# shellcheck source=../_paste-deliver.sh
+[[ -r "$_respawn_dir/../_paste-deliver.sh" ]] && source "$_respawn_dir/../_paste-deliver.sh"
 if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
     # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
     # tell a live pane from a corpse, and a paste into a corpse kills the
@@ -788,6 +794,11 @@ export NEXUS_ORCHESTRATOR_WINDOW="$target_window"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so the
 # orchestrator invokes nexus tools by name; guarded silent no-op if absent.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# TMPDIR for the agent process and everything under it (your-org/nexus-code#1628):
+# claude does not set one, so \$TMPDIR/x was /x. Here, in the LAUNCHER, not in
+# locals-env.sh, which services and helpers also source (a callee with a private
+# TMPDIR under a caller without one split the labsh rotation).
+[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
 # The shim precondition, emitted from the SINGLE source monitor/guard-block.sh.in
 # (your-org/nexus-code#589). The orchestrator runs the same Bash-tool shells a
 # worker does, so every monitor/*wrap shim must be reachable there. No
@@ -866,11 +877,20 @@ _respawn_spawn_window() {
     fi
     if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
         if [[ -n "$_sel_file" ]]; then
-            tmux_selection_capture "$target" "$_sel_file" >/dev/null 2>&1 || true
+            # Best-effort, NOT silent (your-org/nexus-code#1562): a failed
+            # capture deletes its file, and without this line the only trace
+            # is an operator on the wrong window.
+            local _cap_rc=0
+            tmux_selection_capture "$target" "$_sel_file" >/dev/null 2>&1 || _cap_rc=$?
+            (( _cap_rc == 0 )) || printf '_respawn: selection capture before killing %s FAILED rc=%d: %s (non-fatal)\n' \
+                "$target" "$_cap_rc" "${TMUX_SELECTION_WHY:-no reason recorded}" >&2
         fi
         tmux kill-window -t "$target" 2>/dev/null || true
         if [[ -n "$_sel_file" ]]; then
-            tmux_selection_note_post_kill "$_sel_file" >/dev/null 2>&1 || true
+            local _post_rc=0
+            tmux_selection_note_post_kill "$_sel_file" >/dev/null 2>&1 || _post_rc=$?
+            (( _post_rc == 0 || _cap_rc != 0 )) || printf '_respawn: selection post-kill note for %s FAILED rc=%d: %s (non-fatal)\n' \
+                "$target" "$_post_rc" "${TMUX_SELECTION_WHY:-no reason recorded}" >&2
         fi
     fi
     # `remain-on-exit` is armed ATOMICALLY WITH CREATION, in ONE tmux command
@@ -1049,7 +1069,7 @@ _respawn_wait_for_input_ready() {
             blocked)
                 if (( dismiss_count < max_dismiss )); then
                     "$log_fn" "readiness: state=blocked observed (likely --continue summary prompt or permission overlay); sending Escape to dismiss (attempt $((dismiss_count + 1))/${max_dismiss})"
-                    tmux send-keys -t "$target" Escape 2>/dev/null || true
+                    tmux send-keys -t ":=${target}" Escape 2>/dev/null || true
                     dismiss_count=$(( dismiss_count + 1 ))
                 else
                     "$log_fn" "readiness: state=blocked persists after ${max_dismiss} Escape attempts; giving up dismissal, continuing to wait"
@@ -1104,6 +1124,25 @@ _respawn_wait_for_submit_evidence() {
     return 1
 }
 
+# EVERY KEYSTROKE AND PASTE IN THIS FILE TARGETS `:=<name>`, NEVER A BARE NAME
+# (your-org/nexus-code#1524). tmux resolves the window part of a bare
+# `-t <name>` as id → index → exact name → UNIQUE PREFIX → fnmatch, so when the
+# exact window is absent and exactly one longer sibling exists — and worker /
+# skeptic names share a stem by convention (`w`, `w-sk`, `w-skeptic`) — the
+# keystroke lands in the SIBLING at rc 0: an Escape aborts its turn, an Enter
+# submits whatever is in its box (`#1200`'s shape).
+#
+# Measured on this host's tmux 2.6, one fresh private server per row, 40 rows,
+# no rig failures: a bare `w1` and `s:w1` redirect to `w1-sk` for send-keys,
+# paste-buffer, display-message and kill-window alike; `=w1` is exact for
+# kill-window but is REJECTED (`can't find pane =w1`) by every pane-target verb
+# EVEN WHEN `w1` EXISTS, so it is not a drop-in; `:=w1` and `s:=w1` act on
+# exactly `w1` when it is present and FAIL (rc 1, `can't find window w1`) when
+# it is not, for all four verbs. Every site below already treats a failed send
+# as a failed send, so the new outcome is a refusal where there used to be a
+# mis-aim. `:=` keeps the bare form's session scope (an empty session part is
+# the current session). Re-measure on any tmux the host moves to.
+
 # _respawn_paste_prompt_file <target> <prompt_file>
 #
 # VI-mode hardening (send `i` BSpace first), load-buffer the prompt
@@ -1131,51 +1170,164 @@ _respawn_paste_prompt_file() {
         fi
         return 1
     fi
-    buf="nexus-respawn-$$-$(date +%s%N)"
+    # THE PASTE GOES THROUGH THE ONE PRIMITIVE (your-org/nexus-code#1591):
+    # monitor/_paste-deliver.sh normalises the brief, loads it from a FILE and
+    # makes the tree's only `tmux paste-buffer` call — BRACKETED (`-p`), for the
+    # reason recorded there (#1516, #1518: unbracketed, a REPL that reads the
+    # paste and the Enter in one chunk takes the Enter's CR as a line break, and
+    # the brief sits unsubmitted in the input box).
+    #
+    # WHY THIS SITE WAS THE WORST OF THE THREE, kept because it is still the
+    # reason the verify stage in `_respawn_orchestrator` exists: this function's
+    # only failure signal is a tmux rc. A strand here is an orchestrator that
+    # was respawned, never briefed, and reported respawned — a MANUFACTURED
+    # SUCCESS. The SUBMIT is therefore established by the caller's post-paste
+    # verify, which presses Enter again only on `state=user-typing input=typed`
+    # — the same positive-`held` allowlist `pd_submit` applies everywhere else,
+    # with the longer budget a freshly `--resume`d orchestrator was measured to
+    # need (2026-09-11: Enter ignored for ~5.5 min).
+    #
+    # `:=<name>`, never a bare name (#1524, see the block above this function).
     rc=0
-    if ! tmux send-keys -t "$target" i BSpace 2>/dev/null; then
+    if ! declare -F pd_paste_file >/dev/null 2>&1; then
+        printf '_respawn: monitor/_paste-deliver.sh is unavailable — refusing to paste the recovery prompt into %q without the confirmed-delivery primitive (your-org/nexus-code#1591)\n' "$target" >&2
+        return 1
+    fi
+    local norm=""
+    norm=$(mktemp "${TMPDIR:-/tmp}/nexus-respawn-brief.XXXXXX" 2>/dev/null) || norm=""
+    if [[ -n "$norm" ]] && ! pd_normalise_file "$prompt_file" "$norm"; then
+        rm -f "$norm"; norm=""
+    fi
+    buf="nexus-respawn-$$-$(date +%s%N)"
+    if ! pd_paste_file ":=${target}" "${norm:-$prompt_file}" "$buf"; then
         rc=1
-    elif ! tmux load-buffer -b "$buf" "$prompt_file" 2>/dev/null; then
-        rc=1
-    # BRACKETED (`-p`), as `main.sh`'s emit paste and `_unstick.sh`'s line paste
-    # are on this base (your-org/nexus-code#1516, #1518). THE THIRD AND LAST
-    # unbracketed `paste-buffer` in the tree — `#1514`'s branch was believed to
-    # cover it and does not: measured `paste-buffer -p` count in this file is
-    # **0** at `origin/dev` 4f73e0e7, `origin/main` 0a76c4d5, at this branch's
-    # base 81c38b39, AND at `operator/w234-restart-boundary` da1b54c3 (two
-    # `paste-buffer` occurrences in the file, of which one is the comment above
-    # and one is this call). Skeptic `w236sk` F3.
-    #
-    # Unbracketed, the REPL can only infer a paste from bytes that arrive
-    # together, so a REPL that reads the paste and the Enter 0.1 s below in ONE
-    # chunk takes the Enter's CR as part of the paste — a line break, not the
-    # submit — and the text sits UNSUBMITTED in the input box. Bracketed, that CR
-    # arrives after `ESC[201~` and is a keypress however the bytes are chunked.
-    # `-p` is inert on a pane that never requested mode ?2004.
-    #
-    # WHY THIS SITE IS THE WORST OF THE THREE. It pastes the RESPAWN PROMPT into
-    # a window `_respawn_spawn_window` has just created, and this function's only
-    # failure signal is a tmux rc — there is no content check here at all. So a
-    # strand is an orchestrator that was respawned, never briefed, and reported
-    # respawned: it comes up, sits holding an unsubmitted prompt, and nothing
-    # downstream disagrees. That is the 11-hour-silence shape of `#1518` reached
-    # by a different road, and it is a MANUFACTURED SUCCESS rather than a masked
-    # failure — every visible artefact says the respawn worked.
-    #
-    # The `#745` dead-pane guard above is untouched and still precedes this call:
-    # `-p` does not change that hazard (`_pane-live.sh` measured
-    # `paste-buffer -p -d` killing the server 20/20, same as the plain form).
-    elif ! tmux paste-buffer -p -b "$buf" -t "$target" 2>/dev/null; then
-        rc=1
-        tmux delete-buffer -b "$buf" 2>/dev/null || true
     else
         sleep 0.1
-        if ! tmux send-keys -t "$target" Enter 2>/dev/null; then
+        if ! tmux send-keys -t ":=${target}" Enter 2>/dev/null; then
             rc=1
         fi
-        tmux delete-buffer -b "$buf" 2>/dev/null || true
+    fi
+    # THE VERIFY STAGE NEEDS THE BYTES THAT WERE PASTED (your-org/nexus-code#1596):
+    # its retry Enter is an EQUALITY against them (`pd_box_is_ours`). A caller
+    # that sets _RESPAWN_KEEP_PASTED=1 takes ownership of the file named in
+    # _RESPAWN_PASTED_FILE and removes it (only when _RESPAWN_PASTED_IS_TEMP=1 —
+    # when normalisation was unavailable it IS the caller's own prompt file).
+    if [[ -n "${_RESPAWN_KEEP_PASTED:-}" ]]; then
+        _RESPAWN_PASTED_FILE="${norm:-$prompt_file}"
+        _RESPAWN_PASTED_IS_TEMP=0; [[ -n "$norm" ]] && _RESPAWN_PASTED_IS_TEMP=1
+    else
+        [[ -n "$norm" ]] && rm -f "$norm"
     fi
     return $rc
+}
+
+# _respawn_paste_lock_path <target>
+#
+# The per-target paste lock main.sh's paste_to_target takes (#562). MUST stay
+# the same expression as there: the lock only serialises the pasters that agree
+# on its path (your-org/nexus-code#1539).
+_respawn_paste_lock_path() {
+    local target="$1"
+    printf '%s\n' "${STATE_DIR:-/tmp}/paste-locks/${target//[^A-Za-z0-9._-]/_}.lock"
+}
+
+_respawn_field() {
+    printf '%s' "$1" | awk -v k="$2" '{
+        for (i = 1; i <= NF; i++) {
+            n = index($i, "=")
+            if (n > 0 && substr($i, 1, n - 1) == k) { print substr($i, n + 1); exit }
+        }
+    }'
+}
+
+# _respawn_box_is_brief <target> <pane-state-bin> <pasted-file>
+#
+# rc 0 only when BOTH hold — the two conditions `pd_submit` requires before any
+# retry Enter, for the same measured reason (monitor/_paste-deliver.sh, "A RETRY
+# ENTER NEEDS AN EQUALITY, NOT A SHAPE"):
+#   1. pane-state positively reads `state=user-typing input=typed`, and
+#   2. the input box's content IS the brief that was pasted (`pd_box_is_ours`).
+# (1) alone is a shape every typed draft has. Everything else — idle, `input=?`,
+# no `input=` field, an unreadable pane, a missing primitive, a box holding
+# somebody else's text or paste — is rc 1: NO Enter.
+# Sets _RESPAWN_BOX_WHY for the log line.
+_respawn_box_is_brief() {
+    local target="$1" bin="$2" file="${3:-}" mode="${4:-first}" raw st inp
+    _RESPAWN_BOX_WHY=""
+    raw=$(_respawn_probe_raw "$target" "$bin" 2>/dev/null || true)
+    # FIELD-EXACT, never a greedy `s/.*state=…`: that binds to the LAST `state=`
+    # on the line, so a trailing `refined_state=…` would answer for `state`
+    # (#1295 review; the same reader as monitor/_paste-deliver.sh:_pd_field).
+    st=$(_respawn_field "$raw" state); inp=$(_respawn_field "$raw" input)
+
+    # ORDER IS THE DESIGN. The state token gates FIRST and the equality decides
+    # INSIDE it — the same shape `pd_submit` uses, deliberately, because a
+    # respawn-path predicate that is MORE PERMISSIVE than the shared primitive
+    # would be a divergence with no measurement behind it. The first cut of this
+    # function put the CONTENT check first, so it outranked the state entirely;
+    # measured, that pressed SIX Enters in four arms whose pane positively
+    # reports nothing typed (test-respawn.sh A4, A6, A7, 3b).
+    #
+    # 1. An overlay is up. An Enter SELECTS ITS HIGHLIGHTED DEFAULT (#1200).
+    if [[ "$st" == blocked ]]; then
+        _RESPAWN_BOX_WHY="state=blocked: an overlay is up and an Enter would answer IT, not submit the brief"
+        return 1
+    fi
+
+    # 2. INDETERMINATE — `empty` means "DON'T KNOW YET", never "nothing is
+    #    there" (CLAUDE.md, #603), and an unreadable pane is not evidence
+    #    either. This is the ONLY arm added to the primitive's contract, and it
+    #    exists because refusing here is itself a failure mode: the orchestrator
+    #    is the thing being respawned, so nothing supervises the retry, and the
+    #    caller stamps its cooldown on rc 4 as well as rc 0
+    #    (spawn-fresh-orchestrator.sh, deliberately — it stops the caller looping
+    #    every poll), which throttles the re-arm. Treating `empty` as a negative
+    #    turns a DROPPED Enter into a silent, un-retried failure: window up,
+    #    claude running, brief never delivered — the manufactured-success family.
+    #    Measured by test-spawn-fresh-orchestrator.sh Test 7, a suite that
+    #    declares no population and is therefore invisible to `guards-for-diff`
+    #    (skeptic pastefusk round 1, F1).
+    #
+    #    `empty` IS DISTINCT FROM `idle`, and that distinction is what makes this
+    #    arm safe rather than a widening. Test 7's pane reports `empty` (the
+    #    classifier could not tell); test-respawn.sh's R96-draft.late reports
+    #    `idle` (a POSITIVE reading) for 1.6 s before a draft is typed. A single
+    #    reading separates them, so this arm does not reach the draft case and
+    #    R96-draft.late keeps its 1 Enter. The skeptic predicted these two could
+    #    not be separated at one instant and that R96-draft.late would have to
+    #    flip to 2; measured, the tokens differ and it does not.
+    #
+    #    ACCEPTED RESIDUAL, stated rather than hidden: with the classifier blind,
+    #    an operator draft typed into the freshly respawned window inside the
+    #    verify budget would be submitted by this ONE Enter. That was the base
+    #    behaviour for EVERY state; here it is narrowed to "nothing is known",
+    #    and STRICT mode (the loop) refuses it outright.
+    if [[ -z "$st" || "$st" == empty || "$st" == unknown ]]; then
+        if [[ "$mode" == strict ]]; then
+            _RESPAWN_BOX_WHY="state='${st:-<unreadable>}' is INDETERMINATE — one Enter was already spent on that reading; a LOOP needs the positive equality"
+            return 1
+        fi
+        _RESPAWN_BOX_WHY="state='${st:-<unreadable>}' is INDETERMINATE (not 'the box is clear') — pressing ONE Enter, the pre-#1596 behaviour narrowed to no-evidence"
+        return 0
+    fi
+
+    # 3. Typed text is POSITIVELY in the box. Now the equality decides, and this
+    #    is the #1596 hazard in full: an Enter on the SHAPE alone submits an
+    #    operator's draft. `input=?` is undecidable from bytes and is READ AS A
+    #    DRAFT (#626), so it never reaches the equality.
+    if [[ "$st" == user-typing && "$inp" == typed ]]; then
+        if declare -F pd_box_is_ours >/dev/null 2>&1 && pd_box_is_ours ":=${target}" "$file"; then
+            return 0
+        fi
+        _RESPAWN_BOX_WHY="typed text is in the input box and is not shown to be the brief — it may be an operator draft"
+        return 1
+    fi
+
+    # 4. Everything else POSITIVELY says there is nothing of ours to submit:
+    #    `idle` with a blank box, a ghost, `input=?`, `busy` (a turn is already
+    #    running), or `user-typing` with no `input=` field at all.
+    _RESPAWN_BOX_WHY="state='${st:-unknown}' input='${inp:-<absent>}': nothing of ours is positively in the input box"
+    return 1
 }
 
 # _respawn_orchestrator <target> [--no-continue] [--resume-sid SID]
@@ -1443,6 +1595,52 @@ _respawn_orchestrator() {
         return 4
     fi
 
+    # THE #562 PASTE LOCK, HELD FROM HERE TO THE END OF THE VERIFY
+    # (your-org/nexus-code#1539). main.sh's paste_to_target serialises every
+    # watcher paste into a window on a per-target flock, because two pasters
+    # interleave their bytes (#562). This path was never enrolled, and it is the
+    # one that runs while the pane is least able to take a paste. Measured
+    # 2026-09-16 04:30-04:32 (watcher.log + the orchestrator transcript): the
+    # async respawn's readiness probe timed out at 04:31:02 and it pasted the
+    # brief; compose_emit, which found the new window present, pasted emit ba538f
+    # into the same booting pane at 04:31:03 and re-pasted it 0.5 s later; the
+    # second copy landed at the cursor INSIDE the first (`… ba538` + a whole
+    # ba538f + `f ---`), nothing was submitted, and the next emit's Enter at
+    # 04:32:37 delivered the splice. The brief itself never reached the
+    # transcript: this function's rc 4 was TRUE.
+    #
+    # Held across the readiness wait as well as the paste: an emit pasted into a
+    # still-booting pane is the defect, not only one racing our own bytes. An
+    # emit that meets the lock waits MONITOR_PASTE_LOCK_TIMEOUT_SECONDS, then
+    # takes paste_to_target's LOGGED rc 3 (retried once, then counted and alerted
+    # by _emit_delivery_fail; the body is archived and re-composes). A deferred
+    # emit is recoverable; a spliced one is not.
+    #
+    # Taken AFTER the window is spawned, never before: a lock fd open at
+    # `new-window` time would be inherited by claude and held for its lifetime.
+    # Same file, same expression as paste_to_target — a different path would
+    # be a lock nobody else takes. Not acquired within the timeout: the brief
+    # is pasted WITHOUT it and that is logged — the pre-#1539 behaviour, and
+    # losing the brief to a stuck paster is the worse direction.
+    local _rpl_fd=""
+    if command -v flock >/dev/null 2>&1; then
+        local _rpl_file
+        _rpl_file=$(_respawn_paste_lock_path "$target")
+        mkdir -p "${_rpl_file%/*}" 2>/dev/null || true
+        if { exec {_rpl_fd}>"$_rpl_file"; } 2>/dev/null; then
+            local _rpl_to="${MONITOR_PASTE_LOCK_TIMEOUT_SECONDS:-20}"
+            [[ "$_rpl_to" =~ ^[0-9]+$ ]] || _rpl_to=20
+            if ! flock -w "$_rpl_to" "$_rpl_fd" 2>/dev/null; then
+                exec {_rpl_fd}>&-
+                _rpl_fd=""
+                "$log_fn" "paste lock for '${target}' NOT acquired within ${_rpl_to}s (a concurrent paster holds it); pasting the brief WITHOUT it — an emit may interleave with it (your-org/nexus-code#1539, #562)"
+            fi
+        else
+            _rpl_fd=""
+            "$log_fn" "paste lock file for '${target}' could not be opened (${_rpl_file}); pasting the brief WITHOUT it (your-org/nexus-code#1539, #562)"
+        fi
+    fi
+
     local pane_state_bin="${PANE_STATE_BIN:-$NEXUS_ROOT/monitor/pane-state.sh}"
     local readiness_budget="${FRESH_SPAWN_READINESS_BUDGET_SECONDS:-30}"
     local readiness_poll="${FRESH_SPAWN_READINESS_POLL_SECONDS:-1}"
@@ -1464,6 +1662,7 @@ _respawn_orchestrator() {
     fi
 
     local paste_rc=0
+    local _RESPAWN_KEEP_PASTED=1 _RESPAWN_PASTED_FILE="" _RESPAWN_PASTED_IS_TEMP=0 _RESPAWN_BOX_WHY=""
     _respawn_paste_prompt_file "$target" "$prompt_file" || paste_rc=1
 
     # Post-paste verify: state=busy confirms the Enter submitted. If not
@@ -1486,16 +1685,36 @@ _respawn_orchestrator() {
     # and gives no upper bound, because nobody pressed Enter in between. 0
     # disables the typed-retry.
     #
-    # RESIDUAL: `input=typed` cannot tell the brief from an operator typing into
-    # the freshly respawned window within that minute; an Enter then submits
-    # both. Stated, not solved.
+    # EVERY RETRY ENTER HERE IS AN EQUALITY (your-org/nexus-code#1596). This stage
+    # used to press Enter on a SHAPE, twice over: its first retry was
+    # unconditional, and the typed-retry keyed on `input=typed` alone — which any
+    # typed text has. The residual was written down here ("cannot tell the brief
+    # from an operator typing into the freshly respawned window; an Enter then
+    # submits both. Stated, not solved"), and PR #1595 then MEASURED that shape
+    # going wrong in the shared primitive: a draft appearing 0.3 s after our
+    # submit was SUBMITTED by the retry. Here it matters more, not less: the
+    # orchestrator is the thing being respawned, so nothing supervises this
+    # Enter, and a lost brief is recoverable (rc 4 re-arms) while a submitted
+    # draft is not. So BOTH retries go through `_respawn_box_is_brief`:
+    # `user-typing input=typed` AND `pd_box_is_ours` against the normalised bytes
+    # that were pasted. An idle pane, an unreadable one, `input=?`, a draft, an
+    # operator's paste: no Enter, and the refusal is logged with its reason.
+    # The long budget is untouched: a held brief still gets an Enter every
+    # interval for as long as the box IS the brief.
+    #
+    # ACCEPTED RESIDUAL, inherited from pd_box_is_ours and stated there: an
+    # operator draft that is itself an 8+ character prefix of the brief's first
+    # line, or an operator paste with exactly the brief's line-break count.
     if (( paste_rc == 0 )) && [[ -x "$pane_state_bin" ]]; then
         local submit_state
         if submit_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
             "$log_fn" "post-paste verify: state=${submit_state} — turn submitted"
         else
-            "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); retrying Enter once"
-            if tmux send-keys -t "$target" Enter 2>/dev/null; then
+            if ! _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE"; then
+                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); NO retry Enter — ${_RESPAWN_BOX_WHY}; reporting UNDELIVERED (rc 4)"
+                paste_rc=1
+            elif tmux send-keys -t ":=${target}" Enter 2>/dev/null; then
+                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); the brief is IN the input box, unsubmitted; retrying Enter once"
                 local retry_state typed_submitted=0 typed_n=0
                 if ! retry_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
                     local typed_budget="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS:-60}"
@@ -1506,14 +1725,18 @@ _respawn_orchestrator() {
                     local typed_raw typed_input
                     while (( $(date +%s) < typed_deadline )); do
                         typed_raw=$(_respawn_probe_raw "$target" "$pane_state_bin" 2>/dev/null || true)
-                        retry_state=$(sed -n 's/.*state=\([a-z-]*\).*/\1/p' <<<"$typed_raw")
+                        retry_state=$(_respawn_field "$typed_raw" state)
                         [[ "$retry_state" == busy ]] && { typed_submitted=1; break; }
-                        [[ "$retry_state" == user-typing ]] || break
-                        typed_input=$(sed -n 's/.*[[:space:]]input=\([a-z?]*\).*/\1/p' <<<"$typed_raw")
-                        [[ "$typed_input" == typed ]] || break
+                        # The EQUALITY, re-established before EVERY Enter: a box
+                        # that was the brief five seconds ago may be a draft now.
+                        if ! _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE" strict; then
+                            "$log_fn" "post-paste verify: typed-retry stopped — ${_RESPAWN_BOX_WHY}"
+                            break
+                        fi
+                        typed_input=typed
                         typed_n=$(( typed_n + 1 ))
                         "$log_fn" "post-paste verify: state=user-typing input=${typed_input:-<absent>} — the brief is IN the input box, unsubmitted; re-sending Enter (typed-retry ${typed_n}, budget ${typed_budget}s)"
-                        tmux send-keys -t "$target" Enter 2>/dev/null || break
+                        tmux send-keys -t ":=${target}" Enter 2>/dev/null || break
                         if retry_state=$(_respawn_wait_for_submit_evidence "$target" "$typed_interval" "$pane_state_bin"); then
                             typed_submitted=1; break
                         fi
@@ -1565,6 +1788,9 @@ _respawn_orchestrator() {
         fi
     fi
 
+    (( _RESPAWN_PASTED_IS_TEMP )) && [[ -n "$_RESPAWN_PASTED_FILE" ]] && rm -f "$_RESPAWN_PASTED_FILE"
+    # Released only once the verify has finished with the box (#1539 above).
+    [[ -n "$_rpl_fd" ]] && exec {_rpl_fd}>&-
     if (( paste_rc != 0 )); then
         return 4
     fi

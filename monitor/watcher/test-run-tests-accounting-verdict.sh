@@ -410,7 +410,7 @@ assert_not_contains "…never as an unverifiable pass" "$OUT" "unverifiable pass
 _ov="$WORK/ceil.tsv"; _slow="$WORK/suite/test-slowish.sh"
 _run_ceil() {  # <override-file> <run-timeout> [jobs]
     OUT=$( cd "$WORK/cwd" && NEXUS_TEST_NPROC_GUARD=off KEEP_LOGS_DIR= \
-             _RT_CEILING_FILE="$1" timeout 120 bash "$RUNNER" --jobs "${3:-1}" \
+             NEXUS_TEST_CEILING_FILE="$1" timeout 120 bash "$RUNNER" --jobs "${3:-1}" \
              --timeout "$2" "$_slow" </dev/null 2>&1 ); RC=$?
 }
 # KEYED ON THE VERDICT ROW, NOT THE WORD. `assert_contains "$OUT" "TIMEOUT"` is

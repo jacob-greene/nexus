@@ -77,6 +77,8 @@
 set -uo pipefail
 _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_self_dir/../_test_helpers.sh"
+# shellcheck source=_renderer_scrape_check.sh
+. "$_self_dir/_renderer_scrape_check.sh"
 . "$_self_dir/../../cc-harness/_lib.sh"
 
 cch_skip_if_disabled
@@ -210,19 +212,23 @@ echo "        pane-state: state=${ps_state:-<none>} reset_at=${ps_reset:-<none>}
 assert_eq "live pane classifies over-limit via the stamp" "over-limit" "$ps_state"
 assert_eq "pane-state carries the reset token"            "$WANT_TOKEN" "$ps_reset"
 
-# Opportunistic renderer-scrape sub-check: when the real TUI painted
-# the failed-turn frame (it renders the API error text, i.e. the
-# notice), _detect_over_limit must classify it WITHOUT the stamp.
-# The render gap makes painting nondeterministic in this sandbox, so
-# a blank frame downgrades to a loud note, never a silent pass.
-pane_text=$(cch_capture "$IDX")
-if grep -q "hit your" <<<"$pane_text"; then
-    ps2_out=$(CCH_PANE_STATE_DIR="$OL_STATE" cch_pane_state "$IDX" \
-        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1)
-    ps2_state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$ps2_out")
-    if [[ "$ps2_state" == "over-limit" ]]; then
-        echo "  PASS: renderer scrape classifies the REAL painted notice (no stamp)"; PASS=$((PASS+1))
-    else
+# The DISCRIMINATING renderer-scrape sub-check: the REAL painted notice must
+# classify over-limit WITHOUT the stamp, which is how production reads it. The
+# render gap makes painting nondeterministic in this sandbox, so the capture is
+# RETRIED for a bounded time — and a frame that never paints is UNMEASURED, a
+# third outcome that cannot finish GREEN (your-org/nexus-code#1530). This block
+# used to end in an `else` that printed a `note:` and carried on: "could not
+# measure" became "measured and fine", in a scenario `cc-harness/gate.sh` reads.
+# The check itself lives in _renderer_scrape_check.sh so its three outcomes are
+# driven without a real binary (test-realmodel-overlimit-unmeasured.sh).
+UNMEASURED=0
+rsc_check "$IDX" "$OL_STATE" "$CCH_DIR/no-such-stamp.json"
+pane_text="$RSC_PANE_TEXT"
+case "$RSC_VERDICT" in
+    pass)
+        echo "  PASS: renderer scrape classifies the REAL painted notice (no stamp; frame painted on capture $RSC_ATTEMPTS_USED)"; PASS=$((PASS+1)) ;;
+    fail)
+        ps2_state="$RSC_STATE"
         echo "  FAIL: real pane paints the notice but renderer scrape says '$ps2_state'" >&2
         FAIL=$((FAIL+1))
         # A renderer-scrape failure is unreadable without the frame it
@@ -247,11 +253,18 @@ if grep -q "hit your" <<<"$pane_text"; then
                      | grep -n 'hit your' | cut -d: -f1 | tr '\n' ' ')"
             echo "  --- bottom 20 rows ---"
             printf '%s\n' "$pane_text" | tail -n 20 | cat -v | sed 's/^/  | /'
-        } >&2
-    fi
-else
-    echo "  note: TUI frame blank (known render gap) — renderer-scrape sub-check not exercisable this run; fixture coverage in test-pane-state.sh"
-fi
+        } >&2 ;;
+    *)
+        UNMEASURED=1
+        {
+            echo "  UNMEASURED: the TUI frame stayed BLANK across $RSC_ATTEMPTS_USED captures (known render gap) — the"
+            echo "              renderer-scrape sub-check DID NOT RUN. This is not a pass: the surface this"
+            echo "              scenario exists to measure (what production reads WITHOUT a stamp) was not"
+            echo "              exercised. The scenario will exit 69 (ENVSKIP) unless something else FAILED;"
+            echo "              cc-harness/gate.sh counts that as RED. Fixture coverage of the scrape is in"
+            echo "              test-pane-state.sh — against a CAPTURED frame, never this binary's."
+        } >&2 ;;
+esac
 
 # ---- phase C: the watcher's HOLD — gate closes on the detected status ------
 # Source the production _over_limit.sh at its unit seam: record what the
@@ -358,4 +371,14 @@ for want in "WHAT HAPPENED" "STATE NOW" "LOG OF THE OFF-TIME" "over-limit-held.l
 done
 
 cch_teardown
+# AN UNMEASURED DISCRIMINATING SUB-CHECK CANNOT FINISH GREEN (#1530). A FAIL
+# outranks it — `th_summary_and_exit` reports that red as it always has. Only a
+# run with no failure and a sub-check that never ran leaves by 69, with the ENV
+# line the ENVSKIP contract asks for, so the reader is sent to the MACHINE and
+# not into the renderer.
+if [[ "$(rsc_exit_code "$FAIL" "$UNMEASURED")" == 69 ]]; then
+    printf '=== summary: %d passed, %d failed — and 1 DISCRIMINATING sub-check UNMEASURED ===\n' "$PASS" "$FAIL"
+    echo "ENV: the real TUI never painted the failed-turn frame on this host, so the renderer scrape could not be exercised (your-org/nexus-code#1530). Exit 69 — not a pass, not a product failure." >&2
+    exit 69
+fi
 th_summary_and_exit

@@ -197,6 +197,58 @@ else
     pass "sync-base.sh stages its output (git write-tree records the scrubbed tree, not the source)"
 fi
 
+[[ "$(awk -F= '$1=="build_yes"{print $2}' <<<"$sb_out")" == passed ]] \
+    && pass "a build.sh that carries --yes is handed it (build_yes=passed)" \
+    || fail "current-toolkit fixture did not report build_yes=passed: $(grep build_yes <<<"$sb_out")"
+
+# --- 2b. a base whose build.sh PREDATES --yes (your-org/nexus-code#1556) -----
+#
+# sync-base runs the build.sh AT THE REF, and before #1001 (2026-08-28) that
+# build.sh read its first positional as the mapping path: `--yes` became
+# `mapping not readable: --yes`, exit 2, and sync-base exit 3 for every base
+# older than that — the only base the ledger named. The fixture's build.sh is a
+# STAND-IN with the pre-#1001 surface (positional mapping, no flag parsing,
+# destructive by default); it delegates the scrub to today's build.sh renamed
+# to build-impl.sh, via the env switch, so the probe — which reads build.sh
+# ONLY — sees a file with no `--yes` in it. The coverage boundary this states:
+# the stand-in pins the INTERFACE the old tool had, not its scrub behaviour.
+OLDTK="$WORK/oldtk"
+mkdir -p "$OLDTK/pm"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$OLDTK/pm/"
+cp "$TOOLKIT/build.sh" "$OLDTK/pm/build-impl.sh"
+cat > "$OLDTK/pm/build.sh" <<'OLDBUILD'
+#!/usr/bin/env bash
+# pre-#1001 surface: the first positional IS the mapping path.
+_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MAP="${1:-$_here/mapping.tsv}"
+[ -r "$MAP" ] || { echo "build.sh: mapping not readable: $MAP" >&2; exit 2; }
+NEXUS_MIRROR_BUILD_OK=1 exec bash "$_here/build-impl.sh" "$MAP"
+OLDBUILD
+cat > "$OLDTK/pm/mapping.tsv" <<'MAP'
+map	qzcorp	your-org	<your-org>
+deny	qzcorp
+exclude	pm/mapping.tsv
+MAP
+printf 'owner qzcorp runs the box\n' > "$OLDTK/prose.txt"
+( cd "$OLDTK" && git init -q && git config user.email t@t && git config user.name t \
+    && git add -A && git commit -qm old-toolkit ) >/dev/null 2>&1
+OT=$( cd "$OLDTK" && git rev-parse HEAD )
+ot_out=$( cd "$OLDTK" && bash pm/sync-base.sh "$WORK/ot-out" "$OT" 2>"$WORK/ot.err" ); ot_rc=$?
+if (( ot_rc == 0 )); then
+    pass "a base whose build.sh predates --yes BUILDS (exit 0; was exit 3 'mapping not readable: --yes')"
+else
+    fail "pre---yes build.sh: sync-base exit $ot_rc — $(tr '\n' ' ' < "$WORK/ot.err")"
+fi
+[[ "$(awk -F= '$1=="build_yes"{print $2}' <<<"$ot_out")" == not-supported-at-ref ]] \
+    && pass "…and says it ran that ref's build.sh bare (build_yes=not-supported-at-ref)" \
+    || fail "pre---yes build.sh: build_yes line: $(grep build_yes <<<"$ot_out")"
+if [[ -f "$WORK/ot-out/prose.txt" ]] && ! grep -q qzcorp "$WORK/ot-out/prose.txt" \
+   && [[ "$(awk -F= '$1=="gate"{print $2}' <<<"$ot_out")" == clean ]]; then
+    pass "…and the base it built is SCRUBBED and gate-clean, not a raw clone"
+else
+    fail "pre---yes base not scrubbed/gated: $(cat "$WORK/ot-out/prose.txt" 2>/dev/null) / $(grep gate <<<"$ot_out")"
+fi
+
 # --- 3. refusals ------------------------------------------------------------
 #
 # Each refusal is asserted on its EXIT CODE, not on a message: a script that
@@ -254,7 +306,7 @@ else
 fi
 
 # --- assertion-count guard ---------------------------------------------------
-EXPECTED_ASSERTIONS=16
+EXPECTED_ASSERTIONS=20   # +4: your-org/nexus-code#1556 (§2 build_yes=passed; §2b three pre---yes assertions)
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} + ${SKIP:-0} + 1 ))
 if (( TOTAL_ASSERTIONS == EXPECTED_ASSERTIONS )); then
     pass "assertion total is exactly $EXPECTED_ASSERTIONS"

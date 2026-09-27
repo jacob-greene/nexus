@@ -201,7 +201,16 @@ gp_repo_root() {
 # containing a glob character must not be expanded, and setting `set -f` to
 # prevent that is exactly the shell-option leak this file's header forbids
 # (#721's class).
+# `_gp_canon_var` / `_gp_relpath_var` set `_GP_CANON` / `_GP_REL` instead of
+# printing: gp_render calls them once per population ROW, and three `$(…)` per
+# row were three forks per row, ~2,100 per probe over a ~700-row population —
+# most of every probe's cost, and `ng guards-for-diff` runs ~97 probes a call
+# (bundle-0923). `gp_canon` / `gp_relpath` are the printing wrappers.
 gp_canon() {   # <path> -> the same path, canonically spelled
+    _gp_canon_var "$1"
+    printf '%s' "$_GP_CANON"
+}
+_gp_canon_var() {   # <path> -> sets _GP_CANON
     local p="$1" seg rest lead='' n
     local -a out=()
     [[ "$p" == /* ]] && lead='/'
@@ -228,17 +237,21 @@ gp_canon() {   # <path> -> the same path, canonically spelled
         [[ -n "$rest" ]] || break
     done
     local IFS=/
-    printf '%s%s' "$lead" "${out[*]-}"
+    _GP_CANON="$lead${out[*]-}"
 }
 
 # Normalise one path to repo-relative. An absolute path under the root has the
 # root stripped; anything else is passed through unchanged, so a guard that
 # already emits repo-relative rows needs no adaptation.
 gp_relpath() {   # <root> <path>
+    _gp_relpath_var "$1" "$2"
+    printf '%s' "$_GP_REL"
+}
+_gp_relpath_var() {   # <root> <path> -> sets _GP_REL
     local root="$1" p="$2"
     case "$p" in
-        "$root"/*) printf '%s' "${p#"$root"/}" ;;
-        *)         printf '%s' "$p" ;;
+        "$root"/*) _GP_REL="${p#"$root"/}" ;;
+        *)         _GP_REL="$p" ;;
     esac
 }
 
@@ -700,11 +713,11 @@ ${BASH_SOURCE[0]}"
         # predicate over all of them (your-org/nexus-code#1218). Order matters:
         # `gp_relpath` strips the root by PREFIX match, so an uncanonical
         # absolute row would fail to match the root and pass through absolute.
-        line=$(gp_canon "$line")
-        rel=$(gp_relpath "$root" "$line")
+        _gp_canon_var "$line";           line=$_GP_CANON
+        _gp_relpath_var "$root" "$line"; rel=$_GP_REL
         # And again after relativising: stripping the root can expose a leading
         # `./` or a `..` that was hidden inside the absolute form.
-        rel=$(gp_canon "$rel")
+        _gp_canon_var "$rel";            rel=$_GP_CANON
         # A ROW THAT CANONICALISES TO NOTHING IS NOT A PATH. `.`, `./`, `a/..`
         # and the repo root itself all reduce to the empty string, and an empty
         # row would pass the `-e` check below (`$root/` exists), then sit in the

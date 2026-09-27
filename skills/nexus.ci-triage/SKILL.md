@@ -219,6 +219,40 @@ base first is the DEFAULT move rather than a last resort.
   night (`#829`, "exactly ONE test file, exactly ONE assertion, exactly
   ONE real-tree offender"). Same lint, same trap, twice.
 
+## A LOCAL band is evidence about ONE tree — so run it from a tree you never edit
+
+When CI cannot run, a local `run-tests.sh` band is the only evidence there is,
+and it has a failure mode CI does not: **every suite reads its files from the
+working tree at the moment IT starts.** A band launched from the clone you are
+developing in, while you keep developing, tests commit A for the suites that
+started early, commit B for the ones that started late, and a half-written
+file for whichever began in between (`<your-org>/nexus-code#1586`: a 12:20 band,
+an edit between 12:40 and 12:49, ~85 suites logged inside the window). Its
+failing set reads exactly like a clean tree's. It is evidence for NEITHER.
+
+The recipe, in order — the guards are the `WORKTREE-BLIND-SPOT` ones above,
+applied BEFORE launch rather than after a red:
+
+1. `git -C <clone> worktree add --detach <band-dir> <sha>` — no `-q` (absent at
+   git 2.17.1), and a path unique to you.
+2. `git -C <band-dir> rev-parse HEAD` equals `<sha>`; `git -C <band-dir> status
+   --porcelain --ignored` is EMPTY; `git -C <band-dir> ls-files -- CLAUDE.md`
+   prints it. Any of the three failing means the tree is not the one you think.
+3. Launch the band THERE. Keep editing in the clone. Never touch `<band-dir>`.
+
+`run-tests.sh` now enforces the property rather than trusting the recipe: it
+records HEAD and the CONTENT of every tracked-modified path at the start,
+re-reads them at the end, and exits **5 — NOT A VERDICT**, naming what moved,
+when they differ. 5 outranks 0, 1 and 3 alike: a red from a mixed tree is no
+more a finding than a green from one. An UNTRACKED path that appears or changes
+is reported loudly and does NOT void the verdict (suites plant files while they
+run) — so `git add` a new suite before a band, or an edit to it mid-band is the
+one mixed-tree case this check errs toward missing.
+
+The same hazard exists at every smaller scale. A single suite whose source is
+rewritten while it runs fails with a parse error that is not in the file:
+`bash` reads a script incrementally, so an edit shifts the bytes under it.
+
 ## Reading a job log
 
 Read it with `gh api repos/O/R/actions/jobs/<id>/logs`, never

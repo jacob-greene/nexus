@@ -159,6 +159,7 @@ cleanup() {
     # name/index collision needs a session the collision is NOT in.
     env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-1318-name >/dev/null 2>&1 || true
     env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-1318-clean >/dev/null 2>&1 || true
+    env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-1524 >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -620,8 +621,20 @@ resolve_window_id|monitor/_tmux-window.sh|3state
 resolve_window_index|monitor/_tmux-window.sh|3state
 resolve_window_key|monitor/_tmux-window.sh|3state
 _tmux_selection_rows|monitor/_tmux-window.sh|not-a-resolver
+cmd_retire_watchdog|monitor/cc-auto-update-apply.sh|3state
 EOF
 )
+# `cmd_retire_watchdog` (your-org/nexus-code#1627) asks one question of the
+# board — is the restart watchdog still window <@id>? — and has THREE arms: a
+# failed or EMPTY `list-windows` is could-not-look (it concludes nothing and
+# polls again), a non-empty listing without the name is absent (it stands
+# down), and present-as-another-@id is a refusal. It does not call
+# `resolve_window_id` because that reads the PATH `tmux` and the current
+# session only, while this verb must read the board through the same
+# CC_AUTO_TMUX seam as the rest of cc-auto-update-apply.sh: the alternative, a
+# PATH-front tmux shim in the suite, is exactly what #1105's BASH_ENV
+# force-front defeats. It acts only through `ng retire-window`, whose own
+# preflight re-resolves by @id.
 # `_tmux_selection_rows` (your-org/nexus-code#1528) enumerates the whole
 # `session|window|name|active` table for the selection capture/restore across
 # an orchestrator restart; it answers about no NAME. Its two arms are rows
@@ -1308,11 +1321,49 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
+# ---- Part K: your-org/nexus-code#1524 ROW A — the worker is gone, its skeptic is not
+#
+# tmux resolves the window part of `-t <name>` as id -> index -> exact name ->
+# UNIQUE PREFIX, so with `zz1524w` closed and `zz1524w-sk` alive a bare-name
+# kill or paste lands on the skeptic at rc 0. The resolver is the mechanism that
+# prevents it: it matches names by EQUALITY over the window table, so it must
+# answer "LOOKED, AND ABSENT" (rc 1, nothing on stdout) — a caller that acts on
+# the handle it was given then has NO handle, and targets nothing.
+#
+# PREDICTED FLIP for "make the resolver ask tmux (`display-message -t <name>`)
+# instead of walking the table": K2/K3 go red (rc 0, the SIBLING's id). K1 (the
+# premise) and K6 (the control) do not move.
+srv tmux new-session -d -s zz-1524 -n zz-1524-filler 2>/dev/null \
+    || { echo "SETUP FAILED: could not create the Part K fixture session" >&2; exit 1; }
+srv tmux new-window -d -t 'zz-1524:' -n zz1524w-sk >/dev/null 2>&1
+srv tmux set-window-option -t 'zz-1524:zz1524w-sk' automatic-rename off >/dev/null 2>&1 || true
+assert_eq "K1 PREMISE (measured here, not assumed): bare tmux resolves 'zz-1524:zz1524w' to the SIBLING" \
+    "$(srv tmux display-message -p -t 'zz-1524:zz1524w' '#{window_name}' 2>/dev/null)" zz1524w-sk
+r=$(run3 srv bash "$HELPER" id zz1524w)
+assert_eq "K2 resolve_window_id on the ABSENT name is rc 1 (LOOKED, AND ABSENT) — never the prefix sibling" "$(f_rc "$r")" 1
+assert_eq "K2 …and hands back NO handle, so an id-targeted kill or paste has nothing to land on" "$(f_out "$r")" ""
+r=$(run3 srv bash "$HELPER" index zz1524w)
+assert_eq "K3 resolve_window_index likewise: rc 1" "$(f_rc "$r")" 1
+r=$(run3 srv tmux kill-window -t 'zz-1524:=zz1524w')
+assert_eq "K4 the exact form ':=<name>' on the absent name is REFUSED by tmux itself (rc 1)" "$(f_rc "$r")" 1
+assert_eq "K4 …and the sibling is STILL THERE" \
+    "$(srv tmux list-windows -t 'zz-1524:' -F '#{window_name}' 2>/dev/null | grep -cx 'zz1524w-sk')" 1
+# POSITIVE CONTROL: with the exact window present the same path ACTS, on it alone.
+srv tmux new-window -d -t 'zz-1524:' -n zz1524w >/dev/null 2>&1
+srv tmux set-window-option -t 'zz-1524:=zz1524w' automatic-rename off >/dev/null 2>&1 || true
+r=$(run3 srv bash "$HELPER" id zz1524w)
+assert_eq "K6 CONTROL: with 'zz1524w' present the resolver answers rc 0" "$(f_rc "$r")" 0
+_kid=$(f_out "$r"); [[ "$_kid" == @* ]] && srv tmux kill-window -t "$_kid" >/dev/null 2>&1
+_knames=$(srv tmux list-windows -t 'zz-1524:' -F '#{window_name}' 2>/dev/null)
+assert_eq "K6 CONTROL: …and a kill by THAT id removes exactly 'zz1524w', leaving 'zz1524w-sk'" \
+    "w=$(grep -cx 'zz1524w' <<<"$_knames") sk=$(grep -cx 'zz1524w-sk' <<<"$_knames")" "w=0 sk=1"
+srv tmux kill-session -t zz-1524 >/dev/null 2>&1 || true
+
 # ---- summary ------------------------------------------------------------
 #
 # Expected-count guard: an assert_* that never runs reports 0 failures and
 # reads as a pass — the defect class this whole suite is about.
-EXPECTED=103  # 78 + Part I x15 (#944) + Part J x10 (#1318: the collision check spans sessions)
+EXPECTED=111  # 78 + Part I x15 (#944) + Part J x10 (#1318: the collision check spans sessions) + Part K x8 (#1524 row A)
 echo
 echo "=== summary: $PASS passed, $FAIL failed ($(( PASS + FAIL )) assertions; expected $EXPECTED) ==="
 if (( PASS + FAIL != EXPECTED )); then

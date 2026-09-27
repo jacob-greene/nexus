@@ -15,7 +15,7 @@ Every `monitor.interval_seconds` (default 60) the watcher snapshots:
 On every observed change the watcher does four things, in order:
 
 1. Archives the report under `monitor/.state/diffs/<ts>_<shortid>.md` so nothing is lost if a paste fails.
-2. Pastes the report into the target tmux window (default `orchestrator`) via `tmux set-buffer` + `tmux paste-buffer` + `Enter`.
+2. Pastes the report into the target tmux window (default `orchestrator`) through the confirmed-delivery primitive `monitor/_paste-deliver.sh`: the body is normalised, loaded from a FILE (`tmux load-buffer`, never an argv element), pasted bracketed, submitted with `Enter`, and then CONFIRMED against the target's transcript. If the pane instead positively reads "the text is still in the input box" (`state=user-typing input=typed` — Claude Code >= 2.1.277 holds a prompt carrying an invisible character for review), `Enter` is pressed again, a bounded number of times, and never into an overlay. A paste that stays unsubmitted is reported as such (rc 6) and is NOT re-pasted (`<your-org>/nexus-code#1591`).
 3. Logs an append-only line to `monitor/.state/watcher.log`, and stamps `monitor/.state/watcher-cycle` — the "a full compose cycle completed" proof (see [Heartbeat and liveness](#heartbeat-and-liveness)).
 4. Handles ancillary work — auto-unstick, GraphQL-backoff bookkeeping, deliveries-log consumption.
 

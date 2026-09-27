@@ -39,6 +39,15 @@
 # resolve on its own. `squeue` is consulted as a second source before saying
 # unknown, because a queued job is visible there before accounting has it.
 
+# AN ARRAY (or het job) IS A SET, NOT A ROW (your-org/nexus-code#1629). For an
+# array id `sacct -X` prints ONE ROW PER TASK (plus a collapsed row for tasks
+# still pending); this probe used to keep the FIRST line only, so the first
+# task's COMPLETED emitted DONE while its siblings ran, and after two of them
+# had FAILED. Every row is classified now: any pending/running row -> the set is
+# not terminal; all terminal and ANY failed (or unrecognised) -> failed; all
+# COMPLETED -> done. A single-row job prints exactly what it printed before.
+# Classified inline (no `$(…)` per row): an array can have thousands of tasks.
+
 lj_probe_main() {
     local target="$1"
     [[ "$target" =~ ^[0-9][0-9_.+]*$ ]] || { printf 'unknown|not a Slurm job id: %s' "$target"; return 0; }
@@ -48,6 +57,7 @@ lj_probe_main() {
     if (( rc != 0 )); then
         printf 'unknown|sacct rc=%s' "$rc"; return 0
     fi
+    local rows="$out"
     out="${out%%$'\n'*}"
     if [[ -z "$out" ]]; then
         local sq
@@ -62,6 +72,32 @@ lj_probe_main() {
             fi
         fi
         printf 'unknown|no accounting row for job %s (submission failed, accounting lag, or not this cluster)' "$target"
+        return 0
+    fi
+    if [[ "$rows" == *$'\n'* ]]; then
+        local line c n=0 np=0 nr=0 nd=0 nf=0 first_bad=''
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            n=$((n + 1))
+            c="${line%%|*}"
+            case "${c%% *}" in
+                PENDING|CONFIGURING|REQUEUED|RESV_DEL_HOLD) np=$((np + 1)) ;;
+                RUNNING|COMPLETING|SUSPENDED|SIGNALING|STAGE_OUT|RESIZING) nr=$((nr + 1)) ;;
+                COMPLETED) nd=$((nd + 1)) ;;
+                *)  # the known failure states AND the unrecognised default arm
+                    nf=$((nf + 1)); [[ -n "$first_bad" ]] || first_bad="$c exit=${line#*|}" ;;
+            esac
+        done <<< "$rows"
+        local tally="array/het set of $n rows: $nd completed, $nf failed, $nr running, $np pending"
+        if (( nr > 0 )); then
+            printf 'running|%s%s' "$tally" "${first_bad:+ (first failure so far: $first_bad)}"
+        elif (( np > 0 )); then
+            printf 'pending|%s%s' "$tally" "${first_bad:+ (first failure so far: $first_bad)}"
+        elif (( nf > 0 )); then
+            printf 'failed|%s; first failure: %s' "$tally" "$first_bad"
+        else
+            printf 'done|COMPLETED %s' "$tally"
+        fi
         return 0
     fi
     state="${out%%|*}"; exit_code="${out#*|}"

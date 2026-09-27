@@ -376,8 +376,8 @@ assert_contains "tmux set-window-option remain-on-exit on" "$tmux_log" \
 assert_contains "tmux load-buffer received the report file" "$tmux_log" \
                 "tmux load-buffer -b nexus-respawn"
 assert_contains "tmux paste-buffer targeted the new window" "$tmux_log" \
-                "paste-buffer -p -b nexus-respawn"
-assert_contains "tmux send-keys submitted with Enter"  "$tmux_log" "send-keys -t orchestrator Enter"
+                "paste-buffer -p -d -b nexus-respawn"
+assert_contains "tmux send-keys submitted with Enter"  "$tmux_log" "send-keys -t :=orchestrator Enter"
 
 # Pane-state probe was actually used to gate the paste.
 pane_state_log=$(cat "$PANE_STATE_LOG")
@@ -678,7 +678,7 @@ assert_eq "exit 0 when Enter-retry succeeds" "$rc" "0"
 tmux_log=$(cat "$TMUX_LOG")
 # Count Enter invocations: the paste path always sends one Enter; the
 # retry path sends a second. Two is the expected total.
-enter_count=$(grep -c "send-keys -t orchestrator Enter" <<<"$tmux_log" || true)
+enter_count=$(grep -c "send-keys -t :=orchestrator Enter" <<<"$tmux_log" || true)
 if (( enter_count == 2 )); then
     pass "send-keys Enter invoked exactly 2x (initial + 1 retry)"
 else
@@ -728,7 +728,7 @@ assert_eq "exit 0 when blocked-overlay is dismissed within budget" "$rc" "0"
 
 tmux_log=$(cat "$TMUX_LOG")
 # Two Escapes during the readiness wait (one per blocked observation).
-escape_count=$(grep -c "send-keys -t orchestrator Escape" <<<"$tmux_log" || true)
+escape_count=$(grep -c "send-keys -t :=orchestrator Escape" <<<"$tmux_log" || true)
 if (( escape_count == 2 )); then
     pass "send-keys Escape invoked exactly 2x (one per blocked observation)"
 else
@@ -740,7 +740,7 @@ assert_contains "logfile records the dismiss attempts" \
 assert_contains "paste still proceeded after dismissal" \
                 "$tmux_log" "load-buffer -b nexus-respawn"
 assert_contains "Enter still sent after dismissal" \
-                "$tmux_log" "send-keys -t orchestrator Enter"
+                "$tmux_log" "send-keys -t :=orchestrator Enter"
 
 # Test 8b: a runaway dialog that regenerates each cycle should NOT
 # turn the readiness wait into an Escape spammer beyond
@@ -778,7 +778,7 @@ rm -f "$WORK/pane-state-by-enters"
 assert_eq "exit 0 even when readiness budget elapses on persistent blocked" "$rc" "0"
 
 tmux_log=$(cat "$TMUX_LOG")
-escape_count=$(grep -c "send-keys -t orchestrator Escape" <<<"$tmux_log" || true)
+escape_count=$(grep -c "send-keys -t :=orchestrator Escape" <<<"$tmux_log" || true)
 if (( escape_count <= 3 )); then
     pass "Escape attempts capped at MAX_DISMISS_ATTEMPTS=3 (saw ${escape_count})"
 else

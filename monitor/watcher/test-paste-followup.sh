@@ -9,7 +9,7 @@
 # point NEXUS_STATE_DIR at a temp dir so the machine-input stamp and
 # the ng action-log land in the sandbox. Covers:
 #   - happy path: stamp row written, VI-safe tmux sequence (insert
-#     guard → set-buffer → paste-buffer → Enter), action-log event
+#     guard → load-buffer → paste-buffer → Enter), action-log event
 #   - --no-enter skips the submit key
 #   - missing window / empty message / unreadable file fail loudly
 #     with NO stamp and NO paste
@@ -95,6 +95,10 @@ cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
 cmd="${1:-}"
 if [[ "$cmd" == "list-windows" ]]; then
+    # list-windows is answered and NOT appended to $ACTIONS (every assertion on
+    # that file predates this line and counts paste actions). Its argv goes to a
+    # file of its own, so "WHICH SESSION was asked" is observable (#1321).
+    [[ -n "${ACTIONS:-}" ]] && printf '%s\n' "$*" >> "$ACTIONS.list-windows"
     # Three callers: a bare existence check queries `-F
     # '#{window_name}'`; resolve_window_id queries
     # `#{window_id}<delim>#{window_name}` (#323); resolve_window_key /
@@ -140,10 +144,40 @@ fi
 # TUI-submission line in the session transcript (#507). MOCK_NO_SUBMIT=1
 # swallows it — an Enter tmux accepted that never became a submit, which
 # is precisely the defect the confirmation exists to catch.
+# THE RECORD CARRIES WHAT WAS PASTED (your-org/nexus-code#1591, skeptic pastesk
+# F1): delivery evidence is content-matched now — a transcript record counts
+# only if it CONTAINS a needle from this paste — so a stand-in for Claude Code
+# has to record the payload it was handed, as the real one does, and not a fixed
+# string. The payload arrives as a FILE (`load-buffer -b <buf> <file>`, #1590).
+if [[ "$cmd" == "load-buffer" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
+    cat -- "${!#}" > "${MOCK_TRANSCRIPT}.payload" 2>/dev/null
+    rm -f "${MOCK_TRANSCRIPT}.submitted"   # a NEW paste: the box is occupied again
+fi
+# WHAT A HELD PASTE LOOKS LIKE (your-org/nexus-code#1591; the orchestrator's
+# direction after skeptic pastesk's A4). A retry Enter is no longer BLIND: it
+# needs the pane to read `user-typing input=typed` AND the box's first row to BE
+# this payload. So a stand-in for a pane that swallowed the Enter has to show
+# what the real one shows — the payload, sitting in the box.
+if [[ "$cmd" == "capture-pane" && -n "${MOCK_TRANSCRIPT:-}" \
+      && -s "${MOCK_TRANSCRIPT}.payload" && ! -e "${MOCK_TRANSCRIPT}.submitted" ]]; then
+    IFS= read -r _first < "${MOCK_TRANSCRIPT}.payload" || true
+    printf '\342\235\257\302\240%s\n' "$_first"
+fi
 if [[ "$cmd" == "send-keys" && "${!#}" == "Enter" \
       && "${MOCK_NO_SUBMIT:-0}" != "1" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
-    printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"the follow-up"}}\n' \
-        >> "$MOCK_TRANSCRIPT"
+    if [[ -s "${MOCK_TRANSCRIPT}.payload" ]]; then
+        # JSON-escaped in PURE BASH, never `jq`: test-tmux-shim-gate3-safety.sh
+        # default-denies any external in a planted tmux stub that it cannot prove
+        # never reaches a real tmux, and it is right to (#1105).
+        _p=$(cat -- "${MOCK_TRANSCRIPT}.payload"; printf x); _p=${_p%x}
+        _p=${_p//\\/\\\\}; _p=${_p//\"/\\\"}; _p=${_p//$'\n'/\\n}; _p=${_p//$'\t'/\\t}; _p=${_p//$'\r'/\\r}
+        printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"%s"}}\n' "$_p" \
+            >> "$MOCK_TRANSCRIPT"
+        : > "${MOCK_TRANSCRIPT}.submitted"
+    else
+        printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the follow-up"}}\n' \
+            >> "$MOCK_TRANSCRIPT"
+    fi
 fi
 exit 0
 STUB
@@ -175,8 +209,25 @@ helper_env() {
         "NEXUS_CC_HOME=$CC_HOME" \
         "PASTE_CONFIRM_TIMEOUT_SECONDS=2" \
         "PASTE_CONFIRM_POLL_SECONDS=0.05" \
+        "PD_HELD_CHECK_SECONDS=0.2" \
         "BASH_ENV="
 }
+# The pane reader for the rows that do not supply their own: `held` while a
+# payload sits unsubmitted, idle otherwise (so the pre-paste overlay guard,
+# which runs before any payload exists, reads a clear pane).
+cat > "$STUB_DIR/pane-state-held" <<'PSH'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_TRANSCRIPT:-}" && -s "${MOCK_TRANSCRIPT}.payload" && ! -e "${MOCK_TRANSCRIPT}.submitted" ]]; then
+    echo "state=user-typing active=0 input=typed"
+else
+    echo "state=idle active=0 input=blank"
+fi
+PSH
+chmod +x "$STUB_DIR/pane-state-held"
+# EXPORTED as the default, deliberately NOT placed in helper_env: the overlay-guard
+# rows below name their own reader with a command-prefix assignment, and an
+# `env NAME=…` argument after it would silently override theirs.
+export NEXUS_PASTE_PANE_STATE_BIN="$STUB_DIR/pane-state-held"
 
 # ── THE FIXTURE'S PATH ISOLATION, MADE REAL (your-org/nexus-code#1120, #1188)
 #
@@ -264,7 +315,8 @@ assert_contains "stamp src is paste-followup" \
 seq=$(cat "$ACTIONS")
 # Targeting is by the resolved @id (#323), not the dotted-safe name.
 assert_contains "insert-mode guard sent"  "$seq" 'send-keys -t @3 i BSpace'
-assert_contains "buffer loaded"           "$seq" 'set-buffer -b'
+assert_contains "buffer loaded FROM A FILE (#1590)" "$seq" 'load-buffer -b'
+assert_not_contains "payload is never an argv element (#1590)" "$seq" 'set-buffer'
 assert_contains "buffer pasted to window" "$seq" '-t @3'
 assert_contains "Enter submits"           "$seq" 'send-keys -t @3 Enter'
 # Order: the stamp must precede any tmux action is enforced by code
@@ -476,6 +528,47 @@ chmod +x "$_ovl_greedy2"
 NEXUS_PASTE_PANE_STATE_BIN="$_ovl_greedy2" \
     run_helper demo-rerun-lead --message 'blocked pane, decoy field'
 assert_eq "#1200 …and a trailing *_state=idle does NOT suppress it" "$(( HELPER_RC != 0 ))" "1"
+
+# your-org/nexus-code#1321 (completing #944): THE SESSION A KEY NAMES MUST REACH
+# BOTH of its consumers. `resolve_window_key` publishes the session in a shell
+# variable; this script calls it inside `$( )`, so the variable died in the
+# subshell and `_PF_SESSION` was always empty. Two observable consequences, one
+# assertion each — and a control, because a stub that logs nothing would satisfy
+# "no session-blind lookup" vacuously.
+_ovl_echo="$STUB_DIR/ps-echo-key"
+cat > "$_ovl_echo" <<PSSTUB
+#!/usr/bin/env bash
+printf '%s\n' "\$1" > "$WORK/ovl-key-seen"
+printf 'state=idle active=0 window=9 name=x input=blank content_hash=1\n'
+PSSTUB
+chmod +x "$_ovl_echo"
+# `run_helper` seeds the confirmation heartbeat under its FIRST ARGUMENT, and the
+# script looks it up by the RESOLVED NAME — so a session:name key is seeded by
+# its bare name here, or the run ends rc 3 "unverifiable" for a reason that has
+# nothing to do with the session.
+run_helper_key() {   # <session:name> <args…>
+    local key="$1"; shift
+    RUN_STATE=$(mktemp -d "$WORK/state.XXXXXX")
+    seed_session "${key##*:}"
+    HELPER_OUT=$(env $(helper_env) bash "$SCRIPT" "$key" "$@" 2>&1)
+    HELPER_RC=$?
+}
+: > "$ACTIONS"; rm -f "$ACTIONS.list-windows" "$WORK/ovl-key-seen"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_echo" \
+    run_helper_key sessA:demo-rerun-lead --message 'cross-session follow-up'
+assert_eq       "#1321 a session:name key still delivers" "$HELPER_RC" "0"
+assert_contains "#1321 CONTROL: the stub recorded the list-windows calls at all" \
+    "$(cat "$ACTIONS.list-windows" 2>/dev/null)" "window_id"
+assert_contains "#1321 the @id RE-RESOLUTION is scoped to the session the key named (#944's second half, live)" \
+    "$(grep -F 'window_id' "$ACTIONS.list-windows" 2>/dev/null)" "-t sessA"
+assert_eq       "#1321 the OVERLAY GUARD asks pane-state about session:INDEX — not a bare name, which pane-state resolves in session 0" \
+    "$(cat "$WORK/ovl-key-seen" 2>/dev/null)" "sessA:0"
+# …and a key that names NO session is passed through exactly as before.
+: > "$ACTIONS"; rm -f "$ACTIONS.list-windows" "$WORK/ovl-key-seen"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_echo" \
+    run_helper demo-rerun-lead --message 'same-session follow-up'
+assert_eq "#1321 a bare name reaches pane-state unchanged (production's spelling is untouched)" \
+    "$(cat "$WORK/ovl-key-seen" 2>/dev/null)" "demo-rerun-lead"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

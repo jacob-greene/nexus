@@ -967,6 +967,35 @@ else
     bad "parsable cluster suffix" "got=$(read_waits)"
 fi
 
+# PHANTOM IDS (your-org/nexus-code#1629). The id field was `^([0-9_]+)`,
+# leading digits only, so any other stdout line of the same call that merely
+# BEGAN with digits became a job id: one call armed ten phantom watches,
+# 121..661, beside the real job id (synthetic here: 4200001) (worker-a-sk, 2026-09-23). The field now
+# anchors the whole line, as `--parsable` prints it.
+reset_hb
+fire_hook "jid=\$(sbatch --parsable j.sh); echo \$jid; grep -n x f" $'121:x = 1\n489:  x\n4200001\n542: done'
+got=$(read_waits)
+if jq -e 'map(.id) == ["4200001"]' <<<"$got" >/dev/null; then
+    ok "#1629 line-numbered output beside a parsable id registers ONLY the real id"
+else
+    bad "#1629 phantom ids from line-numbered output" "got=$(jq -c 'map(.id)' <<<"$got")"
+fi
+reset_hb
+fire_hook "sbatch --parsable j.sh" "2307577 jobs queued"
+got=$(read_waits)
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$got" >/dev/null; then
+    ok "#1629 a line that only BEGINS with digits is not a parsable id (syn- fallback)"
+else
+    bad "#1629 digits-then-words line read as an id" "got=$got"
+fi
+reset_hb
+fire_hook "sbatch --parsable j.sh" "2307577  "
+if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2307577" ]]; then
+    ok "#1629 trailing whitespace after a parsable id is still accepted (control)"
+else
+    bad "#1629 trailing whitespace" "got=$(read_waits)"
+fi
+
 # NARROW ON PURPOSE. A general bare-numeric id rule would register stray output
 # as a job id, and a WRONG id is strictly worse than a `syn-` — `sacct` may
 # resolve it to ANOTHER job's COMPLETED and tell the worker its data is good,
@@ -1085,7 +1114,7 @@ got=$(read_waits)
 assert_eq "#1439 CONTROL: no identity in the payload → no launcher field (not an empty string)" \
     "$(jq -r '.[0] | has("launcher")' <<<"$got")" "false"
 
-_EXPECTED_ASSERTIONS=122   # +3: #1439 launcher identity on the row
+_EXPECTED_ASSERTIONS=125   # +3: #1439 launcher identity on the row; +3: #1629 phantom parsable ids
 _ran=$(( PASS + FAIL + 1 ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     ok "every declared assertion executed ($_EXPECTED_ASSERTIONS)"

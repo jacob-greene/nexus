@@ -461,11 +461,38 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # bundle-2609 tree by this suite's own census (this block, run on the merged
 # tree: `11`, `52 15 37 0`): one new announcement, disposed by a counter
 # bump. `neither` is still 0.
-assert_eq "manifest: 11 realmodel files are enumerated"  "$_nfiles"          "11"
-assert_eq "manifest: 52 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "52"
-assert_eq "manifest: 15 are disposed by \`exit\`, NOT by a counter" \
-    "$(echo "$_c" | cut -d' ' -f2)" "15"
-assert_eq "manifest: 37 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "37"
+# +1 file / +12 announcements / +12 counter-bumped for
+# test-realmodel-auth-failure-hooks.sh (your-org/nexus-code#1548 F1, #1520):
+# every one of its twelve `FAIL:` announcements is followed by
+# `FAIL=$((FAIL+1))` on the same line, so the counter-bumped column moves by
+# exactly the announcement column and the UNCOUNTED residue is unchanged.
+# Found by the full local band; this suite declares no population, so
+# `guards-for-diff` could not select it.
+# 12 -> 13 files, 64 -> 66 announcements, 15 -> 16 by-exit, 49 -> 50 by-count:
+# your-org/nexus-code#1591 added `test-realmodel-paste-held.sh` (the emit paste
+# against the real binary). Two announcements: the orchestrator window never
+# appearing is a precondition disposed by `exit 1`, and the recorded-prompt
+# check is disposed by a counter bump. `neither` is still 0. Found by the full
+# local band; this suite declares no population, so `guards-for-diff` could not
+# select it.
+# 13 -> 14 files, 66 -> 68 announcements, 16 -> 17 by-exit, 50 -> 51 by-count:
+# your-org/nexus-code#1622 added `test-realmodel-respawn-verify.sh` (the
+# orchestrator-respawn verify stage against the real binary). Re-derived by
+# this block's own census on the bundle-0922 tree: the orchestrator window never
+# appearing is a precondition disposed by `exit 1`, and the count guard's
+# `${FAIL:-0}` expansion matches the announcement pattern and is disposed by
+# the counter it reads — the same two shapes `test-realmodel-paste-held.sh`
+# added. `neither` is still 0.
+# 14 -> 15 files, announcements/by-exit/by-count unchanged: your-org/nexus-code#1632
+# (PR #1633) added `test-realmodel-dangerous-rm-decide.sh` without re-pinning this
+# line, so `dev` @ 049b31d6 was red here (got 15 want 14, reproduced in isolation).
+# Its failure lines do not match the `FAIL:` announcement pattern this census
+# counts, so only the file count moves. `neither` is still 0.
+assert_eq "manifest: 15 realmodel files are enumerated"  "$_nfiles"          "15"
+assert_eq "manifest: 68 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "68"
+assert_eq "manifest: 17 are disposed by \`exit\`, NOT by a counter" \
+    "$(echo "$_c" | cut -d' ' -f2)" "17"
+assert_eq "manifest: 51 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "51"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \
     "$(echo "$_c" | cut -d' ' -f4)" "0"

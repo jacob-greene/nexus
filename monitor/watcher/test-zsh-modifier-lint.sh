@@ -42,6 +42,23 @@ PASS=0; FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 
+# --- population (your-org/nexus-code#1301) ---------------------------------
+# Section 2 greps every tracked shell source in the repo, so a script added
+# anywhere joins this lint's population. `_zml_sources` is the ONE enumerator
+# (defined here so the probe can call it): section 2 and `gp_population` both
+# use it. The self-exclusion is section 2's concern, not the population's —
+# gp_handle adds this file back, because bash reads it either way. `gp_handle`
+# EXITS on --population, so it sits above the first line of output.
+_self="monitor/watcher/$(basename "${BASH_SOURCE[0]}")"
+_zml_sources() {
+    ( cd "$REPO_ROOT" && git ls-files -z -- '*.sh' 'monitor/ng' 'monitor/*/gh' \
+        'monitor/*/pip' 'monitor/*/sandbox-notify' 'monitor/shellenv/*' 2>/dev/null \
+        | tr '\0' '\n' | grep -v '^$' | grep -vFx "$_self" )
+}
+. "$REPO_ROOT/monitor/_guard_population.sh"
+gp_population() { _zml_sources | sed "s|^|$REPO_ROOT/|"; }
+gp_handle "$@"
+
 # --- 1. the trap is real (executable proof, not prose) ---------------------
 # Assert the behaviour against a real zsh so this file documents a fact that
 # still holds, rather than folklore. Skips cleanly where zsh is absent.
@@ -103,12 +120,7 @@ fi
 # so exempted nothing while looking like it worked. Section 4 catches that: it
 # feeds a real multi-word reason through and requires it to be exempted.
 _LINT_MARKER='zsh-modifier-lint:[[:space:]]+allow-demonstration[[:space:]]+[^[:space:]].{7,}'
-_self="monitor/watcher/$(basename "${BASH_SOURCE[0]}")"
-mapfile -t sources < <(
-    cd "$REPO_ROOT" && git ls-files -z -- '*.sh' 'monitor/ng' 'monitor/*/gh' \
-        'monitor/*/pip' 'monitor/*/sandbox-notify' 'monitor/shellenv/*' 2>/dev/null \
-        | tr '\0' '\n' | grep -v '^$' | grep -vFx "$_self"
-)
+mapfile -t sources < <(_zml_sources)
 if (( ${#sources[@]} == 0 )); then
     bad "source enumeration" "git ls-files returned nothing — lint would vacuously pass"
 else

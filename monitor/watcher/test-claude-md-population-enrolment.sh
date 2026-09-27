@@ -132,10 +132,10 @@ _cme_declares() {    # <file> -> rc 0 if it implements the --population protocol
 _cme_applicable() {
     (
         cd "$REPO_ROOT" || exit 1
-        git ls-files -- ':(glob)**/test-*.sh' 2>/dev/null | while IFS= read -r f; do
-            [[ -f "$f" ]] || continue
-            _cme_reads_doc "$f" && printf '%s\n' "$f"
-        done
+        # One batched grep with _cme_reads_doc's own pattern, not a grep per
+        # suite (bundle-0923); `xargs` execs the grep BINARY.
+        git ls-files -z -- ':(glob)**/test-*.sh' 2>/dev/null \
+            | xargs -0 -r grep -lE -e 'CLAUDE_MD=|/CLAUDE\.md' -- 2>/dev/null
         # AN ENUMERATOR'S EXIT STATUS MUST DESCRIBE THE ENUMERATION, NOT ITS
         # LAST CANDIDATE. A `while` loop's rc is its final iteration's, so this
         # returns 1 whenever the alphabetically-last suite is not applicable —

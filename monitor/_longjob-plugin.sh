@@ -4,7 +4,8 @@
 #
 #   longjob_plugin_flag [<window>] [<state-dir>]
 #                                    → stdout: `--plugin-dir <dir>` or NOTHING
-#                                      rc 0 armed · 1 not armed (reason on stderr)
+#                                      rc 0 armed (incl. armed-unprobed) ·
+#                                      1 not armed (reason on stderr)
 #
 # FAIL OPEN, BY CONSTRUCTION. Every launch surface in this nexus (worker
 # spawn, worker resume, the claude-loop wrapper, the orchestrator respawn)
@@ -13,16 +14,42 @@
 # unsupported by the binary, because the alternative — a `claude` that
 # refuses to start — breaks the watcher's own revival path, which nothing on
 # the board can fix from inside. So this function NEVER exits, never returns
-# a partial flag, and turns every doubt into "no flag + one stderr line":
+# a partial flag, and turns every ESTABLISHED reason not to arm into "no flag +
+# one stderr line" — while an UNESTABLISHED one (a probe that timed out) arms,
+# for the reason given below the list (your-org/nexus-code#1611):
 #
 #   1. kill switch:   monitor.longjob.enabled / MONITOR_LONGJOB_ENABLED
 #                     (its OWN knob, not shared with any other feature — a
 #                     field that selects is not a label, #1050)
 #   2. the manifest must exist and be readable
-#   3. the binary must advertise `--plugin-dir <path>` (capability probe,
-#      bounded, monitor/_claude-bin.sh:claude_supports_plugin_dir_flag)
-#   4. `claude plugin validate <dir>` must pass (bounded; a timeout is NOT
-#      a pass; warnings are)
+#   3. the binary must not be KNOWN to lack `--plugin-dir <path>` (capability
+#      probe, bounded, monitor/_claude-bin.sh:claude_supports_plugin_dir_flag)
+#   4. `claude plugin validate <dir>` must not FAIL (bounded; warnings pass)
+#
+# A PROBE THAT COULD NOT ANSWER IS NOT A "NO" (your-org/nexus-code#1611). Steps
+# 3 and 4 each have a third outcome — the bound fired, or --help printed
+# nothing — and before #1611 both were logged `skipped`, so a mass
+# resurrection on a loaded node (every probe slow at once) relaunched sessions
+# with no dispatcher for their whole life, silently: `rtevsk` was `armed` and
+# `skipped` 8 s apart on one binary. Now a could-not-determine ARMS and is
+# logged `armed-unprobed` with the reason, so the record still says the
+# capability was never established. `skipped` means a probe COMPLETED and said
+# no. The two error directions are not symmetric, and the argument has two
+# halves, only one of which is the measurement below:
+#
+#   - a BROKEN PLUGIN under a binary that HAS the flag fails open — MEASURED
+#     (below). That covers step 4's timeout outright.
+#   - an UNSUPPORTED FLAG is NOT covered by that measurement and is FATAL:
+#     `claude --nosuchflag` exits 1, "unknown option" (_claude-bin.sh,
+#     claude_supports_name_flag's header). Arming on an unknown step 3 is
+#     therefore a bet that the binary is the pinned one, which advertises the
+#     flag and whose removal skills/nexus.cc-update gates (2e). The bet is
+#     hedged by step 4: a binary without the plugin subsystem FAILS `plugin
+#     validate` rather than passing it, so the only residual that can kill a
+#     spawn is "binary lacks the flag AND both bounded probes timed out" — and
+#     that failure is LOUD (the window dies at launch), where a skip on the
+#     pinned binary is SILENT for the session's life. Order the operation so
+#     the failure mode is the observable one.
 #
 # MEASURED 2026-09-15 on 2.1.272, hermetic tmux, one session per case: a
 # missing plugin dir, a malformed manifest, a manifest whose command does
@@ -33,7 +60,7 @@
 # session where its only symptom is an absent monitor.
 #
 # EVERY DECISION IS RECORDED in <state-dir>/longjob/arming.log
-# (`<epoch>\t<window>\t<armed|skipped>\t<reason>\t<src>`), a detector that is
+# (`<epoch>\t<window>\t<armed|armed-unprobed|skipped>\t<reason>\t<src>`), a detector that is
 # not the emit path: `longjob-watch.sh status` and a human can read WHY a
 # session was launched without a dispatcher, which the session itself
 # cannot know.
@@ -97,23 +124,39 @@ longjob_plugin_flag() {
         echo "_longjob-plugin: _claude-bin.sh has no claude_supports_plugin_dir_flag (older primary?) — NOT passing --plugin-dir (your-org/nexus-code#1535)." >&2
         _lj_plugin_log "$win" skipped "no capability probe in _claude-bin.sh" "$sd"; return 1
     fi
-    if ! claude_supports_plugin_dir_flag; then
-        _lj_plugin_log "$win" skipped "binary does not advertise --plugin-dir (or --help unreadable/timed out)" "$sd"; return 1
-    fi
-    # Bounded validate. `timeout` injects 124/137, neither of which is a
-    # validator verdict (your-org/nexus-code#1248); both are "not armed".
+    # Three-valued (your-org/nexus-code#1611): 0 yes, 1 a COMPLETED probe
+    # found no flag, 2 the probe could not answer. `|| prc=$?` rather than
+    # `cmd; prc=$?` so a caller running under `set -e` survives the 1 and 2.
+    local prc=0 unprobed=''
+    claude_supports_plugin_dir_flag || prc=$?
+    case "$prc" in
+        0) ;;
+        1)  _lj_plugin_log "$win" skipped "binary's --help was read and does not list --plugin-dir" "$sd"; return 1 ;;
+        *)  unprobed="${_CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON:-capability probe rc=$prc}" ;;
+    esac
+    # Bounded validate. `timeout` injects 124/137 (and 125 for its own
+    # failure), none of which is a validator verdict (your-org/nexus-code#1248)
+    # — so they are could-not-determine, and since a broken manifest under a
+    # binary that has the flag is MEASURED to fail open (header), they arm as
+    # `armed-unprobed` (#1611). Only a validator that RAN and FAILED skips.
     if command -v timeout >/dev/null 2>&1; then tb="timeout -k 2 ${NEXUS_LONGJOB_VALIDATE_TIMEOUT:-20}"; fi
     # shellcheck disable=SC2086
     $tb "$CLAUDE_BIN" plugin validate "$dir" >/dev/null 2>&1; rc=$?
     case "$rc" in
-        0) ;;
-        124|137)
-            echo "_longjob-plugin: 'claude plugin validate' TIMED OUT (rc $rc) — NOT passing --plugin-dir; a validator this slow is a degraded binary or a stalled filesystem, not an answer (your-org/nexus-code#1535)." >&2
-            _lj_plugin_log "$win" skipped "validate timed out rc=$rc" "$sd"; return 1 ;;
+        0)  [[ -n "$unprobed" ]] && unprobed="$unprobed; plugin validate passed" ;;
+        124|125|137)
+            echo "_longjob-plugin: 'claude plugin validate' TIMED OUT (rc $rc) — manifest NOT validated; passing --plugin-dir anyway, because a broken manifest is measured to fail open and a skipped flag is silent for the session's life (your-org/nexus-code#1611)." >&2
+            unprobed="${unprobed:+$unprobed; }plugin validate TIMED OUT (rc $rc) — manifest not validated" ;;
         *)
             echo "_longjob-plugin: 'claude plugin validate $dir' FAILED (rc $rc) — NOT passing --plugin-dir; fix the manifest (run the validate command by hand for the errors). This session cannot be woken by a long job (your-org/nexus-code#1535)." >&2
             _lj_plugin_log "$win" skipped "validate failed rc=$rc" "$sd"; return 1 ;;
     esac
+    if [[ -n "$unprobed" ]]; then
+        echo "_longjob-plugin: arming UNPROBED — $unprobed. Passing --plugin-dir; if this session failed to start with 'unknown option', the binary lacks the flag (your-org/nexus-code#1611)." >&2
+        _lj_plugin_log "$win" armed-unprobed "$unprobed: $dir" "$sd"
+        printf -- '--plugin-dir %q' "$dir"
+        return 0
+    fi
     _lj_plugin_log "$win" armed "$dir" "$sd"
     printf -- '--plugin-dir %q' "$dir"
     return 0

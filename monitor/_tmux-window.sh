@@ -649,13 +649,21 @@ tmux_selection_capture_file() {
 # every window on the server. rc 3 when tmux would not answer or answered in
 # a shape this file cannot parse (a stub printing names, a locale rewriting
 # the delimiter): a capture that cannot vouch for its rows writes nothing.
+#
+# ON FAILURE STDOUT CARRIES THE REASON (your-org/nexus-code#1562). Every caller
+# reads this through `rows=$(…)`, a subshell, so a variable set here is lost and
+# the two causes used to be indistinguishable: `tmux-exit=<rc>` when tmux would
+# not answer, `bad-row=<the first rejected row>` when it answered in a shape
+# this file refuses. rc stays 3 for both — the public contract is unchanged —
+# and a caller that ignores stdout on failure, as all of them did, still works.
 _tmux_selection_rows() {
     local tm="${TMUX_WINDOW_TMUX_CMD:-tmux}" out rc=0 sid wid wn act
     out=$("$tm" list-windows -a -F "#{session_id}|#{window_id}|#{window_name}|#{window_active}" 2>/dev/null) || rc=$?
-    (( rc == 0 )) || return 3
+    (( rc == 0 )) || { printf 'tmux-exit=%s\n' "$rc"; return 3; }
     while IFS='|' read -r sid wid wn act; do
         [[ -n "$sid$wid$wn$act" ]] || continue
-        [[ "$sid" == \$[0-9]* && "$wid" == @[0-9]* && ( "$act" == 0 || "$act" == 1 ) ]] || return 3
+        [[ "$sid" == \$[0-9]* && "$wid" == @[0-9]* && ( "$act" == 0 || "$act" == 1 ) ]] \
+            || { printf 'bad-row=%s\n' "$(printf '%s|%s|%s|%s' "$sid" "$wid" "$wn" "$act" | tr -c '[:print:]' '?' | cut -c1-120)"; return 3; }
     done <<<"$out"
     printf '%s\n' "$out"
     return 0
@@ -672,7 +680,7 @@ _tmux_selection_write() {
         printf 'v=1\nts=%s\ntarget=%s\n' "$(date +%s)" "$target"
         if [[ -n "$prior" ]]; then printf '%s\n' "$prior"; fi
         if [[ -n "$post"  ]]; then printf '%s\n' "$post";  fi
-    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null && return 0
+    } 2>/dev/null > "$tmp" && mv -f "$tmp" "$file" 2>/dev/null && return 0   # 2> FIRST: redirections apply left to right, and a failed `>` open reported itself before a trailing 2>/dev/null existed
     rm -f "$tmp" 2>/dev/null
     return 1
 }
@@ -687,12 +695,25 @@ _tmux_selection_write() {
 # active, a prior that has closed is kept. rc 0 written; rc 1 written but no
 # session holds the target; rc 2 usage; rc 3 tmux would not answer — the file
 # is REMOVED, so a stale earlier capture cannot be consumed in its place.
+#
+# A FAILED CAPTURE SAYS WHY (your-org/nexus-code#1562). rc 3 has three causes
+# (tmux did not answer, a row was rejected, the file could not be written) and
+# rc 1 a fourth outcome, and every caller runs this `|| true` because a capture
+# must never block a restart. That made the failure a DELETED FILE and nothing
+# else: no line, no status, and an operator on the wrong window assuming they
+# put themselves there — #1528's bug, reintroduced silently. The reason is left
+# in `TMUX_SELECTION_WHY` (empty on rc 0), a plain global because callers
+# invoke this in the CURRENT shell; the caller decides where to log it. The
+# `rm -f` stands: a stale capture is worse than none.
+TMUX_SELECTION_WHY=""
 tmux_selection_capture() {
     local refresh=0
+    TMUX_SELECTION_WHY=""
     if [[ "${1-}" == --refresh ]]; then refresh=1; shift; fi
     local target="${1-}" file="${2-}" rows
-    [[ -n "$target" && -n "$file" ]] || return 2
+    [[ -n "$target" && -n "$file" ]] || { TMUX_SELECTION_WHY="usage: target and file are required"; return 2; }
     if ! rows=$(_tmux_selection_rows); then
+        TMUX_SELECTION_WHY="tmux list-windows unusable (${rows:-no reason given}); any earlier capture was removed"
         rm -f "$file" 2>/dev/null
         return 3
     fi
@@ -733,8 +754,10 @@ tmux_selection_capture() {
         is_t=0; [[ "$targets" == *" $s:$cur_wid "* ]] && is_t=1
         prior+="prior|$s|$cur_wid|$is_t"$'\n'
     done
-    _tmux_selection_write "$file" "$target" "${prior%$'\n'}" || return 3
+    _tmux_selection_write "$file" "$target" "${prior%$'\n'}" \
+        || { TMUX_SELECTION_WHY="could not write $file"; return 3; }
     [[ -n "$prior" ]] && return 0
+    TMUX_SELECTION_WHY="written, but no session holds a window named '$target' with an active window — nothing to restore"
     return 1
 }
 
@@ -744,8 +767,9 @@ tmux_selection_capture() {
 # restore then cannot detect navigation and applies the rules as captured).
 tmux_selection_note_post_kill() {
     local file="$1" rows
-    [[ -n "$file" && -r "$file" ]] || return 1
-    rows=$(_tmux_selection_rows) || return 3
+    TMUX_SELECTION_WHY=""
+    [[ -n "$file" && -r "$file" ]] || { TMUX_SELECTION_WHY="no readable capture at ${file:-<empty path>}"; return 1; }
+    rows=$(_tmux_selection_rows) || { TMUX_SELECTION_WHY="tmux list-windows unusable (${rows:-no reason given}); the prior rows stand"; return 3; }
     local sid wid wn act active=" "
     while IFS='|' read -r sid wid wn act; do
         [[ "$act" == 1 ]] && active+="$sid=$wid "
@@ -758,7 +782,7 @@ tmux_selection_note_post_kill() {
         post+="post|$s|$cur"$'\n'
     done < "$file"
     [[ -n "$post" ]] || return 0
-    printf '%s' "$post" >> "$file" 2>/dev/null || return 3
+    printf '%s' "$post" >> "$file" 2>/dev/null || { TMUX_SELECTION_WHY="could not append to $file"; return 3; }
     return 0
 }
 

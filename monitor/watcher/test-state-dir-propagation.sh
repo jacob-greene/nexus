@@ -32,6 +32,30 @@ MANIFEST="$_test_dir/state-dir-propagation.manifest"
 # shellcheck source=monitor/shell-files.sh
 . "$_repo_root/monitor/shell-files.sh" || th_abort "cannot source monitor/shell-files.sh"
 
+# ---- population (your-org/nexus-code#1301) --------------------------------
+# The lint below classifies every tracked non-test shell file under monitor/
+# (shf_is_shell, so an extensionless script counts), so a file added there joins
+# this guard's population. `_sdp_lint_files` is the ONE enumerator: the lint
+# loop and `gp_population` both call it, beside the manifest it ratchets against
+# and the sourced library its behavioural section drives. `gp_handle` EXITS on
+# --population, so it sits above the first line of output.
+_sdp_lint_files() {
+    local f
+    while IFS= read -r f; do
+        case "$f" in
+            monitor/watcher/test-*|monitor/test-*|monitor/ng|*.md|*.manifest) continue ;;
+        esac
+        shf_is_shell "$_repo_root/$f" || continue
+        printf '%s\n' "$f"
+    done < <(git -C "$_repo_root" ls-files -- monitor)
+}
+. "$_repo_root/monitor/_guard_population.sh"
+gp_population() {
+    _sdp_lint_files | sed "s|^|$_repo_root/|"
+    printf '%s\n' "$MANIFEST" "$_repo_root/monitor/shell-files.sh" "$_test_dir/_target_absent.sh" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 [[ -f "$MANIFEST" ]] || th_abort "manifest missing: $MANIFEST"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sdp-XXXXXX") || th_abort "mktemp failed"
@@ -146,10 +170,6 @@ done < "$MANIFEST"
 members=0 noncompliant_new="" stale=""
 declare -A SEEN=()
 while IFS= read -r f; do
-    case "$f" in
-        monitor/watcher/test-*|monitor/test-*|monitor/ng|*.md|*.manifest) continue ;;
-    esac
-    shf_is_shell "$_repo_root/$f" || continue
     v=$(sdp_classify "$_repo_root/$f")
     [[ "$(_field "$v" member)" == 1 ]] || continue
     members=$(( members + 1 )); SEEN["$f"]=1
@@ -160,7 +180,7 @@ while IFS= read -r f; do
     else
         [[ -n "${KNOWN[$f]:-}" ]] && stale="${stale}    $f  (now compliant — remove it from the manifest)"$'\n'
     fi
-done < <(git -C "$_repo_root" ls-files -- monitor)
+done < <(_sdp_lint_files)
 for k in "${!KNOWN[@]}"; do
     [[ -n "${SEEN[$k]:-}" ]] || stale="${stale}    $k  (no longer a member, or not tracked — remove it from the manifest)"$'\n'
 done

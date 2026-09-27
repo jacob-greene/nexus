@@ -69,7 +69,18 @@ cause_classify_error() {
             printf 'transient\tpaste'; return 0 ;;
         model_not_found|not_found_error)
             printf 'config\trespawn'; return 0 ;;
-        authentication_error|permission_error|auth_error|forbidden)
+        # `authentication_failed` is the token the REAL binary emits for an
+        # expired OAuth login: all 40 `authentication_failed` StopFailure captures
+        # (37 from the orchestrator, 2 from cc-auto-update, 1 from guardkey —
+        # corrected from "40 of 40 orchestrator" by skeptic oplivesk F4) across
+        # the 2026-08-19..21 and 2026-09-17 outages carry exactly
+        # `"error":"authentication_failed"` with the copy `Login expired ·
+        # Please run /login` (monitor/.state/stopfailure-raw-captures.jsonl).
+        # Before it was listed here that payload fell through to the message
+        # probe, matched nothing, and classified `unknown:paste` — so the
+        # "auth has no in-band recovery" conclusion #1520 credits this file
+        # with was unreachable for the one token production produces.
+        authentication_error|authentication_failed|permission_error|auth_error|forbidden)
             printf 'auth\toperator'; return 0 ;;
     esac
 
@@ -86,7 +97,11 @@ cause_classify_error() {
             printf 'conversation\trespawn'; return 0 ;;
         *"may not exist"*|*"access to it"*|*"selected model"*)
             printf 'config\trespawn'; return 0 ;;
-        *"authentic"*|*"credential"*|*"unauthorized"*|*"forbidden"*)
+        # The harness's own login copy (`Login expired · Please run /login`)
+        # and the 401 mid-retry render (`OAuth token has expired`) name none
+        # of the four words below; listed by their measured wording.
+        *"authentic"*|*"credential"*|*"unauthorized"*|*"forbidden"* \
+        |*"login expired"*|*"run /login"*|*"token has expired"*|*"please log in"*)
             printf 'auth\toperator'; return 0 ;;
     esac
 

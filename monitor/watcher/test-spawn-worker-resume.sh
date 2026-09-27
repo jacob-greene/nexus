@@ -27,7 +27,8 @@ SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 # reports dir instead of the fixture's.
 #
 # Every nexus-spawned agent has NEXUS_ROOT exported, and CI does not: its
-# cell is literally named `unit suite (NEXUS_ROOT unset)`. That single
+# unit cells run under `env -u NEXUS_ROOT -u NEXUS_LOCALS` (a cell once
+# literally named `unit suite (NEXUS_ROOT unset)`, folded in by #1474). That single
 # variable is #655's "dev red locally / green in CI", measured:
 #
 #     test-spawn-worker.sh          75 pass / 24 fail  ->  101 / 0

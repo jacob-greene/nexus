@@ -51,9 +51,13 @@ SHELL_FILES_LIB="$repo_root/monitor/shell-files.sh"
     echo "missing shell-file enumerator: $SHELL_FILES_LIB" >&2; exit 2; }
 . "$SHELL_FILES_LIB"
 
+# `ignored-under-monitor` (your-org/nexus-code#1594): a kill guard reads the
+# GITIGNORED files under `monitor/` too, because an ignored path is unreviewed
+# by definition and the root `.gitignore` ignores `bin/` and `logs/` at any
+# depth. Without it `monitor/cc-harness/bin/x.sh` was invisible to this lint.
 files0() {   # <root> -> NUL-separated script files, minus this lint itself
     local f
-    shf_find0 "$1" script | while IFS= read -r -d '' f; do
+    shf_find0 "$1" script ignored-under-monitor | while IFS= read -r -d '' f; do
         [[ "${f##*/}" == "$self_base" ]] && continue
         printf '%s\0' "$f"
     done
@@ -117,6 +121,12 @@ selftest() {
     out=$(scan "$d")
     _ck 'a NON-script file with the same bytes is NOT scanned' \
         $([[ -z "$out" ]] && echo 0 || echo 1) "expected unscanned, got: $out"
+
+    # The UNTRACKED-AND-GITIGNORED plant case (your-org/nexus-code#1594 item 1)
+    # needs a real git fixture, and a `git init` in this file is refused by the
+    # cc-update no-remote-code lint (this lint is in its gated population). It
+    # therefore lives in monitor/watcher/test-shell-files.sh, which runs THIS
+    # lint's CLI against that fixture.
 
     # Non-vacuity on the real tree.
     _ck 'the population clears its non-vacuity floor' \

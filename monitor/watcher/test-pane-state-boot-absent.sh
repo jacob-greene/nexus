@@ -164,6 +164,14 @@ ps_state() {  # ps_state <window-index> -> the bare state token
         | head -1 | sed -n 's/.*state=\([a-z-]*\).*/\1/p'
 }
 
+# The WHOLE first line, for the cases that must read `reason=` as well as
+# `state=` (hoisted from test 9 so tests 1 and 3 can name a reason too).
+ps_emit_grace() {  # ps_emit_grace <grace-seconds> <window-index> -> the first output line
+    NEXUS_PANE_BOOT_GRACE_SECONDS="$1" PATH="$SHIMDIR:$PATH" \
+        bash "$PANE_STATE" "$SESSION:$2" 2>/dev/null | sed -n 1p
+}
+_field() { sed -n "s/.*\\b$2=\\([A-Za-z0-9_-]*\\).*/\\1/p" <<<"$1"; }
+
 # Same, with the #777 boot grace pinned to an explicit value.
 #
 # Grace 0 is how the negative controls stay meaningful. Every "genuinely dead"
@@ -198,11 +206,96 @@ ps_state_blind() {  # ps_state_blind <blind-dir> <window-index>
 settle_childless() {  # settle_childless <pane-pid> <label>
     local pp="$1" label="$2" i
     for i in $(seq 1 30); do
-        [[ -n "$pp" ]] && [[ -z "$(pgrep -P "$pp" 2>/dev/null)" ]] && return 0
+        if [[ -n "$pp" ]] && [[ -z "$(pgrep -P "$pp" 2>/dev/null)" ]]; then
+            # HOW LONG it took is printed on SUCCESS too (#1317): a settle that
+            # took 27 of its 30 s is one loaded run from a false red, and until
+            # it lapsed nothing said so.
+            printf '  note: %s settled childless after %ds of 30\n' "$label" "$(( i - 1 ))"
+            return 0
+        fi
         sleep 1
     done
     printf '  NOTE: %s did not settle childless within 30s — a failure just below is the FIXTURE, not the classifier (still alive: %s)\n' \
         "$label" "$(pgrep -P "$pp" 2>/dev/null | tr '\n' ' ')" >&2
+    return 1
+}
+
+# wait_pane_comm <window-name> <comm> — until the named window's PANE PROCESS
+# is <comm>, or 30 s. (your-org/nexus-code#1317.) Tests 9 and 10 used to
+# `sleep 2` and then read the pane process ONCE. tmux starts a window command as
+# `default-shell -c "<cmd>"`, so for the first moments the pane process is the
+# operator's SHELL; a quiet host gets through that in well under 2 s, and a
+# `--jobs 6` band on 12 cores did not: `pane really hosts a live claude
+# (precondition) — got zsh`, red 3/3 in band and green 3/3 alone. A fixed sleep
+# is a guess about how long an event takes; this waits for the event. Returns
+# the instant it holds, so it costs a green run nothing, and on expiry it
+# returns 1 and the precondition assertion below fails exactly as before —
+# nothing is relaxed.
+wait_pane_comm() {
+    local name="$1" want="$2" i idx pid comm
+    for i in $(seq 1 120); do
+        idx=$(win_index "$name")
+        if [[ -n "$idx" ]]; then
+            # No `exit` in the awk: an early-exiting reader, and these windows
+            # have exactly one pane, so there is nothing after the first match.
+            pid=$(tx list-panes -a -F '#{window_index} #{pane_pid}' 2>/dev/null | awk -v i="$idx" '$1==i{print $2}')
+            comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$comm" == "$want" ]]; then
+                printf '  note: %s pane process became %s after ~%d.%02ds\n' "$name" "$want" "$(( (i-1) / 4 ))" "$(( ((i-1) % 4) * 25 ))"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    printf '  NOTE: %s pane process never became %s within 30s (last seen: %s) — a failure just below is the FIXTURE, not the classifier\n' \
+        "$name" "$want" "${comm:-<none>}" >&2
+    return 1
+}
+
+# wait_pane_child_args <pane-pid> <exact args> — until <pane-pid> has a live CHILD
+# whose `ps -o args=` is EXACTLY <exact args>, or 30 s. Sets WPC_PID.
+# (your-org/nexus-code#1317.)
+#
+# EXACT ARGS, NOT `comm`. The first cut matched `comm == sleep`, and a shell
+# startup helper that happens to BE a `sleep` would then be recorded and reaped
+# in place of the fixture's own child — this defect again, by a second road.
+# The fixture owns its argv, so that is what identifies it. Scoped to the
+# children of ONE pane pid on a private server, so the argv-matches-a-sibling
+# hazard (#1073) has nothing to reach.
+#
+# THE FIXTURE'S LONG-LIVED CHILD IS AN EVENT, AND TESTS 1 AND 3 USED TO GUESS WHEN
+# IT HAPPENED. tmux starts a window command as `$SHELL -c "<cmd>"`, so for the
+# first moments the pane process is the operator's shell still starting; only
+# after it execs does `bash -c 'sleep 300; …'` fork its `sleep`. Test 3 slept 1 s
+# and then killed "every child that exists NOW" — a ONE-SHOT SAMPLE. When startup
+# outran the second (this suite's own instrument measured ~1.25 s and ~1.50 s in
+# the two retained failing runs) the sample held either nothing or a startup
+# helper, `sleep 300` was born afterwards, and NOTHING EVER KILLED IT. Both
+# failing logs show it, with opposite settle lines:
+#     `settled childless after 0s of 30`  then  `got unknown want absent`
+#     `did not settle childless within 30s (still alive: 20887)`  then the same
+# The first rules out "the settle lapsed under load": it returned at once and the
+# assertion still failed. So the 30 s budget was never the variable — no budget
+# waits out a process nobody killed — and the classifier was RIGHT each time:
+# `unknown` is the correct verdict for a pane with a live `sleep 300`. That is
+# why 42678908, which gave tests 9 and 10 an event-wait, left this red in place
+# (measured: it is an ancestor of both later failing refs).
+wait_pane_child_args() {
+    local pp="$1" want="$2" i c
+    WPC_PID=""
+    for i in $(seq 1 120); do
+        for c in $(pgrep -P "$pp" 2>/dev/null); do
+            if [[ "$(ps -o args= -p "$c" 2>/dev/null | sed 's/[[:space:]]*$//')" == "$want" ]]; then
+                WPC_PID="$c"
+                printf '  note: pane %s grew its `%s` child (pid %s) after ~%d.%02ds\n' \
+                    "$pp" "$want" "$c" "$(( (i-1) / 4 ))" "$(( ((i-1) % 4) * 25 ))"
+                return 0
+            fi
+        done
+        sleep 0.25
+    done
+    printf '  NOTE: pane %s never grew a `%s` child within 30s (children now: %s) — a failure just below is the FIXTURE, not the classifier\n' \
+        "$pp" "$want" "$(pgrep -P "$pp" 2>/dev/null | tr '\n' ' ')" >&2
     return 1
 }
 
@@ -226,11 +319,23 @@ echo '=== a pane with a live descendant but no claude is NOT absent ==='
 # process with the long-running child underneath it, which is the real spawn
 # shape: a pane shell running the launcher.
 tx new-window -d -n boot643 "bash -c 'sleep 300; true'" >/dev/null 2>&1
-sleep 1
 bidx=$(win_index boot643)
 if [[ -z "$bidx" ]]; then
     echo "  FAIL: could not create boot643 window" >&2; FAIL=$(( FAIL + 1 ))
 else
+    bpp=$(tx list-panes -a -F '#{window_index} #{pane_pid}' 2>/dev/null | awk -v i="$bidx" '$1==i{print $2}')
+    wait_pane_child_args "$bpp" 'sleep 300'
+    # THE #643 CHECK ITSELF, WITH THE BOOT GRACE OFF. The two assertions below
+    # read at the DEFAULT grace (90 s) a pane that is seconds old — and test 2
+    # shows a pane of that age with NOTHING under it reads `unknown` too. So
+    # they hold whether or not the live-descendant check works: the grace
+    # answers for it. Grace 0 removes the answer the grace was supplying, and
+    # the reason says WHICH arm refused.
+    bline=$(ps_emit_grace 0 "$bidx")
+    assert_eq "booting pane is unknown with the boot grace OFF (the #643 check, not the #777 grace)" \
+              "$(_field "$bline" state)" "unknown"
+    assert_eq "…and it refuses BECAUSE a descendant is alive" \
+              "$(_field "$bline" reason)" "live-descendant"
     bstate=$(ps_state "$bidx")
     # The decisive assertion: NOT the kill-authorising state.
     assert_eq "booting pane does not report absent" \
@@ -285,19 +390,30 @@ echo '=== one window crossing the boundary: unknown -> absent ==='
 # string rather than `absent`. A bare `read` blocks on the pane's tty forever
 # and spawns nothing, so the shell stays as a childless pane process.
 tx new-window -d -n flip643 "bash -c 'sleep 300; read -r _'" >/dev/null 2>&1
-sleep 1
 fidx=$(win_index flip643)
 if [[ -z "$fidx" ]]; then
     echo "  FAIL: could not create flip643 window" >&2; FAIL=$(( FAIL + 1 ))
 else
+    fpp=$(tx list-panes -a -F '#{window_index} #{pane_pid}' 2>/dev/null | awk -v i="$fidx" '$1==i{print $2}')
+    # WAIT FOR THE DESCENDANT, THEN KILL THAT ONE (#1317 — see the helper).
+    wait_pane_child_args "$fpp" 'sleep 300'
+    assert_eq "flip643 pane grew the descendant this case is about to reap (precondition)" \
+              "$([[ -n "$WPC_PID" ]] && echo yes || echo no)" "yes"
     before=$(ps_state "$fidx")
-    fpp=$(tx list-panes -a -F '#{window_index} #{pane_pid}' 2>/dev/null | awk -v i="$fidx" '$1==i{print $2; exit}')
     # Kill by RECORDED PID only — never a cmdline pattern. Every agent on this
     # host runs the same `claude` binary in one PID namespace, so `pkill -f`
-    # has already caused a mass-kill incident.
-    for p in $(pgrep -P "$fpp" 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
+    # has already caused a mass-kill incident. And the ONE pid the wait
+    # recorded, not "whatever is under the pane now": that sample is what let
+    # the real descendant be born after the kill.
+    [[ -n "$WPC_PID" ]] && kill -TERM "$WPC_PID" 2>/dev/null
     settle_childless "$fpp" "flip643 pane (after reaping its descendant)"
-    after=$(ps_state_grace 0 "$fidx")
+    aline=$(ps_emit_grace 0 "$fidx"); after=$(_field "$aline" state)
+    # SAY WHY, when it is not `absent`. The retained failing logs of #1317 show
+    # `got unknown` and nothing else, so they cannot tell "a descendant was born
+    # after the reap" from `proc-view-blind` (a fork refused under the band's
+    # RLIMIT_NPROC cap). One field, printed only on the unexpected road.
+    [[ "$after" == absent ]] || printf '  NOTE: flip643 after the reap: %s (children now: %s)\n' \
+        "${aline:-<no output>}" "$(pgrep -P "$fpp" 2>/dev/null | tr '\n' ' ')" >&2
     assert_eq "same window, descendant alive → unknown" "$before" "unknown"
     assert_eq "same window, descendant reaped → absent" "$after" "absent"
 fi
@@ -456,8 +572,6 @@ ps_emit() {  # ps_emit <window-index> -> the whole emit line
 ps_emit_capfail() {  # ps_emit <window-index>, with capture-pane broken
     PATH="$CAPFAIL:$PATH" bash "$PANE_STATE" "$SESSION:$1" 2>/dev/null | head -1
 }
-_field() { sed -n "s/.*\\b$2=\\([A-Za-z0-9_-]*\\).*/\\1/p" <<<"$1"; }
-
 # ---- Test 9: THE THIRD SITE. Failed capture on a pane with a LIVE agent --
 #
 # Measured at 16728e7 on a real private-socket server, same pane, same instant,
@@ -471,7 +585,7 @@ _field() { sed -n "s/.*\\b$2=\\([A-Za-z0-9_-]*\\).*/\\1/p" <<<"$1"; }
 # "the capture failed" and "the pane is blank" arrived at the same arm.
 echo '=== a FAILED capture must not authorise a kill on a live agent ==='
 tx new-window -d -n capfail788 "exec bash -c 'printf \"working\\n\"; exec $CLAUDEBIN/claude 300'" >/dev/null 2>&1
-sleep 2
+wait_pane_comm capfail788 claude
 cidx=$(win_index capfail788)
 if [[ -z "$cidx" ]]; then
     echo "  FAIL: could not create capfail788 window" >&2
@@ -503,7 +617,7 @@ fi
 # signal is empty" — and worked around it with a `wait_for` instead of fixing it.
 echo '=== an EMPTY capture must not authorise a kill on a live agent ==='
 tx new-window -d -n silent788 "exec $CLAUDEBIN/claude 300" >/dev/null 2>&1
-sleep 2
+wait_pane_comm silent788 claude
 sidx=$(win_index silent788)
 if [[ -z "$sidx" ]]; then
     echo "  FAIL: could not create silent788 window" >&2
@@ -587,7 +701,7 @@ fi
 # early, a helper that vanished (rc 127 is counted by nothing) — otherwise
 # reports 0 failures and reads as a pass. This suite's own dominant defect class
 # is exit-0 for work not done; the count is what makes silence loud.
-EXPECTED=24
+EXPECTED=27
 echo
 echo "=== summary: $PASS passed, $FAIL failed ($(( PASS + FAIL )) assertions; expected $EXPECTED) ==="
 if (( PASS + FAIL != EXPECTED )); then

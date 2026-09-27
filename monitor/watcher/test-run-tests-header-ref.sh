@@ -173,7 +173,88 @@ assert_contains "no usable git: ref=UNKNOWN, never a blank line" \
     "$line" "ref=UNKNOWN ("
 assert_not_contains "no usable git: no sha is printed" "$line" "$HEAD_SHA"
 
-EXPECTED_ASSERTIONS=20
+# ── H. THE TREE IS RE-READ AT THE END (your-org/nexus-code#1586) ─────────
+# The header has named the tree since #1465, and named it ONCE. A band launched
+# from a clone that is being edited tests commit A for the early suites and
+# commit B for the late ones; its failing set reads exactly like a clean one.
+# So the runner now compares HEAD and the CONTENT of every tracked-modified
+# path, start to end, and a drift is rc 5: NOT A VERDICT, outranking 0, 1, 3.
+#
+# Each planted suite mutates the FIXTURE repository while the copied runner is
+# mid-run, which is the incident itself at the smallest scale that still has a
+# "before" and an "after".
+DR="$WORK/drift"
+mkdir -p "$DR" && fgit init -q "$DR" && mk_tree "$DR" || { echo "FAIL: drift fixture" >&2; exit 1; }
+printf 'v1\n' > "$DR/monitor/subject.sh"
+_suite() {   # <name> <rc> <body…>  — a planted suite; ROOT is the fixture repo
+    { printf '#!/usr/bin/env bash\nROOT=$(cd "$(dirname "$0")/../.." && pwd)\n'
+      printf '%s\n' "${@:3}"
+      if [[ "$2" == 0 ]]; then printf 'echo "=== summary: 1 passed, 0 failed ==="\necho "ALL TESTS PASSED"\nexit 0\n'
+      else printf 'echo "  FAIL: planted red"\necho "=== summary: 0 passed, 1 failed ==="\nexit 1\n'; fi
+    } > "$DR/monitor/watcher/$1"
+    chmod +x "$DR/monitor/watcher/$1"
+}
+_suite test-h-edits-tracked.sh   0 'printf "edited-mid-run\n" >> "$ROOT/monitor/subject.sh"'
+_suite test-h-commits.sh         0 'env -u GIT_DIR -u GIT_WORK_TREE git -C "$ROOT" -c user.name=fixture -c user.email=fixture@example.invalid -c core.hooksPath=/dev/null commit -q --allow-empty -m mid-run'
+_suite test-h-leaves-untracked.sh 0 'printf "leaked\n" > "$ROOT/monitor/leaked-plant.txt"'
+_suite test-h-plants-and-removes.sh 0 'printf "x\n" > "$ROOT/monitor/transient.txt"; rm -f "$ROOT/monitor/transient.txt"'
+_suite test-h-red-and-edits.sh   1 'printf "edited-by-a-red-suite\n" >> "$ROOT/monitor/subject.sh"'
+_suite test-h-red-only.sh        1 ':'
+fgit -C "$DR" add -A && fgit -C "$DR" commit -q -m 'drift fixture' || { echo "FAIL: drift commit" >&2; exit 1; }
+th_require_fixture_repo "$DR"
+_restore() { fgit -C "$DR" checkout -q -- monitor/subject.sh; rm -f "$DR/monitor/leaked-plant.txt"; }
+run_h() {   # <suite-basename…> -> RUN_OUT, RUN_RC, END_LINE
+    local -a paths=(); local n
+    for n in "$@"; do paths+=( "$DR/monitor/watcher/$n" ); done
+    RUN_OUT=$( cd "$WORK/cwd" && bash "$DR/monitor/watcher/run-tests.sh" --jobs 1 "${paths[@]}" 2>&1 )
+    RUN_RC=$?
+    END_LINE=$(tail -n 1 <<<"$RUN_OUT")
+}
+
+run_h test-trivial.sh
+assert_eq           "H1 nothing changes: rc 0 (MUST NOT FLIP)"                 "$RUN_RC" "0"
+assert_not_contains "H1 …and no drift banner on a tree that held still"         "$RUN_OUT" "TREE CHANGED DURING RUN"
+assert_contains     "H1 …and the closing marker is the ordinary green one"      "$END_LINE" "END rc=0 (COMPLETE and green"
+
+run_h test-trivial.sh test-h-edits-tracked.sh
+assert_eq       "H2 a TRACKED file edited mid-run: rc 5, not 0"                 "$RUN_RC" "5"
+assert_contains "H2 …the banner says the verdict describes no single tree"      "$RUN_OUT" "TREE CHANGED DURING RUN — this verdict describes no single tree"
+assert_contains "H2 …the path that moved is NAMED"                              "$RUN_OUT" "monitor/subject.sh"
+assert_contains "H2 …and the LAST LINE says NOT A VERDICT (a reader of a truncated log has only that)" \
+    "$END_LINE" "END rc=5 (NOT A VERDICT — the tree CHANGED during the run"
+_restore
+
+_h_before=$(fgit -C "$DR" rev-parse HEAD)
+run_h test-h-commits.sh
+assert_eq       "H3 HEAD moved mid-run (a commit): rc 5"                        "$RUN_RC" "5"
+assert_contains "H3 …and the HEAD it STARTED at is named"                       "$RUN_OUT" "HEAD $_h_before"
+assert_contains "H3 …beside the HEAD it ended at"                               "$RUN_OUT" "HEAD $(fgit -C "$DR" rev-parse HEAD)"
+
+# THE CASE `dirty=yes` CANNOT SEE: dirty at the start, DIFFERENTLY dirty at the
+# end. Both headers would print the same boolean.
+printf 'dirty-before-the-run\n' >> "$DR/monitor/subject.sh"
+run_h test-h-edits-tracked.sh
+assert_contains "H4 CONTROL: the header already said dirty=yes at the start"    "$(grep -aE '^=== tree: ' <<<"$RUN_OUT")" "dirty=yes"
+assert_eq       "H4 dirty at start and DIFFERENTLY dirty at end: rc 5 — content, not a boolean" "$RUN_RC" "5"
+_restore
+
+run_h test-h-leaves-untracked.sh
+assert_eq           "H5 an UNTRACKED file left behind: the verdict STANDS (rc 0)" "$RUN_RC" "0"
+assert_contains     "H5 …but it is said, loudly, by path"                        "$RUN_OUT" "monitor/leaked-plant.txt"
+assert_not_contains "H5 …and it is NOT called a changed tree"                    "$RUN_OUT" "TREE CHANGED DURING RUN"
+_restore
+
+run_h test-h-plants-and-removes.sh
+assert_eq           "H6 planted AND removed mid-run: rc 0"                       "$RUN_RC" "0"
+assert_not_contains "H6 …with no note at all — only START and END are compared"  "$RUN_OUT" "UNTRACKED paths appeared"
+
+run_h test-h-red-and-edits.sh
+assert_eq       "H7 a RED suite on a tree that moved: rc 5, NOT 1 — a mixed tree is evidence for neither verdict" "$RUN_RC" "5"
+_restore
+run_h test-h-red-only.sh
+assert_eq       "H8 CONTROL: a red suite on a tree that held still is still rc 1 — the re-check does not mask a red" "$RUN_RC" "1"
+
+EXPECTED_ASSERTIONS=39
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \

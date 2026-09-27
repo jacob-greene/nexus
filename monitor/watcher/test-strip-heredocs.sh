@@ -56,6 +56,21 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 MANIFEST="$_test_dir/strip-heredocs-failsafe.manifest"
 
+# ── POPULATION (your-org/nexus-code#1301) ───────────────────────────────
+# §5 reads the first line of EVERY tracked file to select the shell corpus by
+# shebang, so an edit anywhere can join or leave it. `_shd_corpus` is the ONE
+# enumerator: §5 and `gp_population` both call it, beside the fail-safe
+# manifest §5 compares against and the stripper it measures (shell-files.sh and
+# its quote machine). `gp_handle` EXITS on --population, so it sits above the
+# first line of output.
+_shd_corpus() { git -C "$REPO_ROOT" ls-files; }
+. "$REPO_ROOT/monitor/_guard_population.sh"
+gp_population() {
+    _shd_corpus | sed "s|^|$REPO_ROOT/|"
+    printf '%s\n' "$MANIFEST" "$REPO_ROOT/monitor/shell-files.sh" "$_test_dir/_shell_quotes.awk" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 [[ -r "$MANIFEST" ]] || { echo "missing manifest: $MANIFEST" >&2; exit 2; }
 
 WORK=$(mktemp -d) || { echo "FAIL: mktemp"; exit 1; }
@@ -207,7 +222,7 @@ while IFS= read -r f; do
         printf '         line-count mismatch: %s\n' "$f" >&2
     fi
     [[ -n "$(strip_err "$f")" ]] && failsafe+="$f"$'\n'
-done < <(git ls-files)
+done < <(_shd_corpus)
 
 # A population this scan could not have enumerated makes every result below
 # meaningless — the silent-zero class this repo keeps re-learning. 300 is a

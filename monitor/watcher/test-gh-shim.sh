@@ -375,8 +375,12 @@ if command -v zsh >/dev/null 2>&1; then
     [ "$t" = "$GHWRAP/gh" ] && ok "race-win: wrapper resolves AHEAD of a late linuxbrew-like gh re-prepend" || bad "race-win" "command -v: $t (expected $GHWRAP/gh)"
 
     # (c) write + empty mint → refuse (rc 1), no gh call, no network.
+    # stderr is DISCARDED, not parked in /tmp (your-org/nexus-code#1601): the old
+    # `2>/tmp/ghsz.$$` expanded `$$` in the INNER zsh while the cleanup `rm`
+    # expanded it in this shell — two different pids — so every run leaked one
+    # /tmp/ghsz.<pid> (146 of them measured). Nothing ever read the file.
     out=$( NEXUS_ROOT="$_repo_root" ZDOTDIR="$SHELLENV" GH_TOKEN= MINT_TOKEN_BIN="$MINT_EMPTY" \
-           zsh -c 'gh pr comment 1 --body x >/dev/null 2>/tmp/ghsz.$$; echo "rc=$?"'; rm -f /tmp/ghsz.$$ 2>/dev/null )
+           zsh -c 'gh pr comment 1 --body x >/dev/null 2>/dev/null; echo "rc=$?"' )
     case "$out" in *"rc=1"*) ok "zsh -c: write + empty mint → refuses (rc 1), no network" ;; *) bad "zsh fail-loud" "got: $out" ;; esac
 
     # (d) GH_IMPERSONATE without reason → refuse (rc 3) in real zsh.

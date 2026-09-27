@@ -77,8 +77,14 @@ make_tmux_stub() {
     cat > "$bindir/tmux" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "list-panes" && "${2:-}" == "-t" ]]; then
-    printf '%s\n' "$3" >> "$TMUX_STUB_LOG"
-    if [[ "$3" == "$TMUX_STUB_WINDOW" ]]; then
+    # The loop asks for the EXACT window, `:=<name>` (your-org/nexus-code#1524):
+    # a bare name resolves by unique PREFIX when the target is absent, and the
+    # baseline would be a sibling's pane pid. The stub models tmux: `:=` is
+    # stripped for the comparison, and a BARE name is answered as NOT FOUND, so
+    # a loop that regresses to the bare spelling stops arming here.
+    case "$3" in :=*) _w="${3#:=}" ;; *) _w="" ;; esac
+    printf '%s\n' "${_w:-BARE:$3}" >> "$TMUX_STUB_LOG"
+    if [[ -n "$_w" && "$_w" == "$TMUX_STUB_WINDOW" ]]; then
         printf '%s\n' "$TMUX_STUB_PID"
         exit 0
     fi

@@ -62,6 +62,17 @@ MON="$REPO/monitor"
 LIB="$MON/_remote_lib.sh"
 [[ -r "$LIB" ]] || th_abort "missing $LIB"
 
+# ---- population (your-org/nexus-code#1301) --------------------------------
+# Section 12's wiring census sweeps every tracked production remote script
+# (`monitor/remote-*.sh`), so a remote script added there joins this guard's
+# population. `_rpc_wiring_files` is the ONE enumerator: the census and
+# `gp_population` both call it, beside the library every section drives.
+# `gp_handle` EXITS on --population, so it sits above the first line of output.
+_rpc_wiring_files() { git -C "$REPO" ls-files -- 'monitor/remote-*.sh' 2>/dev/null | sed "s|^|$REPO/|"; }
+. "$MON/_guard_population.sh"
+gp_population() { _rpc_wiring_files; printf '%s\n' "$LIB" "$_test_dir/_test_helpers.sh"; }
+gp_handle "$@"
+
 WORK=$(mktemp -d "/tmp/tt-$$-posture.XXXXXX") || th_abort "mktemp failed"
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
@@ -468,8 +479,7 @@ _count_occurrences() {  # <name> <file...>  -> occurrences, comments dropped
 # `monitor/remote-*.sh` glob excludes both by construction; that is the intent,
 # not a coincidence, and it is why the glob is written this way.
 _WIRING_POP=()
-while IFS= read -r _f; do [[ -n "$_f" ]] && _WIRING_POP+=("$_f"); done < <(
-    git -C "$REPO" ls-files -- 'monitor/remote-*.sh' 2>/dev/null | sed "s|^|$REPO/|")
+while IFS= read -r _f; do [[ -n "$_f" ]] && _WIRING_POP+=("$_f"); done < <(_rpc_wiring_files)
 # ══ POPULATION SANITY FIRST — DO NOT DELETE THIS WHEN WIDENING THE GLOB ══
 # An empty enumeration makes BOTH counts 0, so `n_direct == 0` passes and the
 # guard reports green having examined NOTHING. A mistyped pathspec, a `git

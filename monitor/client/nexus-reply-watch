@@ -103,7 +103,20 @@
 #   2   state=failed   (terminal error — see reason=; agent may re-file /
 #                      re-enroll / alert its operator)
 #   3   state=timeout  (wall-clock lifetime budget exhausted, still pending)
+#   4   state=already-emitted — this id's terminal event was ALREADY delivered
+#                      by an earlier run; the once-only sentinel short-circuited
+#                      it. NOT a new reply and NOT a loss: a handler that treats
+#                      4 as 0 acts twice on one reply. Re-deliver on purpose
+#                      with --re-emit (see the sentinel note above).
 #   64  usage error    (bad invocation — fix the launch, not the channel)
+#   143 stopped        (SIGINT/SIGTERM, or the --stop-file appeared) — a clean
+#                      exit with NO emit. It says nothing about the request,
+#                      which is still pending on the server; re-watch the id.
+#
+#   This block is CHECKED: monitor/watcher/test-nexus-reply-watch.sh asserts its
+#   code set equals the `exit N` literals in this file plus _nexus_watch_lib.sh
+#   (your-org/nexus-code#1581 — it listed 0/2/3/64 while the code also exited 4
+#   and 143, and it is the block a client copies into a handler).
 #
 # USAGE
 #   nexus-reply-watch <id> [--poll S] [--timeout S] [--out FILE]

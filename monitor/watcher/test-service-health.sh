@@ -1262,4 +1262,214 @@ assert_eq "no live build ⇒ watcher does NOT set SVC_FORCE" \
 assert_eq "no live build ⇒ nothing was force-restarted" \
     "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "0"
 
+# ============================================================================
+# OPERATOR ALERT WHEN THE EMIT ROUTE IS UNAVAILABLE (your-org/nexus-code#1534)
+# ============================================================================
+# Measured on dev 353867a0: this module had ZERO alert-helper hits against 7 in
+# main.sh, so an emit-only service dying during an auth hold, an over-limit
+# hold or an absent target reached nobody. The two seams are driven here with
+# recorders; the module is the real one. Both premises are required — an
+# escalation AND a known-unavailable route — and each is removed in turn.
+echo "## #1534: an emit-only escalation while the emit route is BLOCKED raises the operator alert"
+OPCAP="$WORK/opalerts"; : > "$OPCAP"
+OPSTAND="$WORK/opstanding"
+_rec_op() {
+    case "${1:-}" in
+        due)      return 0 ;;
+        standing) [[ -f "$OPSTAND.${2:-}" ]] ;;
+        raise)    : > "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        clear)    rm -f "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        *)        printf '%s\n' "$*" >> "$OPCAP" ;;
+    esac
+}
+ROUTE_REASON=""            # empty = route open (rc 1); non-empty = blocked, printed
+_route() { [[ -n "$ROUTE_REASON" ]] || return 1; printf '%s' "$ROUTE_REASON"; return 0; }
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_rec_op
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_route
+
+reset_state
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn"
+NEXUS_TEST_NOW=40000 _service_health_check_tick          # detected: grace
+assert_eq "inside grace nothing is raised (not yet an escalation)" "$(grep -c '^raise' "$OPCAP")" "0"
+NEXUS_TEST_NOW=40100 _service_health_check_tick          # past grace → emit-only
+assert_eq "past grace, emit-only + blocked route → ONE raise" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+assert_contains "the text names the service and says DOWN" "$(cat "$OPCAP")" "raise service-health:myservice critical service 'myservice' is DOWN"
+assert_contains "…and carries the route's REASON (why the orchestrator cannot be told)" "$(cat "$OPCAP")" "LOGGED OUT (auth=expired)"
+assert_contains "…and the policy" "$(cat "$OPCAP")" "policy emit-only"
+NEXUS_TEST_NOW=40200 _service_health_check_tick          # still emit-only, still blocked
+assert_eq "every tick the pair holds re-raises (the primitive owns dedup and reminders)" "$(grep -c '^raise' "$OPCAP")" "2"
+# Recovery clears it.
+touch "$OKFLAG"
+NEXUS_TEST_NOW=40300 _service_health_check_tick
+assert_eq "recovery CLEARS the alert" "$(grep -c '^clear service-health:myservice ' "$OPCAP")" "1"
+assert_contains "…naming the recovery" "$(grep '^clear' "$OPCAP")" "recovered"
+
+echo "## #1534/neg: the SAME escalation with the route OPEN raises nothing (the orchestrator's to judge)"
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=""
+NEXUS_TEST_NOW=41000 _service_health_check_tick
+NEXUS_TEST_NOW=41100 _service_health_check_tick
+NEXUS_TEST_NOW=41200 _service_health_check_tick
+assert_eq "route open ⇒ no operator alert" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_file_exists "CONTROL: the emit-only escalation itself still happened" "$SHDIR/myservice.state"
+assert_eq "CONTROL: status is emit-only" "$(_sh_field "$SHDIR/myservice.state" status)" "emit-only"
+# The route closing LATER, while the escalation stands, raises on that tick.
+ROUTE_REASON="a dialog is open on the orchestrator and emits are HELD (auth hold)"
+NEXUS_TEST_NOW=41300 _service_health_check_tick
+assert_eq "the route closing while the escalation stands raises on that tick" "$(grep -c '^raise' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=41400 _service_health_check_tick
+
+echo "## #1534/neg: a blocked route with NO escalation (grace, auto-restart in progress) raises nothing"
+reset_state; : > "$OPCAP"
+set_policy auto-restart
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator is OVER-LIMIT and emits are held"
+NEXUS_TEST_NOW=42000 _service_health_check_tick          # grace
+NEXUS_TEST_NOW=42100 _service_health_check_tick          # restart attempt 1 → recovering
+assert_eq "grace/recovering are not escalations ⇒ no alert even with the route blocked" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "CONTROL: a restart was issued" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+
+echo "## #1534: FLAPPING (auto-restart ceiling) + blocked route raises too"
+reset_state; : > "$OPCAP"
+set_policy auto-restart
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=0
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator window is ABSENT (respawn pending)"
+NEXUS_TEST_NOW=43000 _service_health_check_tick   # grace
+NEXUS_TEST_NOW=43100 _service_health_check_tick   # attempt 1
+NEXUS_TEST_NOW=43101 _service_health_check_tick   # attempt 2
+NEXUS_TEST_NOW=43102 _service_health_check_tick   # attempt 3
+NEXUS_TEST_NOW=43103 _service_health_check_tick   # ceiling → flapping
+assert_eq "CONTROL: the service is flapping" "$(_sh_field "$SHDIR/myservice.state" status)" "flapping"
+assert_eq "flapping + blocked route → raised" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+assert_contains "…text says flapping" "$(grep '^raise' "$OPCAP")" "status flapping"
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=300
+touch "$OKFLAG"; NEXUS_TEST_NOW=43200 _service_health_check_tick
+assert_eq "…and recovery clears it" "$(grep -c '^clear' "$OPCAP")" "1"
+
+echo "## #1534: reclassification to a FINDING (alive) clears a standing alert"
+reset_state; : > "$OPCAP"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\temit-only\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$FINDMODE"
+ROUTE_REASON="the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn"
+NEXUS_TEST_NOW=44000 _service_health_check_tick
+NEXUS_TEST_NOW=44100 _service_health_check_tick
+assert_eq "CONTROL: raised while DOWN" "$(grep -c '^raise' "$OPCAP")" "1"
+{ printf 'tmpfs-guard: FINDING: /tmp is over threshold\nfinding-key: k1\nfinding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=44200 _service_health_check_tick
+assert_eq "a finding supersedes the incident ⇒ the alert is cleared" "$(grep -c '^clear service-health:myservice ' "$OPCAP")" "1"
+assert_contains "…naming the reclassification" "$(grep '^clear' "$OPCAP")" "reclassified"
+rm -f "$FINDMODE"
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_sh_route_blocked_noop
+
+echo "## #1601: a healthcheck that does NOT FINISH is UNKNOWN — no restart, no recovery, state untouched"
+# The check ran unbounded; a hung one stopped the whole serial tick. Bounded,
+# its outcome is neither DOWN (the caller would walk grace -> `svc.sh restart`
+# on a service whose only fault was a slow probe) nor healthy (that would close
+# a real incident on no evidence). The fixture check hangs while `hang` exists.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=50000 _service_health_check_tick            # DOWN -> grace opened
+assert_eq "PRECONDITION: the incident is in grace" "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+touch "$WD/hang"
+_t0=$SECONDS
+_log=$(NEXUS_TEST_NOW=50100 _service_health_check_tick 2>&1)   # past grace: a DOWN here restarts
+assert_eq "the tick returns within the bound instead of waiting on the hung check" \
+    "$(( SECONDS - _t0 < 10 ? 1 : 0 ))" "1"
+assert_eq "a timed-out check does NOT restart (past grace + auto-restart: a DOWN would)" \
+    "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_eq "…and the incident state is left exactly as it was (grace)" \
+    "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+assert_contains "…and the tick SAYS health is UNKNOWN, naming the bound" "$_log" "did not finish within 1s"
+# A HEALTHY service whose check hangs must not open an incident either.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=51000 _service_health_check_tick 2>/dev/null
+assert_no_file "a hung check on a service with no incident opens NONE" "$SHDIR/myservice.state"
+# CONTROL: the check's OWN `exit 124`, inside the bound, is still a failure —
+# the status alone does not make a timeout; the clock has to agree.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=5
+printf 'myservice\t%s\t./launch.sh\texit 124\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+NEXUS_TEST_NOW=52000 _service_health_check_tick 2>/dev/null
+assert_eq "CONTROL: a check's own fast exit 124 is DOWN (grace), not UNKNOWN" \
+    "$(_sh_field "$SHDIR/myservice.state" status 2>/dev/null)" "grace"
+rm -f "$WD/hang"
+
+echo "## #1631: a STANDING UNKNOWN escalates — N consecutive timed-out ticks raise, a finished check clears"
+# Before #1631 the timed-out arm `continue`d past every status and alert arm,
+# so a check hanging on EVERY tick left a healthy service healthy forever with
+# no alert. Threshold 3, bound 1; the recorder is #1534's `_rec_op`.
+reset_state; : > "$OPCAP"; rm -f "$OPSTAND".*
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_rec_op
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+export MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS=3
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=53000 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=53120 _service_health_check_tick 2>/dev/null
+assert_eq "UNKNOWN ticks 1-2 (below the threshold) raise nothing" \
+    "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "…and the sidecar counts them" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+NEXUS_TEST_NOW=53240 _service_health_check_tick 2>/dev/null
+assert_eq "UNKNOWN tick 3 (AT the threshold) raises exactly one WARNING on the unknown key" \
+    "$(grep -c '^raise service-health-unknown:myservice warning ' "$OPCAP")" "1"
+assert_contains "…naming the count, the first tick and the bound" "$(grep '^raise' "$OPCAP")" \
+    "UNKNOWN for 3 consecutive watcher ticks (since $(date -d @53000 -Is)): its healthcheck did not finish within 1s"
+assert_contains "…and saying nothing restarts on it" "$(grep '^raise' "$OPCAP")" "does NOT restart"
+assert_no_file "a healthy service's hung checks still open NO incident record (status SELECTS)" \
+    "$SHDIR/myservice.state"
+rm -f "$WD/hang"
+NEXUS_TEST_NOW=53360 _service_health_check_tick 2>/dev/null     # the check FINISHES (healthy)
+assert_eq "the first finished check clears the unknown key exactly once" \
+    "$(grep -c '^clear service-health-unknown:myservice ' "$OPCAP")" "1"
+assert_no_file "…and removes the counter" "$SHDIR/myservice.unknown"
+NEXUS_TEST_NOW=53480 _service_health_check_tick 2>/dev/null     # nothing standing: no second clear
+assert_eq "…and does not re-clear once nothing stands" \
+    "$(grep -c '^clear service-health-unknown:' "$OPCAP")" "1"
+
+echo "## #1631/control: interleaved U,U,finished,U,U never reaches 3 consecutive — no raise"
+reset_state; : > "$OPCAP"; rm -f "$OPSTAND".*
+# reset_state -> set_policy rewrites the registry, so re-plant the hang-able check.
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=54000 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=54120 _service_health_check_tick 2>/dev/null
+assert_eq "PRECONDITION: two UNKNOWN ticks counted" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+rm -f "$WD/hang"; rm -f "$OKFLAG"                              # a FINISHED check, verdict DOWN
+NEXUS_TEST_NOW=54240 _service_health_check_tick 2>/dev/null
+assert_no_file "a finished check resets the counter whatever its verdict (here DOWN)" \
+    "$SHDIR/myservice.unknown"
+touch "$WD/hang"
+NEXUS_TEST_NOW=54360 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=54480 _service_health_check_tick 2>/dev/null
+assert_eq "U,U,finished,U,U raises nothing (the run was broken)" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "CONTROL: the counter restarted at the break" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+rm -f "$WD/hang"; touch "$OKFLAG"
+
+echo "## #1631: the bound is a HARD total — a setsid grandchild cannot hold the tick open"
+# Measured before the fix: the stderr CAPTURE PIPE is held by the detached
+# grandchild, so a 1 s bound returned only when `sleep 15` did.
+reset_state; : > "$OPCAP"
+printf 'myservice\t%s\t./launch.sh\tsetsid sleep 15 & sleep 30\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+_t0=$SECONDS
+NEXUS_TEST_NOW=55000 _service_health_check_tick 2>/dev/null
+assert_eq "a 1 s bound returns in < 5 s despite a setsid grandchild holding stderr" \
+    "$(( SECONDS - _t0 < 5 ? 1 : 0 ))" "1"
+assert_eq "…and that tick counts as UNKNOWN" "$(_sh_field "$SHDIR/myservice.unknown" count)" "1"
+
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
+unset MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS
+unset MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS
+set_policy ""
+
 th_summary_and_exit

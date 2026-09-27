@@ -78,9 +78,36 @@ printf '#!/bin/bash\necho "skipped: needs a thing this host lacks"\nexit 77\n' >
 #                  Kept so the fix cannot regress the path that worked.
 printf '#!/bin/bash\necho "VERDICT-ON-STDOUT: the guard did not trip"\nexit 1\n' > "$FIX/red-stdout.sh"
 printf '#!/bin/bash\necho "VERDICT-ON-STDERR: assertion 3 failed" >&2\nexit 1\n' > "$FIX/red-stderr.sh"
+#   red-evicted.sh  the #1561 shape: the FAIL line is written EARLY and 25 lines
+#                  of unrelated stderr follow it, so a 20-line tail is filled
+#                  entirely with noise and the assertion is evicted.
+#   red-evicted-stdout.sh  the same, with the assertion on STDOUT and the noise
+#                  on stderr — the residual `_rt_failure_tail`'s own header
+#                  used to DISCLOSE rather than close.
+#   red-flood.sh   45 failing assertions, to exercise the cap.
+{
+    printf '#!/bin/bash\n'
+    printf 'echo "  FAIL: EVICTED-ASSERTION capture not written (seen=0)" >&2\n'
+    printf 'for i in $(seq 1 25); do echo "noise-line-$i: list-windows: command not found" >&2; done\n'
+    printf 'exit 1\n'
+} > "$FIX/red-evicted.sh"
+{
+    printf '#!/bin/bash\n'
+    printf 'echo "  FAIL: STDOUT-ASSERTION under stderr noise"\n'
+    printf 'for i in $(seq 1 25); do echo "noise-line-$i" >&2; done\n'
+    printf 'exit 1\n'
+} > "$FIX/red-evicted-stdout.sh"
+{
+    printf '#!/bin/bash\n'
+    printf 'for i in $(seq 1 45); do echo "  FAIL: flood-$i" >&2; done\n'
+    printf 'exit 1\n'
+} > "$FIX/red-flood.sh"
 chmod +x "$FIX"/*.sh
 
-run() { OUT=$(bash "$RUNNER" "$@" 2>&1); RC=$?; }
+# `-u KEEP_LOGS_DIR`: a band run with --keep-logs EXPORTS it, and a nested runner
+# that inherits it takes the "logs are already durable" path — so T7g/T7i, which
+# pin the NO --keep-logs behaviour, were green alone and red in-band (#1561).
+run() { OUT=$(env -u KEEP_LOGS_DIR bash "$RUNNER" "$@" 2>&1); RC=$?; }
 
 # ---- T1: timeouts are terminated, named, tallied — never passes ----------
 echo '=== T1: --timeout turns a hang into a LOUD TIMEOUT, exit 1 ==='
@@ -288,9 +315,16 @@ t6_floor=$(sed -n 's/.*probed task floor \([0-9]*\).*/\1/p'    <<<"$OUT" | head 
 # Environment-independent, and it is what makes the floor the auditable
 # quantity rather than the cap. An absent banner is a failure, not a skip:
 # it means the guard never engaged.
+#
+# A PASS LABEL IS A NAME, NOT A MEASUREMENT (your-org/nexus-code#1617, as #1574 did
+# for test-cc-auto-update.sh). T6a, T6b and the two T6d labels below carried the
+# PROBED floor, the host's task counts and a wall time, so they relabelled between
+# two runs of one tree — a plain diff of two label lists read `4 LOST / 9 NEW` for
+# an additive change. The values now print on a `note:` line beside the verdict;
+# the FAIL messages keep them, because a FAIL is read, not paired.
+printf '  note: T6a cap %s, probed floor %s, headroom 64\n' "$t6_cap" "$t6_floor"
 if [[ "$t6_cap" =~ ^[0-9]+$ && "$t6_floor" =~ ^[0-9]+$ ]] && (( t6_cap == t6_floor + 64 )); then
-    printf '  PASS: T6a cap %s == probed floor %s + headroom 64 (banner accounting is honest)\n' \
-        "$t6_cap" "$t6_floor"
+    printf '  PASS: T6a cap == probed floor + headroom 64 (banner accounting is honest)\n'
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: T6a cap %q / floor %q do not reconcile with headroom 64 (banner absent or wrong)\n' \
@@ -342,8 +376,9 @@ _t6b_verdict() {
 t6_gap=$(( t6_tasks - t6_procs ))
 case "$(_t6b_verdict "$t6_farm_ready" "$t6_floor" "$t6_procs" "$t6_tasks" "$T6_THREADS")" in
     task-scale)
-        printf '  PASS: T6b floor %s counts TASKS not processes (procs=%s tasks=%s gap=%s, needed >= %s)\n' \
+        printf '  note: T6b floor %s (procs=%s tasks=%s gap=%s, needed >= %s)\n' \
             "$t6_floor" "$t6_procs" "$t6_tasks" "$t6_gap" "$(( t6_procs + t6_gap / 2 ))"
+        printf '  PASS: T6b the floor counts TASKS not processes\n'
         PASS=$(( PASS + 1 )) ;;
     process-scale)
         # The floor IS a number and it IS too low. Only this arm has earned the
@@ -389,6 +424,52 @@ _t6c task-scale    "a task-derived floor passes"                                
 _t6c skip          "no manufactured gap → skip, not a verdict"                                   1 '600' 100 100  64
 _t6c skip          "farm not ready → skip"                                                       0 '600' 100 1000 64
 _t6c unmeasured    "unreadable procs/tasks are UNMEASURED before any arithmetic touches them"    1 '600' ''  1000 64
+
+# ---- T6d: the floor search runs in ONE helper process (#1474, plan item 1) ---
+#
+# Each FAILING shell probe costs ~15 s of bash's own EAGAIN retry backoff, the
+# search fails about three, and so every runner invocation paid ~45 s before its
+# first test (measured 45.79 s against 0.41 s with the guard off). The helper
+# does the same bisection with direct fork() calls. Asserted: it is the DEFAULT
+# instrument, it is FAST, it AGREES with the shell probe it replaces, and the
+# shell probe is still reachable — a guard that silently disengaged when an
+# optional interpreter was missing would be #863 again.
+echo '=== T6d: the fork-floor search is one helper process, and agrees with the shell probe ==='
+_t6d_floor() { local f; f=$(sed -n 's/.*probed task floor \([0-9]*\).*/\1/p' <<<"$1"); printf '%s' "${f%%$'\n'*}"; }
+t6d_t0=$SECONDS
+OUT=$(NEXUS_TEST_NPROC_GUARD=on bash "$RUNNER" "$FIX/ok-a.sh" 2>&1); t6d_rc=$?
+t6d_helper_wall=$(( SECONDS - t6d_t0 ))
+t6d_helper_floor=$(_t6d_floor "$OUT")
+assert_eq       "T6d the default run is green"                         "$t6d_rc" "0"
+if command -v python3 >/dev/null 2>&1; then
+    assert_contains "T6d the banner names the helper as the instrument" "$OUT" "probe=helper) ==="
+    # 20 s: a third of ONE failing shell probe pair, and ~30x the measured helper
+    # wall (0.6 s at load 34) — a bound on the instrument, not on the host.
+    printf '  note: T6d the helper-probed run took %ss\n' "$t6d_helper_wall"
+    assert_eq "T6d the helper-probed run finishes in under 20 s (was ~45 s)" \
+        "$(( t6d_helper_wall < 20 ))" "1"
+    OUT=$(NEXUS_TEST_NPROC_GUARD=on NEXUS_TEST_NPROC_PROBE=shell bash "$RUNNER" "$FIX/ok-a.sh" 2>&1); t6d_rc=$?
+    t6d_shell_floor=$(_t6d_floor "$OUT")
+    assert_eq       "T6d MUST-NOT-FLIP: the shell probe is still reachable and still green" "$t6d_rc" "0"
+    assert_contains "T6d …and says it was the instrument" "$OUT" "probe=shell) ==="
+    # AGREEMENT, with a tolerance that is about the HOST, not the instruments:
+    # the uid's task count moved 800 -> 1330 between two consecutive probes when
+    # this was measured, and both instruments tracked it (906/904, 1433/1391).
+    # A garbage floor is off by an order of magnitude (23 against 566, #597),
+    # which a factor-of-two band catches and ambient churn does not trip.
+    if [[ "$t6d_helper_floor" =~ ^[0-9]+$ && "$t6d_shell_floor" =~ ^[0-9]+$ ]] \
+       && (( t6d_helper_floor * 2 >= t6d_shell_floor && t6d_shell_floor * 2 >= t6d_helper_floor )); then
+        printf '  note: T6d floors: helper %s, shell %s\n' "$t6d_helper_floor" "$t6d_shell_floor"
+        printf '  PASS: T6d the two instruments agree on the floor (within 2x)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: T6d the helper floor %q and the shell floor %q disagree by more than 2x\n' "$t6d_helper_floor" "$t6d_shell_floor" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    printf '  SKIP: T6d helper timing/agreement — python3 absent, so the shell probe IS the default here\n' >&2
+    SKIP=$(( SKIP + 4 ))
+fi
 
 # ---- T7: a red must print the failing test's OWN diagnosis ------------------
 #
@@ -448,6 +529,322 @@ else
     printf '  PASS: T7d --jobs 2: no "command not found" in the run\n'
     PASS=$(( PASS + 1 ))
 fi
+
+# T7e — A FAILING SUITE MUST NOT BE ABLE TO EVICT ITS OWN ASSERTION
+# (your-org/nexus-code#1561). The tail is positional; the assertion is not.
+# POSITIVE CONTROL FIRST: the fixture must really push the assertion out of a
+# 20-line tail, or "the assertion reached the summary" proves nothing about
+# eviction — `noise-line-6` is the first line INSIDE a 20-line tail of 26, and
+# `noise-line-5` the last one OUTSIDE it.
+run --state "$WORK/t7e.tsv" "$FIX/red-evicted.sh"
+# The tail line carries its SUITE since #1571 F4's residual (`<suite>| <line>`).
+# BOTH halves of this control name the owned shape: left on the bare one, the
+# NEGATIVE half below would pass VACUOUSLY — a string the runner can no longer
+# print is absent whether or not the fixture still evicts anything.
+assert_contains "T7e control: the fixture's noise fills the tail (line 6 shown)" "$OUT" "    red-evicted.sh| noise-line-6:"
+if [[ "$OUT" == *"red-evicted.sh| noise-line-5:"* ]]; then
+    printf '  FAIL: T7e control: noise-line-5 is inside the tail — the fixture no longer evicts anything\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7e control: noise-line-5 is OUTSIDE the tail, so the assertion above it is too\n'
+    PASS=$(( PASS + 1 ))
+fi
+assert_contains "T7e the evicted assertion still reaches the summary" \
+    "$OUT" "FAIL: EVICTED-ASSERTION capture not written (seen=0)"
+assert_contains "T7e …with its line number, which says how far above the tail it sat" \
+    "$OUT" "    red-evicted.sh:1:  FAIL: EVICTED-ASSERTION"
+assert_contains "T7e the tail states how much it left out" "$OUT" "stderr: last 20 of 26 lines"
+
+# T7f — the assertion on STDOUT while stderr carries only noise. Before #1561
+# `_rt_failure_tail` returned after the stderr tail and never opened `.out`.
+run --state "$WORK/t7f.tsv" "$FIX/red-evicted-stdout.sh"
+assert_contains "T7f a stdout assertion is surfaced even when stderr is non-empty" \
+    "$OUT" "FAIL: STDOUT-ASSERTION under stderr noise"
+assert_contains "T7f …and is attributed to stdout" "$OUT" "failing-assertion line(s) on stdout"
+
+# T7g — the full log of a red is KEPT without --keep-logs, and the row says
+# where. The kept file must be the WHOLE stream (26 lines), not the tail.
+run --state "$WORK/t7g.tsv" "$FIX/red-evicted.sh"
+t7g_path=$(sed -n 's/^    full logs (kept): \(.*\)\.{out,err}$/\1/p' <<<"$OUT"); t7g_path=${t7g_path%%$'\n'*}
+if [[ -n "$t7g_path" && -f "$t7g_path.err" ]]; then
+    assert_eq "T7g the kept stderr is the WHOLE stream, not the tail" \
+        "$(wc -l < "$t7g_path.err" | tr -d ' ')" "26"
+    assert_eq "T7g the kept log lives under the runner's state dir" \
+        "$([[ "$t7g_path" == "$NEXUS_TEST_STATE_DIR/failed-logs/"* ]] && echo yes || echo no)" "yes"
+else
+    printf '  FAIL: T7g no kept-log path printed for a red (got %q)\n' "$t7g_path" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# MUST-NOT: a GREEN run keeps nothing and creates no failed-logs run dir.
+t7g_before=$(find "$NEXUS_TEST_STATE_DIR/failed-logs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+run --state "$WORK/t7g2.tsv" "$FIX/ok-a.sh"
+t7g_after=$(find "$NEXUS_TEST_STATE_DIR/failed-logs" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "T7g a green run keeps no logs" "$t7g_after" "$t7g_before"
+if [[ "$OUT" == *"full logs"* || "$OUT" == *"failing-assertion"* ]]; then
+    printf '  FAIL: T7g a green run printed failure furniture\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7g a green run prints no failure furniture\n'; PASS=$(( PASS + 1 ))
+fi
+
+# T7j — A CEILING-OVERRIDE ROW APPLIES UNDER --jobs > 1 (your-org/nexus-code#1474).
+# The row is looked up by BASENAME in the runner's REAL ceiling-overrides.tsv,
+# through the runner's REAL path resolution — no `_RT_CEILING_FILE` handed in,
+# because handing it in is exactly how the probe that "verified" this was
+# blind. The fixture borrows the basename of a suite that has a row (3600 s),
+# sleeps 3 s, and runs under --timeout 1: it passes only if the row is read.
+mkdir -p "$WORK/ceil"
+printf '#!/bin/bash\nsleep 3\necho "  PASS: slept"\necho "ALL TESTS PASSED (1 assertions)"\n' > "$WORK/ceil/test-guards-for-diff.sh"
+cp "$FIX/ok-a.sh" "$WORK/ceil/test-ok-a.sh"
+assert_eq "T7j control: the real manifest still carries a row for the borrowed basename" \
+    "$(awk -F'\t' '!/^[[:space:]]*#/ && $1=="test-guards-for-diff.sh" && $2+0 > 600 {n++} END{print n+0}' "$_test_dir/ceiling-overrides.tsv")" "1"
+OUT=$(env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE -u NEXUS_TEST_CEILING_FILE bash "$RUNNER" --jobs 2 --timeout 1 "$WORK/ceil/test-guards-for-diff.sh" "$WORK/ceil/test-ok-a.sh" 2>&1); RC=$?
+assert_eq "T7j --jobs 2: a suite with an override row is NOT cut off at the run ceiling (rc 0)" "$RC" "0"
+if [[ "$OUT" == *"TIMEOUT  test-guards-for-diff.sh"* ]]; then
+    printf '  FAIL: T7j --jobs 2: the override row was INERT — the suite was TIMEOUT-killed at the 1 s run ceiling\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7j --jobs 2: no TIMEOUT row for the overridden suite\n'; PASS=$(( PASS + 1 ))
+fi
+# MUST-NOT-FLIP: serially the row always applied (BASH_SOURCE is set there).
+OUT=$(env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE -u NEXUS_TEST_CEILING_FILE bash "$RUNNER" --jobs 1 --timeout 1 "$WORK/ceil/test-guards-for-diff.sh" 2>&1); RC=$?
+assert_eq "T7j control: --jobs 1 honours the row too (it always did)" "$RC" "0"
+# …and a suite WITHOUT a row is still cut off: the fix must not unbound anything.
+printf '#!/bin/bash\nsleep 30\n' > "$WORK/ceil/test-no-row-here.sh"
+OUT=$(env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE -u NEXUS_TEST_CEILING_FILE bash "$RUNNER" --jobs 2 --timeout 1 "$WORK/ceil/test-no-row-here.sh" "$WORK/ceil/test-ok-a.sh" 2>&1); RC=$?
+assert_contains "T7j control: a suite with NO row still TIMEOUTs at the run ceiling" "$OUT" "TIMEOUT  test-no-row-here.sh"
+
+# T7k — (skeptic F3 on #1569) the runner's INTERNAL path is never inherited, and
+# an unreadable file is SAID. A nested runner of another tree used to take the
+# outer tree's rows through the exported internal name; and a missing file was
+# answered by silently returning the run ceiling — the inert-rows defect's own
+# shape, still armed for its next trigger.
+OUT=$(_RT_CEILING_FILE=/nonexistent/inherited.tsv env -u KEEP_LOGS_DIR -u NEXUS_TEST_CEILING_FILE bash "$RUNNER" --jobs 2 --timeout 1 "$WORK/ceil/test-guards-for-diff.sh" "$WORK/ceil/test-ok-a.sh" 2>&1); RC=$?
+assert_eq "T7k an INHERITED internal _RT_CEILING_FILE is ignored: the run uses its own tree's rows (rc 0)" "$RC" "0"
+OUT=$(NEXUS_TEST_CEILING_FILE=/nonexistent/asked-for.tsv env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE bash "$RUNNER" --jobs 2 --timeout 1 "$WORK/ceil/test-guards-for-diff.sh" "$WORK/ceil/test-ok-a.sh" 2>&1); RC=$?
+assert_contains "T7k a caller-supplied file that is unreadable is SAID, by path" "$OUT" "ceiling overrides: /nonexistent/asked-for.tsv is NOT READABLE"
+assert_contains "T7k …and the consequence still happens (the row is gone, the suite is cut off)" "$OUT" "TIMEOUT  test-guards-for-diff.sh"
+# MUST-NOT-FLIP: a readable file prints no such line.
+OUT=$(env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE -u NEXUS_TEST_CEILING_FILE bash "$RUNNER" --jobs 1 "$FIX/ok-a.sh" 2>&1)
+if [[ "$OUT" == *"NOT READABLE"* ]]; then
+    printf '  FAIL: T7k a readable overrides file still printed the NOT READABLE line\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7k a readable overrides file prints no warning\n'; PASS=$(( PASS + 1 ))
+fi
+
+# T7l — (#1574 G2, G3) the file is judged by what it DOES. Each of these passes
+# `[[ -r ]]`, so before #1574 each was SILENT and the suite was cut off at the
+# run ceiling with nothing to say why. The realistic one is the first: a row
+# typed with SPACES in a hand-maintained TSV.
+_ceil_run() {   # <overrides-file> -> OUT, RC
+    OUT=$(NEXUS_TEST_CEILING_FILE="$1" env -u KEEP_LOGS_DIR -u _RT_CEILING_FILE bash "$RUNNER" --jobs 2 --timeout 1 "$WORK/ceil/test-guards-for-diff.sh" "$WORK/ceil/test-ok-a.sh" 2>&1); RC=$?
+}
+printf '# a comment\ntest-guards-for-diff.sh 3600 typed with spaces\n' > "$WORK/ceil-spaces.tsv"
+_ceil_run "$WORK/ceil-spaces.tsv"
+assert_contains "T7l a SPACE-delimited row is called INERT, at startup"          "$OUT" "has 1 INERT row(s)"
+assert_contains "T7l …and the offending line is NAMED by number"               "$OUT" "line 2: test-guards-for-diff.sh 3600 typed with spaces"
+assert_contains "T7l …and the consequence still happens (the row never applied)" "$OUT" "TIMEOUT  test-guards-for-diff.sh"
+assert_contains "T7l …and the note is REPEATED beside the verdict (G3), not only thousands of lines above it" \
+    "$OUT" "NOTE (said at startup too): ceiling overrides:"
+printf 'test-guards-for-diff.sh\t3600\r\n' > "$WORK/ceil-crlf.tsv"
+_ceil_run "$WORK/ceil-crlf.tsv"
+assert_contains "T7l a two-column CRLF row is INERT too (\`3600<CR>\` is not a number)" "$OUT" "has 1 INERT row(s)"
+: > "$WORK/ceil-empty.tsv"
+_ceil_run "$WORK/ceil-empty.tsv"
+assert_contains "T7l an EMPTY file parses to ZERO usable rows, and says so"       "$OUT" "parsed to ZERO usable rows"
+mkdir -p "$WORK/ceil-dir.tsv"
+_ceil_run "$WORK/ceil-dir.tsv"
+assert_contains "T7l a DIRECTORY passes \`[[ -r ]]\` and is still ZERO usable rows" "$OUT" "parsed to ZERO usable rows"
+# MUST-NOT-FLIP: a well-formed row, with a trailing CR on a LATER column, is
+# neither inert nor warned about — and it APPLIES (rc 0, no TIMEOUT).
+printf 'test-guards-for-diff.sh\t3600\t12.5\ta note\r\n' > "$WORK/ceil-good.tsv"
+_ceil_run "$WORK/ceil-good.tsv"
+assert_eq           "T7l a well-formed row still APPLIES (rc 0)"                  "$RC" "0"
+# The suite's own negative idiom: it defines `assert_eq`/`assert_contains` and
+# NOT `assert_not_contains`. A first cut of these two rows called the helper
+# anyway — rc 127, counted by nothing, and the suite still printed ALL TESTS
+# PASSED with two assertions missing. Caught by arithmetic (84 + 10 != 92),
+# because this suite carries no count guard.
+for _neg in 'INERT row|T7l …with no warning at startup' 'NOTE (said at startup too)|T7l …and no note in the verdict section'; do
+    if [[ "$OUT" == *"${_neg%%|*}"* ]]; then
+        printf '  FAIL: %s — found %q\n' "${_neg#*|}" "${_neg%%|*}" >&2; FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: %s\n' "${_neg#*|}"; PASS=$(( PASS + 1 ))
+    fi
+done
+
+# T7n — AN UNTERMINATED FINAL LINE IS STILL A LINE (#1571 F4 regression, caught by
+# the rtev skeptic). The skeptic proved the construct and said reachability was
+# UNMEASURED; this fixture makes it reachable by construction, which is the part
+# that keeps the fix honest — a suite whose last write has no newline is exactly
+# what a `printf` without `\n`, or a process killed mid-write, leaves behind.
+#
+# BOTH assertions are needed and they fail the same way alone: before the fix the
+# loop DROPPED the line and `wc -l` MISSED it, so the header said 2 and the body
+# printed 2 — internally consistent and both wrong. A reader checking one against
+# the other got a false confirmation, so the count is asserted as well as the text.
+{ printf '#!/usr/bin/env bash\n'
+  printf 'printf "  FAIL: unterm-case — got x want y\\n" >&2\n'
+  printf 'printf "noise-before-the-end\\n" >&2\n'
+  printf 'printf "TAIL-LAST-NO-NEWLINE" >&2\n'
+  printf 'exit 1\n'; } > "$FIX/red-unterminated.sh"
+chmod +x "$FIX/red-unterminated.sh"
+run --state "$WORK/t7n.tsv" "$FIX/red-unterminated.sh"
+assert_contains "T7n the unterminated FINAL line is printed, with its suite" \
+    "$OUT" "    red-unterminated.sh| TAIL-LAST-NO-NEWLINE"
+assert_contains "T7n …and the header COUNTS it (3, not the 2 newlines)" \
+    "$OUT" "--- red-unterminated.sh: stderr: all 3 line(s) ---"
+
+# T7o — A NON-NUMERIC ACCOUNTING FLOOR MUST NOT KILL THE RUN (your-org/nexus-code
+# #1616). `: "${NEXUS_ASSERT_ACCOUNTING_FLOOR:=20}"` guards UNSET, not SHAPE, so a
+# leaked non-numeric value survived the default-assign and reached `(( … ))`, where
+# bash reads the string as a VARIABLE NAME, finds it unset, and under `set -u`
+# aborts the runner. Measured at the merge-base d58bc49a, in its own tree: the
+# suite RAN (one PASS row) and the runner then died at `line 3839: SENT: unbound
+# variable`, closing `STOPPED WITHOUT REACHING A VERDICT`.
+#
+# THAT IS THIS BUNDLE'S OWN SUBJECT, which is why the fix lives here rather than
+# elsewhere: the log it leaves reads `selected=1 reported=1 pass=1` — every row
+# present, none red — with NO END marker, so band-verdict.sh calls it
+# `class=aborted` rc 4, while a reader grepping PASS rows would call it a pass.
+# The bundle already DETECTS that shape; it should not also be able to CAUSE it.
+printf '#!/usr/bin/env bash\necho "  PASS: ok"\necho "=== summary: 1 passed, 0 failed ==="\necho "ALL TESTS PASSED"\n' > "$FIX/floor-ok.sh"
+chmod +x "$FIX/floor-ok.sh"
+OUT=$(NEXUS_ASSERT_ACCOUNTING_FLOOR=SENT env -u KEEP_LOGS_DIR bash "$RUNNER" --timeout 60 "$FIX/floor-ok.sh" 2>&1); RC=$?
+assert_eq       "T7o a NON-NUMERIC floor no longer aborts the runner (rc 0)" "$RC" "0"
+assert_contains "T7o …the run reaches its VERDICT rather than dying without one" "$OUT" "=== run-tests: END rc=0 (COMPLETE and green) ==="
+assert_contains "T7o …and the override is SAID, not silent"                      "$OUT" "is not a non-negative integer — using 20"
+# MUST-NOT-FLIP: a well-formed floor is untouched and says nothing.
+OUT=$(NEXUS_ASSERT_ACCOUNTING_FLOOR=25 env -u KEEP_LOGS_DIR bash "$RUNNER" --timeout 60 "$FIX/floor-ok.sh" 2>&1); RC=$?
+assert_eq "T7o MUST-NOT-FLIP: a numeric floor still runs clean (rc 0)" "$RC" "0"
+if [[ "$OUT" == *"is not a non-negative integer"* ]]; then
+    printf '  FAIL: T7o a VALID floor was overridden — the guard fires on good input\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7o …and a VALID floor triggers no override message\n'; PASS=$(( PASS + 1 ))
+fi
+
+# T7h — the cap is bounded AND says what it dropped, first lines kept.
+run --state "$WORK/t7h.tsv" "$FIX/red-flood.sh"
+assert_contains "T7h the count is the TRUE total, not the cap" "$OUT" "45 failing-assertion line(s) on stderr"
+# …and every line names its SUITE (#1571 F4), in the `grep -Hn` shape.
+assert_contains "T7h the first failure is kept, and says whose it is" "$OUT" "    red-flood.sh:1:  FAIL: flood-1"
+assert_contains "T7h the dropped remainder is counted"         "$OUT" "and 5 more (first 40 shown)"
+
+# T7i — the parallel path again: three new helpers, each of which is `command
+# not found` in an xargs child unless exported (T7d's hazard, new members).
+run --jobs 2 --state "$WORK/t7i.tsv" "$FIX/red-evicted.sh" "$FIX/red-evicted-stdout.sh"
+assert_contains "T7i --jobs 2: the evicted assertion survives the dispatcher" "$OUT" "FAIL: EVICTED-ASSERTION"
+assert_contains "T7i --jobs 2: the kept-log line survives the dispatcher"     "$OUT" "full logs (kept):"
+# THE POINT OF #1571 F4: at --jobs 2 the two reds' blocks INTERLEAVE, and each
+# assertion line must still say whose it is. Asserted per line, for BOTH suites,
+# and that NO assertion line is left bare — a bare one is the unattributable
+# line the skeptic measured.
+assert_contains "T7i --jobs 2: the stderr red's assertion line names its suite" "$OUT" "    red-evicted.sh:"
+assert_contains "T7i --jobs 2: the stdout red's assertion line names its suite" "$OUT" "    red-evicted-stdout.sh:"
+assert_eq       "T7i --jobs 2: NO failing-assertion line is left unattributed" \
+    "$(grep -acE '^    [0-9]+:[[:space:]]*(FAIL|✗|not ok)' <<<"$OUT" || true)" "0"
+# …AND THE TAIL (#1571 F4, the residual). e34a03ba attributed the assertion
+# lines and left the tail bare: measured at d58bc49a, two reds at --jobs 2
+# interleaved line by line and their tail lines had no owner. The tail is the
+# ONLY evidence for a suite whose failure is not spelled `FAIL:`. Both fixtures
+# write `noise-line-<i>` to stderr, so a bare one is countable — and the
+# POSITIVE CONTROL comes first, because "0 bare lines" is also what a runner
+# that printed no tail at all would score.
+assert_contains "T7i --jobs 2: a tail line names its suite (stderr red)"  "$OUT" "    red-evicted.sh| noise-line-25"
+assert_contains "T7i --jobs 2: a tail line names its suite (stdout red)"  "$OUT" "    red-evicted-stdout.sh| noise-line-25"
+assert_contains "T7i --jobs 2: the tail HEADER names its suite too"       "$OUT" "--- red-evicted-stdout.sh: stderr: last 20 of"
+assert_eq       "T7i --jobs 2: NO tail line is left unattributed" \
+    "$(grep -acE '^    noise-line-[0-9]+' <<<"$OUT" || true)" "0"
+if grep -qE '_rt_[a-z_]+: command not found' <<<"$OUT"; then
+    printf '  FAIL: T7i --jobs 2: a #1561 helper is missing from the parallel children\n' >&2; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: T7i --jobs 2: no runner helper is "command not found"\n'; PASS=$(( PASS + 1 ))
+fi
+
+# T7m — (#1571 F5, the CLASS) the runner's caller-facing inputs do not reach the
+# SUITE it launches. Measured at 4a2bc49b: 16 runner-nesting suites under an
+# outer --keep-logs left 226 files in that dir where 32 were their own. Called
+# DIRECTLY, not through `run`, which unsets KEEP_LOGS_DIR itself.
+mkdir -p "$WORK/t7m-keep" "$WORK/t7m-fx"
+printf '#!/usr/bin/env bash\nprintf "SAW keep=%%s rr=%%s rm=%%s ceil=%%s state=%%s slow=%%s\\n" "${KEEP_LOGS_DIR:-unset}" "${NEXUS_TEST_REQUIRE_RUN:-unset}" "${NEXUS_TEST_REQUIRE_MEASURED:-unset}" "${NEXUS_TEST_CEILING_FILE:-unset}" "${NEXUS_TEST_STATE_DIR:+set}" "${SLOW_TESTS:-unset}"\necho "  PASS: looked"\necho "=== summary: 1 passed, 0 failed ==="\necho "ALL TESTS PASSED"\n' > "$WORK/t7m-fx/test-t7m-env.sh"
+cp "$WORK/t7m-fx/test-t7m-env.sh" "$WORK/t7m-fx/test-t7m-env-b.sh"; chmod +x "$WORK/t7m-fx"/*.sh
+for _j in 1 2; do
+    rm -f "$WORK/t7m-keep"/*
+    SLOW_TESTS=1 NEXUS_TEST_CEILING_FILE="$WORK/ceil-good.tsv" env -u _RT_CEILING_FILE bash "$RUNNER" --jobs "$_j" --require-run \
+        --keep-logs "$WORK/t7m-keep" "$WORK/t7m-fx/test-t7m-env.sh" "$WORK/t7m-fx/test-t7m-env-b.sh" >"$WORK/t7m.out" 2>&1
+    _saw=$(cat "$WORK/t7m-keep/t7m-fx__test-t7m-env.sh.out" 2>/dev/null | grep -a '^SAW ' || true)
+    assert_contains "T7m --jobs $_j: the suite does NOT inherit the outer --keep-logs / --require-run / ceiling file" \
+        "$_saw" "SAW keep=unset rr=unset rm=unset ceil=unset"
+    # MUST-NOT-FLIP: the keep-list still passes through (the helper's reasons).
+    assert_contains "T7m --jobs $_j: …while NEXUS_TEST_STATE_DIR and the suite gates still reach it" \
+        "$_saw" "state=set slow=1"
+done
+# THE RATCHET, AND ITS REACH STATED RATHER THAN IMPLIED. `_RT_SUITE_ENV_SCRUB` is
+# hand-kept, and a hand-kept list is a denylist with a permissive default, so an
+# input the derivation SEES must be classified here and a new one is red until
+# somebody decides. UNDECIDED is a real class and says so: those inherit exactly
+# as before this change.
+#
+# ERROR DIRECTION, because this ratchet is a predicate over source text and the
+# first version of this comment claimed a reach it does not have (found by the
+# rtev skeptic, delta 2). `th_runner_env_inputs` matches SIX NAME FAMILIES —
+# NEXUS_TEST_*, KEEP_LOGS_DIR, RT_*, SLOW_TESTS, RUN_INTEGRATION, RUN_CC_HARNESS
+# — so the ratchet covers "every input the DERIVATION SEES", NOT "every env input
+# the runner reads". Measured with a `${NAME[:}#%/+=?-]}` probe over the same file:
+# the derivation sees 15 of 28 OCCURRENCES IN THE FILE, so 13 are invisible here.
+# OCCURRENCES IN THE FILE, not reads in the CODE, and the distinction is not
+# pedantry: a grep counts comments. Exactly one token is comment-only —
+# RUN_INTEGRATION, whose sole `${…}` form is documentation at run-tests.sh:659
+# while its only real use greps a TEST FILE for the literal string — so the
+# code-only figures are 14 of 27. **13 is invariant** (28-15 = 27-14) because that
+# name is in BOTH sets and cancels, which is why the load-bearing number survives
+# the correction while both absolutes were wrong. The
+# caller-facing ones (no unconditional assignment anywhere, read with a default)
+# are NEXUS_ASSERT_ACCOUNTING_FLOOR, NEXUS_CEILING_ADJACENT_PCT,
+# NEXUS_CI_BASH_VERSION_FILE, NEXUS_KNOWN_LOCAL_RED, NEXUS_TMUX_SOCKET_CHECK and
+# NEXUS_STATE_DIR; the rest are internals like PER_TEST_TIMEOUT and TALLY_FILE, or
+# the deliberately handled TMPDIR/TMUX_TMPDIR, or the nexus prelude's BASH_ENV. An
+# input added OUTSIDE the six families is therefore not red, not classified, and
+# not a decision anybody is asked to make — the UNDER-covering direction, which is
+# the safe one, but it must be said rather than left for a reader to discover.
+#
+# THE FIRST VERSION OF THIS NOTE SAID 27 AND 12, FROM A `${NAME:-}` PROBE — and it
+# was itself an under-count by the very mechanism it exists to describe (the rtev
+# skeptic's third delta). A `:-` probe cannot see a default-ASSIGN: the one name in
+# the difference, NEXUS_ASSERT_ACCOUNTING_FLOOR, is read `: "${NAME:=20}"` at
+# run-tests.sh:3925, and it is the WORST one to have missed — an inherited value
+# WINS under `:=` (measured: 9999 survives), and raising it suppresses the
+# broken-accounting detector at :3926 (`_n_pass_files >= FLOOR`), which is the
+# fail-open direction. If you widen this measurement again, reconcile BY NAME and
+# not by the delta: 27 was a strict SUBSET of 28, which is the only reason the
+# single missing name could be identified at all.
+#
+# DELIBERATELY NOT WIDENED here: `th_scrub_inherited_runner_env` UNSETS everything
+# the derivation returns minus its keep-list, so broadening the alternation to
+# `NEXUS_[A-Z_]+` would start unsetting NEXUS_STATE_DIR and friends inside every
+# nesting suite. That is a behavioural change with a blast radius of its own and
+# belongs to a change that can measure it, not to a label fix.
+_t7m_scrub=' KEEP_LOGS_DIR NEXUS_TEST_REQUIRE_MEASURED NEXUS_TEST_REQUIRE_RUN NEXUS_TEST_CEILING_FILE '
+_t7m_keep=' NEXUS_TEST_JOBS NEXUS_TEST_DEADLINE_SCALE NEXUS_TEST_STATE_DIR SLOW_TESTS RUN_INTEGRATION RUN_CC_HARNESS '
+_t7m_undecided=' NEXUS_TEST_NPROC_GUARD NEXUS_TEST_NPROC_HEADROOM NEXUS_TEST_NPROC_PROBE NEXUS_TEST_PRIVATE_ROOT_BASE NEXUS_TEST_REQUIRE_CI_PARITY NEXUS_TEST_SHELL NEXUS_TEST_TIMEOUT RT_FAILED_LOGS_DIR '
+_t7m_unclassified=''; _t7m_n=0
+while IFS= read -r _v; do
+    [[ -n "$_v" ]] || continue
+    _t7m_n=$(( _t7m_n + 1 ))
+    case "$_t7m_scrub$_t7m_keep$_t7m_undecided" in *" $_v "*) ;; *) _t7m_unclassified+="$_v " ;; esac
+done < <(bash -c '. "$1" >/dev/null 2>&1; th_runner_env_inputs "$2"' _ "$_test_dir/_test_helpers.sh" "$RUNNER")
+# ^ In a SUBSHELL: this suite defines its own assert_* and does not source
+#   _test_helpers.sh, so a bare `th_runner_env_inputs` here is rc 127, counted
+#   by nothing — and the CONTROL below is what would have said so.
+assert_eq "T7m ratchet: every input the DERIVATION SEES is classified (scrub / keep / undecided) — six name families, not every env input the runner reads" "$_t7m_unclassified" ""
+# A derivation broken into finding nothing would pass the line above vacuously.
+if (( _t7m_n >= 10 )); then
+    printf '  PASS: T7m ratchet CONTROL: the derivation found %d inputs (floor 10)\n' "$_t7m_n"; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: T7m ratchet CONTROL: the derivation found only %d inputs — the line above is vacuous\n' "$_t7m_n" >&2; FAIL=$(( FAIL + 1 ))
+fi
+for _v in $_t7m_scrub; do
+    case " $(sed -n "s/^export _RT_SUITE_ENV_SCRUB='\(.*\)'\$/\1/p" "$RUNNER") " in *" $_v "*) ;; *) _t7m_unclassified+="MISSING-FROM-RUNNER:$_v " ;; esac
+done
+assert_eq "T7m ratchet: and the runner's own list carries every name this test calls scrubbed" "$_t7m_unclassified" ""
 
 # ---- summary ---------------------------------------------------------------
 echo

@@ -221,8 +221,10 @@
 #   PASTE_NG_BIN      `ng` binary for the action-log append.
 #   PASTE_CONFIRM_POLL_SECONDS   confirmation poll interval (default 0.3).
 #
-# tmux ≥ 2.6 compatible: set-buffer -b / paste-buffer -b / send-keys
-# only.
+# tmux ≥ 2.6 compatible: load-buffer -b / paste-buffer -b / send-keys
+# only. The payload reaches tmux as a FILE, never as an argv element — tmux
+# 2.6's command-list rule ate a trailing `;` from `set-buffer -- "$MSG"`
+# (your-org/nexus-code#1590).
 
 set -uo pipefail
 
@@ -523,6 +525,19 @@ command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
 # now go through `resolve_window_key`, so they cannot disagree. The NAME stays
 # the durable key everything below targets by; this only widens what a caller
 # may TYPE.
+# THE SESSION THE KEY NAMED IS PARSED HERE, BEFORE THE RESOLVER RUNS — not read
+# back from it (your-org/nexus-code#1321, completing #944). `resolve_window_key`
+# publishes `RESOLVED_WINDOW_SESSION` for exactly this caller, and this caller
+# invokes it inside `$( )`: a SUBSHELL, whose variables die with it. So the
+# published session never arrived, `_PF_SESSION` below was ALWAYS empty, and
+# `#944`'s second half — "carry the session, or the re-resolution looks in the
+# current one" — was inert in its only consumer. Its test stayed green because
+# it calls the resolver BARE (`resolve_window_key … >/dev/null`), which is not
+# how production calls it: the linkage was asserted in a calling convention
+# nothing uses. Same rule the resolver itself states: `validate_window_name`
+# forbids `:` in a name, so a colon in the key is always the session delimiter.
+_PF_KEY_SESSION=""
+[[ "$WINDOW" == *:* ]] && _PF_KEY_SESSION="${WINDOW%%:*}"
 _wkey_rc=0
 _RESOLVED_WINDOW=$(resolve_window_key "$WINDOW") || _wkey_rc=$?
 case "$_wkey_rc" in
@@ -564,7 +579,7 @@ fi
 # message guessed "race with a close?" for all of them.
 # Carry the SESSION the key named, or this re-resolution looks in the current
 # one and reports a cross-session window as closed (your-org/nexus-code#944).
-_PF_SESSION="${RESOLVED_WINDOW_SESSION:-}"
+_PF_SESSION="$_PF_KEY_SESSION"
 _wid_rc=0
 WIN_ID=$(resolve_window_id "$WINDOW" "$_PF_SESSION") || _wid_rc=$?
 if (( _wid_rc == 1 )); then
@@ -608,6 +623,48 @@ export NEXUS_STATE_DIR="$STATE_DIR"
 if [[ -r "$_script_dir/_submit_evidence.sh" ]]; then
     . "$_script_dir/_submit_evidence.sh"
 fi
+# ---- THE confirmed-delivery primitive (your-org/nexus-code#1591, #1590) ----
+#
+# The paste, the Enter, the confirmation and the Enter retry are no longer
+# hand-rolled here: monitor/_paste-deliver.sh is the ONE implementation, shared
+# with the watcher's three paste paths, and it holds the tree's only
+# `tmux paste-buffer`. FAIL CLOSED when it is missing — a paste tool that
+# cannot reach its paste primitive must refuse, not improvise a second one.
+# shellcheck source=monitor/_paste-deliver.sh
+if [[ -r "$_script_dir/_paste-deliver.sh" ]]; then
+    . "$_script_dir/_paste-deliver.sh"
+fi
+declare -F pd_paste_file >/dev/null 2>&1 \
+    || die "cannot load $_script_dir/_paste-deliver.sh — refusing to paste without the confirmed-delivery primitive (your-org/nexus-code#1591)"
+
+# THE BYTES GO THROUGH A FILE, NEVER ARGV (your-org/nexus-code#1590). This used
+# to be `tmux set-buffer -b "$BUF" -- "$MSG"`, and tmux 2.6 applies its
+# command-list rule to that DATA argument: a message whose last character is
+# `;` silently lost it, and a message that was exactly `;` failed outright.
+# `load-buffer` reads bytes. `printf '%s'` writes exactly $MSG — the same bytes
+# the argv form was meant to carry, no trailing newline added.
+#
+# NORMALISED before the digest, not after (#1591): Claude Code >= 2.1.277
+# removes invisible characters from a prompt before recording it, so a digest
+# over the raw bytes could never match the transcript. Normalising first keeps
+# `digest=` a description of the bytes that are actually pasted. What the
+# normaliser deliberately leaves alone, and why it may: _paste-deliver.sh.
+_PF_TMP=$(mktemp -d "${TMPDIR:-/tmp}/nexus-followup.XXXXXX") \
+    || die "cannot create a temp dir for the paste payload"
+trap 'rm -rf "$_PF_TMP"' EXIT
+printf '%s' "$MSG" > "$_PF_TMP/raw" || die "cannot write the paste payload to $_PF_TMP"
+PASTE_FILE="$_PF_TMP/raw"
+NORMALISED_BYTES=0
+if pd_normalise_file "$_PF_TMP/raw" "$_PF_TMP/norm" && (( PD_NORMALISED_BYTES > 0 )); then
+    NORMALISED_BYTES=$PD_NORMALISED_BYTES
+    PASTE_FILE="$_PF_TMP/norm"
+    # `$(…; printf x)` so a trailing newline the normaliser produced (U+2028 ->
+    # LF at the very end) is not eaten by command substitution.
+    MSG=$(cat "$_PF_TMP/norm"; printf x); MSG="${MSG%x}"
+    printf 'paste-followup: removed %s byte(s) of invisible characters before pasting — Claude Code >= 2.1.277 holds a prompt that carries them for review instead of sending it (your-org/nexus-code#1591)\n' \
+        "$NORMALISED_BYTES" >&2
+fi
+
 PASTE_DIGEST=""
 if declare -F se_paste_digest >/dev/null 2>&1; then
     PASTE_DIGEST=$(se_paste_digest "$MSG" 2>/dev/null) || PASTE_DIGEST=""
@@ -655,20 +712,12 @@ _write_paste_sidecar() {
 
 # ---- submission post-condition (issue #507) --------------------------
 
-# A TUI-submission record. See the header for why `promptSource` is the
-# discriminator and why "a new user message" is not.
-_JQ_SUBMISSION='
-select(.type == "user")
-| select((.isMeta // false) | not)
-| select((.isSidechain // false) | not)
-| select(
-    if has("promptSource") then
-        (.promptSource != "system" and .promptSource != "sdk")
-    else
-        ((.message.content | type) == "string")
-    end
-  )
-| 1'
+# WHAT A TUI-SUBMISSION RECORD IS lives in ONE place now: `_SE_JQ_SELECT` in
+# monitor/_submit_evidence.sh, read by monitor/_paste-deliver.sh. This file used
+# to carry a byte-identical copy, with a contract test asserting the two had
+# not drifted; there is no second copy left to drift (your-org/nexus-code#1591).
+# See the header for why `promptSource` is the discriminator and why "a new
+# user message" is not.
 
 # Claude Code homes to search, most specific first. NEXUS_CC_HOME, when
 # set, is the ONLY root consulted (hermetic-test seam).
@@ -719,30 +768,6 @@ _file_size() {
     printf '%s' "$n"
 }
 
-# Count TUI submissions among the bytes appended after byte offset `base`.
-#
-# Byte offset, not line offset, and the difference is not cosmetic: a
-# live worker transcript reaches hundreds of MB (792 MB observed on this
-# operator), so `tail -n +N` — which must scan from byte 0 to count
-# lines — costs ~0.25 s per poll, ~17 s per paste. `tail -c +N` seeks
-# straight to the offset: 0.007 s, and O(1) in file size.
-#
-# The price of a byte offset is that it may land mid-line if we stat
-# while a line is being appended, and jq aborts the whole stream on one
-# malformed value. `^\{.*\}$` is the cheap, total guard: a leading
-# fragment is some line's TAIL (never starts with `{`), a trailing
-# fragment is some line's HEAD (never ends with `}`), and JSONL forbids
-# raw newlines inside strings, so no complete record is ever rejected.
-_submissions_since() {
-    local t="$1" base="$2" n
-    [[ -f "$t" ]] || { printf '0'; return 0; }
-    n=$(tail -c +"$(( base + 1 ))" "$t" 2>/dev/null \
-        | grep -E '^\{.*\}$' 2>/dev/null \
-        | jq -c "$_JQ_SUBMISSION" 2>/dev/null | wc -l) || n=0
-    n="${n//[^0-9]/}"
-    printf '%s' "${n:-0}"
-}
-
 # Evidence (b): the worker's own UserPromptSubmit stamp advanced past
 # our paste, in the session we baselined against.
 _hook_stamp_confirms() {
@@ -754,31 +779,10 @@ _hook_stamp_confirms() {
     (( epoch > PASTE_EPOCH ))
 }
 
-# Evidence (a) then (b). The transcript scan is gated on the file
-# actually having grown — an inert session (the #507 failure) costs one
-# stat per poll and never spawns tail/grep/jq at all.
-LAST_SIZE=0
-_confirmed() {
-    local cur subs
-    cur=$(_file_size "$TRANSCRIPT")
-    if (( cur != LAST_SIZE )); then
-        LAST_SIZE=$cur
-        subs=$(_submissions_since "$TRANSCRIPT" "$BASE_SIZE")
-        (( subs > 0 )) && return 0
-    fi
-    _hook_stamp_confirms
-}
-
-# Poll for the post-condition for `$1` seconds. rc0 the moment it holds.
-_poll_confirm() {
-    local secs="$1" iters i
-    iters=$(awk -v s="$secs" -v p="$POLL" 'BEGIN { n = s / p; printf "%d", (n < 1 ? 1 : n) }')
-    for (( i = 0; i < iters; i++ )); do
-        _confirmed && return 0
-        sleep "$POLL"
-    done
-    _confirmed
-}
+# Evidence (a) — the transcript scan, byte-offset based and gated on the file
+# having grown — and the poll loop are monitor/_paste-deliver.sh's
+# (`pd_evidence_begin` / `pd_evidence_seen` / `pd_submit`). Evidence (b) above
+# is handed to it as `PD_EXTRA_EVIDENCE_FN`.
 
 # Resolve the confirmation surfaces BEFORE pasting, so the baseline
 # cannot include our own submission. VERIFY=0 with a reason set means
@@ -797,7 +801,6 @@ if (( SEND_ENTER )); then
         VERIFY=0; UNVERIFIABLE_REASON="no transcript for session $SESSION_ID under $(_cc_homes | tr '\n' ' ')"
     else
         BASE_SIZE=$(_file_size "$TRANSCRIPT")
-        LAST_SIZE=$BASE_SIZE
     fi
 fi
 
@@ -868,9 +871,23 @@ _ovl_field() {   # $1 = line, $2 = field name
         }
     }'
 }
+# ASK ABOUT THE WINDOW THE KEY NAMED, IN THE SESSION IT NAMED
+# (your-org/nexus-code#1321). `pane-state.sh` resolves a bare NAME against
+# session `0` — production's session is literally `0`, so this was invisible
+# there — and a `session:NAME` key fell into that same arm. For any other
+# session the detector therefore answered `no such tmux window`, which this
+# guard reads as DOUBT, and EVERY DOUBT PASTES: the guard was silently disarmed
+# for the one spelling a hermetic harness (or a second session) must use, and a
+# real overlay then ate the Enter and killed the pane while this script
+# reported `pasted`. `session:INDEX` is the form pane-state takes verbatim.
+_ovl_key="$WINDOW"
+if [[ -n "$_PF_SESSION" ]]; then
+    _ovl_idx=$(resolve_window_index "$WINDOW" "$_PF_SESSION" 2>/dev/null) || _ovl_idx=""
+    [[ "$_ovl_idx" =~ ^[0-9]+$ ]] && _ovl_key="$_PF_SESSION:$_ovl_idx"
+fi
 _ovl_line=""; _ovl_state=""; _ovl_kind=""
 if [[ -x "$_ovl_bin" ]]; then
-    _ovl_line=$("$_ovl_bin" "$WINDOW" 2>/dev/null) || _ovl_line=""
+    _ovl_line=$("$_ovl_bin" "$_ovl_key" 2>/dev/null) || _ovl_line=""
     _ovl_state=$(_ovl_field "$_ovl_line" state)
     _ovl_kind=$(_ovl_field "$_ovl_line" overlay)
 fi
@@ -1033,65 +1050,118 @@ if _tmux_pane_is_dead "$WIN_ID"; then
     die "could NOT establish that window $WINDOW is a live pane (verdict='${NEXUS_PANE_LIVE_VERDICT:-unset}'). Refusing to paste, because a paste into a DEAD pane kills the tmux SERVER (your-org/nexus-code#745) and this check cannot rule that out. THIS IS NOT A FINDING THAT THE WINDOW IS DEAD — nobody looked successfully, and the window may be perfectly healthy. Do NOT respawn it on the strength of this message. The usual cause is transient (a failed fork under a process-count ceiling, a busy tmux socket), so RETRY first; if it persists, check tmux and the process/fd ceilings."
 fi
 
-BUF="nexus-followup-$$-${RANDOM}"
-tmux send-keys -t "$WIN_ID" i BSpace 2>/dev/null \
-    || die "tmux send-keys (insert-mode guard) failed for window $WINDOW"
-sleep 0.1
-tmux set-buffer -b "$BUF" -- "$MSG" \
-    || die "tmux set-buffer failed"
-if ! tmux paste-buffer -p -d -b "$BUF" -t "$WIN_ID"; then
-    tmux delete-buffer -b "$BUF" 2>/dev/null || true
-    die "tmux paste-buffer failed for window $WINDOW"
+# Baseline the transcript BEFORE the paste, through the primitive, so the
+# offset cannot include our own submission. The resolution above already
+# decided VERIFY and its reason; this only arms the primitive's own reader.
+# …and the record that confirms it must be OURS (skeptic pastesk F1 on #1595):
+# a needle from this payload, which the transcript record has to contain.
+_PD_NEEDLE_DERIVED=$(pd_needle_from_file "$PASTE_FILE")
+if (( SEND_ENTER && VERIFY )); then
+    if ! pd_evidence_begin "$SESSION_ID"; then
+        VERIFY=0; UNVERIFIABLE_REASON="${PD_UNVERIFIABLE_REASON:-transcript not readable}"
+    fi
 fi
+
+BUF="nexus-followup-$$-${RANDOM}"
+_pf_paste_rc=0
+pd_paste_file "$WIN_ID" "$PASTE_FILE" "$BUF" || _pf_paste_rc=$?
+case "$_pf_paste_rc" in
+    0) : ;;
+    5) die "window $WINDOW became a DEAD pane between the guard above and the paste — refused (your-org/nexus-code#745)." ;;
+    6) die "could NOT establish that window $WINDOW is a live pane at paste time — refused (your-org/nexus-code#745). RETRY; this is not a finding that the window is dead." ;;
+    *)
+        # Each message starts its own line ON PURPOSE: test-paste-bracketed.sh's
+        # population guard tells an executable `paste-buffer` from a diagnostic
+        # that merely NAMES it by the message verb at line start.
+        [[ "$PD_FAIL_STEP" == send-keys-insert ]] && \
+            die "tmux send-keys (insert-mode guard) failed for window $WINDOW"
+        [[ "$PD_FAIL_STEP" == load-buffer ]] && \
+            die "tmux load-buffer failed"
+        die "tmux paste-buffer failed for window $WINDOW"
+        ;;
+esac
 
 # 3. Submit, then establish that it submitted.
 OUTCOME="pasted (NOT submitted, --no-enter)"
 RC=0
 RETRIED=0
 if (( SEND_ENTER )); then
-    sleep 0.2
-    tmux send-keys -t "$WIN_ID" Enter \
-        || die "tmux send-keys Enter failed for window $WINDOW (message pasted but NOT submitted)"
+    # Split the budget: watch, retry the Enter once, watch again. The retry is
+    # not superstition — a paste Claude Code collapsed into a
+    # `[Pasted text #N +N lines]` placeholder can need a second Enter (#507),
+    # and since 2.1.277 so does a prompt HELD for review (#1591). The loop is
+    # the primitive's: it ends a window EARLY on positive evidence that the
+    # text is still in the box, and it WITHHOLDS the retry from a pane that
+    # reads `blocked`, where an Enter would answer the overlay (#1200).
+    first=$(awk -v t="$CONFIRM_TIMEOUT" 'BEGIN { n = int(t * 0.4); printf "%d", (n < 1 ? 1 : n) }')
+    second=$(( CONFIRM_TIMEOUT - first ))
+    (( second >= 1 )) || second=1
+    # Evidence (b), the hook stamp, rides along as the primitive's extra
+    # predicate. Only when we can baseline a session: without one the stamp's
+    # session column has nothing to be compared with.
+    PD_EXTRA_EVIDENCE_FN=""
+    (( VERIFY )) && PD_EXTRA_EVIDENCE_FN=_hook_stamp_confirms
+    PD_POLL_SECONDS="$POLL"
+    _pf_windows="$first $second"
+    # Unverifiable: no BLIND retry, exactly as before — a retry with no way to
+    # see its effect has no success criterion (the primitive enforces this).
+    # A second window is still offered, because one thing CAN be seen without
+    # a transcript: the pane positively reading "the text is still in the
+    # box". That, and only that, earns the second Enter.
+    (( VERIFY )) || _pf_windows="1 2"
+    # One seam for both pane readers: the overlay guard above and the
+    # primitive's held/blocked verdict must not be able to disagree about
+    # which pane-state they asked.
+    PD_PANE_STATE_BIN="$_ovl_bin"
 
-    if (( ! VERIFY )); then
+    _pf_rc=0
+    # The retry Enter needs the box to hold THIS payload (pd_box_is_ours).
+    PD_PAYLOAD_FILE="$PASTE_FILE" pd_submit "$WIN_ID" "$_ovl_key" "$_pf_windows" || _pf_rc=$?
+    (( PD_ENTER_RETRIES > 0 )) && RETRIED=1
+    (( RETRIED )) && printf 'paste-followup: no submission after the first Enter — it was retried %s time(s) (collapsed-paste placeholder, or a prompt held for review)\n' \
+        "$PD_ENTER_RETRIES" >&2
+
+    if (( _pf_rc == 1 )); then
+        die "tmux send-keys Enter failed for window $WINDOW (message pasted but NOT submitted)"
+    elif (( ! VERIFY )) && [[ "$PD_OUTCOME" != held && "$PD_OUTCOME" != blocked && "$PD_OUTCOME" != undecidable-box ]]; then
         OUTCOME="pasted (submission unconfirmed: $UNVERIFIABLE_REASON)"
         RC=$RC_UNCONFIRMED
+    elif (( _pf_rc == 0 )); then
+        case "$PD_OUTCOME" in
+            submitted)             OUTCOME="submitted" ;;
+            submitted-after-retry) OUTCOME="submitted (after one Enter retry)" ;;
+            queued)                OUTCOME="submitted (queued behind a running turn)" ;;
+            queued-after-retry)    OUTCOME="submitted (queued behind a running turn, after one Enter retry)" ;;
+            *)                     OUTCOME="submitted" ;;
+        esac
     else
-        # Split the budget: watch, retry the Enter once, watch again.
-        # The retry is not superstition — a paste Claude Code collapsed
-        # into a `[Pasted text #N +N lines]` placeholder can need a
-        # second Enter to submit, and that is exactly the intermittent
-        # mechanism #507 describes.
-        first=$(awk -v t="$CONFIRM_TIMEOUT" 'BEGIN { n = int(t * 0.4); printf "%d", (n < 1 ? 1 : n) }')
-        second=$(( CONFIRM_TIMEOUT - first ))
-        (( second >= 1 )) || second=1
-
-        if _poll_confirm "$first"; then
-            OUTCOME="submitted"
+        # Distinguish an established negative from an unestablishable one.
+        # Never conflate them.
+        sid_now=""
+        sid_now=$(_session_id_for_window "$WINDOW") || sid_now=""
+        end_size=$(_file_size "$TRANSCRIPT")
+        if [[ -n "$SESSION_ID" && -n "$sid_now" && "$sid_now" != "$SESSION_ID" ]]; then
+            OUTCOME="pasted (submission unconfirmed: session-id changed under us — $SESSION_ID → $sid_now; window resumed mid-paste?)"
+            RC=$RC_UNCONFIRMED
+        elif [[ "$PD_OUTCOME" == blocked ]]; then
+            # POSITIVELY not submitted, and the retry was deliberately withheld.
+            OUTCOME="pasted (NOT submitted: an overlay came up — the pane reads state=blocked, so the Enter retry was WITHHELD; it would have answered the overlay, your-org/nexus-code#1200)"
+            RC=$RC_NOT_SUBMITTED
+        elif [[ "$PD_OUTCOME" == held ]]; then
+            OUTCOME="pasted (NOT submitted)"
+            RC=$RC_NOT_SUBMITTED
+        elif [[ "$PD_OUTCOME" == undecidable-box ]]; then
+            OUTCOME="pasted (submission unconfirmed: typed text is in the input box and cannot be shown to be this message — it may be an operator draft, so NO Enter was sent; re-check)"
+            RC=$RC_UNCONFIRMED
+        elif (( end_size > BASE_SIZE )); then
+            OUTCOME="pasted (submission unconfirmed: a turn is in flight — the transcript grew by $(( end_size - BASE_SIZE )) bytes with no submission record, so the text is plausibly QUEUED behind it; re-check)"
+            RC=$RC_UNCONFIRMED
+        elif [[ "$PD_OUTCOME" == in-flight ]]; then
+            OUTCOME="pasted (submission unconfirmed: the pane is mid-turn and nothing of ours is in the transcript yet, so the text is plausibly QUEUED behind it; re-check)"
+            RC=$RC_UNCONFIRMED
         else
-            RETRIED=1
-            printf 'paste-followup: no submission after %ss — retrying Enter once (collapsed-paste placeholder?)\n' \
-                "$first" >&2
-            tmux send-keys -t "$WIN_ID" Enter 2>/dev/null || true
-            if _poll_confirm "$second"; then
-                OUTCOME="submitted (after one Enter retry)"
-            else
-                # Distinguish an established negative from an
-                # unestablishable one. Never conflate them.
-                sid_now=""
-                sid_now=$(_session_id_for_window "$WINDOW") || sid_now=""
-                end_size=$(_file_size "$TRANSCRIPT")
-                if [[ -n "$sid_now" && "$sid_now" != "$SESSION_ID" ]]; then
-                    OUTCOME="pasted (submission unconfirmed: session-id changed under us — $SESSION_ID → $sid_now; window resumed mid-paste?)"
-                    RC=$RC_UNCONFIRMED
-                elif (( end_size > BASE_SIZE )); then
-                    OUTCOME="pasted (submission unconfirmed: a turn is in flight — the transcript grew by $(( end_size - BASE_SIZE )) bytes with no submission record, so the text is plausibly QUEUED behind it; re-check)"
-                    RC=$RC_UNCONFIRMED
-                else
-                    OUTCOME="pasted (NOT submitted)"
-                    RC=$RC_NOT_SUBMITTED
-                fi
-            fi
+            OUTCOME="pasted (NOT submitted)"
+            RC=$RC_NOT_SUBMITTED
         fi
     fi
 fi
@@ -1193,8 +1263,21 @@ if (( RC == 0 )); then
 else
     printf 'paste-followup: %s to %s (%s chars pasted)%s\n' "$OUTCOME" "$WINDOW" "${#MSG}" "$NOTE_CLAUSE" >&2
     if (( RC == RC_NOT_SUBMITTED )); then
-        printf 'paste-followup: the text is sitting in %s'"'"'s input box unsent. Re-paste, or press Enter in the pane.\n' \
-            "$WINDOW" >&2
+        case "${PD_OUTCOME:-}" in
+            held)
+                # POSITIVELY in the box (pane-state: user-typing input=typed). A
+                # re-paste APPENDS a second copy to it — measured on the real
+                # binary: `[Pasted text #1 …][Pasted text #2 …]`, both unsent
+                # (your-org/nexus-code#1591). The remedy is a keypress, not a paste.
+                printf 'paste-followup: the text is POSITIVELY sitting in %s'"'"'s input box unsent (pane reads user-typing input=typed) after %s Enter retr%s. Do NOT re-paste — that appends a second copy to it. Press Enter in the pane, or clear the box first.\n' \
+                    "$WINDOW" "$PD_ENTER_RETRIES" "$( (( PD_ENTER_RETRIES == 1 )) && echo y || echo ies )" >&2 ;;
+            blocked)
+                printf 'paste-followup: %s is sitting on an overlay and the text is unsent. Resolve the overlay first; do NOT send Enter blind — it would select the overlay'"'"'s highlighted default.\n' \
+                    "$WINDOW" >&2 ;;
+            *)
+                printf 'paste-followup: the text is sitting in %s'"'"'s input box unsent. Re-paste, or press Enter in the pane.\n' \
+                    "$WINDOW" >&2 ;;
+        esac
     fi
 fi
 exit "$RC"

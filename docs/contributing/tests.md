@@ -591,11 +591,16 @@ entry in the workflow carries the issue that added it
 `paths:` list is canonical; this block is a reading aid and MUST be
 re-derived from the yaml before it is quoted.**
 
-This workflow is not one job. At `a3177ef6` it carries `syntax`,
-`unit` (a `login_shell` × `jobs` matrix — bash@4 and zsh@4),
-`clean-env`, `inherited-root`, `inherited-root-gate`, `bash-legacy`
-and `tmux-matrix`; the yaml is canonical and this list is a reading
-aid. The steps below are the fast unit path only, split across
+This workflow is not one job. It carries `syntax`, `unit` (a
+`login_shell` × `jobs` matrix — bash@4 and zsh@4, each run with
+`env -u NEXUS_ROOT -u NEXUS_LOCALS`, which absorbed the former
+`clean-env` job, <your-org>/nexus-code#1474), `inherited-root`,
+`inherited-root-gate`, `bash-legacy` and `tmux-matrix`; the yaml is
+canonical and this list is a reading aid. Each unit band is bounded
+below its job's `timeout-minutes` and followed by a `band verdict`
+step (`monitor/watcher/ci-band-verdict.sh`), so a band that did not
+finish is annotated `NO VERDICT` rather than reading as an ordinary
+red. The steps below are the fast unit path only, split across
 `syntax` (2, 3) and `unit` (1, 4):
 
 1. Install `jq` + `tmux` + `zsh` on the runner. Ubuntu's

@@ -55,6 +55,18 @@ NG="$_monitor_dir/ng"
 # asserts other people's honesty, so it holds itself to the same level.
 . "$_test_dir/_test_helpers.sh"
 
+# ---- population (your-org/nexus-code#1301) --------------------------------
+# Section 2 greps EVERY tracked file for a frontmatter read of `state`, so a
+# reader added anywhere joins this guard's population. `_rsf_all_tracked` is the
+# ONE enumerator: section 2 and `gp_population` both call it, beside the channel
+# script, the ng dispatcher and the client watcher sections 1/3/4 execute (all
+# tracked, so already inside it). `gp_handle` EXITS on --population, so it sits
+# above the first line of output.
+_rsf_all_tracked() { git -C "$_monitor_dir/.." ls-files; }
+. "$_monitor_dir/_guard_population.sh"
+gp_population() { _rsf_all_tracked | sed "s|^|$_monitor_dir/../|"; }
+gp_handle "$@"
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 export NEXUS_STATE_DIR="$WORK/state"
@@ -161,7 +173,7 @@ _case_arms_on_state() {
 # (1) enumerate. Tracked files only, no pathspec glob (git's `*` crosses `/`
 # and an `ls-tree` glob pathspec is a confident zero — your-org/nexus-code#770,
 # #954). Filter the OUTPUT.
-_all_tracked=$(cd "$_monitor_dir/.." && git ls-files)
+_all_tracked=$(_rsf_all_tracked)
 _readers=""
 while IFS= read -r _f; do
     [[ -n "$_f" ]] || continue

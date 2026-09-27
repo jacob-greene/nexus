@@ -7,7 +7,9 @@ description: "Being WOKEN when a long computation ends, fails, or does anything 
 ## The problem this closes
 
 The model-armed `Monitor` is capped at 30 minutes, enforced at arm time and at
-runtime. `CronCreate` waits for an idle REPL (measured 18m35s late). The Bash
+runtime — and its expiry notice is a RE-ARM instruction, never an answer about
+the condition you were watching (<your-org>/nexus-code#1540, #1549: the worker
+floor says the same, at the point it bites). `CronCreate` waits for an idle REPL (measured 18m35s late). The Bash
 tool's `run_in_background` re-invokes you, but it must be launched by a turn
 and re-launched per job. `monitor/async-run.sh` RETAINS an exit status and
 re-invokes nobody (`<your-org>/nexus-code#1523`: an `await` expired cleanly and
@@ -78,7 +80,12 @@ detectors OUTSIDE the emit path:
   `run_in_background: true` (rc 0 done, 1 failed, 3 unknown/parked, 4 timeout),
   and `ng longjob status` says why the session is unarmed; the launcher's
   reason is in `monitor/.state/longjob/arming.log` (`epoch`, `window`,
-  `armed|skipped`, `reason`, `src`). **A row whose fifth column names a
+  `armed|armed-unprobed|skipped`, `reason`, `src`). `skipped` means a probe
+  COMPLETED and said no (or the kill switch / manifest / validator did);
+  `armed-unprobed` means a bounded probe TIMED OUT or read nothing, and the
+  flag was passed anyway — the capability was never established
+  (`<your-org>/nexus-code#1611`). Match the third column EXACTLY: `armed*`
+  matches both armed tokens. **A row whose fifth column names a
   `watcher/test-*.sh` is a FIXTURE row written by a test suite, not a
   launch** — read only rows with an empty fifth column as launcher reasons.
 - **The host arms plugin monitors only under a remote rollout flag.** On
@@ -132,6 +139,86 @@ detectors OUTSIDE the emit path:
 
 ## The ledger contract
 
+**ONE WRITER, ENFORCED** (`<your-org>/nexus-code#1544`). A `dispatch` that finds
+the ledger naming a DIFFERENT live dispatcher (pid + start ticks) with fresh
+polls REFUSES TO ARM: it stays alive, polls nothing and writes nothing — the
+owner's ledger is untouched — says why once on stderr and in `events.log`
+(`dispatcher refused`), re-checks every poll, and arms only if that owner
+stops. The same check runs each pass AFTER arming, so two dispatchers started
+together, or a predecessor that was merely wedged, converge on one writer:
+whichever next finds the other's fresh write yields. This is a KILL-DIRECTION
+rule, not housekeeping: pane-state excludes the ledger pid's root from the
+background-shell census, and a second writer made it exclude the wrong
+subtree — `idle` over a live `sleep 600`. pane-state now also refuses to
+exclude a root that holds anything beside the dispatcher's own chain. **Never
+run `dispatch` by hand in a live session**; the unarmed fallback is `await`.
+
+**WHICH writer: the one serving the NEWEST live claude**
+(`<your-org>/nexus-code#1623`). "The incumbent wins" was right for a hand-run
+dispatcher under the same claude and exactly wrong for a `--resume`: the
+resumed session keeps its session id, so its host-armed dispatcher found the
+DEAD incarnation's dispatcher (reparented to init, still polling) holding the
+ledger and refused to arm. The orphan then retired terminal watches into a
+pipe nobody read (measured on `lsc2`: 7 × `done write-failed`, including a
+2335 s suite), and the window could not be retired either (next paragraph).
+Three rules now close that, each pinned by `test-longjob-watch.sh` (`#1623a`–`e`):
+
+- **A dispatcher exits when its claude is gone.** At arm it records its OWNER,
+  the nearest `claude` above it, as `owner_pid` + `owner_start` (/proc start
+  ticks: never ppid, which reparenting changes, and never pid alone, which gets
+  recycled). It checks that owner at the top of every loop and exits within one
+  poll once the owner is gone (`dispatcher orphaned` in `events.log`). Exiting
+  costs nobody a turn, because there is no session left to notify.
+  `ledger-verdict` reads a live pid with a gone owner as `dead … ORPHANED`,
+  never `armed`. With no claude above it (hermetic tests, CI), no owner is
+  recorded and nothing exits on this ground.
+- **A newer session supersedes; the older exits.** A dispatcher defers only to
+  one serving the SAME claude (the #1544 case, unchanged) or a NEWER one (a
+  later start). It supersedes one serving an OLDER claude, or none at all:
+  it arms at once (`dispatcher supersedes`), and the older one sees the write
+  and exits (`dispatcher superseded`). A ledger written before #1623 has no
+  owner fields. Its owner is derived live by the same ancestry walk, so an old
+  orphan with no claude above it is superseded too; it runs the old code, so it
+  YIELDS rather than exits, and it re-arms if the newer one stops. Stop such a
+  leftover by hand, from its own session:
+  `monitor/proc-kill-authorized --orphans --filter`.
+- **A failed write is not a delivery.** When a terminal line's write fails
+  (`write-failed`), the pass undoes its OWN write to the watch: it puts back
+  the spec as it stood just before that write, un-retired, with its external
+  wait still declared. The pass stops there. It undoes only its own write: if
+  a newer dispatcher retired and delivered the same watch while this one was
+  mid-probe, that retirement is put back rather than erased, so the watch is
+  not delivered twice (`#1623e`). If anything wrote the spec after this pass
+  did, the restore is skipped. There is no flock (the spool is on NFS), so this
+  is a compare followed by an atomic rename, and a write landing in the
+  milliseconds between the two is not covered.
+  A write to the host's pipe fails only when its reader is gone, so the
+  dispatcher RELEASES the spool: it writes one last ledger with
+  `service=stdout-closed` (read as `disabled`, and never treated as an
+  owner), then polls and writes nothing more. A live dispatcher arms at
+  once and delivers the line exactly once. Nothing that was `written` is
+  ever re-delivered.
+
+**Boundary: two LIVE panes resuming the same session id.** The spool is keyed
+by session id, not by pane, so two claudes that `--resume` the same id at once
+share one ledger. The newer claude's dispatcher supersedes, and the older
+pane's dispatcher exits for good: it is never re-armed while its claude lives,
+because only a new session launch arms a dispatcher. If the newer pane then
+closes, its dispatcher exits with it and the older pane, still live, has NO
+dispatcher. Its watches stay in the spool and are delivered to nobody until a
+session with that id is launched again. `ledger-verdict` reads that state as
+not armed (`dead`), so `add` says NOT ARMED. In that pane use `await` under
+`run_in_background`, or respawn the session. This is a stated boundary, not
+a tested case: nothing in the suite runs two live panes on one id.
+
+**The unretirable window was this, not the discount.** pane-state's discount
+(`_pane_longjob_root`) walks from the LEDGER's pid up to its claude. It found
+the orphan, whose chain reaches init with no claude, so nothing was excluded,
+and the LIVE dispatcher's shell was counted as background work:
+`working-background bg_longjob=0`, refused by `retire-window` indefinitely.
+Once the live dispatcher owns the ledger, the discount finds it; pane-state
+needed no change.
+
 `dispatcher.json` is written by `dispatch` alone, atomically: when armed,
 after every poll pass, and inside a pass before every paced wait — so
 `last_poll` never ages by more than the pacing gap while the dispatcher is
@@ -139,7 +226,7 @@ alive. Freshness is judged against the ledger's OWN `poll_seconds` (never a
 reader's config), and `_ledger_verdict` (`ng longjob ledger-verdict`) is the
 one reader of liveness AND service that `status`, `add` and pane-state's
 discount share. **`armed` means SERVICE, not process:** the ledger carries a
-`service` field (`polling` | `disabled` | `unscoped`), and a live, fresh
+`service` field (`polling` | `disabled` | `unscoped` | `stdout-closed`), and a live, fresh
 ledger whose service is not `polling` — the kill switch's own branch — reads
 `disabled`, so `add` says NOT ARMED (rc 3) instead of "safe to end your
 turn". The kill-decision discount counts live watches FROM THE SPOOL through
@@ -171,12 +258,15 @@ id and an empty spool, so a dead session's watches cannot leak into it.
 The **dispatcher process** is session-scoped. It dies with the `claude` that
 armed it and comes back only when a session is launched with the plugin
 present — which every nexus launcher does, and which you cannot do for
-yourself mid-session. Measured (`<your-org>/<your-nexus>#375` S1): a plugin
+yourself mid-session. It is also the ONE thing allowed to make the dispatcher
+exit: once its owner claude is gone (`<your-org>/nexus-code#1623`), or once a
+dispatcher serving a newer claude has taken the ledger. Measured (`<your-org>/<your-nexus>#375` S1): a plugin
 monitor command that exits is NOT relaunched, and its exit reaches the model
 as a "script failed" notice that costs a turn (measured 2026-09-15: ~16–21 s,
 ~$0.11). The dispatcher therefore never returns — an empty spool, an
 unreadable spool and a fatal poll error are all loops that sleep — and the
-suite asserts it is alive after every watch has retired.
+suite asserts it is alive after every watch has retired. A closed stdout does
+not end it either: it releases the spool (above) and waits for its owner to go.
 
 Nothing here outlives the sandbox. PID 1's argv ends
 `-- tmux new-session ./watcher --continue`: the watcher is the sandbox's init
@@ -195,7 +285,12 @@ On Claude Code 2.1.272, hermetic tmux, n=1 per probe unless stated
 - **arming fails open**: a missing plugin dir, a malformed manifest, a
   manifest naming a non-existent command, and a command that exits at once
   all start a session that takes turns. The launcher additionally
-  pre-validates and omits the flag on any doubt.
+  pre-validates and omits the flag when a probe COMPLETES negative; a probe
+  that times out arms (`armed-unprobed`, #1611). **Boundary: this
+  measurement covers a broken PLUGIN, not an unsupported FLAG** — a binary
+  that does not know `--plugin-dir` exits 1 (`unknown option`), so arming on
+  an unknown capability probe is a bet on the pinned binary, hedged by
+  `plugin validate` (see `monitor/_longjob-plugin.sh` header).
 - **mid-turn delivery**: a line emitted during a 100 s foreground tool call
   was surfaced inside that turn, after the tool result and before the
   model's reply — not deferred to idle (n=1).

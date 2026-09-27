@@ -98,15 +98,93 @@ cleanup() {
 }
 trap cleanup EXIT
 
-wait_for() {  # wait_for <label> <deadline-s> -- cmd...
-    local label="$1" deadline="$2"; shift 3
-    local t=0
-    while (( t < deadline * 2 )); do
-        "$@" >/dev/null 2>&1 && { printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 )); return 0; }
-        sleep 0.5; t=$(( t + 1 ))
+# THE WAITS ARE WALL-CLOCK, SCALED, AND SELF-EXPLAINING (your-org/nexus-code#1584).
+#
+# `wait_for` used to count ITERATIONS — `deadline * 2` rounds of `sleep 0.5`
+# PLUS one probe — and print "(deadline 90s)" when they ran out. Three things
+# were wrong with that, and only the first is about the number:
+#   * "90" was never 90 s. With a probe that takes 0.1-1 s under load it was
+#     110-270 s of wall clock, so the printed deadline described no quantity
+#     anybody measured, and a red could not say how long it had really waited.
+#   * It took none of `th_deadline`'s `--jobs` scaling (the #749 lineage).
+#   * A red said NOTHING about why. `health green with rotated token` went red
+#     in two consecutive full bands with a bare `curl: (22) … 403`, and whether
+#     the self-heal was SLOW or NEVER HAPPENED is still unmeasured, because the
+#     supervisor's log died with the fixture. #1570's lesson, applied here
+#     before the next occurrence rather than after: read the PRODUCER's log.
+#
+# THE CEILINGS ARE CHOSEN, NOT INHERITED. 300 s for the three waits that are
+# really "one server bounce under load" ([6] [7] [8]): above the old loop's
+# effective budget, below the supervisor's own START_GRACE (900 s) — which is
+# the ONLY bound the self-heal has by design (detection is INTERVAL x FAILS,
+# then a full restart with no tighter promise). These are polled ceilings: a
+# green run returns the instant the predicate holds, so a larger one costs
+# nothing until something is actually broken. WHETHER 300 s IS ENOUGH UNDER
+# BAND LOAD IS UNMEASURED; the diagnostics below exist so the next red says.
+#
+# `th_deadline` scales by jobs/cpus and is therefore x1 on a 36-core host at
+# `--jobs 4`: it does not see OTHER agents' load, which is what the two red
+# bands had (load ~40). That is why the base moved as well as the helper.
+
+# _wait_until <ceiling-s> -- cmd…   rc 0 once cmd succeeds; rc 1 at the ceiling.
+# Sets WAITED (whole seconds actually spent). The ceiling is WALL CLOCK: a slow
+# probe spends the budget, it does not extend it.
+_wait_until() {
+    local limit="$1"; shift 2
+    local t0=$SECONDS
+    WAITED=0
+    while :; do
+        if "$@" >/dev/null 2>&1; then WAITED=$(( SECONDS - t0 )); return 0; fi
+        WAITED=$(( SECONDS - t0 ))
+        (( WAITED >= limit )) && return 1
+        sleep 0.5
     done
-    printf '  FAIL: %s (deadline %ss)\n' "$label" "$deadline" >&2; FAIL=$(( FAIL + 1 )); return 1
 }
+
+wait_for() {  # wait_for <label> <unloaded-ceiling-s> -- cmd...
+    local label="$1" base="$2"; shift 3
+    local limit last proj
+    limit=$(th_deadline "$base")
+    if _wait_until "$limit" -- "$@"; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+        # Beside the PASS, never IN its label: a label that embeds a wall time
+        # relabels between runs and reads as a different case (#1574).
+        printf '        (held after %ss; ceiling %ss)\n' "$WAITED" "$limit"
+        return 0
+    fi
+    printf '  FAIL: %s — not true after %ss of WALL CLOCK (ceiling %ss = th_deadline %s)\n' \
+        "$label" "$WAITED" "$limit" "$base" >&2
+    FAIL=$(( FAIL + 1 ))
+    # The predicate's own last words. jupyter-health.sh distinguishes "cold
+    # build still materialising", "port refused" and "wrong token" on stderr.
+    last=$("$@" 2>&1 >/dev/null | tail -n 5)
+    [[ -n "$last" ]] && printf '%s\n' "$last" | sed 's/^/        probe: /' >&2
+    # The PRODUCER's log, while the fixture still exists. A health wait's last
+    # argument is the project directory; anything else has no service log.
+    proj="${*: -1}"
+    if [[ -d "$proj/.jupyter" ]]; then
+        local lf
+        for lf in "$proj/.jupyter/labsh-service.log" "$proj/.jupyter/labsh.bg.log"; do
+            [[ -s "$lf" ]] || { printf '        %s: (absent or empty)\n' "${lf##*/}" >&2; continue; }
+            printf '        --- last 25 lines of %s ---\n' "${lf##*/}" >&2
+            tail -n 25 "$lf" | sed 's/^/        | /' >&2
+        done
+    fi
+    return 1
+}
+
+# THE WALL-CLOCK PROPERTY, PINNED — cheaply, before any server exists. A probe
+# that takes 1 s and fails, under a 2 s ceiling: wall-clock gives up in 2-4 s.
+# The iteration-counted form this replaced would spend 2*2*(0.5+1) = 6 s.
+_slow_false() { sleep 1; return 1; }
+_wait_until 2 -- _slow_false; _wu_rc=$?
+assert_eq "wait ceiling is WALL CLOCK: a 1 s failing probe under a 2 s ceiling gives up (rc 1)" "$_wu_rc" "1"
+# The measured value goes BESIDE the row, never in its label (#1574).
+assert_eq "…within 2-4 s, not the 6 s an iteration count would take" \
+    "$(( WAITED >= 2 && WAITED <= 4 ? 1 : 0 ))" "1"
+printf '        (gave up after %ss)\n' "$WAITED"
+_wait_until 5 -- true; _wu_rc=$?
+assert_eq "…and a predicate that already holds returns at once (rc 0, 0 s)" "$_wu_rc:$WAITED" "0:0"
 
 # sup_pid_of <pidfile> — the supervisor pid, FIRST LINE ONLY, guarded.
 #
@@ -217,13 +295,13 @@ assert_contains "agent exec works alongside UI traffic" "$got" "43"
 
 echo '=== [6] watchdog bounces a killed server ==='
 kill -KILL "$srv_before" 2>/dev/null
-wait_for "health green again after server kill" 90 -- "$HEALTH" "$PROJA"
+wait_for "health green again after server kill" 300 -- "$HEALTH" "$PROJA"
 srv_after=$(server_pid_of "$PROJA")
 assert_eq "a NEW server is up" "$(( srv_after != srv_before ))" "1"
 
 echo '=== [7] token rotation self-heals; exec works after ==='
 ( cd "$PROJA" && labsh token --rotate ) >/dev/null 2>&1
-wait_for "health green with rotated token" 90 -- "$HEALTH" "$PROJA"
+wait_for "health green with rotated token" 300 -- "$HEALTH" "$PROJA"
 ( cd "$PROJA" && labsh notebook attach analysis.ipynb ) >/dev/null 2>&1
 got=$(cd "$PROJA" && labsh kernel exec -n analysis.ipynb 'print("post-rotate-ok")' 2>/dev/null)
 assert_contains "exec against post-rotation server" "$got" "post-rotate-ok"
@@ -237,7 +315,7 @@ srv=$(server_pid_of "$PROJA") && kill -KILL "$srv" 2>/dev/null
 sleep 1
 out=$("$RECOVER" --services-only 2>&1)
 assert_contains "recover relaunched jupyter-projA-fresh" "$out" "service 'jupyter-projA-fresh': relaunched"
-wait_for "healthy after recovery" 120 -- "$HEALTH" "$PROJA"
+wait_for "healthy after recovery" 300 -- "$HEALTH" "$PROJA"
 
 echo '=== [9] --down: no orphans, deregistered ==='
 srv=$(server_pid_of "$PROJA")
@@ -356,28 +434,70 @@ for p in pa pb pc; do
 done
 assert_eq "exactly 3 proj-* kernelspecs" "$(compgen -G "$KDIR/proj-*/kernel.json" | wc -l)" "3"
 
+# A RED IN [17]/[18] MUST EXPLAIN ITSELF (skeptic testinfra2sk on PR 1593). In
+# 1 of 10 isolated runs at e34a03ba these two sections went red — 7 FAILs, every
+# `labsh kernel exec` after the first returning EMPTY, "no running labsh server
+# found" — while the root server had just passed its health probe. Attribution
+# is NOT established: these assertions dumped nothing, the fixture died with the
+# run, and no prior report carries the signature. So the failure count is marked
+# here and, if it moves, the ROOT supervisor's logs are printed while they exist.
+_root_fail_mark=$FAIL
+# your-org/nexus-code#1594 item 2: the red's ONLY stderr was `labsh url`'s "no
+# running labsh server found" — in labsh 0.4.1 that string is raised by the
+# shell `cmd_url` alone, while the `kernel exec` calls threw theirs away. So
+# every labsh call below keeps its stderr (one file per call), and the section
+# marks the supervisor log's length first: a red then says whether the
+# supervisor RESTARTED the root server mid-section (its production pattern:
+# three failed health checks, then a restart — measured 7 in 30 days on one
+# nexus, and in 4 of 4 other operator nexuses running this supervisor).
+_serr="$RWS/.t1594-stderr"; mkdir -p "$_serr"
+_svc_log_mark=$(wc -l < "$RWS/.jupyter/labsh-service.log" 2>/dev/null || echo 0)
 echo '=== [17] kernel exec per project runs in the CORRECT venv (isolation) ==='
 for p in pa pb pc; do
     ( cd "$RWS" && labsh notebook attach "$p/nb-$p.ipynb" --kernel-name "proj-$p" ) >/dev/null 2>&1
     got=$(cd "$RWS" && labsh kernel exec -n "$p/nb-$p.ipynb" \
-        'import sys, projmarker; print(projmarker.NAME, sys.executable)' 2>/dev/null)
+        'import sys, projmarker; print(projmarker.NAME, sys.executable)' 2>"$_serr/17-exec-$p")
     assert_contains "proj-$p kernel sees its own marker"      "$got" "$p "
     assert_contains "proj-$p kernel runs $p's venv python"    "$got" "$RWS/$p/.venv"
 done
 
 echo '=== [18] project-dir agent reaches the root server via labsh-root.sh ==='
 got=$(cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" kernel exec -n nb-pa.ipynb \
-    'print("agent-sees-root:", projmarker.NAME)' 2>/dev/null)
+    'print("agent-sees-root:", projmarker.NAME)' 2>"$_serr/18-exec-root")
 assert_contains "exec from inside the project dir works" "$got" "agent-sees-root: pa"
-( cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" notebook attach agent-nb.ipynb --kernel-name proj-pa ) >/dev/null 2>&1
+( cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" notebook attach agent-nb.ipynb --kernel-name proj-pa ) >/dev/null 2>"$_serr/18-attach"
 assert_eq "attach of a NEW notebook from the project dir succeeds" "$?" "0"
 got=$(cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" kernel exec -n agent-nb.ipynb \
-    'import sys; print(sys.executable)' 2>/dev/null)
+    'import sys; print(sys.executable)' 2>"$_serr/18-exec-agent")
 assert_contains "agent-attached kernel runs pa's venv" "$got" "$RWS/pa/.venv"
-url_root=$(cd "$RWS" && labsh url)
-url_proj=$(cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" url)
+url_root=$(cd "$RWS" && labsh url 2>"$_serr/18-url-root")
+url_proj=$(cd "$RWS/pa" && NEXUS_WORKROOT="$RWS" "$LROOT" url 2>"$_serr/18-url-proj")
 assert_eq "labsh-root url from the project dir is the root URL" "$url_proj" "$url_root"
 
+if (( FAIL > _root_fail_mark )); then
+    {
+        printf '        --- [17]/[18] went red (%s new FAILs): the ROOT service, as it stands NOW ---\n' "$(( FAIL - _root_fail_mark ))"
+        printf '        health: '; "$HEALTH" "$RWS" 2>&1 | tail -n 2 | tr '\n' ' '; printf '(rc %s)\n' "${PIPESTATUS[0]}"
+        printf '        server pid now: %s\n' "$(server_pid_of "$RWS" 2>/dev/null || echo '?')"
+        # The attribution line (#1594 item 2): did the SUPERVISOR restart the
+        # root server while [17]/[18] ran? A non-zero restart count names the
+        # mechanism; zero with failed checks names a slow server; zero and
+        # zero points back at labsh's own discovery.
+        _svc_new=$(tail -n +"$(( _svc_log_mark + 1 ))" "$RWS/.jupyter/labsh-service.log" 2>/dev/null)
+        printf '        during [17]/[18] the supervisor logged: %s failed health check(s), %s restart(s)\n' \
+            "$(grep -c 'healthcheck failed' <<<"$_svc_new")" "$(grep -c 'restarting labsh server' <<<"$_svc_new")"
+        for _ef in "$_serr"/*; do
+            [[ -s "$_ef" ]] || continue
+            printf '        --- stderr of %s ---\n' "${_ef##*/}"
+            tail -n 5 "$_ef" | sed 's/^/        | /'
+        done
+        for _lf in "$RWS/.jupyter/labsh-service.log" "$RWS/.jupyter/labsh.bg.log" "$RWS/.jupyter/labsh-periodic.log"; do
+            [[ -s "$_lf" ]] || { printf '        %s: (absent or empty)\n' "${_lf##*/}"; continue; }
+            printf '        --- last 30 lines of %s ---\n' "${_lf##*/}"
+            tail -n 30 "$_lf" | sed 's/^/        | /'
+        done
+    } >&2
+fi
 echo '=== [19] crawl discovers a fresh project; re-crawl idempotent ==='
 make_proj pd || { echo "FATAL: fixture venv for pd failed" >&2; exit 1; }
 # The supervisor's periodic crawl may win the race for any individual

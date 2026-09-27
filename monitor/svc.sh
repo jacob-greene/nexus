@@ -140,6 +140,14 @@ source "$_script_dir/bootstrap-recover.sh"
 # shellcheck source=_labsh_build_evidence.sh
 source "$_script_dir/_labsh_build_evidence.sh" 2>/dev/null || true
 
+# The logged-out predicate (`_auth_hold_expiry_standing`, functions only) so
+# the orchestrator row can say LOGGED-OUT (your-org/nexus-code#1548 row E).
+# During the 2026-09-17 outage this cockpit showed a green `UP` for a
+# logged-out agent for 7 h, `UP` being derived from window existence alone.
+# Guarded: an older tree without the module keeps the old row.
+# shellcheck source=watcher/_auth_hold.sh
+[[ -r "$_script_dir/watcher/_auth_hold.sh" ]] && source "$_script_dir/watcher/_auth_hold.sh" 2>/dev/null || true
+
 # The tmux window the watcher pastes into — the orchestrator's home.
 # The cockpit window name (this dashboard) is config-resolved too, so
 # the idle-probe exemption and the cockpit's own window all track one
@@ -297,6 +305,52 @@ svc_supervisor() {
         absent)  printf '%s' '-' ;;
         *)       [[ "$up" == UP ]] && printf 'orphan' || printf 'stale' ;;
     esac
+}
+
+# THE STATUS PATH'S HEALTHCHECK IS BOUNDED (your-org/nexus-code#1601).
+#
+# `_recover_service_healthy` (bootstrap-recover.sh) runs a registry healthcheck
+# with NO time limit, which is right for recovery and wrong for a READOUT: on
+# 2026-09-21 `tmpfs-guard.sh --check` walked a /tmp holding 15,234 depth-1
+# entries and `svc.sh status` printed ZERO lines in 180 s. Every service was
+# healthy; the one readout that says so was not answering, so the board was
+# blind — not "a service is down" but "nobody can say".
+#
+# So each row's check runs under `timeout`, and a check that does not finish
+# renders `UNKNOWN` with the bound in its DETAIL — never nothing, and never
+# `DOWN`, which would send a reader to restart a service that may be fine. A
+# row that cannot be measured still needs attention, and it gets it: the
+# priority renderer keys on `up != UP`.
+#
+# TIMED OUT IS DECIDED BY THE STATUS SET *AND* THE CLOCK. `timeout` injects 124
+# (137 after `-k`), but a healthcheck may exit 124 on its own (CLAUDE.md, the
+# `timeout` status-injection entry); requiring the elapsed wall clock to have
+# reached the bound separates the two. A callee's own 124 inside the bound stays
+# DOWN, as it always was.
+#
+# The run shape (subshell cd, script over /dev/fd so no argv carries a
+# pattern, rc 100 == alive-with-a-finding) MIRRORS `_recover_service_healthy`
+# and must stay in step with it — that function's own comment names this
+# replication hazard for its watcher twin. `timeout` without `--foreground`
+# signals its whole process group, so the check's children (the guard's
+# `find`) go with it rather than outliving the row.
+#
+# SVC_STATUS_HEALTH_TIMEOUT: seconds per row (default 20). Only the READOUT is
+# bounded; start/stop/restart/recovery keep the unbounded check.
+SVC_STATUS_HEALTH_TIMEOUT="${SVC_STATUS_HEALTH_TIMEOUT:-20}"
+[[ "$SVC_STATUS_HEALTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || SVC_STATUS_HEALTH_TIMEOUT=20
+
+_svc_row_health() {   # <workdir> <health> -> prints UP | DOWN | UNKNOWN
+    local workdir="$1" health="$2" rc=0 t0=$SECONDS
+    ( cd "$workdir" 2>/dev/null \
+        && timeout -k 2 "$SVC_STATUS_HEALTH_TIMEOUT" bash <(printf '%s' "$health") ) >/dev/null 2>&1 || rc=$?
+    if (( rc == 124 || rc == 137 )) && (( SECONDS - t0 >= SVC_STATUS_HEALTH_TIMEOUT )); then
+        printf 'UNKNOWN'
+    elif (( rc == 0 || rc == 100 )); then
+        printf 'UP'
+    else
+        printf 'DOWN'
+    fi
 }
 
 # --- external-bind detection (display only) --------------------------------
@@ -764,17 +818,31 @@ render_core_rows() {
             "no crash-revival — orchestrator must arm the supervisor Monitor"
     fi
 
-    if _recover_window_exists "$TARGET_WINDOW"; then
-        up='UP'; upc="$C_G"
-    else
+    local logged_out=0
+    if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 \
+        && STATE_DIR="$STATE_DIR" _auth_hold_expiry_standing; then
+        logged_out=1
+    fi
+    if ! _recover_window_exists "$TARGET_WINDOW"; then
         up='DOWN'; upc="$C_R"
+    elif (( logged_out )); then
+        # The window exists and the session inside it cannot take a turn.
+        # `UP` here was the 2026-09-17 reading for 7 h 24 m (#1548).
+        up='LOGGED-OUT'; upc="$C_R"
+    else
+        up='UP'; upc="$C_G"
     fi
     # The watcher is the orchestrator's supervisor: it spawns/revives
     # the target window via its liveness machinery. Colour the word by
     # the watcher's own state so a dead supervisor is visible here too.
     sup='watcher'
     case "$rc" in 0) supc="$C_DIM" ;; 1) supc="$C_Y" ;; *) supc="$C_R" ;; esac
-    if [[ -f "$ORCH_HB" ]]; then
+    if (( logged_out )); then
+        local _lo_first _lo_age
+        _lo_first=$(cut -f1 "$STATE_DIR/auth-expired.tsv" 2>/dev/null)
+        if [[ "$_lo_first" =~ ^[0-9]+$ ]]; then _lo_age=$(( $(date +%s) - _lo_first )); else _lo_age=0; fi
+        detail="run /login in the orchestrator window — logged out for $(fmt_age "$_lo_age"); no agent can take a turn"
+    elif [[ -f "$ORCH_HB" ]]; then
         detail="last turn $(fmt_age "$(_watcher_heartbeat_age "$ORCH_HB")") ago"
     else
         detail='no turn-end heartbeat'
@@ -941,11 +1009,13 @@ render_status() {
     for (( i=1; i<=SVC_N; i++ )); do
         name="${SVC_NAME[$i]}"; workdir="${SVC_WORKDIR[$i]}"
         launch="${SVC_LAUNCH[$i]}"; health="${SVC_HEALTH[$i]}"
-        if _recover_service_healthy "$workdir" "$health"; then
-            up='UP';   upc="$C_G"
-        else
-            up='DOWN'; upc="$C_R"
-        fi
+        detail=''
+        case "$(_svc_row_health "$workdir" "$health")" in
+            UP)      up='UP';      upc="$C_G" ;;
+            UNKNOWN) up='UNKNOWN'; upc="$C_Y"
+                     detail="healthcheck did not finish within ${SVC_STATUS_HEALTH_TIMEOUT}s — health UNKNOWN, not DOWN (your-org/nexus-code#1601)" ;;
+            *)       up='DOWN';    upc="$C_R" ;;
+        esac
         # Health verdict feeds the supervisor cell so a dead pid record next
         # to a passing healthcheck renders as `orphan`, never a bare `stale`.
         sup="$(svc_supervisor "$name" "$launch" "$up")"
@@ -969,7 +1039,6 @@ render_status() {
         # derived endpoint. Keyed on the raw healthcheck, not the possibly
         # degraded STATUS word — a DEGRADED service is still serving, and
         # withholding its URL would help nobody.
-        detail=''
         [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
         [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'

@@ -453,10 +453,13 @@ else
     # The FILE SET is declared, so a fifth site cannot appear silently —
     # a new file goes red until somebody classifies it, which is the
     # whole point (your-org/nexus-code#735 F5, #682's manifest pattern).
-    EXPECTED_PASTE_FILES='monitor/paste-followup.sh
-monitor/watcher/_respawn.sh
-monitor/watcher/_unstick.sh
-monitor/watcher/main.sh'
+    # your-org/nexus-code#1591: the four former sites (paste-followup.sh,
+    # watcher/_respawn.sh, watcher/_unstick.sh, watcher/main.sh) all paste
+    # THROUGH monitor/_paste-deliver.sh now, which makes the tree's only call.
+    # The set shrank on purpose; a second file appearing here is a paste path
+    # that has grown outside the primitive — and outside its submit
+    # confirmation — and is to be refused, not added.
+    EXPECTED_PASTE_FILES='monitor/_paste-deliver.sh'
     # Both sides through the SAME `sort -u`: the collation here is
     # locale-dependent (it orders `main.sh` before `_respawn.sh`), so
     # comparing a hand-ordered literal against sorted output fails on
@@ -464,7 +467,7 @@ monitor/watcher/main.sh'
     got_files=$(printf '%s\n' "$paste_sites" | sed "s|^$MON|monitor|" | cut -d: -f1 | sort -u)
     want_files=$(printf '%s\n' "$EXPECTED_PASTE_FILES" | sort -u)
     if [[ "$got_files" == "$want_files" ]]; then
-        pass "B: paste-buffer file set matches the manifest ($nsites site(s) in 4 files)"
+        pass "B: paste-buffer file set matches the manifest ($nsites site(s) in $(printf '%s\n' "$want_files" | command grep -c .) file(s))"
     else
         fail "B: paste-buffer FILE SET changed — classify the new/removed site, do not widen this test."$'\n'"expected:"$'\n'"$want_files"$'\n'"got:"$'\n'"$got_files"
     fi

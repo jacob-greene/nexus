@@ -242,10 +242,25 @@ done
 # kill allowlist AND is the canonical paste-me state), and if a future release
 # makes it read `busy` the premise of the liveness gate has changed and this
 # suite should say so rather than silently pass.
+#
+# …AND IT DID, for the MID-RETRY render only, by `your-org/nexus-code#1552` — a
+# classifier change, not a release change, and this is the suite saying so. The
+# 401 mid-retry row (`… · Retrying in 16s · attempt 6/10`) is the same render
+# family as the connection-refused retry, and `#1552` keys on what they share:
+# the harness is RE-SENDING, so the turn is in flight and the pane reads `busy
+# retrying=6/10`. The PREMISE OF THE LIVENESS GATE IS UNCHANGED, and that is
+# checked rather than argued: `_auth_hold_auth_expired` and
+# `_auth_hold_expiry_observe` key on the `auth=` FIELD alone, never on `state=`,
+# and `auth=expired` rides on whatever verdict the pane produces — asserted on
+# the same capture in the first line of the loop. The TERMINAL render, which is
+# the 45-hour surface `#1517` measured, stays `idle`.
 for f in auth-expired-retrying-realmodel-268 auth-expired-terminal-realmodel-268; do
     assert_eq "A/$f auth"  "$(auth_of  "$f")" expired
-    assert_eq "A/$f state" "$(state_of "$f")" idle
 done
+assert_eq "A/auth-expired-retrying-realmodel-268 state (mid-retry IS a turn in flight, #1552)" \
+    "$(state_of auth-expired-retrying-realmodel-268)" busy
+assert_eq "A/auth-expired-terminal-realmodel-268 state" \
+    "$(state_of auth-expired-terminal-realmodel-268)" idle
 
 # NEGATIVE CONTROLS. Without these the detector could match everything and
 # every assertion above would still pass.
@@ -297,6 +312,25 @@ _cap_log()   { printf '%s\n' "$1" >> "$LOGCAP"; }
 _cap_alert() { printf '%s\n' "$1" >> "$ALERTCAP"; }
 _AUTH_HOLD_LOG_FN=_cap_log
 _AUTH_HOLD_ALERT_FN=_cap_alert
+# The TEXT-CARRYING operator alert (your-org/nexus-code#1548). Recorded as one
+# line per call, `<verb> <key> [<severity>] <message>`, so parts F3/H/E can
+# assert WHICH verb fired, for WHICH key, with WHAT text — the three things
+# the expiry arm never said on 2026-09-17.
+OPCAP="$WORK/opalerts"
+: > "$OPCAP"
+# The recorder also tracks STANDING like the real primitive does (raise sets,
+# clear unsets), so the module's `standing`-gated clear is exercised for real.
+OPSTAND="$WORK/opstanding"
+_cap_op() {
+    case "${1:-}" in
+        due)      return 0 ;;
+        standing) [[ -f "$OPSTAND.${2:-}" ]] ;;
+        raise)    : > "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        clear)    rm -f "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        *)        printf '%s\n' "$*" >> "$OPCAP" ;;
+    esac
+}
+_AUTH_HOLD_OPERATOR_ALERT_FN=_cap_op
 
 # A MISSING SUBJECT IS A **FAILURE**, NOT AN ENVIRONMENT SKIP — and the
 # distinction is the whole reason `env_fail` exits 97 rather than 1. `env_fail`
@@ -344,7 +378,7 @@ probe_key()    { cut -f1 "$PROBE_ARGS" 2>/dev/null; }
 probe_expect() { cut -f2 "$PROBE_ARGS" 2>/dev/null; }
 
 row_path=$(_auth_hold_state_path)
-reset_arm() { rm -f "$row_path" "$(_auth_hold_alert_stamp_path)" "$(_auth_hold_held_log_path)"; : > "$LOGCAP"; : > "$ALERTCAP"; }
+reset_arm() { rm -f "$row_path" "$(_auth_hold_alert_stamp_path)" "$(_auth_hold_held_log_path)" "$(_auth_hold_ceiling_stamp_path)" "$OPSTAND".* "$STATE_DIR"/turn-failure/*.json; : > "$LOGCAP"; : > "$ALERTCAP"; : > "$OPCAP"; }
 
 # ---- C0. the probe is keyed on the window INDEX, for the shared cache ---
 #
@@ -579,8 +613,17 @@ fi
 # arms cover DIFFERENT states and neither alone suffices:
 #
 #   renderer path                  state=blocked  auth=login   both arms
-#   heartbeat idle_prompt          state=idle     auth=login   LABELLED arm only
+#   heartbeat idle_prompt          state=idle     auth=login   LABELLED arm only   <- UNTIL #1521
 #   heartbeat permission_prompt    state=blocked  (no auth)    STRUCTURAL arm only
+#
+# THE MIDDLE ROW WAS `your-org/nexus-code#1521`, AND IT IS FIXED: a fresh
+# `idle_prompt` stamp no longer outranks a dialog the hook cannot see, so that
+# row now reads `state=blocked auth=login` — BOTH arms, the same as the renderer
+# path, because it IS the renderer's answer (the heartbeat route defers to it
+# whenever the pane contradicts `idle`). The precondition below used to PROVE
+# the route was taken by exhibiting that very defect ("it reports idle where the
+# renderer reports blocked"); it now proves it with a `permission_prompt` stamp
+# over a genuinely idle capture, which reads `blocked` only if the stamp is read.
 #
 # So whichever route runs and whichever heartbeat state it reports, at least one
 # arm fires. #1520 proposes giving the orchestrator worker-style hook coverage;
@@ -593,16 +636,18 @@ _hb_probe() {   # <heartbeat-state> <fixture> <token>
     "$PS" --fixture "$FIX/$2.ansi" --heartbeat-file "$_hbdir/h.json" --now "$now" 2>/dev/null \
         | awk -v t="$3" '{for(i=1;i<=NF;i++){n=index($i,"="); if(n>0&&substr($i,1,n-1)==t){print substr($i,n+1);exit}}}'
 }
-# PRECONDITION: the heartbeat route must actually be TAKEN, or every assertion
-# below is a renderer-path assertion wearing a heartbeat label. `idle` on a
-# capture the renderer calls `blocked` is the proof that it was.
-_hb_state=$(_hb_probe idle_prompt blocked-login-method-realmodel-268 state)
-if [[ "$_hb_state" == "idle" ]]; then
-    pass "F4 the heartbeat route is genuinely taken (it reports idle where the renderer reports blocked)"
+# PRECONDITION: the heartbeat file must actually be READ, or every assertion
+# below is a renderer-path assertion wearing a heartbeat label. `blocked` on a
+# capture the renderer calls `idle` is the proof that it was.
+_hb_state=$(_hb_probe permission_prompt idle-empty-post-turn-realmodel state)
+if [[ "$_hb_state" == "blocked" && "$(state_of idle-empty-post-turn-realmodel)" == "idle" ]]; then
+    pass "F4 the heartbeat route is genuinely taken (a permission_prompt stamp reports blocked where the renderer reports idle)"
 else
     env_fail "the heartbeat route was not taken (state=$_hb_state); every F4 assertion would be a renderer-path assertion mislabelled"
 fi
-assert_eq "F4 heartbeat idle_prompt on a login frame still carries auth=login (the LABELLED arm covers the route the structural one loses)" \
+assert_eq "F4 heartbeat idle_prompt on a login frame reads BLOCKED — the stamp no longer outranks a dialog the hook cannot see (#1521)" \
+    "$(_hb_probe idle_prompt blocked-login-method-realmodel-268 state)" blocked
+assert_eq "F4 …and still carries auth=login, so BOTH arms hold it on this route too" \
     "$(_hb_probe idle_prompt blocked-login-method-realmodel-268 auth)" login
 assert_eq "F4 …and on the non-menu code-paste frame too" \
     "$(_hb_probe idle_prompt blocked-login-codepaste-realmodel-268 auth)" login
@@ -828,7 +873,38 @@ if _auth_hold_auth_expired orchestrator; then
 else
     pass "F3 the expiry arm FAILS OPEN past max_hold_seconds (9000 s > 7200 s)"
 fi
-grep -q 'ceiling REACHED' "$LOGCAP" && pass "F3 …and says so in the log, naming the ceiling" || fail "F3 the fail-open is silent"
+grep -q 'ceiling CROSSED' "$LOGCAP" && pass "F3 …and says so in the log, naming the ceiling" || fail "F3 the fail-open is silent"
+# ---- F3b. THE CEILING LINE IS THROTTLED (your-org/nexus-code#1548 §2 / P3) --
+# The predecessor logged from inside this predicate every ~5 s: 3364 lines in
+# 5 h 22 m, 1.2 MB, 2.11x the log's remaining headroom, and every one carried
+# `respawn` / `credential` / `login` / `expired` / `#1518`, so a count of any of
+# those over the outage was inflated by exactly 3364. Now: one crossing line,
+# then repeats at a doubling backoff capped at 3600 s, worded as an AGE and
+# free of the forensic terms.
+for _i in 1 2 3 4 5; do _auth_hold_auth_expired orchestrator >/dev/null; done
+assert_eq "F3b five consecutive past-ceiling polls log the crossing ONCE (was: one line per poll)" \
+    "$(grep -c 'expiry ceiling' "$LOGCAP")" 1
+# Back-date the throttle stamp so a repeat is due, and check its shape.
+printf '%s\t%s\n' "$(( now - 4000 ))" 5 > "$(_auth_hold_ceiling_stamp_path)"
+_auth_hold_auth_expired orchestrator >/dev/null
+assert_eq "F3b a due repeat logs exactly one more line" "$(grep -c 'expiry ceiling' "$LOGCAP")" 2
+grep -q 'expiry ceiling held open since' "$LOGCAP" \
+    && pass "F3b the repeat is worded as an AGE (held open since …), not as a transition (REACHED)" \
+    || fail "F3b repeat wording: $(grep 'expiry ceiling' "$LOGCAP" | tail -n1)"
+if grep -qiE 'respawn|credential|login|expired|#1518' <<<"$(grep 'held open since' "$LOGCAP")"; then
+    fail "F3b the repeat line carries a forensic search term — a 5 h outage would again inflate grep counts by its own diagnostic"
+else
+    pass "F3b the repeat line carries none of respawn/credential/login/expired/#1518 (the flood's poison words)"
+fi
+IFS=$'\t' read -r _ _nxt < "$(_auth_hold_ceiling_stamp_path)"
+assert_eq "F3b the backoff DOUBLED (5 → 10 s) after the repeat" "$_nxt" 10
+printf '%s\t%s\n' "$(( now - 4000 ))" 3600 > "$(_auth_hold_ceiling_stamp_path)"
+_auth_hold_auth_expired orchestrator >/dev/null
+IFS=$'\t' read -r _ _nxt < "$(_auth_hold_ceiling_stamp_path)"
+assert_eq "F3b the backoff is CAPPED at 3600 s" "$_nxt" 3600
+# The throttle stamp dies with the expiry row, so a NEW expiry crosses loudly.
+PROBE_REPLY="idle none 111"; _auth_hold_observe orchestrator
+[[ -f "$(_auth_hold_ceiling_stamp_path)" ]] && fail "F3b the ceiling stamp survived the expiry clearing" || pass "F3b the ceiling stamp is removed with the expiry row (a new outage crosses loudly again)"
 # The WIDENED case: the hold arm now fires on any dialog, so its ceiling must
 # bound that population too — asserted here rather than assumed from the
 # login-only case it was written against.
@@ -942,6 +1018,9 @@ ladder 5
 assert_eq "E …and the cycle after does not re-deliver it (no duplicate)" "$(grep -c . "$PASTES")" 2
 grep -q 'ESCAPED' "$LOGCAP" && pass "E the escape is in the log" || fail "E no ESCAPED line"
 grep -q 'login hold EXPIRED' "$ALERTCAP" && pass "E the operator is told the hold expired" || fail "E no expiry alert"
+grep -q '^notify auth-dialog-escaped critical ' "$OPCAP" \
+    && pass "E …and on the TEXT-CARRYING leg too (notify auth-dialog-escaped, critical): an abandoned login is the case where nobody is at the terminal" \
+    || fail "E the escape reached only the bell (#1533: one bit); OPCAP=$(cat "$OPCAP")"
 
 # ---- G(1). the #745 dead-pane guard precedes the Escape ----------------
 # A write into a `remain-on-exit` corpse kills the tmux SERVER — the watcher,
@@ -1072,6 +1151,134 @@ else
     pass "F/neg a healthy pane reaches the ordinary ladder, not the auth gate (got: '$verdict2')"
 fi
 
+# ---- H. THE EXPIRY ARM TELLS THE OPERATOR (your-org/nexus-code#1548) --------
+# Measured 2026-09-17: `auth-hold: EXPIRY observed` at 04:02:52, zero operator
+# alerts until 11:24:55, when the operator had already opened /login unaided.
+# `_AUTH_HOLD_ALERT_FN` sites: 2, both on the DIALOG arm. This part pins that
+# the expiry arm now RAISES the text-carrying alert on the first observation,
+# keeps calling it (the primitive owns the reminder cadence), and CLEARS it on
+# the transition out — with the remedy first in the text.
+reset_arm
+rm -f "$(_auth_hold_expiry_path)"
+PROBE_REPLY="idle expired 111"; _auth_hold_observe orchestrator
+assert_eq "H the first expiry observation RAISES the operator alert" "$(grep -c '^raise auth-expired critical ' "$OPCAP")" 1
+grep -q '^raise auth-expired critical RUN /login IN THE ORCHESTRATOR WINDOW' "$OPCAP" \
+    && pass "H the alert text leads with the REMEDY (RUN /login …), phone-readable" \
+    || fail "H alert text: $(head -n1 "$OPCAP")"
+grep -q 'no resubmit and no respawn' <<<"$(grep '^raise auth-expired' "$OPCAP")" \
+    && pass "H …and states the channel consequences the operator would otherwise mis-infer" \
+    || fail "H alert text does not state the consequences"
+grep -q 'repeats hourly' <<<"$(grep '^raise auth-expired' "$OPCAP")" \
+    && pass "H …and promises the reminder cadence" || fail "H no cadence promise"
+_auth_hold_observe orchestrator
+assert_eq "H every cycle re-raises (the primitive dedups; this is what buys the hourly reminder)" "$(grep -c '^raise auth-expired critical ' "$OPCAP")" 2
+assert_eq "H nothing was CLEARED while the expiry stands" "$(grep -c '^clear auth-expired' "$OPCAP")" 0
+assert_eq "H the DIALOG bell did not fire for a bare expiry (that arm is the dialog's)" "$(grep -c . "$ALERTCAP")" 0
+PROBE_REPLY="idle none 111"; _auth_hold_observe orchestrator
+assert_eq "H the transition OUT clears the alert" "$(grep -c '^clear auth-expired ' "$OPCAP")" 1
+_auth_hold_observe orchestrator
+assert_eq "H …exactly once (a healthy cycle after the clear clears nothing)" "$(grep -c '^clear auth-expired ' "$OPCAP")" 1
+# NEGATIVE CONTROL: a healthy pane never raises. Without this the arm could
+# fire unconditionally and every assertion above would still pass.
+reset_arm
+PROBE_REPLY="idle none 111"; _auth_hold_observe orchestrator; _auth_hold_observe orchestrator
+assert_eq "H/neg a healthy pane raises nothing" "$(grep -c '^raise' "$OPCAP")" 0
+# The knob-off path clears too, or an alert would outlive the feature.
+reset_arm
+PROBE_REPLY="idle expired 111"; _auth_hold_observe orchestrator
+MONITOR_AUTH_HOLD_ENABLED=false _auth_hold_observe orchestrator
+assert_eq "H knob OFF clears a standing expiry alert" "$(grep -c '^clear auth-expired ' "$OPCAP")" 1
+unset MONITOR_AUTH_HOLD_ENABLED
+
+# ---- I. THE TYPED SENSOR: the orchestrator's StopFailure marker (#1520/#1517)
+# Planted markers in the exact shape the real writer produces (measured on
+# 2.1.273 in test-realmodel-auth-failure-hooks.sh). Each negative control
+# removes ONE premise: freshness, category, well-formedness, existence.
+plant_tf() {   # <target> <age_s> <category> <recovery> [last_msg]
+    mkdir -p "$STATE_DIR/turn-failure"
+    printf '{"ts":%s,"error":"authentication_failed","category":"%s","recovery":"%s","last_msg":"%s","session_id":"s","window":"%s","hook_event_name":"StopFailure"}\n' \
+        "$(( now - $2 ))" "$3" "$4" "${5:-Login expired · Please run /login}" "$1" > "$STATE_DIR/turn-failure/$1.json"
+}
+reset_arm
+plant_tf orchestrator 30 auth operator
+if row=$(_auth_hold_turn_failure_gate orchestrator); then pass "I a fresh auth marker GATES (rc 0)"; else fail "I a fresh auth marker did not gate"; fi
+[[ "$row" == *$'\t'"Login expired"* ]] && pass "I …and hands back the last message for the alert text" || fail "I gate row: '$row'"
+plant_tf orchestrator 4000 auth operator
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I/neg a 4000 s-old marker still gates (gate window is 600 s) — a wedged pane would be vouched for by a stale marker"; else pass "I/neg a STALE marker does not gate"; fi
+plant_tf orchestrator 30 transient paste "API Error: 529 Overloaded"
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I/neg a TRANSIENT marker gates — a 529 would suppress the remedies that fix it"; else pass "I/neg a transient (529) marker does not gate"; fi
+printf 'not json\n' > "$STATE_DIR/turn-failure/orchestrator.json"
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I/neg a malformed marker gates"; else pass "I/neg a MALFORMED marker does not gate"; fi
+rm -f "$STATE_DIR/turn-failure/orchestrator.json"
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I/neg no marker gates"; else pass "I/neg NO marker does not gate"; fi
+plant_tf other-window 30 auth operator
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I/neg another window's marker gates the orchestrator"; else pass "I/neg another window's marker does not gate this target"; fi
+# The alert from the typed sensor, and its clear once the sensor is quiet.
+reset_arm
+plant_tf orchestrator 30 auth operator
+_auth_hold_turn_failure_alert orchestrator
+assert_eq "I the typed sensor RAISES the same key (auth-expired)" "$(grep -c '^raise auth-expired critical ' "$OPCAP")" 1
+grep -q 'StopFailure marker' <<<"$(grep '^raise auth-expired' "$OPCAP")" && pass "I …naming its source in the text" || fail "I text: $(head -n1 "$OPCAP")"
+grep -q '^raise auth-expired critical RUN /login' <<<"$(grep '^raise auth-expired' "$OPCAP")" && pass "I …remedy first, same as the pane arm" || fail "I remedy not first"
+PROBE_REPLY="idle none 111"; _auth_hold_observe orchestrator
+assert_eq "I a healthy PANE does not clear while the marker is still fresh (the typed sensor still says logged out)" "$(grep -c '^clear' "$OPCAP")" 0
+rm -f "$STATE_DIR/turn-failure/orchestrator.json"
+_auth_hold_observe orchestrator
+assert_eq "I …and clears once the marker is gone too (a successful turn's Stop removed it)" "$(grep -c '^clear auth-expired ' "$OPCAP")" 1
+_auth_hold_observe orchestrator
+assert_eq "I …exactly once" "$(grep -c '^clear auth-expired ' "$OPCAP")" 1
+# ---- I(F3). CURRENCY IS A DISJUNCTION: fresh, OR the latest paste was answered
+# by this failure (skeptic oplivesk F3). A fixed 600 s window alone respawned
+# at +1385 s in the skeptic's rig; `marker.ts >= last_paste_ts` closes it, and
+# a NEWER paste with no newer marker (a wedge) releases it.
+reset_arm
+plant_tf orchestrator 1400 auth operator                 # 1400 s old: far outside the 600 s window
+if _auth_hold_turn_failure_gate orchestrator "$(( now - 1450 ))" >/dev/null; then
+    pass "I(F3) a 1400 s-old marker still gates while it ANSWERS the latest paste (paste 1450 s ago)"
+else
+    fail "I(F3) an old marker that answers the latest paste did not gate — dead-threshold (1320 s) is open again"
+fi
+if _auth_hold_turn_failure_gate orchestrator "$(( now - 100 ))" >/dev/null; then
+    fail "I(F3)/neg an old marker gates although a NEWER paste (100 s ago) went unanswered — a wedged agent would be vouched for"
+else
+    pass "I(F3)/neg a NEWER unanswered paste releases the gate (the wedge case)"
+fi
+if _auth_hold_turn_failure_gate orchestrator "" >/dev/null; then
+    fail "I(F3)/neg an old marker gates with NO paste epoch at all"
+else
+    pass "I(F3)/neg with no paste epoch an old marker does not gate (freshness alone applies)"
+fi
+# ---- I(F5). THE TYPED ARM HAS THE SAME CEILING AS THE PANE ARM. Without one it
+# silently revoked the max_hold fail-open the alert text promises.
+reset_arm; rm -f "$(_auth_hold_turn_failure_first_path)"
+plant_tf orchestrator 30 auth operator
+_auth_hold_turn_failure_gate orchestrator >/dev/null
+[[ -f "$(_auth_hold_turn_failure_first_path)" ]] && pass "I(F5) the first gated cycle records first-seen" || fail "I(F5) no first-seen row"
+printf '%s\n' "$(( now - 9000 ))" > "$(_auth_hold_turn_failure_first_path)"
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then
+    fail "I(F5) a typed gate 9000 s old still suppresses — past the 7200 s ceiling it must FAIL OPEN, as the alert text and the pane arm both promise"
+else
+    pass "I(F5) the typed arm FAILS OPEN past max_hold_seconds (9000 s > 7200 s)"
+fi
+grep -q 'ceiling CROSSED' "$LOGCAP" && pass "I(F5) …through the same throttled ceiling line" || fail "I(F5) the typed fail-open is silent"
+if _auth_hold_turn_failure_marker orchestrator >/dev/null; then pass "I(F5) …while the RAW sensor still reports the condition (so the alert is not cleared past the ceiling)"; else fail "I(F5) raw sensor lost the marker"; fi
+rm -f "$STATE_DIR/turn-failure/orchestrator.json"
+_auth_hold_turn_failure_gate orchestrator >/dev/null
+[[ ! -f "$(_auth_hold_turn_failure_first_path)" ]] && pass "I(F5) first-seen is removed the first cycle the sensor is quiet (a new outage gets a fresh ceiling)" || fail "I(F5) first-seen row survived"
+# The alert text must not claim emits are held under expiry (they are pasted).
+reset_arm; rm -f "$(_auth_hold_expiry_path)"
+PROBE_REPLY="idle expired 111"; _auth_hold_observe orchestrator
+if grep -q 'archived and wait' "$OPCAP"; then fail "I(F5) the alert text still says emits 'are archived and wait' — false under expiry, where they are PASTED"; else pass "I(F5) the alert text no longer claims emits are held under expiry"; fi
+grep -q 'still PASTED' "$OPCAP" && pass "I(F5) …it says they are still pasted, and that only a dialog holds them" || fail "I(F5) text: $(head -n1 "$OPCAP" | cut -c1-200)"
+PROBE_REPLY="idle none 111"; _auth_hold_observe orchestrator
+
+# Knob OFF disarms the typed sensor as well as the pane one.
+plant_tf orchestrator 30 auth operator
+MONITOR_AUTH_HOLD_ENABLED=false
+if _auth_hold_turn_failure_gate orchestrator >/dev/null; then fail "I knob OFF left the typed sensor gating"; else pass "I knob OFF disarms the typed sensor too"; fi
+unset MONITOR_AUTH_HOLD_ENABLED
+rm -f "$STATE_DIR/turn-failure/orchestrator.json"
+
 # EXPECTED-COUNT GUARD. Derived from the parts rather than pinned to a literal,
 # so adding a case to a part updates one number next to that part's name instead
 # of drifting silently. It exists because an assertion that never EXECUTED is
@@ -1098,7 +1305,22 @@ fi
 #        the superseded unconditional claim is GONE  (w237sk D1)
 # D2  8  splice preconditions x2, busy-not-labelled, hold-acts-by-design,
 #        3 direction assertions on real login captures, list completeness + wired
-EXPECTED=120
+# F4 +1  120 -> 121: the login frame's STATE on the heartbeat route, asserted
+#        beside its auth= label (your-org/nexus-code#1521)
+# F3b 7  crossing once, one repeat, age wording, no poison words, doubled,
+#        capped, stamp dies with the row  (#1548 §2 / P3)
+# E  +1  the escape reaches the text-carrying leg (notify)  (#1548 / #1533)
+# H  11  raise on first, remedy-first text, consequences, cadence, re-raise,
+#        no clear while standing, no dialog bell, clear on exit, once, neg,
+#        knob-off clear  (#1548)
+# I  14  fresh gates + row, stale/transient/malformed/absent/other-window (5
+#        neg), raise + source + remedy, no-clear-while-fresh, clear-once (x2),
+#        knob-off  (#1520/#1517)
+# I(F3) 3  old-marker-answers-latest-paste gates, newer paste releases, no
+#        epoch falls back to freshness  (skeptic oplivesk F3)
+# I(F5) 7  first-seen recorded, ceiling fails open, logged, raw sensor still
+#        true, first-seen removed, alert text x2  (skeptic oplivesk F5)
+EXPECTED=164
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

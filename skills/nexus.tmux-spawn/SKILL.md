@@ -205,11 +205,13 @@ both mean the worker is ACTIVE; `empty` means "don't know yet";
 `unknown` means the classifier could not look at all. Dropping any
 of them into a permissive else branch is how a live worker gets
 retired — the misread that `retire-preflight.sh` Hard gate 0
-exists to prevent (2026-06-15). Two FIELDS ride the `busy` line rather than
+exists to prevent (2026-06-15). Three FIELDS ride the `busy` line rather than
 being states of their own — `queued=1` (input already waiting
-behind a running turn: do not paste again) and `throttled=1`
+behind a running turn: do not paste again), `throttled=1`
 (mid-turn under `/low-priority`, retry banner up, no tokens
-moving).
+moving) and `retrying=<k>/<N>` (the request FAILED and the harness is
+re-sending it by itself — the pane every agent shows during a backend
+outage; `<your-org>/nexus-code#1552`).
 
 **Manual fallback** when the helper returns something surprising or
 appears miscalibrated (e.g. after a Claude Code release): inspect
@@ -571,10 +573,10 @@ second one — and reports only what it established:
 
 | rc | meaning | what you do |
 |---|---|---|
-| `0` | `submitted` — a TUI submission record appeared | nothing; the worker has it |
+| `0` | `submitted` — a TUI submission record appeared; or `submitted (queued behind a running turn)` — the pane was mid-turn and Claude Code recorded the ENQUEUE, which is the arrival event for a busy pane (`<your-org>/nexus-code#665`, `#1591`). `(after one Enter retry)` means the first Enter did not submit: a collapsed-paste placeholder, or — since Claude Code 2.1.277 — a prompt HELD for review because it carried an invisible character | nothing; the worker has it |
 | `1` | hard failure (window absent, tmux error, empty message) | fix the call; `spawn-worker.sh --resume` if the window is gone |
 | `3` | `submission unconfirmed` — unverifiable, or a turn was in flight so the text is plausibly **queued** behind it | **re-check** before relying on the worker having read it; re-paste once the pane is idle |
-| `4` | `pasted (NOT submitted)` — established negative: the session stayed inert, the text sits in the input box | **re-paste**; the worker has not seen it |
+| `4` | `pasted (NOT submitted)` — established negative: the session stayed inert, or the pane POSITIVELY reads the text still in the input box after the Enter retry, or an overlay came up (then the retry was WITHHELD: an Enter would answer the overlay, `#1200`) | read the second stderr line: when the text is positively IN the box, **press Enter, do NOT re-paste** — a re-paste appends a second copy (`#1591`, measured); otherwise re-paste |
 
 Never read a non-zero rc as delivery. `--no-enter` exits `0` and says so
 explicitly — it never claims a submission it did not intend. Do **not**
@@ -590,9 +592,14 @@ the resulting submit as OPERATOR input, marks the window
 `operator-engaged`, and mutes its stall-nag /
 `idle_prompt` surfacing for up to 24 h — exactly the worker you
 wanted to keep an eye on. The helper also handles the mechanics that
-used to be hand-rolled here: `set-buffer` + `paste-buffer` (atomic,
-any length; `send-keys` drops characters on long strings), the
-paste→Enter delay, and the VI-mode hazard below. It fails loudly
+used to be hand-rolled here: `load-buffer` from a file + bracketed
+`paste-buffer` (atomic, any length; `send-keys` drops characters on long
+strings, and a `set-buffer` DATA argument loses a trailing `;` to tmux's
+command-list rule, `<your-org>/nexus-code#1590`), the paste→Enter delay, the
+CONFIRMATION that the prompt was submitted rather than held in the input box
+(`#1591`: Claude Code >= 2.1.277 holds a prompt carrying an invisible
+character until a second Enter), and the VI-mode hazard below. All of it is
+`monitor/_paste-deliver.sh`, shared with the watcher's own pastes. It fails loudly
 when the window is gone (then use `spawn-worker.sh --resume`).
 
 **Relay scope-expansion through a GitHub comment, not a bare paste.** A

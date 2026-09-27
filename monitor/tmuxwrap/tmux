@@ -94,6 +94,31 @@
 #      the orchestrator's own window-retirement loop issues targeted
 #      `kill-window` calls: the legitimate mechanism and the lethal one are the
 #      same command with different runtime state.
+#   4. A NAMED `-t` that tmux resolved by PREFIX to a DIFFERENT window — or,
+#      in its session part, to a different SESSION — for the kills AND for the
+#      verbs that act on a window (send-keys, paste-buffer, respawn-*,
+#      select-*, pipe-pane): your-org/nexus-code#1524, #1578's bundle (G2/G3).
+#   5. COMMAND CARRIERS (if-shell, run-shell, source-file, set-hook, bind-key,
+#      confirm-before, command-prompt, choose-*, display-panes): for an AGENT
+#      caller (CLAUDECODE=1) refused OUTRIGHT on the board, and so is ANY `-C`
+#      invocation from an agent — control mode reads commands from stdin on
+#      every command that attaches, and on none. For EVERY caller the CARRIED
+#      tmux text is parsed as 2.6 parses it and judged by these same rules, and
+#      a `source-file` CYCLE (which wedges the server) is refused. Then the
+#      LETHAL NON-KILLS, for every caller: set-option or set-window-option of
+#      exit-/destroy-unattached to anything but off, unlink-window -k (a
+#      kill-window), move/link-window -k (Rule 4 on the destination), and an
+#      alias that expands to nothing, which crashes tmux 2.6 (#1583; the policy
+#      is stated above _tw_classify, the carried-text judge just below it).
+# Every rule applies to EVERY command of an invocation that tmux parses from
+# ARGV, split exactly as tmux 2.6 splits it (#1578 — an argument ENDING in `;`
+# separates), including the expansion of a command-alias (#1575) and every
+# command a carrier carries.
+# NOT covered here: shell text the SERVER runs (#() formats, default-command,
+# the command of new-window/respawn-*, pipe-pane, run-shell). Its `tmux` is
+# found on the server's PATH, not the caller's; monitor/tmux-server-path.sh
+# fronts this shim there, which was measured to close a DIRECT `tmux <kill>` in
+# such text (#1583) — and nothing else: the shell text is never parsed.
 #
 # PERMISSIVE FOR ISOLATED SOCKETS. A kill against a private socket is
 # legitimate and frequent — cc-harness and the tmux-touching suites depend on
@@ -138,6 +163,34 @@
 #   * A PATH-front shim can silently fall out of PATH — the `gh` wrapper has
 #     been observed BROKEN on a live clone, five operator-authored writes in one
 #     day (`#497`).
+#   * An alias's value, and a carrier's payload, is tokenised by the shim's own
+#     copy of 2.6's cmd_string_split (_tw_str_split). `$VAR` and `~` there are
+#     read from the SERVER's global environment, as tmux reads them (#1582 D3),
+#     at the moment of the probe — a variable set between the probe and the
+#     server's own parse (a hook fires LATER) is not seen. Expansion is one
+#     level, as on 2.6; an alias chain (possible on 3.x) is judged on its
+#     first hop only.
+#   * For a caller WITHOUT CLAUDECODE, a carrier passes when its payload holds
+#     nothing the rules refuse — so what the payload judge cannot see passes
+#     with it: shell text, an unreadable or later-changed source-file, a
+#     template's `%%` placeholders, control mode's stdin (a human's client —
+#     Claude Code's own `--tmux` launcher runs `-CC attach-session` from a
+#     process with no CLAUDECODE), and 3.x's display-menu/display-popup. An
+#     agent that scrubs CLAUDECODE is on this path too; that is evasion.
+#   * The command split reproduces tmux 2.6's cmd_list_parse (#1578). tmux
+#     3.x parses with a grammar of its own, unmeasured here; the 2.6 rule is
+#     the wider of the two for `;`-ended arguments as far as anyone has
+#     measured, but that is a statement about 2.6, not a proof about 3.x.
+#   * A shell that names tmux by ABSOLUTE path (`/usr/bin/tmux kill-server`),
+#     here or in server-run text, is never routed through PATH at all.
+#   * The command table the carriers and lethal shapes are resolved against is
+#     tmux 2.6's `list-commands`. 3.x adds commands (two carriers, display-menu
+#     and display-popup, are refused by exact name); 3.x is otherwise unmeasured.
+#   * Two deliberate OVER-refusals, both on the kill-safe side: a bare act
+#     target that names a session is refused when two windows in it share the
+#     word as a prefix (tmux then does fall back to the session — use
+#     `-t <session>:`), and `kill-session -t <window>.<pane>` meant as "the
+#     session holding that window" is refused.
 #
 # So this degrades to TODAY's protection, not to safety. It does NOT retire the
 # lint, `#889`'s hook-pattern work, or the worker-floor sentence; it is a fourth
@@ -406,8 +459,11 @@ fi
 _tw_argv=("$@")
 _tw_cmdline="$*"        # captured HERE: inside a function `$*` is the FUNCTION's args
 _tw_globals=()
+_tw_pglobals=()        # the same, minus CONTROL MODE — what the shim's own probes replay (F3)
+_tw_ctl=0              # 1 when -C/-CC was given: it reads COMMANDS FROM STDIN on any attaching command (#1583 F1)
 _tw_verb=""
 _tw_vi=0
+_tw_vfound=0           # set when a COMMAND slot exists — the verb may legitimately be ''
 _tw_i=0
 _tw_parse_ok=1
 
@@ -423,35 +479,46 @@ while [ "$_tw_i" -lt "${#_tw_argv[@]}" ]; do
             # something tmux accepts is never safe — bail only on shapes tmux
             # ALSO rejects.
             _tw_i=$((_tw_i + 1))
-            [ "$_tw_i" -lt "${#_tw_argv[@]}" ] && { _tw_verb="${_tw_argv[$_tw_i]}"; _tw_vi=$_tw_i; }
+            [ "$_tw_i" -lt "${#_tw_argv[@]}" ] && { _tw_verb="${_tw_argv[$_tw_i]}"; _tw_vi=$_tw_i; _tw_vfound=1; }
             break ;;
         -?*)
             _tw_rest="${_tw_a#-}"
             _tw_takes_val=0
             _tw_j=0
+            _tw_pa="-"
             while [ "$_tw_j" -lt "${#_tw_rest}" ]; do
                 case "${_tw_rest:$_tw_j:1}" in
                     c|f|L|S)
                         # Value is the remainder of this token if there is one,
                         # otherwise the NEXT argv element.
                         [ $((_tw_j + 1)) -ge "${#_tw_rest}" ] && _tw_takes_val=1
+                        _tw_pa+="${_tw_rest:$_tw_j}"
                         _tw_j="${#_tw_rest}"
                         ;;
-                    *) _tw_j=$((_tw_j + 1)) ;;
+                    # `-C`/`-CC` (control mode) is NOT replayed on a probe (#1582
+                    # skeptic F3). Control mode frames every reply (`%begin …`),
+                    # so the socket probe's first line was never `NXSOCK:`, fell
+                    # into the no-server arm, and `tmux -C kill-server` killed
+                    # the board at rc 0 at f0809ada, f13cfb74 and 63945c85. It
+                    # selects no socket, so dropping it cannot change the answer.
+                    C) _tw_ctl=1; _tw_j=$((_tw_j + 1)) ;;
+                    *) _tw_pa+="${_tw_rest:$_tw_j:1}"; _tw_j=$((_tw_j + 1)) ;;
                 esac
             done
             _tw_globals+=("$_tw_a")
+            [ "$_tw_pa" = "-" ] || _tw_pglobals+=("$_tw_pa")
             _tw_i=$((_tw_i + 1))
             if [ "$_tw_takes_val" = 1 ]; then
                 if [ "$_tw_i" -lt "${#_tw_argv[@]}" ]; then
                     _tw_globals+=("${_tw_argv[$_tw_i]}")
+                    _tw_pglobals+=("${_tw_argv[$_tw_i]}")
                     _tw_i=$((_tw_i + 1))
                 else
                     _tw_parse_ok=0; break     # dangling flag — tmux will complain
                 fi
             fi
             ;;
-        *) _tw_verb="$_tw_a"; _tw_vi=$_tw_i; break ;;
+        *) _tw_verb="$_tw_a"; _tw_vi=$_tw_i; _tw_vfound=1; break ;;
     esac
 done
 
@@ -467,13 +534,17 @@ done
 #       full-name matcher, `kill-ser` -> SERVER DEAD.
 #
 #   F3. COMMAND SEQUENCES. tmux takes several commands in one invocation,
-#       separated by an argument that is exactly `;` (written `\;` so the shell
-#       does not eat it). Inspecting only the FIRST command word misses every
-#       later one. Measured: `list-windows \; kill-server` -> SERVER DEAD.
+#       separated by `;` (written `\;` so the shell does not eat it).
+#       Inspecting only the FIRST command word misses every later one.
+#       Measured: `list-windows \; kill-server` -> SERVER DEAD.
 #
-# Splitting argv on exact-`;` elements IS tmux's own rule, not a heuristic, so
-# this models the grammar rather than guessing at it: an argument that is
-# literally `;` is a separator to tmux no matter which command precedes it.
+# THE SEPARATOR IS NOT "AN ARGUMENT THAT IS EXACTLY `;`" — your-org/nexus-code
+# #1578. That sentence stood here as "tmux's own rule" and was a SHAPE of the
+# rule: tmux 2.6's `cmd_list_parse` ends a command at ANY argument whose LAST
+# character is `;`. So `tmux display-message 'hi;' kill-server` killed a board
+# pinned server THROUGH THIS SHIM at rc 0 (measured at f0809ada, efd4e3a8 and
+# f13cfb74), and every per-command rule below — Rule 1 included — was blind to
+# the second command. `_tw_split_open` now reproduces the parser itself; see it.
 # ---------------------------------------------------------------------------
 
 # Canonical kill verb for a (possibly abbreviated) word; empty if it is not a
@@ -504,31 +575,725 @@ _tw_kill_of() {
 }
 
 if [ "$_tw_parse_ok" != 1 ]; then exec "$_tw_real" "$@"; fi
+# AN AGENT CALLER — Claude Code marks its tool subprocesses (and hooks) with
+# CLAUDECODE=1; its own main process, the operator's shells and every process the
+# server spawns carry none (measured, see the carrier block above _tw_classify).
+_tw_agent=0; [ "${CLAUDECODE:-}" = 1 ] && _tw_agent=1
+# CONTROL MODE FROM AN AGENT IS DECIDED BEFORE THE NO-COMMAND EXIT BELOW (#1583
+# F1). `-C` reads tmux commands from STDIN on ANY command that attaches, not only
+# `attach`: `tmux -C` with no command (new-session), `-C new-session -s q` and
+# `-C new -A -s p`, each fed `kill-server`, ended a board-pinned server at rc 0
+# at 4bbfe878, ff9f8a55 and 8c9c3aa9. The no-command form never reached a rule
+# at all: the exit just below is a SAFE arm ahead of every DENY (#1121's shape).
+# So an agent's `-C` is judged as a whole, on the flag, not per verb — which
+# verbs attach is a SHAPE question and every hole in this file has been one.
+# Refused on the board only (the socket probe still decides), for agents only:
+# Claude Code's own `--tmux` launcher runs `tmux -CC attach-session -t <s>` for a
+# HUMAN in iTerm2, from its main process, which carries no CLAUDECODE (measured
+# in the 2.1.273 binary), and that stream is the human's terminal, not text a
+# guard could read.
+_tw_ctl_agent=0; [ "$_tw_ctl" = 1 ] && [ "$_tw_agent" = 1 ] && _tw_ctl_agent=1
+# No command word at all (`tmux`, `tmux -L x`, `tmux --`): tmux runs its
+# default command, new-session. Nothing here can be a kill or an act.
+[ "$_tw_vfound" = 1 ] || [ "$_tw_ctl_agent" = 1 ] || exec "$_tw_real" "$@"
 
 # Walk every command in the sequence and record where each begins. Pure argv
 # arithmetic — no subprocess, no server query — so the hot path pays only this.
-_tw_starts=()          # argv index of each command's verb
+_tw_starts=()          # _tw_argv index of each command's verb
+_tw_typedw=()          # the word to NAME each command by in a message (an alias's name, for its expansion)
 _tw_kills=()           # canonical kill verb per command, "" when not a kill
 _tw_any_kill=0
 _tw_any_unknown=0      # any command word that did NOT resolve to a kill
-_tw_ci=$_tw_vi
-_tw_expect_verb=1
-_tw_k=$_tw_vi
-while [ "$_tw_k" -lt "${#_tw_argv[@]}" ]; do
-    _tw_w="${_tw_argv[$_tw_k]}"
-    if [ "$_tw_w" = ";" ]; then
-        _tw_expect_verb=1
-    elif [ "$_tw_expect_verb" = 1 ]; then
-        _tw_starts+=("$_tw_k")
-        _tw_kv=$(_tw_kill_of "$_tw_w")
-        _tw_kills+=("$_tw_kv")
-        if [ -n "$_tw_kv" ]; then _tw_any_kill=1; else _tw_any_unknown=1; fi
-        _tw_expect_verb=0
+# ACT verbs (your-org/nexus-code#1524): the non-kill commands that DO something
+# to the window a `-t` names — keystrokes, a paste, a respawn, a selection, a
+# pipe. tmux resolves their target exactly as it resolves a kill's, so a bare
+# name whose window is gone lands on its unique-prefix sibling at rc 0: a paste
+# delivers an instruction to the wrong agent, an Enter submits whatever that
+# agent has drafted (#1200). Rule 4 below refuses that for them too.
+#
+# READS ARE DELIBERATELY NOT HERE (display-message, list-panes, capture-pane).
+# A refused read is rc 1 with empty stdout — byte-identical to "no such
+# window" — and `_pane-live.sh` uses the prefix resolution ON PURPOSE to turn
+# "no row matched, yet tmux resolves it" into CANNOT-TELL; refusing that read
+# would turn its cannot-tell into `absent`. A read that feeds a decision is
+# fixed at its call site with `:=<name>` instead.
+_tw_acts=()            # "1" per command that is an act verb, "" otherwise
+_tw_any_act=0
+# _tw_act_canon <word> -> sets _tw_ac to the ONE full command name the word
+# denotes, or "" — and returns 0 when the word is (an abbreviation of) an act
+# verb at all. No fork.
+#
+# EVERY TABLE BELOW KEYS ON _tw_ac, NEVER ON THE WORD AS TYPED (delta skeptic H1
+# on #1568). tmux accepts any unambiguous PREFIX of a command name, and this
+# function has always admitted one; the value-letter table in _tw_act_target was
+# nevertheless keyed on the typed word (`paste-*`), so `pa`, `pas`, `past` and
+# `paste` — all `paste-buffer` to tmux 2.6 — got the EMPTY set, `-b` read as
+# bare, its value `nxb` ended the walk as "the first non-flag word", and
+# `pa -b nxb -t w1` LANDED IN THE SIBLING (refused one commit earlier, when the
+# set was shared). The kill path never had this shape: _tw_kill_of canonicalises
+# first and everything after it reads the canonical verb. Swept by construct at
+# the fix: that table was the only one in this file keyed on a typed verb.
+#
+# A word that prefixes SEVERAL of these (`select`, `respawn-`) is ambiguous to
+# tmux, which refuses it itself; _tw_ac is "" and no value letters are assumed.
+_tw_act_canon() {
+    _tw_ac=""; _tw_ac_n=0
+    case "${1:-}" in
+        '') return 1 ;;
+        send)     _tw_ac=send-keys;      return 0 ;;
+        pasteb)   _tw_ac=paste-buffer;   return 0 ;;
+        respawnw) _tw_ac=respawn-window; return 0 ;;
+        respawnp) _tw_ac=respawn-pane;   return 0 ;;
+        selectw)  _tw_ac=select-window;  return 0 ;;
+        selectp)  _tw_ac=select-pane;    return 0 ;;
+        selectl)  _tw_ac=select-layout;  return 0 ;;
+        pipep)    _tw_ac=pipe-pane;      return 0 ;;
+    esac
+    for _tw_ia_v in send-keys send-prefix paste-buffer respawn-window respawn-pane \
+                    select-window select-pane select-layout pipe-pane; do
+        if [ "${_tw_ia_v:0:${#1}}" = "$1" ]; then _tw_ac="$_tw_ia_v"; _tw_ac_n=$((_tw_ac_n + 1)); fi
+    done
+    [ "$_tw_ac_n" -ge 1 ] || return 1
+    [ "$_tw_ac_n" -eq 1 ] || _tw_ac=""
+    return 0
+}
+# _tw_act_target <first-arg-index> <end-index> -> sets _tw_at to the command's
+# `-t` value, or "". Flags only: the walk STOPS at `--` or at the first word
+# that is not a flag, because everything after it is keys, paste text or a
+# shell command — and a literal `-t` in THERE is data, not a target.
+#
+# THE WALK IS GETOPT'S, LETTER BY LETTER — NOT A SET OF GLOB ARMS (delta skeptic
+# G1-G3 on #1568). Two glob versions of this function each opened a hole:
+#   * the first let a cluster ending in `t` (`-kt w1`) fall to a generic arm, so
+#     the target was never found and the check was SKIPPED (F4);
+#   * the repair added `-t|-[!-]*t)` ABOVE `-t*)`, and `[!-]` admits `t` — so a
+#     GLUED target ending in `t` (`-tbot`) was read as a cluster and the NEXT
+#     word became the target. Measured: `send-keys -tbot X` was REFUSED before
+#     that repair and LANDED IN THE SIBLING after it (G1). A pattern arm
+#     shadowing another is #1121's shape, inside the fix for it.
+# So no arm here is a pattern over a whole word. Each flag word is read one
+# letter at a time, as tmux's own getopt reads it: `t` takes the REST of the
+# word, or the next word, as the target; a value-taking letter takes the rest or
+# the next word and is skipped; any other letter is a bare flag. The LAST `-t`
+# wins, as it does in tmux and in this file's kill path (G2: the first cut took
+# the FIRST, so `-t other -t w1` was judged on `other`).
+#
+# VALUE-TAKING LETTERS ARE PER VERB, from `tmux list-commands` (G3: a letter
+# wrongly in the set hides the target just as surely — `select-pane -e` is BARE
+# on 2.6 and was in a shared set). `c`/`e` for respawn-* are 3.x flags; 2.6
+# rejects them itself, so carrying them costs nothing here.
+#
+# FAILURE DIRECTION, stated: a target this walk cannot find is a check that does
+# not run — pass-through, the dangerous direction. The walk STOPS at `--` or at
+# the first word that is not a flag: everything after is keys, paste text or a
+# shell command, and a `-t` in THERE is data, exactly as it is to tmux.
+#
+# ALSO REPORTED, for every caller that needs a flag rather than a target (#1583):
+#   _tw_athas_t  1 when a `-t` was given at all (even with an empty value);
+#   _tw_atf      every BARE flag letter seen (`-k`, `-a`, `-u` …), in order;
+#   _tw_atp      the _tw_argv index of the first POSITIONAL word (or <end-index>).
+# The kill path reads its `-t` and `-a` from here too: it used to run a separate
+# shape-based loop (`-t*)`, `-*a*)`), the exact duplication the lesson above
+# forbids, and one that read `unlink-window -kt w` as untargeted.
+_tw_act_target() {     # <first-arg-index> <end-index> <CANONICAL verb> -> _tw_at (+ _tw_athas_t _tw_atf _tw_atp)
+    _tw_at=""; _tw_atk="$1"; _tw_athas_t=0; _tw_atf=""; _tw_atp="$2"
+    # EQUALITY on the full command name — never a pattern, never the typed word (H1).
+    case "${3:-}" in
+        send-keys)                   _tw_atv='N' ;;
+        paste-buffer)                _tw_atv='bs' ;;
+        respawn-window|respawn-pane) _tw_atv='ce' ;;
+        select-pane)                 _tw_atv='PT' ;;
+        move-window|link-window)     _tw_atv='s' ;;
+        # The carriers whose payload is unfolded (#1583): their value letters, so
+        # the first POSITIONAL word is found where tmux finds it.
+        bind-key)                    _tw_atv='T' ;;
+        confirm-before)              _tw_atv='p' ;;
+        command-prompt)              _tw_atv='Ip' ;;
+        choose-tree|choose-client|choose-buffer) _tw_atv='FfO' ;;
+        display-panes)               _tw_atv='d' ;;
+        *)                           _tw_atv='' ;;
+    esac
+    while [ "$_tw_atk" -lt "$2" ]; do
+        _tw_ata="${_tw_argv[$_tw_atk]}"
+        case "$_tw_ata" in
+            --) _tw_atp=$((_tw_atk + 1)); return 0 ;;
+            -?*) : ;;
+            *) _tw_atp="$_tw_atk"; return 0 ;;   # first non-flag word (a bare `-` included)
+        esac
+        _tw_atj=1
+        while [ "$_tw_atj" -lt "${#_tw_ata}" ]; do
+            _tw_atc="${_tw_ata:$_tw_atj:1}"
+            _tw_atr="${_tw_ata:$((_tw_atj + 1))}"
+            if [ "$_tw_atc" = t ]; then
+                _tw_athas_t=1
+                if [ -n "$_tw_atr" ]; then _tw_at="$_tw_atr"
+                else _tw_atk=$((_tw_atk + 1)); _tw_at=""; [ "$_tw_atk" -lt "$2" ] && _tw_at="${_tw_argv[$_tw_atk]}"; fi
+                break
+            fi
+            case "$_tw_atv" in
+                *"$_tw_atc"*) [ -n "$_tw_atr" ] || _tw_atk=$((_tw_atk + 1)); break ;;
+            esac
+            _tw_atf+="$_tw_atc"
+            _tw_atj=$((_tw_atj + 1))
+        done
+        _tw_atk=$((_tw_atk + 1))
+    done
+    return 0
+}
+# _tw_cmd_canon <word> -> _tw_cc: the ONE tmux 2.6 command the word names, or "".
+# tmux's own rule (cmd_parse): a word EQUAL to a built-in alias is that command;
+# otherwise it names the command whose NAME it is a unique prefix of (an exact
+# name wins over a longer one). Anything else is ambiguous or unknown to tmux,
+# which then tries command-alias and otherwise rejects it.
+#
+# WHY THE WHOLE TABLE AND NOT A LIST OF THE VERBS OF INTEREST (#1583). A prefix
+# test over a SUBSET is wrong exactly where a name outside the subset is an
+# alias: `set` is set-option's alias and a prefix of `set-hook`, `display` is
+# display-message's alias and a prefix of `display-panes` — a subset matcher
+# would have refused every `tmux set …`. The table is `list-commands` on tmux
+# 2.6, verbatim (83 commands, 72 aliases); 3.x adds commands, and a word that is
+# unique here but ambiguous there is rejected by 3.x itself.
+_TW_CMDS='attach-session|attach bind-key|bind break-pane|breakp capture-pane|capturep choose-buffer choose-client choose-tree clear-history|clearhist clock-mode command-prompt confirm-before|confirm copy-mode delete-buffer|deleteb detach-client|detach display-message|display display-panes|displayp find-window|findw has-session|has if-shell|if join-pane|joinp kill-pane|killp kill-server kill-session kill-window|killw last-pane|lastp last-window|last link-window|linkw list-buffers|lsb list-clients|lsc list-commands|lscm list-keys|lsk list-panes|lsp list-sessions|ls list-windows|lsw load-buffer|loadb lock-client|lockc lock-server|lock lock-session|locks move-pane|movep move-window|movew new-session|new new-window|neww next-layout|nextl next-window|next paste-buffer|pasteb pipe-pane|pipep previous-layout|prevl previous-window|prev refresh-client|refresh rename-session|rename rename-window|renamew resize-pane|resizep respawn-pane|respawnp respawn-window|respawnw rotate-window|rotatew run-shell|run save-buffer|saveb select-layout|selectl select-pane|selectp select-window|selectw send-keys|send send-prefix set-buffer|setb set-environment|setenv set-hook set-option|set set-window-option|setw show-buffer|showb show-environment|showenv show-hooks show-messages|showmsgs show-options|show show-window-options|showw source-file|source split-window|splitw start-server|start suspend-client|suspendc swap-pane|swapp swap-window|swapw switch-client|switchc unbind-key|unbind unlink-window|unlinkw wait-for|wait'
+_tw_cmd_canon() {
+    _tw_cc=""; _tw_cc_n=0
+    [ -n "${1:-}" ] || return 0
+    for _tw_ce_e in $_TW_CMDS; do
+        case "$_tw_ce_e" in *"|$1") _tw_cc="${_tw_ce_e%|*}"; return 0 ;; esac   # alias: EXACT
+    done
+    for _tw_ce_e in $_TW_CMDS; do
+        _tw_ce_n="${_tw_ce_e%|*}"
+        [ "$_tw_ce_n" = "$1" ] && { _tw_cc="$_tw_ce_n"; return 0; }          # exact name wins
+        [ "${_tw_ce_n:0:${#1}}" = "$1" ] && { _tw_ce_h="$_tw_ce_n"; _tw_cc_n=$((_tw_cc_n + 1)); }
+    done
+    [ "$_tw_cc_n" = 1 ] && _tw_cc="$_tw_ce_h"
+    return 0
+}
+# ONE RULE FOR KILLS AND ACTS: judge the RESOLVED target by EQUALITY; use the
+# word's SHAPE only to skip forms that PROVABLY cannot prefix-redirect (merge4's
+# finding on #1568 — the FOURTH hole on the act path, and the same lesson as the
+# other three). The first cut of this function ended `*) return 1` for an
+# all-digit word, on the reasoning "an index never redirects". That is true only
+# when the index EXISTS: tmux 2.6 falls through index -> exact name -> PREFIX,
+# so with windows `1566-sk` and no index 1566, `send-keys -t p:1566` LANDED in
+# `1566-sk` at rc 0 — and worker windows ARE named by issue number. The kill
+# path, a few hundred lines down, already did the equality right; it and this
+# path now share _tw_target_word and _tw_is_misaim, so they cannot drift again.
+#
+# WHAT IS SKIPPED, and why each is safe: empty; `@id` / `%id` (ids are exact);
+# `=name` (exact by construction — `:=name` arrives here as `=name`); `{…}`,
+# `!`, `^`, `$`, and `+`/`-` offsets (tmux's own special tokens, not names);
+# anything holding a glob character (a DELIBERATE pattern, the fnmatch tier).
+# Everything else — digits included, and names holding characters outside
+# [A-Za-z0-9_-], which the first cut also skipped — is judged.
+#
+# `name.<anything>` (skeptic F3, then delta G4, on #1568). tmux 2.6 splits a
+# target at its FIRST `.` — measured: `kill-window -t a.b` with a window NAMED
+# `a.b` answers "can't find pane b" — so the part before the first `.` is the
+# window, and it prefix-redirects like any bare name WHATEVER follows: `w1.0`,
+# but also `w1.`, `w1.+` and `w1.{top}`, each of which killed the sibling at
+# rc 0 through the first cut (which split only a trailing `.<digits>`). The
+# caller refuses only when the resolved window_name equals NEITHER reading — not
+# the part before the first `.`, and not the whole word, which costs nothing on
+# 2.6 (the OR cannot widen: a whole-word match there is unreachable) and keeps a
+# tmux that DOES resolve a dotted name from being falsely refused.
+# _tw_pw is the name to compare; _tw_pw_whole is the other reading ("" if none).
+_tw_target_word() {    # <target> -> rc 0 when it must be JUDGED; sets _tw_pw (+ _tw_pw_whole)
+    _tw_pw="${1:-}"; _tw_pw_whole=""
+    case "$_tw_pw" in *:*) _tw_pw="${_tw_pw#*:}" ;; esac
+    case "$_tw_pw" in
+        ''|@*|%*|=*|'{'*|'!'|'^'|'$'|+*|-*|*'*'*|*'?'*|*'['*) return 1 ;;
+    esac
+    case "$_tw_pw" in
+        *.*) _tw_pw_whole="$_tw_pw"; _tw_pw="${_tw_pw%%.*}" ;;
+    esac
+    [ -n "$_tw_pw" ] || return 1
+    return 0
+}
+# THE SESSION PART IS A NAME TOO, AND IT PREFIX-REDIRECTS (merge4sk G3 on #1568).
+# tmux 2.6's cmd_find_get_session tries `$id`, then the EXACT name, then a
+# UNIQUE PREFIX, then fnmatch — the same ladder as a window. Measured, sessions
+# `p` and `s1x` with `s1` gone: `kill-window -t s1:w1` killed `s1x:w1`,
+# `kill-window -t s1:` killed s1x's current window, and `kill-session -t s1`
+# killed `s1x` — every one at rc 0. Nothing here judged a session word before.
+#
+# _tw_session_word <target> <window|session> -> rc 0 when the target carries a
+# session word that must be JUDGED; sets _tw_sw. The session word is the part
+# before the FIRST `:` (tmux uses strchr; a session name cannot hold `:`). A
+# target with NO `:` names a session only for a SESSION-type target
+# (kill-session): the whole word, or the part before its first `.` — measured,
+# `s1.0` with `s1` gone resolves to session `s1x`, because a `window.pane`
+# word whose window part matches no window falls back to the session tier.
+# FAILURE DIRECTION of that last case: `kill-session -t <window>.<pane>` meant
+# as "the session holding that window" is REFUSED — an idiom nothing in this
+# repo uses, and the refusal direction on a kill.
+# Skipped, exactly as `_tw_target_word` skips them: empty (the current
+# session), `$id`, `@id`/`%id`, `=name` (exact by construction), a `{…}` token
+# and anything holding a glob character. Digits are NOT skipped: a session has
+# no index.
+_tw_session_word() {
+    _tw_sw=""
+    case "${1:-}" in
+        *:*) _tw_sw="${1%%:*}" ;;
+        *)   [ "${2:-}" = session ] || return 1
+             _tw_sw="${1%%.*}" ;;
+    esac
+    case "$_tw_sw" in
+        ''|'$'*|@*|%*|=*|'{'*|*'*'*|*'?'*|*'['*) return 1 ;;
+    esac
+    return 0
+}
+# _tw_session_resolved <target> <window|session> -> sets _tw_rs to the name of
+# the session tmux RESOLVES the target's session part to ("" = could not ask).
+# Its OWN probe, deliberately: the fields tmux prints are free text, and BOTH
+# names can hold any byte the probe could use as a separator — measured on 2.6,
+# a session name keeps a raw 0x1f and `new-window -n` keeps a raw newline — so
+# one line carrying both names cannot be split with certainty. A bare
+# session-type word with no `.` is asked as `<word>:`, which forces tmux's
+# SESSION lookup; `display-message -t <word>` would walk pane -> window ->
+# session instead. Every other shape resolves its session part the same way
+# for display-message as for the command it guards, so it is asked as typed.
+# Paid only when a session word is judged — never for `@id` or `:=name`.
+_tw_session_resolved() {
+    case "$1" in *:*|*.*) _tw_sq="$1" ;; *) _tw_sq="$1:" ;; esac
+    _tw_rs=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_sq" '#{session_name}' 2>/dev/null | head -1)
+}
+# _tw_judge_session <target> <window|session> <verb-as-typed> <consequence>
+# Exits 1 through _tw_session_misaim_refuse on a POSITIVELY IDENTIFIED session
+# mis-aim; returns 0 otherwise (no session word, or tmux would not say).
+_tw_judge_session() {
+    _tw_session_word "$1" "$2" || return 0
+    _tw_session_resolved "$1"
+    [ -n "$_tw_rs" ] || return 0                       # unresolvable: tmux refuses it itself
+    [ "$_tw_rs" = "$_tw_sw" ] && return 0              # EQUALITY: the named session
+    _tw_session_misaim_refuse "$3" "$1" "$_tw_sw" "$_tw_rs" "$4"
+}
+# _tw_is_pane_index <canonical verb> <target> <resolved pane_index> <resolved window_active>
+# -> rc 0 when a bare all-digit target on a PANE-type verb named a PANE of the
+# current window, which is tmux's FIRST tier for a pane target (semisplitsk F6:
+# in a 2-pane window `select-pane -t 1` and `kill-pane -t 1` act on pane 1, and
+# the shim refused them as a window mis-aim — the wedge direction).
+# It is an EXEMPTION, so it proves itself, and it is asked only AFTER the
+# mis-aim is established (#1121's order). Proof, all by equality:
+#   * the VERB is pane-type (target-pane in `list-commands`) — for a WINDOW-type
+#     verb tmux never tries the pane tier, so `kill-window -t 1` with no index 1
+#     still prefix-redirects and must stay refused;
+#   * the target is bare digits — no `:` or `.`;
+#   * the resolved pane's index IS those digits;
+#   * and the resolved window IS the CURRENT window: its `#{window_id}` EQUALS the
+#     one an UNTARGETED `display-message -p` reports with the same globals. The
+#     pane tier looks only in the current window, so if the current window holds
+#     pane N the pane tier finds it FIRST and the two probes cannot disagree;
+#     if they agree, the answer is exactly the pane tier's.
+# THE FIRST CUT KEYED ON `#{window_active}` AND WAS UNSOUND (semisplitsk2 F2, a
+# regression against 4bbfe878): tmux 2.6's LAST tier is the SESSION fallback,
+# which also lands on an active window — ANOTHER session's current one. With a
+# session `1s` whose active pane is index 1, `kill-pane -t 1` from session `p`
+# KILLED `1s:far.1` and `send-keys -t 1` typed into it, both at rc 0, both
+# refused at 4bbfe878. "Active" is a property of every session's current window;
+# "current" is one window. The untargeted probe is paid only here, after a
+# mis-aim is already established, and at most once.
+_tw_cur_wid=""; _tw_cur_wid_done=0
+_tw_is_pane_index() {  # <canonical verb> <target> <resolved pane_index> <resolved window_id>
+    case "${1:-}" in
+        kill-pane|send-keys|send-prefix|paste-buffer|respawn-pane|select-pane|pipe-pane) : ;;
+        *) return 1 ;;
+    esac
+    case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${3:-x}" = "$2" ] || return 1
+    case "${4:-}" in @[0-9]*) : ;; *) return 1 ;; esac
+    if [ "$_tw_cur_wid_done" = 0 ]; then
+        _tw_cur_wid_done=1
+        _tw_cur_wid=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p '#{window_id}' 2>/dev/null | head -1)
     fi
-    _tw_k=$((_tw_k + 1))
-done
+    [ -n "$_tw_cur_wid" ] && [ "$_tw_cur_wid" = "$4" ]
+}
+# _tw_is_misaim <resolved-index> <resolved-name> -> rc 0 iff tmux resolved the
+# word to a window it does NOT name. EQUALITY ONLY. A word names a window by its
+# NAME (either reading of a dotted word) or, when it is all digits, by its INDEX.
+_tw_is_misaim() {
+    [ -n "${2:-}" ] || return 1                       # no resolved name: establishes nothing
+    [ "$2" = "$_tw_pw" ] && return 1
+    [ -n "$_tw_pw_whole" ] && [ "$2" = "$_tw_pw_whole" ] && return 1
+    case "$_tw_pw" in
+        *[!0-9]*) : ;;
+        *) [ "${1:-}" = "$_tw_pw" ] && return 1 ;;    # all digits AND it is that window's index
+    esac
+    return 0
+}
+# ---------------------------------------------------------------------------
+# SPLIT argv INTO COMMANDS EXACTLY AS tmux 2.6's cmd_list_parse DOES (#1578).
+# ---------------------------------------------------------------------------
+# Every per-command rule in this file reads its command through THIS split and
+# nothing else, so the shim and tmux cannot disagree about where a command
+# starts. tmux 2.6's rule, from cmd-list.c, and measured shape by shape on this
+# host (the table is on #1578):
+#
+#   * an argument whose LAST character is `;` ENDS the current command. The `;`
+#     is stripped; whatever is left, if anything, stays as that command's LAST
+#     argument. `'hi;'`, `'hi ;'`, `';;'` (argument `;`), `'list-windows;'` in
+#     the VERB slot, and the exact `';'` are all this one rule;
+#   * UNLESS the character before it is `\`: then `\;` becomes a literal `;`
+#     and the argument is NOT a separator. There is NO backslash parity — tmux
+#     looks at one character, so `hi\\;` is literal too (it becomes `hi\;`);
+#   * a `;` anywhere else in an argument (`'a;b'`) is data, and tmux does not
+#     re-split inside an argument (`'x; kill-server'` is ONE argument);
+#   * a command left EMPTY (a leading `;`, or two adjacent separators) makes
+#     tmux 2.6 reject the WHOLE invocation — `no command`, rc 1, nothing runs
+#     (measured). The split below simply records no command for it, so the
+#     rest is still judged: the only possible error is refusing something
+#     tmux would not have run anyway.
+#
+# `_tw_argv` is REBUILT from the verb slot on: separators removed, a stripped
+# argument kept stripped, `\;` turned into `;`. So a `-t 'p:w1;'` is read as
+# `p:w1` by every consumer — the kill flag loop, `_tw_act_target`, the `-a`
+# walk — which is what tmux will act on. Indices below `_tw_vi` (the global
+# flags) are untouched. `"$@"` is what is exec'd; `_tw_argv` is only ever READ.
+#
+# The two halves are separate so an alias expansion (below) can be split by the
+# same rule and then have the caller's own, ALREADY-split arguments appended to
+# its last command — tmux splits the invocation before it expands an alias.
+#
+# Each recorded command also carries three facts about WHERE it came from, taken
+# from the _tw_sa_mode / _tw_sa_depth / _tw_sa_resolv context at the moment it is
+# closed (the defaults describe a command the caller typed):
+#   _tw_cmode   ""  judged by every rule; "i" INTERACTIVE — carried text that runs
+#               only when a human presses a key or answers a prompt (see the
+#               carried-text block below), judged for unconditional lethality only;
+#   _tw_cdepth  how many carriers deep it sits (0 = typed);
+#   _tw_resolv  1 when its word is alias-resolved: typed and carried commands are,
+#               an alias's own expansion is not (2.6 expands once);
+#   _tw_cchain  the files it was read from, outermost first, each as `|<realpath>`
+#               ("" = none) — how a source-file CYCLE is recognised.
+_tw_sa_cs=0
+_tw_sa_mode=""; _tw_sa_depth=0; _tw_sa_resolv=1; _tw_sa_chain=""
+_tw_cmode=(); _tw_cdepth=(); _tw_resolv=(); _tw_cchain=()
+_tw_split_close() {    # end the open command, recording it if it holds anything
+    if [ "${#_tw_argv[@]}" -gt "$_tw_sa_cs" ]; then
+        _tw_starts+=("$_tw_sa_cs")
+        _tw_typedw+=("${_tw_sa_ov:-${_tw_argv[$_tw_sa_cs]}}")
+        _tw_cmode+=("$_tw_sa_mode"); _tw_cdepth+=("$_tw_sa_depth"); _tw_resolv+=("$_tw_sa_resolv")
+        _tw_cchain+=("$_tw_sa_chain")
+    fi
+    _tw_sa_cs=${#_tw_argv[@]}
+}
+_tw_split_open() {     # <name-override or ""> <word>... — appends; leaves the LAST command open
+    _tw_sa_ov="$1"; shift
+    _tw_sa_cs=${#_tw_argv[@]}
+    for _tw_sa_w in "$@"; do
+        case "$_tw_sa_w" in    # `\;` last: a LITERAL `;` (tmux rewrites it so), never a separator
+            *'\;') _tw_argv+=("${_tw_sa_w%??};"); continue ;;
+        esac
+        if [ "${_tw_sa_w: -1}" = ';' ]; then   # the LAST character, not the whole word (#1578)
+            [ -n "${_tw_sa_w%?}" ] && _tw_argv+=("${_tw_sa_w%?}")
+            _tw_split_close
+        else
+            _tw_argv+=("$_tw_sa_w")
+        fi
+    done
+}
+_tw_argv=("${_tw_argv[@]:0:$_tw_vi}")
+if [ "$_tw_vfound" = 1 ]; then       # an agent's bare `-C` has no command to split
+    _tw_split_open "" "${@:$((_tw_vi + 1))}"     # positional params are 1-based: this is argv[_tw_vi..]
+    _tw_split_close
+fi
 
-_tw_g=(${_tw_globals[@]+"${_tw_globals[@]}"})
+# _tw_end_of <i> -> _tw_ce: the _tw_argv index one past command <i>'s last argument.
+_tw_end_of() {
+    if [ $(($1 + 1)) -lt "${#_tw_starts[@]}" ]; then _tw_ce="${_tw_starts[$(($1 + 1))]}"; else _tw_ce=${#_tw_argv[@]}; fi
+}
+
+# ---------------------------------------------------------------------------
+# CARRIERS AND LETHAL NON-KILLS — the policy for #1583's F5, stated once.
+# ---------------------------------------------------------------------------
+# Everything above judges commands tmux parses from ARGV. Two further classes
+# end the board without any kill verb in argv, and both were MEASURED lethal
+# through this shim on tmux 2.6 (a board-pinned hermetic server, rc 0, DEAD):
+#
+# (1) COMMAND CARRIERS — verbs whose argument is tmux COMMAND TEXT the server
+#     parses later or elsewhere: `if-shell true kill-server`, `source-file
+#     <file holding kill-server>`, `set-hook -g after-list-windows kill-server`
+#     (the watcher's own next `list-windows` detonates it), `bind-key`,
+#     `confirm-before`, `command-prompt`, `choose-*` / `display-panes`
+#     templates, `run-shell`, and CONTROL MODE, where `-C` reads commands from
+#     STDIN on ANY command that attaches — the bare `tmux -C` (new-session),
+#     `-C new-session`, `-C new -A` and `-C attach` all do (semisplitsk2 F1,
+#     measured). An earlier revision of this paragraph said "only `attach`
+#     does; `-C new-session` ignores stdin". THAT WAS FALSE: it was measured
+#     with `-d`, which does not attach. Retracted here, where it was written.
+#     Two answers, one per caller:
+#       * an AGENT (CLAUDECODE=1): every carrier is REFUSED OUTRIGHT on the
+#         board, and so is every `-C` invocation (decided before the
+#         no-command exit, see _tw_ctl_agent). `git grep` over the tracked
+#         corpus finds no call site of any carrier and no `tmux -C`;
+#       * EVERY caller: the CARRIED TEXT is parsed as tmux 2.6 parses it and
+#         each carried command is judged by the rules below (next block).
+#     `set-hook -u` (unset) carries nothing and passes. TMUX_UNWRAPPED=1 remains
+#     the audited escape.
+# (2) LETHAL NON-KILL SHAPES, refused for EVERY caller:
+#     * `set-option` OR `set-window-option` of `exit-unattached` or
+#       `destroy-unattached` to anything but a literal off/no/0 — tmux
+#       prefix-matches OPTION names too (`set -s exit-un on` killed the server),
+#       a missing value TOGGLES (`set -s exit-unattached` killed it), and 2.6's
+#       set-window-option sets SERVER and SESSION options by name
+#       (`setw -g exit-unattached on`, `set-window-option exit-unattached on` and
+#       `setw -g destroy-unattached on` each killed a board-pinned server through
+#       the shim that judged set-option alone — semisplitsk2 F3). The rule keys
+#       on the RESOLVED command, _tw_cc, never on how it was typed;
+#     * `unlink-window -k`, which KILLS a window linked once: a kill-window,
+#       judged by Rules 2-4;
+#     * `move-window -k` / `link-window -k`, which kill whatever sits at the
+#       DESTINATION — and the destination prefix-redirects (measured: `-t p:w1`
+#       with `w1` gone killed `w1-sk`), so Rule 4 judges it;
+#     * an alias that expands to NO words, invoked with no arguments: tmux 2.6
+#       CRASHES ("lost server"; measured for `zz=`, `zz=X=1`, `zz=#c`).
+#
+# NOT COVERED HERE, AND WHY: shell text the SERVER executes — `run-shell`'s
+# command and if-shell's shell-command, `#()` in any format, `default-command`,
+# the command of new-window/split-window/respawn-*, `pipe-pane`. Those shells
+# take their PATH from the server, and on the live board that PATH does not
+# hold this shim (measured: `tmux show-environment -g PATH` fronts
+# agent-sandbox's tmux). Measured the other way round too: with this shim
+# prepended to a probe server's PATH, `run-shell 'tmux kill-server'` was REFUSED
+# and the server lived; without it, the server died. So a DIRECT `tmux <kill>` in
+# server-run shell text is closed at the ENVIRONMENT, not by a parser:
+# monitor/tmux-server-path.sh puts this directory at the front of a server's
+# global PATH — and ONLY that class. The shell text itself is never parsed here.
+_tw_carr=()            # per command: why it is refused on the board as a carrier/lethal non-kill, "" otherwise
+_tw_any_carrier=0
+_tw_any_crash=0        # an alias expanding to NO words, invoked bare: tmux 2.6 crashes (#1583)
+_tw_crash_word=""
+# _tw_lethal_option <command index> <canonical verb> -> rc 0 when that
+# set-option / set-window-option would END the server; sets _tw_lo to the
+# reason. Reads the OPTION and VALUE as positional words after getopt's flags,
+# so `set -gq destroy-unattached on` is found too.
+_tw_lethal_option() {
+    _tw_act_target $((${_tw_starts[$1]} + 1)) "$_tw_ce" "$2"
+    case "$_tw_atf" in *u*) return 1 ;; esac            # -u: back to the default, which is off
+    [ "$_tw_atp" -lt "$_tw_ce" ] || return 1
+    _tw_lo_o="${_tw_argv[$_tw_atp]}"
+    case "$_tw_lo_o" in ''|@*) return 1 ;; esac          # a user option is never one of these
+    _tw_lo_v=""; [ $((_tw_atp + 1)) -lt "$_tw_ce" ] && _tw_lo_v="${_tw_argv[$((_tw_atp + 1))]}"
+    for _tw_lo_n in exit-unattached destroy-unattached; do
+        [ "${_tw_lo_n:0:${#_tw_lo_o}}" = "$_tw_lo_o" ] || continue
+        case "$_tw_lo_v" in off|no|0) return 1 ;; esac    # only an explicit OFF is safe; none TOGGLES
+        _tw_lo="$2 $_tw_lo_n ${_tw_lo_v:-(no value: TOGGLES it on)}"
+        return 0
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# THE CARRIED TEXT, JUDGED FOR EVERY CALLER (#1583, the carve-out gap —
+# semisplitsk2 F4).
+# ---------------------------------------------------------------------------
+# Refusing carriers for AGENTS only (8c9c3aa9) left every other caller unguarded
+# for them, and not only until tmux-server-path.sh --apply: every carrier except
+# run-shell runs its payload INSIDE the server, where no PATH lookup happens, so
+# --apply never reaches it. The realistic unmarked callers are an `env -i`
+# harness an agent launches (cc-harness/_lib.sh runs one) and anything the server
+# spawns. So the carried text is parsed here, by the same machinery that already
+# reads an alias value, and every carried command is APPENDED as a command of its
+# own — exactly as an alias expansion is — and judged by the same rules. Nested
+# carriers unfold the same way (a carried `if-shell` is classified, and its own
+# payload appended), and a carried word is alias-resolved like a typed one.
+#
+# THE GRAMMAR, as tmux 2.6 applies it (each MEASURED on a hermetic 2.6 server with
+# `set-environment` markers — never a kill):
+#   * a command STRING (if-shell's commands, set-hook's command, confirm-before's
+#     command, the templates of command-prompt, choose-* and display-panes) is
+#     cmd_string_parse: _tw_str_split, the leading NAME=value words dropped, then
+#     the #1578 `;` split. `if-shell true 'a ; b'` and `'a; b'` both ran b;
+#     `a#b` stopped at the `#`;
+#   * bind-key's command is ARGV already (cmd_list_parse on the words after the
+#     key): a single word 'x ; y' is an unknown command, `x \; y` binds two;
+#   * source-file reads a FILE, line by line: a line ending in an ODD number of
+#     backslashes continues onto the next (`x\\` does not), a `#` line is a
+#     comment, and each logical line is a command string. A RELATIVE path is
+#     resolved against the CALLER's cwd (measured: server started in dir A,
+#     `source-file rel.conf` from dir B read B's). 2.6 takes one path, no glob.
+#
+# TWO READINGS OF A CARRIED COMMAND, because WHEN it runs differs:
+#   * IMMEDIATE (if-shell, source-file, set-hook — a hook fires on events, with
+#     no human in the loop): judged by EVERY rule, like a typed command;
+#   * INTERACTIVE (bind-key, confirm-before, command-prompt, choose-*,
+#     display-panes, and anything nested inside one): it runs only when a HUMAN
+#     presses a key, answers y, or picks an item. Rules 2-4 ask about the
+#     runtime state at THAT moment and about what the human aims at — `bind x
+#     confirm-before kill-pane` is tmux's own default binding — so only the
+#     UNCONDITIONAL lethality is judged: kill-server (Rule 1), a lethal option,
+#     the empty-alias crash. A binding that ends the board when the operator
+#     presses a key is a trap whoever set it.
+#
+# BOUNDED: nesting deeper than _TW_CARRY_MAXDEPTH, more than _TW_CARRY_MAXCMDS
+# commands, or a file longer than _TW_CARRY_MAXLINES lines stops the unfolding
+# and records why in _tw_carry_over. For an agent that changes nothing (the
+# carrier is refused outright); for any other caller the call passes WITH A LOUD
+# WARNING — this file's pass-through policy, applied honestly and audibly, never
+# an unbounded parse on a caller's input.
+#
+# DECLARED BOUNDARY — what is still NOT judged for a caller without CLAUDECODE:
+#   * shell text (run-shell, if-shell's condition, #(), …): see NOT COVERED;
+#   * a source-file this process cannot read (then tmux, same uid and same path,
+#     cannot either), and the file CHANGING between this read and the server's;
+#   * the `%%`/`%1` placeholders of a template, which a human fills in;
+#   * control mode's stdin (a human's iTerm2, see _tw_ctl_agent);
+#   * 3.x's display-menu and display-popup, refused for agents by name only;
+#   * Rules 3-4 for carried text are judged against the state NOW and from the
+#     CALLER's point of view; a hook fires later, in the server's context.
+_TW_CARRY_MAXDEPTH=8
+_TW_CARRY_MAXCMDS=400
+_TW_CARRY_MAXLINES=5000
+_tw_carry_over=""
+_tw_cycle=""           # the file of a source-file CYCLE, "" when there is none
+# _tw_drop_assign: drop the leading NAME=value words from _tw_ra_words, as 2.6's
+# cmd_string_split does (#1582 skeptic D1): every leading word — as TOKENISED,
+# so quoting is irrelevant — that holds a `=` before any space or tab. Measured:
+# `X=1`, `"X=1"`, `X="a b"`, `=1`, `X\=1` and `A=b C=d` are dropped, `"X Y=1"` is not.
+_tw_drop_assign() {
+    while [ "${#_tw_ra_words[@]}" -gt 0 ]; do
+        case "${_tw_ra_words[0]}" in *=*) : ;; *) break ;; esac
+        case "${_tw_ra_words[0]%%=*}" in *' '*|*$'\t'*) break ;; esac
+        _tw_ra_words=("${_tw_ra_words[@]:1}")
+    done
+}
+# _tw_carry_argv <name> <depth> <mode> <word>... : append the words as carried
+# commands (cmd_list_parse: the #1578 `;` rule), named <name> in any message.
+_tw_carry_argv() {
+    _tw_cy_ov="$1"; _tw_cy_d="$2"; _tw_cy_m="$3"; shift 3
+    [ "$#" -gt 0 ] || return 0
+    if [ "$_tw_cy_d" -gt "$_TW_CARRY_MAXDEPTH" ] || [ "${#_tw_starts[@]}" -ge "$_TW_CARRY_MAXCMDS" ]; then
+        _tw_carry_over="carried commands nested deeper than $_TW_CARRY_MAXDEPTH, or more than $_TW_CARRY_MAXCMDS of them"
+        return 0
+    fi
+    _tw_sa_mode="$_tw_cy_m"; _tw_sa_depth="$_tw_cy_d"; _tw_sa_resolv=1; _tw_sa_chain="$_tw_cy_chain"
+    _tw_split_open "$_tw_cy_ov" "$@"
+    _tw_split_close
+    _tw_sa_ov=""; _tw_sa_mode=""; _tw_sa_depth=0; _tw_sa_resolv=1; _tw_sa_chain=""
+}
+# _tw_carry_string <name> <depth> <mode> <command string> : cmd_string_parse.
+_tw_carry_string() {
+    _tw_str_split "$4" || return 0          # tmux fails to parse it: that text runs nothing
+    _tw_drop_assign
+    _tw_carry_argv "$1" "$2" "$3" ${_tw_ra_words[@]+"${_tw_ra_words[@]}"}
+}
+# _tw_carry_file <name> <depth> <mode> <path> : 2.6's load_cfg, one logical line
+# at a time. Unreadable: nothing is judged (see the DECLARED BOUNDARY).
+_tw_carry_file() {
+    [ -f "$4" ] && [ -r "$4" ] || return 0
+    _tw_cf_acc=""; _tw_cf_n=0
+    while IFS= read -r _tw_cf_l || [ -n "$_tw_cf_l" ]; do
+        _tw_cf_n=$((_tw_cf_n + 1))
+        if [ "$_tw_cf_n" -gt "$_TW_CARRY_MAXLINES" ]; then
+            _tw_carry_over="a sourced file longer than $_TW_CARRY_MAXLINES lines"; return 0
+        fi
+        _tw_cf_b="$_tw_cf_l"; _tw_cf_k=0
+        while [ "${_tw_cf_b: -1}" = '\' ]; do _tw_cf_b="${_tw_cf_b%?}"; _tw_cf_k=$((_tw_cf_k + 1)); done
+        if [ $((_tw_cf_k % 2)) = 1 ]; then _tw_cf_acc+="${_tw_cf_l%?}"; continue; fi
+        _tw_carry_string "$1" "$2" "$3" "$_tw_cf_acc$_tw_cf_l"
+        _tw_cf_acc=""
+    done < "$4"
+    [ -n "$_tw_cf_acc" ] && _tw_carry_string "$1" "$2" "$3" "$_tw_cf_acc"
+    return 0
+}
+# _tw_carry_of <command index> : unfold the payload of carrier <index> (its
+# canonical name in _tw_cc, its end in _tw_ce). Positional words come from the
+# same getopt walk as every flag in this file (_tw_act_target, per-verb value
+# letters from 2.6's list-commands).
+_tw_carry_of() {
+    _tw_co_cc="$_tw_cc"; _tw_co_end="$_tw_ce"
+    _tw_co_name="${_tw_typedw[$1]}"
+    _tw_co_d=$(( ${_tw_cdepth[$1]:-0} + 1 ))
+    _tw_co_m="${_tw_cmode[$1]:-}"
+    _tw_cy_chain="${_tw_cchain[$1]:-}"      # the payload was read from where its carrier was
+    case "$_tw_co_cc" in
+        bind-key|confirm-before|command-prompt|choose-tree|choose-client|choose-buffer|display-panes) _tw_co_m=i ;;
+    esac
+    _tw_act_target $((${_tw_starts[$1]} + 1)) "$_tw_co_end" "$_tw_co_cc"
+    _tw_co_p=("${_tw_argv[@]:$_tw_atp:$((_tw_co_end - _tw_atp))}")
+    case "$_tw_co_cc" in
+        if-shell)
+            [ "${#_tw_co_p[@]}" -gt 1 ] && _tw_carry_string "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "${_tw_co_p[1]}"
+            [ "${#_tw_co_p[@]}" -gt 2 ] && _tw_carry_string "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "${_tw_co_p[2]}" ;;
+        set-hook)
+            case "$_tw_atf" in *u*) return 0 ;; esac
+            [ "${#_tw_co_p[@]}" -gt 1 ] && _tw_carry_string "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "${_tw_co_p[1]}" ;;
+        bind-key)
+            [ "${#_tw_co_p[@]}" -gt 1 ] && _tw_carry_argv "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "${_tw_co_p[@]:1}" ;;
+        confirm-before|command-prompt|choose-tree|choose-client|choose-buffer|display-panes)
+            [ "${#_tw_co_p[@]}" -gt 0 ] && _tw_carry_string "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "${_tw_co_p[0]}" ;;
+        source-file)
+            [ "${#_tw_co_p[@]}" -gt 0 ] || return 0
+            # A FILE ALREADY ON ITS OWN SOURCE CHAIN IS A CYCLE, and tmux 2.6 does
+            # not stop one: `source-file <a file that sources itself>` pinned a
+            # hermetic 2.6 server at 99% CPU, unresponsive to every tmux command
+            # including kill-server, and immune to SIGTERM — it took a SIGKILL
+            # (measured while building this block). On the board that is the
+            # outage without the kill verb: every pane's tmux call hangs. So a
+            # cycle is REFUSED FOR EVERY CALLER, like a lethal option. Identity is
+            # the resolved path (readlink -f from the caller's cwd, which is where
+            # 2.6 resolves a relative path — measured), compared by EQUALITY.
+            _tw_co_rp=$(readlink -f -- "${_tw_co_p[0]}" 2>/dev/null) || _tw_co_rp=""
+            [ -n "$_tw_co_rp" ] || return 0
+            case "$_tw_cy_chain|" in
+                *"|$_tw_co_rp|"*) _tw_cycle="$_tw_co_rp"; return 0 ;;
+            esac
+            _tw_cy_chain="$_tw_cy_chain|$_tw_co_rp"
+            _tw_carry_file "$_tw_co_name" "$_tw_co_d" "$_tw_co_m" "$_tw_co_rp" ;;
+    esac
+    return 0
+}
+
+# Classify command <i> by its (canonicalised) verb word. Appends one slot each to
+# _tw_kills, _tw_acts and _tw_carr, so it must be called for i = 0, 1, 2… in order
+# — and a carrier's payload is APPENDED here, so every loop that classifies runs
+# to the CURRENT length of _tw_starts, never to a length it sampled.
+_tw_classify() {
+    _tw_cw="${_tw_argv[${_tw_starts[$1]}]}"
+    _tw_end_of "$1"
+    _tw_cmd_canon "$_tw_cw"
+    _tw_kv=$(_tw_kill_of "$_tw_cw")
+    # `unlink-window -k` kills the window when it is linked only once (#1583).
+    if [ -z "$_tw_kv" ] && [ "$_tw_cc" = unlink-window ]; then
+        _tw_act_target $((${_tw_starts[$1]} + 1)) "$_tw_ce" unlink-window
+        case "$_tw_atf" in *k*) _tw_kv=kill-window ;; esac
+    fi
+    _tw_kills+=("$_tw_kv")
+    if [ -n "$_tw_kv" ]; then _tw_any_kill=1; else _tw_any_unknown=1; fi
+    # The slot holds the CANONICAL name (`?` when the word is ambiguous among act
+    # verbs — tmux refuses those itself), so nothing downstream re-reads the typed word.
+    # This runs for an alias's EXPANSION exactly as for a typed command (#1575:
+    # an expansion used to be asked only "is this a KILL").
+    if [ -z "$_tw_kv" ] && _tw_act_canon "$_tw_cw"; then _tw_acts+=("${_tw_ac:-?}")
+    elif [ -z "$_tw_kv" ] && { [ "$_tw_cc" = move-window ] || [ "$_tw_cc" = link-window ]; }; then
+        # Judged ONLY with -k: without it an occupied destination is an error,
+        # not a kill, and the nexus's one move-window call (bootstrap-recover.sh)
+        # carries no -k and must keep costing nothing.
+        _tw_act_target $((${_tw_starts[$1]} + 1)) "$_tw_ce" "$_tw_cc"
+        case "$_tw_atf" in *k*) _tw_acts+=("$_tw_cc") ;; *) _tw_acts+=("") ;; esac
+    else _tw_acts+=(""); fi
+    _tw_cr=""
+    case "$_tw_cc" in
+        if-shell|run-shell|source-file|bind-key|confirm-before|command-prompt|choose-tree|choose-client|choose-buffer|display-panes)
+            _tw_cr="$_tw_cc" ;;
+        set-hook)
+            _tw_act_target $((${_tw_starts[$1]} + 1)) "$_tw_ce" set-hook
+            case "$_tw_atf" in *u*) : ;; *) _tw_cr=set-hook ;; esac ;;
+        set-option|set-window-option)
+            _tw_lethal_option "$1" "$_tw_cc" && _tw_cr="$_tw_lo" ;;
+    esac
+    # 3.x-only carriers, by EQUALITY on the typed word (2.6 has no such command
+    # and rejects them itself): display-menu runs commands, display-popup a shell.
+    case "$_tw_cw" in display-menu|menu|display-popup|popup) _tw_cr="$_tw_cw" ;; esac
+    _tw_carr+=("$_tw_cr")
+    [ -n "$_tw_cr" ] && _tw_any_carrier=1
+    # The payload, appended as commands of their own (the carried-text block).
+    case "$_tw_cr" in
+        if-shell|set-hook|bind-key|confirm-before|command-prompt|choose-tree|choose-client|choose-buffer|display-panes|source-file)
+            _tw_carry_of "$1" ;;
+    esac
+    return 0
+}
+
 
 # ---------------------------------------------------------------------------
 # COMMAND-ALIAS RESOLUTION — the one thing argv can never answer.
@@ -562,7 +1327,7 @@ _tw_g=(${_tw_globals[@]+"${_tw_globals[@]}"})
 # watcher is the highest-frequency issuer of `kill-window`.
 _tw_alias_done=0
 _tw_alias_tbl=""
-# SETS `_tw_ra_result` (canonical kill verb, or empty). It does NOT print, and
+# SETS `_tw_ra_val` (the alias's expansion text, or empty). It does NOT print, and
 # must NOT be called in a command substitution — your-org/nexus-code#892 skeptic
 # F9. It was `_tw_ak=$(_tw_resolve_alias …)`, and a `$( )` runs in a SUBSHELL, so
 # `_tw_alias_done=1` and the fetched table died with it: the "at most ONE round
@@ -576,25 +1341,188 @@ _tw_alias_tbl=""
 # second instance: `_tw_kill_of` and `_tw_rp` ARE captured in `$( )`, but their
 # globals are scratch and only stdout matters, so they are correct;
 # `_tw_sessions_get` is invoked BARE, so its cache does reach the caller.
-_tw_resolve_alias() {
-    _tw_ra_result=""
-    _tw_ra_w="${1:-}"
-    [ -n "$_tw_ra_w" ] || return 0
+_tw_resolve_alias() {   # <word> -> _tw_ra_found (1 = an alias of that name exists) + _tw_ra_val (its text, possibly "")
+    _tw_ra_val=""; _tw_ra_found=0
+    [ -n "${1:-}" ] || return 0
     if [ "$_tw_alias_done" = 0 ]; then
         _tw_alias_done=1
         _tw_alias_tbl=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} show -s command-alias 2>/dev/null)
     fi
     [ -n "$_tw_alias_tbl" ] || return 0
-    # Entries print as: command-alias[N] "name=target args". Pull this word's
-    # target, then canonicalise it the same way a typed verb is canonicalised —
-    # so an alias pointing at an ABBREVIATION (`x=kill-ser`) resolves too.
-    _tw_ra_t=$(printf '%s' "$_tw_alias_tbl" \
-        | tr ',' '\n' \
-        | sed -n 's/.*"\{0,1\}'"$_tw_ra_w"'=\([^"]*\)"\{0,1\}.*/\1/p' \
-        | head -1 | awk '{print $1}')
-    [ -n "$_tw_ra_t" ] || return 0
-    _tw_ra_result=$(_tw_kill_of "$_tw_ra_t")
+    # THE NAME IS COMPARED BY EQUALITY (#1578 bundle). It used to be a sed regex,
+    # `.*"?WORD=`, whose leading `.*` let it match ANY alias whose name merely
+    # ENDS in the word, and `head -1` took the first such line. So with
+    # `anxs=list-windows` above `nxs=kill-server`, the word `nxs` resolved to
+    # list-windows and the kill-server alias PASSED — and a word holding a regex
+    # character was a pattern. tmux looks an alias up by exact name, first
+    # match in index order; so does this.
+    #
+    # THE RENDERING IS DECODED, NOT TRIMMED (#1582 skeptic F1/F2). Measured on
+    # 2.6: every entry prints INDEXED, `command-alias[N] "name=value"`, with
+    # `"` shown as `\"`, `\` as `\\` and a control byte as octal (`\011`). The
+    # first cut stripped the outer quotes and kept the escapes, so the value
+    # `zq="kill-server"` was read as `\"kill-server\"` — not a kill — and the
+    # server DIED through it. And it split the table on EVERY comma, which on
+    # 2.6 never separates entries (a comma stays inside its indexed line,
+    # measured) and so only ever FORGED them: `za=display -p x,zq=list-windows`
+    # listed first made `zq` resolve to list-windows and a later
+    # `zq=kill-server` PASSED. A comma is now a separator only on a line with
+    # no `[N]` — the one-string rendering of the option's comma-joined default.
+    while IFS= read -r _tw_ra_l; do
+        # Cheap: most lines cannot match. But the test runs on the RENDERING,
+        # which escapes `"`, `\` and every control byte (`\011`), so it may skip
+        # a line only when the rendering holds NO backslash — then the rendered
+        # text IS the text. The first cut exempted only WORDS holding `"` or `\`,
+        # and a tab in an alias NAME was rendered `\011` and skipped: the entry
+        # never matched and `z<TAB>q` (=kill-server) killed the server (#1582
+        # skeptic D2 — a SAFE arm deciding before the DENY, #1121's shape).
+        case "$_tw_ra_l" in
+            *'\'*) : ;;
+            *) case "$_tw_ra_l" in *"$1"*) : ;; *) continue ;; esac ;;
+        esac
+        _tw_ra_l="${_tw_ra_l#command-alias}"
+        case "$_tw_ra_l" in
+            '['*']'*) _tw_ra_l="${_tw_ra_l#*]}"; _tw_ra_multi=0 ;;
+            *)        _tw_ra_multi=1 ;;
+        esac
+        _tw_ra_l="${_tw_ra_l# }"
+        case "$_tw_ra_l" in
+            '"'*'"') _tw_unrender "${_tw_ra_l:1:$((${#_tw_ra_l} - 2))}"; _tw_ra_l="$_tw_ur" ;;
+        esac
+        if [ "$_tw_ra_multi" = 1 ]; then _tw_ra_l="${_tw_ra_l//,/$'\n'}"; fi
+        while IFS= read -r _tw_ra_e; do
+            case "$_tw_ra_e" in *=*) : ;; *) continue ;; esac
+            [ "${_tw_ra_e%%=*}" = "$1" ] || continue
+            _tw_ra_val="${_tw_ra_e#*=}"; _tw_ra_found=1
+            return 0
+        done <<< "$_tw_ra_l"
+    done <<< "$_tw_alias_tbl"
+    return 0
 }
+# _tw_unrender <text> -> _tw_ur: undo `show`'s quoting inside "…" — `\NNN`
+# octal is that byte, `\X` is X. Measured renderings: `\"`, `\\`, `\011`.
+_tw_unrender() {
+    _tw_ur=""; _tw_ur_s="$1"; _tw_ur_i=0
+    while [ "$_tw_ur_i" -lt "${#_tw_ur_s}" ]; do
+        _tw_ur_c="${_tw_ur_s:$_tw_ur_i:1}"; _tw_ur_i=$((_tw_ur_i + 1))
+        if [ "$_tw_ur_c" = '\' ]; then
+            _tw_ur_o="${_tw_ur_s:$_tw_ur_i:3}"
+            case "$_tw_ur_o" in
+                [0-7][0-7][0-7]) printf -v _tw_ur_c "\\$_tw_ur_o"; _tw_ur_i=$((_tw_ur_i + 3)) ;;
+                *)               _tw_ur_c="${_tw_ur_s:$_tw_ur_i:1}"; _tw_ur_i=$((_tw_ur_i + 1)) ;;
+            esac
+        fi
+        _tw_ur+="$_tw_ur_c"
+    done
+}
+# _tw_str_split <alias value> -> _tw_ra_words: the WORDS tmux 2.6's
+# cmd_string_split makes of it; rc 1 where tmux fails to parse it (then the
+# alias does not resolve and tmux runs nothing). Each rule MEASURED on 2.6
+# through an alias to `display-message -p` (#1582 skeptic F1):
+#   * space / tab end a word; an unquoted `\` is an ordinary character — it
+#     does NOT escape the space after it (`a\ b` is two words);
+#   * `'…'` is literal, no escapes (`'a\b'` is `a\b`);
+#   * `"…"` honours `\e \r \n \t`, `\X` -> X, and `$VAR` (`"a\"b"` is `a"b`);
+#   * pieces concatenate (`x"y z"w` is `xy zw`; `'it''s'` is `its`);
+#   * `#` starts a comment ANYWHERE, mid-word included (`a#b` is `a`);
+#   * `$VAR` / `${VAR}` expand outside quotes too, and a word-leading `~`
+#     is the home directory.
+# DECLARED APPROXIMATION: tmux expands `$VAR` and `~` from the SERVER's
+# environment; this reads the caller's (the same $HOME in every measured
+# case). `~user` is kept literal. A verb spelled through a variable the
+# server holds and the caller does not is therefore misread.
+_tw_str_split() {
+    _tw_ra_words=(); _tw_ts_s="$1"; _tw_ts_i=0; _tw_ts_b=""; _tw_ts_h=0
+    while :; do
+        if [ "$_tw_ts_i" -ge "${#_tw_ts_s}" ]; then
+            [ "$_tw_ts_h" = 1 ] && _tw_ra_words+=("$_tw_ts_b")
+            return 0
+        fi
+        _tw_ts_c="${_tw_ts_s:$_tw_ts_i:1}"; _tw_ts_i=$((_tw_ts_i + 1))
+        case "$_tw_ts_c" in
+            "'")
+                _tw_ts_r="${_tw_ts_s:$_tw_ts_i}"
+                case "$_tw_ts_r" in *"'"*) : ;; *) return 1 ;; esac   # unterminated: tmux fails
+                _tw_ts_b+="${_tw_ts_r%%"'"*}"; _tw_ts_h=1
+                _tw_ts_t="${_tw_ts_r#*"'"}"
+                _tw_ts_i=$((_tw_ts_i + ${#_tw_ts_r} - ${#_tw_ts_t}))
+                ;;
+            '"')
+                _tw_ts_h=1
+                while :; do
+                    [ "$_tw_ts_i" -lt "${#_tw_ts_s}" ] || return 1             # unterminated
+                    _tw_ts_c="${_tw_ts_s:$_tw_ts_i:1}"; _tw_ts_i=$((_tw_ts_i + 1))
+                    case "$_tw_ts_c" in
+                        '"') break ;;
+                        '\')
+                            [ "$_tw_ts_i" -lt "${#_tw_ts_s}" ] || return 1
+                            _tw_ts_c="${_tw_ts_s:$_tw_ts_i:1}"; _tw_ts_i=$((_tw_ts_i + 1))
+                            case "$_tw_ts_c" in
+                                e) _tw_ts_c=$'\033' ;; r) _tw_ts_c=$'\r' ;;
+                                n) _tw_ts_c=$'\n' ;;   t) _tw_ts_c=$'\t' ;;
+                            esac
+                            _tw_ts_b+="$_tw_ts_c" ;;
+                        '$') _tw_str_var || return 1; _tw_ts_b+="$_tw_ts_v" ;;
+                        *)   _tw_ts_b+="$_tw_ts_c" ;;
+                    esac
+                done ;;
+            '$') _tw_str_var || return 1; _tw_ts_b+="$_tw_ts_v"; _tw_ts_h=1 ;;
+            '#') [ "$_tw_ts_h" = 1 ] && _tw_ra_words+=("$_tw_ts_b")
+                 return 0 ;;
+            ' '|$'\t')
+                 [ "$_tw_ts_h" = 1 ] && _tw_ra_words+=("$_tw_ts_b")
+                 _tw_ts_b=""; _tw_ts_h=0 ;;
+            '~') if [ "$_tw_ts_h" = 0 ]; then
+                     case "${_tw_ts_s:$_tw_ts_i:1}" in
+                         ''|/|' '|$'\t') _tw_server_env HOME; _tw_ts_b+="${_tw_se_v:-${HOME:-~}}" ;;
+                         *)              _tw_ts_b+='~' ;;
+                     esac
+                 else _tw_ts_b+='~'; fi
+                 _tw_ts_h=1 ;;
+            *)   _tw_ts_b+="$_tw_ts_c"; _tw_ts_h=1 ;;
+        esac
+    done
+}
+_tw_str_var() {   # at _tw_ts_i just past a `$` -> _tw_ts_v (the SERVER's global value)
+    _tw_ts_v=""
+    if [ "${_tw_ts_s:$_tw_ts_i:1}" = '{' ]; then
+        _tw_ts_r="${_tw_ts_s:$((_tw_ts_i + 1))}"
+        case "$_tw_ts_r" in *'}'*) : ;; *) return 1 ;; esac
+        _tw_ts_nm="${_tw_ts_r%%'}'*}"
+        _tw_ts_i=$((_tw_ts_i + 2 + ${#_tw_ts_nm}))
+    else
+        _tw_ts_nm="${_tw_ts_s:$_tw_ts_i}"; _tw_ts_nm="${_tw_ts_nm%%[!A-Za-z0-9_]*}"
+        _tw_ts_i=$((_tw_ts_i + ${#_tw_ts_nm}))
+    fi
+    case "$_tw_ts_nm" in
+        '') _tw_ts_v='$' ;;
+        [!A-Za-z_]*|*[!A-Za-z0-9_]*) : ;;                  # not a name the caller can hold
+        *) _tw_server_env "$_tw_ts_nm"; _tw_ts_v="$_tw_se_v" ;;
+    esac
+    return 0
+}
+# _tw_server_env <NAME> -> _tw_se_v: NAME in the SERVER's GLOBAL environment, ""
+# when unset. tmux expands an alias value's `$VAR` and `~` from there (measured:
+# a -g variable expanded, a SESSION variable expanded EMPTY), never from the
+# caller's — so the first cut, which read the caller's, was fooled by
+# `set-environment -g NXV kill-server` + `zq=$NXV` (#1582 skeptic D3). One
+# probe, paid only when an alias value holds a `$` or a word-leading `~`.
+_tw_server_env() {
+    _tw_se_v=""
+    _tw_se_o=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} show-environment -g "$1" 2>/dev/null) || return 0
+    case "$_tw_se_o" in "$1="*) _tw_se_v="${_tw_se_o#"$1="}" ;; esac
+    return 0
+}
+
+# CLASSIFY every command the caller typed — HERE, below the tokeniser, because
+# unfolding a carrier's payload calls _tw_str_split and _tw_server_env, and a
+# function called before its definition is `command not found` at rc 127, which
+# the unfolding reads as "tmux cannot parse this" and passes: the carried-text
+# judge was silently INERT on its first draft, caught by a real-server row.
+# _tw_g (every probe replays these: -C dropped, F3) is set first for the same reason.
+_tw_g=(${_tw_pglobals[@]+"${_tw_pglobals[@]}"})
+_tw_ci=0
+while [ "$_tw_ci" -lt "${#_tw_starts[@]}" ]; do _tw_classify "$_tw_ci"; _tw_ci=$((_tw_ci + 1)); done
 
 # THE FAST PATH THAT WAS HERE IS GONE, AND THE REASON MATTERS.
 #
@@ -672,7 +1600,7 @@ _tw_resolve_alias() {
 # `_tw_alias_done` flag and the fetched table died in the subshell — 1/2/3/4
 # unknown words cost 1/2/3/4 queries, measured. Nothing in `monitor/` chains
 # commands, so nothing broke operationally; it was a false claim with nothing
-# checking it. The function now ASSIGNS `_tw_ra_result` and must never be
+# checking it. The function now ASSIGNS `_tw_ra_val` and must never be
 # captured in a command substitution.
 #
 # So: resolve unconditionally, and pay for it. The cost is why the
@@ -702,29 +1630,105 @@ if [ "$_tw_any_unknown" = 1 ] \
    && [ -z "${WATCHER_WINDOW:-}" ] \
    && [ "${NEXUS_TMUX_RESOLVE_ALIASES:-1}" != 0 ]; then
     _tw_ai=0
+    # To the CURRENT length: a carried command (typed text a carrier holds) is
+    # resolved like a typed one, and one can be appended by an expansion below.
     while [ "$_tw_ai" -lt "${#_tw_starts[@]}" ]; do
         # Resolve exactly the words that are still unidentified. Words already
         # canonicalised to a kill need no query; words that are NOT kills are
         # precisely what an alias can redefine — including ones that look like
         # built-ins, since on tmux 3.x an alias CAN shadow a built-in (measured),
         # so "it is a built-in" is not a safety argument.
-        if [ -z "${_tw_kills[$_tw_ai]}" ]; then
-            _tw_aw="${_tw_argv[${_tw_starts[$_tw_ai]}]}"
-            _tw_resolve_alias "$_tw_aw"        # sets _tw_ra_result; NOT $( )
-            _tw_ak="$_tw_ra_result"
-            if [ -n "$_tw_ak" ]; then
-                _tw_kills[$_tw_ai]="$_tw_ak"
-                _tw_any_kill=1
+        #
+        # THE EXPANSION IS APPENDED AS A COMMAND OF ITS OWN and classified by the
+        # same rules as a typed one (#1575). The resolver used to answer only "is
+        # this a KILL verb", so an alias to an ACT verb (`nxs=send-keys`) was
+        # never judged and its keys landed in the prefix-sibling at rc 0
+        # (measured by killsafe, 17b00ef0). tmux 2.6's cmd_try_alias REPLACES the
+        # word with the alias's words and keeps the caller's arguments after
+        # them, so the appended command is exactly that: the expansion, split
+        # by the #1578 rule, then this command's own arguments — which is also
+        # how an alias-CARRIED flag (`nxp=paste-buffer -b nxb -t w1`) reaches
+        # `_tw_act_target` and the kill flag loop.
+        #
+        # APPENDED, NOT SPLICED: the typed command keeps its own reading too.
+        # For an unknown word that reading is "no verb" and costs nothing; for a
+        # built-in that an alias shadows (3.x) BOTH readings are judged, which is
+        # the conservative answer when this shim cannot know which tmux wins.
+        # An EXPANSION is never alias-resolved again: 2.6 expands once
+        # (_tw_resolv is 0 for it; typed and carried commands carry 1).
+        #
+        # THE VALUE IS TOKENISED AS tmux 2.6 TOKENISES IT (_tw_str_split). The
+        # first cut split on whitespace, so a QUOTED verb (`zq="kill-server"`)
+        # was the word `"kill-server"` — not a kill — and the server DIED
+        # through it at rc 0 (#1582 skeptic F1; the sed parser before it had
+        # the same hole). A value tmux cannot parse resolves to nothing, as it
+        # does in tmux.
+        if [ -z "${_tw_kills[$_tw_ai]}" ] && [ "${_tw_resolv[$_tw_ai]:-1}" = 1 ]; then
+            _tw_resolve_alias "${_tw_argv[${_tw_starts[$_tw_ai]}]}"   # sets _tw_ra_val; NOT $( )
+            # FOUND, not NON-EMPTY: `zz=` is an alias, and the one whose empty
+            # expansion crashes the server (#1583).
+            if [ "$_tw_ra_found" = 1 ]; then
+                _tw_str_split "$_tw_ra_val" || { _tw_ai=$((_tw_ai + 1)); continue; }
+                # LEADING `NAME=value` WORDS ARE ENVIRONMENT ASSIGNMENTS, not argv
+                # (#1582 skeptic D1). 2.6's cmd_string_split consumes every leading
+                # word — as TOKENISED, so quoting is irrelevant — that holds a `=`
+                # before any space or tab: measured, `X=1`, `"X=1"`, `X="a b"`,
+                # `=1`, `X\=1` and `A=b C=d` are all dropped, `"X Y=1"` is not.
+                # Keeping them made the verb `X=1`, and `zq=X=1 kill-server`
+                # killed the server through the shim.
+                _tw_drop_assign
+                _tw_end_of "$_tw_ai"
+                _tw_ra_args=("${_tw_argv[@]:$((${_tw_starts[$_tw_ai]} + 1)):$((_tw_ce - ${_tw_starts[$_tw_ai]} - 1))}")
+                # NOTHING LEFT, AND NOTHING TYPED AFTER IT: tmux 2.6 CRASHES — "lost
+                # server", measured for `zz=`, `zz=X=1`, `zz=#c` and a blank value
+                # (the same alias with any caller argument runs that argument).
+                if [ "${#_tw_ra_words[@]}" = 0 ] && [ "${#_tw_ra_args[@]}" = 0 ]; then
+                    _tw_any_crash=1
+                    _tw_crash_word="${_tw_argv[${_tw_starts[$_tw_ai]}]}"
+                fi
+                _tw_ra_first=${#_tw_starts[@]}
+                # The expansion runs WHEN and HOW the aliased command would: it
+                # inherits that command's reading and depth, and is not re-resolved.
+                _tw_sa_mode="${_tw_cmode[$_tw_ai]:-}"; _tw_sa_depth="${_tw_cdepth[$_tw_ai]:-0}"; _tw_sa_resolv=0
+                _tw_sa_chain="${_tw_cchain[$_tw_ai]:-}"
+                _tw_split_open "${_tw_argv[${_tw_starts[$_tw_ai]}]}" ${_tw_ra_words[@]+"${_tw_ra_words[@]}"}
+                _tw_argv+=(${_tw_ra_args[@]+"${_tw_ra_args[@]}"})
+                _tw_split_close
+                _tw_sa_ov=""; _tw_sa_mode=""; _tw_sa_depth=0; _tw_sa_resolv=1; _tw_sa_chain=""
+                while [ "$_tw_ra_first" -lt "${#_tw_starts[@]}" ]; do
+                    _tw_classify "$_tw_ra_first"; _tw_ra_first=$((_tw_ra_first + 1))
+                done
             fi
         fi
         _tw_ai=$((_tw_ai + 1))
     done
 fi
 
+# Does ANY act command carry a target that must be JUDGED? Pure argv arithmetic.
+# An act aimed at `@id`, `%id`, `=name` / `:=name`, a `{…}` / offset token, or a
+# glob sets nothing here and keeps the fast exit — which is what every production
+# caller that resolves first sends. AN INDEX DOES NOT, AND NEITHER DOES A DOTTED
+# WORD (merge4sk G4 on this line): since merge4's all-digit finding an index is
+# judged (it redirects when that index is gone), and since F3/G4 `name.<pane>`
+# is judged — both pay the display-message probe (~+55-75 ms measured by
+# merge4sk on a loaded node). And since #1578's G3 a target with a named SESSION
+# part (`helper:3`) is judged on its session word too.
+_tw_ai=0
+while [ "$_tw_ai" -lt "${#_tw_starts[@]}" ]; do
+    if [ -n "${_tw_acts[$_tw_ai]}" ]; then
+        _tw_end_of "$_tw_ai"
+        _tw_act_target $((${_tw_starts[$_tw_ai]} + 1)) "$_tw_ce" "${_tw_acts[$_tw_ai]}"
+        if _tw_target_word "$_tw_at" || _tw_session_word "$_tw_at" window; then _tw_any_act=1; else _tw_acts[$_tw_ai]=""; fi
+    fi
+    _tw_ai=$((_tw_ai + 1))
+done
+
 # Anything with no kill verb ANYWHERE in the sequence leaves HERE. On the
 # watcher's path (and with resolution disabled) that is reached having touched
 # nothing at all; otherwise it has cost exactly one `show -s command-alias`.
-[ "$_tw_any_kill" = 1 ] || exec "$_tw_real" "$@"
+# …and with no bare-NAME act either (#1524).
+[ "$_tw_any_kill" = 1 ] || [ "$_tw_any_act" = 1 ] || [ "$_tw_any_carrier" = 1 ] || [ "$_tw_any_crash" = 1 ] \
+    || [ "$_tw_ctl_agent" = 1 ] || [ -n "$_tw_cycle" ] || exec "$_tw_real" "$@"
 
 # ===========================================================================
 # (3) KILL PATH — from here on, correctness outranks speed. Kills are rare.
@@ -772,8 +1776,17 @@ case "$_tw_probe" in
         printf 'tmux shim: WARNING — this tmux (%s) does not support the socket_path format, so the board-lethal-kill guard CANNOT identify its target and is INERT for this call. Allowing %s unchecked (your-org/nexus-code#892).\n' \
             "$("$_tw_real" -V 2>/dev/null || echo 'version unknown')" "$_tw_verb" >&2
         exec "$_tw_real" "$@" ;;
-    *)  # No server on the target socket: the kill is a no-op, or tmux will
+    '') # No server on the target socket: the kill is a no-op, or tmux will
         # report its own error better than we would.
+        exec "$_tw_real" "$@" ;;
+    *)  # A server ANSWERED, in a framing this shim does not parse. This arm
+        # used to be the no-server arm too, and `-C` framing (`%begin …`)
+        # landed here SILENTLY: the #1121 shape, a pass-through arm whose
+        # input set held "a server is there" (#1582 skeptic F3). -C is no
+        # longer replayed; anything else that frames the reply is at least
+        # LOUD now. Same policy as the unsupported-format arm above.
+        printf 'tmux shim: WARNING — the socket probe got an answer it cannot parse (%s), so the board-lethal-kill guard CANNOT identify its target and is INERT for this call. Allowing %s unchecked (your-org/nexus-code#892).\n' \
+            "$(printf '%s' "$_tw_probe" | cut -c1-60)" "$_tw_verb" >&2
         exec "$_tw_real" "$@" ;;
 esac
 
@@ -801,6 +1814,159 @@ fi
 # From here: the target IS the board. Only now can a refusal be justified.
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# TELL THE ORCHESTRATOR — your-org/nexus-code#1550. The operator's own hedge,
+# "if this is reliably possible", is what decided the mechanism.
+# ---------------------------------------------------------------------------
+# A refusal is the only evidence that an agent tried to end the board, and
+# today it reaches nobody who can act: the stderr goes to the process that just
+# made the mistake, `tmux-refused.log` is read by nothing, and the
+# `sandbox-notify` below fell to notifywrap's catch-all `task` tier rather than
+# `critical` (measured against `_nw_classify`; see #1551). "The orchestrator is
+# informed" was false in both directions — wrong audience, lowest priority.
+#
+# WHY THE REQUEST INBOX AND NOT THE OTHER CANDIDATES. The channel has to
+# survive a caller that is mid-catastrophe, so every requirement is a negative:
+#
+#   * IT MUST NOT CALL `tmux`. This file IS `tmux` on PATH, so a notifier that
+#     shells out to anything re-invoking it re-enters the wrapper. MEASURED
+#     with a PATH-front tripwire and a positive control: `request-channel.sh
+#     file` invokes tmux ZERO times; the real `sandbox-notify` invokes it ONCE
+#     (`tmux new-window -d -n '•bell'`), so the notify call below is ALREADY a
+#     re-entry — bounded by (0a), and kept rather than removed because the
+#     operator's bell is worth one bounded hop. State it; do not add a second.
+#   * IT MUST NOT NEED A SERVICE UP. A file in the inbox is durable: the
+#     watcher surfaces it on its next `requests_poll` tick (scheduled at 10 s
+#     in `main.sh`) and re-emits until acked; if the watcher is down the
+#     request simply waits. A live transport — `ng send` to the orchestrator
+#     pane — has the opposite property: it is lost exactly when the board is in
+#     trouble, which is now. A pane write is also not a message read.
+#   * IT MUST NOT NEED `NEXUS_ROOT`. `request-channel.sh` resolves its state
+#     dir from `NEXUS_STATE_DIR`, then `NEXUS_ROOT`, then `config/load.sh` —
+#     the ladder `_tw_state_dir` already uses — and the script is found as this
+#     wrapper's own SIBLING, so a secondary clone needs no env at all.
+#   * IT MUST BE BOUNDED. `timeout` caps it and the status is DISCARDED, so the
+#     status-injection trap (#1248) cannot reach a decision here.
+#
+# FAIL-OPEN ON TELLING, NEVER ON REFUSING. Every arm below returns 0. The
+# refusal is written to stderr BEFORE this runs and `exit 1` is downstream of
+# it: if the inbox is unwritable, the script missing, or the timeout fires, the
+# kill is still refused and the log row still lands.
+#
+# THE FLOOD GUARD IS THE PENDING REQUEST ITSELF, NOT A TIMER. #1550's evaluator
+# was refused five times in 33 seconds; five requests would be five re-emitting
+# blocks in the orchestrator's context. A request still `.new`/`.claimed` is BY
+# CONSTRUCTION already re-emitting until acked, so a second adds nothing — skip
+# it and let `tmux-refused.log` carry the count, which the body points at.
+#
+# AND THE KEY IS PER-WINDOW, BECAUSE "ONE PER INCIDENT" IS THE CLAIM AND A SLUG
+# IS NOT AN INCIDENT (`#1553` skeptic F1). Keyed on the slug alone, the FIRST
+# un-acked request suppresses every later refusal — including one from a
+# different window, hours later, about a different mistake — and the body the
+# orchestrator reads describes only the first. Measured read-only on this
+# nexus's own `tmux-refused.log` (10,174 rows, 2026-08-14 .. 2026-09-17): **41
+# distinct `window=` values overall, and 6 distinct windows inside one day's
+# 2,163 rows**. So the slug key is right about BURSTS, which share a window,
+# and wrong about DAYS. Folding the window in keeps the burst case collapsing —
+# #1550's five shared `window=cc-auto-update` — while letting a genuinely
+# different caller through. The window is sanitised to the charset
+# `request-channel.sh` accepts in a slug, so a hostile or odd window name
+# degrades to a stable token rather than to a rejected call.
+#
+# DECLARED BOUNDARY, now narrower: if nobody ever acks, every later refusal
+# FROM THAT SAME WINDOW is silent on this channel. Deliberate — the log is the
+# durable record, and the ack is the orchestrator saying it has the message.
+_TW_REQ_SLUG_BASE=board-kill-refused
+
+# Body on STDIN, never `--message "…"`: agent-adjacent prose is dense with
+# backticked identifiers and a double-quoted argument would command-substitute
+# them before the channel ever saw it (#1157). The delimiter here is UNQUOTED
+# so the fields expand — which is exactly why the text carries no backtick.
+#
+# LINE 1 IS THE EMIT SUMMARY. `requests_render` renders only the first line of
+# the body beside `summary:`, so a first line that continues into the second is
+# truncated mid-sentence in the one place the orchestrator reads first. Keep it
+# self-contained.
+_tw_req_body() {   # $1 = the one-line reason
+    cat <<REQ
+tmuxwrap REFUSED a board-lethal '$_tw_verb' from ${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-an unnamed window}} — the shim was all that stopped the sandbox being torn down.
+
+The caller tried to end the tmux server the whole sandbox hangs off
+(your-org/nexus-code#892, #1550).
+
+  window:  ${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}
+  typed:   ${_tw_typed:-$_tw_verb}   (tmux resolves this to: $_tw_verb)
+  command: $_tw_cmdline
+  reason:  $1
+  socket:  $_tw_target_sock   (this IS the board)
+
+ACT ON THIS, do not just ack it. The caller has been told the kill cannot be
+attempted, but that is advisory text to a process which already believed it was
+addressing a throwaway server — #1550's evaluator was refused five times in 33
+seconds and kept going. Read the refusal log for every refusal since, including
+any that arrived while this request was pending: this channel files ONE request
+per un-acked incident on purpose, so the LOG carries the count, not this body.
+
+  log: ${_tw_state:-<no state dir>}/tmux-refused.log
+
+Likely cause, and the first thing to check: a read scoped only by TMUX_TMPDIR.
+Inside a pane it is inert because \$TMUX outranks it, so such a read answers
+about the BOARD at rc 0 with empty stderr and the caller reasonably concludes
+its throwaway server exists. CLAUDE.md, block TMUX-SOCKET-SELECTION.
+REQ
+}
+
+_tw_tell_orchestrator() {   # $1 = the one-line reason; SETS _tw_told
+    _tw_told=""
+    [ -n "${_tw_dir:-}" ] || return 0
+    _tw_chan="$_tw_dir/../request-channel.sh"
+    [ -x "$_tw_chan" ] || return 0
+    # Per-window key (#1553 skeptic F1). Sanitised forkless to the charset a
+    # slug accepts; an empty result falls back to a literal so the glob below
+    # and the filed slug can never disagree.
+    _tw_w="${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}"
+    _tw_w=$(printf '%s' "$_tw_w" | tr -c 'A-Za-z0-9-' '-' | tr -s '-')
+    case "$_tw_w" in ''|-) _tw_w=unknown ;; esac
+    _TW_REQ_SLUG="${_TW_REQ_SLUG_BASE}-${_tw_w}"
+    # THE GUARD MUST GLOB THE DIRECTORY THE CHANNEL WILL ACTUALLY WRITE TO.
+    # `_tw_state_dir` and the channel's `_resolve_state_dir` agree whenever
+    # either `NEXUS_STATE_DIR` or `NEXUS_ROOT` is set, and DIVERGE when neither
+    # is: ours returns empty, the channel's falls through to `config/load.sh`
+    # and then to its own dir. Guessing there would leave the flood guard
+    # looking at a directory nothing is written to — a guard that is silently
+    # inert, which is the shape this repo keeps filing. So: PIN the value into
+    # the child when we have one (an empty assignment is indistinguishable from
+    # unset to the channel, so the prefix is unconditional), and ASK the
+    # channel where it writes when we do not.
+    if [ -n "${_tw_state:-}" ]; then
+        _tw_reqdir="$_tw_state/requests"
+    else
+        _tw_reqdir=$("$_tw_chan" dir 2>/dev/null) || _tw_reqdir=""
+    fi
+    # Already pending? Then the orchestrator is being re-emitted at already.
+    # Both glob shapes are correct with AND without `nullglob` (#1214): unset,
+    # the literal pattern fails `-e`; set, the loop body never runs.
+    if [ -n "$_tw_reqdir" ]; then
+        for _tw_pf in "$_tw_reqdir"/*-"$_TW_REQ_SLUG".new.md \
+                      "$_tw_reqdir"/*-"$_TW_REQ_SLUG".claimed.md; do
+            [ -e "$_tw_pf" ] && { _tw_told=pending; return 0; }
+        done
+    fi
+    # NO `timeout` MEANS SKIP, NOT RUN UNBOUNDED (#1553 skeptic F2). An earlier
+    # draft fell back to an unwrapped call, which contradicts this block's own
+    # "IT MUST BE BOUNDED" requirement in the one configuration where it
+    # matters: measured with `timeout` removed from PATH and a channel stub
+    # sleeping 60 s, the notifier was still running at 30 s, holding a refusal
+    # that had already been printed. Fail-open on TELLING means not telling.
+    command -v timeout >/dev/null 2>&1 || { _tw_told=unbounded-skipped; return 0; }
+    # The pipeline's status IS the channel's — it is the last command (#928).
+    _tw_told=$(_tw_req_body "$1" | NEXUS_STATE_DIR="${_tw_state:-}" \
+        timeout 10 "$_tw_chan" file \
+        --origin tmuxwrap --kind incident --priority high \
+        --slug "$_TW_REQ_SLUG" - 2>/dev/null) || _tw_told=""
+    return 0
+}
+
 _tw_refuse() {   # <what> <why>
     # Name what the caller TYPED as well as what tmux would have run, so an
     # abbreviation (`kill-ser`) is greppable in their own scrollback and the
@@ -808,29 +1974,42 @@ _tw_refuse() {   # <what> <why>
     _tw_shown="$_tw_verb"
     [ -n "${_tw_typed:-}" ] && [ "$_tw_typed" != "$_tw_verb" ] \
         && _tw_shown="$_tw_typed' (tmux resolves this to \`$_tw_verb')"
+    # MESSAGE ORDER IS THE FIX, NOT THE WORDING (your-org/nexus-code#1550). The
+    # old text closed on `env -u TMUX … -L <your-socket>` and `TMUX_UNWRAPPED=1`
+    # — two recipes, in the last thing read. A refusal that ends with a recipe
+    # reads as a syntax correction, and the caller that had just been refused
+    # five times in 33 seconds read it that way. So: verdict, then THIS CANNOT
+    # BE ATTEMPTED, then the consequence, and the recipes demoted into one
+    # closing line saying a private server is a DIFFERENT command rather than
+    # this one re-run. Measured 19 lines -> 16, and the operative sentence
+    # moves from line 6 to line 3.
     cat >&2 <<MSG
 tmux: REFUSING \`$_tw_shown\` — $1
 
+  THIS CANNOT BE ATTEMPTED. No flag, no retry and no re-scoping makes it safe.
   $2
-
   Ending this server ends the tmux session bwrap holds open under
-  --die-with-parent, so the ENTIRE SANDBOX is torn down: watcher, every worker
-  window, every registered service, the operator's session. There is no
-  in-sandbox recovery and the notification path dies with it, so nobody can
-  even be told. It happened on 2026-08-09 and five times in 33 minutes on
-  2026-07-30 (your-org/nexus-code#644, #892).
+  --die-with-parent: the ENTIRE SANDBOX goes — watcher, every worker window,
+  every registered service, the operator's session. There is no in-sandbox
+  recovery and the notification path dies with it (your-org/nexus-code#644, #892).
 
-  board socket: $_tw_board
-  your target:  $_tw_target_sock
+  socket: $_tw_target_sock   <- your target AND the board. That is the refusal.
 
-  If you meant a PRIVATE server, pin it and neutralise the ambient one:
-      env -u TMUX $_tw_name -L <your-socket> $_tw_verb ...
-  TMUX_TMPDIR alone is NOT containment — tmux resolves -L/-S > \$TMUX >
-  TMUX_TMPDIR, and \$TMUX is always set inside an agent pane.
-  Deliberate and unavoidable? TMUX_UNWRAPPED=1 (loud, and logged).
+  If a TMUX_TMPDIR-scoped read told you this was a throwaway server, that read
+  answered about the BOARD at rc 0 with empty stderr: inside a pane \$TMUX
+  outranks it (-L/-S > \$TMUX > TMUX_TMPDIR — your-org/nexus-code#1550). A
+  private server is a DIFFERENT command, env -u TMUX $_tw_name -L <sock> ...,
+  never this one retried. Override: TMUX_UNWRAPPED=1 (loud, logged, audited).
 MSG
+    # `CRITICAL:` is what makes this RING. The old wording matched none of
+    # notifywrap's arms and fell to the `task` catch-all — measured against
+    # `_nw_classify`. `CRITICAL:` hits the `critical` arm, whose 60 s cooldown
+    # is the operator-side flood guard: five refusals in 33 s become one bell
+    # plus a digest. We do NOT borrow the watcher's `watcher ALERT:` prefix —
+    # same tier, but it would attribute this to a component that did not raise
+    # it, and #1551's measurement of that prefix is about the WATCHER's channel.
     command -v sandbox-notify >/dev/null 2>&1 \
-        && sandbox-notify "tmuxwrap REFUSED a board-lethal \`$_tw_verb\` (#892)" >/dev/null 2>&1 || true
+        && sandbox-notify "CRITICAL: tmuxwrap REFUSED a board-lethal \`$_tw_verb\` — a caller tried to end the sandbox's tmux server (your-org/nexus-code#892, #1550)" >/dev/null 2>&1 || true
     _tw_state="$(_tw_state_dir)"
     if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
         printf '%s\tverb=%s\twindow=%s\treason=%s\targs=%s\n' \
@@ -838,6 +2017,24 @@ MSG
             "$_tw_verb" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" "$1" "$_tw_cmdline" \
             >> "$_tw_state/tmux-refused.log" 2>/dev/null || true
     fi
+    # Reported AFTER the attempt, and only what actually happened. A line
+    # claiming "the orchestrator has been told", printed before the filing,
+    # would be this repo's manufactured-success shape inside its own guard.
+    #
+    # AND THE TAIL IS NEVER EMPTY (#1553 skeptic F3). The empty arm used to fall
+    # through silently, so in every DEGRADED configuration — unwritable inbox,
+    # state dir that is a FILE, channel exiting non-zero, no `timeout` — the
+    # message ended on `Override: TMUX_UNWRAPPED=1`, which is exactly the shape
+    # the rewrite exists to remove. The failure arm now SAYS it failed, which
+    # is both honest and the last thing read.
+    _tw_tell_orchestrator "$1"
+    case "${_tw_told:-}" in
+        pending) printf '  The orchestrator already holds an un-acked board-kill report from this window; this one is in tmux-refused.log.\n' >&2 ;;
+        unbounded-skipped)
+                 printf '  NOT reported to the orchestrator (no bounded notifier available) — it is in tmux-refused.log, and nobody has been told. Say so on the thread yourself.\n' >&2 ;;
+        ?*)      printf '  Reported to the orchestrator (request %s). This refusal is on the record.\n' "$_tw_told" >&2 ;;
+        *)       printf '  The orchestrator could NOT be told (the request channel failed) — this refusal is in tmux-refused.log only. Say so on the thread yourself.\n' >&2 ;;
+    esac
     exit 1
 }
 
@@ -849,6 +2046,64 @@ MSG
 # flags are re-read here.
 # ===========================================================================
 
+# _tw_misaim_refuse <verb> <target-as-typed> <word> <resolved-name> <resolved-index> <consequence>
+# The ONE Rule 4 refusal, for kills and acts alike (your-org/nexus-code#1524).
+# Exits 1. Reached only on a POSITIVELY IDENTIFIED mis-aim: tmux has just said
+# which window it will act on, and it is not the one that was named.
+_tw_misaim_refuse() {
+    cat >&2 <<MSG
+tmux: REFUSING \`$1 -t $2\` — there is NO window named '$3'; tmux
+resolved the name by PREFIX to a DIFFERENT window, '$4' (index $5),
+and $6 (your-org/nexus-code#1524).
+
+  A bare \`-t <name>\` falls back to a unique-prefix match when the exact window
+  is absent. '$3' is most likely already closed; '$4' is a live
+  sibling — by this board's naming convention, often its skeptic.
+
+  Nothing was done. To act on EXACTLY one window:
+      $_tw_name $1 -t @<id>        # id from monitor/_tmux-window.sh:resolve_window_id
+      $_tw_name $1 -t :=$3     # exact name or rc 1 — never a prefix
+  If '$4' really is what you meant, name it in full.
+MSG
+    _tw_state="$(_tw_state_dir)"
+    if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
+        printf '%s\tverb=%s\twindow=%s\treason=%s\targs=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "$1" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+            "prefix mis-aim: '$3' resolved to '$4'" "$_tw_cmdline" \
+            >> "$_tw_state/tmux-refused.log" 2>/dev/null || true
+    fi
+    exit 1
+}
+
+# _tw_session_misaim_refuse <verb> <target-as-typed> <session-word> <resolved-session> <consequence>
+# Rule 4's SESSION half (merge4sk G3). Exits 1, on a POSITIVELY IDENTIFIED
+# mis-aim only: tmux has just said which session it will use, and it is not the
+# one that was named.
+_tw_session_misaim_refuse() {
+    cat >&2 <<MSG
+tmux: REFUSING \`$1 -t $2\` — there is NO session named '$3'; tmux
+resolved the name by PREFIX to a DIFFERENT session, '$4',
+and $5 (your-org/nexus-code#1524, #1578).
+
+  A session name falls back to a unique-prefix match when the exact session is
+  absent, exactly as a window name does. '$3' is most likely already gone.
+
+  Nothing was done. To name EXACTLY one session, prefix it with '=':
+      $_tw_name $1 -t '=$3:<window>'     # exact session or rc 1 — never a prefix
+  If '$4' really is what you meant, name it in full.
+MSG
+    _tw_state="$(_tw_state_dir)"
+    if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
+        printf '%s\tverb=%s\twindow=%s\treason=%s\targs=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "$1" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+            "session prefix mis-aim: '$3' resolved to '$4'" "$_tw_cmdline" \
+            >> "$_tw_state/tmux-refused.log" 2>/dev/null || true
+    fi
+    exit 1
+}
+
 # Shared counts, fetched lazily and at most once — a sequence of five kills must
 # not mean five `list-sessions` round-trips.
 _tw_sessions=""
@@ -858,21 +2113,181 @@ _tw_sessions_get() {
     printf ''
 }
 
+# _tw_carrier_refuse <typed> <what> — a COMMAND CARRIER from an AGENT on the
+# board (#1583 policy (1), in the block above _tw_classify). Not an incident: the
+# carried text, where there was any, held no kill this file could find (those are
+# refused by the rules, as incidents, for every caller) — this refusal is about
+# what cannot be read. Logged, not escalated. Exits 1.
+_tw_carrier_refuse() {
+    cat >&2 <<MSG
+tmux: REFUSING \`$1\` on the board — \`$2\` CARRIES tmux commands (or, in control
+mode, reads them from stdin) that the server runs later or elsewhere
+(your-org/nexus-code#1583).
+
+  Measured through a shim that judged only argv: \`if-shell true kill-server\`,
+  \`source-file <a file holding kill-server>\`, \`set-hook -g after-list-windows
+  kill-server\`, and \`tmux -C\` / \`-C new-session\` / \`-C attach\` fed
+  \`kill-server\` on stdin each ended a board-pinned server at rc 0. For an
+  AGENT caller these are refused outright on the board: nothing in the nexus
+  uses any of them, and a carried command this guard cannot see is one it
+  cannot vouch for.
+
+  Nothing was done. Run the carried command DIRECTLY, where this guard judges it.
+  A private server is a different command: env -u TMUX $_tw_name -L <sock> ...
+  Override: TMUX_UNWRAPPED=1 (loud, logged, audited).
+MSG
+    _tw_state="$(_tw_state_dir)"
+    if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
+        printf '%s\tverb=%s\twindow=%s\treason=%s\targs=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "$2" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+            "command carrier on the board: $2" "$_tw_cmdline" \
+            >> "$_tw_state/tmux-refused.log" 2>/dev/null || true
+    fi
+    exit 1
+}
+
+# --- Carriers and lethal non-kills, judged BEFORE any per-command rule -------
+# Each is refused on the board whatever else the invocation holds (#1583).
+if [ "$_tw_any_crash" = 1 ]; then
+    _tw_verb="$_tw_crash_word"; _tw_typed="$_tw_crash_word"
+    _tw_refuse "the alias '$_tw_crash_word' expands to NO command and is invoked with no arguments — tmux 2.6 CRASHES on exactly that (\"lost server\", measured for zz=, zz=X=1 and zz=#c)." \
+               "No kill verb is involved: the fault is in tmux's own alias expansion, and the server it crashes is this board's."
+fi
+# A source-file CYCLE wedges the server (see _tw_carry_of) — for every caller.
+if [ -n "$_tw_cycle" ]; then
+    _tw_verb=source-file; _tw_typed=source-file
+    _tw_refuse "the file '$_tw_cycle' is sourced again from inside its own source chain — tmux 2.6 then loops for ever: the server pins a CPU, answers no tmux command (kill-server included) and ignores SIGTERM (measured on a hermetic server; it took a SIGKILL)." \
+               "No kill verb is involved: every board pane's tmux call would hang behind it, which is the outage without the kill."
+fi
+# An AGENT's control mode, whatever its command (F1; see _tw_ctl_agent).
+if [ "$_tw_ctl_agent" = 1 ]; then
+    _tw_carrier_refuse "-C${_tw_verb:+ $_tw_verb}" "-C (control mode: tmux reads COMMANDS from stdin on any command that attaches, and on none)"
+fi
+_tw_ix=0
+while [ "$_tw_ix" -lt "${#_tw_starts[@]}" ]; do
+    _tw_cr="${_tw_carr[$_tw_ix]:-}"
+    if [ -n "$_tw_cr" ]; then
+        _tw_typed="${_tw_typedw[$_tw_ix]}"
+        # THE CARRIER ITSELF IS REFUSED FOR AGENT CALLERS ONLY; the lethal shapes
+        # (a lethal option, the crash) for EVERY caller, and so is every kill in
+        # the carried text, by the per-command rules below. Measured before
+        # narrowing: every live board pane's ROOT process already fronts this shim
+        # on PATH (6/6) and NONE carries CLAUDECODE — Claude Code sets CLAUDECODE=1
+        # in its own tool subprocesses only — and neither does the server's global
+        # environment, which run-shell jobs, #() and new panes inherit. So an
+        # operator's `tmux source-file <conf>` reload in any board pane, and, once
+        # monitor/tmux-server-path.sh --apply fronts this shim on the server's
+        # PATH, a plugin job's `tmux bind-key …` (the run-shell plugin pattern),
+        # would all have been refused. The accident the OUTRIGHT refusal guards
+        # against is an agent's, so that is what it keys on.
+        # FAILURE DIRECTION, stated: a non-agent caller's carrier passes when its
+        # payload holds nothing the rules refuse, or cannot be read (the DECLARED
+        # BOUNDARY in the carried-text block); so does an agent that scrubs
+        # CLAUDECODE, which is evasion, outside the threat model in the header.
+        case "$_tw_cr" in set-option\ *|set-window-option\ *) : ;;
+            *) [ "$_tw_agent" = 1 ] || { _tw_ix=$((_tw_ix + 1)); continue; } ;;
+        esac
+        case "$_tw_cr" in
+            set-option\ *|set-window-option\ *)
+                _tw_verb="${_tw_cr%% *}"
+                _tw_refuse "\`${_tw_cr}\` ENDS the server: tmux exits (exit-unattached) or destroys the session (destroy-unattached) the moment no client is attached — measured, at rc 0, on a board-pinned server." \
+                           "tmux matches option NAMES by prefix, a missing value TOGGLES the flag, and set-window-option sets these server/session options too; only an explicit off/no/0 is let through." ;;
+            *)  _tw_carrier_refuse "$_tw_typed" "$_tw_cr" ;;
+        esac
+    fi
+    _tw_ix=$((_tw_ix + 1))
+done
+# A payload too deep or too large to unfold was NOT judged. For an agent that
+# never reaches here (its carrier was refused above); for anyone else it passes,
+# per this file's policy — but it says so, because an inert guard nobody knows is
+# inert is worse than a documented hazard.
+if [ -n "$_tw_carry_over" ]; then
+    printf 'tmux shim: WARNING — %s: the carried tmux commands beyond that point were NOT judged, so the board-lethal-kill guard is INERT for them on this call (your-org/nexus-code#1583).\n' \
+        "$_tw_carry_over" >&2
+fi
+
 _tw_n=${#_tw_starts[@]}
 _tw_ix=0
 while [ "$_tw_ix" -lt "$_tw_n" ]; do
     _tw_verb="${_tw_kills[$_tw_ix]}"
-    if [ -z "$_tw_verb" ]; then _tw_ix=$((_tw_ix + 1)); continue; fi   # not a kill
     _tw_vi="${_tw_starts[$_tw_ix]}"
     # This command's arguments end at the next command's verb, or at argv's end.
-    if [ $((_tw_ix + 1)) -lt "$_tw_n" ]; then
-        _tw_end="${_tw_starts[$((_tw_ix + 1))]}"
-    else
-        _tw_end=${#_tw_argv[@]}
-    fi
+    _tw_end_of "$_tw_ix"; _tw_end="$_tw_ce"
     # The word the CALLER actually typed, for messages — `kill-ser`, not the
-    # canonical name, so the refusal names the command they will look for.
-    _tw_typed="${_tw_argv[$_tw_vi]}"
+    # canonical name, so the refusal names the command they will look for; for
+    # an alias's expansion, the alias's name.
+    _tw_typed="${_tw_typedw[$_tw_ix]}"
+    # INTERACTIVE carried text (a binding, a prompt, a chooser) runs when a HUMAN
+    # acts, so only its UNCONDITIONAL lethality is judged — kill-server here; a
+    # lethal option and the crash above. See the carried-text block.
+    if [ "${_tw_cmode[$_tw_ix]:-}" = i ] && [ "$_tw_verb" != kill-server ]; then
+        _tw_ix=$((_tw_ix + 1)); continue
+    fi
+    if [ -z "$_tw_verb" ] && [ -n "${_tw_acts[$_tw_ix]}" ]; then
+        # --- Rule 4 for an ACT verb (your-org/nexus-code#1524) ---------------
+        # Only a target that must be judged reaches here (see the argv pass
+        # above). The SESSION word first (G3), then ask tmux which window it
+        # WILL act on.
+        _tw_act_target $((_tw_vi + 1)) "$_tw_end" "${_tw_acts[$_tw_ix]}"
+        _tw_judge_session "$_tw_at" window "$_tw_typed" \
+            "would have ACTED IN IT at rc 0 — keys, a paste or a respawn delivered to the wrong agent"
+        _tw_target_word "$_tw_at" || { _tw_ix=$((_tw_ix + 1)); continue; }
+        # The pane's INDEX and its window's ID lead (F6/F2, _tw_is_pane_index);
+        # the name stays LAST because it is the only field that may hold a `|`.
+        _tw_ainfo=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_at" \
+                       '#{pane_index}|#{window_id}|#{window_index}|#{window_name}' 2>/dev/null | head -1)
+        # Unresolvable: tmux will refuse it itself. Not provably a mis-aim: pass.
+        if [ -n "$_tw_ainfo" ]; then
+            _tw_rpane="${_tw_ainfo%%|*}"; _tw_rest="${_tw_ainfo#*|}"
+            _tw_rwid="${_tw_rest%%|*}"; _tw_rest="${_tw_rest#*|}"
+            _tw_rindex="${_tw_rest%%|*}"; _tw_rname="${_tw_rest#*|}"
+            if _tw_is_misaim "$_tw_rindex" "$_tw_rname" \
+               && ! _tw_is_pane_index "${_tw_acts[$_tw_ix]}" "$_tw_at" "$_tw_rpane" "$_tw_rwid"; then
+                # THE DENY IS ESTABLISHED FIRST; the one exemption below must
+                # then PROVE itself by equality (merge4sk G2, #1121's shape).
+                # `send-keys -t <session>` is an ordinary idiom, and the old
+                # code let any word naming the resolved SESSION through — in an
+                # arm that ran BEFORE the mis-aim test. But tmux 2.6 tries the
+                # word as a WINDOW (index, exact, prefix, fnmatch) before it
+                # ever tries it as a session, so with session `nx` holding
+                # `base` and `nx-fix`, `send-keys -t nx X` landed in `nx-fix` at
+                # rc 0 while the arm said "session target". So the session
+                # reading is taken ONLY when the window tier provably did not
+                # resolve it:
+                #   * the target is a BARE word — no `:` (then the session is
+                #     named separately and the window part cannot fall back to
+                #     a session). A `window.pane` word DOES fall back (measured:
+                #     `nx.0` -> `nx:base.0` when no window begins with `nx`), so
+                #     it is admitted, judged on the part before its first `.`;
+                #   * the resolved window's name does NOT begin with the word —
+                #     if it did, the prefix tier matched (the index and exact
+                #     tiers are already excluded by _tw_is_misaim, and a word
+                #     reaching here holds no glob character);
+                #   * and a probe of its own says the resolved SESSION is
+                #     named exactly the word.
+                # FAILURE DIRECTION: over-refusal when two windows share the
+                # prefix (the window tier is then ambiguous and tmux does fall
+                # back to the session) — the remedy `-t <session>:` is exact on
+                # the session and judged by _tw_judge_session.
+                case "$_tw_at" in
+                    *:*) _tw_sess_ok=0 ;;
+                    *) _tw_sess_ok=0
+                       if [ "${_tw_rname#"$_tw_pw"}" = "$_tw_rname" ]; then
+                           _tw_rs=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_at" \
+                                       '#{session_name}' 2>/dev/null | head -1)
+                           [ -n "$_tw_rs" ] && [ "$_tw_rs" = "$_tw_pw" ] && _tw_sess_ok=1
+                       fi ;;
+                esac
+                if [ "$_tw_sess_ok" != 1 ]; then
+                    _tw_misaim_refuse "$_tw_typed" "$_tw_at" "$_tw_pw" "$_tw_rname" "$_tw_rindex" \
+                        "would have ACTED ON THAT at rc 0 — keys, a paste or a respawn delivered to the wrong agent"
+                fi
+            fi
+        fi
+        _tw_ix=$((_tw_ix + 1)); continue
+    fi
+    if [ -z "$_tw_verb" ]; then _tw_ix=$((_tw_ix + 1)); continue; fi   # neither a kill nor an act
 
     # --- Rule 1: kill-server on the board is unconditionally fatal -----------
     if [ "$_tw_verb" = "kill-server" ]; then
@@ -881,28 +2296,51 @@ while [ "$_tw_ix" -lt "$_tw_n" ]; do
     fi
 
     # --- This command's own flags: -t <target>, and -a (all-BUT-target) ------
-    _tw_t=""
-    _tw_have_t=0
-    _tw_all=0
-    _tw_k=$((_tw_vi + 1))
-    while [ "$_tw_k" -lt "$_tw_end" ]; do
-        _tw_a="${_tw_argv[$_tw_k]}"
-        case "$_tw_a" in
-            -t)  _tw_have_t=1
-                 _tw_k=$((_tw_k + 1))
-                 [ "$_tw_k" -lt "$_tw_end" ] && _tw_t="${_tw_argv[$_tw_k]}"
-                 ;;
-            -t*) _tw_have_t=1; _tw_t="${_tw_a#-t}" ;;
-            -*a*) _tw_all=1 ;;
-            *) : ;;
-        esac
-        _tw_k=$((_tw_k + 1))
-    done
+    # Read by the SAME getopt walk as every other path (#1583): the shape loop
+    # that stood here (`-t)`, `-t*)`, `-*a*)`) read `-kt w` as untargeted and was
+    # the one flag reader in the file that the #1568 lesson had not yet reached.
+    _tw_act_target $((_tw_vi + 1)) "$_tw_end" "$_tw_verb"
+    _tw_t="$_tw_at"; _tw_have_t="$_tw_athas_t"
+    case "$_tw_atf" in *a*) _tw_all=1 ;; *) _tw_all=0 ;; esac
 
     # `-a` means "all EXCEPT the target", which by construction leaves one
     # behind and can never empty the server. This COMMAND is fine; keep going,
     # because a later one in the sequence may not be.
-    if [ "$_tw_all" = 1 ]; then _tw_ix=$((_tw_ix + 1)); continue; fi
+    #
+    # …BUT IT IS STILL AIMED, AND A MIS-AIMED `-a` IS THE WORST KILL IN THIS FILE
+    # (found by the shape-skip sweep on #1568, measured first). This `continue`
+    # used to run BEFORE Rule 4, on the true-but-irrelevant ground that `-a`
+    # cannot empty the server. With `w1` gone and `w1-sk` alive,
+    # `kill-window -a -t p:w1` resolved the target by PREFIX and killed EVERY
+    # OTHER window, keeping only the sibling — rc 0, not refused. So the target
+    # is judged first, by the same shared rule as everything else, and found by
+    # the same getopt walk (the flag loop above reads `-at w1` as a bare `-a`
+    # and never sees its target).
+    if [ "$_tw_all" = 1 ]; then
+        # kill-session -a keeps ONE session and kills every other — and its
+        # target is a session word, so it redirects by prefix like any other
+        # (found in this bundle's own review, measured: sessions `p` and
+        # `s1x`, `kill-session -a -t s1` killed `p` and kept `s1x`, rc 0).
+        if [ "$_tw_verb" = kill-session ]; then
+            _tw_act_target $((_tw_vi + 1)) "$_tw_end" ""
+            _tw_judge_session "$_tw_at" session "$_tw_verb -a" \
+                "would have killed EVERY OTHER session and kept only THAT one, at rc 0"
+        fi
+        if [ "$_tw_verb" = kill-window ] || [ "$_tw_verb" = kill-pane ]; then
+            _tw_act_target $((_tw_vi + 1)) "$_tw_end" ""
+            _tw_judge_session "$_tw_at" window "$_tw_verb -a" \
+                "would have killed EVERY OTHER window of the session you meant to keep one in, at rc 0"
+            if _tw_target_word "$_tw_at"; then
+                _tw_ainfo=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_at" \
+                               '#{window_index}|#{window_name}' 2>/dev/null | head -1)
+                if [ -n "$_tw_ainfo" ] && _tw_is_misaim "${_tw_ainfo%%|*}" "${_tw_ainfo#*|}"; then
+                    _tw_misaim_refuse "$_tw_verb -a" "$_tw_at" "$_tw_pw" "${_tw_ainfo#*|}" "${_tw_ainfo%%|*}" \
+                        "would have killed EVERY OTHER window and kept only THAT, at rc 0"
+                fi
+            fi
+        fi
+        _tw_ix=$((_tw_ix + 1)); continue
+    fi
 
     # --- Rule 2 (the lint's rule3): untargeted acts on the CURRENT one -------
     if [ "$_tw_have_t" != 1 ] || [ -z "$_tw_t" ]; then
@@ -910,17 +2348,103 @@ while [ "$_tw_ix" -lt "$_tw_n" ]; do
                    "The current window/pane/session can be the last one, and the lint (rule3-untargeted-kill) bans this form repo-wide for that reason."
     fi
 
+    # --- Rule 4, SESSION part (merge4sk G3): a named session that tmux
+    # resolved by PREFIX to a different one. For kill-session a bare word IS the
+    # session; for kill-window/kill-pane only a `session:` part is.
+    if [ "$_tw_verb" = kill-session ]; then _tw_skind=session; _tw_scons="would have killed THAT session at rc 0"
+    else _tw_skind=window; _tw_scons="would have killed a window IN THAT session at rc 0"; fi
+    _tw_judge_session "$_tw_t" "$_tw_skind" "$_tw_typed" "$_tw_scons"
+
     # --- Rule 3: would this targeted kill EMPTY the server? ------------------
     # The check no lint can make. Ask the running server.
-    _tw_info=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_t" \
-                  '#{session_windows}|#{window_panes}' 2>/dev/null | head -1)
+    # ONE probe answers Rule 3 AND Rule 4: the two counts, then the INDEX and the
+    # NAME of the window tmux ACTUALLY RESOLVED the target to. The name is last
+    # because it is the only field that may itself contain a `|`.
+    #
+    # AN `=name` TARGET IS ASKED IN A SPELLING display-message ACCEPTS (#1583 F4).
+    # `display-message -t =name` is REJECTED (`can't find pane =name`), while
+    # kill-window and kill-session ACCEPT `=name` — so the probe came back empty,
+    # the arm below read that as "unresolvable: tmux will refuse it itself", and
+    # `kill-window -t =base` / `kill-session -t =p` on the last window / session
+    # killed the server at rc 0. Measured: `:=name` (window) and `=name:`
+    # (session) resolve the same object, exactly. kill-pane REJECTS `=name`
+    # itself, so it keeps the typed spelling.
+    # Only a target that STARTS with `=` and holds no `:` is respelled; a
+    # `=s:w` is already session-qualified, and display-message accepts it.
+    _tw_probe_t="$_tw_t"
+    case "$_tw_t" in
+        =*) case "$_tw_t" in
+                *:*) : ;;
+                *)   case "$_tw_verb" in
+                         kill-window)  _tw_probe_t=":$_tw_t" ;;
+                         kill-session) _tw_probe_t="$_tw_t:" ;;
+                     esac ;;
+            esac ;;
+    esac
+    # The pane INDEX and the window's ID (F6/F2) precede the name, which stays
+    # LAST because it is the only field that may hold a `|`.
+    _tw_info=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_probe_t" \
+                  '#{session_windows}|#{window_panes}|#{pane_index}|#{window_id}|#{window_index}|#{window_name}' 2>/dev/null | head -1)
 
     # Unresolvable target: tmux itself will refuse it with a better message than
     # ours. Judge no further on THIS command — but do not abandon the sequence.
     if [ -z "$_tw_info" ]; then _tw_ix=$((_tw_ix + 1)); continue; fi
 
     _tw_windows="${_tw_info%%|*}"
-    _tw_panes="${_tw_info##*|}"
+    _tw_rest="${_tw_info#*|}"
+    _tw_panes="${_tw_rest%%|*}"
+    _tw_rest="${_tw_rest#*|}"
+    _tw_rpane="${_tw_rest%%|*}"
+    _tw_rest="${_tw_rest#*|}"
+    _tw_rwid="${_tw_rest%%|*}"
+    _tw_rest="${_tw_rest#*|}"
+    _tw_rindex="${_tw_rest%%|*}"
+    _tw_rname="${_tw_rest#*|}"
+
+    # --- Rule 4: a NAMED target that tmux resolved to a DIFFERENT window ------
+    # your-org/nexus-code#1524. The window part of `-t <name>` resolves as
+    # id -> index -> exact name -> UNIQUE PREFIX -> fnmatch. So when the exact
+    # window is already gone and exactly one longer sibling exists, the kill
+    # LANDS ON THE SIBLING at rc 0 — and worker/skeptic names share a stem by
+    # convention (`w`, `w-sk`, `wsk`, `w-skeptic`), which is why "retire the
+    # worker, then the skeptic" run twice, or racing the watcher, kills the live
+    # skeptic while every artefact says the right window closed. Measured on
+    # this host's tmux 2.6, and THROUGH THIS SHIM (the issue's row N), which
+    # passed it straight along.
+    #
+    # THIS FITS THE PASS-THROUGH DOCTRINE RATHER THAN BENDING IT. The header's
+    # rule is "never refuse on a guess": this rule fires only on a POSITIVELY
+    # IDENTIFIED mis-aim — tmux has just told us which window it will act on,
+    # and it is not the one that was named. Everything not provably that passes:
+    #   * only kill-window and kill-pane (a kill-session target is a SESSION);
+    #   * only a window part that is a plain word, `[A-Za-z0-9_][A-Za-z0-9_-]*`
+    #     after an optional `session:`. That excludes every form that cannot
+    #     prefix-redirect or that we cannot parse with certainty: `@id`, `%id`,
+    #     `=exact`, the `{…}` and `!`/`+`/`-` tokens, anything holding a glob
+    #     character, and anything holding a `.` — which is EITHER a `.pane`
+    #     suffix OR part of a window's name, and this shim cannot tell which
+    #     (the first cut stripped it as a suffix and refused a legitimate kill
+    #     of a window named `a.b`; its own suite caught that);
+    #   * an all-digit word is an INDEX first: it is a mis-aim only when the
+    #     resolved window has neither that index nor that name.
+    # The remedy it prints is the measured one: `-t @<id>` from the resolver, or
+    # `-t :=<name>`, which acts on exactly that name or fails.
+    if [ "$_tw_verb" = kill-window ] || [ "$_tw_verb" = kill-pane ]; then
+        # The SAME two functions the act path uses (see _tw_target_word): one
+        # rule, so the two paths cannot drift. This also closes what the kill
+        # path's own shape test let through — `kill-pane -t 1566.0`, an all-digit
+        # base with a pane suffix, was judged by NOTHING here.
+        if _tw_target_word "$_tw_t"; then
+            _tw_w="$_tw_pw"
+            _tw_misaim=0
+            _tw_is_misaim "$_tw_rindex" "$_tw_rname" && _tw_misaim=1
+            [ "$_tw_misaim" = 1 ] && _tw_is_pane_index "$_tw_verb" "$_tw_t" "$_tw_rpane" "$_tw_rwid" && _tw_misaim=0
+            if [ "$_tw_misaim" = 1 ]; then
+                _tw_misaim_refuse "$_tw_verb" "$_tw_t" "$_tw_w" "$_tw_rname" "$_tw_rindex" \
+                    "would have killed THAT at rc 0"
+            fi
+        fi
+    fi
     _tw_sessions_get
 
     # Any unreadable count means lethality cannot be established for this

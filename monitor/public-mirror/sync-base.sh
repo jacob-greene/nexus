@@ -101,7 +101,30 @@ git -C "$OUTDIR" checkout -q --detach "$FULL" \
 # clone is fresh, detached and clean by construction (L92-95 above), so no
 # `--allow-dirty` is needed or wanted here — if this tree is ever dirty, that
 # is a bug in this script and the refusal is the right outcome.
-build_out=$( cd "$OUTDIR" && bash "$REL_PM/build.sh" --yes 2>&1 ); build_rc=$?
+#
+# BUT THE build.sh THAT RUNS IS THE OLD ONE, so its flag surface is the OLD
+# one too (your-org/nexus-code#1556). `--yes` arrived with #1001 (50180eae,
+# 2026-08-28); before it, build.sh read its FIRST POSITIONAL as the mapping
+# path, so `--yes` became `mapping not readable: --yes`, build.sh exit 2, and
+# this script exit 3 for every base older than that commit — which was the only
+# base the ledger named. And the pressure a rc 3 creates is toward building the
+# base "some other way", i.e. with the CURRENT dictionary: the wrong base this
+# script exists to prevent. So the flag is passed only when THAT ref's build.sh
+# carries it, and a pre-#1001 build.sh is run bare — exactly as its own recipe
+# ran it (destructive by default at that ref, on a clone that is ours).
+#
+# The probe errs SAFE: a build.sh that merely MENTIONS `--yes` without parsing
+# it gets the flag and fails loudly (exit 3, as before); a build.sh that parses
+# it cannot fail to mention it. It reads the file on disk in $OUTDIR, which IS
+# the checked-out ref — never this script's own sibling, which is today's.
+build_args=()
+if grep -qF -e '--yes' "$OUTDIR/$REL_PM/build.sh" 2>/dev/null; then
+    build_args=(--yes); build_yes=passed
+else
+    build_yes=not-supported-at-ref
+    echo "sync-base.sh: build.sh at $FULL predates --yes (your-org/nexus-code#1556); running it bare, as that ref's recipe did" >&2
+fi
+build_out=$( cd "$OUTDIR" && bash "$REL_PM/build.sh" ${build_args[@]+"${build_args[@]}"} 2>&1 ); build_rc=$?
 if (( build_rc != 0 )); then
     printf '%s\n' "$build_out" >&2
     die "build.sh exit $build_rc at $FULL" 3
@@ -139,5 +162,6 @@ echo "base_source_sha=$FULL"
 echo "base_tree=$TREE"
 echo "base_dir=$OUTDIR"
 echo "gate=$gate"
+echo "build_yes=$build_yes"
 echo "renames=$(grep -c '^build\.sh: renamed ' <<<"$build_out")"
 echo "overlays=$(grep -c '^build\.sh: overlay applied to ' <<<"$build_out")"

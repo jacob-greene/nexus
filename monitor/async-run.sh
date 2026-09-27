@@ -168,7 +168,13 @@
 #   9  REFUSED — an identical job (same argv) is already RUNNING in this window;
 #      its token is printed. `--allow-concurrent` overrides (#1389)
 #   --cancel only:
-#   4  signalled, but the process is STILL ALIVE after TERM and KILL
+#   4  signalled, but one or more processes of the job's SESSION are STILL
+#      ALIVE after TERM and KILL — each is NAMED (your-org/nexus-code#1585)
+#  10  the job's session is STOPPED, but N descendant(s) that LEFT that session
+#      (their own `setsid`) were found by the job tag and NOT signalled — each
+#      is named with its pid. Not a failure of the cancel and not a success to
+#      be silent about: a process that detached may be a deliberate daemon, so
+#      the decision to stop it is the caller's, made on its cmdline (#1585)
 #   5  no such token in this window's namespace
 #   6  DENIED — the token is owned by a DIFFERENT session
 #   7  REFUSED — ownership could not be determined (no session recorded, this
@@ -332,6 +338,82 @@ _pid_alive() {
     # /proc is usable at all before reading absence as death.
     [[ -d "/proc/$$" ]] || return 2
     return 1
+}
+
+# ---- the job's SESSION (your-org/nexus-code#1585) ---------------------------
+#
+# A job's extent is its SESSION, not its process GROUP. The runner is launched
+# under `setsid`, so it leads a session that every descendant inherits and that
+# only a further `setsid` can leave. A process GROUP is weaker: `timeout` makes
+# ITSELF a group leader, and `run-tests.sh` runs every suite under one. Measured
+# on a fixture shaped like that runner: `kill -- -<leader>` reported
+# `cancelled` at rc 0 while 6 of 6 suite processes lived on, reparented to
+# init — and `xargs -P`, woken by a dying child, had time to START a new test.
+
+# _proc_ids <pid> -> "<state> <ppid> <pgrp> <sid>" (rc 1 if the pid is gone).
+# Parsed AFTER the last `)`: comm may contain spaces and parentheses
+# (`tmux: server`), which shifts every whitespace-split field before it.
+# A builtin `read`, never `$(cat …)`: this runs once per process on the host.
+_proc_ids() {
+    local st a b c d
+    { IFS= read -r st < "/proc/$1/stat"; } 2>/dev/null || return 1
+    st=${st##*) }
+    read -r a b c d _ <<<"$st" || return 1
+    printf '%s %s %s %s' "$a" "$b" "$c" "$d"
+}
+
+# _session_members <sid> -> "<pid> <ppid>" per LIVE member. Zombies are not
+# live: they hold a slot in the session until reaped and can do nothing.
+_session_members() {
+    local want="$1" p ids st ppid pgrp sid
+    for p in /proc/[0-9]*; do
+        p=${p#/proc/}
+        ids=$(_proc_ids "$p") || continue
+        read -r st ppid pgrp sid <<<"$ids"
+        [[ "$sid" == "$want" && "$st" != Z ]] && printf '%s %s\n' "$p" "$ppid"
+    done
+}
+
+# _freeze_session <sid> — SIGSTOP every member, iterated to a FIXED POINT. One
+# pass is not enough: a member can fork between being listed and being
+# stopped. A stopped parent cannot fork, so the set converges; the bound is a
+# backstop, not the mechanism.
+_freeze_session() {
+    local sid="$1" round p pp any seen=" "
+    # TOP-DOWN: the leader first, explicitly. `/proc/[0-9]*` sorts LEXICALLY
+    # (`10` before `9`), so the enumeration below promises no order at all.
+    kill -STOP "$sid" 2>/dev/null && seen+="$sid "
+    for round in 1 2 3 4 5 6 7 8; do
+        any=0
+        while read -r p pp; do
+            [[ -n "$p" ]] || continue
+            case "$seen" in *" $p "*) continue ;; esac
+            kill -STOP "$p" 2>/dev/null && { seen+="$p "; any=1; }
+        done < <(_session_members "$sid")
+        (( any )) || break
+    done
+}
+
+# _signal_session_bottom_up <sid> <SIG> — deepest first. With the session
+# frozen, TERM is left PENDING on every member and they are then continued
+# children-before-parents: a parent such as `xargs -P` wakes to find its own
+# TERM already pending and dies BEFORE it can react to a child's death by
+# starting the next one. KILL needs no CONT; it acts on a stopped process.
+_signal_session_bottom_up() {
+    local sid="$1" sig="$2" p pp d q n=0
+    local -A par=() dep=()
+    while read -r p pp; do [[ -n "$p" ]] && par[$p]=$pp; done < <(_session_members "$sid")
+    for p in "${!par[@]}"; do
+        d=0; q=$p
+        while [[ -n "${par[$q]:-}" && $d -lt 64 ]]; do q=${par[$q]}; d=$(( d + 1 )); done
+        dep[$p]=$d
+    done
+    for p in "${!par[@]}"; do kill "-$sig" "$p" 2>/dev/null && n=$(( n + 1 )); done
+    if [[ "$sig" != KILL ]]; then
+        while read -r d p; do kill -CONT "$p" 2>/dev/null; done \
+            < <(for p in "${!dep[@]}"; do printf '%s %s\n' "${dep[$p]}" "$p"; done | sort -rn)
+    fi
+    printf '%s' "$n"
 }
 
 # ---- the evidence census --------------------------------------------------
@@ -839,28 +921,113 @@ case "${1:-}" in
                  echo "  refusing to signal, because a kill with no marker reads as 'died'." >&2
                  exit 3; }
 
-        # The runner is a session leader, so its process GROUP is the whole job.
-        kill -TERM -- "-$_pid" 2>/dev/null || kill -TERM "$_pid" 2>/dev/null || true
+        # THE JOB IS ITS SESSION (#1585). This used to read "the runner is a
+        # session leader, so its process GROUP is the whole job" and signalled
+        # `-$_pid`. The premise is right and the conclusion is not: `timeout`
+        # leaves the leader's GROUP without leaving its SESSION.
+        #
+        # PROVEN, not assumed: the sweep keys on `sid == $_pid`, so it is only
+        # sound if the recorded pid really LEADS a session — and that session
+        # is not the CALLER's. A leader's identity was verified by start time
+        # just above; a session can only be joined by descent, so membership in
+        # a verified leader's session is proof the process is this job's.
+        _ids=$(_proc_ids "$_pid") || _ids=""
+        read -r _ _ _ _lsid <<<"$_ids"
+        _mysid=$(_proc_ids "$$") || _mysid=""
+        read -r _ _ _ _mysid <<<"$_mysid"
+        if [[ "$_lsid" != "$_pid" || -z "$_mysid" || "$_lsid" == "$_mysid" ]]; then
+            # Default-DENY on the wide form. Fall back to the one process whose
+            # identity IS established, and say the sweep did not happen.
+            echo "async-run.sh: --cancel: recorded pid $_pid does not lead its own session (sid=${_lsid:-?}, caller sid=${_mysid:-?})" >&2
+            echo "  — REFUSING the session-wide sweep; signalling that one process only." >&2
+            kill -TERM "$_pid" 2>/dev/null || true
+            _swept="(no session sweep: leader-only)"
+            _sweep=0
+        else
+            _freeze_session "$_pid"
+            _nsig=$(_signal_session_bottom_up "$_pid" TERM)
+            _swept="$_nsig process(es) of session $_pid signalled"
+            _sweep=1
+        fi
+        # Wait on what was actually signalled: the SESSION when it was swept,
+        # the one verified LEADER when it was not — never a session number that
+        # was just refused as not provably this job's.
         _i=0
         while (( _i < 20 )); do
-            _pid_alive "$_pid" "$_want"; (( $? == 0 )) || break
+            if (( _sweep )); then
+                [[ -z "$(_session_members "$_pid")" ]] && break
+            else
+                _pid_alive "$_pid" "$_want"; (( $? == 0 )) || break
+            fi
             sleep 0.5; _i=$(( _i + 1 ))
         done
-        _pid_alive "$_pid" "$_want"
-        if (( $? == 0 )); then
-            echo "async-run.sh: --cancel: pid $_pid still alive after 10s — escalating to KILL" >&2
-            kill -KILL -- "-$_pid" 2>/dev/null || kill -KILL "$_pid" 2>/dev/null || true
+        if (( ! _sweep )); then
+            _pid_alive "$_pid" "$_want"
+            if (( $? == 0 )); then
+                echo "async-run.sh: --cancel: pid $_pid still alive after 10s — escalating to KILL" >&2
+                kill -KILL "$_pid" 2>/dev/null || true
+                sleep 0.5
+            fi
+        elif [[ -n "$(_session_members "$_pid")" ]]; then
+            echo "async-run.sh: --cancel: session $_pid still has live members after 10s — escalating to KILL" >&2
+            _freeze_session "$_pid"
+            _signal_session_bottom_up "$_pid" KILL >/dev/null
             sleep 0.5
         fi
 
+        # SURVIVORS, BY NAME. "cancel issued" said what was ATTEMPTED; for the
+        # jobs this verb is most needed for that was a manufactured success.
+        _left=""
+        (( _sweep )) && _left=$(_session_members "$_pid")
+        # DESCENDANTS THAT LEFT THE SESSION. Found by the job tag the runner
+        # exports, in ONE grep over /proc/*/environ; reported, never signalled.
+        _escaped=""
+        if [[ -f "$d/jobtag" ]]; then
+            _tag="NEXUS_ASYNC_RUN_JOB=$(cat "$d/jobtag")"
+            while IFS= read -r _ef; do
+                _ep=${_ef#/proc/}; _ep=${_ep%/environ}
+                _eids=$(_proc_ids "$_ep") || continue
+                read -r _est _ _ _esid <<<"$_eids"
+                [[ "$_esid" == "$_pid" || "$_est" == Z || "$_ep" == "$$" ]] && continue
+                _escaped+="    pid $_ep (sid $_esid): $(2>/dev/null tr '\0' ' ' < "/proc/$_ep/cmdline" | cut -c1-120)"$'\n'
+            done < <(command grep -laF -- "$_tag" /proc/[0-9]*/environ 2>/dev/null)
+        fi
+
         _v2=$(_verdict "$token")
-        printf 'async-run: cancel issued for %s\n  verdict %s: %s\n' "$token" "${_v2%%|*}" "${_v2#*|}"
+        # "none survive" is a claim about a session that was SWEPT AND RE-READ.
+        # On the leader-only path nothing was enumerated, so the honest line is
+        # that survivors were NOT CHECKED — never a zero nobody counted.
+        if (( _sweep )); then
+            _surv="$( [[ -z "$_left" ]] && echo none || printf '%s\n' "$_left" | grep -c . ) survive in it"
+        else
+            _surv="survivors in its session were NOT CHECKED"
+        fi
+        printf 'async-run: cancelled %s — %s; %s.\n  verdict %s: %s\n' \
+            "$token" "$_swept" "$_surv" "${_v2%%|*}" "${_v2#*|}"
+        if [[ -n "$_left" ]]; then
+            echo "  SURVIVORS — still alive in session $_pid after TERM and KILL (D state, typically NFS I/O):" >&2
+            while read -r _sp _; do
+                [[ -n "$_sp" ]] && printf '    pid %s: %s\n' "$_sp" "$(2>/dev/null tr '\0' ' ' < "/proc/$_sp/cmdline" | cut -c1-120)" >&2
+            done <<<"$_left"
+            exit 4
+        fi
         case "${_v2%%|*}" in
             cancel-requested)
                 echo "  NOTE: the process is STILL ALIVE after TERM and KILL. It may be in" >&2
                 echo "  uninterruptible sleep (D state, typically NFS I/O). Nothing further to try here." >&2
                 exit 4 ;;
         esac
+        if [[ -n "$_escaped" ]]; then
+            echo "  NOT REACHED — launched by this job, but they LEFT its session (their own setsid)," >&2
+            echo "  so they were NOT signalled. A process that detaches may be a deliberate daemon:" >&2
+            echo "  read the cmdline, then stop it by pid if it is yours to stop." >&2
+            printf '%s' "$_escaped" >&2
+            exit 10
+        fi
+        if [[ ! -f "$d/jobtag" ]]; then
+            echo "  NOTE: this token predates the job tag (#1585), so a descendant that left the job's" >&2
+            echo "  session could not be looked for. 'none survive' above is about the SESSION only." >&2
+        fi
         exit 0
         ;;
     --list)
@@ -995,6 +1162,12 @@ cd "$(cat "$d/cwd")" 2>/dev/null || cd / || exit 127
 _st=$(awk '{r=$0; sub(/^.*\) /,"",r); print r}' "/proc/$$/stat" 2>/dev/null | awk '{print $20}')
 printf '%s\n' "$$"   > "$d/pid.tmp"      && mv -f "$d/pid.tmp"      "$d/pid"
 printf '%s\n' "$_st" > "$d/pidstart.tmp" && mv -f "$d/pidstart.tmp" "$d/pidstart"
+# THE JOB TAG (your-org/nexus-code#1585). Every descendant inherits it, including
+# one that later `setsid`s out of this session — which is the only handle
+# `--cancel` has on such a process. `jobtag` on disk records that THIS job was
+# launched with one, so a cancel can tell "none found" from "could not look".
+export NEXUS_ASYNC_RUN_JOB="$d"
+printf '%s\n' "$d" > "$d/jobtag.tmp" && mv -f "$d/jobtag.tmp" "$d/jobtag"
 args=()
 while IFS= read -r -d '' a; do args+=("$a"); done < "$d/argv"
 "${args[@]}" < /dev/null > "$d/out" 2> "$d/err"

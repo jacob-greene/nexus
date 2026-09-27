@@ -435,6 +435,45 @@ gcov_report() {
         fi
     done
 
+    # ---- R4b: …AND THE CONVERSE — every DECLARED-gated row must be EXECUTED ----
+    # (your-org/nexus-code#1592.) R4 asks "is everything the gate RUNS declared?"
+    # and R6 asks "is everything ON DISK declared?". Nothing asked whether what
+    # is DECLARED gated is actually RUN — so PR 1566 landed a scenario file and
+    # its `gated` row without the `gate.sh` list entry, green. The row's column 6
+    # names `monitor/hooks/turn-failure-emit.sh` as a DRIVEN surface, which lifts
+    # the surfaces axis; every GREEN after that printed a coverage boundary that
+    # credited a surface no gated run had touched (`gated=9`, 8 ran). A plausible
+    # OVER-count, in the gate's own statement of what its green does not say.
+    #
+    # `gated` is a claim about THIS run. A scenario that is deliberately not run
+    # belongs in an `exempt` row, which requires an owner and a reason.
+    #
+    # ONLY WHEN A DISPATCHED LIST WAS SUPPLIED. `gcov_report` with no arguments
+    # is a legitimate mode — "is the declaration consistent with what is on
+    # disk" — and an ABSENT list is not an EMPTY dispatch. Reading it as one
+    # would refuse every gated row and conflate "could not check" with "checked
+    # and failed" (the first cut of this rule did exactly that, and the real-tree
+    # band of test-cc-harness-gate-population.sh caught it). So the unchecked
+    # case SAYS it is unchecked, rather than passing in silence: a parity check
+    # that quietly did not run reads exactly like one that found nothing.
+    # (A production gate with an empty list is a different defect with its own
+    # rule, `gate_refuse_if_vacuous`.)
+    local _g _hit
+    if (( ${#prod[@]} == 0 )); then
+        echo "=== gate-coverage: dispatch-parity UNCHECKED (no scenario list supplied — declared-gated vs dispatched was NOT compared) ==="
+    fi
+    for _g in $( (( ${#prod[@]} > 0 )) && printf '%s\n' ${gated_names[@]+"${gated_names[@]}"} ); do
+        _hit=0
+        for s in "${prod[@]}"; do
+            [[ "$(basename "$s")" == "$_g" ]] && { _hit=1; break; }
+        done
+        if (( ! _hit )); then
+            echo "=== gate-coverage: REFUSED reason=declared_gated_but_not_dispatched scenario=$_g ==="
+            echo "gate.sh: REFUSED — '$_g' is declared \`gated\` in gate-coverage.tsv but is NOT in the gate's scenario list, so no gated run drives it and the surfaces it declares are credited to a run that never touched them. Add it to gate.sh's scenario list, or move the row to \`exempt\` with an owner." >&2
+            refused=1
+        fi
+    done
+
     # ---- R6: THE RATCHET — every realmodel file on disk is gated or exempt ----
     local sdir="${GCOV_SCENARIO_DIR:-$_gcov_repo/monitor/watcher/test-integration}"
     local -a on_disk=() on_disk_paths=()

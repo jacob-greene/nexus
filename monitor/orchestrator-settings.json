@@ -1,5 +1,7 @@
 {
   "skipDangerousModePermissionPrompt": true,
+  "syncClaudeAiSkills": false,
+  "syncClaudeAiPlugins": false,
   "env": {
     "DISABLE_AUTOUPDATER": "1"
   },
@@ -41,13 +43,25 @@
         ]
       }
     ],
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/dangerous-rm-decide.sh --mode orchestrator",
+            "timeout": 30 }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
           { "type": "command",
             "command": "(mkdir -p \"$NEXUS_ROOT/monitor/.state\" && touch \"$NEXUS_ROOT/monitor/.state/orchestrator-heartbeat\" &) >/dev/null 2>&1" },
           { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh over-limit" }
+            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh over-limit" },
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh turn-failure" }
         ]
       }
     ],
@@ -55,7 +69,9 @@
       {
         "hooks": [
           { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/over-limit-emit.sh" }
+            "command": "$NEXUS_ROOT/monitor/hooks/over-limit-emit.sh" },
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/turn-failure-emit.sh" }
         ]
       }
     ]

@@ -58,16 +58,17 @@ trap 'rm -rf "$WORK"' EXIT
 
 STUB_DIR="$WORK/bin"; mkdir -p "$STUB_DIR"
 ACTIONS="$WORK/actions.log"
-PAYLOAD="$WORK/payload.txt"     # exactly the bytes handed to set-buffer
+PAYLOAD="$WORK/payload.txt"     # exactly the bytes handed to load-buffer
 CC_HOME="$WORK/cc"
 SID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 TRANSCRIPT="$CC_HOME/projects/-stub-slug/$SID.jsonl"
 mkdir -p "$(dirname "$TRANSCRIPT")"
 
 # tmux stub. Same recorder shape as test-paste-followup.sh, with ONE
-# addition that is the whole point of Part A: `set-buffer` writes its
-# payload argument verbatim to $PAYLOAD, so the suite can measure what
-# was DELIVERED rather than trusting the receipt's own arithmetic.
+# addition that is the whole point of Part A: `load-buffer` copies the
+# payload FILE it is handed verbatim to $PAYLOAD, so the suite can measure
+# what was DELIVERED rather than trusting the receipt's own arithmetic. The
+# payload is a file and not an argv element since your-org/nexus-code#1590.
 cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
 cmd="${1:-}"
@@ -94,13 +95,31 @@ if [[ "$cmd" == "list-windows" ]]; then
     exit 0
 fi
 printf '%s\n' "$*" >> "$ACTIONS"
-# The delivered payload: `set-buffer -b <buf> -- <MSG>`, last arg.
-if [[ "$cmd" == "set-buffer" && -n "${MOCK_PAYLOAD_FILE:-}" ]]; then
-    printf '%s' "${!#}" > "$MOCK_PAYLOAD_FILE"
+# The delivered payload: `load-buffer -b <buf> <file>`, last arg is the FILE.
+if [[ "$cmd" == "load-buffer" && -n "${MOCK_PAYLOAD_FILE:-}" ]]; then
+    cat -- "${!#}" > "$MOCK_PAYLOAD_FILE"
+fi
+# THE RECORD CARRIES WHAT WAS PASTED (your-org/nexus-code#1591, skeptic pastesk
+# F1): delivery evidence is content-matched now — a transcript record counts
+# only if it CONTAINS a needle from this paste — so a stand-in for Claude Code
+# has to record the payload it was handed, as the real one does, and not a fixed
+# string. The payload arrives as a FILE (`load-buffer -b <buf> <file>`, #1590).
+if [[ "$cmd" == "load-buffer" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
+    cat -- "${!#}" > "${MOCK_TRANSCRIPT}.payload" 2>/dev/null
 fi
 if [[ "$cmd" == "send-keys" && "${!#}" == "Enter" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
-    printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the follow-up"}}\n' \
-        >> "$MOCK_TRANSCRIPT"
+    if [[ -s "${MOCK_TRANSCRIPT}.payload" ]]; then
+        # JSON-escaped in PURE BASH, never `jq`: test-tmux-shim-gate3-safety.sh
+        # default-denies any external in a planted tmux stub that it cannot prove
+        # never reaches a real tmux, and it is right to (#1105).
+        _p=$(cat -- "${MOCK_TRANSCRIPT}.payload"; printf x); _p=${_p%x}
+        _p=${_p//\\/\\\\}; _p=${_p//\"/\\\"}; _p=${_p//$'\n'/\\n}; _p=${_p//$'\t'/\\t}; _p=${_p//$'\r'/\\r}
+        printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"%s"}}\n' "$_p" \
+            >> "$MOCK_TRANSCRIPT"
+    else
+        printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the follow-up"}}\n' \
+            >> "$MOCK_TRANSCRIPT"
+    fi
 fi
 exit 0
 STUB

@@ -603,4 +603,47 @@ OSC_SHELLS="${ESC}]8;;file:///proc/self/task${ESC}\\2 shells${ESC}]8;;${ESC}\\"
     printf '%s\n' "${ESC}[38;5;246m❯ Press up to edit queued messages${ESC}[0m"
 } > busy-dialog-quoted-queued-synthetic.ansi
 
+# --- the TRANSPORT-RETRY family (your-org/nexus-code#1552) -----------------
+#
+# The two REAL captures (`transport-retry-connrefused-realmodel-273.ansi` and
+# `…-exhausted-…`) carry the measured render. These three vary ONE property of
+# it each, because a real binary cannot be asked to:
+#
+#   quoted       an IDLE pane whose transcript QUOTES the construct, in both
+#                shapes that can carry it — inside a `●`-headed logical row,
+#                and on an indented row with no head at all. Must stay `idle`.
+#                Without it the detector could match any text and every busy
+#                assertion would still pass.
+#   capitalised  the live row with the vendor strings re-capitalised and
+#                nothing else changed — `#1340`'s measured regression shape.
+#   wrapped      the live row WRAPPED so that `Retrying in` and `attempt k/N`
+#                land on different physical rows. Matching per physical row
+#                would miss it; the detector joins the logical row.
+_tr_box() {
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;246m❯${NBSP}${ESC}[7m ${ESC}[0m${ESC}[39m${ESC}[49m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '  ${ESC}[38;5;246m-- INSERT -- ⏵⏵ bypass permissions on${ESC}[0m\n'
+}
+{
+    printf '%s\n' "${ESC}[39m● During the outage every pane read \"Retrying in 3s · attempt 3/10\" and classified idle.${ESC}[0m"
+    printf '\n'
+    printf '%s\n' "  ✻ Connection refused — a firewall or proxy may be blocking it · Retrying in 2s · attempt 4/10"
+    printf '\n'
+    printf '%s\n\n' "${ESC}[38;5;246m✻ Cooked for 12s${ESC}[0m"
+    _tr_box
+} > transport-retry-quoted-synthetic.ansi
+{
+    printf '%s\n\n' "${ESC}[39m● Re-running the aggregation over the remaining shards.${ESC}[0m"
+    printf '%s\n\n' "${ESC}[38;5;211m✻${ESC}[39m ${ESC}[38;5;211mConnection Refused — a firewall or proxy may be blocking it${ESC}[38;5;246m · Retrying In 3s · Attempt 3/10${ESC}[39m"
+    _tr_box
+} > transport-retry-capitalised-synthetic.ansi
+{
+    printf '%s\n\n' "${ESC}[39m● Re-running the aggregation over the remaining shards.${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;211m✻${ESC}[39m ${ESC}[38;5;211m529 Overloaded. The service is temporarily over capacity; please retry your${ESC}[39m"
+    printf '%s\n' "  ${ESC}[38;5;211mrequest shortly${ESC}[38;5;246m · Retrying in${ESC}[39m"
+    printf '%s\n\n' "  ${ESC}[38;5;246m38s · attempt 7/10${ESC}[39m"
+    _tr_box
+} > transport-retry-wrapped-synthetic.ansi
+
 echo "synthesized $(ls -1 *-synthetic.ansi | wc -l) fixtures"

@@ -502,21 +502,32 @@ else
 fi
 
 echo
-echo "=== heartbeat overrides busy-mid-render fixture ==="
-# The busy-mid-render fixture has no chevron at all — without a
-# heartbeat, pane-state has to infer busy from the spinner token
-# counter. With a fresh `idle_prompt` heartbeat, the heartbeat wins.
+echo "=== a fresh idle_prompt heartbeat does NOT override a pane with no REPL row ==="
+# The busy-mid-render fixture has no chevron at all and a LIVE token counter.
+#
+# THIS ASSERTION USED TO SAY THE OPPOSITE (issue #74: "with a fresh
+# `idle_prompt` heartbeat, the heartbeat wins" → `idle`), and it is reversed
+# DELIBERATELY by your-org/nexus-code#1521. The hook's `idle_prompt` is a claim
+# about the TURN that was last announced; it cannot see anything RAISED since.
+# A pane with no `❯<NBSP>` row is not showing a REPL at all — it is a `/login`
+# code-paste step, a fullscreen slash-command UI, a half-painted frame, or (as
+# here) a turn the hooks have not announced — and `idle` is both the kill
+# allowlist's first member and the canonical paste-me state. `#74`'s reading
+# erred toward a KILL for up to 1800 s; this one errs toward a one-poll DELAY on
+# a genuinely transient frame, and introduces no new verdict: it is the answer
+# the same pane already gets the moment its stamp goes stale (asserted just
+# below, unchanged).
 mid_render_fixture="$FIX_DIR/busy-mid-render-no-chevron-synthetic.ansi"
 if [[ -f "$mid_render_fixture" ]]; then
     printf '{"state":"idle_prompt","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
     out=$("$HELPER" --fixture "$mid_render_fixture" --window 9 --name test --active 0 \
                     --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
     got=$(awk -F'[ =]' '{print $2}' <<<"$out")
-    if [[ "$got" == "idle" ]]; then
-        printf '  PASS: fresh idle_prompt heartbeat overrides busy-mid-render → idle\n'
+    if [[ "$got" == "busy" ]]; then
+        printf '  PASS: fresh idle_prompt heartbeat + no REPL row + live token counter → busy (the pane outranks the hook; #1521)\n'
         PASS=$(( PASS + 1 ))
     else
-        printf '  FAIL: heartbeat override — got=%s want=idle\n' "$got" >&2
+        printf '  FAIL: heartbeat vs no-REPL-row pane — got=%s want=busy\n' "$got" >&2
         FAIL=$(( FAIL + 1 ))
     fi
     # And the inverse: stale heartbeat lets the renderer's busy
@@ -3067,6 +3078,236 @@ if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
         ok "#1340 NEGATIVE CONTROL an ordinary busy pane carries no throttled=1"
     fi
 fi
+
+# (7c) your-org/nexus-code#1552 — THE TRANSPORT-RETRY PANE, through the same
+#      chain, for the same reason: the hazard is what the GATE does with the
+#      token. Measured on the real 2.1.273 binary with the mock backend killed
+#      mid-stream: `state=idle` → `bk_pane_kill_authorized` rc 0. This is the
+#      pane every agent on the board shows at once during an outage.
+#
+#      PREDICTED FLIP SET, written before the mutation round (see the PR body):
+#        * drop disjunct (c) from `_detect_busy`      → all five `busy` rows
+#          below go `idle|AUTHORIZED`, the field row fails, the three
+#          controls hold;
+#        * make the head test permissive (`head_ok` always 1) → ONLY the quoted
+#          control flips, to `busy|refused`;
+#        * match per PHYSICAL row instead of per logical row → ONLY the wrapped
+#          row flips.
+if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
+    for _rt in transport-retry-connrefused-realmodel-273.ansi \
+               transport-retry-connrefused-plaincapture-273.ansi \
+               transport-retry-capitalised-synthetic.ansi \
+               transport-retry-wrapped-synthetic.ansi \
+               auth-expired-retrying-realmodel-268.ansi; do
+        _v=$(_1340_verdict "$_rt")
+        if [[ "$_v" == "busy|refused" ]]; then
+            ok "#1552 $_rt -> $_v (a pane mid-retry is a turn in flight, not a retirable one)"
+        else
+            bad "kill gate" "#1552 $_rt -> $_v, want busy|refused — a worker retrying a failed request is kill-authorised"
+        fi
+    done
+    _1552_out=$(bash "$HELPER" --fixture "$FIX_DIR/transport-retry-connrefused-realmodel-273.ansi" 2>/dev/null)
+    if grep -qE '(^| )retrying=3/10( |$)' <<<"$_1552_out"; then
+        ok "#1552 the real capture carries retrying=3/10 (a FIELD on busy, not a new state token)"
+    else
+        bad "kill gate" "#1552 the real capture carries no retrying=3/10 field: $_1552_out"
+    fi
+    _1552_out=$(bash "$HELPER" --fixture "$FIX_DIR/transport-retry-wrapped-synthetic.ansi" 2>/dev/null)
+    if grep -qE '(^| )retrying=7/10( |$)' <<<"$_1552_out"; then
+        ok "#1552 a WRAPPED retry row still yields retrying=7/10 (the logical row is joined before matching)"
+    else
+        bad "kill gate" "#1552 the wrapped retry row lost its attempt counter: $_1552_out"
+    fi
+    # `auth=` rides on whatever verdict the pane produces (#1518), so the 401
+    # mid-retry render keeps its label while its STATE stops being killable.
+    _1552_out=$(bash "$HELPER" --fixture "$FIX_DIR/auth-expired-retrying-realmodel-268.ansi" 2>/dev/null)
+    if grep -qE '(^| )auth=expired( |$)' <<<"$_1552_out" && grep -qE '(^| )retrying=6/10( |$)' <<<"$_1552_out"; then
+        ok "#1552 the 401 mid-retry render is busy AND still carries auth=expired retrying=6/10 (the liveness gate keys on the field)"
+    else
+        bad "kill gate" "#1552 the 401 mid-retry render lost a field: $_1552_out"
+    fi
+    # NEGATIVE CONTROLS. (i) the SAME outage once the retry budget is spent is
+    # genuinely idle — the turn is lost; (ii) a pane merely QUOTING the
+    # construct; (iii) an ordinary busy pane carries no retrying= field.
+    for _rt in transport-retry-exhausted-realmodel-273.ansi transport-retry-quoted-synthetic.ansi; do
+        _v=$(_1340_verdict "$_rt")
+        if [[ "$_v" == "idle|AUTHORIZED" ]]; then
+            ok "#1552 NEGATIVE CONTROL $_rt -> $_v (no live retry row: still retirable)"
+        else
+            bad "kill gate" "#1552 NEGATIVE CONTROL $_rt -> $_v, want idle|AUTHORIZED — the detector fires on text that is not a live retry row"
+        fi
+    done
+    if grep -qF 'retrying=' <<<"$_1340_busy"; then
+        bad "kill gate" "#1552 an ORDINARY busy pane was labelled retrying= — the detector fires on any spinner"
+    else
+        ok "#1552 NEGATIVE CONTROL an ordinary busy pane carries no retrying= field"
+    fi
+
+    # your-org/nexus-code#1527 — a stranded BRACKETED multi-line paste. Real
+    # capture, 2.1.273. At base: `state=idle input=blank`, i.e. paste- AND
+    # kill-authorised over an unsubmitted brief.
+    _1527_out=$(bash "$HELPER" --fixture "$FIX_DIR/pasted-multiline-chip-realmodel-273.ansi" 2>/dev/null)
+    _1527_st=$(sed -n 's/.*state=\([A-Za-z-]*\).*/\1/p' <<<"$_1527_out")
+    if [[ "$_1527_st" == user-typing ]] && grep -qE '(^| )input=typed( |$)' <<<"$_1527_out"; then
+        ok "#1527 the collapsed-paste chip reads user-typing input=typed (content somebody placed is not a blank box)"
+    else
+        bad "input kind" "#1527 the collapsed-paste chip reads: $_1527_out — want state=user-typing input=typed"
+    fi
+    if bk_pane_kill_authorized "$_1527_st"; then
+        bad "kill gate" "#1527 a pane holding an unsubmitted paste is kill-authorised (state=$_1527_st)"
+    else
+        ok "#1527 …and the kill gate refuses it"
+    fi
+    # The chip regex must not make every box typed: the blank-box control.
+    _1527_ctl=$(bash "$HELPER" --fixture "$FIX_DIR/idle-empty-post-turn-realmodel.ansi" 2>/dev/null)
+    if grep -qE '(^| )input=blank( |$)' <<<"$_1527_ctl"; then
+        ok "#1527 NEGATIVE CONTROL a real empty box still reads input=blank"
+    else
+        bad "input kind" "#1527 NEGATIVE CONTROL an empty box no longer reads input=blank: $_1527_ctl"
+    fi
+
+    # your-org/nexus-code#1531, mechanism 2 — the queued placeholder at 2.1.273
+    # sits on the REAL input row with its first glyph under the cursor cell
+    # (`\x1b[7m\x1b[39mP\x1b[0;2mress up …`). In vim INSERT the lone `P` read as
+    # operator-typed text: `user-typing input=typed`, and NO queued=1.
+    _1531_out=$(bash "$HELPER" --fixture "$FIX_DIR/queued-vim-insert-realmodel-273.ansi" 2>/dev/null)
+    if [[ "$(sed -n 's/.*state=\([A-Za-z-]*\).*/\1/p' <<<"$_1531_out")" == busy ]] \
+       && grep -qE '(^| )queued=1( |$)' <<<"$_1531_out"; then
+        ok "#1531 the 2.1.273 queued placeholder (vim INSERT) reads busy queued=1"
+    else
+        bad "queued" "#1531 the 2.1.273 queued placeholder reads: $_1531_out — want state=busy … queued=1"
+    fi
+    # …and the tolerant cursor-cell cut must not swallow REAL vim-INSERT text.
+    _1531_ctl=$(bash "$HELPER" --fixture "$FIX_DIR/user-typing-vim-dim-box-border-synthetic.ansi" 2>/dev/null)
+    if grep -qE '(^| )input=typed( |$)' <<<"$_1531_ctl"; then
+        ok "#1531 NEGATIVE CONTROL real vim-INSERT operator text still reads input=typed"
+    else
+        bad "input kind" "#1531 NEGATIVE CONTROL vim-INSERT operator text lost: $_1531_ctl"
+    fi
+fi
+
+# (7d) THE HEARTBEAT ROUTE — your-org/nexus-code#1521, #1531 (mechanism 1), and
+#      the heartbeat half of #1552 and #1527.
+#
+#      Every assertion above runs with NO heartbeat, i.e. on the renderer route.
+#      Workers carry heartbeat hooks, and a fresh `idle_prompt` (Stop) stamp is
+#      trusted for 1800 s — so for the half hour after every turn, a worker pane
+#      is classified by `_classify_from_heartbeat`, which used to emit `idle` and
+#      `exit 0` having asked the pane ONE question (the bright-typed marker).
+#      A dialog, a queued message, in-flight chrome and unmarked box content were
+#      all invisible to it: measured at d5874b26, every row of the first table
+#      below read `state=idle` — kill-authorised, paste-authorised.
+#
+#      THE ROUTE-POTENCY PAIR IS NOT OPTIONAL. "The pane now reads `blocked`" is
+#      also what you get if the heartbeat file is never read at all (a typo'd
+#      flag, a rejected JSON), because the renderer says `blocked` by itself. So
+#      the same harness must show the hook's answer being TAKEN where the pane
+#      agrees: a ghost-text pane reads `autosuggest-only` on the renderer route
+#      and `idle` on this one, and a `permission_prompt` stamp turns an ordinary
+#      busy capture into `blocked`.
+#
+#      PREDICTED FLIP SET for "delete the deferral block" (written before the
+#      mutation round): all eleven rows of the first table flip to `idle`, their
+#      four gate rows flip to AUTHORIZED; the potency pair, the idle control and
+#      the empty-capture polarity row do NOT move.
+_hb_dir=$(mktemp -d)
+_hb_now=1789700000
+_hb_file="$_hb_dir/hb.json"
+_hb_write() {   # <heartbeat state> — a Stop-shaped stamp, 5 s old
+    printf '{"state":"%s","last_activity":%s,"last_turn_end":%s,"event":"Stop","window":"hbw","external_waits":[],"dismissed_waits":[]}\n' \
+        "$1" "$(( _hb_now - 5 ))" "$(( _hb_now - 5 ))" > "$_hb_file"
+}
+_hb_line() {    # <fixture path> [extra helper args…]
+    local _f="$1"; shift
+    bash "$HELPER" --fixture "$_f" --name hbw --heartbeat-file "$_hb_file" --now "$_hb_now" "$@" 2>/dev/null
+}
+_hb_state() { sed -n 's/.*state=\([A-Za-z-]*\).*/\1/p' <<<"$1"; }
+# A live `claude` for the ONE row that needs a process fact: with no REPL row the
+# renderer asks whether a claude is alive (`empty`) or not (the one door to
+# `absent`). In production a pane on the code-paste step always has one.
+_hb_claude_pid=""
+if cp "$(command -v bash)" "$_hb_dir/claude" 2>/dev/null; then
+    "$_hb_dir/claude" -c 'sleep 300; :' >/dev/null 2>&1 &
+    _hb_claude_pid=$!
+fi
+_hb_write idle_prompt
+while IFS='|' read -r _hbf _hb_want _hb_field _hb_why; do
+    [[ -n "$_hbf" ]] || continue
+    _hb_args=()
+    if [[ "$_hbf" == blocked-login-codepaste-realmodel-268.ansi ]]; then
+        if [[ -z "$_hb_claude_pid" ]]; then
+            bad "heartbeat route" "could not start the stand-in claude; the code-paste row is UNMEASURED"
+            continue
+        fi
+        _hb_args=(--pane-pid "$_hb_claude_pid")
+    fi
+    _hb_out=$(_hb_line "$FIX_DIR/$_hbf" "${_hb_args[@]}")
+    _hb_got=$(_hb_state "$_hb_out")
+    if [[ "$_hb_got" == "$_hb_want" ]] && { [[ -z "$_hb_field" ]] || grep -qE "(^| )${_hb_field}( |\$)" <<<"$_hb_out"; }; then
+        ok "heartbeat idle_prompt + $_hbf -> $_hb_want${_hb_field:+ $_hb_field} ($_hb_why)"
+    else
+        bad "heartbeat route" "idle_prompt + $_hbf -> '$_hb_out', want state=$_hb_want${_hb_field:+ with $_hb_field} ($_hb_why)"
+    fi
+done <<'HBROWS'
+blocked-login-method-realmodel-268.ansi|blocked|auth=login|#1521: the /login menu; the hook cannot see a dialog raised after Stop
+blocked-permission-synthetic.ansi|blocked|overlay=permission|#1521: any dialog, not only a login one
+blocked-askuq-synthetic.ansi|blocked||#1521: AskUserQuestion
+blocked-bypass-permissions-synthetic.ansi|blocked||#1521: the bypass-permissions modal
+blocked-login-codepaste-realmodel-268.ansi|empty|auth=login|#1521: the code-paste step has no REPL row, so the hook's idle has nothing to stand on
+queued-vim-insert-realmodel-273.ansi|busy|queued=1|#1531: a message queued behind a turn the hooks have not announced
+busy-dialog-quoted-queued-synthetic.ansi|busy|queued=1|#1531: the older placeholder rendering, which replaces the REPL row
+transport-retry-connrefused-realmodel-273.ansi|busy|retrying=3/10|#1552: a harness-initiated turn mid-retry
+busy-encode-win5.ansi|busy||a live token counter under a stale idle stamp
+pasted-multiline-chip-realmodel-273.ansi|user-typing|input=typed|#1527: the stranded respawn brief, on the route a respawned worker takes
+user-typing-vim-dim-box-border-synthetic.ansi|user-typing|input=typed|#603's vim-INSERT text, never applied on this route before
+HBROWS
+if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
+    for _hbf in blocked-login-method-realmodel-268.ansi queued-vim-insert-realmodel-273.ansi \
+                transport-retry-connrefused-realmodel-273.ansi pasted-multiline-chip-realmodel-273.ansi; do
+        _hb_got=$(_hb_state "$(_hb_line "$FIX_DIR/$_hbf")")
+        if bk_pane_kill_authorized "$_hb_got"; then
+            bad "kill gate" "heartbeat idle_prompt + $_hbf -> $_hb_got, which is KILL-AUTHORISED"
+        else
+            ok "heartbeat idle_prompt + $_hbf -> $_hb_got, refused by the kill gate"
+        fi
+    done
+fi
+# ROUTE POTENCY + CONTROLS.
+_hb_got=$(_hb_state "$(_hb_line "$FIX_DIR/autosuggest-merge-win3.ansi")")
+_hb_ren=$(bash "$HELPER" --fixture "$FIX_DIR/autosuggest-merge-win3.ansi" 2>/dev/null | sed -n 's/.*state=\([A-Za-z-]*\).*/\1/p')
+if [[ "$_hb_got" == idle && "$_hb_ren" == autosuggest-only ]]; then
+    ok "ROUTE POTENCY: the ghost-text capture reads idle WITH the stamp and autosuggest-only WITHOUT it — the heartbeat route is demonstrably the one answering"
+else
+    bad "heartbeat route" "ROUTE POTENCY: with-stamp='$_hb_got' (want idle) without='$_hb_ren' (want autosuggest-only) — the rows above do not show what they claim"
+fi
+_hb_write permission_prompt
+_hb_got=$(_hb_state "$(_hb_line "$FIX_DIR/busy-encode-win5.ansi")")
+if [[ "$_hb_got" == blocked ]]; then
+    ok "ROUTE POTENCY: a permission_prompt stamp turns a busy capture into blocked — the stamp is read"
+else
+    bad "heartbeat route" "ROUTE POTENCY: permission_prompt + busy capture -> '$_hb_got', want blocked"
+fi
+_hb_write idle_prompt
+_hb_got=$(_hb_state "$(_hb_line "$FIX_DIR/idle-empty-synthetic.ansi")")
+if [[ "$_hb_got" == idle ]]; then
+    ok "CONTROL: a genuinely idle pane under an idle stamp still reads idle (the deferral did not make every worker unretirable)"
+else
+    bad "heartbeat route" "CONTROL: idle stamp + idle pane -> '$_hb_got', want idle"
+fi
+# POLARITY (#1521's second requirement): an EMPTY capture must never NARROW the
+# hook's answer — a tmux hiccup that manufactures `blocked` retires nothing, ever.
+: > "$_hb_dir/empty.ansi"
+_hb_got=$(_hb_state "$(_hb_line "$_hb_dir/empty.ansi")")
+if [[ "$_hb_got" == idle ]]; then
+    ok "POLARITY: an empty capture under an idle stamp stays idle (deferral needs pane EVIDENCE, never its absence)"
+else
+    bad "heartbeat route" "POLARITY: empty capture + idle stamp -> '$_hb_got', want idle"
+fi
+if [[ -n "$_hb_claude_pid" ]]; then
+    for _hb_k in $(pgrep -P "$_hb_claude_pid" 2>/dev/null); do kill "$_hb_k" 2>/dev/null; done
+    kill "$_hb_claude_pid" 2>/dev/null; wait "$_hb_claude_pid" 2>/dev/null
+fi
+rm -rf "$_hb_dir"
 
 # (8) NOTHING AUTO-ANSWERS IT, AND NO ARM FIRES ON A WORKING PANE.
 #

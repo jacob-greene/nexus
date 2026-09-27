@@ -42,6 +42,12 @@ must=(
   # say that async-run.sh does not — measured: rc 4 retained, 809 s idle.
   'A retained exit status is not an armed wake'
   'run_in_background'
+  # your-org/nexus-code#1540 / #1549: a Monitor until-loop is bounded (2.1.271)
+  # and its expiry is a RE-ARM instruction, not an answer about the condition.
+  'at most 30 minutes'
+  'means RE-ARM, not "done"'
+  # your-org/nexus-code#1533: sandbox-notify delivers one bit.
+  'ATTENTION, not content'
 )
 for m in "${must[@]}"; do
     if grep -qF -- "$m" <<<"$floor"; then ok "floor states: $m"; else bad "floor is missing: $m"; fi

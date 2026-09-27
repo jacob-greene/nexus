@@ -267,7 +267,7 @@ usage: monitor/spawn-worker.sh -n <window-name> -c <workdir> -p <prompt-file>
                  but the WHOLE chain back to this original deliverable, and
                  may question both. Defaults to --skeptic-target when
                  omitted (the first skeptic's target IS the original).
-                 Threaded forward by `ng wrap-up`'s recursive spawn command.
+                 Threaded forward by \`ng wrap-up\`'s recursive spawn command.
   --print-prompt emit the composed prompt to stdout and exit without
                  spawning a tmux window. For testing.
   --resume       respawn mode: re-attach a prior worker session via
@@ -866,6 +866,50 @@ fi
 # the worker shell's PATH.
 # shellcheck disable=SC1091
 . "$NEXUS_ROOT/monitor/_claude-bin.sh"
+
+# _sw_sweep_stale_spawn_tmp — BACKSTOP for launcher/prompt files no launcher
+# ever consumed (your-org/nexus-code#1601).
+#
+# Only the LAUNCHER removes `spawn-prompt-*`/`spawn-launcher-*`, in its first
+# lines. When it never runs — a suite that stubs `tmux send-keys`, a launcher
+# its guard refused (exit 78/79) before reaching its `rm` — the pair stays in
+# ${TMPDIR:-/tmp} for ever: 922 of them, all >24 h old, on 2026-09-21, part of
+# the depth-1 population that made `tmpfs-guard.sh --check` stop returning.
+# This process cannot know whether ITS launcher will run, so it removes other
+# spawns' leftovers instead, and only what it can ATTRIBUTE on every axis:
+#   name   the exact shapes this file writes (…<name>.<pid>.txt / .sh, plus
+#          the trust-retry `.keep` / `.stamp` siblings);
+#   owner  this uid; a regular file, never a symlink;
+#   age    mtime older than 24 h (CHOSEN: the tmpfs-guard reap window; a
+#          launcher that runs deletes both files within seconds of starting);
+#   use    not open in any live process (a launcher still executing holds
+#          its script open) — checked, not assumed.
+# Anything failing one axis is left. The walk is bounded (10 s, CHOSEN: the
+# depth-1 walk of a 76k-entry /tmp measured under 1 s) and a sweep that cannot
+# complete removes nothing further; it never blocks a spawn.
+_sw_sweep_stale_spawn_tmp() {
+    local dir="${TMPDIR:-/tmp}" f base inuse
+    local -a cand=()
+    [ -d "$dir" ] || return 0
+    while IFS= read -r -d '' f; do
+        base=${f##*/}
+        [[ "$base" =~ ^spawn-(prompt-.+\.[0-9]+\.txt|launcher-.+\.[0-9]+\.sh)(\.keep|\.stamp)?$ ]] || continue
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        cand+=("$f")
+    done < <(timeout -k 2 10 find "$dir" -mindepth 1 -maxdepth 1 -type f -user "$(id -u)" -mmin +1440 \
+                 \( -name 'spawn-prompt-*' -o -name 'spawn-launcher-*' \) -print0 2>/dev/null)
+    [ "${#cand[@]}" -gt 0 ] || return 0
+    # A TIMED-OUT use-check is an incomplete one: remove nothing (fail closed).
+    # Other non-zero statuses are routine here — processes exit mid-walk.
+    local urc=0
+    inuse=$(timeout -k 2 10 find /proc/[0-9]*/fd -maxdepth 1 -lname "$dir/spawn-*" -printf '%l\n' 2>/dev/null) || urc=$?
+    [ "$urc" = 124 ] || [ "$urc" = 137 ] && return 0
+    for f in "${cand[@]}"; do
+        grep -qxF -e "$f" <<<"$inuse" && continue
+        rm -f -- "$f" 2>/dev/null || true
+    done
+    return 0
+}
 
 # Session MESSAGING name = this worker's tmux window name (#1047), so an
 # orchestrator can address a live worker by the window it can already see
@@ -2062,7 +2106,12 @@ _resume_workdir() {
         # Re-resolve name→@id so a dotted name (#323) doesn't dot-parse
         # here and silently skip the live-pane source.
         local _wid; _wid=$(resolve_window_id "$window" 2>/dev/null || true)
-        wd=$(tmux display-message -p -t "${_wid:-$window}" '#{pane_current_path}' 2>/dev/null || true)
+        # (your-org/nexus-code#1524) NEVER fall back to the BARE name: tmux resolves
+        # a bare `-t <name>` by UNIQUE PREFIX when the exact window is absent, so a
+        # failed id resolution used to be name-targeted exactly when a mis-aim was
+        # likeliest (#701's shape). `:=<name>` is exact-or-rc-1 for every verb
+        # (measured per verb on tmux 2.6) — a failed resolution now REFUSES at tmux.
+        wd=$(tmux display-message -p -t "${_wid:-:=$window}" '#{pane_current_path}' 2>/dev/null || true)
         if [ -n "$wd" ] && [ -d "$wd" ]; then printf '%s' "$wd"; return 0; fi
     fi
     # 2. window-close event (the close protocol records workdir=).
@@ -2335,9 +2384,10 @@ MSG
         # Re-resolve name→@id and target by id: a dotted name (#323)
         # would otherwise dot-parse in display-message/kill-window -t.
         EXIST_WID=$(resolve_window_id "$WINDOW_NAME" || true)
-        pane_dead=$(tmux display-message -p -t "${EXIST_WID:-$WINDOW_NAME}" '#{pane_dead}' 2>/dev/null || echo "")
+        # `:=` on the fallback arm, never the bare name (#1524; see _resume_workdir).
+        pane_dead=$(tmux display-message -p -t "${EXIST_WID:-:=$WINDOW_NAME}" '#{pane_dead}' 2>/dev/null || echo "")
         if [ "$pane_dead" = "1" ] || [ "$RESUME_REPLACE" -eq 1 ]; then
-            tmux kill-window -t "${EXIST_WID:-$WINDOW_NAME}"
+            tmux kill-window -t "${EXIST_WID:-:=$WINDOW_NAME}"
         else
             cat >&2 <<MSG
 spawn-worker: --resume: window '$WINDOW_NAME' exists with a LIVE pane.
@@ -2351,6 +2401,7 @@ MSG
 
     SAFE_NAME=$(wk_encode "$WINDOW_NAME")
     LAUNCHER_TMP="${TMPDIR:-/tmp}/spawn-launcher-${SAFE_NAME}.$$.sh"
+    _sw_sweep_stale_spawn_tmp
 
     # Resume launcher: identical env wiring to the fresh-spawn shape
     # (the exports are the whole point — every hook in
@@ -2380,6 +2431,11 @@ $SPAWNER_SNAPSHOT_EXPORT
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# TMPDIR for the agent process and everything under it (your-org/nexus-code#1628):
+# claude does not set one, so \$TMPDIR/x was /x. Here, in the LAUNCHER, not in
+# locals-env.sh, which services and helpers also source (a callee with a private
+# TMPDIR under a caller without one split the labsh rotation).
+[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
 # It is applied BEFORE the precondition check below, deliberately: that check
@@ -3181,6 +3237,7 @@ fi
 # the launchers byte-identical to the pre-#1535 form; the reason is on
 # stderr and in monitor/.state/longjob/arming.log.
 PLUGIN_ARG=$(_spawn_plugin_arg "$WINDOW_NAME")
+_sw_sweep_stale_spawn_tmp   # #1601 backstop — see the function
 if [ "$USE_LOOP_WRAPPER" -eq 1 ]; then
 cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
@@ -3194,6 +3251,11 @@ $SPAWNER_SNAPSHOT_EXPORT
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# TMPDIR for the agent process and everything under it (your-org/nexus-code#1628):
+# claude does not set one, so \$TMPDIR/x was /x. Here, in the LAUNCHER, not in
+# locals-env.sh, which services and helpers also source (a callee with a private
+# TMPDIR under a caller without one split the labsh rotation).
+[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
 # It is applied BEFORE the precondition check below, deliberately: that check
@@ -3250,6 +3312,11 @@ $SPAWNER_SNAPSHOT_EXPORT
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# TMPDIR for the agent process and everything under it (your-org/nexus-code#1628):
+# claude does not set one, so \$TMPDIR/x was /x. Here, in the LAUNCHER, not in
+# locals-env.sh, which services and helpers also source (a callee with a private
+# TMPDIR under a caller without one split the labsh rotation).
+[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
 # It is applied BEFORE the precondition check below, deliberately: that check
@@ -3377,6 +3444,29 @@ else
         "kind=$SPAWN_KIND" \
         "skeptic-mode=$SKEPTIC_MODE" "skeptic-depth=$SKEPTIC_DEPTH" \
         ${_anchor_extra_replyto[@]+"${_anchor_extra_replyto[@]}"}
+fi
+
+# A REUSED WINDOW NAME MUST NOT MERGE UNRELATED SKEPTIC ROUNDS
+# (your-org/nexus-code#1252). The skeptic ledger is keyed on the window NAME
+# and names are recycled across tasks and days. On a FRESH spawn — never on
+# `--resume`, which continues the same session and the same rounds — a fully
+# SETTLED ledger on this name is archived. `ng skeptic-ledger-rotate` owns the
+# decision and REFUSES (rc 5) whenever anything is outstanding, a marker is
+# pending, or it could not read the ledger: an open obligation is inherited,
+# loudly, never dropped. Best-effort and never fatal — a spawn must not fail on
+# bookkeeping — but a refusal is printed, because it means this session starts
+# life owing a review somebody else's session armed.
+if [ -z "$RESUME_TARGET" ] && [ -x "$NEXUS_ROOT/monitor/ng" ]; then
+    _lr_rc=0
+    _lr_out=$("$NEXUS_ROOT/monitor/ng" skeptic-ledger-rotate "$WINDOW_NAME" \
+        --state-dir "$STATE_DIR" 2>&1) || _lr_rc=$?
+    case "$_lr_rc" in
+        0) printf 'spawn-worker: %s\n' "$_lr_out" >&2 ;;
+        3) : ;;
+        *) printf 'spawn-worker: NOTE — the skeptic ledger on the reused name %s was NOT rotated (ng skeptic-ledger-rotate rc=%s):\n' \
+               "$WINDOW_NAME" "$_lr_rc" >&2
+           printf '%s\n' "$_lr_out" | sed 's/^/  /' >&2 ;;
+    esac
 fi
 
 # Write the durable provenance record. The ABSENCE of this file is what

@@ -56,6 +56,22 @@ FAIL=0
 pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 
+# ---- population (your-org/nexus-code#1301) ----------------------------------
+# Section 7 sweeps every tracked production shell file under monitor/, so a
+# paste-buffer call added anywhere there joins this guard's population.
+# `_pb_files` is the ONE enumerator: section 7 and `gp_population` both call it,
+# alongside the manifest its floor is derived from. Declared ABOVE the tmux
+# skip, so the probe answers on a runner with no tmux, and above the first line
+# of output, because `gp_handle` EXITS on --population.
+_PB_ROOT=$(cd "$MONITOR_DIR/.." && pwd)
+_pb_files() { git -C "$_PB_ROOT" ls-files -- monitor 2>/dev/null | grep -E '\.sh$' | grep -v '/test-\|/fixtures/'; }
+. "$MONITOR_DIR/_guard_population.sh"
+gp_population() {
+    _pb_files | sed "s|^|$_PB_ROOT/|"
+    printf '%s\n' "$_script_dir/paste-buffer-sites.manifest" "$_script_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 command -v tmux >/dev/null 2>&1 || { echo "skipped: tmux not on PATH"; exit 77; }   # SKIP (#568 A6)
 
 WORK=$(mktemp -d)
@@ -227,6 +243,14 @@ assert_paste() {
             tmux() { command tmux -L "$sock" "$@"; }
             . "$MONITOR_DIR/_pane-live.sh"
             . "$MONITOR_DIR/_tmux-window.sh"
+            # The paste itself is monitor/_paste-deliver.sh's now
+            # (your-org/nexus-code#1591) — the functions driven below call it.
+            # Loaded AFTER the `tmux` override so every tmux call it makes
+            # lands on THIS private server; short windows, because nothing in
+            # this echo-less pane can ever confirm a submit and the byte
+            # assertions below do not need it to.
+            export PD_CONFIRM_WINDOWS="1" PD_POLL_SECONDS=0.1 PD_HELD_CHECK_SECONDS=0.3
+            . "$MONITOR_DIR/_paste-deliver.sh"
             "$driver"
             printf '%s' "$?" > "$WORK/drv-rc"
         )
@@ -319,10 +343,21 @@ fi
 # 4. source guard: the fix is present in paste-followup.sh. Deliberately
 #    OUTSIDE the capability gate — it is a pure source grep, so it holds the
 #    regression line on every tmux, including one that cannot run 1-3.
-if grep -Eq 'tmux paste-buffer[^|]*-p' "$PASTE"; then
-    pass "paste-followup.sh calls paste-buffer with '-p'"
+#    The call moved: paste-followup.sh, like every other paste path, goes through
+#    monitor/_paste-deliver.sh (your-org/nexus-code#1591), which holds the tree's
+#    ONE paste-buffer. So the guard follows the call — and additionally pins that
+#    paste-followup.sh really does route through it, or "the primitive is
+#    bracketed" would say nothing about follow-ups.
+_PD_LIB="$MONITOR_DIR/_paste-deliver.sh"
+if grep -Eq '^[^#]*tmux paste-buffer[^|]*-p' "$_PD_LIB"; then
+    pass "_paste-deliver.sh — the one paste-buffer call — carries '-p'"
 else
-    fail "paste-followup.sh paste-buffer call lost its '-p' flag (regression)"
+    fail "_paste-deliver.sh's paste-buffer call lost its '-p' flag (regression: EVERY paste path is unbracketed)"
+fi
+if grep -Eq '^[^#]*pd_paste_file ' "$PASTE"; then
+    pass "paste-followup.sh pastes THROUGH the primitive (pd_paste_file)"
+else
+    fail "paste-followup.sh no longer calls pd_paste_file — it has grown its own paste, outside the bracketed primitive"
 fi
 
 # 7. THE POPULATION GUARD, and it is the part that makes 4/5/6 more than three
@@ -351,7 +386,6 @@ fi
 #    begin with the call.
 echo
 echo "== 7. population guard: every executable paste-buffer in monitor/ is bracketed =="
-_PB_ROOT=$(cd "$MONITOR_DIR/.." && pwd)
 _pb_unbracketed=0
 _pb_total=0
 while IFS= read -r _pb_f; do
@@ -398,7 +432,7 @@ while IFS= read -r _pb_f; do
     # here costs one `-p` on a string nobody executes, while a false negative is
     # an unbracketed paste, and this file's own history is three missed sites.
     done < <(grep -E 'paste-buffer' "$_PB_ROOT/$_pb_f" 2>/dev/null | grep -vE '^[[:space:]]*#')
-done < <(git -C "$_PB_ROOT" ls-files -- monitor 2>/dev/null | grep -E '\.sh$' | grep -v '/test-\|/fixtures/')
+done < <(_pb_files)
 # A ZERO TOTAL IS NOT A PASS. If the enumeration finds no call sites at all, the
 # guard has gone blind — a renamed directory, a changed call spelling, a `git
 # ls-files` returning nothing in a worktree — and a blind guard reports green.

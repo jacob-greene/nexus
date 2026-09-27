@@ -459,16 +459,72 @@ if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] && _nw_under_test; then
     exit 0
 fi
 
+# --- (1b) CONTEXT: an idle default from a window that CANNOT TAKE A TURN -----
+# (your-org/nexus-code#1551). During the 2026-09-17 login expiry the harness
+# raised 13 `Needs attention` notifications — twelve at exactly +60 s from an
+# API failure — and the equality arm below suppressed all 13, correctly by its
+# own lights: the harness supplies the SAME four bytes for "this agent is
+# idle" and "this agent is logged out", and the raw payload is no better
+# (`notification_type: idle_prompt` in both cases). A classifier keyed on the
+# text cannot separate them, so the discriminator is CONTEXT the text lacks:
+# the `StopFailure` marker `turn-failure/<window>.json`, written by
+# `monitor/hooks/turn-failure-emit.sh` ~1 s after the failed turn, typed by
+# `_cause_classify.sh`, and cleared by the next SUCCESSFUL turn's Stop hook.
+#
+# Only `recovery=operator` (an auth failure: no in-band remedy) REWORDS the
+# message. A `transient` 529 on a worker is the orchestrator's business via
+# the idle-probe's `interrupted` advisory, and ringing the operator for it is
+# the flood #976 measured. The reworded text is one the arms below CAN
+# distinguish (`failure`, 120 s cooldown — the per-window rate cap #1551 asks
+# for), and it carries the window and the cause, so the bell's record says
+# what the bell cannot (#1533).
+#
+# Failure direction: a stale marker (a missed Stop clear) over-rings for at
+# most NEXUS_NOTIFY_TURN_FAILURE_STALENESS (default 1800 s, matching the
+# idle-probe's own freshness gate) — noisy, not silent. The probe is two
+# `sed` reads of a one-line file; it can never block the bell, and any
+# malformed field returns the message unchanged.
+_nw_suppress_msg="${NEXUS_NOTIFY_SUPPRESS_MSG:-Needs attention}"
+_nw_tf_field() {   # <file> <field> → first match on line 1, or empty
+    sed -n "1s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null
+}
+_nw_turn_failure_reword() {
+    [ "$_nw_msg" = "$_nw_suppress_msg" ] || return 0
+    _nwtf_win="${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-}}"
+    [ -n "$_nwtf_win" ] || return 0
+    _nwtf_f="$_nw_state_dir/turn-failure/$_nwtf_win.json"
+    [ -f "$_nwtf_f" ] || return 0
+    _nwtf_rec=$(_nw_tf_field "$_nwtf_f" recovery)
+    [ "$_nwtf_rec" = "operator" ] || return 0
+    _nwtf_ts=$(sed -n '1s/.*"ts":\([0-9]*\).*/\1/p' "$_nwtf_f" 2>/dev/null)
+    case "$_nwtf_ts" in ''|*[!0-9]*) return 0 ;; esac
+    _nwtf_stale="${NEXUS_NOTIFY_TURN_FAILURE_STALENESS:-1800}"
+    case "$_nwtf_stale" in ''|*[!0-9]*) _nwtf_stale=1800 ;; esac
+    _nwtf_now=$(date +%s)
+    [ $((_nwtf_now - _nwtf_ts)) -le "$_nwtf_stale" ] || return 0
+    _nwtf_cat=$(_nw_tf_field "$_nwtf_f" category)
+    _nwtf_last=$(_nw_tf_field "$_nwtf_f" last_msg)
+    _nw_msg="turn FAILED (needs operator): $_nwtf_win cannot take a turn — ${_nwtf_cat:-auth}: ${_nwtf_last:-(no message)}"
+    _nw_record "context" "reword-turn-failure" "$_nw_msg"
+    return 0
+}
+_nw_turn_failure_reword
+
 # --- (2) Severity classification ---------------------------------------------
 # Emits "<class> <interval>". Special interval "never" = class-suppress (no bell,
 # no batch). Class "routine" = digest-only (never its own bell; batched; surfaced
 # only by the release digest). Order matters: most specific first.
-_nw_suppress_msg="${NEXUS_NOTIFY_SUPPRESS_MSG:-Needs attention}"
 
 _nw_classify() {
     case "$_nw_msg" in
         "$_nw_suppress_msg")
             echo "agent-default never" ;;
+
+        # An idle default REWORDED by the context probe above (#1551): the
+        # window's last turn failed with no in-band remedy. Its own arm, ahead
+        # of the demotions, so a future routine pattern cannot swallow it.
+        "turn FAILED (needs operator):"*)
+            echo "failure $(_nw_batch_interval failure)" ;;
 
         # Genuinely BLOCKED awaiting operator approval (from notify-permission.sh).
         "permission needed"*)

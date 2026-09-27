@@ -1199,7 +1199,18 @@ th_require_fork_headroom() {
 th_deadline() {
     local base="${1:-0}" scale jobs cpus
     scale="${NEXUS_TEST_DEADLINE_SCALE:-}"
-    if [[ ! "$scale" =~ ^[0-9]+$ ]] || (( scale < 1 )); then
+    # No leading zero (your-org/nexus-code#1618): bash reads `010` as OCTAL 8
+    # (deadlines x8, not x10) and `08` as an arithmetic ERROR — false here, so
+    # the derive arm was skipped and `$(( base * scale ))` below then killed the
+    # caller, leaving an EMPTY deadline. Same shape as run-tests.sh's
+    # `_rt_is_decimal`, which also unsets such a value before any suite sees it;
+    # this covers a suite run directly. A malformed value is ignored (derived).
+    # At most 18 digits, the same CHOSEN bound as `_rt_is_decimal` and for the
+    # same reason: bash arithmetic wraps at 2^64 silently, so a 20-digit
+    # `18446744073709551618` read as scale 2. (The PRODUCT `base * scale` can
+    # still overflow for an absurd scale; the bound closes the wrap of the
+    # value itself, which is what made a garbage string look well-formed.)
+    if [[ ! "$scale" =~ ^(0|[1-9][0-9]{0,17})$ ]] || (( scale < 1 )); then
         jobs="${NEXUS_TEST_JOBS:-1}"
         [[ "$jobs" =~ ^[0-9]+$ ]] && (( jobs >= 1 )) || jobs=1
         # `nproc` (coreutils) honours the process's CPU AFFINITY mask;
@@ -1497,6 +1508,73 @@ th_trap_exit() {
 if [[ -z "$(trap -p EXIT)" ]]; then
     trap -- '_th_reap_own_tmp' EXIT
 fi
+
+# th_runner_env_inputs <runner> — the environment variables `run-tests.sh` READS,
+# derived from its SOURCE, one per line. th_scrub_inherited_runner_env <runner>
+# — unset every one of them this process INHERITED, minus a short keep-list.
+#
+# WHY (your-org/nexus-code#1571 F5, the class stated once). A suite that NESTS
+# the runner hands the inner runner every exported input the OUTER caller set:
+# `KEEP_LOGS_DIR` sent `test-run-tests-false-pass.sh`'s fixture logs into the
+# OUTER run's `--keep-logs` directory, and in `test-run-tests-bounded.sh` the
+# same variable made two tests green alone and red in-band. `#1569` fixed that
+# one variable at that one call site. The class is every runner input carried by
+# an exported environment, so the list is DERIVED from the runner — a hand-kept
+# one is a denylist with a permissive default, and the day someone adds an input
+# it silently stops covering it.
+#
+# CALL IT ONCE, AT SUITE START, before the suite exports anything of its own.
+# It removes what was INHERITED; a nesting suite that deliberately sets
+# `NEXUS_TEST_STATE_DIR` or a probe knob for its inner runs does so afterwards
+# and is unaffected. A per-invocation `env -u` of the whole set would erase
+# those too, which is why this is not that.
+#
+# THE KEEP-LIST, each with its reason — these are NOT the outer caller's
+# policy for the inner run:
+#   NEXUS_TEST_JOBS, NEXUS_TEST_DEADLINE_SCALE  the SUITE's own `th_deadline`
+#       inputs; unsetting them would size this suite's waits for an idle host
+#       while it runs inside a contended band (#558).
+#   NEXUS_TEST_STATE_DIR  unsetting reverts the inner runner to its default
+#       under $HOME, shared by every clone on the host — strictly worse than
+#       inheriting the outer run's private one.
+#   SLOW_TESTS, RUN_INTEGRATION, RUN_CC_HARNESS  gates on which SUITES apply,
+#       read by the suites themselves; not runner policy.
+#
+# ERROR DIRECTION of the derivation, on TWO axes. The second was missing, and a
+# reader of the first reasonably over-read the reach (rtev skeptic, delta 2).
+# SPELLING: it sees `${NAME…}` forms, so an input read only as a bare `$NAME` is
+# MISSED (under-scrubbed — the pre-#1571 behaviour for that one variable, never
+# worse). NAME FAMILY: the alternation below is the WHOLE vocabulary, so an input
+# outside those families is invisible however it is spelled — measured 15 names
+# seen against 28 that a `${NAME[:}#%/+=?-]}` probe finds in run-tests.sh, which
+# are OCCURRENCES IN THE FILE and not reads in the CODE (a grep counts comments;
+# code-only it is 14 of 27, the one comment-only token being RUN_INTEGRATION).
+# A KEEP-LIST ENTRY HERE IS LOAD-BEARING FOR A NAME THE RUNNER NEVER READS, and a
+# COMMENT is what keeps it visible to this derivation: delete that comment and the
+# name leaves; delete the keep-list entry believing it unused while the comment
+# stands, and every nesting suite starts having RUN_INTEGRATION unset. Both directions UNDER-select, which is the safe one, and neither
+# is a claim that the list is complete. AND THE PROBE HAS A DIRECTION TOO: a
+# `${NAME:-}`-only probe reports 27 there, missing a default-ASSIGN
+# (`${NAME:=…}`), so a measurement of this blind spot can carry a blind spot of
+# its own — reconcile BY NAME, never by the count. The floor in the caller's control makes a
+# derivation broken into finding nothing loud rather than a silent no-op.
+_TH_RUNNER_ENV_KEEP=' NEXUS_TEST_JOBS NEXUS_TEST_DEADLINE_SCALE NEXUS_TEST_STATE_DIR SLOW_TESTS RUN_INTEGRATION RUN_CC_HARNESS '
+th_runner_env_inputs() {   # <runner>
+    command grep -oE '\$\{(NEXUS_TEST_[A-Z_]+|KEEP_LOGS_DIR|RT_[A-Z_]+|SLOW_TESTS|RUN_INTEGRATION|RUN_CC_HARNESS)[:}#%/+=?-]' "$1" 2>/dev/null \
+        | sed -E 's/^\$\{//; s/.$//' | LC_ALL=C sort -u
+}
+th_scrub_inherited_runner_env() {   # <runner> ; sets TH_RUNNER_ENV_SCRUBBED (count)
+    local v
+    TH_RUNNER_ENV_SCRUBBED=0
+    while IFS= read -r v; do
+        [[ -n "$v" ]] || continue
+        case "$_TH_RUNNER_ENV_KEEP" in *" $v "*) continue ;; esac
+        if [[ -n "${!v+set}" ]]; then
+            unset "$v"
+            TH_RUNNER_ENV_SCRUBBED=$(( TH_RUNNER_ENV_SCRUBBED + 1 ))
+        fi
+    done < <(th_runner_env_inputs "$1")
+}
 
 # th_alloc_port <base> [<extra-exclude-csv>] [<bind-addr>]
 #

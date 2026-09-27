@@ -270,6 +270,12 @@ source "$_script_dir/_fs_guard.sh"
 # shellcheck source=../_tmux-window.sh
 source "$_script_dir/../_tmux-window.sh"
 
+# THE confirmed-delivery primitive (your-org/nexus-code#1591): every paste the
+# watcher makes goes through it, and the one executable `tmux paste-buffer`
+# under monitor/ lives there. Tracked in the watcher source set via this line.
+# shellcheck source=../_paste-deliver.sh
+source "$_script_dir/../_paste-deliver.sh"
+
 # The integration-branch resolver (your-org/nexus-code#763) — the ONE record
 # of "the branch merged fixes land on", consumed by the clone-drift detector
 # and by cc-auto-update's deployment gate.
@@ -713,9 +719,12 @@ REPORTS_ROLL_NOTICE_FILE="${STATE_DIR}/reports-roll-notice"
 : "${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS:=3600}"
 : "${MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS:=300}"
 # Watcher-supervision (your-org/your-nexus, mutual-liveness design).
-# The ORCHESTRATOR arms a persistent Monitor (watcher-supervise-tick.sh)
-# that revives a crashed watcher; that Monitor TOUCHES this heartbeat each
-# tick. The watcher STATS it: if it is stale/absent the supervisor is not
+# The ORCHESTRATOR arms a supervisor that revives a crashed watcher: a
+# persistent longjob watch (monitor/arm-watcher-supervisor.sh →
+# watcher-supervise-probe.sh → watcher-supervise-tick.sh), or, when its plugin
+# dispatcher is NOT ARMED, a 30-min Monitor lease re-armed on each expiry
+# (your-org/nexus-code#1532). Either TOUCHES this heartbeat each tick; a
+# lapsed lease or a dead dispatcher reads here exactly like an unarmed one. The watcher STATS it: if it is stale/absent the supervisor is not
 # armed, and the watcher emits an `--- arm watcher supervisor ---`
 # reminder nudging the (possibly freshly-restarted) orchestrator to
 # (re)arm the Monitor. This is the mutual-liveness contract: watcher
@@ -1059,7 +1068,17 @@ _watcher_alert() {
 _emit_delivery_ok() {
     date +%s > "$EMIT_LAST_DELIVERY_FILE" 2>/dev/null || true
     rm -f "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null || true
+    # A delivered emit is the fault the self-heal restart exists to restore, so
+    # it is the "absent" signal for the loop-guard alert (your-org/nexus-code#1572).
+    # Called on EVERY delivery, as _operator_alert's clear hold-down requires; a
+    # key never raised costs one stat and returns.
+    declare -F _operator_alert >/dev/null 2>&1 \
+        && _operator_alert clear "${_SELF_HEAL_LOOP_GUARD_ALERT_KEY:-watcher-self-heal-loop-guard}" \
+            "emit delivery to '${TARGET:-?}' works again; the self-restart loop guard no longer stands between a fault and its remedy"
+    return 0
 }
+# The operator-alert key for a TRIPPED self-restart loop guard (#1572).
+_SELF_HEAL_LOOP_GUARD_ALERT_KEY="watcher-self-heal-loop-guard"
 
 # ---- one-shot marker consumption, deferred to delivery -------------------
 #
@@ -1139,6 +1158,68 @@ _reports_roll_emit_section() {
 _emit_delivery_fail() {
     local rc="${1:-0}"
     [[ "$rc" == 2 ]] && return 0
+    # rc=7: the target is sitting on an OVERLAY and NOTHING was pasted
+    # (skeptic pastesk F7 on #1595). Like rc 2 it is a fact about the
+    # ORCHESTRATOR, not a fault in the watcher's paste path: restarting the
+    # watcher cannot clear an overlay, and three emits against one the operator
+    # left up would restart it anyway. The unstick path owns overlays; the
+    # refusal is logged at the paste site, and nothing is lost — the dedup
+    # anchor did not move, so the body re-composes next cycle.
+    [[ "$rc" == 7 ]] && return 0
+    # A LOGGED-OUT ORCHESTRATOR is not a watcher fault either
+    # (your-org/nexus-code#1572, carried from #1517). On 2026-09-11/12 every emit
+    # landed on a session that could not take a turn, 3,004 consecutive rc=4
+    # were counted here, and the self-heal restarted the WATCHER until its loop
+    # guard tripped — a restart cannot fix a credential. Keyed on the two
+    # existing logout signals and nothing new, both read-only here:
+    #   * the pane-observed expiry row (`_auth_hold_expiry_standing`: fresh,
+    #     written by the 5 s observe cycle, released when stale — the same
+    #     predicate service-health's route check uses), and
+    #   * the orchestrator's own TYPED StopFailure marker (#1566/#1520:
+    #     `category=auth recovery=operator`, fresh or newer than the last paste),
+    #     AND no older than `max_hold_seconds` by its OWN ts — see below.
+    # The logout itself is ALREADY told to the operator by the auth-hold
+    # expiry alert, so nothing is lost by not alerting twice. Error direction,
+    # stated: a genuine watcher paste fault DURING a logout is not counted —
+    # and a restart could not have been shown to fix it while every turn fails.
+    #
+    # THE MARKER ARM IS AGE-CAPPED (skeptic verdict on your-org/nexus-code#1626,
+    # finding 2). `_auth_hold_turn_failure_marker` is the RAW sensor: it reads
+    # CURRENT while `ts >= last_paste_ts`, and last_paste_ts moves only on a
+    # SUCCESSFUL paste — which is exactly what a failing delivery never
+    # produces. Uncapped, one logout episode left the exemption standing
+    # indefinitely: measured with the real module, a marker 72 h old gave five
+    # rc=3 failures with no count, no ALERT, no self-heal and so never the
+    # #1572 loop-guard alert either — the silent direction, for as long as the
+    # orchestrator stayed quiet. The cap REUSES `_auth_hold_max_hold` (7200 s,
+    # the module's own fail-open ceiling for every other logout gate), aged from
+    # the marker's ts rather than from a first-seen stamp: this arm must stay
+    # side-effect free (the gate `_auth_hold_turn_failure_gate` writes and
+    # deletes `auth-turn-failure.tsv`, liveness's state), and the marker's ts is
+    # refreshed by every failed TURN, so a live logout that is still receiving
+    # turns keeps it young. Fails toward COUNTING: no ts, a malformed ts, or no
+    # ceiling function all mean "not exempt". The pane arm needs no such cap —
+    # it is a FRESH observation by construction (the 5 s observe cycle's
+    # staleness window).
+    local _edf_why="" _edf_row _edf_ts _edf_max
+    if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 && _auth_hold_expiry_standing; then
+        _edf_why="the orchestrator pane reports a logged-out session (auth=expired)"
+    elif [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_turn_failure_marker >/dev/null 2>&1 \
+        && declare -F _auth_hold_max_hold >/dev/null 2>&1 \
+        && _edf_row=$(_auth_hold_turn_failure_marker "$TARGET" 2>/dev/null); then
+        _edf_ts="${_edf_row%%$'\t'*}"
+        _edf_max=$(_auth_hold_max_hold)
+        if [[ "$_edf_ts" =~ ^[0-9]+$ && "$_edf_max" =~ ^[0-9]+$ ]] \
+            && (( $(date +%s) - _edf_ts < _edf_max )); then
+            _edf_why="the orchestrator's own StopFailure marker is typed auth/operator"
+        else
+            log "emit delivery to '${TARGET}' failed rc=$rc: the auth StopFailure marker stands but is older than max_hold=${_edf_max:-?}s (ts=${_edf_ts:-?}) — the logout exemption has FAILED OPEN, so this failure IS counted (your-org/nexus-code#1572)."
+        fi
+    fi
+    if [[ -n "$_edf_why" ]]; then
+        log "emit delivery to '${TARGET}' failed rc=$rc while ${_edf_why} — an ORCHESTRATOR fact, not a watcher paste fault: NOT counted toward self-heal (your-org/nexus-code#1572); the emit is archived and re-composes."
+        return 0
+    fi
     local n=0
     [[ -f "$EMIT_DELIVERY_FAIL_FILE" ]] && n=$(cat "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null || echo 0)
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
@@ -1178,6 +1259,19 @@ _watcher_self_heal_restart() {
             "${MONITOR_VERSION_SELF_LOOP_LIMIT:-3}" \
             "${MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS:-3600}" "$now"; then
         log "self-heal suppressed ($reason): self-restart loop guard TRIPPED — manual restart required (no storm)"
+        # …and TELL SOMEBODY (your-org/nexus-code#1572). This line says a human is
+        # required, and it went only to the log: 2,977 of them on 2026-09-11/12,
+        # read by nobody. The one agent that acts on watcher output is the
+        # orchestrator, and when this trips it is usually the component that is
+        # down — so the ask goes out-of-band, through the text-carrying operator
+        # alert (record + bell + push + bot-authored issue; its own cadence makes
+        # a call per suppressed attempt one announcement and hourly reminders).
+        # Cleared by _emit_delivery_ok.
+        if declare -F _operator_alert >/dev/null 2>&1 \
+            && _operator_alert due "${_SELF_HEAL_LOOP_GUARD_ALERT_KEY:-watcher-self-heal-loop-guard}"; then
+            _operator_alert raise "${_SELF_HEAL_LOOP_GUARD_ALERT_KEY:-watcher-self-heal-loop-guard}" critical \
+                "RESTART THE WATCHER BY HAND (monitor/svc.sh restart watcher) — its self-heal wants a restart ($reason) but the self-restart loop guard has TRIPPED (${MONITOR_VERSION_SELF_LOOP_LIMIT:-3} restarts inside ${MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS:-3600}s), so it will not restart itself. If the orchestrator is logged out or wedged, fix that first: a watcher restart cannot. Log: ${LOGFILE:-watcher.log}."
+        fi
         return 0
     fi
     # Leave a revived-marker so the SUCCESSOR's startup sweep surfaces the
@@ -2329,8 +2423,8 @@ _compose_report_body() {
 #
 # Content-level verification: after the Enter, grep the target pane for
 # the body's trailer signature (`nexus-emit-sig <iso> <nonce>`, written by
-# compose_report). If absent, the paste didn't land — paste_with_retry
-# triggers a second attempt. It is a RENDERING check, not a SUBMIT check:
+# compose_report). If absent it answers rc 4, which is NOT re-pasted: the
+# Enter already went out (your-org/nexus-code#1539). It is a RENDERING check, not a SUBMIT check:
 # a body sitting unsubmitted in the input box can render its trailer too,
 # and then this returns 0 for an emit nobody received — measured against
 # the real binary with the Enter withheld (your-org/nexus-code#1516).
@@ -2342,13 +2436,48 @@ _compose_report_body() {
 # clock, otherwise the rescue would reset the dead-threshold deadline
 # it is supposed to be racing against.
 #
+# SUBMIT verification (your-org/nexus-code#1591). Claude Code >= 2.1.277 HOLDS a
+# prompt that carries an invisible character: the first Enter cleans it and
+# keeps it in the input box, the second sends it. Against that, the rendering
+# check above failed in two shapes, both measured on the real 2.1.278 at
+# 17f1f926. A SHORT body renders its trailer in the box, so the check returned
+# 0 for an emit nobody received (no request, no transcript record, pane
+# `user-typing input=typed`). A real, EMIT-SHAPED body collapses to a
+# `[Pasted text #N …]` placeholder, so the check returned 4 — and
+# paste_with_retry RE-PASTED, leaving two unsent copies in the box for the next
+# emit's Enter to submit. So the paste now goes through monitor/_paste-deliver.sh, which
+# looks for the prompt in the TARGET'S TRANSCRIPT (a TUI-submission or an
+# enqueue record after a pre-paste byte offset) and presses Enter again only
+# while the pane positively reads "the text is still in the box". The
+# rendering check survives as the FALLBACK for a target whose transcript
+# cannot be found, and the log line says which of the two answered.
+#
 # Return codes:
-#   0  pasted, Enter sent, trailer visible in the pane (NOT proof the
-#      emit was submitted — see "Content-level verification" above)
+#   0  delivered. EITHER confirmed against the transcript (submitted, or
+#      queued behind a running turn), OR — transcript unavailable — the
+#      trailer is visible in the pane ABOVE the input box, which is the old
+#      rendering check and is logged as UNCONFIRMED.
 #   1  tmux not available
 #   2  target window missing
-#   3  paste / submit tmux API call failed
-#   4  paste submitted but signature not visible in pane
+#   3  a tmux call BEFORE the Enter failed (lock, insert key, load-buffer,
+#      paste-buffer), or pane liveness unknown — nothing reached the Enter, so
+#      it is the ONE code paste_with_retry re-pastes (your-org/nexus-code#1539)
+#   4  pasted AND Enter sent, nothing could confirm it, and the signature is
+#      not visible even after a bounded re-look. NEVER re-pasted: the Enter
+#      went out, so a re-paste either duplicates an emit that landed or stacks
+#      a second copy in the box (#1539, #1591). The caller archives it and the
+#      body re-composes next cycle, logged.
+#   5  target is a dead pane (#745) — never retried
+#   6  NOT SUBMITTED: the text is still in the input box after the bounded
+#      Enter retries, or an overlay came up — or one was ALREADY up and nothing
+#      was pasted at all. NEVER retried by paste_with_retry — a re-paste would
+#      append a second copy to text already in the box, or paste into the
+#      overlay. (`inert` is NOT here: it falls back to the rendering check —
+#      which itself answers 6 when the trailer it finds sits IN the input box,
+#      i.e. the body is there unsent; your-org/nexus-code#1604.)
+#   7  the target was ALREADY on an overlay, so NOTHING was pasted. Never
+#      retried, and — like rc 2 — never counted toward the watcher's self-heal:
+#      it is a fact about the orchestrator, not a paste-path fault.
 #
 # Concurrency (your-org/nexus-code#562): with `comment_surface` and
 # `compose_emit` both running as async tasks, two pastes into the SAME
@@ -2432,40 +2561,187 @@ _paste_to_target_unlocked() {
     # below — both are name-keyed by design. Fall back to the name if
     # resolution fails (the existence check just passed, so this is
     # belt-and-suspenders).
-    local tgt; tgt=$(resolve_window_id "$target" 2>/dev/null || true); tgt="${tgt:-$target}"
-    # Force target into insert mode without corrupting an already-insert
-    # target. See function-header comment for the rationale.
-    tmux send-keys -t "$tgt" i BSpace 2>/dev/null || return 3
-    local buf="nexus-watcher-$$-$(date +%s%N)"
-    tmux load-buffer -b "$buf" "$body_file" 2>/dev/null || return 3
-    # BRACKETED (`-p`), as paste-followup.sh has been since #521. Unbracketed,
-    # the REPL can only infer a paste from bytes that arrive together, so when
-    # it reads the paste and the Enter below in ONE chunk (the Enter follows by
-    # only 0.1 s) it takes the Enter's CR as part of the paste — a line break,
-    # not the submit — and the emit sits UNSUBMITTED in the input box until
-    # something else presses Enter (your-org/nexus-code#1516; measured on
-    # the real binary, single-line bodies included). Bracketed, that CR arrives
-    # after ESC[201~ and is a keypress however the bytes are chunked. `-p` is
-    # inert on a pane that never requested mode ?2004 (test-paste-bracketed.sh).
-    tmux paste-buffer -p -b "$buf" -t "$tgt" 2>/dev/null \
-        || { tmux delete-buffer -b "$buf" 2>/dev/null; return 3; }
-    sleep 0.1
-    tmux send-keys -t "$tgt" Enter 2>/dev/null \
-        || { tmux delete-buffer -b "$buf" 2>/dev/null; return 3; }
-    tmux delete-buffer -b "$buf" 2>/dev/null || true
-    # Content-level verification. Every emit body ends with a
-    # `--- nexus-emit-sig <iso> <nonce> ---` trailer — unique per emit
-    # and close to the cursor in the rendered pane so it stays visible
-    # even when the paste is long enough to push the header off-screen.
-    # Grep for the bare `nexus-emit-sig <iso> <nonce>` substring so
-    # leading dashes don't look like grep options.
-    sleep 0.2
+    # …and the fallback is the EXACT name (`:=`), never the bare one: a bare name
+    # resolves by unique PREFIX once the window is gone, and this paste + Enter
+    # would land in the live sibling (your-org/nexus-code#1524). `:=` fails rc 1.
+    local tgt; tgt=$(resolve_window_id "$target" 2>/dev/null || true); tgt="${tgt:-:=$target}"
+    # WHOSE TRANSCRIPT. The orchestrator carries no heartbeat/<window>.json;
+    # its session-id is the pin. Every other target (the over-limit and
+    # orphan-async wakes paste into WORKERS) has a heartbeat. An empty sid is
+    # not an error: the primitive then reports `unverifiable` and the
+    # rendering check below answers, exactly as before.
+    local _pt_sid=""
+    if [[ "$target" == "${TARGET:-}" ]] && declare -F _respawn_read_pin_sid >/dev/null 2>&1; then
+        _pt_sid=$(_respawn_read_pin_sid)
+    fi
+    if [[ -z "$_pt_sid" ]] && declare -F se_session_id_for_window >/dev/null 2>&1; then
+        _pt_sid=$(se_session_id_for_window "$target" "${STATE_DIR:-}" 2>/dev/null) || _pt_sid=""
+    fi
+    # Normalise -> baseline -> VI-safe bracketed paste (bytes from a FILE,
+    # never argv) -> Enter -> confirm -> Enter again only on positive `held`.
+    # The `-p` rationale (#1516) and the dead-pane guard (#745) live with the
+    # one paste-buffer call, in monitor/_paste-deliver.sh.
+    # THE RECORD MUST BE THIS EMIT'S (skeptic pastesk F1 on #1595): the evidence
+    # must CONTAIN the emit's own `nexus-emit-sig <iso> <nonce>` trailer — unique
+    # per emit, pure ASCII, so it survives Claude Code's cleaning. Without it an
+    # EARLIER queued prompt submitted at turn end, or a compaction summary,
+    # landing inside the held window read as this emit being delivered.
     local sig
     sig=$(tail -1 "$body_file" 2>/dev/null \
           | sed -n 's/.*\(nexus-emit-sig [^ ]* [^ ]*\).*/\1/p' | head -c 100)
-    if [[ -n "$sig" ]]; then
-        grep -qF -e "$sig" \
-            <<<"$(tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null)" || return 4
+    local _pt_rc=0
+    PD_EVIDENCE_NEEDLE="$sig" pd_deliver "$tgt" "$target" "$body_file" "$_pt_sid"; _pt_rc=$?
+    # An emit whose bytes were ALTERED before the paste always says so, however
+    # it went (pastesk F5): an instruction quoting an invisible character loses
+    # it, on the running pin too, and a clean submit used to leave no trace.
+    (( ${PD_NORMALISED_BYTES:-0} > 0 )) \
+        && log "paste_to_target: '${target}' body NORMALISED before the paste — ${PD_NORMALISED_BYTES} byte(s) of invisible characters removed (your-org/nexus-code#1591)"
+    # `inert` — a readable transcript that recorded nothing while the box is
+    # clear — is a FALSE NEGATIVE whenever the session-id is stale (pastesk F2):
+    # treat it as unconfirmed and let the rendering check answer, like rc 3.
+    [[ "$_pt_rc" == 4 && "$PD_OUTCOME" == inert ]] && _pt_rc=3
+    # …but NOT `undecidable-box`. Typed text is sitting in the input box and it
+    # could not be shown to be this emit; the rendering check below READS THAT
+    # BOX, so it would find the trailer there and certify the emit — the #1591
+    # manufactured success again (caught by test-paste-deliver.sh E-qmark). Not
+    # delivered, and not re-pasted: the box is occupied.
+    if [[ "$_pt_rc" == 3 && "$PD_OUTCOME" == undecidable-box ]]; then
+        log "paste_to_target: '${target}' NOT CONFIRMED — typed text is in the input box and cannot be shown to be this emit (pane reads input=?, or the box was seen empty since our Enter); no Enter was sent and the rendering check is NOT consulted, because it reads that same box (your-org/nexus-code#1591)."
+        return 6
+    fi
+    case "$_pt_rc" in
+        0)  [[ "$PD_OUTCOME" == submitted ]] \
+                || log "paste_to_target: '${target}' ${PD_OUTCOME} (enter_retries=${PD_ENTER_RETRIES}; your-org/nexus-code#1591)" ;;
+        1)  # WHICH tmux call failed decides whether a re-paste is safe
+            # (your-org/nexus-code#1539). Before the paste (insert key,
+            # load-buffer, paste-buffer) nothing is in the box: rc 3, re-pasted.
+            # A refused ENTER comes after the body is IN the box, so a re-paste
+            # would stack a second copy on it (#1591): rc 6, not re-pasted.
+            if [[ "${PD_FAIL_STEP:-}" == send-keys-enter ]]; then
+                log "paste_to_target: '${target}' NOT SUBMITTED — the body was PASTED but tmux refused the Enter, so it sits UNSENT in the input box; NOT re-pasted, which would stack a second copy on it (your-org/nexus-code#1539, #1591)."
+                return 6
+            fi
+            return 3 ;;
+        5)  log "paste_to_target: target '$target' became a dead pane before the paste — refused (your-org/nexus-code#745)"
+            return 5 ;;
+        6)  return 3 ;;
+        4)  if [[ "$PD_OUTCOME" == blocked-before-paste ]]; then
+                log "paste_to_target: '${target}' is sitting on an OVERLAY — NOTHING was pasted (an Enter would answer the overlay, your-org/nexus-code#1200). rc 7: not a watcher delivery fault, so it does not count toward self-heal; the body re-composes next cycle."
+                return 7
+            fi
+            log "paste_to_target: '${target}' NOT SUBMITTED (${PD_OUTCOME}, enter_retries=${PD_ENTER_RETRIES}) — the emit is NOT delivered. held = still in the input box after the Enter retries; blocked = an overlay came up and an Enter would answer IT; blocked-before-paste = an overlay was already up, so NOTHING was pasted (your-org/nexus-code#1591, #1200)."
+            return 6 ;;
+        *)  : ;;   # 3 = unverifiable / in-flight: the rendering check decides
+    esac
+    # Content-level verification — the FALLBACK. Every emit body ends with a
+    # `--- nexus-emit-sig <iso> <nonce> ---` trailer, unique per emit and close
+    # to the cursor in the rendered pane. A RENDERING check, not a submit
+    # check (#1516): it is consulted only when nothing better could answer.
+    # Grep for the bare `nexus-emit-sig <iso> <nonce>` substring so leading
+    # dashes don't look like grep options.
+    #
+    # WHERE THE TRAILER SITS, not merely WHETHER (your-org/nexus-code#1604). The
+    # remap above sends `inert` here, and `inert` means "the pane did not read as
+    # held" — which is NOT "the box is empty". Production pane-state classifies
+    # the input from the glyph row alone, so a body whose first row reads blank
+    # (measured on the real 2.1.278: a leading empty line) lands `inert` while it
+    # sits, unsent, in the box — and a whole-pane grep found its trailer THERE
+    # and certified it, rc 0 with no request and no record. The same holds for
+    # every rc-3 outcome that reaches this point (`unverifiable`, `in-flight`):
+    # whatever misreads the box, the grep reads the box. So the pane is SPLIT at
+    # the input row — the LAST row starting with the prompt glyph `❯` (e2 9d
+    # af), the same row pd_box_is_ours reads (_paste-deliver.sh states why it is
+    # the input row: the box is drawn last in every real capture) — and:
+    #   above  the trailer is in the HISTORY: a real earlier submit, which is
+    #          what the stale-session-id fallback (pastesk F2) exists to catch.
+    #          UNCONFIRMED delivered, as before.
+    #   box    the trailer is at or below the input row: OUR BODY IS SITTING IN
+    #          THE BOX, UNSENT. rc 6 — not delivered, and NOT re-pasted, because a
+    #          re-paste appends a second copy to the one already there (#1591).
+    #          `box` wins over `above`: an occupied box is never certified.
+    #   none   rc 4, as before.
+    #   nobox  no prompt-glyph row at all — not a layout this can split, so the
+    #          old whole-pane answer stands. BOUNDARY, stated: a target that
+    #          draws no `❯` row gets the pre-#1604 check, error direction
+    #          "certifies a trailer wherever it renders".
+    # A layout that drew the box ABOVE history would read history as box and
+    # answer rc 6 for a real submit — the safe direction (a re-composed emit),
+    # never a manufactured success.
+    #
+    # A BODY WITH NO TRAILER took the same door WITHOUT ANY CHECK AT ALL, and it
+    # is the door #1604's own real-binary repro went through: its body carried
+    # no `nexus-emit-sig`, so `$sig` was empty, the grep was skipped, and rc 0
+    # followed unconditionally. Only compose_report writes a trailer; the
+    # over-limit and orphan-async briefs reach this function without one. So a
+    # trailer-less body is located by the primitive's OWN derived needle (the
+    # longest printable-ASCII run of the pasted bytes, _PD_NEEDLE_DERIVED — what
+    # the transcript search already keys on), first 32 bytes so it is less
+    # likely to wrap. That needle ONLY REFUSES: `box` is rc 6, and every other
+    # answer keeps the pre-#1604 behaviour for such a body (no trailer, no
+    # rendering check, rc 0 UNCONFIRMED) — a needle that is simply not visible
+    # (a collapsed `[Pasted text #N]` body, a wrapped row) must not become rc 4,
+    # an undelivered report for a body that was submitted. Error direction, stated:
+    # a trailer-less body in the box whose needle is not on one rendered row is
+    # still certified, as before.
+    if (( _pt_rc != 0 )); then
+        sleep 0.2
+        local _pt_needle="$sig" _pt_nkind=sig
+        if [[ -z "$_pt_needle" && -n "${_PD_NEEDLE_DERIVED:-}" ]]; then
+            _pt_needle="${_PD_NEEDLE_DERIVED:0:32}"; _pt_nkind=derived
+        fi
+        if [[ -n "$_pt_needle" ]]; then
+            local _pt_where _pt_look=0 _pt_looks
+            # A BOUNDED RE-LOOK, NEVER A RE-PASTE (your-org/nexus-code#1539). Every
+            # road here ran AFTER the Enter. An emit-shaped body collapses to
+            # `[Pasted text #N]` in the box, so its trailer can reach the pane
+            # only once the submitted prompt renders in HISTORY — later than the
+            # 0.2 s above. The old answer to "not visible yet" was rc 4, which
+            # paste_with_retry met with a SECOND PASTE, and that second attempt
+            # then "confirmed" itself off the FIRST copy's trailer: one
+            # `pasted to` log line, two deliveries (the quiescent duplicates on
+            # #1539). So look again, without pasting: every 0.5 s for
+            # MONITOR_PASTE_RENDER_RECHECK_SECONDS (default 3 — CHOSEN, not
+            # measured: several times the 0.5 s + paste the old retry spent
+            # before its own look; held under the 20 s paste lock with the
+            # primitive's ~9 s worst case). Only a SIG needle that is `none`
+            # re-looks: `box`/`above` are already answers, and a derived needle
+            # never refuses on `none`.
+            _pt_looks="${MONITOR_PASTE_RENDER_RECHECK_SECONDS:-3}"
+            [[ "$_pt_looks" =~ ^[0-9]+$ ]] || _pt_looks=3
+            _pt_looks=$(( _pt_looks * 2 ))
+            while :; do
+                # The needle reaches awk through ENVIRON, NOT `-v` (skeptic note on
+                # your-org/nexus-code#1626): `-v` runs escape processing on its
+                # value, so a derived needle carrying a literal `\n`/`\t` (any
+                # printable-ASCII run can) became a DIFFERENT string that matched
+                # no row, and the `box` refusal was silently off for that body.
+                _pt_where=$(tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
+                    | _PT_NEEDLE="$_pt_needle" LC_ALL=C awk '
+                        BEGIN { s = ENVIRON["_PT_NEEDLE"] }
+                        { row[NR] = $0; if (index($0, "\342\235\257") == 1) last = NR }
+                        END {
+                            a = 0; b = 0
+                            for (i = 1; i <= NR; i++) if (index(row[i], s)) {
+                                if (last && i >= last) b = 1; else a = 1
+                            }
+                            if (b) print "box"; else if (a) print (last ? "above" : "nobox"); else print "none"
+                        }')
+                [[ "$_pt_where" == none && "$_pt_nkind" == sig ]] || break
+                (( _pt_look < _pt_looks )) || break
+                _pt_look=$(( _pt_look + 1 )); sleep 0.5
+            done
+            case "$_pt_where" in
+                above|nobox) : ;;
+                box)
+                    log "paste_to_target: '${target}' NOT SUBMITTED (${PD_OUTCOME}) — the emit's $([[ $_pt_nkind == sig ]] && echo trailer || echo 'text (derived needle; no trailer)') sits in the INPUT BOX (at or below the last prompt row), so the body is there UNSENT; the rendering check does not certify it, and it is not re-pasted (your-org/nexus-code#1604, #1591)."
+                    return 6 ;;
+                *)  if [[ "$_pt_nkind" == sig ]]; then
+                        log "paste_to_target: '${target}' delivery UNCONFIRMED (${PD_OUTCOME}${PD_UNVERIFIABLE_REASON:+: $PD_UNVERIFIABLE_REASON}) and the trailer is NOT on the pane after ${_pt_look} re-look(s) — the Enter WAS sent, so the body is NOT re-pasted: a re-paste duplicates an emit that landed or stacks a second copy in the box (your-org/nexus-code#1539, #1591). rc 4: archived, re-composes next cycle."
+                        return 4
+                    fi ;;
+            esac
+        fi
+        log "paste_to_target: '${target}' delivery UNCONFIRMED (${PD_OUTCOME}${PD_UNVERIFIABLE_REASON:+: $PD_UNVERIFIABLE_REASON}) — the trailer renders in the pane, which is not proof of a submit (your-org/nexus-code#1516, #1591)"
     fi
     # Refresh the orchestrator-liveness pin (issue #150). A successful
     # round-trip here is the strongest "orch is reachable" signal the
@@ -2497,18 +2773,41 @@ _paste_to_target_unlocked() {
 
 paste_with_retry() {
     local target="$1" body_file="$2" stamp_mode="${3:-stamp}" rc
+    # Cleared per attempt: paste_to_target's early refusals (lock timeout, pane
+    # liveness) return before the primitive sets these, and the retry log line
+    # below must not quote a PREVIOUS paste's outcome.
+    PD_OUTCOME=""; PD_FAIL_STEP=""
     paste_to_target "$target" "$body_file" "$stamp_mode"; rc=$?
-    # rc=3 (tmux API glitch) and rc=4 (content didn't land) are both
-    # retryable with a 0.5 s delay. rc=2 (target missing) is handled
+    # rc=3 is the ONE retryable code: a tmux call BEFORE the Enter failed (or
+    # the lock / pane liveness refused), so nothing can have been submitted and
+    # a re-paste cannot duplicate. It is retried once after 0.5 s, and the retry
+    # is LOGGED — an unlogged re-paste is how two deliveries left one `pasted
+    # to` line in watcher.log (your-org/nexus-code#1539).
+    # rc=4 (Enter sent, signature not visible) is NOT retried any more
+    # (#1539): the Enter went out, so the emit either landed — and a re-paste
+    # delivers it TWICE, the second attempt then "confirming" off the first
+    # copy's trailer — or it sits in the box, where a re-paste stacks a second
+    # copy on it (#1591). paste_to_target has already re-LOOKED for the trailer
+    # without pasting; the caller archives, alerts, and the body re-composes
+    # next cycle. rc=2 (target missing) is handled
     # by the agent-respawn path upstream; rc=1 (no tmux) is terminal.
     # rc=5 (target is a dead pane, #745) is EXPLICITLY NOT retryable —
     # the refusal is the point. A corpse does not become live in 0.5 s,
     # and every retry is another chance to paste into it. The `#741`
     # probe sees the same corpse on its own 2 s cadence and respawns;
     # that is the recovery, not this.
-    if (( rc == 3 || rc == 4 )); then
+    # rc=7 (an overlay was already up; nothing pasted) is not retryable: the
+    # overlay does not clear in 0.5 s, and the unstick path owns it.
+    # rc=6 (pasted, NOT submitted — #1591) is not retryable either, for a
+    # different reason: the text is ALREADY in the input box, so a re-paste
+    # appends a second copy to it. The primitive has spent its Enter retries;
+    # the caller's delivery-failure accounting is the loud path from here.
+    if (( rc == 3 )); then
+        log "paste_with_retry: '${target}' attempt 1 rc=3 (${PD_OUTCOME:-refused before the paste}${PD_FAIL_STEP:+ at $PD_FAIL_STEP}) — nothing reached the Enter; re-pasting once in 0.5s (your-org/nexus-code#1539)"
         sleep 0.5
+        PD_OUTCOME=""; PD_FAIL_STEP=""
         paste_to_target "$target" "$body_file" "$stamp_mode"; rc=$?
+        log "paste_with_retry: '${target}' attempt 2 rc=${rc}${PD_OUTCOME:+ (${PD_OUTCOME}${PD_FAIL_STEP:+ at $PD_FAIL_STEP})}"
     fi
     return $rc
 }
@@ -2565,15 +2864,15 @@ respawn_agent() {
     prompt_tmpdir="${RESPAWN_TMPDIR:-/tmp}"
     prompt_file=$(mktemp --suffix=.txt "$prompt_tmpdir/nexus-respawn-prompt-XXXXXX") \
         || { log "respawn-agent: mktemp prompt failed"; return 1; }
-    # issue #238: the in-process watcher-supervisor Monitor died with the
-    # orchestrator we are replacing. Pass the exact (re-)arm command into
+    # issue #238: the in-process watcher supervisor died with the
+    # orchestrator we are replacing. Pass the exact (re-)arm instruction into
     # the turn-1 prompt so the new orchestrator re-arms it as its first
     # post-validation action — closing the post-respawn gap deterministically
     # instead of relying on the heartbeat-staleness emit. Single source of
-    # truth via _supervisor_monitor_command (shared with the arm-emit + the
-    # supervise-tick DOWN message), so the command can never drift.
+    # truth via _supervisor_arm_instruction (shared with the arm-emit + the
+    # supervise-tick DOWN message), so the instruction can never drift.
     local sup_cmd
-    sup_cmd=$(_supervisor_monitor_command "$NEXUS_ROOT")
+    sup_cmd=$(_supervisor_arm_instruction "$NEXUS_ROOT")
     if [[ "$resume_mode" == "resume" ]]; then
         _respawn_render_prompt_resume "$target" "$reason" "$resume_cmd_label" "$sup_cmd" \
             > "$prompt_file"
@@ -3090,6 +3389,13 @@ source "$_script_dir/_orphan_async.sh"
 # shellcheck source=_auth_hold.sh
 source "$_script_dir/_auth_hold.sh"
 
+# The TEXT-CARRYING, turn-independent operator alert (your-org/nexus-code#1548,
+# #1533, #1534): durable record + `watcher ALERT:` bell + push + a bot-authored
+# GitHub issue, every leg fail-open. Sourced after _auth_hold.sh so the expiry
+# arm's injection below can point at it. Functions only; no side effects.
+# shellcheck source=_operator_alert.sh
+source "$_script_dir/_operator_alert.sh"
+
 # Orchestrator-liveness state machine (issue #164). Replaces the
 # binary unresponsive_age > threshold check from #157 with a
 # three-knob model that distinguishes idle-but-healthy from
@@ -3190,9 +3496,13 @@ _over_limit_paste_via_watcher() {
 }
 _OVER_LIMIT_LOG_FN=_over_limit_log_to_watcher
 _OVER_LIMIT_PASTE_FN=_over_limit_paste_via_watcher
-# Suppression is a channel-muting condition, so it must report on the
-# channel-INDEPENDENT surface (your-org/nexus-code#592). `_watcher_alert` is
-# built for exactly this: alerts log + watcher log + sandbox-notify.
+# Suppression is a channel-muting condition, so it reports OUTSIDE the emit
+# channel it mutes (your-org/nexus-code#592). `_watcher_alert` is alerts log +
+# watcher log + sandbox-notify — and that last leg rings a bell and carries NO
+# TEXT (#1533): the words reach only the two log files. So this is ATTENTION
+# off the channel, not a text-carrying surface, and unlike the auth expiry arm
+# below it is not routed to `_operator_alert` (#1533's caller audit is partial;
+# your-org/nexus-code#1567).
 _over_limit_alert_to_watcher() { _watcher_alert "$@"; }
 _OVER_LIMIT_ALERT_FN=_over_limit_alert_to_watcher
 export _OVER_LIMIT_LOG_FN _OVER_LIMIT_PASTE_FN _OVER_LIMIT_ALERT_FN
@@ -3203,16 +3513,84 @@ export _OVER_LIMIT_LOG_FN _OVER_LIMIT_PASTE_FN _OVER_LIMIT_ALERT_FN
 # a property of the already-exercised path rather than of new code.
 #
 # The ALERT routing is load-bearing, not decorative. A login hold mutes the one
-# channel the operator reads, so it must announce itself on the
-# channel-INDEPENDENT surface — `#592` measured a 15-hour over-limit blackout
-# pass unnoticed while the watcher logged its own suppression once per cycle
-# into a file no human opens. `_watcher_alert` is alerts log + watcher log +
-# sandbox-notify.
+# channel the operator reads, so it must announce itself OUTSIDE that channel —
+# `#592` measured a 15-hour over-limit blackout pass unnoticed while the watcher
+# logged its own suppression once per cycle into a file no human opens.
+# `_watcher_alert` is alerts log + watcher log + sandbox-notify, whose bell
+# carries no text (#1533); the text-carrying legs are `_operator_alert`, wired
+# just below (`notify` on an escaped dialog, `raise` for the expiry).
 _auth_hold_log_to_watcher() { log "$@"; }
 _auth_hold_alert_to_watcher() { _watcher_alert "$@"; }
 _AUTH_HOLD_LOG_FN=_auth_hold_log_to_watcher
 _AUTH_HOLD_ALERT_FN=_auth_hold_alert_to_watcher
 export _AUTH_HOLD_LOG_FN _AUTH_HOLD_ALERT_FN
+
+# THE LEG THE EXPIRY ARM WAS MISSING (your-org/nexus-code#1548). `_watcher_alert`
+# above ends in a bell with no text (#1533), and the expiry arm never reached
+# even that: 0 operator alerts in 7 h 22 m on 2026-09-17. `_operator_alert`
+# carries the text on legs that need no model turn and no operator credential.
+_operator_alert_log_to_watcher() { log "$@"; }
+_OPERATOR_ALERT_LOG_FN=_operator_alert_log_to_watcher
+_AUTH_HOLD_OPERATOR_ALERT_FN=_operator_alert
+export _OPERATOR_ALERT_LOG_FN _AUTH_HOLD_OPERATOR_ALERT_FN
+
+# RECOVERY PASTES WITHIN ONE CYCLE, NOT ONE HEARTBEAT (your-org/nexus-code#1567 G2).
+# Since #1566 the typed StopFailure marker gates liveness while it answers the
+# latest paste (`marker.ts >= last_paste_ts`), so the old ~+755 s resubmit of a
+# FAILED emit no longer happens: once the operator logs back in, the board waits
+# for the next paste, which on a quiet board is the full-state heartbeat — up to
+# 1200 s. On the `auth-expired` clear transition this pulls compose_emit forward,
+# and when the latest paste's turn is the one that failed (the marker still
+# answers it) it also makes that compose a FULL-STATE one: the failed paste
+# already moved the dedup anchor and committed what it carried, so only a
+# full-state body (which skips the dedup gate) re-delivers the board. With
+# nothing pending it only fires compose_emit early, whose own gates then paste
+# nothing on a quiet board. Chosen failure direction (the issue's option b):
+# one extra full-state paste per recovery, against up to 20 minutes of a
+# recovered board saying nothing. Boundary: a comment/request that rode ONLY on
+# the failed paste was committed by it and is not re-sent by this.
+_operator_alert_cleared_to_watcher() {   # <key> <first_epoch>
+    [[ "${1:-}" == "${_AUTH_HOLD_EXPIRY_ALERT_KEY:-auth-expired}" ]] || return 0
+    declare -F _schedule_fire_now >/dev/null 2>&1 || return 0
+    local row ts lp
+    lp=$(head -n 1 "$ORCH_LAST_PASTE_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [[ "$lp" =~ ^[0-9]+$ && -n "${TARGET:-}" ]] \
+        && declare -F _auth_hold_turn_failure_marker >/dev/null 2>&1 \
+        && row=$(_auth_hold_turn_failure_marker "$TARGET" "$lp" 2>/dev/null); then
+        ts="${row%%$'\t'*}"
+        if [[ "$ts" =~ ^[0-9]+$ ]] && (( ts >= lp )); then
+            rm -f "$FULL_STATE_STAMP" "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || true
+            log "operator-alert cleared (${1}): the latest paste's turn FAILED (marker ts=${ts} >= last paste ${lp}) — forcing a full-state emit on the next compose_emit (your-org/nexus-code#1567 G2)"
+        fi
+    fi
+    _schedule_fire_now compose_emit >/dev/null 2>&1 || true
+    return 0
+}
+_OPERATOR_ALERT_CLEARED_FN=_operator_alert_cleared_to_watcher
+export _OPERATOR_ALERT_CLEARED_FN
+
+# service-health's operator leg (your-org/nexus-code#1534): fires only when an
+# emit-only/flapping escalation coincides with a KNOWN-UNAVAILABLE emit route.
+# The four conditions are the four arms of this file's own emit ladder plus the
+# absent-target probe; each prints the reason the alert carries.
+_service_health_route_blocked_via_watcher() {
+    if declare -F _over_limit_orchestrator_paused >/dev/null 2>&1 && _over_limit_orchestrator_paused; then
+        printf 'the orchestrator is OVER-LIMIT and emits are held'; return 0
+    fi
+    if declare -F _auth_hold_active >/dev/null 2>&1 && _auth_hold_active; then
+        printf 'a dialog is open on the orchestrator and emits are HELD (auth hold)'; return 0
+    fi
+    if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 && _auth_hold_expiry_standing; then
+        printf 'the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'; return 0
+    fi
+    if [[ "${_V2_LAST_TARGET_RC:-0}" == "2" ]]; then
+        printf 'the orchestrator window is ABSENT (respawn pending)'; return 0
+    fi
+    return 1
+}
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_service_health_route_blocked_via_watcher
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_operator_alert
+export _SERVICE_HEALTH_ROUTE_BLOCKED_FN _SERVICE_HEALTH_OPERATOR_ALERT_FN
 
 # Same two contracts for the orphan-async wake loop (your-org/nexus-code#1071).
 # It deliberately reuses `paste_with_retry` rather than a bespoke delivery: the
@@ -3750,7 +4128,7 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         case $rc in
             1) log "startup-sweep: tmux not available; archive only" ;;
             2) log "startup-sweep: target window '${TARGET}' missing; archive only" ;;
-            4) log "startup-sweep: paste submitted but signature not visible (VI mode?); archive only" ;;
+            4) log "startup-sweep: paste submitted but signature not visible; archive only — NOT re-pasted, the Enter went out (your-org/nexus-code#1539)" ;;
             *) log "startup-sweep: paste failed (rc=$rc); archive only" ;;
         esac
         _emit_delivery_fail "$rc"
@@ -4007,12 +4385,15 @@ _v2_task_orchestrator_liveness() {
     # block owns only the pane-state call and the override-count state file.
     # See docs/reference/orchestrator-liveness.md.
     if (( liveness_rc == 0 )) && [[ "$liveness_verdict" == respawn* ]]; then
-        local _idle_guard_state="" _idle_guard_count=0 _idle_guard_decision
+        local _idle_guard_state="" _idle_guard_line="" _idle_guard_count=0 _idle_guard_decision
         if [[ -x "$NEXUS_ROOT/monitor/pane-state.sh" ]]; then
-            _idle_guard_state=$(
-                "$NEXUS_ROOT/monitor/pane-state.sh" "$TARGET" 2>/dev/null \
-                    | grep -o 'state=[^ ]*' | head -n1 | cut -d= -f2
-            ) || true
+            # The WHOLE line, because the guard now reads a FIELD off it
+            # (`retrying=`, your-org/nexus-code#1559); `state=` is the first
+            # token, so the state is a parameter expansion, not a pipeline.
+            _idle_guard_line=$("$NEXUS_ROOT/monitor/pane-state.sh" "$TARGET" 2>/dev/null) || _idle_guard_line=""
+            _idle_guard_state="${_idle_guard_line#state=}"
+            _idle_guard_state="${_idle_guard_state%% *}"
+            [[ "$_idle_guard_line" == state=* ]] || _idle_guard_state=""
         fi
         if [[ -f "$ORCH_IDLE_OVERRIDE_COUNT_FILE" ]]; then
             _idle_guard_count=$(head -n1 "$ORCH_IDLE_OVERRIDE_COUNT_FILE" 2>/dev/null | tr -d '[:space:]')
@@ -4020,13 +4401,14 @@ _v2_task_orchestrator_liveness() {
         fi
         _idle_guard_decision=$(_orchestrator_idle_pane_guard \
             "$liveness_verdict" "${_idle_guard_state:-}" \
-            "$_idle_guard_count" "${ORCH_IDLE_OVERRIDE_MAX:-5}")
+            "$_idle_guard_count" "${ORCH_IDLE_OVERRIDE_MAX:-5}" \
+            "${_idle_guard_line:-}")
         case "$_idle_guard_decision" in
             suppress)
                 _idle_guard_count=$(( _idle_guard_count + 1 ))
                 mkdir -p "$(dirname "$ORCH_IDLE_OVERRIDE_COUNT_FILE")" 2>/dev/null || true
                 printf '%d\n' "$_idle_guard_count" > "$ORCH_IDLE_OVERRIDE_COUNT_FILE" 2>/dev/null || true
-                log "orchestrator-liveness: idle-pane-override (#${_idle_guard_count}/${ORCH_IDLE_OVERRIDE_MAX:-5}): pane state='${_idle_guard_state:-unknown}' — suppressed likely-false-positive respawn ($liveness_verdict); clock resets on next compose_emit paste"
+                log "orchestrator-liveness: idle-pane-override (#${_idle_guard_count}/${ORCH_IDLE_OVERRIDE_MAX:-5}): pane state='${_idle_guard_state:-unknown}'$( [[ " $_idle_guard_line " == *" retrying="* ]] && printf ' (mid-retry: the harness is re-sending — a respawn into an outage discards context, your-org/nexus-code#1559)' ) — suppressed likely-false-positive respawn ($liveness_verdict); clock resets on next compose_emit paste"
                 rm -f "$ORCH_UNRESPONSIVE_SINCE_FILE" "$ORCH_RESUBMIT_MARKER_FILE" 2>/dev/null || true
                 liveness_verdict="healthy reason=idle-pane-override"
                 liveness_rc=1
@@ -4617,7 +4999,7 @@ _v2_task_comment_surface() {
         case $rc in
             1) log "comment-surface: tmux not available; archive only" ;;
             2) log "comment-surface: target window '${TARGET}' missing; archive only" ;;
-            4) log "comment-surface: paste submitted but signature not visible (VI mode?); archive only" ;;
+            4) log "comment-surface: paste submitted but signature not visible; archive only — NOT re-pasted, the Enter went out (your-org/nexus-code#1539)" ;;
             *) log "comment-surface: paste failed (rc=$rc); archive only" ;;
         esac
         # Same loud delivery-failure accounting as compose_emit: a
@@ -5087,7 +5469,7 @@ _v2_task_compose_emit() {
                 case $rc in
                     1) log "tmux not available; archive only" ;;
                     2) log "target window '${TARGET}' missing; archive only" ;;
-                    4) log "paste submitted but signature not visible (VI mode?); archive only" ;;
+                    4) log "paste submitted but signature not visible; archive only — NOT re-pasted, the Enter went out (your-org/nexus-code#1539)" ;;
                     *) log "paste failed (rc=$rc); archive only" ;;
                 esac
                 # Fail LOUD, never silent: track the delivery failure, alert
@@ -5285,6 +5667,7 @@ _scheduler_post_tick_hook() {
         "${STATE_DIR}/deliveries-queue.lines" \
         "${V2_STAGE_DIR}/github_poll.out" \
         "${V2_STAGE_DIR}/requests_poll.out" \
+        "${STATE_DIR}/decisions/.urgent" \
         >/dev/null 2>&1 || true
 }
 

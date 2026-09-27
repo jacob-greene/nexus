@@ -243,16 +243,19 @@ SUITES=$(git ls-files -- 'monitor/**' 2>/dev/null \
                printf '%s\n' "$_f"
            done | sort -u)
 N_SUITES=$(printf '%s\n' "$SUITES" | grep -c . )
+# `--population` prints SUITES alone, so it answers before SOURCING below: that
+# loop runs up to four greps per suite and was most of this probe's cost
+# (bundle-0923), for a value this mode never reads.
+if [[ "$MODE" == "--population" ]]; then
+    printf '%s\n' "$SUITES"
+    exit 0
+fi
 SOURCING=$(printf '%s\n' "$SUITES" | while IFS= read -r _f; do
                [[ -n "$_f" ]] || continue
                _uhl_sources_helper "$_f" && printf '%s\n' "$_f"
            done)
 N_SOURCING=$(printf '%s\n' "$SOURCING" | grep -c . )
 
-if [[ "$MODE" == "--population" ]]; then
-    printf '%s\n' "$SUITES"
-    exit 0
-fi
 if [[ "$MODE" == "--population-sourcing" ]]; then
     printf '%s\n' "$SOURCING"
     exit 0

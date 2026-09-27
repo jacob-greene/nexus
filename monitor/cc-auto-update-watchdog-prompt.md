@@ -43,6 +43,16 @@ Two hard rules (each fixed an actual past watchdog mistake):
 
 2. **Loop exit 0** — verified. `sandbox-notify` a one-liner, write the
    report (`monitor/ng report-init cc-restart-watchdog`), stand down.
+   **Standing down means ending your turn with nothing running.** This
+   window is retired AUTOMATICALLY (<your-org>/nexus-code#1627): the loop's
+   exit 0 recorded SUCCESS for attempt `{{ATTEMPT}}`, and the apply flow
+   retires this window through `ng retire-window` once this pane
+   is idle. There is no tracking issue or trigger comment for this brief,
+   so there is no `ng wrap-up` to run, and nothing depends on one. Do not
+   retire yourself, and do not leave a background job or a Monitor
+   running: the retire gate refuses a pane with work in flight, and the
+   window then stays open. A verify-only re-run's exit 0 records the same
+   SUCCESS, so this holds after a fix too.
 
 3. **Loop exit non-zero** — diagnose, FIX, re-run the loop.
    **Once the kill has happened, re-run it as a verify, exactly this:**

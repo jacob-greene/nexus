@@ -404,8 +404,8 @@ probe_one() {
     # bash_env.sh fronts $NEXUS_LOCALS/bin, so a bare `ng` in a suite resolves
     # to the PRIMARY's wrapper and writes to the PRIMARY's state — off the
     # decoy entirely, so the probe sees nothing and reports `hermetic`. The
-    # canonical drive (`env -u NEXUS_ROOT -u NEXUS_LOCALS`) and CI's clean-env
-    # job both treat the two as one axis, and so must this.
+    # canonical drive (`env -u NEXUS_ROOT -u NEXUS_LOCALS`) and CI's unit cells
+    # (tests.yml `unit`) both treat the two as one axis, and so must this.
     #
     # NEXUS_STATE_DIR is SCRUBBED (your-org/nexus-code#1349, #1386). It is arm
     # 1 of the STATE-class chain and unconditional, so an ambient pin from the

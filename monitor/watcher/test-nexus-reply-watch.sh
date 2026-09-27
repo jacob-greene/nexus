@@ -339,4 +339,55 @@ assert_eq "(m) --re-emit delivers again, exit 0" "$RC" "0"
 assert_contains "(m) …re-emitting the body" "$OUT" "Here is your answer: 42."
 assert_contains "(m) …as a normal replied emit" "$OUT" "state=replied id=t-sent"
 
+# ---- (n) THE EXIT CODES HEADER IS THE CODE'S, NOT A MEMORY OF IT ------------
+#
+# your-org/nexus-code#1581. nexus-reply-watch's `EXIT CODES` block listed
+# 0/2/3/64 while the code also exits 4 (already-emitted) and 143 (stopped).
+# It is the block a client copies into a handler, and exit 4 exists precisely
+# so "already emitted" is not read as a new reply — a handler written from the
+# block could not see it. nexus-request's block had 4 and was missing 143.
+#
+# So the block is now DERIVED-CHECKED in both directions, for both front-ends:
+#   header codes  ==  `exit N` literals in the front-end  ∪  _nexus_watch_lib.sh
+#
+# THE PREDICATE AND ITS ERROR DIRECTION. It reads `exit <digits>` on
+# non-comment lines. A COMPUTED status (`exit "$rc"`) is invisible to it, so it
+# would UNDER-count — and an under-count on the code side reads as "the header
+# lists a code nothing emits", or worse hides a missing one. Hence (n0): there
+# must be NO computed exit in these files; the day one appears, this fails and
+# the predicate has to be extended rather than quietly trusted.
+echo "== (n) EXIT CODES header == reachable exit literals (#1581) =="
+_LIB="$MON_DIR/client/_nexus_watch_lib.sh"
+_codes_in_code() {   # files… -> sorted unique literal exit codes, one per line
+    local f
+    for f in "$@"; do
+        grep -vE '^[[:space:]]*#' "$f" \
+            | grep -oE '(^|[^[:alnum:]_.-])exit[[:space:]]+[0-9]+' | grep -oE '[0-9]+$'
+    done | sort -n | uniq | tr '\n' ' '
+}
+_codes_in_header() { # file -> the codes its EXIT CODES block lists
+    # The block runs from the `# EXIT CODES` line to the next `# USAGE` line; a
+    # code line is `#   <digits><space>`. Continuation lines are indented past
+    # the code column, so they cannot be mistaken for one.
+    sed -n '/^# EXIT CODES/,/^# USAGE/p' "$1" \
+        | grep -oE '^#   [0-9]+[[:space:]]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' '
+}
+_computed=$(grep -nE '(^|[^[:alnum:]_.-])exit[[:space:]]+"?\$' "$WATCH" "$MON_DIR/client/nexus-request" "$_LIB" \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+assert_eq "(n0) no COMPUTED exit status in the client helpers (the literal predicate would under-count one)" \
+    "$_computed" ""
+for _fe in nexus-reply-watch nexus-request; do
+    _hdr=$(_codes_in_header "$MON_DIR/client/$_fe")
+    _code=$(_codes_in_code "$MON_DIR/client/$_fe" "$_LIB")
+    # Non-vacuous on BOTH sides: an extraction that came back empty would make
+    # "" == "" a pass about nothing.
+    if [[ "$_hdr" != *"0 "* || "$_code" != *"64 "* ]]; then
+        _th_fail; echo "  FAIL: (n) $_fe — an extraction came back short (header='$_hdr' code='$_code'); the comparison would be vacuous"
+    else
+        assert_eq "(n) $_fe: the EXIT CODES block lists exactly the codes the code can exit with" "$_hdr" "$_code"
+    fi
+done
+assert_contains "(n) nexus-reply-watch's block names 4 …" "$(_codes_in_header "$WATCH")" "4 "
+assert_contains "(n) … and 143" "$(_codes_in_header "$WATCH")" "143 "
+
 th_summary_and_exit

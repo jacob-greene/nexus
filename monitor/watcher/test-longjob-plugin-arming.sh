@@ -38,7 +38,7 @@ cp "$REPO_ROOT/monitor/longjob-plugin/.claude-plugin/plugin.json" "$ROOT/monitor
 STUB="$WORK/claude-stub"
 cat > "$STUB" <<'EOF'
 #!/usr/bin/env bash
-# LJ_HELP: "full" (advertises --plugin-dir <path>), "old" (no such flag), "hang"
+# LJ_HELP: "full" (advertises --plugin-dir <path>), "old" (no such flag), "hang", "empty"
 # LJ_VALIDATE_RC: exit code for `plugin validate`; "hang" sleeps
 case "${1:-}" in
   --help)
@@ -46,6 +46,7 @@ case "${1:-}" in
       full) printf 'Usage: claude [options]\n  --name <name>   Set a display name\n  --plugin-dir <path>   Load a plugin from a directory\n' ;;
       old)  printf 'Usage: claude [options]\n  --name <name>   Set a display name\n' ;;
       hang) sleep 60 ;;
+      empty) : ;;
     esac; exit 0 ;;
   plugin)
     [[ "${2:-}" == validate ]] || exit 2
@@ -78,7 +79,9 @@ echo "=== control: everything in order → the flag, rc 0, an armed row ==="
 r=$(LJ_HELP=full LJ_VALIDATE_RC=0 run_case good)
 rc="${r%%|*}"; rest="${r#*|}"; flag="${rest%%|*}"; rest="${rest#*|}"; err="${rest%%|*}"; row="${rest#*|}"
 (( rc == 0 )) && [[ "$flag" == "--plugin-dir $ROOT/monitor/longjob-plugin" ]] && ok "control: rc 0 and the exact flag ($flag)" || bad "control: rc=$rc flag='$flag' err='$err'"
-[[ "$row" == armed* ]] && ok "control: arming.log row 'armed'" || bad "control row: '$row'"
+# EXACT token, not `armed*`: `armed-unprobed` (#1611) shares the prefix, so a
+# prefix match here would pass a control that had silently become unprobed.
+[[ "${row%%$'\t'*}" == armed ]] && ok "control: arming.log row 'armed' (exact token)" || bad "control row: '$row'"
 [[ -z "$err" ]] && ok "control: nothing on stderr" || bad "control stderr: $err"
 
 neg() {   # <name> <expect-reason-substr> <expect-stderr-substr>
@@ -90,14 +93,50 @@ neg() {   # <name> <expect-reason-substr> <expect-stderr-substr>
 }
 echo "=== kill switch ==="
 MONITOR_LONGJOB_ENABLED=false neg killswitch "disabled" "DISABLED"
-echo "=== binary without --plugin-dir ==="
-LJ_HELP=old neg oldbinary "does not advertise" "does not support '--plugin-dir'"
-echo "=== --help hangs (bounded probe) ==="
-LJ_HELP=hang neg helphang "does not advertise" "TIMED OUT"
+# unprobed <name> <expect-reason-substr> <expect-stderr-substr> — a probe that
+# could NOT answer ARMS, logged `armed-unprobed` (your-org/nexus-code#1611).
+# Before #1611 each of these cases was a `skipped` row and an EMPTY flag: the
+# mass-resurrection failure, where every slow --help became a session with no
+# longjob-watch dispatcher for its whole life.
+unprobed() {
+    local r rc flag err row tok
+    r=$(run_case "$1"); rc="${r%%|*}"; rest="${r#*|}"; flag="${rest%%|*}"; rest="${rest#*|}"; err="${rest%%|*}"; row="${rest#*|}"
+    tok="${row%%$'\t'*}"
+    (( rc == 0 )) && [[ "$flag" == "--plugin-dir $ROOT/monitor/longjob-plugin" ]] && ok "$1: could-not-determine ARMS — rc 0 and the exact flag" || bad "$1: rc=$rc flag='$flag' err='$err'"
+    [[ "$tok" == armed-unprobed && "$row" == *"$2"* ]] && ok "$1: arming.log row 'armed-unprobed … $2'" || bad "$1 row: '$row'"
+    [[ "$err" == *"$3"* ]] && ok "$1: stderr names the reason" || bad "$1 stderr: '$err'"
+}
+echo "=== binary without --plugin-dir (a COMPLETED probe that said no) ==="
+LJ_HELP=old neg oldbinary "was read and does not list --plugin-dir" "does not support '--plugin-dir'"
+echo "=== --help hangs (bounded probe) → UNKNOWN, arms unprobed (#1611) ==="
+LJ_HELP=hang unprobed helphang "--help probe TIMED OUT (rc 124" "UNKNOWN, not 'unsupported'"
+echo "=== --help prints nothing → UNKNOWN, arms unprobed (#1611) ==="
+LJ_HELP=empty unprobed helpempty "--help produced no output" "UNKNOWN, not 'unsupported'"
 echo "=== validate fails ==="
 LJ_HELP=full LJ_VALIDATE_RC=1 neg badmanifest "validate failed rc=1" "FAILED (rc 1)"
-echo "=== validate hangs (bounded; a timeout is NOT a pass) ==="
-LJ_HELP=full LJ_VALIDATE_RC=hang neg validatehang "validate timed out" "TIMED OUT"
+echo "=== --help hangs BUT validate RAN and FAILED → skipped: a completed negative outranks an unknown ==="
+LJ_HELP=hang LJ_VALIDATE_RC=1 neg hang-then-badmanifest "validate failed rc=1" "FAILED (rc 1)"
+echo "=== validate hangs (bounded; a timeout is not a pass, and not a fail) → arms unprobed (#1611) ==="
+LJ_HELP=full LJ_VALIDATE_RC=hang unprobed validatehang "plugin validate TIMED OUT (rc 124)" "TIMED OUT"
+echo "=== the probe itself: three-valued, and UNKNOWN is never cached (#1611) ==="
+# One shell, two asks: the first while --help hangs, the second after it
+# recovers. Pre-#1611 the first CACHED `no`, so the second returned 1 without
+# re-probing — the transient timeout made permanent for that launcher.
+r=$(bash -c '
+    export NEXUS_ROOT="$1" CLAUDE_BIN="$2" NEXUS_CLAUDE_HELP_TIMEOUT=1
+    . "$1/monitor/_claude-bin.sh" >/dev/null 2>&1
+    export LJ_HELP=hang; claude_supports_plugin_dir_flag 2>/dev/null; a=$?
+    export LJ_HELP=full; claude_supports_plugin_dir_flag 2>/dev/null; b=$?
+    export LJ_HELP=old;  claude_supports_plugin_dir_flag 2>/dev/null; c=$?
+    printf "%s,%s,%s" "$a" "$b" "$c"' _ "$ROOT" "$STUB")
+[[ "$r" == "2,0,0" ]] && ok "probe: hang→2 (unknown, uncached), recovered→0 (re-probed), then 0 (a COMPLETED yes IS cached)" || bad "probe sequence: got '$r' (want 2,0,0)"
+r=$(bash -c '
+    export NEXUS_ROOT="$1" CLAUDE_BIN="$2" NEXUS_CLAUDE_HELP_TIMEOUT=1
+    . "$1/monitor/_claude-bin.sh" >/dev/null 2>&1
+    export LJ_HELP=old;  claude_supports_plugin_dir_flag 2>/dev/null; a=$?
+    export LJ_HELP=full; claude_supports_plugin_dir_flag 2>/dev/null; b=$?
+    printf "%s,%s" "$a" "$b"' _ "$ROOT" "$STUB")
+[[ "$r" == "1,1" ]] && ok "probe: a COMPLETED no → 1 and IS cached (1,1) — only the unknown escapes the cache" || bad "probe completed-no: got '$r' (want 1,1)"
 echo "=== manifest missing ==="
 mv "$ROOT/monitor/longjob-plugin/.claude-plugin/plugin.json" "$WORK/plugin.json.bak"
 LJ_HELP=full neg nomanifest "manifest unreadable" "manifest missing"
