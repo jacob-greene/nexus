@@ -184,7 +184,7 @@ _ncbi_get() {
         out=$(curl "${args[@]}" 2>/dev/null) || { note "PubMed: $util request failed (network?)"; return 1; }
         code="${out##*$'\n'}"; body="${out%$'\n'*}"
         [[ "$code" == 429 ]] || break
-        sleep "$attempt"
+        (( attempt < 3 )) && sleep "$attempt"   # no wait after the last try
     done
     if [[ "$code" != 200 ]]; then
         local msg; msg=$(printf '%s' "$body" | jq -r '.error // empty' 2>/dev/null)
@@ -196,7 +196,8 @@ _ncbi_get() {
 }
 
 # PMIDs (comma-separated) -> esummary JSON normalized to the search shape,
-# in the order given (esearch's relevance order).
+# in the order given (esearch's relevance order). The order comes from $ids,
+# never from esummary's `uids`, which NCBI does not promise to preserve.
 _pubmed_summaries() {
     local ids="$1" resp
     resp=$(_ncbi_get esummary db=pubmed "id=$ids" retmode=json) || return 1
@@ -204,7 +205,7 @@ _pubmed_summaries() {
         note "PubMed: esummary: $(printf '%s' "$resp" | jq -r '.error // .esummaryresult[0]? // "unexpected response"' 2>/dev/null)"
         return 1
     fi
-    printf '%s' "$resp" | jq '.result as $r | [ $r.uids[] | $r[.] | select(.error == null) | {
+    printf '%s' "$resp" | jq --arg ids "$ids" '.result as $r | [ $ids | split(",")[] | $r[.] // empty | select(.error == null) | {
         source: "pubmed",
         id: .uid,
         pmid: .uid,
@@ -409,6 +410,21 @@ _pubmed_search() {
         note "PubMed: esearch: $(printf '%s' "$resp" | jq -r '.esearchresult.ERROR // .error // "unexpected response"' 2>/dev/null)"
         return 1
     fi
+    # PubMed drops a term it cannot match and still returns hits for the
+    # rest, so a typo silently BROADENS the query. Surface what it dropped.
+    local warn
+    warn=$(printf '%s' "$resp" | jq -c '.esearchresult as $e
+        | { query_translation: ($e.querytranslation // null),
+            warnings: ( [ ($e.errorlist.phrasesnotfound // [])[]      | "phrase not found: " + . ]
+                      + [ ($e.errorlist.fieldsnotfound // [])[]       | "field not found: " + . ]
+                      + [ ($e.warninglist.phrasesignored // [])[]     | "phrase ignored: " + . ]
+                      + [ ($e.warninglist.quotedphrasesnotfound // [])[] | "quoted phrase not found: " + . ]
+                      + [ ($e.warninglist.outputmessages // [])[] | select(. != "No items found.") | "message: " + . ] ) }')
+    if [[ -n "${_LIT_PUBMED_META:-}" ]]; then printf '%s' "$warn" >"$_LIT_PUBMED_META"; fi
+    local w
+    while IFS= read -r w; do
+        [[ -n "$w" ]] && note "PubMed: $w (query ran as: $(jq -r '.query_translation // "?"' <<<"$warn"))"
+    done < <(jq -r '.warnings[]' <<<"$warn")
     local ids; ids=$(printf '%s' "$resp" | jq -r '.esearchresult.idlist | join(",")')
     [[ -z "$ids" ]] && { printf '[]'; return 0; }
     _pubmed_summaries "$ids"
@@ -453,11 +469,15 @@ cmd_search() {
     fi
 
     local results="[]" used=() skipped=() r
+    local pm_meta='{"query_translation":null,"warnings":[]}'
     if [[ $want_pm -eq 1 ]]; then
         _ncbi_init
+        _LIT_PUBMED_META=$(mktemp); export _LIT_PUBMED_META
         if r=$(_pubmed_search "$q" "$limit" "$year"); then
             results=$(jq -n --argjson a "$results" --argjson b "$r" '$a + $b'); used+=(pubmed)
         fi
+        [[ -s "$_LIT_PUBMED_META" ]] && pm_meta=$(cat "$_LIT_PUBMED_META")
+        rm -f "$_LIT_PUBMED_META"
     fi
     if [[ $want_s2 -eq 1 ]]; then
         if [[ -n "$s2key" ]]; then
@@ -505,8 +525,11 @@ cmd_search() {
                    | if ($a | length) > 6 then ($a[:6] | join(", ")) + ", et al." else ($a | join(", ")) end;
                .[] | "  [\(if .in_library then "IN-LIB" else "new" end)] \(.title)\n      \(.authors | short)\n      \(.venue // "") (\(.year // "n/a"))  cites:\(.citations // "?")  doi:\(.doi // "n/a")\(if .pmid then "  pmid:\(.pmid)" else "" end)  [\(.source)]\n"' <<<"$results"
     else
-        jq -n --argjson r "$results" --arg sources "${used[*]:-}" \
-              '{query_sources: ($sources | split(" ") | map(select(length>0))), count: ($r|length), results: $r}' <<<""
+        jq -n --argjson r "$results" --arg sources "${used[*]:-}" --argjson pm "$pm_meta" \
+              '{query_sources: ($sources | split(" ") | map(select(length>0))), count: ($r|length),
+                warnings: ($pm.warnings | map("pubmed: " + .)),
+                pubmed_query_translation: $pm.query_translation,
+                results: $r}' <<<""
     fi
     [[ ${#used[@]} -eq 0 ]] && { note "no backend returned results"; return 1; }
     return 0
