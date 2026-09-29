@@ -158,11 +158,12 @@ github:
 
 lit:
   # Literature-research tool (`ng lit`). Content-relevance paper discovery
-  # over Semantic Scholar (S2) and ASTA, deduped against the reference
-  # library. Both keys are OPTIONAL: an unconfigured backend is skipped
-  # with a note (never a hang). With neither configured, `ng lit` prints
-  # setup references and exits. Full setup + key-acquisition walkthrough:
-  # docs/reference/literature.md.
+  # over PubMed (NCBI E-utilities), Semantic Scholar (S2) and ASTA, deduped
+  # against the reference library. PubMed needs NO key and is the default
+  # backend when neither S2 nor ASTA is configured, so `ng lit search` works
+  # out of the box. The S2/ASTA keys are OPTIONAL: an unconfigured keyed
+  # backend is skipped with a note (never a hang). Full setup +
+  # key-acquisition walkthrough: docs/reference/literature.md.
   #
   # config/nexus.yml is gitignored, so inlining the keys here is safe; you
   # may also export S2_API_KEY / ASTA_API_KEY in the environment (env wins).
@@ -171,6 +172,15 @@ lit:
   s2_api_key: ""
   # ASTA / Allen AI key: request via the ASTA program (see the docs page).
   asta_api_key: ""
+  # PubMed (NCBI E-utilities). All three are optional; env vars win.
+  # NCBI API key (NCBI_API_KEY): raises the NCBI limit from 3 to 10
+  # requests/s. Free, from https://account.ncbi.nlm.nih.gov/settings/
+  ncbi_api_key: ""
+  # Contact address sent as `email=` (NCBI_EMAIL). NCBI asks E-utilities
+  # callers for one so it can reach you before blocking abusive traffic.
+  ncbi_email: ""
+  # Sent as `tool=` (NCBI_TOOL). Default: nexus-lit.
+  # ncbi_tool: nexus-lit
   # Reference library (JSONL). Default: <nexus.root>/.bipartite/refs.jsonl.
   # Point this at a path inside your asset repo to version the library.
   # library_path: ~/path/to/refs.jsonl
