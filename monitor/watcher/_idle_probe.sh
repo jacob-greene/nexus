@@ -2233,6 +2233,15 @@ _idle_dead_window_pending_rows() {
     [[ -n "$state_dir" ]] || return 0
     local dir="${state_dir}/skeptic/pending"
     [[ -d "$dir" ]] || return 0
+    # FAIL CLOSED on an empty live list. Every caller captures it with
+    # `tmux list-windows ... || true`, so a tmux that cannot answer reads
+    # as "no window is live", and every marker — including the marker of
+    # a LIVE, parked worker — would be reported as abandoned. That is the
+    # false accusation the sanitized comparison below exists to prevent
+    # (#202 depth-3 skeptic finding 3). The watcher always runs inside a
+    # tmux session that holds at least the orchestrator window, so an
+    # empty list means "unknown", never "all windows gone".
+    [[ -n "${live//[[:space:]]/}" ]] || return 0
     local live_safe marker name mtime age req waited
     live_safe=$(printf '%s\n' "$live" | sed 's/[^a-zA-Z0-9_-]/_/g')
     for marker in "$dir"/*; do

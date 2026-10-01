@@ -4068,10 +4068,13 @@ _v2_task_compose_emit() {
                 # always caught this, so the total-only form was a
                 # REGRESSION of the #14 guarantee, not merely a gap.
                 #
-                # The fix is a name-aware second test: the staged body must
-                # carry exactly `_fs_dead` dead-window rows. In the
+                # The fix is a second, dead-row count test: the staged body
+                # must carry exactly `_fs_dead` dead-window rows. In the
                 # cancelling case the body has 0 and the disk has 1, so the
-                # gate fires. Anchored on the rendered row shape, not a bare
+                # gate fires. It compares COUNTS, not names: a swap within
+                # one cycle (a marked window closes while another marker is
+                # resolved) keeps both counts equal and passes. The live
+                # check above has the same limit. Anchored on the rendered row shape, not a bare
                 # substring, so a window whose NAME contains the class
                 # string cannot inflate the count.
                 _fs_dead_rows=$(printf '%s\n' "$full_state_lines" \

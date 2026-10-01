@@ -125,8 +125,10 @@ assert_contains "the row states how long the skeptic has been owed" "$rows" \
 echo "=== 2. the count helper agrees with the row producer ==="
 assert_eq "count helper returns 1" \
     "$(_idle_dead_window_pending_count "$NOW" "$LIVE")" "1"
-assert_eq "count helper returns 2 when NO window is live (control)" \
-    "$(_idle_dead_window_pending_count "$NOW" "")" "2"
+# Control. Only an unrelated window is live, so both markers count. (An
+# EMPTY list is "tmux unknown" and counts 0 — see section 12.)
+assert_eq "count helper returns 2 when no MARKED window is live (control)" \
+    "$(_idle_dead_window_pending_count "$NOW" "orchestrator")" "2"
 
 echo "=== 3. liveness is tested on the SANITIZED name (fails closed) ==="
 # The marker filename is the sanitized window name, so a live window whose
@@ -250,5 +252,59 @@ assert_contains "a marker with no request event is still reported" \
     "$rows_nr" $'no-req-w\tdead-window-skeptic-pending'
 assert_contains "its owed-time falls back to the marker mtime" \
     "$rows_nr" "skeptic required 500000s ago"
+
+echo "=== 11. the REAL row is stable under the emit strip (depth-3 finding 1) ==="
+# Built from the real renderer, not a hand-typed row: the row carries TWO
+# wall-clock tokens (`marker Ns old` and `skeptic required Ns ago`), and a
+# hand-typed fixture only sees the tokens its author remembered. `date`
+# is shadowed only for `+%s`, so `now` moves while marker mtimes do not.
+source "$_test_dir/_emit_dedup.sh"
+snap_at() {   # <fake-now> -> stripped full-state snapshot
+    FAKE_NOW="$1" bash -c '
+        date() { if [[ "$*" == "+%s" ]]; then printf "%s\n" "$FAKE_NOW"; else command date "$@"; fi; }
+        source "'"$PROBE"'"
+        _idle_pane_state_line() { printf "state=idle active=0\n"; }
+        source "'"$_test_dir/_emit_dedup.sh"'"
+        render_full_state_snapshot | _emit_volatile_strip'
+}
+s1=$(snap_at "$NOW")
+s2=$(snap_at "$(( NOW + 7 ))")
+s3=$(snap_at "$(( NOW + 7200 ))")
+assert_contains "fixture control: the real row is in the snapshot" "$s1" \
+    "- ghost-w dead-window-skeptic-pending"
+assert_eq "7 s later, the stripped snapshot is byte-identical" "$s1" "$s2"
+# Two hours on, live-w's own class legitimately changes (a real state
+# transition), so compare only the dead-window rows there.
+dw() { grep 'dead-window-skeptic-pending' <<<"$1"; }
+assert_eq "2 h later, the stripped dead-window rows are byte-identical" \
+    "$(dw "$s1")" "$(dw "$s3")"
+# The strip removes the two ages and NOTHING else: the marker path, which
+# names the window, must survive. An over-broad rule such as
+# `s/marker [^;]*;/marker;/g` passes both equalities above and fails here.
+assert_contains "the strip keeps the marker path" "$s1" \
+    "(marker old; skeptic required ago; marker $STATE_DIR/skeptic/pending/ghost-w; window GONE"
+# Control: unstripped, the two renders DO differ, so the equalities above
+# are not vacuous.
+raw1=$(FAKE_NOW="$NOW" bash -c 'date() { [[ "$*" == "+%s" ]] && { echo "$FAKE_NOW"; return; }; command date "$@"; }; source "'"$PROBE"'"; _idle_pane_state_line() { echo "state=idle active=0"; }; render_full_state_snapshot')
+raw2=$(FAKE_NOW="$(( NOW + 7 ))" bash -c 'date() { [[ "$*" == "+%s" ]] && { echo "$FAKE_NOW"; return; }; command date "$@"; }; source "'"$PROBE"'"; _idle_pane_state_line() { echo "state=idle active=0"; }; render_full_state_snapshot')
+if [[ "$raw1" != "$raw2" ]]; then assert_eq "control: unstripped renders differ" x x
+else assert_eq "control: unstripped renders differ" same differ; fi
+
+echo "=== 12. an EMPTY live list is unknown, not all-dead (depth-3 finding 3) ==="
+# `tmux list-windows ... || true` yields "" when tmux cannot answer. Read
+# as "no window is live", that would accuse live-w, a parked worker.
+assert_empty "an empty live list yields no rows" \
+    "$(_idle_dead_window_pending_rows "$NOW" "")"
+assert_empty "a whitespace-only live list yields no rows" \
+    "$(_idle_dead_window_pending_rows "$NOW" $'\n')"
+assert_eq "the count helper agrees: 0" \
+    "$(_idle_dead_window_pending_count "$NOW" "")" "0"
+assert_not_contains "render with tmux silent does not accuse live-w" \
+    "$(MOCK_TMUX_ROWS="" MOCK_TMUX_WINDOWS="" render_full_state_snapshot)" \
+    "live-w dead-window-skeptic-pending"
+# Control: one unrelated live window is enough to run the sweep.
+assert_contains "control: a non-empty list still reports ghost-w" \
+    "$(_idle_dead_window_pending_rows "$NOW" "orchestrator")" \
+    $'ghost-w\tdead-window-skeptic-pending'
 
 th_summary_and_exit

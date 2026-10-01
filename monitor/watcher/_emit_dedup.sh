@@ -47,6 +47,10 @@
 #     hour. Both are wall-clock derived, so both must be stripped or
 #     the canonical snapshot changes every second for as long as one
 #     dead-window marker exists.
+#   - `skeptic required Ns ago`, the same row's owed-time in its detail
+#     column (issue #202, depth-3 skeptic finding 1). It is `now - req`,
+#     so it advances every second too. It is always raw seconds: the
+#     detail string is preformatted in _idle_dead_window_pending_rows.
 #   - the trailing `--- nexus-emit-sig <iso> <nonce> ---` footer
 # Everything else — workspace counts, eligible-comments rows,
 # pending-decisions rows, the local-diff payload, bell entries —
@@ -75,6 +79,7 @@ _emit_volatile_strip() {
         s/[0-9]+ awaiting-input/awaiting-input/g
         s/marker [0-9]+h[0-9]+m old/marker old/g
         s/marker [0-9]+s old/marker old/g
+        s/skeptic required [0-9]+s ago/skeptic required ago/g
         s/^\(full snapshot, rendered [0-9]+s ago/(full snapshot/
         /^--- nexus-emit-sig /d
     '
