@@ -166,6 +166,14 @@ else
         # did, stranding every work/<project> worker spawn pre-REPL on a
         # dialog that classified `empty` and matched no unstick case.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-nested-trust.sh"
+        # DELIBERATELY ABSENT: test-realmodel-permission-dialog.sh. It
+        # paints a real tool-permission dialog and asserts pane-state
+        # classifies it `blocked`; pane-state answers `empty` today
+        # (your-org/nexus-code#157), so its classification assertions carry
+        # an XFAIL marker. An XFAIL-marked gate entry tells an operator
+        # nothing about a candidate release: it cannot go red for the
+        # reason a gate exists. Add it here in the same change that fixes
+        # #157 and removes the marker.
         # VI-safe paste (GUIDE.md surface 2c). Every other scenario
         # either types with `send-keys <text>` or stubs the paste
         # function outright (test-realmodel-overlimit.sh swaps in
