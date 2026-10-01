@@ -182,9 +182,14 @@ FRAME_NO_CHEVRON=${FRAME_WRITE/ ❯ 1. Yes/   1. Yes}
 #   a) an AskUserQuestion menu drawn under the transcript;
 #   b) a bare chevron row whose number is not even `1.`.
 #
-# The fix is co-location: the option rows and the chevron must sit in the
-# eight rows ABOVE the footer, so a menu BELOW a quoted footer cannot
-# lend its chevron. These two fixtures are the regression test for it.
+# The fix is co-location: the legs must sit in a window around the LAST
+# `Esc to cancel` row. These two fixtures put their menu three or more
+# rows below the quoted footer, so the window's `anchor + 2` lower bound
+# drops it before any other rule is consulted. They do NOT test the
+# above-the-anchor split: removing that split leaves both green (depth-1
+# skeptic on #159, finding 2). The split has its own fixture, in the
+# "-- the Tab-to-amend, above-the-anchor and two-row rules are gated --"
+# section below.
 read -r -d '' FRAME_PROSE_PLUS_MENU <<EOF
 $FRAME_PROSE
  Which color should the demo use?
@@ -236,6 +241,18 @@ read -r -d '' FRAME_TRUST_BARE_NO <<'EOF'
   ⎿ note: permission dialogs end with Tab to amend
 EOF
 
+# The decline row with trailing text. Claude Code renders a decline row
+# with text after `No` in the trust dialog (`2. No, exit`), and the
+# permission dialog's option 3 has read `No, and tell Claude what to do
+# differently (esc)`. The detector first required the bare word `No`, so
+# this frame was rejected (depth-1 skeptic on #159, finding 3, probe P4).
+# The `no` leg now accepts `No` followed by end-of-row OR a comma.
+FRAME_NO_WITH_TEXT=${FRAME_WRITE/   3. No/   3. No, and tell Claude what to do differently (esc)}
+
+# The guard on that loosening: a word that merely STARTS with `No` is
+# not a decline row. Everything else is a valid Write dialog.
+FRAME_NO_PREFIX_ONLY=${FRAME_WRITE/   3. No/   3. Notes}
+
 # All three selection positions of a real dialog must still match.
 FRAME_CHEVRON_ON_2=${FRAME_WRITE/ ❯ 1. Yes
    2. Yes, allow all edits during this session (shift+tab)/   1. Yes
@@ -251,6 +268,7 @@ echo "=== frames that DO carry a permission dialog ==="
 should_match "Write dialog (\"Do you want to create …?\")"          "$FRAME_WRITE"
 should_match "Edit dialog (\"Do you want to make this edit …?\")"   "$FRAME_EDIT"
 should_match "two-option dialog (decline row is \`2. No\`)"          "$FRAME_TWO_OPTION"
+should_match "decline row with trailing text (\`3. No, and tell …\`)" "$FRAME_NO_WITH_TEXT"
 should_match "chevron arrowed down to option 2"                      "$FRAME_CHEVRON_ON_2"
 should_match "chevron arrowed down to option 3"                      "$FRAME_CHEVRON_ON_3"
 
@@ -268,6 +286,7 @@ should_not_match "prose + a bare unrelated chevron row below it"     "$FRAME_PRO
 should_not_match "a live menu ABOVE quoted dialog rows"              "$FRAME_MENU_ABOVE_PROSE"
 should_not_match "a live menu INTERLEAVED with quoted dialog rows"   "$FRAME_INTERLEAVED_MENU"
 should_not_match "trust dialog, bare \`2. No\`, borrowed footer"      "$FRAME_TRUST_BARE_NO"
+should_not_match "decline row is only a \`No\` prefix (\`3. Notes\`)"   "$FRAME_NO_PREFIX_ONLY"
 
 # Co-location, stated directly: the same real dialog still matches when
 # unrelated content sits below it, and stops matching when its option
@@ -506,6 +525,44 @@ should_not_match "a blank line between the option rows still breaks the run" \
  ❯ 2. Blue
    3. No
  Esc to cancel · Tab to amend"
+
+# Three more rules with no fixture, found by the depth-1 skeptic on #159
+# (finding 2, mutants M07, M12 and M15). The author's own mutation pass
+# covered _cch_option_run_ok only; these three rules live in
+# cch_has_permission_dialog and _cch_dialog_window. Each fixture below
+# fails on exactly one rule, so it matches if and only if that rule is
+# removed.
+echo
+echo "-- the Tab-to-amend, above-the-anchor and two-row rules are gated --"
+# M07: the `Tab to amend` conjunct. A live `1. Yes` / `2. No` overlay
+# with a chevron and `Esc to cancel`, but no `Tab to amend` anywhere.
+# Every other leg holds. Matches if the conjunct is dropped.
+should_not_match "live 1. Yes / 2. No overlay with no \`Tab to amend\`" \
+" Should the demo ship today?
+ ❯ 1. Yes
+   2. No
+ Esc to cancel"
+# M12: the above-the-anchor split. A live menu ONE row below a quoted
+# footer, so it sits inside the `anchor + 2` window. Only the rule that
+# option rows must sit ABOVE the anchor rejects it. Matches if every
+# window row is treated as above.
+should_not_match "live 1. Yes / 2. No menu one row below a quoted footer" \
+"  ⎿  transcript quoting a footer: Esc to cancel · Tab to amend
+ ❯ 1. Yes
+   2. No"
+# M15: the two-row bound below the anchor. A valid option run above the
+# anchor, but `Tab to amend` only in a transcript line five rows below.
+# Matches if the window runs to the end of the frame.
+should_not_match "\`Tab to amend\` five rows below the anchor" \
+" Should the demo ship today?
+ ❯ 1. Yes
+   2. No
+ Esc to cancel
+ filler 1
+ filler 2
+ filler 3
+ filler 4
+  ⎿  docs: the permission dialog footer reads Tab to amend"
 
 # ---- regression: no locale or awk precondition ---------------------------
 #

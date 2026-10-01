@@ -368,7 +368,7 @@ cch_capture() {
 # "Do you want to make this edit to …?"):
 #
 #   1. a first option row `1. Yes`, with or without the chevron;
-#   2. a numbered decline row, `N. No`;
+#   2. a numbered decline row, `N. No` alone or `N. No, …`;
 #   3. the two footer phrases `Esc to cancel` and `Tab to amend`;
 #   4. LIVENESS: a chevron sitting on a NUMBERED option row.
 #
@@ -404,7 +404,11 @@ cch_capture() {
 #   leg 3b (`Tab to amend`) must land at the anchor or within two rows.
 #
 # Above-only for the option rows is what closes the hole: a menu pasted
-# BELOW a quoted footer cannot lend its chevron to the match. Eight rows
+# BELOW a quoted footer cannot lend its chevron to the match. Two rules
+# do that work. The `anchor + 2` bound drops a menu three or more rows
+# down; the above-only split rejects one that sits one or two rows down,
+# inside the window. Each is gated by its own fixture in
+# monitor/test-cch-permission-dialog.sh. Eight rows
 # is generous against the measured dialog, whose option rows sit two to
 # four rows above the footer, and it tolerates a longer option list.
 #
@@ -545,7 +549,11 @@ _cch_option_run_ok() {
         END {
             opt  = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]"
             yes  = "^[ \t]*(❯[ \t]+)?1\\.[ \t]+Yes[ \t]*$"
-            no   = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]+No[ \t]*$"
+            # `No` alone, or `No` then a comma: `3. No, and tell Claude
+            # what to do differently (esc)` is a real decline row, and so
+            # is `2. No, exit` in the trust dialog. A word that only
+            # starts with `No` (`Notes`) is not.
+            no   = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]+No([ \t]*$|,)"
             # ANCHORED, exactly as `opt`, `yes` and `no` already are. An
             # unanchored chevron matched a ❯ anywhere INSIDE a row, so
             # the chevron leg could still be borrowed — now from the
@@ -642,7 +650,7 @@ cch_assert_permission_dialog() {
                 printf '      present somewhere in that region:'
                 grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes[[:space:]]*$' <<<"$above" \
                     && printf ' `1. Yes`'
-                grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No[[:space:]]*$' <<<"$above" \
+                grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No([[:space:]]*$|,)' <<<"$above" \
                     && printf ' `N. No`'
                 grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
                     && printf ' a chevron row'
