@@ -28,9 +28,20 @@
 #                  knob existed.
 #
 # The suite is hermetic: no tmux, no claude binary, no mock backend. It
-# only needs `git` to read the baseline blob, and self-skips (green) if
-# the baseline commit is unreachable — a shallow clone must not turn into
-# a false failure.
+# needs `git` to read the two baseline blobs.
+#
+# A SHALLOW CLONE MUST NOT TURN INTO A FALSE PASS. CI checks out with
+# depth 1, so the baseline commits are usually absent. This suite used to
+# print `skipped:` and exit 0 there, before any assertion ran: twelve
+# assertions lost and the run still reported green. That is the failure
+# class gate.sh's exit-77 sentinel exists for. Now:
+#
+#   1. The whitelist check (section 3) needs no git, so it runs FIRST and
+#      always runs.
+#   2. A missing baseline is fetched by its full SHA from `origin`
+#      (self-repair). This works on a GitHub depth-1 checkout.
+#   3. If it is still unreachable, every baseline assertion is counted as
+#      a FAILURE, and the suite exits 1. There is no skip path.
 
 set -uo pipefail
 
@@ -41,8 +52,17 @@ LIB="$_test_dir/cc-harness/_lib.sh"
 # The commit the knob was written against. The baseline is read from git,
 # not transcribed here, so this suite cannot drift from what actually
 # shipped.
-BASELINE_REF="c9c07bc"
+#
+# Full SHAs, not short ones: the self-repair fetch below can only ask a
+# remote for a full object name.
+BASELINE_REF="c9c07bc01d92bc02e48ec3ea5cfdc6758941af29"
 BASELINE_PATH="monitor/cc-harness/_lib.sh"
+
+# The commit where `main` added the settings-file argument (the hook and
+# VI-paste scenarios boot through it), immediately before this branch
+# folded that argument into cch_launch_cmd. Read for the same reason as
+# BASELINE_REF: the settings shape is measured, not transcribed.
+SETTINGS_REF="d079074f0edc7a71408a691addcf7425e11810c2"
 
 PASS=0
 FAIL=0
@@ -73,14 +93,71 @@ CLAUDE_BIN='/tmp/cc harness/node_modules/.bin/claude'
 TERM='xterm-256color'
 export CCH_CFG CCH_MOCK_PORT CLAUDE_BIN TERM
 
-# ---- the baseline builder, read from git --------------------------------
+# ---- whitelist: no scenario rebuilds the launch string -------------------
+# Runs first, because it needs no git: a missing baseline below must not
+# take this assertion down with it.
+echo "=== no scenario rebuilds the launch string ==="
+
+# The duplication this knob exists to remove. A scenario that only
+# wants a different cwd, or one flag dropped, must NOT rebuild the
+# launch string — that is what two agents did on 2026-09-09 and what
+# the knob plus the workdir argument now make unnecessary.
+#
+# The check is a closed whitelist of the files allowed to carry a
+# `printf -v launch` statement. A new copy therefore fails here, in
+# the fast test loop, instead of drifting silently from the production
+# spawn flags. Each exemption is justified:
+#
+#   _lib.sh          the one construction site (cch_launch_cmd).
+#   apispoof         adds the hook substrate: NEXUS_* env plus
+#                    `--settings <file>`. A genuinely different launch
+#                    shape, not a copy made to drop a flag. Folding
+#                    the hook substrate into cch_launch_cmd is a
+#                    follow-up, deliberately not done here.
+#   overlimit        same hook substrate, plus a pinned TZ and
+#                    CLAUDE_CODE_MAX_RETRIES.
+#   this file        quotes the statement inside an awk range, to read
+#                    the baseline out of git.
+#
+# demo.sh writes `printf -v LAUNCH` (upper case) and does not source
+# _lib.sh at all; it is a standalone human-facing demo.
+#
+# Use `command grep -r`: the bundled `grep` shell function honours
+# .gitignore and would return an empty, exit-1 result that reads
+# identically to a true negative.
+mapfile -t builders < <(
+    command grep -rl --include='*.sh' -- 'printf -v launch' \
+        "$REPO_ROOT/monitor" 2>/dev/null | sort
+)
+expected=(
+    "$_test_dir/cc-harness/_lib.sh"
+    "$_test_dir/test-cch-launch-string.sh"
+    "$_test_dir/watcher/test-integration/test-realmodel-apispoof.sh"
+    "$_test_dir/watcher/test-integration/test-realmodel-overlimit.sh"
+)
+assert_eq "only the whitelisted files build a launch string" \
+    "$(printf '%s\n' "${builders[@]}")" "$(printf '%s\n' "${expected[@]}")"
+
+# ---- the baseline builders, read from git -------------------------------
+# Read <ref>:<path>. If the commit is absent (a shallow clone), fetch it
+# once by full SHA from origin and retry. Prints the blob; returns 1 if
+# it is still unreachable.
+read_blob() {
+    local ref="$1" path="$2"
+    if ! git -C "$REPO_ROOT" cat-file -e "$ref^{commit}" 2>/dev/null; then
+        git -C "$REPO_ROOT" fetch --quiet --no-tags --depth=1 origin "$ref" \
+            >/dev/null 2>&1 || true
+    fi
+    git -C "$REPO_ROOT" show "$ref:$path" 2>/dev/null
+}
+
 # Extract the `printf -v launch ... "$CLAUDE_BIN"` statement verbatim from
 # the baseline blob. This is the pre-knob code path, evaluated, not a
 # transcription of it.
 BASELINE_BLOCK=""
 read_baseline_block() {
     local blob
-    blob=$(git -C "$REPO_ROOT" show "$BASELINE_REF:$BASELINE_PATH" 2>/dev/null) || return 1
+    blob=$(read_blob "$BASELINE_REF" "$BASELINE_PATH") || return 1
     BASELINE_BLOCK=$(awk '/^    printf -v launch /,/"\$CLAUDE_BIN"$/' <<<"$blob")
     [[ -n "$BASELINE_BLOCK" ]] || return 1
     # Guard the extraction itself: if the awk range ever matches the wrong
@@ -90,9 +167,39 @@ read_baseline_block() {
     grep -qF -- 'ANTHROPIC_BASE_URL' <<<"$BASELINE_BLOCK" || return 1
 }
 
+# The settings-file builder as `main` shipped it: from `local
+# settings_arg` to the closing `"$settings_arg"` argument.
+SETTINGS_BLOCK=""
+read_settings_block() {
+    local blob
+    blob=$(read_blob "$SETTINGS_REF" "$BASELINE_PATH") || return 1
+    SETTINGS_BLOCK=$(awk '/^    local settings_arg=""/,/"\$settings_arg"$/' <<<"$blob")
+    [[ -n "$SETTINGS_BLOCK" ]] || return 1
+    grep -qF -- '--settings' <<<"$SETTINGS_BLOCK" || return 1
+    grep -qF -- '--dangerously-skip-permissions' <<<"$SETTINGS_BLOCK" || return 1
+}
+
+# No skip path. An unreachable baseline is a FAILURE: the suite cannot
+# measure what it claims, so it must not report green.
+summary() {
+    echo
+    printf 'cch-launch-string: %d passed, %d failed\n' "$PASS" "$FAIL"
+    if (( FAIL == 0 )); then
+        echo "ALL TESTS PASSED"
+        exit 0
+    fi
+    exit 1
+}
+unreachable() {
+    printf '  FAIL: cannot read %s at %s, even after a fetch from origin.\n' \
+        "$BASELINE_PATH" "$1" >&2
+    printf '        Every assertion that compares against it is counted as failed.\n' >&2
+    printf '        In CI, check actions/checkout fetch-depth in tests.yml.\n' >&2
+    FAIL=$(( FAIL + 1 ))
+}
 if ! read_baseline_block; then
-    echo "skipped: cannot read $BASELINE_PATH at $BASELINE_REF (shallow clone?)"
-    exit 0
+    unreachable "$BASELINE_REF"
+    summary
 fi
 
 launch_baseline() {
@@ -112,6 +219,7 @@ launch_new() {
 
 BASELINE=$(launch_baseline)
 
+echo
 echo "=== cch_launch_cmd: default is byte-for-byte the pre-knob string ==="
 
 # 1. Knob unset — the state every existing scenario runs in.
@@ -159,53 +267,29 @@ assert_eq "knob is re-read per call -> back to baseline" \
     "$(launch_new)" "$BASELINE"
 
 echo
-echo "=== no scenario rebuilds the launch string ==="
+echo "=== cch_launch_cmd: a settings file keeps main's shape ==="
 
-# 7. The duplication this knob exists to remove. A scenario that only
-#    wants a different cwd, or one flag dropped, must NOT rebuild the
-#    launch string — that is what two agents did on 2026-09-09 and what
-#    the knob plus the workdir argument now make unnecessary.
-#
-#    The check is a closed whitelist of the files allowed to carry a
-#    `printf -v launch` statement. A new copy therefore fails here, in
-#    the fast test loop, instead of drifting silently from the production
-#    spawn flags. Each exemption is justified:
-#
-#      _lib.sh          the one construction site (cch_launch_cmd).
-#      apispoof         adds the hook substrate: NEXUS_* env plus
-#                       `--settings <file>`. A genuinely different launch
-#                       shape, not a copy made to drop a flag. Folding
-#                       the hook substrate into cch_launch_cmd is a
-#                       follow-up, deliberately not done here.
-#      overlimit        same hook substrate, plus a pinned TZ and
-#                       CLAUDE_CODE_MAX_RETRIES.
-#      this file        quotes the statement inside an awk range, to read
-#                       the baseline out of git.
-#
-#    demo.sh writes `printf -v LAUNCH` (upper case) and does not source
-#    _lib.sh at all; it is a standalone human-facing demo.
-#
-#    Use `command grep -r`: the bundled `grep` shell function honours
-#    .gitignore and would return an empty, exit-1 result that reads
-#    identically to a true negative.
-mapfile -t builders < <(
-    command grep -rl --include='*.sh' -- 'printf -v launch' \
-        "$REPO_ROOT/monitor" 2>/dev/null | sort
-)
-expected=(
-    "$_test_dir/cc-harness/_lib.sh"
-    "$_test_dir/test-cch-launch-string.sh"
-    "$_test_dir/watcher/test-integration/test-realmodel-apispoof.sh"
-    "$_test_dir/watcher/test-integration/test-realmodel-overlimit.sh"
-)
-assert_eq "only the whitelisted files build a launch string" \
-    "$(printf '%s\n' "${builders[@]}")" "$(printf '%s\n' "${expected[@]}")"
+# 7. The settings-file form (hook and VI-paste scenarios) must boot
+#    exactly what `main` booted before the merge folded its argument into
+#    cch_launch_cmd. Same awkward inputs, plus a settings path with a
+#    space so %q quoting is exercised.
+SETTINGS_FILE='/tmp/cc harness/settings "v".json'
+if ! read_settings_block; then
+    unreachable "$SETTINGS_REF"
+else
+    launch_settings_main() {
+        local PATH="$FAKE_PATH" launch="" settings="$SETTINGS_FILE"
+        eval "$SETTINGS_BLOCK"
+        printf '%s' "$launch"
+    }
+    SETTINGS_MAIN=$(launch_settings_main)
+    unset CCH_SKIP_PERMISSIONS
+    assert_eq "settings file -> identical to main's settings form" \
+        "$(PATH="$FAKE_PATH" cch_launch_cmd "$SETTINGS_FILE")" "$SETTINGS_MAIN"
+    # An empty settings argument is the renderer path, not `--settings ''`.
+    assert_eq "empty settings argument -> identical to baseline" \
+        "$(PATH="$FAKE_PATH" cch_launch_cmd "")" "$BASELINE"
+fi
 
 # ---- summary -------------------------------------------------------------
-echo
-printf 'cch-launch-string: %d passed, %d failed\n' "$PASS" "$FAIL"
-if (( FAIL == 0 )); then
-    echo "ALL TESTS PASSED"
-    exit 0
-fi
-exit 1
+summary
