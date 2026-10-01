@@ -31,10 +31,14 @@ expect() {  # expect <name> <condition-exit> [detail]
 # --- fixtures (recorded from E-utilities, trimmed) ---------------------------
 mkdir -p "$TMP/fx" "$TMP/bin"
 cat >"$TMP/fx/esearch.json" <<'EOF'
-{"header":{"type":"esearch","version":"0.3"},"esearchresult":{"count":"16","retmax":"2","retstart":"0","idlist":["36420896","37248244"],"translationset":[],"querytranslation":"\"GENCODE\"[All Fields] AND \"2023\"[All Fields]"}}
+{"header":{"type":"esearch","version":"0.3"},"esearchresult":{"count":"16","retmax":"2","retstart":"0","idlist":["37248244","36420896"],"translationset":[],"querytranslation":"\"GENCODE\"[All Fields] AND \"2023\"[All Fields]"}}
 EOF
 cat >"$TMP/fx/esearch-empty.json" <<'EOF'
 {"header":{"type":"esearch","version":"0.3"},"esearchresult":{"count":"0","retmax":"0","retstart":"0","idlist":[],"translationset":[],"querytranslation":"zzqq","warninglist":{"outputmessages":["No items found."]}}}
+EOF
+# Dropped terms: PubMed still returns hits for the rest of the query.
+cat >"$TMP/fx/esearch-warn.json" <<'EOF'
+{"header":{"type":"esearch","version":"0.3"},"esearchresult":{"count":"2","retmax":"2","retstart":"0","idlist":["37248244","36420896"],"errorlist":{"phrasesnotfound":["zqxjv"],"fieldsnotfound":[]},"warninglist":{"phrasesignored":["the"],"quotedphrasesnotfound":[],"outputmessages":["[badfield"]},"querytranslation":"\"GENCODE\"[All Fields]"}}
 EOF
 cat >"$TMP/fx/esearch-one.json" <<'EOF'
 {"header":{"type":"esearch","version":"0.3"},"esearchresult":{"count":"1","retmax":"1","retstart":"0","idlist":["36420896"],"translationset":[]}}
@@ -75,6 +79,8 @@ case "$url" in
         if [ ! -e "$FX/.tripped" ]; then : >"$FX/.tripped"; code=429; body='{"error":"API rate limit exceeded"}'
         else body=$(cat "$FX/esearch.json"); fi ;;
       doi) body=$(cat "$FX/esearch-one.json") ;;
+      warn) body=$(cat "$FX/esearch-warn.json") ;;
+      429always) code=429; body='{"error":"API rate limit exceeded"}' ;;
       *) body=$(cat "$FX/esearch.json") ;;
     esac ;;
   *esummary.fcgi)
@@ -120,8 +126,10 @@ run search "GENCODE 2023" --limit 2
 expect "exit 0" "$RC" "rc=$RC err=$ERR"
 [ "$(jq -c '.query_sources' <<<"$OUT")" = '["pubmed"]' ]; expect "query_sources == [pubmed]" $?
 n=$(jq '.count' <<<"$OUT"); [ "${n:-0}" -gt 0 ]; expect "count > 0 on a query that must have hits (got ${n:-none})" $?
-[ "$(jq -r '.results[0].pmid' <<<"$OUT")" = 36420896 ]; expect "relevance order kept: first PMID is esearch's first" $?
-jq -e '.results[0] | (.pmid != "" and .doi == "10.1093/nar/gkac1071" and (.title|length) > 0
+# esearch's relevance order (37248244 first) is the reverse of numeric order
+# and of esummary's uids order, so a sort anywhere turns this red.
+[ "$(jq -c '[.results[].pmid]' <<<"$OUT")" = '["37248244","36420896"]' ]; expect "relevance order kept: PMIDs in esearch's order, not numeric or esummary's" $?
+jq -e '.results[] | select(.pmid == "36420896") | (.pmid != "" and .doi == "10.1093/nar/gkac1071" and (.title|length) > 0
         and (.authors|test("Frankish A")) and .year == 2023 and .venue == "Nucleic acids research"
         and .source == "pubmed" and .url == "https://pubmed.ncbi.nlm.nih.gov/36420896/")' <<<"$OUT" >/dev/null
 expect "result carries pmid, doi, title, authors, year, journal" $?
@@ -165,13 +173,43 @@ chmod +x "$TMP/clock/date" "$TMP/clock/sleep"
 export SLEEP_LOG="$TMP/sleep.log"
 paced() {  # paced [env...] -> $SLEEPS: the sleep arguments, space-joined
   : >"$SLEEP_LOG"; rm -f "$LIT_NCBI_PACE_FILE"
-  env "$@" PATH="$TMP/clock:$TMP/bin:$TMP/pybin:$PATH" bash "$LIT" search "GENCODE 2023" >/dev/null 2>&1
+  env "$@" PATH="$TMP/clock:$TMP/bin:$TMP/pybin:$PATH" bash "$LIT" search "GENCODE 2023" >/dev/null 2>&1; RC=$?
   SLEEPS=$(tr '\n' ' ' <"$SLEEP_LOG")
 }
 paced
 [ "$SLEEPS" = "0.350 " ]; expect "keyless: esummary waits 350 ms after esearch (sleeps: '$SLEEPS')" $?
 paced NCBI_API_KEY=k
 [ "$SLEEPS" = "0.110 " ]; expect "keyed: esummary waits 110 ms after esearch (sleeps: '$SLEEPS')" $?
+rm -f "$FX/.tripped"
+paced SHIM_MODE=429once
+[ "$SLEEPS" = "1 0.350 0.350 " ]; expect "429 once: backs off 1 s, then paces the retry and esummary (sleeps: '$SLEEPS')" $?
+: >"$CURL_LOG"
+paced SHIM_MODE=429always
+[ "$SLEEPS" = "1 0.350 2 0.350 " ] && [ "$(calls esearch.fcgi)" -eq 3 ] && [ "$RC" != 0 ]
+expect "429 always: exactly 3 attempts, backoff 1 s then 2 s, no wait after the last (sleeps: '$SLEEPS')" $?
+# Clock skew: a pace file stamped far in the future must cost one gap, not
+# the whole distance (and never a malformed sleep argument).
+: >"$SLEEP_LOG"; echo 1800000000000 >"$LIT_NCBI_PACE_FILE"
+PATH="$TMP/clock:$TMP/bin:$TMP/pybin:$PATH" bash "$LIT" search "GENCODE 2023" >/dev/null 2>&1
+SLEEPS=$(tr '\n' ' ' <"$SLEEP_LOG")
+[ "$SLEEPS" = "0.350 0.350 " ]; expect "future-stamped pace file: waits one gap, not the skew (sleeps: '$SLEEPS')" $?
+
+# Cross-process pacing: while another process holds the pace lock, no
+# request may go out. Real clock here; hold the lock for 3 s (start-up
+# alone can take ~0.8 s, so the threshold leaves a wide margin).
+if command -v flock >/dev/null 2>&1; then
+  rm -f "$LIT_NCBI_PACE_FILE"; : >"$CURL_LOG"
+  ( flock 9; sleep 3 ) 9>>"$LIT_NCBI_PACE_FILE.lock" &
+  holder=$!; sleep 0.2
+  start=$(( $(date +%s%N) / 1000000 ))
+  PATH="$TMP/bin:$TMP/pybin:$PATH" bash "$LIT" search "GENCODE 2023" >/dev/null 2>&1
+  wait "$holder"
+  first=$(awk 'NR==1{print $1}' "$CURL_LOG")
+  [ -n "$first" ] && [ $(( first - start )) -ge 2000 ]
+  expect "pace lock held by another process -> first request waits for it ($(( ${first:-0} - start )) ms)" $?
+else
+  echo "  SKIP cross-process lock check: no flock on this host"
+fi
 
 echo "-- search: failures are loud, never a silent empty success --"
 SHIM_MODE=badsummary run search "GENCODE 2023"
@@ -184,6 +222,15 @@ grep -q 'API key invalid' <<<"$ERR"; expect "HTTP 400 -> NCBI's error message su
 SHIM_MODE=429once run search "GENCODE 2023"
 expect "HTTP 429 once -> retried and succeeded" "$RC" "rc=$RC err=$ERR"
 [ "$(calls esearch.fcgi)" -eq 2 ]; expect "HTTP 429 once -> exactly 2 esearch calls" $?
+SHIM_MODE=warn run search "zqxjv the GENCODE[badfield"
+expect "dropped terms -> still exit 0 with hits" "$RC" "rc=$RC"
+jq -e '.warnings == ["pubmed: phrase not found: zqxjv","pubmed: phrase ignored: the","pubmed: message: [badfield"]
+       and .pubmed_query_translation == "\"GENCODE\"[All Fields]"' <<<"$OUT" >/dev/null
+expect "dropped terms -> warnings + pubmed_query_translation in JSON" $?
+grep -q 'phrase not found: zqxjv' <<<"$ERR" && grep -q 'query ran as: "GENCODE"\[All Fields\]' <<<"$ERR"
+expect "dropped terms -> stderr note names the term and the translated query" $?
+run search "GENCODE 2023"
+[ "$(jq -c '.warnings' <<<"$OUT")" = '[]' ]; expect "clean query -> warnings []" $?
 SHIM_MODE=empty run search "zzqq"
 expect "genuinely empty query -> exit 0" "$RC" "rc=$RC"
 [ "$(jq '.count' <<<"$OUT")" -eq 0 ] && [ "$(calls esummary.fcgi)" -eq 0 ]

@@ -155,6 +155,12 @@ Every result has the same fields whatever its backend: `source`, `id`,
 `pmid`, `title`, `authors`, `year`, `venue` (the journal, for PubMed), `doi`,
 `citations` (null for PubMed), `url`, `in_library`.
 
+PubMed drops a query term it cannot match and still returns hits for the
+rest, so a typo silently broadens the query. `ng lit` reports each dropped or
+ignored term as a stderr note, and in the JSON output as `warnings` (a list,
+empty when clean) and `pubmed_query_translation` (the query PubMed actually
+ran). Check `warnings` before you trust a result set.
+
 ```console
 $ ng lit search "GENCODE reference annotation" --source pubmed --limit 1 --human
 Found 1 papers (sources: pubmed)

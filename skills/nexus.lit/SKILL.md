@@ -43,6 +43,8 @@ ng lit setup                                     # key-acquisition references
   PubMed, use `--source s2` (needs an S2 key). `--source all` queries
   every backend you have. PubMed's query syntax applies: field tags such
   as `[tiab]` and `[au]`, and `AND`/`OR`, work in the query string.
+  PubMed silently drops a term it cannot match. Read the `warnings` field
+  (and the stderr note) before you trust the hits.
 - **Grow the library** — `ng lit add <DOI|PMID>` fetches metadata
   (with the abstract, for PubMed) and appends a record. Add the papers
   you end up relying on so the library (and future dedup) stays current.
