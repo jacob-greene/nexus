@@ -504,20 +504,80 @@ _over_limit_window() {
     fi
     printf '%s\n' "$body" \
         | grep -v '^[[:space:]]*$' \
-        | tail -n "$OVER_LIMIT_SCAN_ROWS"
+        | tail -n "$OVER_LIMIT_SCAN_ROWS" \
+        | _over_limit_drop_quoted_source
+}
+
+# PROVENANCE filter over the window: drop rows that are QUOTED SOURCE
+# TEXT rather than a notice the renderer painted.
+#
+# Why this exists. On 2026-09-10 at 23:15 PDT the running watcher armed
+# a real 20.7 h hold against a live, working window. Nothing was
+# limited. The window was an agent editing THIS detector, and the
+# file-edit tool had rendered its own diff onto the pane:
+#
+#       334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+#
+# The scrape read that as a painted notice. The stored token was
+# `3am_America/Los_Angeles"` — the trailing double quote is the source
+# line's closing quote, and it is the byte-exact proof of provenance.
+#
+# The positional anchor above is a POSITIONAL defence, and this input
+# defeats it: an ordinary tool render puts the text inside the window
+# with nobody doing anything unusual. So the window also needs a
+# PROVENANCE defence. Three shapes are dropped, each measured against a
+# real captured pane, never invented:
+#
+#   1. A line-number gutter — `334 +`, `107:`, `551 +#`. Emitted by the
+#      file-edit diff render, by `Read`, and by `grep -n`. A painted
+#      notice never starts with a line number.
+#   2. A quote character BEFORE the headline on the same line — the
+#      shell-assertion and markdown-quote shapes. The class is the
+#      three ASCII quotes: `"`, a backtick, and `'`.
+#
+#      The single quote was added on jacob-greene/nexus#79. PR #174
+#      rewrote the three known single-quoted rows in
+#      `docs/reference/dependency-surface.md` to use backticks, which
+#      closed those three instances but left the CLASS narrow. A
+#      single-quoted notice on a pane whose text this repository did
+#      not author still classified.
+#
+#      WHY THE APOSTROPHE IN "You've" SURVIVES THIS. The rule is
+#      positional, not glyph-based: the prefix `^[^"`']*` cannot cross
+#      a quote character, so the quote the rule matches is always the
+#      FIRST quote on the row, and the headline must start AFTER it.
+#      On a painted notice the first quote IS the apostrophe in
+#      "You've", and no second headline follows it, so the row is
+#      kept. On a quoted source row the first quote is the opening
+#      delimiter and the headline follows, so the row is dropped.
+#      The five true-positive fixtures and the eight over-limit
+#      assertions were measured before and after this widening; all
+#      were unchanged.
+#   3. A bare diff or bullet marker at the start of the line (`+ `,
+#      `- `) — the unquoted diff-render shape.
+#
+# This narrows the false-positive surface; it does not close it. A
+# window that paints the notice verbatim with no quote, no gutter and
+# no marker still classifies. That residue is the same bounded one the
+# anchor comment describes, and it is tracked on jacob-greene/nexus#79.
+_over_limit_drop_quoted_source() {
+    grep -vE '^[[:space:]]*[0-9]+[[:space:]]*[:+-]' \
+        | grep -vE "^[^\"\`']*[\"\`'].*You.{0,3}ve (hit|reached) your" \
+        | grep -vE '^[[:space:]]*[-+][[:space:]]'
 }
 
 # Anchor the over-limit notice on the last OVER_LIMIT_SCAN_ROWS
 # non-blank rows above the input box. The
-# canonical text Claude Code renders is:
+# canonical text Claude Code renders is (QUOTED on purpose — see the
+# note in the `_OVER_LIMIT_HEADLINE_RE` block below):
 #
-#     You've hit your limit · resets 3am (America/Los_Angeles)
-#     /extra-usage to finish what you're working on.
+#     "You've hit your limit · resets 3am (America/Los_Angeles)"
+#     "/extra-usage to finish what you're working on."
 #
 # but the headline VARIES by limit flavor — the 2026-07-14 incident
 # (your-org/nexus-code, over-limit emits) rendered
 #
-#     You've hit your weekly limit · resets 3am (America/Los_Angeles)
+#     "You've hit your weekly limit · resets 3am (America/Los_Angeles)"
 #
 # and the exact-substring match on "You've hit your limit" silently
 # missed it, disabling the whole watcher-side hold. The match is now
@@ -526,8 +586,10 @@ _over_limit_window() {
 # apostrophe glyph (the TUI has rendered both ' and ’ historically —
 # the pattern anchors on "ve" and skips the apostrophe entirely).
 #
-# Detection still requires BOTH the headline AND a "resets <time>"
-# companion inside `_over_limit_window`. The position anchor is
+# Detection requires the headline, and then EITHER a "resets <time>"
+# companion OR a sentence-final full stop on the headline line itself
+# (see `_detect_over_limit` for the condition and its rationale), all
+# inside `_over_limit_window`. The position anchor is
 # load-bearing: a transcript scrollback that paraphrases or quotes
 # the notice elsewhere in the pane would otherwise false-trigger
 # (issue #87 edge case). The companion-line requirement defends
@@ -537,13 +599,79 @@ _over_limit_window() {
 # (positional defense only); the consequence is bounded by design —
 # the watcher's hold is capped by the parsed reset time (6h fallback)
 # and fails open with a paste, never latching (_over_limit.sh).
+
+# The headline pattern, factored out so the completeness test in
+# `_detect_over_limit` can reuse it verbatim.
 #
-# The REGEXES below are unchanged from the fixed-`tail -n 15` version.
-# The notice text is intact on cc 2.1.260; only its position moved.
+# Two widenings over the 2.1.220-era pattern
+# (`You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit`), both
+# forced by the cc 2.1.268 budget-exhaustion family
+# (jacob-greene/nexus#173). The three forms are QUOTED below, and the
+# quotes are load-bearing, not decoration — see the note after them:
+#
+#     "You've hit your team's shared budget. Switch to another model to continue."
+#     "You've hit your team's shared budget. /model to switch models."
+#     "You've hit your team's shared budget. Run /usage-credits to raise it …"
+#
+# Those three lines must stay quoted. Unquoted, they are bare notices
+# with no gutter and no marker, so no rule in
+# `_over_limit_drop_quoted_source` drops them, and an agent that `cat`s
+# this file onto its pane classifies over-limit off this comment block.
+# That is the failure this file exists to prevent, and it was measured
+# here, not imagined: unquoted these rows classify `over-limit`, quoted
+# they classify `absent`. A `#   - ` prefix does NOT fix it — the
+# comment's own `#` precedes the marker, so the marker rule never fires.
+#
+#   1. The flavor tokens are any non-space run, not `[[:alnum:]-]`.
+#      "team's" carries an apostrophe, which is not alnum, so the old
+#      class rejected the headline outright. Putting the glyph in the
+#      class is an encoding trap — the TUI has rendered both ' and ’,
+#      and a multibyte ’ inside a bracket expression is byte-dependent.
+#      The pattern therefore skips over the glyph, exactly as the
+#      "You.{0,3}ve" prefix already does for the same reason.
+#   2. The noun is (limit|budget). The 2.1.268 family never uses the
+#      word "limit" at all.
+#
+# The anchor — "You<apostrophe>ve hit/reached your" — is what keeps the
+# widening safe. It is a fixed 4-token phrase; the widened parts are
+# only the <=2 flavor tokens and the final noun.
+_OVER_LIMIT_HEADLINE_RE="You.{0,3}ve (hit|reached) your ([^[:space:]]+ ){0,2}(limit|budget)"
+
 _detect_over_limit() {
     local plain="$1" bottom
     bottom=$(_over_limit_window "$plain")
-    grep -qE "You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit" <<<"$bottom" || return 1
+    grep -qE "$_OVER_LIMIT_HEADLINE_RE" <<<"$bottom" || return 1
+
+    # Companion requirement, CONDITIONAL.
+    #
+    # THE CONDITION: the "resets <time>" companion is waived only when
+    # the headline line ENDS THE SENTENCE — a full stop immediately
+    # after the limit/budget noun, on that same line. Matching
+    # `<headline>\.` in one regex makes "same line" structural, not a
+    # second grep that any other line in the window could satisfy.
+    #
+    # WHY THAT CONDITION: the companion exists to reject a
+    # HALF-RENDERED notice — the renderer painted the headline but not
+    # yet the rest. The canonical notice puts the reset time on the
+    # SAME line, after a "·" separator, so a half-painted canonical
+    # headline stops mid-line with no terminator at all ("You've hit
+    # your weekly limit" and nothing more). A full stop is positive
+    # evidence that the renderer finished the sentence, which is the
+    # thing the companion was standing in for. So the canonical forms
+    # keep their companion requirement and the notices that are
+    # complete WITHOUT a reset time are admitted.
+    #
+    # This also fixes a case that PREDATES 2.1.268: "You've hit your
+    # monthly spend limit." matches the headline but carries no reset
+    # time, so the unconditional companion left it undetected.
+    #
+    # A notice admitted on this branch has no reset time to extract,
+    # so `_extract_over_limit_reset` returns empty and the caller
+    # emits reset_at=unknown. The watcher then holds on its bounded 6h
+    # fallback (_over_limit.sh) — shorter coverage than a parsed
+    # reset, but a hold, where today there is none.
+    grep -qE "${_OVER_LIMIT_HEADLINE_RE}\." <<<"$bottom" && return 0
+
     grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$bottom" || return 1
     return 0
 }
@@ -1496,6 +1624,64 @@ _emit_over_limit_from_stamp() {
     emit over-limit "reset_at=$reset_at"
 }
 
+# Resolve a stamp's own `reset_at` token to an epoch, relative to the
+# instant the stamp was WRITTEN.
+#
+# This deliberately mirrors `_over_limit_reset_at_to_epoch` in
+# `monitor/watcher/_over_limit.sh`. pane-state.sh sources nothing, by
+# design, so the two are separate copies. `test-pane-state.sh` pins
+# them to the same answers over a shared token table, so a change to
+# one that is not made to the other fails the suite.
+#
+# One semantic difference, and it is deliberate. The watcher's copy
+# resolves "3am" against TODAY, because it re-reads a live notice. A
+# stamp can be a day old and its token is a bare wall-clock string with
+# no date, so this copy resolves against the stamp's own `ts`.
+# Resolving a 28h-old stamp against today would name an instant the
+# notice never described. That is the trap the DEADLINE FREEZE guard
+# closes on the watcher side.
+#
+# Prints nothing and returns 1 when the token is missing, is `unknown`,
+# names a timezone that does not resolve, or does not parse. Every one
+# of those cases leaves the TTL as the only bound, which is the
+# behaviour that shipped before.
+_over_limit_stamp_tz_resolves() {
+    local tz="$1" dir
+    [[ -n "$tz" ]] || return 1
+    [[ "$tz" =~ ^[A-Za-z0-9_+/.-]+$ ]] || return 1
+    [[ "$tz" != *..* ]] || return 1
+    dir="${TZDIR:-/usr/share/zoneinfo}"
+    [[ -d "$dir" ]] || return 0
+    [[ -f "$dir/$tz" ]]
+}
+
+_over_limit_stamp_reset_epoch() {
+    local token="$1" ts="$2" time_part tz_part day epoch
+    [[ -n "$token" && "$token" != "unknown" && "$token" != "null" ]] || return 1
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$token" == *_* ]]; then
+        time_part="${token%%_*}"
+        tz_part="${token#*_}"
+    else
+        time_part="$token"
+        tz_part=""
+    fi
+    if [[ -n "$tz_part" ]]; then
+        _over_limit_stamp_tz_resolves "$tz_part" || return 1
+        day=$(TZ="$tz_part" date -d "@$ts" +%Y-%m-%d 2>/dev/null) || return 1
+        [[ -n "$day" ]] || return 1
+        epoch=$(TZ="$tz_part" date -d "$day $time_part" +%s 2>/dev/null)
+    else
+        day=$(date -d "@$ts" +%Y-%m-%d 2>/dev/null) || return 1
+        [[ -n "$day" ]] || return 1
+        epoch=$(date -d "$day $time_part" +%s 2>/dev/null)
+    fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    # The reset named by a notice is always AFTER the notice.
+    (( epoch <= ts )) && epoch=$(( epoch + 86400 ))
+    printf '%d' "$epoch"
+}
+
 # Anti-latch TTL on the hook-written stamp. The stamp's cleanup
 # contract is "the Stop hook on the next successful turn removes it"
 # — but a pane whose settings lost the Stop entry (respawn with stale
@@ -1506,11 +1692,32 @@ _emit_over_limit_from_stamp() {
 # treated as expired — ignored and best-effort deleted, falling
 # through to the renderer detection, which re-detects a GENUINE
 # ongoing suspension from the live pane text.
+#
+# THE STAMP'S OWN `reset_at` IS THE PRIMARY BOUND (jacob-greene/nexus#79).
+# The TTL used to be the only rule, so a stamp whose stated reset had
+# passed an hour ago kept suppressing for the rest of 27h. Measured on
+# 2026-08-24: three stamps all named a 7:10pm reset, all were 27 minutes
+# past it, none expired, and one of the three windows was visibly
+# running a tool call. The TTL is the wrong instrument for that, because
+# it measures the stamp's AGE and the question is whether the suspension
+# the stamp describes is over.
+#
+# Two bounds now, either sufficient:
+#   (a) the stamp's own reset, plus a grace — when `reset_at` parses.
+#   (b) the 27h TTL — the backstop, and the only bound when `reset_at`
+#       is absent, `unknown`, or unparseable.
+#
+# The grace exists because the reset instant is the earliest the pane
+# can resume, not the instant it does. It defaults to 1800s, the same
+# floor the watcher's `_over_limit_grace_default` uses, so both sides of
+# the system forgive the same overrun.
 # Returns 0 when the stamp is expired (caller skips it).
 _over_limit_stamp_expired() {
-    local f="$1" now ts ttl
+    local f="$1" now ts ttl grace token reset_epoch
     ttl="${MONITOR_OVER_LIMIT_STAMP_TTL_SECONDS:-97200}"
     [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=97200
+    grace="${MONITOR_OVER_LIMIT_STAMP_GRACE_SECONDS:-1800}"
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=1800
     now="${now_override:-$(date +%s)}"
     ts=""
     if command -v jq >/dev/null 2>&1; then
@@ -1522,6 +1729,19 @@ _over_limit_stamp_expired() {
         ts=$(date +%s -r "$f" 2>/dev/null) || ts=""
     fi
     [[ "$ts" =~ ^[0-9]+$ ]] || return 0  # unreadable ⇒ treat as expired (fail open)
+    # (a) The stamp's own stated reset. Same normalisation the emit path
+    #     uses, so both read one token shape.
+    if command -v jq >/dev/null 2>&1; then
+        token=$(jq -r '.reset_at // empty' "$f" 2>/dev/null)
+        if [[ -n "$token" ]] && [[ "$token" != "null" ]]; then
+            token=$(printf '%s' "$token" | tr -d '()' | tr -s '[:space:]' '_' | sed 's/_*$//')
+            token="${token:0:40}"
+            if reset_epoch=$(_over_limit_stamp_reset_epoch "$token" "$ts"); then
+                (( now > reset_epoch + grace )) && return 0
+            fi
+        fi
+    fi
+    # (b) Backstop.
     (( now - ts > ttl ))
 }
 

@@ -94,15 +94,30 @@ cch_skip_if_disabled() {
 }
 
 # Resolve the claude binary. Honors CLAUDE_BIN (the pre-update gate sets
-# this to a candidate-version install in a throwaway prefix); else the
-# project-local install. Echoes the path; rc=1 if none found.
+# this to a candidate-version install in a throwaway prefix); else
+# whatever monitor/_claude-bin.sh resolves. Echoes the path; rc=1 if none
+# found.
+#
+# Going through the shared resolver matters here: on a nexus pinned to a
+# native install (config `nexus.claude_bin`) there is no npm tree, so the
+# old direct test found nothing and EVERY harness scenario self-skipped —
+# a gate that quietly stops gating is worse than one that fails.
 cch_resolve_claude() {
     if [[ -n "${CLAUDE_BIN:-}" ]] && [[ -x "$CLAUDE_BIN" ]]; then
         printf '%s' "$CLAUDE_BIN"; return 0
     fi
-    local local_bin="$CCH_REPO_ROOT/node_modules/.bin/claude"
-    if [[ -x "$local_bin" ]]; then
-        printf '%s' "$local_bin"; return 0
+    local resolved
+    resolved=$(
+        # A set-but-unusable CLAUDE_BIN already failed the -x test above;
+        # clear it so the resolver does not hand it straight back.
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$CCH_REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$CCH_REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+            && printf '%s' "$CLAUDE_BIN"
+    ) || resolved=""
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+        printf '%s' "$resolved"; return 0
     fi
     return 1
 }
@@ -223,6 +238,9 @@ cch_control() {
 # Duplicated launch flags drift silently from the production spawn flags,
 # so a scenario ends up gating a boot the watcher never performs.
 #
+#   cch_launch_cmd                  renderer path, no --settings
+#   cch_launch_cmd <settings-file>  adds `--settings <file>`
+#
 # env -i gives a hermetic child: only the vars claude needs. PATH must
 # carry node (claude is a node program) — pass the harness PATH through.
 # ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY avoids the
@@ -248,12 +266,17 @@ cch_control() {
 # The knob is read at call time, not at source time, so a scenario may
 # boot a default worker and a prompting worker in the same run.
 cch_launch_cmd() {
-    # A separate `%s` tail rather than a literal inside the format string:
-    # with CCH_SKIP_PERMISSIONS unset the expansion is byte-for-byte the
-    # pre-knob string. monitor/test-cch-launch-string.sh proves
-    # that against the flag's construction site at c9c07bc.
-    local skip_flag=' --dangerously-skip-permissions'
-    [[ "${CCH_SKIP_PERMISSIONS:-1}" == "0" ]] && skip_flag=''
+    local settings="${1:-}"
+    # The flags go in a separate `%s` tail rather than as literals inside
+    # the format string. With no settings file and CCH_SKIP_PERMISSIONS
+    # unset, the expansion is byte-for-byte the pre-knob string;
+    # monitor/test-cch-launch-string.sh proves that against the flag's
+    # construction site at c9c07bc. With a settings file the tail is
+    # ` --settings <file> --dangerously-skip-permissions`, the shape the
+    # hook (2d) and VI-paste (2c) scenarios were written against.
+    local flags=""
+    [[ -n "$settings" ]] && printf -v flags -- ' --settings %q' "$settings"
+    [[ "${CCH_SKIP_PERMISSIONS:-1}" == "0" ]] || flags+=' --dangerously-skip-permissions'
     local launch
     printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
 ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
@@ -262,24 +285,30 @@ DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
 TERM=%q %q%s' \
         "$CCH_CFG" "$PATH" "$CCH_CFG" \
         "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" \
-        "$CLAUDE_BIN" "$skip_flag"
+        "$CLAUDE_BIN" "$flags"
     printf '%s' "$launch"
 }
 
 # Boot the real claude in a new tmux window against the mock. Echoes the
-# new window's index. Renderer-path only (no --settings hooks) so this
-# exercises pane-state's renderer classification; a heartbeat-substrate
-# variant is a documented follow-up.
+# new window's index.
 #
-#   cch_boot_worker <window-name> [workdir]
+#   cch_boot_worker <name>                            renderer path
+#   cch_boot_worker <name> <settings-file>            boots WITH --settings
+#   cch_boot_worker <name> <settings-file|""> <workdir>
+#
+# The one-argument form is the renderer path: it carries no hooks and no
+# settings keys, so it exercises pane-state's renderer classification
+# only. Pass a settings file when the scenario needs a contract that
+# lives in settings — the hook events (2d) or the VI editor mode (2c).
 #
 # `workdir` defaults to $CCH_WORKDIR, the pre-trusted project dir. A
 # scenario that needs a different cwd (an untrusted nested repo, say)
-# passes it here instead of rebuilding the launch string.
+# passes it here instead of rebuilding the launch string. Pass "" as the
+# settings file to keep the renderer path.
 cch_boot_worker() {
-    local name="$1" workdir="${2:-$CCH_WORKDIR}"
+    local name="$1" settings="${2:-}" workdir="${3:-$CCH_WORKDIR}"
     local launch
-    launch=$(cch_launch_cmd)
+    launch=$(cch_launch_cmd "$settings")
 
     cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$workdir" "$launch"
     local idx
@@ -729,6 +758,36 @@ wait_for() {
         "$label" "$max" "$attempts" >&2
     printf '         last cmd: %s\n' "$*" >&2
     : "${FAIL:=0}"; FAIL=$(( FAIL + 1 )); return 1
+}
+
+# Same as wait_for but inverted: succeeds when the predicate STAYS false
+# for the whole window. Mirrors _harness.sh:220, which this library's
+# header has always claimed to mirror; the absence is why a scenario
+# hand-rolled a bare `sleep` before a negative assertion (skeptic pass on
+# Claude Code 2.1.273).
+#
+# A CAUTION that the missing function cost once: a negative assertion
+# bounded by a timer is only as sound as the timer. If the event you
+# assert absent is asynchronous, prefer a positive barrier — wait for a
+# later event that ORDERS after it (a turn-end Stop hook, say) and only
+# then assert absence. Use hold_false when the window itself is the
+# contract ("must stay idle for N seconds"), not as a substitute for a
+# barrier you can observe.
+hold_false() {
+    local label="$1" duration="$2"; shift 2
+    [[ "$1" == "--" ]] || { echo "hold_false: missing -- separator" >&2; return 2; }
+    shift
+    local deadline=$(( $(date +%s) + duration ))
+    while (( $(date +%s) < deadline )); do
+        if "$@" >/dev/null 2>&1; then
+            printf '  FAIL: %s — predicate became true mid-window\n' "$label" >&2
+            printf '         cmd: %s\n' "$*" >&2
+            : "${FAIL:=0}"; FAIL=$(( FAIL + 1 )); return 1
+        fi
+        sleep 0.25
+    done
+    printf '  PASS: %s (held for %ds)\n' "$label" "$duration"
+    : "${PASS:=0}"; PASS=$(( PASS + 1 )); return 0
 }
 
 # Predicate helper: pane state equals expected.

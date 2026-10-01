@@ -38,6 +38,34 @@ nexus:
   # See <your-org>/<other-nexus>#41.
   node_module: nodejs
 
+  # Absolute path to a Claude Code binary OUTSIDE this repo — the escape
+  # hatch for an operator who runs the NATIVE Claude Code install rather
+  # than the npm one. LEAVE UNSET (the default) to use the npm install
+  # managed by monitor/install-claude-local.sh; the whole npm path below
+  # is untouched when this key is absent.
+  #
+  # When set, monitor/_claude-bin.sh resolves $CLAUDE_BIN to this path
+  # for EVERY spawn surface (workers, the orchestrator respawn, the
+  # watcher, claude-loop, the cc-harness), and locals/bin/claude is
+  # linked to it so PATH-based resolution agrees. It outranks
+  # node_modules/.bin/claude on purpose: a re-appearing npm tree must not
+  # be able to silently take the workspace back off the operator's
+  # choice. Only the CLAUDE_BIN env var wins over it.
+  #
+  # Two consequences worth knowing before you set it:
+  #   - monitor/install-claude-local.sh REFUSES to run (it would leave an
+  #     unused node_modules behind). Override: CLAUDE_INSTALL_ALLOW_PINNED=1.
+  #   - the autonomous cc-update routine (monitor/cc-auto-update-apply.sh)
+  #     REFUSES to apply a bump (exit 32): it bumps by npm install, which
+  #     cannot move a native binary. Keep the native install current
+  #     yourself; the cc-harness gate still runs against whatever this
+  #     names.
+  # A path that is set but not executable is a FATAL error at every spawn
+  # surface — deliberately, so a typo cannot degrade into "quietly ran a
+  # different claude than you asked for". `~` expands to $HOME.
+  # Env var CLAUDE_BIN wins over this key.
+  # claude_bin: ~/.local/bin/claude
+
 github:
   # GitHub login of the single authorised user. Every script treats
   # comments by this user as directives; nobody else can drive the bot.
@@ -130,11 +158,12 @@ github:
 
 lit:
   # Literature-research tool (`ng lit`). Content-relevance paper discovery
-  # over Semantic Scholar (S2) and ASTA, deduped against the reference
-  # library. Both keys are OPTIONAL: an unconfigured backend is skipped
-  # with a note (never a hang). With neither configured, `ng lit` prints
-  # setup references and exits. Full setup + key-acquisition walkthrough:
-  # docs/reference/literature.md.
+  # over PubMed (NCBI E-utilities), Semantic Scholar (S2) and ASTA, deduped
+  # against the reference library. PubMed needs NO key and is the default
+  # backend when neither S2 nor ASTA is configured, so `ng lit search` works
+  # out of the box. The S2/ASTA keys are OPTIONAL: an unconfigured keyed
+  # backend is skipped with a note (never a hang). Full setup +
+  # key-acquisition walkthrough: docs/reference/literature.md.
   #
   # config/nexus.yml is gitignored, so inlining the keys here is safe; you
   # may also export S2_API_KEY / ASTA_API_KEY in the environment (env wins).
@@ -143,6 +172,15 @@ lit:
   s2_api_key: ""
   # ASTA / Allen AI key: request via the ASTA program (see the docs page).
   asta_api_key: ""
+  # PubMed (NCBI E-utilities). All three are optional; env vars win.
+  # NCBI API key (NCBI_API_KEY): raises the NCBI limit from 3 to 10
+  # requests/s. Free, from https://account.ncbi.nlm.nih.gov/settings/
+  ncbi_api_key: ""
+  # Contact address sent as `email=` (NCBI_EMAIL). NCBI asks E-utilities
+  # callers for one so it can reach you before blocking abusive traffic.
+  ncbi_email: ""
+  # Sent as `tool=` (NCBI_TOOL). Default: nexus-lit.
+  # ncbi_tool: nexus-lit
   # Reference library (JSONL). Default: <nexus.root>/.bipartite/refs.jsonl.
   # Point this at a path inside your asset repo to version the library.
   # library_path: ~/path/to/refs.jsonl

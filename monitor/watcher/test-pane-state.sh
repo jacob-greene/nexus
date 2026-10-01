@@ -34,6 +34,14 @@
 #
 # Run: bash monitor/watcher/test-pane-state.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
+#
+# Skip accounting (jacob-greene/nexus#182). The summary line reports four
+# numbers: pass, fail, skip, missing fixture. A skip is an assertion the
+# environment cannot run, for example when tmux or python3 is absent. A
+# missing fixture is a file listed in `fixtures/MANIFEST` but absent from
+# the working tree, which is a broken checkout and is always fatal. Set
+# PANE_STATE_ALLOW_MISSING_FIXTURES=1 to exit 0 anyway; the banner then
+# reads PASSED WITH N MISSING FIXTURE(S), never ALL TESTS PASSED.
 
 set -uo pipefail
 
@@ -44,6 +52,50 @@ FIX_DIR="$_test_dir/fixtures"
 
 PASS=0
 FAIL=0
+SKIP=0
+MISSING=0
+MISSING_FIXTURES=()
+
+# WHY THIS EXISTS (jacob-greene/nexus#182):
+#
+#     A fixture guard written as a bare `if [[ -f "$fixture" ]]` with no
+#     `else` runs fewer assertions when the file is gone, prints nothing,
+#     and leaves FAIL at zero. The suite then reports `ALL TESTS PASSED`
+#     at exit 0 on a broken checkout. Measured at 7c2c466: 21 of the 30
+#     tracked fixtures could be deleted one at a time and every run still
+#     exited 0 with that banner. The reported total fell from 144 to as
+#     low as 141 and no line said why.
+#
+#     PR #179 closed the same class at two sites in this file — the
+#     PermissionRequest heartbeat block and the `_over_limit.sh`
+#     sourceability probe. The helpers below close the residue.
+#
+# `need_fixture` is for a TRACKED fixture: a file committed to the repo,
+# whose absence is a broken checkout and never a normal condition. It is
+# always an error. `skip_test` is for an assertion the ENVIRONMENT cannot
+# run (no python3, no tmux) or a fixture deliberately exempt from prefix
+# classification. Those are counted and reported, but are not fatal.
+need_fixture() {
+    local path="$1" label="${2:-dependent assertions not run}" base seen=0 m
+    base=$(basename "$path")
+    [[ -f "$path" ]] && return 0
+    for m in ${MISSING_FIXTURES[@]+"${MISSING_FIXTURES[@]}"}; do
+        [[ "$m" == "$base" ]] && { seen=1; break; }
+    done
+    if (( ! seen )); then
+        MISSING_FIXTURES+=("$base")
+        MISSING=$(( MISSING + 1 ))
+    fi
+    # Printed at EVERY site, so the operator sees each consequence of the
+    # one absence. Counted once, so the summary counts files not sites.
+    printf '  MISSING FIXTURE: %s — %s\n' "$base" "$label" >&2
+    return 1
+}
+
+skip_test() {
+    SKIP=$(( SKIP + 1 ))
+    printf '  SKIP: %s\n' "$1"
+}
 
 assert_state() {
     local fixture="$1" want="$2"
@@ -80,19 +132,154 @@ expected_state_for() {
     esac
 }
 
+# Fixtures deliberately exempt from filename-prefix classification. Their
+# expected state depends on flags the loop below does not pass (--bg-shells,
+# --bg-cpu, --heartbeat-file), so a bare classification would be wrong. Each
+# is asserted in its own flag-specific block further down. Any OTHER
+# unrecognised name is a naming mistake, not an exemption, and must fail:
+# before this list existed, a new fixture with a misspelled prefix was
+# never classified and never reported.
+PREFIX_EXEMPT=(
+    input-text-bare-dim-synthetic.ansi
+    working-background-bgbash-synthetic.ansi
+    working-background-monitor-synthetic.ansi
+    working-background-shell-realfooter.ansi
+    working-background-spurious-shell-footer-synthetic.ansi
+)
+
+prefix_exempt() {
+    local base="$1" e
+    for e in "${PREFIX_EXEMPT[@]}"; do
+        [[ "$e" == "$base" ]] && return 0
+    done
+    return 1
+}
+
 [[ -x "$HELPER" ]] || { echo "helper not executable: $HELPER" >&2; exit 1; }
 [[ -d "$FIX_DIR" ]] || { echo "fixtures dir missing: $FIX_DIR" >&2; exit 1; }
 
+# The classification loop below iterates a GLOB. A tracked fixture that is
+# simply gone is therefore not in the glob: it contributes no assertion and
+# no message, and the reported total falls in silence. `fixtures/MANIFEST`
+# is the checked-in list of what MUST be there, and this block pins the glob
+# to it in BOTH directions before anything else runs.
+#
+# WHY A FILE AND NOT THE GIT INDEX (#182, skeptic finding 1): an earlier
+# revision of this block read `git ls-files`. That reports a count, it does
+# not pin one. `git rm <fixture>` drops the name from the index and the
+# working tree together, so the count fell from 30 to 29 and agreed with
+# itself; the suite ran one assertion fewer at exit 0 under ALL TESTS
+# PASSED. A tracked manifest cannot be defeated that way, and it needs no
+# git, so an export or a tarball is accounted for too.
+#
+# WHY A NUMBER AND NOT ONLY THE FILE (#185, skeptic findings F1 and F2): the
+# manifest pins WHICH fixtures must exist. On its own it does not pin HOW
+# MANY. Delete a fixture from disk and its line from the manifest in one
+# edit, and both directions below still agree with each other — at 29 names
+# instead of 30 — so one assertion is lost at exit 0 under ALL TESTS PASSED.
+# A duplicated line is accepted the same way, at 31 names and one name
+# checked twice. Both were measured at bed49ac. The count the block printed
+# was compared to nothing, so it could not be read as a set size.
+#
+# MANIFEST_EXPECTED_FIXTURES is the pin. It is deliberately in THIS file and
+# not in the manifest, so that changing the fixture set is a three-file edit
+# and the third file is the one a reviewer reads as a number. Bump it in the
+# same commit that adds or removes a fixture; if you forget, the suite fails
+# and prints both the number it found and the number it wanted.
+MANIFEST_EXPECTED_FIXTURES=30
+
+echo "=== tracked-fixture manifest ==="
+MANIFEST_FILE="$FIX_DIR/MANIFEST"
+if [[ -f "$MANIFEST_FILE" ]]; then
+    manifest_names=()
+    manifest_dupes=()
+    while IFS= read -r _line; do
+        _line="${_line%%#*}"
+        _line="${_line//[[:space:]]/}"
+        [[ -n "$_line" ]] || continue
+        for _seen in ${manifest_names[@]+"${manifest_names[@]}"}; do
+            [[ "$_seen" == "$_line" ]] && { manifest_dupes+=("$_line"); break; }
+        done
+        manifest_names+=("$_line")
+        need_fixture "$FIX_DIR/$_line" "listed in fixtures/MANIFEST, absent from the working tree"
+    done < "$MANIFEST_FILE"
+
+    if (( ${#manifest_names[@]} > 0 )); then
+        printf '  PASS: fixtures/MANIFEST lists %d fixtures\n' "${#manifest_names[@]}"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: fixtures/MANIFEST lists no fixtures\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # The length pin. Closes the coordinated fixture-plus-line deletion.
+    if (( ${#manifest_names[@]} == MANIFEST_EXPECTED_FIXTURES )); then
+        printf '  PASS: fixtures/MANIFEST length matches the pinned count of %d\n' \
+            "$MANIFEST_EXPECTED_FIXTURES"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: fixtures/MANIFEST lists %d fixtures, pinned count is %d — a fixture was added or removed without updating MANIFEST_EXPECTED_FIXTURES in %s\n' \
+            "${#manifest_names[@]}" "$MANIFEST_EXPECTED_FIXTURES" \
+            "$(basename "${BASH_SOURCE[0]}")" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # No duplicates. A repeated name checks one fixture twice and inflates the
+    # listed count, so the count stops being a set size. It also lets a
+    # duplicate absorb a deletion: drop one fixture and duplicate another, and
+    # the length pin above would agree again.
+    if (( ${#manifest_dupes[@]} == 0 )); then
+        printf '  PASS: fixtures/MANIFEST lists every name exactly once\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: fixtures/MANIFEST repeats %d name(s): %s — a repeated name is checked twice and inflates the listed count\n' \
+            "${#manifest_dupes[@]}" "${manifest_dupes[*]}" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # The converse direction. A fixture present on disk but absent from the
+    # manifest is an unreviewed addition: it would be classified by prefix
+    # and then silently forgotten by every check that reads the manifest.
+    shopt -s nullglob
+    _unlisted=()
+    for _f in "$FIX_DIR"/*.ansi; do
+        _b=$(basename "$_f")
+        _known=0
+        for _m in "${manifest_names[@]}"; do
+            [[ "$_m" == "$_b" ]] && { _known=1; break; }
+        done
+        (( _known )) || _unlisted+=("$_b")
+    done
+    if (( ${#_unlisted[@]} == 0 )); then
+        printf '  PASS: every .ansi on disk is listed in fixtures/MANIFEST\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %d fixture(s) on disk but not in fixtures/MANIFEST: %s\n' \
+            "${#_unlisted[@]}" "${_unlisted[*]}" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    printf '  FAIL: fixtures/MANIFEST is missing — the tracked-fixture set cannot be pinned\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo
 echo "=== fixture classification ==="
 shopt -s nullglob
 fixtures=("$FIX_DIR"/*.ansi)
 (( ${#fixtures[@]} > 0 )) || { echo "no fixtures found" >&2; exit 1; }
 for f in "${fixtures[@]}"; do
     want=$(expected_state_for "$f")
-    [[ -z "$want" ]] && {
-        printf '  SKIP: %s (unrecognised filename prefix)\n' "$(basename "$f")"
+    if [[ -z "$want" ]]; then
+        if prefix_exempt "$(basename "$f")"; then
+            skip_test "$(basename "$f") (no prefix classification; asserted by its flag-specific block)"
+        else
+            printf '  FAIL: %s — unrecognised filename prefix and not on PREFIX_EXEMPT\n' \
+                "$(basename "$f")" >&2
+            FAIL=$(( FAIL + 1 ))
+        fi
         continue
-    }
+    fi
     assert_state "$f" "$want"
 done
 
@@ -220,7 +407,7 @@ echo "=== heartbeat overrides busy-mid-render fixture ==="
 # heartbeat, pane-state has to infer busy from the spinner token
 # counter. With a fresh `idle_prompt` heartbeat, the heartbeat wins.
 mid_render_fixture="$FIX_DIR/busy-mid-render-no-chevron-synthetic.ansi"
-if [[ -f "$mid_render_fixture" ]]; then
+if need_fixture "$mid_render_fixture" "2 heartbeat-override assertions not run"; then
     printf '{"state":"idle_prompt","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
     out=$("$HELPER" --fixture "$mid_render_fixture" --window 9 --name test --active 0 \
                     --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
@@ -256,7 +443,10 @@ echo "=== heartbeat-idle refined by renderer typing (issue #196) ==="
 # only) must NOT refine; a busy heartbeat is untouched.
 typing_fixture="$FIX_DIR/user-typing-synthetic.ansi"
 autosuggest_fixture="$FIX_DIR/autosuggest-merge-win3.ansi"
-if [[ -f "$typing_fixture" && -f "$autosuggest_fixture" ]]; then
+_typing_ok=1
+need_fixture "$typing_fixture" "3 typing-refinement assertions not run" || _typing_ok=0
+need_fixture "$autosuggest_fixture" "3 typing-refinement assertions not run" || _typing_ok=0
+if (( _typing_ok )); then
     printf '{"state":"idle_prompt","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
     out=$("$HELPER" --fixture "$typing_fixture" --window 9 --name test --active 0 \
                     --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
@@ -289,8 +479,6 @@ if [[ -f "$typing_fixture" && -f "$autosuggest_fixture" ]]; then
         printf '  FAIL: busy heartbeat + typing fixture — got=%s want=busy\n' "$got" >&2
         FAIL=$(( FAIL + 1 ))
     fi
-else
-    printf '  SKIP: typing/autosuggest fixtures missing\n'
 fi
 
 echo
@@ -545,6 +733,9 @@ fi
 #     _unstick.sh case B can fire its auto-Enter cascade. Once the
 #     menu is dismissed (no overlay text), the stamp takes over.
 blocked_fixture=$(ls "$FIX_DIR"/blocked-*.ansi 2>/dev/null | head -1)
+# `blocked-*.ansi` is a CLASS, not one tracked path, so this guard cannot
+# name the file it wants. The manifest cross-check above already names any
+# absent member, so an empty class here means every one of them is gone.
 if [[ -n "$blocked_fixture" ]]; then
     out=$("$HELPER" --fixture "$blocked_fixture" --window 9 --name olwin --active 0 \
                     --over-limit-file "$ol_tmp" \
@@ -558,7 +749,8 @@ if [[ -n "$blocked_fixture" ]]; then
         FAIL=$(( FAIL + 1 ))
     fi
 else
-    printf '  SKIP: no blocked-*.ansi fixture available for case-B precedence check\n'
+    printf '  FAIL: no blocked-*.ansi fixture available for the case-B precedence check\n' >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 # 4. Missing over-limit file → fall through to heartbeat / renderer.
@@ -612,21 +804,156 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
-# 5b. TTL boundary: a stamp INSIDE the TTL still classifies
-#     over-limit (the TTL must not eat live suspensions).
-printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}\n' \
-    "$(( NOW - 20 * 3600 ))" > "$ol_tmp"   # 20h old < 27h TTL
-out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
-                --over-limit-file "$ol_tmp" \
-                --heartbeat-file /dev/null --now "$NOW" 2>&1)
-got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+# Classify against a stamp built from `ts` and `reset_at`, with the
+# clock pinned. Returns the state field only.
+ol_state_for() {   # $1=ts  $2=reset_at JSON value  $3=now
+    printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit",%s"window":"olwin","hook_event_name":"StopFailure"}\n' \
+        "$1" "$2" > "$ol_tmp"
+    "$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
+              --over-limit-file "$ol_tmp" \
+              --heartbeat-file /dev/null --now "$3" 2>&1 \
+        | awk -F'[ =]' '{print $2}'
+}
+
+# 5b. TTL boundary: a stamp INSIDE the TTL still classifies over-limit
+#     (the TTL must not eat live suspensions). The stamp carries NO
+#     reset_at, so the TTL is the only bound — which is the case the
+#     TTL exists for.
+got_state=$(ol_state_for "$(( NOW - 20 * 3600 ))" '' "$NOW")
 if [[ "$got_state" == "over-limit" ]]; then
-    printf '  PASS: 20h-old stamp (inside TTL) still over-limit\n'
+    printf '  PASS: 20h-old stamp, no reset_at (inside TTL) still over-limit\n'
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: inside-TTL stamp lost — got=%s want=over-limit\n' "$got_state" >&2
     FAIL=$(( FAIL + 1 ))
 fi
+
+# 5b-pre. PRECONDITION, COUNTED. The three stamp assertions below build
+#     their reset_at token with `date '+%-I:%M%P'`, a GNU extension.
+#     These used to be wrapped in `if [[ -n "$token" ]]`, which SKIPPED
+#     them on a host without it and still printed ALL TESTS PASSED
+#     (skeptic finding 2, jacob-greene/nexus#79). A guard around a
+#     condition that cannot occur only hides the case where it does, so
+#     the guards are gone and the capability is asserted once instead.
+#     The suite already depends on GNU `date` in four other places, and
+#     `pane-state.sh` depends on it in three, including the `date +%s -r`
+#     mtime fallback inside `_over_limit_stamp_expired`.
+if [[ -n "$(date -d "@$NOW" '+%-I:%M%P' 2>/dev/null)" ]]; then
+    printf '  PASS: date supports the %%-I:%%M%%P format the stamp tokens need\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: date lacks %%-I:%%M%%P — the stamp reset assertions below cannot build a token\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-ii. A 20h-old stamp whose stated reset is STILL AHEAD keeps
+#     suppressing. The reset-aware bound must not shorten a live
+#     suspension — this is the negative control for defect A's fix.
+ahead_token=$(date -d "@$(( NOW + 7200 ))" '+%-I:%M%P' 2>/dev/null)
+got_state=$(ol_state_for "$(( NOW - 20 * 3600 ))" \
+            "\"reset_at\":\"${ahead_token}\"," "$NOW")
+if [[ "$got_state" == "over-limit" ]]; then
+    printf '  PASS: 20h-old stamp whose reset is still ahead stays over-limit\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: future-reset stamp lost — got=%s want=over-limit\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-iii. DEFECT A (jacob-greene/nexus#79). A FRESH stamp whose stated
+#     reset has already passed must not suppress. Before this fix the
+#     27h TTL was the only rule, so this stamp held for another 25h.
+#     Measured on 2026-08-24: three stamps, all 27 minutes past their
+#     own 7:10pm reset, none expired, one window visibly running a tool
+#     call.
+passed_token=$(date -d "@$(( NOW - 5760 ))" '+%-I:%M%P' 2>/dev/null)   # 1.6h ago
+got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+            "\"reset_at\":\"${passed_token}\"," "$NOW")
+if [[ "$got_state" != "over-limit" ]]; then
+    printf '  PASS: 2h-old stamp past its own reset expires (got %s)\n' "$got_state"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: stamp past its own reset still suppresses — defect A\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-iv. Inside the grace. The reset passed 5 minutes ago, which is
+#     less than the 1800s grace, so the stamp still holds. A reset is
+#     the earliest the pane can resume, not the instant it does.
+grace_token=$(date -d "@$(( NOW - 300 ))" '+%-I:%M%P' 2>/dev/null)
+got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+            "\"reset_at\":\"${grace_token}\"," "$NOW")
+if [[ "$got_state" == "over-limit" ]]; then
+    printf '  PASS: stamp inside the 1800s reset grace still over-limit\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: grace window not honoured — got=%s want=over-limit\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-v. An UNRESOLVABLE zone must not be resolved in UTC and then used
+#     as a deadline. The reset-aware bound declines the token and the
+#     TTL governs, so a fresh stamp keeps suppressing.
+got_state=$(ol_state_for "$(( NOW - 7200 ))" \
+            '"reset_at":"3am_America/Nowhere",' "$NOW")
+if [[ "$got_state" == "over-limit" ]]; then
+    printf '  PASS: unresolvable zone falls back to the TTL, not to UTC\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: unresolvable zone changed the stamp verdict — got=%s\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b-vi. PARSER PARITY. `_over_limit_stamp_reset_epoch` (pane-state.sh)
+#     and `_over_limit_reset_at_to_epoch` (_over_limit.sh) are separate
+#     copies, because pane-state.sh sources nothing. Pin them to the
+#     same deadline: with `ts` = now, the stamp must flip across the
+#     epoch the WATCHER computes, plus the grace.
+#
+#     This block uses the REAL clock, not this file's synthetic
+#     `NOW=2000000000`. The two parsers resolve the bare wall-clock
+#     token against different reference days: the watcher's copy uses
+#     GNU date's "today", which is the real calendar day, while the
+#     stamp copy uses the stamp's own `ts`. Those agree whenever `ts`
+#     is near the real clock, which is every production case, and
+#     disagree under a synthetic clock. Measuring on the real clock is
+#     what makes the comparison meaningful.
+#     The library is a TRACKED file that `main.sh` sources in
+#     production. If it is missing or unsourceable the watcher is
+#     broken, so that is a HARD FAILURE here, never a skip. It used to
+#     be `if [[ -f ]]` plus a silent sourceability probe: making the
+#     library unsourceable dropped the four parity assertions and the
+#     suite still printed `138 pass / 0 fail` and `ALL TESTS PASSED`
+#     (skeptic finding 2, jacob-greene/nexus#79). The parity loop below
+#     now runs unconditionally, so a broken library fails it too.
+OL_LIB="$_repo_root/monitor/watcher/_over_limit.sh"
+parity_now=$(date +%s)
+# shellcheck disable=SC1090
+if [[ -f "$OL_LIB" ]] && ( . "$OL_LIB" ) >/dev/null 2>&1; then
+    printf '  PASS: the watcher parser library is present and sourceable\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s is missing or unsourceable — the parity assertions cannot be trusted\n' \
+        "$OL_LIB" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+for tok in "3am" "11pm" "3am_America/Los_Angeles" "5:30pm_Europe/Berlin"; do
+    # shellcheck disable=SC1090
+    want_epoch=$( . "$OL_LIB" 2>/dev/null; _over_limit_reset_at_to_epoch "$tok" "$parity_now" )
+    [[ "$want_epoch" =~ ^[0-9]+$ ]] || want_epoch=0
+    before=$(ol_state_for "$parity_now" "\"reset_at\":\"${tok}\"," \
+             "$(( want_epoch + 1800 - 60 ))")
+    after=$(ol_state_for "$parity_now" "\"reset_at\":\"${tok}\"," \
+            "$(( want_epoch + 1800 + 60 ))")
+    if [[ "$before" == "over-limit" && "$after" != "over-limit" ]]; then
+        printf '  PASS: stamp parser agrees with the watcher on %s\n' "$tok"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: parser drift on %s — before=%s after=%s (watcher epoch %s)\n' \
+            "$tok" "$before" "$after" "$want_epoch" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
 
 # 5c. Corrupt stamp (no parseable ts, ancient mtime) ages out via
 #     the mtime fallback instead of latching.
@@ -650,7 +977,7 @@ echo
 echo "=== over-limit detection (issue #87) ==="
 # Canonical fixture: emits reset_at=<token> alongside state=over-limit.
 canonical_fixture="$FIX_DIR/over-limit-canonical-synthetic.ansi"
-if [[ -f "$canonical_fixture" ]]; then
+if need_fixture "$canonical_fixture" "the canonical over-limit reset_at assertion not run"; then
     out=$("$HELPER" --fixture "$canonical_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
@@ -664,7 +991,7 @@ fi
 
 # Terse variant: bare time, no timezone parenthetical.
 terse_fixture="$FIX_DIR/over-limit-terse-synthetic.ansi"
-if [[ -f "$terse_fixture" ]]; then
+if need_fixture "$terse_fixture" "the terse over-limit reset_at assertion not run"; then
     out=$("$HELPER" --fixture "$terse_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=11pm' <<<"$out"; then
@@ -686,7 +1013,7 @@ fi
 # while reset_at degraded to `unknown`, which drops the watcher's hold
 # from the parsed reset time to its blind 6h fallback.
 pinned_fixture="$FIX_DIR/over-limit-bottom-pinned-input-cc2.1.260.ansi"
-if [[ -f "$pinned_fixture" ]]; then
+if need_fixture "$pinned_fixture" "the cc 2.1.260 bottom-pinned extractor assertion not run"; then
     out=$("$HELPER" --fixture "$pinned_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=over-limit' <<<"$out" \
        && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
@@ -736,7 +1063,7 @@ rm -f "$inputrow_typed_tmp"
 # False-positive guard: idle pane whose scrollback contains the canonical
 # text. Detection is anchored to the bottom 15 rows so this MUST emit idle.
 fp_fixture="$FIX_DIR/idle-overlimit-text-in-scrollback-synthetic.ansi"
-if [[ -f "$fp_fixture" ]]; then
+if need_fixture "$fp_fixture" "the scrollback false-positive guard not run"; then
     out=$("$HELPER" --fixture "$fp_fixture" --window 9 --name overw --active 0)
     if grep -q 'state=idle' <<<"$out" && ! grep -q 'state=over-limit' <<<"$out"; then
         printf '  PASS: over-limit text in scrollback does not false-trigger\n'
@@ -964,7 +1291,7 @@ if command -v python3 >/dev/null 2>&1; then
         printf '  FAIL: zombie claude read as live (got: %s)\n' "$out_z" >&2; FAIL=$(( FAIL + 1 ))
     fi
 else
-    printf '  SKIP: zombie-claude case (python3 unavailable)\n'
+    skip_test "zombie-claude case (python3 unavailable)"
 fi
 
 echo
@@ -1113,7 +1440,7 @@ assert_async_state "--heartbeat-async-staleness 120 allows 85s-old waits" \
 
 # (7) Pane-footer fallback: no heartbeat, but fixture shows `1 monitor`.
 foot_mon_fixture="$FIX_DIR/working-background-monitor-synthetic.ansi"
-if [[ -f "$foot_mon_fixture" ]]; then
+if need_fixture "$foot_mon_fixture" "the footer-fallback monitor assertion (7) not run"; then
     out=$("$HELPER" --fixture "$foot_mon_fixture" \
                     --window 9 --name ftest --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1129,7 +1456,7 @@ if [[ -f "$foot_mon_fixture" ]]; then
 fi
 
 foot_bg_fixture="$FIX_DIR/working-background-bgbash-synthetic.ansi"
-if [[ -f "$foot_bg_fixture" ]]; then
+if need_fixture "$foot_bg_fixture" "the footer-fallback background-bash assertion (7) not run"; then
     out=$("$HELPER" --fixture "$foot_bg_fixture" \
                     --window 9 --name ftest --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1148,7 +1475,7 @@ fi
 #     can't introspect claude's handle list, so 0 there is "no signal"
 #     not "definitely zero"). If the heartbeat lacks a wait and the
 #     footer carries monitor, we still pick working-background.
-if [[ -f "$foot_mon_fixture" ]]; then
+if need_fixture "$foot_mon_fixture" "the heartbeat-zeros-plus-footer assertion (8) not run"; then
     write_async_hb idle_prompt 5 0 0 - '[]'
     out=$("$HELPER" --fixture "$foot_mon_fixture" \
                     --window 9 --name ftest --active 0 \
@@ -1191,7 +1518,7 @@ echo "=== real-footer shell phrasing + bg_cpu scoping (your-org/nexus-code#445) 
 #      running") → working-background. This is the exact form the old
 #      regex missed. Footer fallback (no heartbeat).
 real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
-if [[ -f "$real_foot" ]]; then
+if need_fixture "$real_foot" "2 real-status-line assertions (10, 10b) not run"; then
     out=$("$HELPER" --fixture "$real_foot" \
                     --window 9 --name paperbench --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1280,7 +1607,7 @@ fi
 #       to `idle`. This is the false-positive the operator flagged:
 #       "the regex may match other output in the window".
 spurious_foot="$FIX_DIR/working-background-spurious-shell-footer-synthetic.ansi"
-if [[ -f "$spurious_foot" ]]; then
+if need_fixture "$spurious_foot" "2 spurious-footer override assertions (11b-i, 11b-ii) not run"; then
     # (11b-i) Fallback path (no reliable tree reading): the footer regex
     #         still fires → working-background. Confirms the fragile
     #         fallback is intact for /proc-restricted environments AND
@@ -1356,7 +1683,7 @@ fi
 # (12b) Fallback path (footer-driven, unreliable tree) → the shell-driven
 #       line still carries bg_reliable=0 so the probe keeps legacy behaviour.
 real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
-if [[ -f "$real_foot" ]]; then
+if need_fixture "$real_foot" "the footer-fallback bg_reliable assertion (12b) not run"; then
     out=$("$HELPER" --fixture "$real_foot" \
                     --window 9 --name bgfields-fallback --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" \
@@ -1491,7 +1818,7 @@ TMUXSHIM
     cleanup_bogus
     trap - EXIT
 else
-    printf '  SKIP: tmux unavailable — bogus-index fail-loud tests skipped\n'
+    skip_test "tmux unavailable — bogus-index fail-loud tests skipped"
 fi
 
 echo "=== autosuggest ghost is not evidence of an empty child set (#455 follow-up) ==="
@@ -1510,7 +1837,7 @@ echo "=== autosuggest ghost is not evidence of an empty child set (#455 follow-u
 #       14b asserts the converse.
 for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
     gfx="$FIX_DIR/$gf.ansi"
-    [[ -f "$gfx" ]] || continue
+    need_fixture "$gfx" "the ghost-plus-live-child assertion (14a) not run" || continue
     out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-live --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" \
                     --bg-shells 1 --bg-cpu 500 2>&1)
@@ -1529,7 +1856,7 @@ done
 #       genuinely idle, ready-to-paste pane.
 for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
     gfx="$FIX_DIR/$gf.ansi"
-    [[ -f "$gfx" ]] || continue
+    need_fixture "$gfx" "the childless-ghost assertion (14b) not run" || continue
     out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-idle --active 0 \
                     --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" 2>&1)
     if grep -qF 'state=autosuggest-only' <<<"$out"; then
@@ -1664,8 +1991,27 @@ fi
 
 echo
 echo "=== summary ==="
-printf '  %d pass / %d fail\n' "$PASS" "$FAIL"
+printf '  %d pass / %d fail / %d skip / %d missing fixture\n' \
+    "$PASS" "$FAIL" "$SKIP" "$MISSING"
+if (( MISSING > 0 )); then
+    printf '  missing tracked fixtures: %s\n' "${MISSING_FIXTURES[*]}" >&2
+fi
 if (( FAIL > 0 )); then
+    echo "FAIL"
+    exit 1
+fi
+# An absent tracked fixture means assertions did not run. That is never a
+# pass. `PANE_STATE_ALLOW_MISSING_FIXTURES=1` is the explicit opt-in for a
+# caller that knowingly runs against a partial tree; even then the banner
+# changes, so `ALL TESTS PASSED` can never appear over a missing fixture.
+if (( MISSING > 0 )); then
+    if [[ "${PANE_STATE_ALLOW_MISSING_FIXTURES:-0}" == "1" ]]; then
+        printf 'PASSED WITH %d MISSING FIXTURE(S) — PANE_STATE_ALLOW_MISSING_FIXTURES=1\n' \
+            "$MISSING"
+        exit 0
+    fi
+    printf '  FAIL: %d tracked fixture(s) absent — their assertions never ran\n' \
+        "$MISSING" >&2
     echo "FAIL"
     exit 1
 fi

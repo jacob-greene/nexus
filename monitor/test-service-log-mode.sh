@@ -215,6 +215,7 @@ SITES=(
     "cc-auto-update-apply.sh"       # apply.log + detached-restart.log
     "node-forensics.sh"             # node-forensics.log (incl. post-rotation)
     "gh-shim.sh"                    # impersonate.log  (audit)
+    "ng"                            # verdict-override.log (audit, #155)
     "hooks/gh-write-guard.sh"       # gh-bypass-warnings.log (audit)
     "remote-forced-command.sh"      # forced-command.log (audit)
     "remote-enroll-session.sh"      # self-enroll.log (audit)

@@ -125,7 +125,17 @@ if [[ -n "$version" ]]; then
 fi
 
 if [[ -z "$claude_bin" ]]; then
-    claude_bin="$REPO_ROOT/node_modules/.bin/claude"
+    # No --claude-bin and no candidate install: gate whatever this nexus
+    # actually runs, via the shared resolver. Testing the npm path
+    # directly failed outright on a nexus pinned to a native install
+    # (config `nexus.claude_bin`), where that path does not exist.
+    claude_bin=$(
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 && printf '%s' "$CLAUDE_BIN"
+    ) || claude_bin=""
+    [[ -n "$claude_bin" ]] || claude_bin="$REPO_ROOT/node_modules/.bin/claude"
 fi
 [[ -x "$claude_bin" ]] || { echo "gate.sh: no executable claude at $claude_bin" >&2; exit 1; }
 
@@ -164,6 +174,30 @@ else
         # nothing about a candidate release: it cannot go red for the
         # reason a gate exists. Add it here in the same change that fixes
         # #157 and removes the marker.
+        # VI-safe paste (GUIDE.md surface 2c). Every other scenario
+        # either types with `send-keys <text>` or stubs the paste
+        # function outright (test-realmodel-overlimit.sh swaps in
+        # `_ol_test_paste`, which only appends to a log). So no scenario
+        # ran the PRODUCTION `i BSpace` + `paste-buffer` sequence against
+        # the candidate, and VI-mode drift — a lost paste, which reads as
+        # a silent worker — would pass this gate green.
+        # It boots with `editorMode: "vim"` and drops the input box to
+        # normal mode FIRST: with the box already in insert mode (the
+        # production default) the `i` guard is inert and the scenario
+        # pins nothing. It drives two of the four production paste
+        # implementations — the respawn form (`paste-buffer -b`) and the
+        # bracketed follow-up form (`paste-buffer -p -d -b`), which is a
+        # separate terminal contract. The plain form pins all three
+        # steps; the bracketed form pins delivery and submit only,
+        # because a bracketed paste is literal in any mode. See the
+        # scenario header — that asymmetry is measured, not assumed.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
+        # Hook + settings contract (GUIDE.md surface 2d). cch_boot_worker
+        # is renderer-path only and never passes `--settings`, so the
+        # hook-event names, the matcher syntax and the PreToolUse exit-2
+        # block were never exercised against a candidate. A silently
+        # disabled hook is the one breakage class the watcher cannot see.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-hooks.sh"
     )
 fi
 

@@ -209,6 +209,57 @@ assert_eq "empty → +6h fallback" "$epoch" "$expected"
 epoch=$(_over_limit_reset_at_to_epoch "not_a_time" "$NOW")
 assert_eq "unparseable → +6h fallback" "$epoch" "$expected"
 
+# ---- timezone validation (jacob-greene/nexus#79) --------------------------
+#
+# An invalid TZ string does not make `date` fail: glibc resolves the time
+# in UTC and exits 0. The parser's numeric-epoch guard passes, so a wrong
+# deadline used to be stored silently. On 2026-09-10 a stray closing
+# quote on the extracted token turned a 3.75h hold into a 20.75h one.
+# Every unresolvable zone must now take the blind 6h net instead.
+
+reset_state
+
+# The incident token, byte for byte: the source line's closing quote is
+# still attached.
+epoch=$(_over_limit_reset_at_to_epoch '3am_America/Los_Angeles"' "$NOW")
+assert_eq "quote-suffixed zone → +6h fallback" "$epoch" "$expected"
+assert_contains "unresolvable zone is logged, not silent" \
+    "$(cat "$LOG_LOG")" "unresolvable timezone"
+
+# A bare abbreviation is not a zone. glibc reads `PDT` as UTC.
+epoch=$(_over_limit_reset_at_to_epoch "3am_PDT" "$NOW")
+assert_eq "bare abbreviation → +6h fallback" "$epoch" "$expected"
+
+# Syntactically clean, but absent from tzdata.
+epoch=$(_over_limit_reset_at_to_epoch "3am_America/Nowhere" "$NOW")
+assert_eq "nonexistent zone → +6h fallback" "$epoch" "$expected"
+
+# NEGATIVE CONTROL. The widened rejection must not swallow a real zone.
+# Both of these resolve, so neither may land on the fallback.
+for good in "3am_America/Los_Angeles" "3am_Europe/Berlin"; do
+    epoch=$(_over_limit_reset_at_to_epoch "$good" "$NOW")
+    if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch != expected )) \
+       && (( epoch >= NOW )) && (( epoch <= NOW + 26*3600 )); then
+        printf '  PASS: %s still resolves in its own zone\n' "$good"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s was rejected (got %s, fallback is %s)\n' \
+            "$good" "$epoch" "$expected" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+# The predicate itself, exercised directly.
+_over_limit_tz_resolves "America/Los_Angeles" \
+    && assert_eq "tz_resolves accepts a real zone" ok ok \
+    || assert_eq "tz_resolves accepts a real zone" rejected ok
+_over_limit_tz_resolves 'America/Los_Angeles"' \
+    && assert_eq "tz_resolves rejects a quoted zone" accepted rejected \
+    || assert_eq "tz_resolves rejects a quoted zone" rejected rejected
+_over_limit_tz_resolves "../../etc/passwd" \
+    && assert_eq "tz_resolves rejects path traversal" accepted rejected \
+    || assert_eq "tz_resolves rejects path traversal" rejected rejected
+
 # ---- stamp lifecycle ------------------------------------------------------
 
 echo '=== stamp insert + load ==='

@@ -85,11 +85,11 @@ EOF
 #
 # This used to carry its own copy of the launch-string block from
 # _lib.sh, purely to boot in a cwd other than $CCH_WORKDIR. cch_boot_worker now
-# takes the workdir as its second argument, so the copy is gone
+# takes the workdir as its third argument, so the copy is gone
 # (your-org/nexus-code#158). Do not reintroduce one: a duplicated launch
 # string drifts from the production spawn flags without any test noticing.
 boot_in() {
-    cch_boot_worker "$1" "$2"
+    cch_boot_worker "$1" "" "$2"
 }
 
 # Poll until the pane settles (idle or blocked), up to ~30s.

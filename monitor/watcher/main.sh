@@ -1937,6 +1937,42 @@ _compose_report_body() {
 #   2  target window missing
 #   3  paste / submit tmux API call failed
 #   4  paste submitted but signature not visible in pane
+# True (0) when the target's input box still holds the pasted emit: the
+# signature, or a collapsed `[Pasted text #N` placeholder, appears on or
+# below the LAST input-chevron row (`❯` + NBSP). A submitted message is
+# echoed ABOVE the fresh, empty input row, so it never matches.
+_paste_input_holds_sig() {
+    local tgt="$1" sig="$2" nbsp=$'\xc2\xa0'
+    tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
+        | awk -v chev="❯${nbsp}" -v sig="$sig" '
+            index($0, chev) { n = NR; delete buf; k = 0 }
+            n { buf[++k] = $0 }
+            END {
+                for (i = 1; i <= k; i++)
+                    if (index(buf[i], sig) || index(buf[i], "[Pasted text #")) exit 0
+                exit 1
+            }'
+}
+
+# Retry the Enter once if the paste is still sitting unsubmitted in the
+# input box (see the call site in paste_to_target). Logs only when it
+# acts, so a healthy workspace stays quiet.
+_paste_submit_confirm() {
+    local tgt="$1" sig="$2" name="${3:-$1}" i
+    for i in 1 2 3; do
+        _paste_input_holds_sig "$tgt" "$sig" || return 0
+        sleep 0.3
+    done
+    tmux send-keys -t "$tgt" Enter 2>/dev/null || true
+    sleep 0.5
+    if _paste_input_holds_sig "$tgt" "$sig"; then
+        log "paste-submit: ${name}: emit still unsubmitted after one Enter retry (liveness state machine will follow up)"
+        return 1
+    fi
+    log "paste-submit: ${name}: first Enter was swallowed; retried Enter submitted the emit"
+    return 0
+}
+
 paste_to_target() {
     local target="$1" body_file="$2" stamp_mode="${3:-stamp}"
     command -v tmux >/dev/null 2>&1 || return 1
@@ -1974,6 +2010,17 @@ paste_to_target() {
     if [[ -n "$sig" ]]; then
         tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
             | grep -qF -e "$sig" || return 4
+        # Submit confirmation (jacob-greene/nexus#221). The signature
+        # being visible proves the text LANDED, not that the Enter
+        # SUBMITTED it. Claude Code 2.1.277 through at least 2.1.283
+        # swallows the first Enter after a small multi-line plain paste
+        # (measured: 419-byte, 7-line body stuck 6/6 on 2.1.280, 0/6 on
+        # 2.1.276); the text sits in the input box until someone presses
+        # Enter. So: if the signature is still inside the input box,
+        # press Enter once more. Bounded to one retry; the orchestrator-
+        # liveness state machine stays the backstop. The return code is
+        # unchanged (the text landed), so no caller re-pastes it.
+        _paste_submit_confirm "$tgt" "$sig" "$target"
     fi
     # Refresh the orchestrator-liveness pin (issue #150). A successful
     # round-trip here is the strongest "orch is reachable" signal the
@@ -3988,15 +4035,63 @@ _v2_task_compose_emit() {
             # regression. `rows == 0` with live workers is already covered by
             # the staging-empty branch above.
             if [[ -z "$_fs_rerender" && -n "$full_state_lines" ]]; then
-                local _fs_rows _fs_live
+                local _fs_rows _fs_live _fs_dead _fs_dead_rows _fs_expected _fs_dead_note
                 _fs_rows=$(printf '%s\n' "$full_state_lines" | grep -c '^  - ' || true)
                 _fs_live=$(_idle_list_worker_windows 2>/dev/null \
                     | awk -F'\t' 'NF>0 && $1!="" {n++} END {print n+0}')
+                # Dead-window skeptic-pending rows (#202) are the one row
+                # class the snapshot prints for a window the enumerator
+                # CANNOT produce — the window is gone, the marker is not.
+                # They belong in the expected row count, so the invariant is
+                # `rows == live + dead`, not `rows == live`. Omitting the
+                # addend would read EVERY emit as stale and re-render
+                # inline on each one — the nexus-code#236 cost this check's
+                # own fail-safe exists to avoid. Cheap for the same reason
+                # `_fs_live` is: one directory glob plus one action-log grep
+                # per marker, and no pane probes. The full tmux window list
+                # (not the worker subset) is the right liveness set here: an
+                # infra or orchestrator window that still exists is live.
+                _fs_dead=$(_idle_dead_window_pending_count "$now_ts" \
+                               "$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)" \
+                           2>/dev/null || printf '0')
+                # …but the TOTAL alone is not sufficient, and this is the
+                # case that proves it (found by the depth-1 skeptic on #202,
+                # req-001, reproduced independently before landing this).
+                # The counts CANCEL for the one population #202 is about: a
+                # worker window that closes while holding a pending marker.
+                # `live` falls by one and `dead` rises by one in the same
+                # cycle, so `live + dead` is unchanged and a staged body
+                # still carrying that window's OLD `(active, state=…)` row
+                # reads as consistent. The emit then asserts a window is
+                # active after it is gone, AND hides the dead-window row
+                # that replaced it. At the parent commit `rows > live`
+                # always caught this, so the total-only form was a
+                # REGRESSION of the #14 guarantee, not merely a gap.
+                #
+                # The fix is a second, dead-row count test: the staged body
+                # must carry exactly `_fs_dead` dead-window rows. In the
+                # cancelling case the body has 0 and the disk has 1, so the
+                # gate fires. It compares COUNTS, not names: a swap within
+                # one cycle (a marked window closes while another marker is
+                # resolved) keeps both counts equal and passes. The live
+                # check above has the same limit. Anchored on the rendered row shape, not a bare
+                # substring, so a window whose NAME contains the class
+                # string cannot inflate the count.
+                _fs_dead_rows=$(printf '%s\n' "$full_state_lines" \
+                    | grep -c '^  - .* dead-window-skeptic-pending' || true)
                 [[ "$_fs_rows" =~ ^[0-9]+$ ]] || _fs_rows=0
                 [[ "$_fs_live" =~ ^[0-9]+$ ]] || _fs_live=0
-                if (( _fs_rows > _fs_live )) \
-                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_live )) ); then
-                    _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live (age ${_fs_age}s)"
+                [[ "$_fs_dead" =~ ^[0-9]+$ ]] || _fs_dead=0
+                [[ "$_fs_dead_rows" =~ ^[0-9]+$ ]] || _fs_dead_rows=0
+                _fs_expected=$(( _fs_live + _fs_dead ))
+                _fs_dead_note=""
+                (( _fs_dead > 0 )) && _fs_dead_note=" + ${_fs_dead} dead-window marker(s)"
+                (( _fs_dead_rows != _fs_dead )) \
+                    && _fs_dead_note="${_fs_dead_note}, body carries ${_fs_dead_rows}"
+                if (( _fs_rows > _fs_expected )) \
+                   || ( (( _fs_rows > 0 )) && (( _fs_rows < _fs_expected )) ) \
+                   || (( _fs_dead_rows != _fs_dead )); then
+                    _fs_rerender="snapshot lists ${_fs_rows} window(s), ${_fs_live} live${_fs_dead_note} (age ${_fs_age}s)"
                 fi
             fi
             # Provenance carried to _compose_report_body's section footer.

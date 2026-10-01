@@ -39,6 +39,10 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | skeptic | an independent agent that adversarially rechecks another worker's result |
 | skeptic round | one validation pass, from the request that opens it to the verdict that closes it |
 | verdict | the skeptic's ruling on a worker's result, which closes the skeptic round |
+| pending marker | the file `monitor/.state/skeptic/pending/<window>`, which marks a worker as awaiting a skeptic |
+| head | the tip commit of a pull request's branch |
+| validated head | the exact commit a verdict states it covers, which the verdict does not extend past |
+| verdict trailer | the `Skeptic-Verdict:` line in a pull-request body that names the verdict and its validated head |
 | parked | idle on purpose and exempt from window cleanup, usually while waiting for a skeptic |
 | ghost | Claude Code's dim autosuggest text in a pane, which looks like typed input but is not |
 | preflight | a check that runs before an action and blocks it when a condition fails |
@@ -48,6 +52,28 @@ after an em dash or inside parentheses. Keep them under 20 words.
 | overview issue | the routing-only issue tagged `nexus:overview`, normally issue 1 |
 | secondary clone | a clone or worktree a worker edits freely, landing canonical changes by PR or via the primary clone |
 | bot | the GitHub App identity that makes every write, so the operator gets notified |
+| over-limit hold | the watcher state that suppresses routine emits to a window it believes is rate limited |
+| scan window | the last 15 non-blank pane rows above the input box, the only rows the over-limit detector reads |
+| hook stamp | the JSON file a Claude Code hook writes when a turn fails on a rate limit, naming the window and its reset |
+| reset_at token | the single-token reset time the detector extracts from a limit notice, for example `3am_America/Los_Angeles` |
+| provenance filter | the step that drops scan-window rows that are quoted source text rather than a painted notice |
+| fixture | a recorded pane capture that a test replays in place of a live tmux pane |
+| tracked fixture | a fixture committed to the repository, so its absence is a broken checkout and never a normal condition |
+| silent skip | a test the harness does not run, does not count, and does not report, so the suite still reads green |
+| mutation arm | one deliberate break of the code under test, run to prove that a stated assertion turns the suite red |
+| landed-mutation proof | a checksum and a diff taken after a mutation and before the suite runs, so a green arm cannot be a mutation that never applied |
+| dangling symlink | a symbolic link whose target does not exist |
+| negative control | a mutation arm that must turn the suite red, so a green result marks a hole in the suite |
+| masked assertion | an assertion that passes against broken code, because a different check rejects its input first |
+| per-assertion attribution | the rule that a mutation arm counts as caught only when the assertion it targets turns red |
+| hermetic suite | a suite that writes only inside its own sandbox, so no run can change the result of a later run |
+| collision surface | one nexus file or contract that a Claude Code release can break, listed in `skills/nexus.cc-update/GUIDE.md` |
+| cc-harness gate | `monitor/cc-harness/gate.sh`, which drives a candidate Claude Code binary and asserts the pane classifier still works |
+| local pin | `monitor/.state/cc-version-local`, the gitignored file that sets the Claude Code version this operator runs |
+| version floor | the `package.json` Claude Code version, used only for a fresh install that has no local pin |
+| bracketed paste | a paste that tmux wraps in the terminal's paste markers (`paste-buffer -p`), so the receiving program reads the text as one literal block |
+| watch item | a release change that does not block a version bump, but that an operator must check if the behaviour it names misbehaves later |
+| barrier assertion | a negative assertion made only after an event that must order after the thing asserted absent, so no timer decides the verdict |
 
 ## Project terms
 
