@@ -90,8 +90,8 @@ verb-specific codes documented per verb (e.g.
 | `ng watcher-status` | heartbeat age + target + liveness | [→](#ng-watcher-status) |
 | `ng log-action <agent>` | append a JSONL event to the action log | [→](#ng-log-action) |
 | `ng mint-jwt` | print an App-level JWT (for `/app/*` endpoints) | [→](#ng-mint-jwt) |
-| `ng lit search "<q>"` | content-relevance paper discovery (S2 + ASTA) | [→](#ng-lit) |
-| `ng lit add <doi>` | fetch metadata + add a paper to the library | [→](#ng-lit) |
+| `ng lit search "<q>"` | content-relevance paper discovery (PubMed, S2, ASTA) | [→](#ng-lit) |
+| `ng lit add <doi\|pmid>` | fetch metadata + add a paper to the library | [→](#ng-lit) |
 | `ng lit status` | keys / library / setup readiness | [→](#ng-lit) |
 
 ---
@@ -1354,21 +1354,24 @@ convention: [Literature research](literature.md) and the
 
 ```console
 $ ng lit status                                          # readiness
-$ ng lit search "<query>" [--source s2|asta|both] [--limit N] [--year A:B] [--human]
-$ ng lit add <DOI|S2-id> [--human]                       # grow the library
+$ ng lit search "<query>" [--source pubmed|s2|asta|both|all] [--limit N] [--year A:B] [--human]
+$ ng lit add <DOI|PMID|S2-id> [--human]                  # grow the library
 $ ng lit setup                                           # key-acquisition refs
 ```
 
-- **`search`** queries Semantic Scholar and ASTA by relevance, dedups
-  against the reference library, and annotates each hit `in_library`. A
-  backend with no key is **skipped with a note** (never a hang). Default
-  output is JSON; `--human` is readable.
-- **`add`** fetches a paper by DOI or S2 id and appends a schema-compatible
-  record to the library (`<nexus.root>/.bipartite/refs.jsonl` by default, or
-  `lit.library_path`). Dedup-checked by DOI.
-- **`status` / `setup`** report configured backends (env / `config/nexus.yml`
-  `lit.*` / legacy `bip` config — never the key itself) and, when nothing is
-  configured, print key-acquisition references and exit non-zero.
+- **`search`** queries PubMed, Semantic Scholar and ASTA by relevance, dedups
+  against the reference library by DOI and PMID, and annotates each hit
+  `in_library`. PubMed needs no key and is the default when no S2/ASTA key is
+  configured. A keyed backend with no key is **skipped with a note** (never a
+  hang). Default output is JSON; `--human` is readable.
+- **`add`** fetches a paper by DOI, PMID or S2 id and appends a
+  schema-compatible record to the library (`<nexus.root>/.bipartite/refs.jsonl`
+  by default, or `lit.library_path`). A PMID, or a DOI with no S2 key, resolves
+  through PubMed. Dedup-checked by DOI and PMID.
+- **`status` / `setup`** report the backends (env / `config/nexus.yml`
+  `lit.*` / legacy `bip` config — never the key itself), the PubMed rate
+  limit, and the default `--source`. `setup` prints key-acquisition
+  references.
 
 ---
 

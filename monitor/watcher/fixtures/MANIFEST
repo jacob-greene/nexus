@@ -12,8 +12,15 @@
 # It also needs no git, so the suite is fully accounted for in an export,
 # a tarball, or any tree with no index.
 #
-# One basename per line. Blank lines and # comments are ignored.
-# Adding a fixture: add its name here in the same commit.
+# One basename per line. Blank lines and # comments are ignored. A repeated
+# name is an error: the suite fails and names it.
+#
+# THE LENGTH OF THIS FILE IS PINNED (#185, skeptic findings F1 and F2). The
+# expected number of names is MANIFEST_EXPECTED_FIXTURES in
+# monitor/watcher/test-pane-state.sh. Adding or removing a fixture is a
+# three-file edit: the fixture, this list, and that number. Without the
+# number, a fixture and its line could be deleted together and the suite
+# would still exit 0 under ALL TESTS PASSED, one assertion lighter.
 
 absent-bash-watcher.ansi
 autosuggest-bare-dim-cc2.1.220.ansi

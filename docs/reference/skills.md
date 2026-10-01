@@ -44,7 +44,7 @@ A skill's audience is the second column in the table below.
 | [`nexus.bot`](#nexusbot) | worker + orchestrator | Bot identity for all GitHub writes; the `ng` / `mint-token.sh` channels |
 | [`nexus.report`](#nexusreport) | worker + orchestrator | Report schema, filename convention, the Infrastructure Issues feedback loop |
 | [`nexus.writing`](#nexuswriting) | worker + orchestrator | House writing style: ASD-STE100 Part 1 rules, sentences under 20 words, one idea each, stats in tables, terms defined from a shared `GLOSSARY.md` |
-| [`nexus.lit`](#nexuslit) | worker | Literature research for scientific work: `ng lit` content-relevance discovery (S2 + ASTA) deduped against the reference library, library growth, and citing references in scientific reports |
+| [`nexus.lit`](#nexuslit) | worker | Literature research for scientific work: `ng lit` content-relevance discovery (PubMed, S2, ASTA) deduped against the reference library, library growth, and citing references in scientific reports |
 | [`nexus.infra-review`](#nexusinfra-review) | orchestrator | Periodic meta-review of `## Infrastructure Issues` across the report corpus |
 | [`nexus.self-fix`](#nexusself-fix) | orchestrator + maintainers | Editing the nexus itself — watcher, monitor scripts, skills, CLAUDE.md |
 | [`nexus.dashboard`](#nexusdashboard) | orchestrator | Overview-issue identity block (`ng nexus-identity`) + formalized dashboard schema (`ng dashboard scaffold`/`validate`) |
@@ -240,10 +240,12 @@ claim that the literature might confirm, contradict, or contextualize;
 deciding what to cite in a scientific report.
 
 **What it covers:** the `ng lit` tool — content-relevance paper
-discovery over Semantic Scholar (S2) and ASTA, deduplicated against the
-nexus reference library (`ng lit search`); pulling papers into the
-library (`ng lit add`); readiness/setup (`ng lit status` / `setup`).
-Both backends are optional and skip-with-note when unkeyed. It also
+discovery over PubMed, Semantic Scholar (S2) and ASTA, deduplicated
+against the nexus reference library (`ng lit search`); pulling papers
+into the library by DOI or PMID (`ng lit add`); readiness/setup
+(`ng lit status` / `setup`). PubMed needs no key and is the default
+when no S2/ASTA key is set; the keyed backends skip-with-note when
+unkeyed. It also
 codifies the convention that scientific reports **may cite the
 references found and the statements they support**, unless irrelevant.
 Full reference: [`reference/literature.md`](literature.md).

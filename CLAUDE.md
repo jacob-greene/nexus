@@ -20,7 +20,7 @@ this is the index. One line per skill, "use when" framing:
 | Making any GitHub write — PR, issue, comment, reaction, wiki upload (`ng` verbs, install scope, push-author verify, fail-loud token guard) | `skills/nexus.bot/SKILL.md` |
 | Writing or reviewing a report under `reports/` (sections, infra-issue feedback loop) | `skills/nexus.report/SKILL.md` |
 | Writing anything a human reads — a report, an issue or PR comment, a dashboard section, a figure caption. The house style: ASD-STE100 writing rules (dictionary deliberately NOT adopted), sentences under 20 words, one idea each, stats and results in tables with fixed columns, internal terms defined on first use from the shared `GLOSSARY.md` | `skills/nexus.writing/SKILL.md` |
-| Doing scientific work that should be grounded in the literature — finding relevant papers by content (`ng lit search` over S2 + ASTA, deduped against the reference library), growing the library (`ng lit add`), and citing the references + their supporting statements in scientific reports | `skills/nexus.lit/SKILL.md` |
+| Doing scientific work that should be grounded in the literature — finding relevant papers by content (`ng lit search` over PubMed, S2 and ASTA, deduped against the reference library), growing the library (`ng lit add`), and citing the references + their supporting statements in scientific reports | `skills/nexus.lit/SKILL.md` |
 | Running periodic infrastructure meta-review across reports | `skills/nexus.infra-review/SKILL.md` |
 | Fixing the nexus itself — orchestrator, watcher, monitor scripts, skills; pre-flight gate (fresh pull + substantiated repro + scope check) before filing on `<your-org>/nexus-code` | `skills/nexus.self-fix/SKILL.md` |
 | Scheduling a multi-fire `CronCreate` whose state must survive an orchestrator respawn — TSV bookkeeping + recovery-marker pattern (workaround for the silently-ignored `durable: true` flag) | `skills/nexus.cron-state-tsv/SKILL.md` |
@@ -202,9 +202,33 @@ Two ways to spin one up:
   work/<project>-<task>/`. Fully isolated `.git` and working
   tree; use when the task touches data the primary reads, or a
   clean remote checkout matters.
-- **Worktree** — `git -C work/<project> worktree add
-  ../<project>-<task> -b <operator>/<task>`. Lighter; shares `.git`,
-  separate working tree and branch. Default for code-only edits.
+- **Worktree** — fetch first, then name the base ref. Use the
+  repository's default branch, for example `origin/main`:
+  `git -C work/<project> fetch origin` and
+  `git -C work/<project> worktree add ../<project>-<task> -b
+  <operator>/<task> origin/main`. Lighter; shares `.git`,
+  separate working tree and branch. Default for code-only edits
+  that stay local.
+
+**Always name the base ref.** `worktree add -b <branch>` with no
+base ref starts the branch at the current HEAD. The primary
+clone's local `main` runs ahead of the public `origin/main` by an
+uncleared number of commits. A worktree off that HEAD inherits
+every one of them.
+
+**A PUBLIC pull-request target means a FRESH CLONE.** The pull
+request publishes each inherited commit. That is a leak vector,
+and it has produced a near-miss. Use a worktree only for work
+that stays local. A worktree is also safe when the target
+repository's local branch is not ahead of its remote.
+
+A correct base ref is necessary but not sufficient, which is why
+the rule above says fresh clone and not "just name the base ref".
+A worktree shares the primary clone's `.git`, so the unpushed
+commits stay reachable from it. `git push --all`, `git push
+--tags`, or an accidental `git merge main` publishes them even
+from a correctly based branch. A fresh clone cannot reach what it
+never fetched.
 
 When the worker runs in a **secondary clone** — data-light,
 sandboxed, or otherwise not the canonical state — say so

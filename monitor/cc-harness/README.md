@@ -211,8 +211,32 @@ un-seed it in a purpose-built scenario.
   heavier `test-integration` Pass-B scenarios.
 - **3-miss paste→respawn** against the real binary.
 - **Heartbeat-substrate variant**: boot with `worker-settings.json` hooks
-  so the harness also exercises the heartbeat path (this slice is
-  renderer-path only, which is what exposed the empty-box finding).
+  so the harness also exercises the heartbeat path. Most scenarios are
+  renderer-path only, which is what exposed the empty-box finding;
+  `test-realmodel-hooks.sh` and `test-realmodel-vipaste.sh` do pass
+  `--settings` (`cch_boot_worker <name> <settings-file>`), but they wire
+  their own marker hooks rather than the production settings file.
+- **The two uncovered paste paths.** `test-realmodel-vipaste.sh` drives
+  the respawn form (`paste-buffer -b`) and the bracketed follow-up form
+  (`paste-buffer -p -d -b`). `monitor/watcher/main.sh` and
+  `monitor/watcher/_unstick.sh` paste in the respawn form too, so their
+  terminal contract is covered, but their own call sites are not.
+- **The follow-up path's insert-mode guard.** `test-realmodel-vipaste.sh`
+  drives `monitor/paste-followup.sh`, but it cannot pin that script's
+  `i BSpace` guard: `paste-buffer -p` wraps the bytes in bracketed-paste
+  markers and Claude Code 2.1.273 takes them as literal text in any VI
+  mode, so the guard is inert on that path and removing it leaves the
+  scenario green (measured). The scenario pins the PROPERTY instead —
+  a bracketed paste lands literally with no guard — so a release that
+  changes it turns the gate red. The guard itself is pinned hermetically
+  by `monitor/watcher/test-paste-followup.sh`, which asserts it is sent
+  and precedes the paste.
+- **The follow-up path's submission confirmation.**
+  `monitor/paste-followup.sh` confirms a submit against the target's
+  heartbeat and session transcript. A harness window has neither, so the
+  scenario drives the paste and asserts the submit itself, and the
+  script reports `unconfirmed` (rc 3). Seeding a heartbeat and a
+  transcript would let the gate cover that logic too.
 - **FIFO injection** mode for live byte-streaming, in addition to the
   control file.
 - **Live autosuggest emission.** `test-realmodel-autosuggest.sh` asserts the

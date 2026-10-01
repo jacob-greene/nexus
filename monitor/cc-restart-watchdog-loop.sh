@@ -72,7 +72,26 @@ fail() {
 }
 
 # 1. baseline
-candidate=$("$NEXUS_ROOT/node_modules/.bin/claude" --version \
+#
+# Resolve the claude binary through the SHARED resolver (CLAUDE_BIN env →
+# config `nexus.claude_bin` → node_modules → PATH) instead of hard-coding
+# the npm path. On a nexus pinned to a native install the npm path does
+# not exist, so the hard-coded form measured nothing and the baseline
+# died with an empty `candidate`. CC_AUTO_CLAUDE_BIN pre-seeds CLAUDE_BIN
+# so this loop and cc-auto-update-apply.sh can never disagree on which
+# binary they are talking about. A subshell traps the helper's
+# exit-on-failure so it becomes a normal `fail` (marker + notify), the
+# same idiom as monitor/watcher/_respawn.sh.
+CLAUDE_BIN="${CLAUDE_BIN:-${CC_AUTO_CLAUDE_BIN:-}}"
+if ! (
+    # shellcheck disable=SC1091
+    . "$NEXUS_ROOT/monitor/_claude-bin.sh" >/dev/null
+); then
+    fail "no claude binary resolvable via _claude-bin.sh (check config nexus.claude_bin)"
+fi
+# shellcheck disable=SC1091
+. "$NEXUS_ROOT/monitor/_claude-bin.sh"
+candidate=$("$CLAUDE_BIN" --version \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 orch_pid=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}' | head -1)
 watcher_pid=$(cat "$STATE/watcher.pid" 2>/dev/null || true)

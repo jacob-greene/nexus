@@ -1255,6 +1255,8 @@ capture, the test suite); the facade is an *alias*, not a migration.
 | `ng retire-preflight <window>` | `retire-preflight.sh` | orchestrator — synchronous go/no-go gate before `tmux kill-window` |
 | `ng pane-state <window-index>` | `pane-state.sh` | orchestrator — classify a worker pane (`idle\|busy\|user-typing\|…`) |
 | `ng write-probe <path>` | `write-probe.sh` | worker — pre-flight that a deliverable path is writable |
+| `ng evidence-freeze <src> --task <slug>` | `evidence-freeze.sh` | worker — freeze an artefact into durable evidence: write-once name, mode-0440 copy, `MANIFEST.md5` extended by append and never regenerated, plus one row appended to the out-of-band freeze log (below). Every mode is read back with `stat`, so the script never prints a property it did not check. Blocks the accidental clobber. A deliberate `rm` + recreate is DETECTED by the freeze log, not prevented — the header is explicit that this needs a consistent edit in two places, and does not make tampering impossible |
+| `ng evidence-freeze --verify --task <slug>` | `evidence-freeze.sh` | worker — check one evidence directory and write nothing. Exit 5 on a checksum mismatch or a broken mode invariant; exit 6 when a top-level regular file is present that `MANIFEST.md5` does not record; exit 8 when the freeze log and the directory disagree. Precedence is 5, then 8, then 6. A row that names the file by a longer path counts as recording it, when the hash also matches — the live store's manifests predate the helper and several use repo-root-relative names. Every run prints a coverage line (`freeze-log cross-check: C of T …`) and the clean verdict carries the same count, so an uncovered directory never reads as a cross-checked one |
 | `ng declare-wait <kind> <id> <desc>` | `declare-wait.sh` | worker — self-declare an async external wait |
 | `ng declare-no-wait <kind> <id>` | `declare-no-wait.sh` | worker — mark an async launch fire-and-forget |
 | `ng paste-followup <window> ...` | `paste-followup.sh` | orchestrator — canonical follow-up paste into a worker window |
@@ -1608,6 +1610,50 @@ update-detection gate (`_v2_task_cc_version_check`) compares the npm
 version you actually run and stops firing once your local pin catches up
 — independent of the lagging floor. You never edit `package.json` to move
 your own version; only the maintainer does, and only to raise the floor.
+
+### Running the NATIVE install instead of the npm one
+
+An operator who already runs a **native** Claude Code install (the
+self-updating one under `~/.local/share/claude/versions/`, exposed as
+`~/.local/bin/claude`) can point the whole nexus at it and delete the
+npm tree. Set **one** operator-local key:
+
+```yaml
+nexus:
+  claude_bin: ~/.local/bin/claude     # config/nexus.yml (gitignored)
+```
+
+`monitor/_claude-bin.sh` is the single resolver every spawn surface
+reads, and its order becomes:
+
+| Rank | Lookup | Notes |
+|---|---|---|
+| 1 | `CLAUDE_BIN` env var | per-process override; also the cc-harness gate seam |
+| 2 | config `nexus.claude_bin` | operator-local; outranks the npm tree |
+| 3 | `$NEXUS_ROOT/node_modules/.bin/claude` | the npm install |
+| 4 | `claude` on PATH | legacy system install |
+
+Rank 2 sits **above** the npm tree on purpose: a re-appearing
+`node_modules` (a stray `npm install`, a fresh bootstrap) must not be
+able to move the workspace back off the operator's choice without
+anyone noticing. `monitor/link-nexus-tools.sh` follows the same
+resolver, so `locals/bin/claude` — the name every PATH lookup hits —
+points at the native binary too, as an **absolute** symlink (the
+relative in-tree form is meaningless across the tree boundary).
+
+A `claude_bin` that is set but not executable is a **fatal** error at
+every spawn surface (`_claude-bin.sh` exit 2), never a silent fall-back
+to the npm tree.
+
+Two npm-shaped mechanisms refuse to run under this key, by design:
+
+| Surface | Behaviour | Override |
+|---|---|---|
+| `install-claude-local.sh` | refuses; installing would leave an unused `node_modules` | `CLAUDE_INSTALL_ALLOW_PINNED=1` |
+| `cc-auto-update-apply.sh safe` | refuses (exit 32); it bumps by `npm install`, which cannot move a native binary | none — keep the native install current yourself |
+
+`monitor/.state/cc-version-local` still records the version you run, so
+the watcher's update-detection gate keeps comparing against reality.
 
 The manual **"update available" emit is OFF by default**
 (`monitor.cc_update.emit_enabled: false`, env
@@ -2183,9 +2229,11 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `watcher/test-snapshot-github.sh` | Mock-gh unit tests for `_github.sh` (run: `bash monitor/watcher/test-snapshot-github.sh`) | yes |
 | `watcher/test-snapshot-github-failure.sh` | Mock-gh unit tests for the detect-and-react path in `_github.sh` (rate-limit sentinel, backoff, expiry) (run: `bash monitor/watcher/test-snapshot-github-failure.sh`) | yes |
 | `watcher/test-deliveries-race.sh` | Mock-curl unit tests for the deliveries durable queue (`_append_to_deliveries_queue` / `_drain_deliveries_queue` in `_deliveries.sh`). Covers the multi-tick overwrite race, cumulative-emit semantics, drain idempotency, and the drain-then-new-event interleaving (run: `bash monitor/watcher/test-deliveries-race.sh`) | yes |
+| `watcher/test-claude-bin-resolver.sh` | Unit tests for the `$CLAUDE_BIN` resolver `_claude-bin.sh`: the four lookups and their order, the native-install pin `nexus.claude_bin` outranking `node_modules`, exit 2 (pin set but not executable) never falling through to the npm tree, the soft degradation when `config/load.sh` cannot read yaml, and `CLAUDE_BIN_NO_PATH` suppressing only the PATH lookup (run: `bash monitor/watcher/test-claude-bin-resolver.sh`) | yes |
 | `watcher/test-cc-version.sh` | Unit tests for the effective-version resolver `_cc-version.sh` (floor-plus-local-pin, #226): floor extraction, local-pin path resolution / trim / blank-handling, `effective = local-pin else floor`, atomic write round-trip, and gate-baseline wiring (the gate fires against the effective version, not the lagging floor) (run: `bash monitor/watcher/test-cc-version.sh`) | yes |
 | `_cc-version.sh`             | Shared resolver for the EFFECTIVE Claude Code version (floor-plus-local-pin, #226). `effective = local-pin (monitor/.state/cc-version-local) else package.json floor`. Read by `install-claude-local.sh` (install + verify) and the watcher gate baseline (`_v2_task_cc_version_check`). Atomic local-pin write. | yes |
-| `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. | yes |
+| `_claude-bin.sh`             | Shared `$CLAUDE_BIN` resolver for every spawn surface. Order: `CLAUDE_BIN` env → config `nexus.claude_bin` → `node_modules/.bin/claude` → `claude` on PATH. Sourced, not executed; exits 1 when nothing resolves and 2 when `nexus.claude_bin` is set but not executable (callers probe in a subshell to tell the two apart). | yes |
+| `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. REFUSES when config `nexus.claude_bin` pins a binary outside the npm tree (override: `CLAUDE_INSTALL_ALLOW_PINNED=1`). | yes |
 | `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `set-buffer` → `paste-buffer` → `Enter` sequence, appends a `paste-followup` action-log audit event. Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
 | `mint-token.sh`              | Mints / caches the bot's installation token | yes |
 | `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the user's `gh auth setup-git` path isn't available (e.g. inside agent-sandbox with a read-only `~/.gitconfig`) — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |
@@ -2209,6 +2257,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `.state/watcher.log`         | Append-only watcher log (startup, emits, paste failures, respawns) | no |
 | `.state/last-ack.txt`        | ISO timestamp of the newest diff the monitor agent has acknowledged | no |
 | `.state/action-log.jsonl`    | Append-only JSONL action trace: `{ts,agent,event,...}` per meaningful action | no |
+| `.state/freeze-log.jsonl`    | Append-only JSONL record of every `evidence-freeze.sh` freeze: `{v,ts,event,dir,name,md5,bytes,src,window}`. The OUT-OF-BAND half of the evidence guard — it lives outside every evidence directory, so removing a directory does not remove the record that it existed, and `--verify` cross-checks the two. Held mode 0440 between appends; appends take an exclusive `flock` on `freeze-log.jsonl.lock`. NEVER rotated, deliberately: `action-log.jsonl` was the other candidate and was rejected because rotation deletes the archive after `DIFF_RETENTION_DAYS`, and a freeze record must outlive the artefact it describes. One line per freeze, so it grows slowly. | no |
 | `.state/last-snapshot.txt`   | Persistent snapshot baseline (carries across watcher restarts) | no |
 | `.state/engagement-log.tsv`  | One row per worker window the watcher has ever observed in `busy` / `user-typing` state: `<window>\t<last-engagement-epoch>`. Consulted by `_idle_probe.sh` for both the idle-pool entry gate (`now - engagement_epoch` is the worker's idle age when a row exists; otherwise fall back to `now - #{window_activity}`) and the retain-consume gate (engagement past `retain.ts` consumes the retain). Replaces direct comparisons against `tmux #{window_activity}` in both places; see issue #111. Append-mostly; at-most-one row per window. | no |
 | `.state/user-prompt/`        | Per-window "last user-prompt submitted" stamp `<window>` (`<epoch>\t<session-id>`), written by `worker-heartbeat.sh` from the worker's `UserPromptSubmit` hook. THE operator-engagement trigger (issues #196, #201): `_idle_probe.sh` attributes each new stamp to the operator or the orchestrator via the machine-input rule — no pane content involved. Pruned with the window by the per-cycle disappearance pruner. | no |

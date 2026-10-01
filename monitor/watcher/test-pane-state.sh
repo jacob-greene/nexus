@@ -171,14 +171,35 @@ prefix_exempt() {
 # itself; the suite ran one assertion fewer at exit 0 under ALL TESTS
 # PASSED. A tracked manifest cannot be defeated that way, and it needs no
 # git, so an export or a tarball is accounted for too.
+#
+# WHY A NUMBER AND NOT ONLY THE FILE (#185, skeptic findings F1 and F2): the
+# manifest pins WHICH fixtures must exist. On its own it does not pin HOW
+# MANY. Delete a fixture from disk and its line from the manifest in one
+# edit, and both directions below still agree with each other — at 29 names
+# instead of 30 — so one assertion is lost at exit 0 under ALL TESTS PASSED.
+# A duplicated line is accepted the same way, at 31 names and one name
+# checked twice. Both were measured at bed49ac. The count the block printed
+# was compared to nothing, so it could not be read as a set size.
+#
+# MANIFEST_EXPECTED_FIXTURES is the pin. It is deliberately in THIS file and
+# not in the manifest, so that changing the fixture set is a three-file edit
+# and the third file is the one a reviewer reads as a number. Bump it in the
+# same commit that adds or removes a fixture; if you forget, the suite fails
+# and prints both the number it found and the number it wanted.
+MANIFEST_EXPECTED_FIXTURES=30
+
 echo "=== tracked-fixture manifest ==="
 MANIFEST_FILE="$FIX_DIR/MANIFEST"
 if [[ -f "$MANIFEST_FILE" ]]; then
     manifest_names=()
+    manifest_dupes=()
     while IFS= read -r _line; do
         _line="${_line%%#*}"
         _line="${_line//[[:space:]]/}"
         [[ -n "$_line" ]] || continue
+        for _seen in ${manifest_names[@]+"${manifest_names[@]}"}; do
+            [[ "$_seen" == "$_line" ]] && { manifest_dupes+=("$_line"); break; }
+        done
         manifest_names+=("$_line")
         need_fixture "$FIX_DIR/$_line" "listed in fixtures/MANIFEST, absent from the working tree"
     done < "$MANIFEST_FILE"
@@ -188,6 +209,31 @@ if [[ -f "$MANIFEST_FILE" ]]; then
         PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: fixtures/MANIFEST lists no fixtures\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # The length pin. Closes the coordinated fixture-plus-line deletion.
+    if (( ${#manifest_names[@]} == MANIFEST_EXPECTED_FIXTURES )); then
+        printf '  PASS: fixtures/MANIFEST length matches the pinned count of %d\n' \
+            "$MANIFEST_EXPECTED_FIXTURES"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: fixtures/MANIFEST lists %d fixtures, pinned count is %d — a fixture was added or removed without updating MANIFEST_EXPECTED_FIXTURES in %s\n' \
+            "${#manifest_names[@]}" "$MANIFEST_EXPECTED_FIXTURES" \
+            "$(basename "${BASH_SOURCE[0]}")" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # No duplicates. A repeated name checks one fixture twice and inflates the
+    # listed count, so the count stops being a set size. It also lets a
+    # duplicate absorb a deletion: drop one fixture and duplicate another, and
+    # the length pin above would agree again.
+    if (( ${#manifest_dupes[@]} == 0 )); then
+        printf '  PASS: fixtures/MANIFEST lists every name exactly once\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: fixtures/MANIFEST repeats %d name(s): %s — a repeated name is checked twice and inflates the listed count\n' \
+            "${#manifest_dupes[@]}" "${manifest_dupes[*]}" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 
