@@ -309,6 +309,54 @@ svc_supervisor() {
     esac
 }
 
+# A JUST-LAUNCHED SERVICE IS NOT DOWN (2026-10-12 sandbox restarts).
+#
+# Measured on 2026-10-12: across four sandbox restarts, myviewer, jupyterlab,
+# paper-radar-serve and nexus-remote-ssh "came back DOWN" and were restarted by
+# hand every time. They were not missed by recovery. bootstrap-recover.sh
+# relaunched every one of them (fresh pid records, live supervisors), but it
+# spawns the ORCHESTRATOR FIRST and the services after it, so the resumed
+# orchestrator's first `svc.sh status` sampled them seconds after launch. Their
+# healthchecks had not passed yet (myviewer serves ~5 s after launch,
+# paper-radar-serve ~10 s, nexus-remote-ssh's wrapper waits ~2-7 s before
+# exec'ing sshd, a labsh cold build takes minutes), and this table printed the
+# same red `DOWN` it prints for a dead service. The hand restart then killed a
+# warm-up that was about to succeed: myviewer answered its first curl with 200
+# at 16:27:06Z and was SIGTERMed at 16:27:23Z by the restart. The four share
+# one property, startup latency, and nothing else.
+#
+# So: a failing healthcheck next to a LIVE supervisor whose process started
+# less than SVC_STARTUP_GRACE_SECONDS ago renders `STARTING`, never `DOWN`.
+# Past the grace it reads `DOWN` exactly as before, so a supervisor that is
+# alive but can never bring its service up is still flagged, just not in its
+# first minutes. Default 300 s: the longest measured bring-up among the four is
+# a labsh cold build of ~2-3 min after a restart (service-health events,
+# 2026-10-05..11). The row still counts as needing attention (it is not UP).
+SVC_STARTUP_GRACE_SECONDS="${SVC_STARTUP_GRACE_SECONDS:-300}"
+[[ "$SVC_STARTUP_GRACE_SECONDS" =~ ^[0-9]+$ ]] || SVC_STARTUP_GRACE_SECONDS=300
+
+# _svc_supervisor_age <name> <pid> — seconds since the supervisor process
+# started. Kernel start-time (jiffies since boot) against /proc/uptime first;
+# the pid record's mtime (it is rewritten at every launch) as the fallback.
+# Prints nothing and returns 1 when neither can be read.
+_svc_supervisor_age() {
+    local name="$1" pid="$2" st up hz age pf mt
+    st=$(_recover_starttime "$pid" 2>/dev/null) || st=''
+    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null) || up=''
+    up="${up%%.*}"
+    hz=$(getconf CLK_TCK 2>/dev/null) || hz=''
+    if [[ "$st" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+$ && "$hz" =~ ^[1-9][0-9]*$ ]]; then
+        age=$(( up - st / hz ))
+        (( age >= 0 )) && { printf '%s' "$age"; return 0; }
+    fi
+    pf=$(_recover_pidfile "$name")
+    mt=$(stat -c '%Y' "$pf" 2>/dev/null) || return 1
+    [[ "$mt" =~ ^[0-9]+$ ]] || return 1
+    age=$(( $(date +%s) - mt ))
+    (( age >= 0 )) || age=0
+    printf '%s' "$age"
+}
+
 # THE STATUS PATH'S HEALTHCHECK IS BOUNDED (your-org/nexus-code#1601).
 #
 # `_recover_service_healthy` (bootstrap-recover.sh) runs a registry healthcheck
@@ -411,11 +459,11 @@ svc_display_url() {
     fi
 }
 
-# Tokened, directly-openable URL for a labsh JupyterLab service. This
-# cockpit serves an internal lab network, so showing the token is the
-# point: the DETAIL cell is meant to be copy-pasted straight into a
-# browser. Reads PORT/SCHEME from .jupyter/labsh-service.env and the
-# token from .jupyter/token (both written by labsh-supervised.sh /
+# Tokened, directly-openable URL for a labsh JupyterLab service. The
+# RENDERED cell never shows the token: svc_detail_url passes this through
+# svc_redact_url, which keeps the full URL in a mode-0600 file and names
+# that file in the cell. Reads PORT/SCHEME from .jupyter/labsh-service.env
+# and the token from .jupyter/token (both written by labsh-supervised.sh /
 # labsh); host rewritten to the FQDN when the bind is external (same
 # rule as svc_display_url). Returns 1 when no port is recorded — the
 # caller falls back to the generic endpoint; a missing token degrades
@@ -503,10 +551,84 @@ svc_endpoint() {
 # so the two cannot disagree (the #1742 WARN once fired on a jupyterlab row
 # whose cell showed a URL, because it asked svc_endpoint alone).
 svc_detail_url() {
-    local workdir="$1" health="$2" up="${3:-}" detail=""
+    local workdir="$1" health="$2" up="${3:-}" name="${4:-}" detail=""
     [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
     [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
-    printf '%s' "$detail"
+    svc_redact_url "$detail" "$name"
+}
+
+# A URL CELL NEVER CARRIES A SECRET (2026-10-12, token in agent transcripts).
+#
+# The jupyterlab row printed `…/lab?token=<the live token>`, so every agent that
+# ran `svc.sh status` copied the JupyterLab credential into its transcript, and
+# from there into reports and issue comments. "This cockpit serves an internal
+# lab network" was the old reason to show it; an agent transcript is not a lab
+# network. So every query parameter whose NAME ends in token / key / secret /
+# password / passwd (case-insensitive: `token`, `access_token`, `api_key`,
+# `client_secret`, …) has its VALUE replaced in the rendered cell, for every
+# row and every URL source (labsh, healthcheck text, `.deploy/endpoint`).
+#
+# The full URL is not lost: it is written to `$STATE_DIR/services/<name>.url`,
+# mode 0600, and the cell names that file, so the operator still has a
+# copy-pasteable URL one `cat` away. Written only when it changed (the cockpit
+# re-renders every few seconds), via a 0600 temp file + rename, so the secret
+# is never readable at a wider mode even for an instant. When the file cannot
+# be written (read-only tree, no name) the cell still redacts and says the URL
+# was not saved — the failure direction is "less convenient", never "leaked".
+#
+# Over-matching is the safe direction and is accepted: a parameter named
+# `monkey=` is redacted too. NOT covered: a password in URL userinfo
+# (`https://user:pw@host`) — no registered service uses that shape.
+SVC_SECRET_PARAM_RE='(token|key|secret|password|passwd)$'
+
+svc_url_file() { printf '%s/services/%s.url' "$STATE_DIR" "$1"; }
+
+# _svc_save_secret_url <name> <url> — persist the full URL at mode 0600.
+# Returns 0 when the file holds exactly <url> at mode 600 afterwards.
+_svc_save_secret_url() {
+    local name="$1" url="$2" f dir tmp cur mode
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    f=$(svc_url_file "$name"); dir="${f%/*}"
+    if [[ -f "$f" && ! -L "$f" ]]; then
+        cur=$(<"$f") 2>/dev/null || cur=''
+        mode=$(stat -c '%a' "$f" 2>/dev/null) || mode=''
+        [[ "$cur" == "$url" && "$mode" == 600 ]] && return 0
+    fi
+    mkdir -p "$dir" 2>/dev/null || return 1
+    tmp=$(umask 077; mktemp "$dir/.$name.url.XXXXXX" 2>/dev/null) || return 1
+    if printf '%s\n' "$url" > "$tmp" 2>/dev/null && chmod 600 "$tmp" 2>/dev/null \
+       && mv -f "$tmp" "$f" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+# svc_redact_url <url> [<service-name>] — print <url> with every secret-named
+# query parameter's value replaced. Unchanged when there is nothing to redact.
+svc_redact_url() {
+    local url="$1" name="${2:-}" base q frag='' p k out='' hit=0 ph
+    if [[ "$url" != *\?* ]]; then printf '%s' "$url"; return 0; fi
+    base="${url%%\?*}"; q="${url#*\?}"
+    if [[ "$q" == *'#'* ]]; then frag="#${q#*#}"; q="${q%%#*}"; fi
+    local -a parts=() kept=()
+    IFS='&' read -r -a parts <<<"$q"
+    for p in "${parts[@]}"; do
+        k="${p%%=*}"; k="${k,,}"
+        if [[ "$p" == *=* && "$k" =~ $SVC_SECRET_PARAM_RE ]]; then
+            kept+=("${p%%=*}=@@REDACTED@@"); hit=1
+        else
+            kept+=("$p")
+        fi
+    done
+    if (( ! hit )); then printf '%s' "$url"; return 0; fi
+    if [[ -n "$name" ]] && _svc_save_secret_url "$name" "$url"; then
+        ph="<redacted: see $(svc_url_file "$name")>"
+    else
+        ph='<redacted: full URL not saved>'
+    fi
+    out=$(IFS='&'; printf '%s' "${kept[*]}")
+    printf '%s?%s%s' "$base" "${out//@@REDACTED@@/$ph}" "$frag"
 }
 
 # svc_health_is_http <workdir> <health> — does this row's healthcheck probe an
@@ -1079,6 +1201,15 @@ render_status() {
         # Health verdict feeds the supervisor cell so a dead pid record next
         # to a passing healthcheck renders as `orphan`, never a bare `stale`.
         sup="$(svc_supervisor "$name" "$launch" "$up")"
+        # A live supervisor launched moments ago whose service is not answering
+        # YET is STARTING, not DOWN — see SVC_STARTUP_GRACE_SECONDS above.
+        local _age=''
+        if [[ "$up" == DOWN && "$sup" == pid:* ]] \
+           && _age=$(_svc_supervisor_age "$name" "${sup#pid:}") \
+           && (( _age < SVC_STARTUP_GRACE_SECONDS )); then
+            up='STARTING'; upc="$C_Y"
+            detail="supervisor launched ${_age}s ago; healthcheck not passing yet — still STARTING, not DOWN; do not restart (reads DOWN after ${SVC_STARTUP_GRACE_SECONDS}s)"
+        fi
         case "$sup" in
             pid:*)  supc="$C_G" ;;
             stale)  supc="$C_R" ;;
@@ -1102,7 +1233,7 @@ render_status() {
         # A non-serving row keeps a detail already set above (a hung check's
         # "did not finish within" note); a serving one always shows its URL.
         if [[ "$up" == UP || "$up" == DEGRADED || -z "$detail" ]]; then
-            detail=$(svc_detail_url "$workdir" "$health" "$up")
+            detail=$(svc_detail_url "$workdir" "$health" "$up" "$name")
         fi
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
@@ -2192,7 +2323,7 @@ cmd_retire_orphan() {
 #       `watch.sh`) — this catches a supervisor from a clone whose registry row
 #       we do not have.
 # Rule (2) alone is demonstrably insufficient ON THIS REGISTRY: the
-# `myviewer-xiulan` row launches `run-supervised-xiulan.sh`, whose basename
+# `myviewer-collab` row launches `run-supervised-collab.sh`, whose basename
 # does NOT end in `-supervised.sh`, so a shape-only predicate misses it. Rule
 # (1) alone is insufficient because a retired clone may run a script this
 # registry never mentions. The union is still an APPROXIMATION and it errs

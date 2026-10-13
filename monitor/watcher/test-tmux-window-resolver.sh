@@ -184,7 +184,7 @@ f_rc()  { printf '%s' "${1%%$'\t'*}"; }
 f_out() { local r="${1#*$'\t'}"; printf '%s' "${r%%$'\t'*}"; }
 f_err() { printf '%s' "${1##*$'\t'}"; }
 
-srv tmux new-session -d -s s699 -n "$PRESENT_WIN" 2>/dev/null \
+srv tmux -f /dev/null new-session -d -s s699 -n "$PRESENT_WIN" 2>/dev/null \
     || { echo "SETUP FAILED: could not start a private tmux server in $PRIV" >&2; exit 1; }
 
 # tmux renames a window to whatever command is running in it, a short moment
@@ -1082,7 +1082,7 @@ assert_eq "I6 CONTROL bare name (single session): rc 0" "$(f_rc "$r")" 0
 assert_eq "I6 CONTROL bare name (single session): resolves to itself" "$(f_out "$r")" "$PRESENT_WIN"
 
 S944=zz-944-other
-srv tmux new-session -d -s "$S944" -n zz-944-alpha 2>/dev/null \
+srv tmux -f /dev/null new-session -d -s "$S944" -n zz-944-alpha 2>/dev/null \
     || { echo "SETUP FAILED: could not create the second fixture session" >&2; exit 1; }
 srv tmux set-window-option -t "$S944:" automatic-rename off >/dev/null 2>&1 || true
 srv tmux new-window -t "$S944:" -d -n zz-944-bravo >/dev/null 2>&1 || true
@@ -1209,7 +1209,7 @@ echo
 echo '=== J: a bare key collides across SESSIONS, and only the REFUSAL widens ==='
 
 S1318=zz-1318-name
-srv tmux new-session -d -s "$S1318" -n zz-1318-filler 2>/dev/null \
+srv tmux -f /dev/null new-session -d -s "$S1318" -n zz-1318-filler 2>/dev/null \
     || { echo "SETUP FAILED: could not create the third fixture session" >&2; exit 1; }
 srv tmux set-window-option -t "$S1318:" automatic-rename off >/dev/null 2>&1 || true
 # The collision's NAME side: a window in the THIRD session named after
@@ -1295,7 +1295,7 @@ fi
 # becomes current by the act of creating it), widened with non-numeric window
 # names until one of its indices is nobody's name server-wide. Bounded, and a
 # loud abort if the bound is reached.
-srv tmux new-session -d -s zz-1318-clean -n zz-1318-solo 2>/dev/null \
+srv tmux -f /dev/null new-session -d -s zz-1318-clean -n zz-1318-solo 2>/dev/null \
     || { echo "SETUP FAILED: could not create the J2 fixture session" >&2; exit 1; }
 srv tmux set-window-option -t 'zz-1318-clean:' automatic-rename off >/dev/null 2>&1 || true
 _jfree=""
@@ -1333,7 +1333,7 @@ fi
 # PREDICTED FLIP for "make the resolver ask tmux (`display-message -t <name>`)
 # instead of walking the table": K2/K3 go red (rc 0, the SIBLING's id). K1 (the
 # premise) and K6 (the control) do not move.
-srv tmux new-session -d -s zz-1524 -n zz-1524-filler 2>/dev/null \
+srv tmux -f /dev/null new-session -d -s zz-1524 -n zz-1524-filler 2>/dev/null \
     || { echo "SETUP FAILED: could not create the Part K fixture session" >&2; exit 1; }
 srv tmux new-window -d -t 'zz-1524:' -n zz1524w-sk >/dev/null 2>&1
 srv tmux set-window-option -t 'zz-1524:zz1524w-sk' automatic-rename off >/dev/null 2>&1 || true

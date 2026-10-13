@@ -106,6 +106,38 @@ export NEXUS_NOTIFYWRAP_DEPTH=$((_nw_depth + 1))
 
 _nw_msg="$*"
 _nw_state_dir="${NEXUS_NOTIFY_STATE_DIR:-${NEXUS_ROOT:-}/monitor/.state}"
+# --- DEGRADED TREE: move the state OFF it, and say so once per call (#1724) ---
+# On a read-only project tree every write below failed, and the failures were
+# not silent: `printf … >> f 2>/dev/null` reports a failed OPEN before the
+# `2>/dev/null` is applied, so each call sprayed raw `Read-only file system`
+# lines (measured, 2026-10-09 RO incident) and the bell went out with no
+# cooldown and no record. Probe the dir with a FRESH create (never a held fd,
+# see monitor/_fs_probe.sh) and, if it cannot take a file, run the cooldown and
+# decision log from the watcher's degraded run dir outside the tree, the one
+# monitor/watcher/_fs_guard.sh already keeps (NEXUS_DEGRADED_RUNDIR).
+if [ -n "${NEXUS_ROOT:-}${NEXUS_NOTIFY_STATE_DIR:-}" ]; then
+    _nw_probe="$_nw_state_dir/.nw-probe.$$.${RANDOM:-0}"
+    if mkdir -p "$_nw_state_dir" 2>/dev/null && ( : > "$_nw_probe" ) 2>/dev/null; then
+        rm -f "$_nw_probe" 2>/dev/null
+    else
+        # The run dir comes from the session-managed $TMPDIR via the shared
+        # resolver, never a literal path (operator, 2026-10-10, #1724).
+        _nw_fb=""
+        _nw_rd="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/../_degraded-rundir.sh"
+        if [ -r "$_nw_rd" ] && . "$_nw_rd" 2>/dev/null \
+           && _nw_fb=$(nexus_degraded_rundir); then
+            _nw_fb="$_nw_fb/notify"
+        fi
+        if [ -n "$_nw_fb" ] && ( umask 077; mkdir -p "$_nw_fb" ) 2>/dev/null && [ -w "$_nw_fb" ]; then
+            printf 'sandbox-notify: DEGRADED — %s is not writable; the bell still rings, and its cooldown and decision log run from %s until the tree heals (your-org/nexus-code#1724; see monitor/ng degraded status)\n' \
+                "$_nw_state_dir" "$_nw_fb" >&2
+            _nw_state_dir="$_nw_fb"
+        else
+            printf 'sandbox-notify: DEGRADED — %s is not writable and no fallback dir could be made (%s); ringing with no cooldown and no decision record (your-org/nexus-code#1724)\n' \
+                "$_nw_state_dir" "$_nw_fb" >&2
+        fi
+    fi
+fi
 _nw_decisions="$_nw_state_dir/notify-decisions.jsonl"
 _nw_cd_dir="$_nw_state_dir/notify-cooldown"
 _nw_incident_window="${NEXUS_NOTIFY_INCIDENT_WINDOW:-6}"
@@ -137,7 +169,7 @@ _nw_record() {
     if [ -f "$_nw_decisions" ]; then
         _nw_lines=$(wc -l < "$_nw_decisions" 2>/dev/null || echo 0)
         if [ "${_nw_lines:-0}" -gt 5000 ] 2>/dev/null; then
-            tail -n 2500 "$_nw_decisions" > "$_nw_decisions.rot" 2>/dev/null \
+            tail -n 2500 "$_nw_decisions" 2>/dev/null > "$_nw_decisions.rot" \
                 && mv -f "$_nw_decisions.rot" "$_nw_decisions" 2>/dev/null
         fi
     fi
@@ -146,7 +178,7 @@ _nw_record() {
     printf '{"ts":%s,"class":"%s","verdict":"%s","window":"%s","msg":"%s"}\n' \
         "$(date +%s)" "$1" "$2" \
         "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:--}}" \
-        "$_nw_esc" >> "$_nw_decisions" 2>/dev/null || true
+        "$_nw_esc" 2>/dev/null >> "$_nw_decisions" || true
 }
 
 # --- Generic lock (atomic mkdir + stale reclaim). Returns 0 always usable: ----
@@ -209,10 +241,10 @@ _nw_batch_add() {   # $1 = class, $2 = message
         return 0
     fi
     if _nw_lock "$_nwb_lock"; then
-        printf '1\t%s\n' "$_nwb_msg" >> "$_nwb_file" 2>/dev/null || true
+        printf '1\t%s\n' "$_nwb_msg" 2>/dev/null >> "$_nwb_file" || true
         _nw_unlock "$_nwb_lock"
     else
-        printf '1\t%s\n' "$_nwb_msg" >> "$_nwb_file.of.$$" 2>/dev/null || true
+        printf '1\t%s\n' "$_nwb_msg" 2>/dev/null >> "$_nwb_file.of.$$" || true
     fi
 }
 
@@ -262,15 +294,15 @@ _nw_batch_drain() {   # $1 = class
     # lost (T26/T27) and nothing loops (the new carry lands after this sweep).
     for _nwd_f in "$_nwd_file".of.carry.*; do
         [ -s "$_nwd_f" ] || continue
-        cat "$_nwd_f" >> "$_nwd_claim" 2>/dev/null
+        cat "$_nwd_f" 2>/dev/null >> "$_nwd_claim"
         rm -f "$_nwd_f" 2>/dev/null || true
     done
-    [ -s "$_nwd_file" ] && cat "$_nwd_file" >> "$_nwd_claim" 2>/dev/null
+    [ -s "$_nwd_file" ] && cat "$_nwd_file" 2>/dev/null >> "$_nwd_claim"
     rm -f "$_nwd_file" 2>/dev/null || true
     for _nwd_f in "$_nwd_file".of.*; do
         [ -s "$_nwd_f" ] || continue
         case "$_nwd_f" in *.of.carry.*) continue ;; esac   # already drained above
-        cat "$_nwd_f" >> "$_nwd_claim" 2>/dev/null
+        cat "$_nwd_f" 2>/dev/null >> "$_nwd_claim"
         rm -f "$_nwd_f" 2>/dev/null || true
     done
     _nw_unlock "$_nwd_lock"
@@ -293,7 +325,7 @@ _nw_batch_drain() {   # $1 = class
         # Same pid draining the same class twice must ACCUMULATE, not clobber.
         _nwd_dest="$_nwd_file.of.carry.$$"
         if [ -e "$_nwd_dest" ]; then
-            cat "$_nwd_carry" >> "$_nwd_dest" 2>/dev/null || true
+            cat "$_nwd_carry" 2>/dev/null >> "$_nwd_dest" || true
             rm -f "$_nwd_carry" 2>/dev/null || true
         else
             mv -f "$_nwd_carry" "$_nwd_dest" 2>/dev/null \
@@ -410,7 +442,7 @@ if [ "${NEXUS_NOTIFY_FLUSH:-0}" = "1" ]; then
            || [ $((_nw_now - _nwf_last)) -ge "$_nwf_iv" ]; then
             _nwf_sum=$(_nw_batch_drain "$_nwf_class")
             if [ -n "$_nwf_sum" ]; then
-                : > "$_nwf_stamp" 2>/dev/null || true
+                : 2>/dev/null > "$_nwf_stamp" || true
                 _nw_emit "batched ($_nwf_class): $_nwf_sum"
                 _nw_record "$_nwf_class" "digest" "batched ($_nwf_class): $_nwf_sum"
             fi
@@ -618,7 +650,7 @@ _nw_decide() {
     _nw_rc=1
     if [ "${_nw_last:-0}" -le 0 ] 2>/dev/null \
        || [ $((_nw_now - _nw_last)) -ge "$_nw_interval" ]; then
-        : > "$_nw_stamp" 2>/dev/null || true
+        : 2>/dev/null > "$_nw_stamp" || true
         _nw_rc=0
     fi
     _nw_unlock "$_nw_lockp"
@@ -634,7 +666,7 @@ fi
 # --- (5) RING. Open an incident if this is critical/failure; drain pending ----
 # batches into the outgoing message so nothing waits for the next tick.
 if [ "$_nw_class" = "critical" ] || [ "$_nw_class" = "failure" ]; then
-    mkdir -p "$_nw_cd_dir" 2>/dev/null && : > "$_nw_cd_dir/.incident" 2>/dev/null || true
+    mkdir -p "$_nw_cd_dir" 2>/dev/null && : 2>/dev/null > "$_nw_cd_dir/.incident" || true
 fi
 
 _nw_final="$_nw_msg"

@@ -46,8 +46,8 @@
 #      bootstrap-recover never sees/auto-starts it; verbs redirect
 #      to activation.
 #  13. DETAIL column — an UP labsh service renders its reachable
-#      tokened URL (FQDN on external bind, ?token= from .jupyter/
-#      token, bare URL without a token, fallback when DOWN); the
+#      URL (FQDN on external bind, ?token= REDACTED to a 0600 file,
+#      bare URL without a token, fallback when DOWN); the
 #      WINDOW column is gone.
 #  14. height-aware priority rendering — in dashboard mode (INPLACE=1)
 #      the frame is budgeted to the pane height: core + DOWN rows are
@@ -717,8 +717,13 @@ printf 'LISTEN 0 4096 0.0.0.0:9755 0.0.0.0:*\n' > "$ROOT/ss.out"
 reg_line jupyterlab "$ROOT/wd-j" './w.sh' 'true' > "$REG"
 
 run_svc status
-grep -qE 'jupyterlab +UP .*http://host\.example\.org:9755/lab\?token=sekrit-token$' "$ROOT/out" \
-    && pass "detail: UP labsh service shows the full tokened FQDN URL" \
+# The token itself is NEVER rendered (2026-10-12: it was copied into every
+# agent transcript that ran status); the cell names the 0600 file that keeps
+# the full URL. test-svc-url-redact.sh owns that contract in depth.
+grep -qE 'jupyterlab +UP .*http://host\.example\.org:9755/lab\?token=<redacted: see .*/services/jupyterlab\.url>$' "$ROOT/out" \
+    && ! grep -q 'sekrit-token' "$ROOT/out" "$ROOT/err" \
+    && grep -qF 'http://host.example.org:9755/lab?token=sekrit-token' "$ROOT/monitor/.state/services/jupyterlab.url" \
+    && pass "detail: UP labsh service shows the FQDN URL, token redacted to its 0600 file" \
     || fail "tokened detail: $(grep jupyterlab "$ROOT/out")"
 grep -q 'WINDOW' "$ROOT/out" \
     && fail "WINDOW column still rendered" \
@@ -730,7 +735,7 @@ grep -q 'DETAIL' "$ROOT/out" \
 # Loopback-only bind keeps localhost in the URL (token still shown).
 printf 'LISTEN 0 4096 127.0.0.1:9755 0.0.0.0:*\n' > "$ROOT/ss.out"
 run_svc status
-grep -q 'http://localhost:9755/lab?token=sekrit-token' "$ROOT/out" \
+grep -q 'http://localhost:9755/lab?token=<redacted: see ' "$ROOT/out" \
     && pass "detail: loopback bind keeps localhost host" \
     || fail "loopback detail: $(grep jupyterlab "$ROOT/out")"
 
@@ -858,7 +863,8 @@ last=$(grep -oE 'page [0-9]+/[0-9]+' <<<"$frame3" | head -1)
     || fail "clamp: [$last]"
 # The tokened URL lives on the last page, full and untruncated.
 grep -q 'token=' <<<"$frame3" \
-    && grep -qF "http://localhost:58888/lab?token=$(cat "$ROOT/wd-jl/.jupyter/token")" <<<"$frame3" \
+    && grep -qF "http://localhost:58888/lab?token=<redacted: see $STATE_DIR/services/jupyterlab.url>" <<<"$frame3" \
+    && ! grep -qF "$(cat "$ROOT/wd-jl/.jupyter/token")" <<<"$frame3" \
     && pass "paging: full tokened URL untruncated on its page" \
     || fail "tokened URL truncated/missing on last page"
 

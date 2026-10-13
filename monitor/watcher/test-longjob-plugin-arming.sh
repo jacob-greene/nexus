@@ -38,18 +38,22 @@ cp "$REPO_ROOT/monitor/longjob-plugin/.claude-plugin/plugin.json" "$ROOT/monitor
 STUB="$WORK/claude-stub"
 cat > "$STUB" <<'EOF'
 #!/usr/bin/env bash
-# LJ_HELP: "full" (advertises --plugin-dir <path>), "old" (no such flag), "hang", "empty"
+# LJ_HELP: "full" (advertises --plugin-dir <path>), "old" (no such flag), "hang", "empty",
+#          "partial134" (a partial usage line, then exit 134: an INCOMPLETE answer)
 # LJ_VALIDATE_RC: exit code for `plugin validate`; "hang" sleeps
 case "${1:-}" in
   --help)
+    [[ -n "${LJ_HELP_LOG:-}" ]] && echo help >> "$LJ_HELP_LOG"
     case "${LJ_HELP:-full}" in
       full) printf 'Usage: claude [options]\n  --name <name>   Set a display name\n  --plugin-dir <path>   Load a plugin from a directory\n' ;;
       old)  printf 'Usage: claude [options]\n  --name <name>   Set a display name\n' ;;
       hang) sleep 60 ;;
       empty) : ;;
+      partial134) printf 'Usage: claude [options]\n'; exit 134 ;;
     esac; exit 0 ;;
   plugin)
     [[ "${2:-}" == validate ]] || exit 2
+    [[ -n "${LJ_VALIDATE_LOG:-}" ]] && echo validate >> "$LJ_VALIDATE_LOG"
     [[ "${LJ_VALIDATE_RC:-0}" == hang ]] && sleep 60
     exit "${LJ_VALIDATE_RC:-0}" ;;
   --version) echo "0.0.0-stub"; exit 0 ;;
@@ -57,6 +61,13 @@ esac
 exit 1
 EOF
 chmod +x "$STUB"
+# This stub's --help varies by ENVIRONMENT at one fixed path, which is exactly
+# the bet the #1721 disk cache does not make. The cases above the #1721 section
+# vary LJ_HELP per case, so the disk cache is OFF for them (the EMPTY string
+# disables it; `${VAR+set}`); that section names its own directories.
+export NEXUS_CLAUDE_HELP_CACHE_DIR=""
+# Same for the validate-pass cache (#1704): its own section names directories.
+export NEXUS_LONGJOB_VALIDATE_CACHE_DIR=""
 
 # run_case <name> → prints "rc|flag|stderr|logrow"
 run_case() {
@@ -111,7 +122,7 @@ LJ_HELP=old neg oldbinary "was read and does not list --plugin-dir" "does not su
 echo "=== --help hangs (bounded probe) → UNKNOWN, arms unprobed (#1611) ==="
 LJ_HELP=hang unprobed helphang "--help probe TIMED OUT (rc 124" "UNKNOWN, not 'unsupported'"
 echo "=== --help prints nothing → UNKNOWN, arms unprobed (#1611) ==="
-LJ_HELP=empty unprobed helpempty "--help produced no output" "UNKNOWN, not 'unsupported'"
+LJ_HELP=empty unprobed helpempty "--help did not complete (empty" "UNKNOWN, not 'unsupported'"
 echo "=== validate fails ==="
 LJ_HELP=full LJ_VALIDATE_RC=1 neg badmanifest "validate failed rc=1" "FAILED (rc 1)"
 echo "=== --help hangs BUT validate RAN and FAILED → skipped: a completed negative outranks an unknown ==="
@@ -137,6 +148,171 @@ r=$(bash -c '
     export LJ_HELP=full; claude_supports_plugin_dir_flag 2>/dev/null; b=$?
     printf "%s,%s" "$a" "$b"' _ "$ROOT" "$STUB")
 [[ "$r" == "1,1" ]] && ok "probe: a COMPLETED no → 1 and IS cached (1,1) — only the unknown escapes the cache" || bad "probe completed-no: got '$r' (want 1,1)"
+echo "=== ONE --help per process for both flags; a disk cache of COMPLETED answers (#1721) ==="
+# A separate stub path, so the binary-change cases below cannot touch $STUB.
+# LJ_HELP is the lever that makes a cache hit OBSERVABLE: a stub that would now
+# answer `old` (--name, no --plugin-dir) still yields the cached `full` answers, with
+# ZERO --help invocations counted in LJ_HELP_LOG.
+HSTUB="$WORK/claude-hc-stub"; cp "$STUB" "$HSTUB"; chmod +x "$HSTUB"
+HLOG="$WORK/hc-help.log"
+# hc_run <cache-dir|-unset-> <LJ_HELP> [fence|-] -> "name_rc,plugin_rc,help_invocations"
+hc_run() {
+    : > "$HLOG"
+    local r
+    r=$(LJ_HELP="$2" LJ_HELP_LOG="$HLOG" bash -c '
+        export NEXUS_ROOT="$1" NEXUS_STATE_DIR="$1/monitor/.state" CLAUDE_BIN="$2" NEXUS_CLAUDE_HELP_TIMEOUT=1
+        if [[ "$3" == -unset- ]]; then unset NEXUS_CLAUDE_HELP_CACHE_DIR; else export NEXUS_CLAUDE_HELP_CACHE_DIR="$3"; fi
+        if [[ "$4" == - ]]; then unset NEXUS_TEST_FENCE; else export NEXUS_TEST_FENCE="$4"; fi
+        . "$1/monitor/_claude-bin.sh" >/dev/null 2>&1
+        claude_supports_name_flag 2>/dev/null; a=$?
+        claude_supports_plugin_dir_flag 2>/dev/null; b=$?
+        printf "%s,%s" "$a" "$b"' _ "$ROOT" "$HSTUB" "$1" "${3:--}")
+    printf '%s,%s' "$r" "$(( $(wc -l < "$HLOG") ))"
+}
+hc_entries() { find "$1" -maxdepth 1 -type f -name 'claude-help-*.v1' 2>/dev/null | wc -l | tr -d ' '; }
+hc_strays()  { find "$1" -maxdepth 1 -type f -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' '; }
+
+r=$(hc_run "" full)
+[[ "$r" == "0,0,1" ]] && ok "C1 one process asks both flags → ONE --help (0,0,1)" || bad "C1 one --help per process: got '$r' (want 0,0,1 — base runs --help once per flag)"
+
+HC="$WORK/hc"; mkdir -p "$HC"
+r=$(hc_run "$HC" full)
+[[ "$r" == "0,0,1" && "$(hc_entries "$HC")" == 1 && "$(hc_strays "$HC")" == 0 ]] \
+    && ok "C2a cold cache: one --help, ONE entry written, no tmp left behind" \
+    || bad "C2a cold cache: got '$r', entries=$(hc_entries "$HC"), strays=$(hc_strays "$HC")"
+r=$(hc_run "$HC" old)
+[[ "$r" == "0,0,0" ]] && ok "C2b warm cache, a SECOND process: ZERO --help, the cached answers (0,0,0)" || bad "C2b warm cache: got '$r' (want 0,0,0)"
+
+printf '# changed binary (#1721 fixture)\n' >> "$HSTUB"
+r=$(hc_run "$HC" old)
+[[ "$r" == "0,1,1" ]] && ok "C3a size+mtime change invalidates: re-probed, the NEW binary's --plugin-dir no (0,1,1)" || bad "C3a changed binary: got '$r' (want 0,1,1)"
+r=$(hc_run "$HC" full)
+[[ "$r" == "0,1,0" ]] && ok "C3b …and the new binary's answer is itself cached (0,1,0)" || bad "C3b re-cached: got '$r' (want 0,1,0)"
+touch -d '2001-02-03 04:05:06' "$HSTUB"
+r=$(hc_run "$HC" full)
+[[ "$r" == "0,0,1" ]] && ok "C3c an mtime-ONLY change (same size) invalidates too (0,0,1)" || bad "C3c mtime-only change: got '$r' (want 0,0,1)"
+
+HC2="$WORK/hc2"; mkdir -p "$HC2"
+r=$(hc_run "$HC2" hang)
+[[ "$r" == "0,2,2" && "$(hc_entries "$HC2")" == 0 && "$(hc_strays "$HC2")" == 0 ]] \
+    && ok "C4a a TIMED-OUT probe writes NO entry, and the UNKNOWN is not shared within the process either (#1611: 0,2,2)" \
+    || bad "C4a timeout: got '$r', entries=$(hc_entries "$HC2") (want 0,2,2 and no entry)"
+r=$(hc_run "$HC2" full)
+[[ "$r" == "0,0,1" && "$(hc_entries "$HC2")" == 1 ]] && ok "C4b …so the next process re-probes and caches the COMPLETED answer (0,0,1)" || bad "C4b after timeout: got '$r'"
+r=$(hc_run "$HC2" empty)
+[[ "$r" == "0,0,0" ]] && ok "C4c (control) the cache is what answered C4b's successor: an EMPTY --help is never even run (0,0,0)" || bad "C4c: got '$r'"
+
+f=$(find "$HC2" -maxdepth 1 -type f -name 'claude-help-*.v1' -print -quit)
+for bad_body in 'garbage' "$(head -n1 "$f")"$'\n''maybe yes' "$(head -n1 "$f")"$'\n''yes yes'$'\n''extra' 'some other key'$'\n''yes yes'; do
+    printf '%s\n' "$bad_body" > "$f"
+    r=$(hc_run "$HC2" old)
+    [[ "$r" == "0,1,1" ]] && ok "C5 malformed/foreign entry ($(head -c 18 <<<"$bad_body" | tr '\n' '|')…) → ignored, re-probed (0,1,1)" || bad "C5 malformed entry: got '$r' (want 0,1,1)"
+done
+[[ "$(wc -l < "$f")" -eq 2 && "$(sed -n 2p "$f")" == "yes no" ]] && ok "C5 …and the re-probe rewrote it as a valid two-line entry" || bad "C5 rewrite: [$(cat "$f")]"
+
+rm -rf "$ROOT/monitor/.state/claude-help-cache"
+r=$(hc_run -unset- full "$WORK")
+[[ "$r" == "0,0,1" && ! -e "$ROOT/monitor/.state/claude-help-cache" ]] && ok "C6a under a TEST FENCE the default location is never written" || bad "C6a fenced default: got '$r', dir exists=$([[ -e "$ROOT/monitor/.state/claude-help-cache" ]] && echo yes || echo no)"
+# The default location serves ONLY this nexus's pinned binary (fenced at the
+# SOURCE, skeptic on #1781): C6b makes the stub the pinned binary, C6c is the
+# decoy-gate shape — an unfenced suite whose CLAUDE_BIN is NOT the pinned one.
+mkdir -p "$ROOT/node_modules/.bin"; ln -sfn "$HSTUB" "$ROOT/node_modules/.bin/claude"
+r=$(hc_run -unset- full -)
+[[ "$r" == "0,0,1" && "$(hc_entries "$ROOT/monitor/.state/claude-help-cache")" == 1 ]] && ok "C6b unfenced, CLAUDE_BIN IS the pinned binary: the default is \$NEXUS_STATE_DIR/claude-help-cache" || bad "C6b default location: got '$r', entries=$(hc_entries "$ROOT/monitor/.state/claude-help-cache")"
+rm -rf "$ROOT/monitor/.state/claude-help-cache" "$ROOT/node_modules"
+r=$(hc_run -unset- full -)
+[[ "$r" == "0,0,1" && ! -e "$ROOT/monitor/.state/claude-help-cache" ]] && ok "C6c unfenced, CLAUDE_BIN is NOT the pinned binary: the default location is never written" || bad "C6c stub binary wrote the default cache: got '$r', dir exists=$([[ -e "$ROOT/monitor/.state/claude-help-cache" ]] && echo yes || echo no)"
+rm -rf "$ROOT/monitor/.state/claude-help-cache"
+
+# ONLY A COMPLETE, rc-0 --help IS AN ANSWER (#1611; skeptic on #1781): a
+# partial usage line followed by exit 134 must not be cached as "no no".
+HC7="$WORK/hc7"; mkdir -p "$HC7"
+r=$(hc_run "$HC7" partial134)
+[[ "$r" == "1,2,2" && "$(hc_entries "$HC7")" == 0 ]] && ok "C7a partial stdout + rc 134: UNKNOWN (name omitted, plugin-dir on the binary's word), not even memoised (2 probes, as C4a), NOTHING cached" || bad "C7a incomplete --help: got '$r', entries=$(hc_entries "$HC7") (want 1,2,2 and 0)"
+r=$(hc_run "$HC7" full)
+[[ "$r" == "0,0,1" ]] && ok "C7b the next process RE-PROBES and gets the real answer (no inherited 'no')" || bad "C7b after an incomplete probe: got '$r' (want 0,0,1)"
+
+echo "=== a disk cache of PASSED validations: binary + plugin bytes (#1704) ==="
+# LJ_VALIDATE_LOG counts real `plugin validate` runs. A cache hit is made
+# OBSERVABLE by asking with LJ_VALIDATE_RC=1: a stub that would now FAIL still
+# arms, with ZERO validate runs. A separate stub path so binary edits stay local.
+VSTUB="$WORK/claude-v-stub"; cp "$STUB" "$VSTUB"; chmod +x "$VSTUB"
+VLOG="$WORK/v-validate.log"
+# vc_run <cache-dir|-unset-> <LJ_VALIDATE_RC> [fence|-] -> "rc,verdict,validate_runs"
+vc_run() {
+    : > "$VLOG"; mkdir -p "$ROOT/monitor/.state/longjob"; : > "$ROOT/monitor/.state/longjob/arming.log"
+    local rc verdict vto=30
+    # Generous bounds so a loaded host cannot turn a real validate into a
+    # timeout (a false armed-unprobed); only the `hang` case needs the short one.
+    [[ "$2" == hang ]] && vto=1
+    LJ_HELP=full LJ_VALIDATE_RC="$2" LJ_VALIDATE_LOG="$VLOG" bash -c '
+        export NEXUS_ROOT="$1" NEXUS_STATE_DIR="$1/monitor/.state" CLAUDE_BIN="$2" NEXUS_CLAUDE_HELP_TIMEOUT=30 NEXUS_LONGJOB_VALIDATE_TIMEOUT="$5"
+        if [[ "$3" == -unset- ]]; then unset NEXUS_LONGJOB_VALIDATE_CACHE_DIR; else export NEXUS_LONGJOB_VALIDATE_CACHE_DIR="$3"; fi
+        if [[ "$4" == - ]]; then unset NEXUS_TEST_FENCE; else export NEXUS_TEST_FENCE="$4"; fi
+        . "$1/monitor/_claude-bin.sh" >/dev/null 2>&1
+        . "$1/monitor/_longjob-plugin.sh"
+        longjob_plugin_flag vc >/dev/null 2>&1' _ "$ROOT" "$VSTUB" "$1" "${3:--}" "$vto"
+    rc=$?
+    verdict=$(tail -n1 "$ROOT/monitor/.state/longjob/arming.log" | cut -f3)
+    printf '%s,%s,%s' "$rc" "$verdict" "$(( $(wc -l < "$VLOG") ))"
+}
+vc_entries() { find "$1" -maxdepth 1 -type f -name 'longjob-validate-*.v1' 2>/dev/null | wc -l | tr -d ' '; }
+vc_strays()  { find "$1" -maxdepth 1 -type f -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' '; }
+VC="$WORK/vc"; mkdir -p "$VC"
+r=$(vc_run "$VC" 0)
+[[ "$r" == "0,armed,1" && "$(vc_entries "$VC")" == 1 && "$(vc_strays "$VC")" == 0 ]] \
+    && ok "V1 cold cache: ONE validate, armed, ONE entry written, no tmp left" \
+    || bad "V1 cold: got '$r', entries=$(vc_entries "$VC"), strays=$(vc_strays "$VC")"
+r=$(vc_run "$VC" 1)
+[[ "$r" == "0,armed,0" ]] && ok "V2 warm cache: ZERO validate runs — the cached pass answered (a stub that would FAIL still arms)" || bad "V2 warm cache: got '$r' (want 0,armed,0)"
+r=$(vc_run "" 1)
+[[ "$r" == "1,skipped,1" ]] && ok "V2c (control) the same stub with the cache DISABLED validates and fails — V2's arm came from the cache" || bad "V2c control: got '$r' (want 1,skipped,1)"
+MAN="$ROOT/monitor/longjob-plugin/.claude-plugin/plugin.json"; cp "$MAN" "$WORK/man.orig"
+printf ' \n' >> "$MAN"
+r=$(vc_run "$VC" 1)
+[[ "$r" == "1,skipped,1" ]] && ok "V3a a manifest edit invalidates: re-validated (and the new FAIL is honoured)" || bad "V3a manifest change: got '$r' (want 1,skipped,1)"
+r=$(vc_run "$VC" 0); r2=$(vc_run "$VC" 1)
+[[ "$r" == "0,armed,1" && "$r2" == "0,armed,0" ]] && ok "V3b …the edited manifest's pass is itself cached" || bad "V3b: got '$r' then '$r2'"
+cp "$WORK/man.orig" "$MAN"
+printf '#!/usr/bin/env bash\n' > "$ROOT/monitor/longjob-plugin/dispatch.sh"
+r=$(vc_run "$VC" 1)
+[[ "$r" == "1,skipped,1" ]] && ok "V3c a NEW/changed file elsewhere in the plugin dir invalidates too" || bad "V3c plugin-dir change: got '$r' (want 1,skipped,1)"
+rm -f "$ROOT/monitor/longjob-plugin/dispatch.sh"
+r=$(vc_run "$VC" 1)
+[[ "$r" == "0,armed,0" ]] && ok "V3d restoring the original bytes hits the original entry again (the key IS the content)" || bad "V3d: got '$r' (want 0,armed,0)"
+printf '# changed binary (#1704 fixture)\n' >> "$VSTUB"
+r=$(vc_run "$VC" 1)
+[[ "$r" == "1,skipped,1" ]] && ok "V4 a binary change (size+mtime) invalidates: re-validated" || bad "V4 binary change: got '$r' (want 1,skipped,1)"
+VC2="$WORK/vc2"; mkdir -p "$VC2"
+r=$(vc_run "$VC2" hang)
+[[ "$r" == "0,armed-unprobed,1" && "$(vc_entries "$VC2")" == 0 && "$(vc_strays "$VC2")" == 0 ]] \
+    && ok "V5a a TIMED-OUT validate arms unprobed and writes NO entry (#1611)" \
+    || bad "V5a timeout: got '$r', entries=$(vc_entries "$VC2")"
+r=$(vc_run "$VC2" 0)
+[[ "$r" == "0,armed,1" && "$(vc_entries "$VC2")" == 1 ]] && ok "V5b …so the next launch RE-validates (1 run) and only then caches" || bad "V5b after timeout: got '$r'"
+VC3="$WORK/vc3"; mkdir -p "$VC3"
+r=$(vc_run "$VC3" 1); r2=$(vc_run "$VC3" 1)
+[[ "$r" == "1,skipped,1" && "$r2" == "1,skipped,1" && "$(vc_entries "$VC3")" == 0 ]] && ok "V6 a FAILED validate is never cached: two launches, two validates, two skips, no entry" || bad "V6 failure cached? got '$r' then '$r2', entries=$(vc_entries "$VC3")"
+VC4="$WORK/vc4"; mkdir -p "$VC4"
+r=$(vc_run "$VC4" 0)
+vf=$(find "$VC4" -maxdepth 1 -type f -name 'longjob-validate-*.v1' -print -quit)
+vkey=$(head -n1 "$vf")
+[[ "$r" == "0,armed,1" && -n "$vkey" ]] || bad "V7 setup: got '$r', entry='$vf'"
+for vbad in 'garbage' "$vkey"$'\n''maybe' "$vkey"$'\n''ok'$'\n''extra' 'some other key'$'\n''ok'; do
+    printf '%s\n' "$vbad" > "$vf"
+    r=$(vc_run "$VC4" 1)
+    [[ "$r" == "1,skipped,1" ]] && ok "V7 malformed/foreign entry for the CURRENT key ($(head -c 12 <<<"$vbad" | tr '\n' '|')…) → ignored, re-validated" || bad "V7 malformed entry: got '$r' (want 1,skipped,1)"
+done
+rm -rf "$ROOT/monitor/.state/longjob-validate-cache"
+r=$(vc_run -unset- 0 "$WORK")
+[[ "$r" == "0,armed,1" && ! -e "$ROOT/monitor/.state/longjob-validate-cache" ]] && ok "V8a under a TEST FENCE the default location is never written" || bad "V8a fenced default: got '$r'"
+mkdir -p "$ROOT/node_modules/.bin"; ln -sfn "$VSTUB" "$ROOT/node_modules/.bin/claude"
+r=$(vc_run -unset- 0 -); r2=$(vc_run -unset- 1 -)
+[[ "$r" == "0,armed,1" && "$r2" == "0,armed,0" && "$(vc_entries "$ROOT/monitor/.state/longjob-validate-cache")" == 1 ]] && ok "V8b unfenced, CLAUDE_BIN IS the pinned binary: cached at \$NEXUS_STATE_DIR/longjob-validate-cache (the #1721 location scheme)" || bad "V8b default location: got '$r' then '$r2'"
+rm -rf "$ROOT/monitor/.state/longjob-validate-cache" "$ROOT/node_modules"
+r=$(vc_run -unset- 0 -)
+[[ "$r" == "0,armed,1" && ! -e "$ROOT/monitor/.state/longjob-validate-cache" ]] && ok "V8c unfenced, a NON-pinned stub: the default location is never written" || bad "V8c: got '$r'"
+
 echo "=== manifest missing ==="
 mv "$ROOT/monitor/longjob-plugin/.claude-plugin/plugin.json" "$WORK/plugin.json.bak"
 LJ_HELP=full neg nomanifest "manifest unreadable" "manifest missing"

@@ -52,6 +52,11 @@ on:
       # real binary, so a change to spawn-worker.sh changes what this workflow
       # proves -- PF001 names it the moment it is left out.
       - 'monitor/spawn-worker.sh'
+      # <your-org>/nexus-code#1779: cc-harness/probe-instruction-files.sh EXECUTES
+      # resolve-settings.sh --nexus-root to measure the PRODUCTION claudeMdExcludes
+      # patterns against the real binary (and spawn-worker.sh, above, calls it
+      # too) -- PF001 names it the moment it is left out.
+      - 'monitor/resolve-settings.sh'
       # <your-org>/nexus-code#1321: test-realmodel-trust-dialog.sh EXECUTES the real
       # paste-followup.sh against the real dialog, and that script sources
       # _pane-live.sh, _nexus-root.sh and config/load.sh — a change to any of
@@ -69,6 +74,9 @@ on:
       # <your-org>/nexus-code#1530: test-realmodel-overlimit.sh SOURCES its
       # three-outcome renderer-scrape check from here.
       - 'monitor/watcher/test-integration/_renderer_scrape_check.sh'
+      # <your-org>/nexus-code#1795: test-realmodel-respawn-verify.sh SOURCES its
+      # load-arm verdict classifier from here.
+      - 'monitor/watcher/test-integration/_rv_load_classify.sh'
       # RETAINED, but D6's stated reason for them was WRONG (<your-org>/nexus-
       # code#765). D6 added these two as "the substrate every scenario runs
       # on". They are not the substrate of THIS workflow's scenarios: the eight

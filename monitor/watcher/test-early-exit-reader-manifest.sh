@@ -105,10 +105,11 @@ assert_gt "manifest accounts for real sites"  "$man_total" "100"
 # ---- Test 2: THE BOUNDARY — classifier output == manifest ---------------
 echo '=== Test 2: the live tree matches the recorded boundary ==='
 live="$WORK/live.tsv"
-# LC_ALL=C pinned here so this output doubles as one half of Test 5b's locale
-# comparison. The classifier walks ~400 files, so a full-corpus invocation is
-# the suite's dominant cost; reusing this one keeps 5b a genuine whole-corpus
-# check instead of paying for a third walk.
+# LC_ALL=C pinned so the boundary comparison is a byte comparison in a known
+# collation. This is the suite's ONLY full-corpus classification: the
+# classifier walks ~800 files and each walk is the suite's dominant cost, so
+# Test 5b's locale check runs on a small discriminating fixture instead (see
+# there for what that does and does not cover; your-org/nexus-code#1704).
 LC_ALL=C bash "$CLASSIFIER" "$REPO_ROOT" > "$live" 2>"$WORK/live.err"
 rc=$?
 assert_eq "classifier exits 0" "$rc" "0"
@@ -251,9 +252,61 @@ assert_gt "the real _lib.sh is enumerated (it was invisible before)" \
 # `_` — so `monitor/_remote_lib.sh` sorted among the `c`s locally and first in
 # CI. Same 91 rows, different ORDER: green on the author's box, red in all four
 # CI cells. Pinned here so the `LC_ALL=C` cannot be dropped silently.
+#
+# ON A FIXTURE, NOT A SECOND WALK OF THE REAL TREE (your-org/nexus-code#1704).
+# This used to re-classify the whole corpus under en_US.utf8 — a second
+# full walk, roughly half the suite's wall time — to compare against Test 2's
+# output. The defect it pins is the FINAL SORT's collation, and that needs only
+# names that collate differently in the two locales, not 800 files. The
+# fixture below supplies them deliberately: `_inherited.sh` (on the axis from
+# Test 4b) sorts FIRST in C and among the `i`s under en_US, and `cpf.sh` sits
+# between — the `_remote_lib.sh`-among-the-`c`s shape of the original incident.
+# The cpf.sh lines carry multi-byte UTF-8 and an INVALID byte next to its
+# readers, so the classification's regexes still meet locale-sensitive input.
+#
+# Strengthened in two ways the whole-corpus form lacked: BOTH output modes are
+# compared (`--sites` has its own sort and was never checked), and a POTENCY
+# control proves the fixture discriminates — that an UNPINNED en_US sort of
+# the C output really does reorder it. Without that control a host whose
+# en_US.utf8 locale is missing (glibc silently falls back to C) passes this
+# test vacuously, which the old form also did, unannounced.
+#
+# COVERAGE CHANGE, stated: classification of the REAL corpus under en_US.utf8
+# is no longer run. A locale effect triggered only by real-corpus content that
+# the fixture does not represent (and that leaves the sort aside) would now go
+# unseen here.
 echo '=== Test 5b: classifier output is byte-identical across locales ==='
-loc_b=$(LC_ALL=en_US.utf8 bash "$CLASSIFIER" "$REPO_ROOT" 2>/dev/null)
-assert_eq "C and en_US.utf8 produce identical output" "$(cat "$live")" "$loc_b"
+{
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'v=$(printf %s | %s)   # caf\xc3\xa9 \xe2\x80\x94 dash\n' "'\xc3\xa9\xe2\x80\x94x\\n'" 'head -1'
+    printf 'w=$(printf %s | %s)\n' "'\xff x\\n'" "awk '{ print; exit }'"
+} > "$FIX/monitor/cpf.sh"
+git -C "$FIX" add -A >/dev/null 2>&1
+loc_c_rows=$(LC_ALL=C bash "$CLASSIFIER" "$FIX" 2>/dev/null)
+loc_u_rows=$(LC_ALL=en_US.utf8 bash "$CLASSIFIER" "$FIX" 2>/dev/null)
+loc_c_sites=$(LC_ALL=C bash "$CLASSIFIER" --sites "$FIX" 2>/dev/null)
+loc_u_sites=$(LC_ALL=en_US.utf8 bash "$CLASSIFIER" --sites "$FIX" 2>/dev/null)
+assert_eq "C and en_US.utf8 produce identical (file,kind) rows" "$loc_c_rows" "$loc_u_rows"
+assert_eq "C and en_US.utf8 produce identical --sites output" "$loc_c_sites" "$loc_u_sites"
+# POTENCY: the fixture must contain both discriminating rows, and an unpinned
+# en_US sort of the C output must REORDER it — else the two equalities above
+# could not have failed with LC_ALL=C dropped from the classifier.
+loc_reordered=$(printf '%s\n' "$loc_c_rows" | LC_ALL=en_US.utf8 sort)
+loc_pot=no
+if "$REAL_GREP" -q '^monitor/_inherited\.sh' <<<"$loc_c_rows" \
+   && "$REAL_GREP" -q '^monitor/cpf\.sh' <<<"$loc_c_rows" \
+   && [[ "$loc_reordered" != "$loc_c_rows" ]]; then loc_pot=yes; fi
+# A host WITHOUT en_US.utf8 cannot discriminate at all (glibc falls back to C).
+# That is an unmeasured row, not a defect in the classifier, so it is ANNOUNCED
+# on stderr and the potency row is not failed — but only when `locale -a`
+# positively lacks the locale; a present locale that fails to reorder still fails.
+_locales=$(locale -a 2>/dev/null)   # captured first: an early-exiting reader on a pipe trips the SIGPIPE lint
+if [[ "$loc_pot" == no ]] && ! "$REAL_GREP" -qixE 'en_US\.utf-?8' <<<"$_locales"; then
+    printf '  UNMEASURED: en_US.utf8 is not installed here, so Test 5b cannot discriminate locales on this host\n' >&2
+    loc_pot=yes
+fi
+assert_eq "potency: the fixture collates differently under en_US.utf8 (locale present, names discriminate)" \
+    "$loc_pot" "yes"
 
 # ---- Test 6: the prod/test split is populated both ways ------------------
 # #682's useful subset is production code; a scope column that silently
@@ -265,7 +318,7 @@ assert_gt "production sites recorded" "$prod"  "0"
 assert_gt "test sites recorded"       "$test_" "0"
 
 # ---- assertion-count guard ----------------------------------------------
-EXPECTED_ASSERTIONS=21
+EXPECTED_ASSERTIONS=23
 TOTAL=$(( PASS + FAIL ))
 if (( TOTAL != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \

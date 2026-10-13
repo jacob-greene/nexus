@@ -4556,6 +4556,9 @@ NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --
 assert_eq       "#1140 undeclared fan-out: exit 1"                       "$rc" "1"
 assert_contains "#1140 undeclared: names the measured spawn count"      "$stderr" "spawned 3 subagent(s)"
 assert_contains "#1140 undeclared: prints the line to add"              "$stderr" "fanout: 3 spawned / <returned> returned"
+assert_contains "#1140 undeclared: <returned> means RETURNED"           "$stderr" "how many subagents RETURNED a result, whether or not the report uses it"
+assert_not_contains "#1140 undeclared: <returned> is not defined as USES" "$stderr" "result this report USES"
+assert_contains "#1140 undeclared: names the optional used field"       "$stderr" "/ <used> used"
 assert_not_contains "#1140 undeclared: nothing was posted"              "$(cat "$GH_CAPTURE" 2>/dev/null)" "/issues/42/comments"
 # Declared with the WRONG spawned count -> refused, both numbers named.
 sed -i 's/^status: completed$/status: completed\nfanout: 2 spawned \/ 2 returned/' "$FAN_REPORT"
@@ -4578,6 +4581,38 @@ NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --
 assert_eq       "#1140 declared complete: exit 0"                       "$rc" "0"
 fan_body=$(jq -r '.body // ""' < "$BODY_CAPTURE" 2>/dev/null)
 assert_not_contains "#1140 declared complete: no INCOMPLETE line"      "$fan_body" "Fan-out INCOMPLETE"
+assert_not_contains "#1140 declared complete: no fan-out line at all"   "$fan_body" "Fan-out"
+# RETURNED is not USED (your-org/nexus-code#1140): all returned, some set
+# aside -> a NEUTRAL line, never INCOMPLETE / "partial evidence".
+sed -i 's/^fanout: .*$/fanout: 3 spawned \/ 3 returned \/ 2 used/' "$FAN_REPORT"
+reset_mocks; : > "$BODY_CAPTURE"
+NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture"
+assert_eq       "#1140 all returned, some unused: exit 0"               "$rc" "0"
+fan_body=$(jq -r '.body // ""' < "$BODY_CAPTURE" 2>/dev/null)
+assert_contains "#1140 all returned, some unused: neutral line"        "$fan_body" "Fan-out: all 3 subagents returned; 2 of them are used by this report"
+assert_not_contains "#1140 all returned, some unused: no INCOMPLETE"   "$fan_body" "INCOMPLETE"
+assert_not_contains "#1140 all returned, some unused: no partial-evidence claim" "$fan_body" "partial evidence"
+# Three fields, all used -> no line, exactly like the two-field N / N.
+sed -i 's/^fanout: .*$/fanout: 3 spawned \/ 3 returned \/ 3 used/' "$FAN_REPORT"
+reset_mocks; : > "$BODY_CAPTURE"
+NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture"
+assert_eq       "#1140 all returned, all used: exit 0"                  "$rc" "0"
+fan_body=$(jq -r '.body // ""' < "$BODY_CAPTURE" 2>/dev/null)
+assert_not_contains "#1140 all returned, all used: no fan-out line"    "$fan_body" "Fan-out"
+# Short AND some unused -> the INCOMPLETE line wins (M < N is the claim that matters).
+sed -i 's/^fanout: .*$/fanout: 3 spawned \/ 2 returned \/ 1 used/' "$FAN_REPORT"
+reset_mocks; : > "$BODY_CAPTURE"
+NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture"
+assert_eq       "#1140 short with used: exit 0"                         "$rc" "0"
+fan_body=$(jq -r '.body // ""' < "$BODY_CAPTURE" 2>/dev/null)
+assert_contains "#1140 short with used: INCOMPLETE line, unchanged"   "$fan_body" "Fan-out INCOMPLETE at wrap-up: 2 of 3 subagents had returned"
+# K > M -> refused (report-check's pre-flight names it), nothing posted.
+sed -i 's/^fanout: .*$/fanout: 3 spawned \/ 3 returned \/ 4 used/' "$FAN_REPORT"
+reset_mocks; : > "$BODY_CAPTURE"
+NEXUS_CC_HOME="$FANOUT_HOME" run_ng stdout stderr rc wrap-up 42 "$FAN_REPORT" --repo override-org/override-repo --skeptic-decision deny --skeptic-rationale "fixture"
+assert_eq       "#1140 used exceeds returned: exit 1"                   "$rc" "1"
+assert_contains "#1140 used exceeds returned: names the inversion"     "$(printf '%s\n%s' "$stdout" "$stderr")" "used 4 exceeds returned 3"
+assert_not_contains "#1140 used exceeds returned: nothing was posted"  "$(cat "$GH_CAPTURE" 2>/dev/null)" "/issues/42/comments"
 # No transcript for the session -> could not look, said on stderr, NOT refused.
 sed -i '/^fanout:/d' "$FAN_REPORT"
 reset_mocks; : > "$BODY_CAPTURE"

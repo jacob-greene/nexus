@@ -469,12 +469,68 @@ out=$(printf '%s\n' "$SECTION3" | _idle_restat_live_windows "$LIVE")
 has "both dead windows named, in row order" "$out" "2 row(s) WITHHELD — the window(s) no longer exist in tmux: deadA, deadB"
 has "…and the live row is kept"              "$out" "livewin idle 300s"
 
-echo "=== B5. non-row lines (footers, blanks) are never touched ==="
+echo "=== B5. the retained FOOTER is reconciled too: dead entries are WITHHELD, not passed through ==="
+# Formerly asserted the DEFECT: the footer passed through untouched, so a
+# retired window was reported as retained (prelude `0 retained` beside
+# `(1 retained windows suppressed: learn-lm-dsk (…))`) and the stale footer
+# re-armed a poll-resurface emit every compose (b1, observed 10-09..10-12).
 SECTION4='  - deadA idle 10s WITHOUT wrap-up — consider follow-up paste
   (3 retained windows suppressed: a, b, c)'
 out=$(printf '%s\n' "$SECTION4" | _idle_restat_live_windows "$LIVE")
-has   "the retained-footer passes through" "$out" "(3 retained windows suppressed: a, b, c)"
-hasnt "…and the dead row does not"         "$out" "deadA idle 10s"
+hasnt "the all-dead retained-footer is dropped"       "$out" "retained windows suppressed"
+has   "…its windows join the WITHHELD note, in order" "$out" "4 row(s) WITHHELD — the window(s) no longer exist in tmux: deadA, a, b, c"
+hasnt "…and the dead row does not survive"            "$out" "deadA idle 10s"
+
+echo "=== B5b. a MIXED footer keeps its live entries, recomputes N, names the dead ==="
+FOOT='(2 retained windows suppressed: livewin (wrap-up-pending), learn-lm-dsk (wrap-up-x))'
+out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows "$LIVE")
+has   "live entry kept with N recomputed to 1" "$out" "(1 retained windows suppressed: livewin (wrap-up-pending))"
+has   "…the dead entry is WITHHELD and named" "$out" "1 row(s) WITHHELD — the window(s) no longer exist in tmux: learn-lm-dsk"
+out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows $'livewin\nlearn-lm-dsk')
+assert_eq "MUST-NOT-FIRE: all-live footer is byte-identical" "$out" "$FOOT"
+
+echo "=== B5c. a section holding ONLY WITHHELD notes is not an emit reason ==="
+out=$(printf '%s\n' '(1 retained windows suppressed: learn-lm-dsk (wrap-up-x))' | _idle_restat_live_windows "$LIVE")
+if printf '%s\n' "$out" | _idle_section_is_withheld_only; then ok "all-dead footer → withheld-only (dropped by compose)"
+else bad "all-dead footer section still counts as content: [$out]"; fi
+out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows "$LIVE")
+if printf '%s\n' "$out" | _idle_section_is_withheld_only; then bad "a live footer entry was classed withheld-only: [$out]"
+else ok "MUST-NOT-FIRE: a live entry beside a WITHHELD note keeps the section"; fi
+if printf '%s\n' '' | _idle_section_is_withheld_only; then bad "an empty section was classed withheld-only"
+else ok "MUST-NOT-FIRE: an empty section is not 'withheld-only'"; fi
+_ce_body=$(_pluck_fn _v2_task_compose_emit "$_MAIN")
+assert_eq "the compose body was plucked (non-vacuous)" "$( (( $(printf '%s\n' "$_ce_body" | wc -l) > 100 )) && echo ok || echo empty)" "ok"
+has "compose_emit drops a withheld-only idle section" "$_ce_body" '_idle_section_is_withheld_only; then'
+
+echo "=== B5d. a comma inside a retained REASON cannot split an entry ==="
+list_idle_transitions() { printf 'livewin\tretained\t0\twrap-up, then await (x)\n'; }
+_rend=$(render_idle_section)
+has "the renderer turns a reason comma into ';'" "$_rend" "(1 retained windows suppressed: livewin (wrap-up; then await (x)))"
+out=$(printf '%s\n' "$_rend" | _idle_restat_live_windows "$LIVE")
+assert_eq "…so the reconciled footer is intact, no phantom WITHHELD" "$out" "$_rend"
+unset -f list_idle_transitions
+source "$_test_dir/_idle_probe.sh" 2>/dev/null
+
+echo "=== B7. the SERVED full-state snapshot says its age, its dropped rows, its missing windows ==="
+SNAP='  - w1 idle 30s (state=idle)
+  - w-dead pane-absent (state=absent)'
+note=$(_full_state_reconcile_note "$SNAP" $'orchestrator\nw1\nw2' $'w1\t0\t1\nw2\t0\t2' 437)
+has   "dead row WITHHELD and named"            "$note" "1 row(s) WITHHELD — the window(s) no longer exist in tmux: w-dead"
+has   "live worker with no row is flagged"     "$note" "1 live window(s) not in this snapshot: w2"
+has   "render age is stamped"                  "$note" "(snapshot rendered 437s ago;"
+note=$(_full_state_reconcile_note "$SNAP" $'w1\nw-dead' $'w1\t0\t1\nw-dead\t0\t2' 5)
+hasnt "MUST-NOT-FIRE: consistent board → no WITHHELD"       "$note" "WITHHELD"
+hasnt "MUST-NOT-FIRE: consistent board → no missing window" "$note" "not in this snapshot"
+note=$(_full_state_reconcile_note "$SNAP" "" "" "")
+assert_eq "empty live sets and no age FAIL OPEN: no claim at all" "$note" ""
+# shellcheck source=_emit_dedup.sh
+source "$_test_dir/_emit_dedup.sh" 2>/dev/null
+assert_eq "the age phrase is volatile-stripped (never a board change)" \
+    "$(printf '(snapshot rendered 437s ago; x)\n' | _emit_volatile_strip)" "(snapshot rendered ago; x)"
+_ce_canon=$(printf '%s\n' "$_ce_body" | grep -n 'full_state_canonical=\$(printf' | awk -F: 'NR==1{print $1}')
+_ce_note=$(printf '%s\n' "$_ce_body" | grep -n '_fs_note=\$(_full_state_reconcile_note' | awk -F: 'NR==1{print $1}')
+assert_eq "the note is appended AFTER the canonical is computed" \
+    "$( [[ "$_ce_canon" =~ ^[0-9]+$ && "$_ce_note" =~ ^[0-9]+$ ]] && (( _ce_note > _ce_canon )) && echo after || echo "canon=${_ce_canon} note=${_ce_note}")" "after"
 
 echo "=== B6. the tracker itself needs no reaper — a vanished window clears in ONE cycle ==="
 # Recorded because the original report guessed the opposite and corrected
@@ -500,7 +556,7 @@ else bad "row survived: [$(cat "$sf")] — the tracker DOES need a reaper; revis
 # This is the same protection this branch relied on elsewhere, and it is not
 # decoration: `test-summary-honesty-manifest` flagged this very file as
 # `ledger=no::count=none` when it was first written.
-_EXPECTED_ASSERTIONS=94
+_EXPECTED_ASSERTIONS=113
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; _th_pass

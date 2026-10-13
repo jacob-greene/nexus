@@ -11,7 +11,7 @@
 #
 # THE DEFECT, measured on the live nexus before this change: the supervisor
 # treated EVERY non-zero sshd exit as transient and relaunched forever —
-# **1,753** `restarting in 60s` rounds against `140.107.222.134:22022`, an
+# **1,753** `restarting in 60s` rounds against `198.51.100.34:22022`, an
 # address held by ANOTHER OPERATOR's sshd (different host key; socket owner
 # `uid:65534` with no pid attribution, i.e. outside this container's user+pid
 # namespace). Waiting cannot clear that. So the decisive assertion in this file

@@ -199,7 +199,7 @@ trap _reap EXIT
 start_server() {
     local d="$1" n="$2" out
     mkdir -p "$d"
-    out=$(env -u TMUX TMUX_TMPDIR="$d" tmux -L "$n" new-session -d 'sleep 30' 2>&1) || {
+    out=$(env -u TMUX TMUX_TMPDIR="$d" tmux -L "$n" -f /dev/null new-session -d 'sleep 30' 2>&1) || {
         printf '%s' "$out"; return 1; }
     _SERVERS+=("$d|$n")
     return 0
@@ -295,7 +295,7 @@ fi
 # ── §3  TMPDIR DOES NOT PARTICIPATE ─────────────────────────────────────
 echo '=== §3 TMPDIR is not consulted; only TMUX_TMPDIR, else /tmp ==='
 d3="$BASE/tmpdir-decoy"; n3="tmpdir-probe"; mkdir -p "$d3"
-out3=$(env -u TMUX -u TMUX_TMPDIR TMPDIR="$d3" tmux -L "$n3" new-session -d 'sleep 30' 2>&1) && \
+out3=$(env -u TMUX -u TMUX_TMPDIR TMPDIR="$d3" tmux -L "$n3" -f /dev/null new-session -d 'sleep 30' 2>&1) && \
     _SERVERS+=("/tmp|$n3")
 assert_no_file     "§3 nothing appeared under the decoy TMPDIR"  "$d3/tmux-$UID_N"
 assert_socket_exists "§3 the socket landed under /tmp instead"     "/tmp/tmux-$UID_N/$n3"
@@ -310,7 +310,7 @@ assert_socket_exists "§3 the socket landed under /tmp instead"     "/tmp/tmux-$
 echo '=== §4 an explicit -L still resolves inside TMUX_TMPDIR when $TMUX is set ==='
 d4="$BASE/withtmux"; n4="withtmux-probe"; mkdir -p "$d4"
 TMUX="${TMUX:-/tmp/tmux-$UID_N/default,1,0}" TMUX_TMPDIR="$d4" \
-    tmux -L "$n4" new-session -d 'sleep 30' >/dev/null 2>&1 && _SERVERS+=("$d4|$n4")
+    tmux -L "$n4" -f /dev/null new-session -d 'sleep 30' >/dev/null 2>&1 && _SERVERS+=("$d4|$n4")
 assert_socket_exists "§4 the socket landed under TMUX_TMPDIR, not under \$TMUX's dir" \
                    "$(tmux_socket_path "$n4" "$d4")"
 
@@ -433,11 +433,15 @@ done < <(_tsc_realtmux)
 # 14/9 -> 15/10 (your-org/nexus-code#1591): test-paste-deliver.sh is a new
 # helper-sourcing real-tmux suite — one private server per row, each behind
 # th_require_tmux_socket in its `row_open` (measured with the file STAGED).
+# 15/10 -> 15/11 (the tmux fixture-config fix, test-tmux-fixture-conf-lint.sh):
+# test-bootstrap-stub-claude.sh now sources the helpers for
+# `th_tmux_fixture_conf` and CALLS the precondition for its Case E socket;
+# the real-tmux total is unchanged, the residue below drops 5 -> 4.
 assert_eq "§8 this guard polices 15 real-tmux suites (16 in the tree, minus this one)" \
           "$realtmux_n" "15"
-assert_eq "§8 …of which 10 source the helpers (11 of 16 including this one)" \
-          "$helper_n"   "10"
-assert_empty "§8 none of those 10 is missing the precondition"        "$unwired"
+assert_eq "§8 …of which 11 source the helpers (12 of 16 including this one)" \
+          "$helper_n"   "11"
+assert_empty "§8 none of those 11 is missing the precondition"        "$unwired"
 
 # THE PREDICATE MUST DISCRIMINATE, or the assertion above is the mention grep
 # again wearing a new name. Two controls on a planted pair: a file that only
@@ -464,8 +468,8 @@ fi
 # by `run-tests.sh`'s pre-flight — still exposed when invoked DIRECTLY. Recorded
 # as data because prose cannot be made to fail: if this grows, somebody decides
 # deliberately instead of inheriting it.
-assert_eq "§8 the uncovered residue is 5 suites that source no helpers" \
-          "$(( realtmux_n - helper_n ))" "5"
+assert_eq "§8 the uncovered residue is 4 suites that source no helpers" \
+          "$(( realtmux_n - helper_n ))" "4"
 
 # THREE OF THE THIRTEEN ARE `SLOW_TESTS`-GATED and exit 77 in a default run, so
 # they never reach a tmux call and cannot demonstrate the ceiling unless

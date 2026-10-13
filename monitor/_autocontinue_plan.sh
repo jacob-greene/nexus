@@ -26,6 +26,11 @@
 #   - `monitor/_autocontinue_plan.sh status`, the live view, for an
 #     orchestrator reading a brief that is minutes old.
 #
+# A plan whose owner died before finishing it is the QUEUE, not litter: the
+# next recovery carries its unfinished rows forward (`ac_plan_carryover`)
+# until a walk finishes them, rather than re-deriving the set from a
+# snapshot the interruption may have truncated (2026-10-12, RO8).
+#
 # "Active" means the plan's OWNER PROCESS is still alive (pid AND /proc
 # start time, so a recycled pid is not mistaken for it) and the plan is not
 # marked done. A recovery that dies mid-walk therefore stops blocking hand
@@ -172,6 +177,44 @@ ac_plan_active() {
 
 # ac_plan_token <state-dir> — the plan's token (recovery's exemption).
 ac_plan_token() { _ac_owner_field "$1" 4; }
+
+# ac_plan_carryover <state-dir>
+# The windows an UNFINISHED prior plan still owes: the plan is marked
+# `running` but its owner is gone (a recovery interrupted mid-walk — a
+# sandbox restart, a read-only incident), and the row is one recovery had
+# taken on: pending | resumed | already-alive | held-live. Prints one
+# window per line; rc 1 when there is nothing to carry.
+#
+# Why (2026-10-12, RO8): recovery derives its candidates from the watcher's
+# last-snapshot.txt, which the RELAUNCHED watcher rewrites from live tmux
+# during the walk. Interrupted after 4 of 12 resumes, the next boot saw a
+# snapshot of 4 and rebuilt the plan from it, so 8 workers dropped out of
+# auto-continue. The plan is the queue; it is not discarded until a walk
+# FINISHES it. over-cap / skipped / failed rows were already handed to the
+# orchestrator ("yours to decide") and are not carried. An ACTIVE plan
+# (rc 0) belongs to a live recovery and a plan that cannot be read (rc 3)
+# carries nothing: neither is ours to take over.
+#
+# AGE BOUND (#1810 skeptic F3): a plan older than <max-age-s> (default
+# AC_PLAN_CARRY_MAX_AGE_SECONDS, 21600 = 6 h) is NOT carried, rc 4 — a worker
+# killed by hand days later must not be resurrected from a stale queue. A plan
+# is normally consumed at the very next boot, and today's 24 RO onsets each
+# ended in a restart within hours. An epoch that does not parse carries
+# nothing (rc 4 too): the base behaviour, never a guess.
+ac_plan_carryover() {
+    local path rc=0 epoch now max="${2:-${AC_PLAN_CARRY_MAX_AGE_SECONDS:-21600}}"
+    path=$(ac_plan_path "$1")
+    ac_plan_active "$1" || rc=$?
+    (( rc == 1 )) || return 1
+    [[ "$(_ac_owner_field "$1" 6)" == running ]] || return 1
+    epoch=$(_ac_owner_field "$1" 5)
+    now=$(date +%s)
+    [[ "$epoch" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]] || return 4
+    (( now - epoch <= max )) || return 4
+    awk -F'\t' '
+        NR > 1 && $1 != "" && ($3 == "pending" || $3 == "resumed" || $3 == "already-alive" || $3 == "held-live") { print $1; n++ }
+        END { exit n ? 0 : 1 }' "$path" 2>/dev/null
+}
 
 # ac_plan_pending_match <state-dir> <window> <sid>
 # rc 0 (and prints the matching window) iff a PENDING row names <window>

@@ -71,6 +71,12 @@ _respawn_dir=${_respawn_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/nu
 # $HOME/.claude/projects — never at a hardcoded `$HOME/.claude/projects`.
 # shellcheck source=../_cc_transcript_roots.sh
 [[ -r "$_respawn_dir/../_cc_transcript_roots.sh" ]] && source "$_respawn_dir/../_cc_transcript_roots.sh"
+# What a TUI submission IS (your-org/nexus-code#1754): the post-paste verify's
+# transcript witness reuses the selectors the paste-unconfirmed detector and
+# paste-followup.sh already agree on. Quiet at load; absent, the witness answers
+# `unknown` and the verify keeps its pane-state-only behaviour.
+# shellcheck source=../_submit_evidence.sh
+[[ -r "$_respawn_dir/../_submit_evidence.sh" ]] && source "$_respawn_dir/../_submit_evidence.sh"
 if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
     # Partial tree (a fixture that copied this file without monitor/): the
     # same roots in the same order, without the realpath dedup — which only
@@ -556,9 +562,18 @@ _respawn_resolve_settings_flag() {
     # settings is strictly better than one that does not come back at
     # all. The failure is not silent: the resolver has already written
     # its reason to stderr, which lands in the watcher log.
-    local eff
+    #
+    # --nexus-root adds `claudeMdExcludes` for the instruction files of repos
+    # cloned under work/ (your-org/nexus-code#1779): the orchestrator reads
+    # files there too, and since cc 2.1.293 a single-file `cat` loads a nested
+    # CLAUDE.md as instructions. Exit 11 = resolved WITHOUT those excludes; the
+    # printed path is still the right one (the overlay is in it when present).
+    local eff rc=0
     if [[ -x "$nexus_root/monitor/resolve-settings.sh" ]]; then
-        eff=$("$nexus_root/monitor/resolve-settings.sh" "$p" 2>/dev/null) && [[ -n "$eff" ]] && p="$eff"
+        eff=$("$nexus_root/monitor/resolve-settings.sh" --nexus-root "$nexus_root" "$p" 2>/dev/null) || rc=$?
+        if [[ ( $rc -eq 0 || $rc -eq 11 ) && -n "$eff" ]]; then
+            p="$eff"
+        fi
     fi
     printf -- '--settings %s' "$p"
 }
@@ -829,7 +844,8 @@ export NEXUS_ORCHESTRATOR_WINDOW="$target_window"
 # claude does not set one, so \$TMPDIR/x was /x. Here, in the LAUNCHER, not in
 # locals-env.sh, which services and helpers also source (a callee with a private
 # TMPDIR under a caller without one split the labsh rotation).
-[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
+export NEXUS_TMPDIR_AGENT="\$NEXUS_ORCHESTRATOR_WINDOW"   # per-agent TMPDIR, keyed on the window (nexus-code bundle 21)
+[ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true
 # The shim precondition, emitted from the SINGLE source monitor/guard-block.sh.in
 # (your-org/nexus-code#589). The orchestrator runs the same Bash-tool shells a
 # worker does, so every monitor/*wrap shim must be reachable there. No
@@ -1373,6 +1389,99 @@ _respawn_brief_lost() {
     [[ "$inp" == blank || "$inp" == ghost ]]
 }
 
+# _respawn_brief_needle <pasted-file> <out-json>
+#
+# The pasted brief as ONE JSON string for _respawn_brief_submitted: TAB mapped
+# to four spaces (the paste channel's one measured transform, _submit_evidence.sh)
+# and TRIMMED at both ends, because the transcript wraps a bracketed paste —
+# measured on this operator's orchestrator transcript, 2026-10-07:
+# `\n\n<pasted_content id="…">\n<bytes>\n</pasted_content id="…">\n`. So the
+# match is CONTAINMENT, not byte equality. rc 1 (no needle, the witness then says
+# `unknown`) when jq is absent or the trimmed brief is shorter than 16 characters:
+# a short needle could be contained in an unrelated message, and a false `yes`
+# suppresses a needed re-paste.
+#
+# NO jq REGEX, here or in the scan: jq 1.5 (this host's) corrupts a string
+# holding a multibyte character under sub/gsub — measured 2026-10-07,
+# `"é—x  \n" | sub("\\s+$"; "")` yields `" \n"` — and every recovery brief
+# carries `—`. The trim is bash parameter expansion; the TAB map is split/join.
+_respawn_brief_needle() {
+    local in="$1" out="$2" s
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -r "$in" ]] || return 1
+    s=$(cat -- "$in" 2>/dev/null; printf x) || return 1
+    s="${s%x}"
+    s="${s//$'\t'/    }"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    (( ${#s} >= 16 )) || return 1
+    printf '%s' "$s" | jq -Rs . > "$out" 2>/dev/null || return 1
+    jq -e 'type == "string"' "$out" >/dev/null 2>&1
+}
+
+# _respawn_brief_submitted <nexus_root> <sid> <epoch> <needle-json>
+#
+# THE POSITIVE SUBMIT WITNESS (your-org/nexus-code#1754). Under load the verify
+# read `idle input=blank` for its whole 3 s + 30 s after a paste that WAS
+# submitted, judged "no turn ran" from the pane alone, and re-pasted: the
+# orchestrator got its brief twice. The session's own transcript is the ledger
+# that pane state only guesses at. Prints exactly one of:
+#   yes             a TUI submission (or a queue `enqueue`) stamped at or after
+#                   <epoch> CONTAINS the brief, in <sid>'s transcript under any
+#                   cc_transcript_roots root
+#   no              the scanned tail holds no such record and is the whole file
+#   unknown <why>   the question could not be put — no jq, no selectors, no
+#                   session id, no needle, no transcript, a scan that failed, or
+#                   a transcript larger than the scanned tail
+# Only `yes` changes a decision. `no` and `unknown` both keep the pane-state
+# verdict, so a missing witness never suppresses a re-paste.
+_respawn_brief_submitted() {
+    local nexus_root="$1" sid="$2" epoch="$3" needle="$4"
+    command -v jq >/dev/null 2>&1 || { printf 'unknown jq-absent'; return 0; }
+    [[ -n "${_SE_JQ_SELECT:-}" && -n "${_SE_JQ_ENQUEUE_SELECT:-}" ]] \
+        || { printf 'unknown submission-selectors-unavailable'; return 0; }
+    [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+        || { printf 'unknown no-session-id'; return 0; }
+    [[ -n "$needle" && -s "$needle" ]] || { printf 'unknown no-brief-needle'; return 0; }
+    local epoch_num=""
+    [[ "$epoch" =~ ^[0-9]+$ ]] && epoch_num=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null)
+    [[ "$epoch_num" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || { printf 'unknown no-paste-epoch'; return 0; }
+    local slug="${nexus_root//[^a-zA-Z0-9-]/-}" root jsonl=""
+    while IFS= read -r root; do
+        [[ -n "$root" && -f "$root/${slug}/${sid}.jsonl" ]] || continue
+        jsonl="$root/${slug}/${sid}.jsonl"; break
+    done < <(cc_transcript_roots)
+    [[ -n "$jsonl" ]] || { printf 'unknown no-transcript'; return 0; }
+    local bound="${FRESH_SPAWN_WITNESS_TAIL_BYTES:-8388608}" size found rc
+    [[ "$bound" =~ ^[0-9]+$ ]] && (( bound > 0 )) || bound=8388608
+    size=$(stat -c %s "$jsonl" 2>/dev/null) || size=0
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    # Transcript timestamps are ISO-8601 UTC (`2026-10-07T22:08:01.284Z`); the
+    # first 19 characters order as the instant does, so they compare against the
+    # paste epoch in the same shape (jq compares strings by codepoint). A record
+    # whose stamp has any other shape is SKIPPED: it can only make `yes` rarer.
+    # `fromjson?` drops a line the tail cut in half.
+    local prog='
+      fromjson?
+      | (( '"$_SE_JQ_SELECT"'
+           | [(.timestamp // ""), (.message.content
+                | if type == "string" then .
+                  elif type == "array" then (map(select(type == "object" and .type == "text") | .text) | join("\n"))
+                  else "" end)] ),
+         ( '"$_SE_JQ_ENQUEUE_SELECT"' | [(.timestamp // ""), .content] ))
+      | select((.[0] | type) == "string" and (.[0] | endswith("Z")) and (.[0][0:19] | length) == 19
+               and .[0][4:5] == "-" and .[0][10:11] == "T" and .[0][0:19] >= $e)
+      | select((.[1] | type) == "string" and (.[1] | split("\t") | join("    ") | contains($w[0])))
+      | "yes"'
+    found=$(set -o pipefail
+            tail -c "$bound" "$jsonl" 2>/dev/null \
+                | jq -R -r --slurpfile w "$needle" --arg e "$epoch_num" "$prog" 2>/dev/null); rc=$?
+    if [[ "$found" == *yes* ]]; then printf 'yes'; return 0; fi
+    (( rc == 0 )) || { printf 'unknown transcript-scan-failed rc=%s' "$rc"; return 0; }
+    (( size > bound )) && { printf 'unknown transcript-larger-than-scanned-tail'; return 0; }
+    printf 'no'
+}
+
 _respawn_box_is_brief() {
     local target="$1" bin="$2" file="${3:-}" mode="${4:-first}" raw st inp
     _RESPAWN_BOX_WHY=""
@@ -1814,17 +1923,32 @@ _respawn_orchestrator() {
     # equality. STATED RESIDUAL: "no turn started" is read as "no `busy` was ever
     # observed"; a turn that ran AND finished between two probes would be re-sent
     # once — a duplicate brief, the recoverable direction, against a lost one.
+    # Narrowed by your-org/nexus-code#1754: the transcript witness below vetoes
+    # the re-paste whenever it can read the session; the residual remains only
+    # where it cannot.
     local _rp_attempt=1 _rp_max="${FRESH_SPAWN_REPASTE_ATTEMPTS:-3}"
     [[ "$_rp_max" =~ ^[0-9]+$ ]] && (( _rp_max >= 1 )) || _rp_max=3
     local paste_rc=0
     local _RESPAWN_KEEP_PASTED=1 _RESPAWN_PASTED_FILE="" _RESPAWN_PASTED_IS_TEMP=0 _RESPAWN_BOX_WHY=""
+    # The transcript witness (your-org/nexus-code#1754): which session to read,
+    # the epoch of the FIRST paste (any of our pastes being submitted is the
+    # brief delivered), and the brief as a needle, built once from the bytes
+    # actually pasted. `--continue` names no session: the witness says unknown.
+    local _wit_sid="${resume_sid:-$session_id}" _wit_epoch="" _wit_needle="" _wit _wit_after_gate=0
     while :; do
     paste_rc=0
     # Attempt 1 keeps the paste's own Enter (the #1591 contract); a RE-paste does
     # not — its first Enter must be the equality (skeptic F1).
     local _RESPAWN_NO_BLIND_ENTER=0
     (( _rp_attempt > 1 )) && _RESPAWN_NO_BLIND_ENTER=1
+    [[ -n "$_wit_epoch" ]] || _wit_epoch=$(date +%s)
     _respawn_paste_prompt_file "$target" "$prompt_file" || paste_rc=1
+    if [[ -z "$_wit_needle" && -n "$_RESPAWN_PASTED_FILE" ]]; then
+        _wit_needle=$(mktemp "${TMPDIR:-/tmp}/nexus-respawn-needle.XXXXXX" 2>/dev/null) || _wit_needle=""
+        if [[ -n "$_wit_needle" ]] && ! _respawn_brief_needle "$_RESPAWN_PASTED_FILE" "$_wit_needle"; then
+            rm -f "$_wit_needle"; _wit_needle=""
+        fi
+    fi
 
     # Post-paste verify: state=busy confirms the Enter submitted. If not
     # busy after the budget, retry Enter once (don't busy-loop — a wedged
@@ -2067,6 +2191,21 @@ _respawn_orchestrator() {
         fi
     fi
 
+    # PANE STATE CANNOT SAY "NO TURN RAN" (your-org/nexus-code#1754). Under load
+    # a SUBMITTED brief read `idle input=blank` through the whole verify and the
+    # late-render wait; the re-paste below then sent it a second time. Before
+    # any re-paste or UNDELIVERED verdict, ask the session's own transcript.
+    # Only a positive `yes` changes the outcome; `no` and `unknown` keep the
+    # pane-state verdict, so a missing witness re-pastes exactly as before.
+    if (( paste_rc != 0 )); then
+        _wit=$(_respawn_brief_submitted "$NEXUS_ROOT" "$_wit_sid" "$_wit_epoch" "$_wit_needle")
+        if [[ "$_wit" == yes ]]; then
+            "$log_fn" "post-paste verify: the session transcript RECORDS the brief as submitted since the paste — delivered; NOT re-pasting, whatever the pane reads (your-org/nexus-code#1754)"
+            paste_rc=0
+            break
+        fi
+        "$log_fn" "post-paste verify: submit witness (session transcript): ${_wit:-unknown} — keeping the pane-state verdict (your-org/nexus-code#1754)"
+    fi
     if (( paste_rc != 0 && _rp_attempt < _rp_max )) && [[ -x "$pane_state_bin" ]] && _respawn_brief_lost "$target" "$pane_state_bin"; then
         _rp_attempt=$(( _rp_attempt + 1 ))
         "$log_fn" "post-paste verify: the brief is NOT in the box and no turn ran — RE-PASTING after a stable-prompt gate (attempt ${_rp_attempt}/${_rp_max}; your-org/nexus-code#1715)"
@@ -2075,12 +2214,20 @@ _respawn_orchestrator() {
         local _rp_obs
         if ! _rp_obs=$(_respawn_wait_for_input_ready "$target" "$readiness_budget" "$readiness_poll" "$pane_state_bin" "$max_dismiss" "$log_fn" "${FRESH_SPAWN_RESUME_STABLE_READS:-3}"); then
             "$log_fn" "post-paste verify: no stable empty prompt within ${readiness_budget}s (last state='${_rp_obs:-unknown}') — NOT re-pasting into a pane that is not ready; reporting UNDELIVERED (rc 4)"
+            _wit_after_gate=1
             break
         fi
         continue
     fi
     break
     done
+    # The re-paste gate waited up to readiness_budget after the witness above
+    # answered: a submission that landed meanwhile is still delivered (#1754).
+    if (( _wit_after_gate )) && [[ "$(_respawn_brief_submitted "$NEXUS_ROOT" "$_wit_sid" "$_wit_epoch" "$_wit_needle")" == yes ]]; then
+        "$log_fn" "post-paste verify: the session transcript RECORDS the brief as submitted since the paste — delivered after all; not UNDELIVERED (your-org/nexus-code#1754)"
+        paste_rc=0
+    fi
+    [[ -n "$_wit_needle" ]] && rm -f "$_wit_needle"
     (( _RESPAWN_PASTED_IS_TEMP )) && [[ -n "$_RESPAWN_PASTED_FILE" ]] && rm -f "$_RESPAWN_PASTED_FILE"
     # Released only once the verify has finished with the box (#1539 above).
     [[ -n "$_rpl_fd" ]] && exec {_rpl_fd}>&-

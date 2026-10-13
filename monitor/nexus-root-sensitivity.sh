@@ -389,6 +389,40 @@ _src_contended() {
     [ -e "$1/config/nexus.yml" ]
 }
 
+# WHEN the discriminator is read matters as much as WHAT it reads
+# (your-org/nexus-code#1718). It used to be read AFTER the suite ran, and
+# config/nexus.yml is outside `_src_snapshot`'s scope — so a suite that PLANTED
+# one demoted its own appends to UNATTRIBUTED and read hermetic, and in a band
+# every later suite inherited the demotion: measured, two appending suites gave
+# rc 0, `hermetic 2`, `leaked-at-source 0`. That is the SILENT direction the
+# error statement above promises never to take. So `probe_one` samples it at
+# the BEFORE-snapshot, `run_probes` samples it ONCE before the first suite and
+# holds it for the band (NRS_BAND_CONTENDED), and a config/nexus.yml that
+# APPEARS during a probe is itself reported as a NEW source path.
+_src_contended_at_start() {
+    case "${NRS_BAND_CONTENDED:-}" in
+        1) return 0 ;; 0) return 1 ;;
+    esac
+    _src_contended "$1"
+}
+
+# _pgrp_alive <pgid> — pids still alive (not zombies) in process group <pgid>
+# AND in this shell's session, one per line (your-org/nexus-code#1718).
+#
+# The suite runs under `timeout`, which makes itself a process-group leader, so
+# everything the suite started and did not detach shares that group. Selected
+# by pgid + session, NEVER by argv: a suite's argv is not unique to it (#851),
+# and the session check keeps a recycled group number from naming a stranger.
+# A child that left the group on purpose (setsid, setpgid — a tmux server, a
+# daemon) is NOT seen: that is the stated boundary of the straggler wait.
+_pgrp_alive() {
+    local pgid="$1" sid
+    sid=$(ps -o sess= -p "$$" 2>/dev/null | tr -d ' ')
+    [ -n "$sid" ] || return 0
+    ps -e -o pgid=,sess=,stat=,pid= 2>/dev/null \
+        | awk -v g="$pgid" -v s="$sid" '$1 == g && $2 == s && $3 !~ /^Z/ { print $4 }'
+}
+
 # ---------------------------------------------------------------------------
 # _nrs_marker_reason <suite> <marker-name>
 #
@@ -480,6 +514,10 @@ probe_one() {
     local src_root="${NRS_SOURCE_ROOT:-$REPO_ROOT}"
     local src_before="$work/src-before.txt" src_after="$work/src-after.txt"
     _src_snapshot "$src_root" > "$src_before" 2>/dev/null
+    # Contention is sampled HERE, before the suite can change the answer (#1718).
+    local src_contended=0 src_cfg_before=0
+    _src_contended_at_start "$src_root" && src_contended=1
+    [ -e "$src_root/config/nexus.yml" ] && src_cfg_before=1
 
     # Tripwire: no record referencing THIS DECOY may appear in the REAL state
     # directory. Contaminating the operator's canonical state is exactly the
@@ -513,10 +551,49 @@ probe_one() {
     # would catch every `ng` write the suite makes and route it OFF the decoy,
     # and every suite would probe `hermetic` regardless of what it does. A
     # suite that pins its own is unaffected: it sets the variable itself.
+    #
+    # `&` + `wait` rather than a foreground call only to learn timeout's pid,
+    # which is the suite's process-group id (see `_pgrp_alive`). `<&0` keeps
+    # the suite's stdin what it was: an async command in a non-interactive
+    # shell otherwise gets /dev/null.
+    local tpid
     timeout -k 10 "$TIMEOUT_SECS" \
         env -u NEXUS_STATE_DIR NEXUS_ROOT="$decoy" NEXUS_LOCALS="$decoy/locals" \
-            bash "$suite" >"$out" 2>&1
+            bash "$suite" >"$out" 2>&1 <&0 &
+    tpid=$!
+    wait "$tpid"
     rc=$?
+
+    # STRAGGLERS (your-org/nexus-code#1718). Every change between the two
+    # snapshots is blamed on this suite, so a process it left running would
+    # otherwise write AFTER the after-snapshot and be blamed on the NEXT suite
+    # — loudly in the default case, silently if that suite carries
+    # allow-source-leak. So the after-snapshot waits, BOUNDED by
+    # NRS_STRAGGLER_GRACE seconds, for the suite's process group to drain,
+    # and kills what is left at the deadline (TERM, then KILL), exactly as
+    # `timeout` does to the same group on expiry. Either way the next suite's
+    # window starts clean. Reported, not gated: the write a straggler makes
+    # inside the grace is caught by the diff below like any other.
+    local strag_grace="${NRS_STRAGGLER_GRACE:-10}" strag="" strag_n=0 strag_t0=$SECONDS
+    [[ "$strag_grace" =~ ^[0-9]+$ ]] || strag_grace=10
+    strag=$(_pgrp_alive "$tpid")
+    if [ -n "$strag" ]; then
+        strag_n=$(grep -c . <<<"$strag")
+        while [ -n "$strag" ] && (( SECONDS - strag_t0 < strag_grace )); do
+            sleep 0.2; strag=$(_pgrp_alive "$tpid")
+        done
+        if [ -n "$strag" ]; then
+            kill -TERM -- "-$tpid" 2>/dev/null
+            local _k
+            for _k in 1 2 3 4 5 6 7 8 9 10; do
+                strag=$(_pgrp_alive "$tpid"); [ -n "$strag" ] || break; sleep 0.2
+            done
+            [ -z "$strag" ] || kill -KILL -- "-$tpid" 2>/dev/null
+            strag="killed"
+        else
+            strag="exited"
+        fi
+    fi
 
     snapshot "$decoy" "$after"
 
@@ -557,7 +634,12 @@ probe_one() {
     _src_snapshot "$src_root" > "$src_after" 2>/dev/null
     local srcchg="$work/src-changes.txt" srcleak="$work/src-leak.txt" srcunattr="$work/src-unattr.txt"
     _src_changes "$src_before" "$src_after" > "$srcchg" 2>/dev/null
-    if _src_contended "$src_root"; then
+    # A configuration that APPEARED is a write into the source checkout, and
+    # the one write that would otherwise switch this arm off (#1718).
+    if [ "$src_cfg_before" = 0 ] && [ -e "$src_root/config/nexus.yml" ]; then
+        printf 'NEW config/nexus.yml\n' >> "$srcchg"
+    fi
+    if [ "$src_contended" = 1 ]; then
         grep -E '^NEW ' "$srcchg" > "$srcleak"
         grep -vE '^NEW ' "$srcchg" > "$srcunattr"
     else
@@ -658,6 +740,10 @@ probe_one() {
                 printf '    marker REJECTED — %s\n' "$marker_reason" >&3
             fi
         fi
+        if [ -n "$strag" ]; then
+            printf '    STRAGGLER — %s: %s process(es) of this suite'"'"'s process group outlived it (#1718); the after-snapshot\n' "$strag" "$strag_n"
+            printf '    waited up to %ss for them, so their writes are attributed HERE and never to the next suite.\n' "$strag_grace"
+        fi
         if [ "$srcunattr_n" -gt 0 ]; then
             # Printed whatever the verdict: a demotion is not an absence.
             printf '    UNATTRIBUTED — %s pre-existing path(s) under %s changed during this probe, but the root is CONTENDED\n' "$srcunattr_n" "$src_root"
@@ -699,7 +785,9 @@ probe_one() {
         fi
     } >&3
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$verdict" "$rc" "$tally" "$leaked_n" "$la_before"
+    # Columns 7-8 (#1718): demoted source paths and the straggler outcome, so
+    # the band summary can COUNT them — a demotion nobody counts is invisible.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$verdict" "$rc" "$tally" "$leaked_n" "$la_before" "$srcunattr_n" "${strag:--}"
 
     if [ "$KEEP_DECOY" = 1 ]; then
         printf '%s: decoy retained at %s\n' "$PROG" "$work" >&2
@@ -1105,7 +1193,7 @@ cmd_audit() {
 run_probes() {
     local -a suites=("$@")
     local rec verdict n_leak=0 n_herm=0 n_skip=0 n_to=0 n_vac=0 n_allow=0 n_unmeasured=0 n_srcleak=0 n_allowsrc=0
-    local n_envskip=0 n_unknownverdict=0 n_done=0
+    local n_envskip=0 n_unknownverdict=0 n_done=0 n_unattr_paths=0 n_unattr_suites=0 n_strag=0
     local human; human=$(mktemp "${TMPDIR:-/tmp}/nrs-human-XXXXXX")
     local recs;  recs=$(mktemp "${TMPDIR:-/tmp}/nrs-recs-XXXXXX")
 
@@ -1116,6 +1204,17 @@ run_probes() {
     # substitution: an `exit` in there ends only the subshell.
     export NRS_ABORT_SENTINEL="${NRS_ABORT_SENTINEL:-$(mktemp "${TMPDIR:-/tmp}/nrs-abort-XXXXXX")}"
     rm -f "$NRS_ABORT_SENTINEL"
+
+    # ONE contention sample for the whole band, taken before the first suite
+    # runs (your-org/nexus-code#1718): a suite that plants config/nexus.yml
+    # must not demote every suite after it. An explicit override still wins.
+    if [ -z "${NRS_SOURCE_CONTENDED:-}" ] && [ -z "${NRS_BAND_CONTENDED:-}" ]; then
+        local NRS_BAND_CONTENDED=0
+        _src_contended "${NRS_SOURCE_ROOT:-$REPO_ROOT}" && NRS_BAND_CONTENDED=1
+        # Deliberately NOT exported: the suites under probe must not inherit
+        # it, or this tool's own suite, run inside a band, would test a frozen
+        # answer instead of the discriminator.
+    fi
 
     local s
     for s in "${suites[@]}"; do
@@ -1158,6 +1257,12 @@ run_probes() {
         fi
         printf '%s\n' "$rec" >> "$recs"
         verdict=$(printf '%s' "$rec" | cut -f2)
+        local _ua _st
+        _ua=$(printf '%s' "$rec" | cut -f7); _st=$(printf '%s' "$rec" | cut -f8)
+        if [[ "$_ua" =~ ^[0-9]+$ ]] && [ "$_ua" -gt 0 ]; then
+            n_unattr_paths=$(( n_unattr_paths + _ua )); n_unattr_suites=$(( n_unattr_suites + 1 ))
+        fi
+        case "$_st" in exited|killed) n_strag=$((n_strag+1)) ;; esac
         case "$verdict" in
             LEAK) n_leak=$((n_leak+1)) ;; LEAK-AT-SOURCE) n_srcleak=$((n_srcleak+1)) ;;
             ALLOWED-AT-SOURCE) n_allowsrc=$((n_allowsrc+1)) ;; hermetic) n_herm=$((n_herm+1)) ;;
@@ -1183,6 +1288,10 @@ run_probes() {
            "${#suites[@]}" "$n_measured" "$n_leak" "$n_srcleak" "$n_allow" "$n_allowsrc" "$n_herm"
     printf 'no evidence: %s   (skipped %s, env-declined %s, timed out %s, vacuous %s, not measured %s, unknown-verdict %s)\n' \
            "$n_noevidence" "$n_skip" "$n_envskip" "$n_to" "$n_vac" "$n_unmeasured" "$n_unknownverdict"
+    # Always printed, zero included (#1718): a demotion to UNATTRIBUTED does
+    # not gate, so this line is the only place a band says it happened.
+    printf 'unattributed (contended source root, NOT gated): %s path(s) in %s suite(s)   stragglers: %s suite(s)\n' \
+           "$n_unattr_paths" "$n_unattr_suites" "$n_strag"
     if [ "$n_allow" -gt 0 ]; then
         say ""
         say "LEAKING BUT EXEMPTED by an explicit marker (reported, not failed):"

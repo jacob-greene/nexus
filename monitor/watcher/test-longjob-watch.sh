@@ -47,6 +47,71 @@ ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 WORK=$(mktemp -d -t lj-test-XXXXXX)
 DPIDS=()
+# ---- EVENT WAITS (your-org/nexus-code#1704) ----------------------------------
+# The dispatcher rigs below used to wait with fixed `sleep 7` / `sleep 9` per
+# poll (≈ 1.5–2 polls of slack each). The poll floor is 5 s inside
+# longjob-watch.sh, so the interval cannot be lowered here; instead every wait
+# keys on an EVENT the dispatcher writes, with a deadline that only turns a
+# hang into a red (never a pass):
+#   - a watch's .last_probe is the pass's START second (set by _update/_retire);
+#   - the ledger's pass-END write has note exactly "ok" (mid-pass writes say
+#     "ok (mid-pass …)"), and pass ends are ≥ poll_seconds (5 s) apart.
+_wait_for() {   # <backstop-seconds> <cmd…> — true as soon as cmd is; false at the backstop
+    local dl=$(( SECONDS + $1 )); shift
+    until "$@"; do (( SECONDS >= dl )) && return 1; sleep 0.2; done
+}
+_armed() {   # <spool> [pid] — the dispatcher has armed (service=polling), optionally THIS pid
+    [[ "$(jq -r '.service // empty' "$1/dispatcher.json" 2>/dev/null)" == polling ]] || return 1
+    [[ -z "${2:-}" || "$(jq -r '.pid // empty' "$1/dispatcher.json" 2>/dev/null)" == "$2" ]]
+}
+_svc_is() { [[ "$(jq -r '.service // empty' "$1/dispatcher.json" 2>/dev/null)" == "$2" ]]; }
+_reason_is() { [[ "$(jq -r '.retired_reason // empty' "$1/watches/$2.json" 2>/dev/null)" == "$3" ]]; }
+_settled() {   # <spool> <id> <T> — <id> was probed in a pass that STARTED after second T, and that pass has ENDED
+    local lp ll note
+    lp=$(jq -r '.last_probe // 0' "$1/watches/$2.json" 2>/dev/null)
+    [[ "$lp" =~ ^[0-9]+$ ]] && (( lp > $3 )) || return 1
+    read -r ll note < <(jq -r '"\(.last_poll // 0) \(.note // "")"' "$1/dispatcher.json" 2>/dev/null) || return 1
+    [[ "$note" == ok && "$ll" =~ ^[0-9]+$ ]] && (( ll >= lp ))
+}
+_poll_after() {   # <spool> <id> — wait for ONE complete pass, begun after now, that probed <id>
+    local t; t=$(date +%s)
+    _wait_for 90 _settled "$1" "$2" "$t" || bad "rig: no completed pass probing $2 within 90 s (since $t): $(jq -c '{state,last_probe}' "$1/watches/$2.json" 2>&1) ledger=$(jq -c '{last_poll,note}' "$1/dispatcher.json" 2>&1)"
+}
+_pass_end_after() {   # <spool> <after-second> [pid] — a pass-END write later than <after-second>; sets _PE_LAST
+    local ll p note
+    read -r ll p note < <(jq -r '"\(.last_poll // 0) \(.pid // 0) \(.note // "")"' "$1/dispatcher.json" 2>/dev/null) || return 1
+    [[ "$note" == ok && "$ll" =~ ^[0-9]+$ ]] && (( ll > $2 )) || return 1
+    [[ -z "${3:-}" || "$p" == "$3" ]] || return 1
+    _PE_LAST=$ll
+}
+_passes_since() {   # <spool> <N> <T> [pid] — N distinct pass-END writes at or after second T (pass ends are ≥ 5 s apart)
+    local prev=$(( $3 - 1 )) i
+    for (( i = 0; i < $2; i++ )); do
+        _wait_for 90 _pass_end_after "$1" "$prev" "${4:-}" || return 1
+        prev=$_PE_LAST
+    done
+}
+# A fixed `sleep 7` raced a 5 s poll cadence under load (`--jobs 6` band, Slurm
+# 8478569, 1 red in 3 — `FAIL: F3 unknown`, your-org/nexus-code#1317). So wait
+# until every named watch carries a retired_reason AND the dispatcher has
+# finished the pass that retired it — its end-of-pass ledger write (note
+# exactly "ok", last_poll ≥ the latest retired_at). The second half matters:
+# the wait side of a retirement (_resolve_waits) and the line itself run AFTER
+# _retire in the same pass, so stopping at the retired_reason alone would read
+# mid-pass. On timeout the caller falls through and its assertions go red on
+# their own evidence — a timeout never passes.
+_retired_settled() {   # <spool> <id>…
+    local sp="$1" id ra lp note maxra=0; shift
+    for id in "$@"; do
+        ra=$(jq -r 'if (.retired_reason // "") != "" then (.retired_at // 0) else empty end' "$sp/watches/$id.json" 2>/dev/null)
+        [[ "$ra" =~ ^[0-9]+$ ]] || return 1
+        (( ra > maxra )) && maxra=$ra
+    done
+    note=$(jq -r '.note // ""' "$sp/dispatcher.json" 2>/dev/null); lp=$(jq -r '.last_poll // 0' "$sp/dispatcher.json" 2>/dev/null)
+    [[ "$note" == ok && "$lp" =~ ^[0-9]+$ ]] && (( lp >= maxra ))
+}
+_lines_ge() { (( $(grep -c "${3:-^longjob-watch: }" "$1" 2>/dev/null) >= $2 )); }   # <file> <n> [pattern]
+_lp_gt() { local l; l=$(jq -r '.last_poll // 0' "$1/dispatcher.json" 2>/dev/null); [[ "$l" =~ ^[0-9]+$ ]] && (( l > $2 )); }
 cleanup() { local p; for p in "${DPIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -65,6 +130,8 @@ cat > "$STUB/sacct" <<'EOF'
 # every call also appends its argv to $LJ_SACCT_CALLS, so a case can assert
 # that sacct was NEVER asked (your-org/nexus-code#1727).
 [[ -n "${LJ_SACCT_CALLS:-}" ]] && printf '%s\n' "$*" >> "$LJ_SACCT_CALLS"
+# $LJ_SACCT_FAIL present: the sandbox chaperon's jam answer (#1728).
+[[ -n "${LJ_SACCT_FAIL:-}" && -e "$LJ_SACCT_FAIL" ]] && { echo 'error: failed to read chaperon response (timeout or error)' >&2; exit 1; }
 [[ -f "${LJ_SACCT_FILE:-}" ]] && cat "$LJ_SACCT_FILE"; exit 0
 EOF
 cat > "$STUB/squeue" <<'EOF'
@@ -204,6 +271,145 @@ printf 'abc\n' > "$WORK/f2"
 [[ "$(probe file:$WORK/f2 --when match --pattern 'zzz')" == running\|* ]] && ok "match: no hit → running" || bad "match miss"
 [[ "$(probe file:$WORK/f2 --when match --pattern '(')" == failed\|* ]]   && ok "match: bad regex → failed (cannot evaluate), not silence" || bad "match bad regex: $(probe file:$WORK/f2 --when match --pattern '(')"
 
+echo "=== file match: a FAILURE ARM by default, so an abort wakes the waiter (bundle 21) ==="
+# Measured 2026-10-08: a wait on a deploy's success line slept ~2 h while the
+# deploy ABORTed. `add --when match` now carries a default failure arm, counted
+# only on lines written after `add`; `await` (the unarmed fallback) is the
+# end-to-end reader, because it probes the subject from the stored spec.
+printf 'start\nold ABORT from yesterday\n' > "$WORK/fa1.log"
+out=$("$LJ" add file:"$WORK/fa1.log" --when match --pattern '^stamp ' --id fa1 --interval 5 2>&1)
+[[ "$out" == *"first probe: running|"* ]] && ok "fail-arm: an ABORT line written BEFORE add does not fire (first probe running)" || bad "fail-arm pre-add line: $out"
+[[ "$out" == *"failure arm: /"*"(the default;"* ]] && ok "fail-arm: add prints the default failure arm it stored" || bad "fail-arm add output: $out"
+[[ "$(jq -r .lines0 "$SPOOL/watches/fa1.json")" == 2 && -n "$(jq -r '.fail_pattern // empty' "$SPOOL/watches/fa1.json")" ]] \
+    && ok "fail-arm: the spec records lines0=2 and a non-empty fail_pattern" || bad "fail-arm spec: $(jq -c '{lines0,fail_pattern}' "$SPOOL/watches/fa1.json")"
+printf 'deploy ABORT: lock held by another build\n' >> "$WORK/fa1.log"
+out=$("$LJ" await fa1 --timeout 12 2>&1); rc=$?
+(( rc == 1 )) && [[ "$out" == *"FAILURE arm"*"line 3"* ]] && ok "fail-arm: await on a success-only pattern returns FAILED (rc 1) on a new ABORT line, naming it — not a timeout" \
+    || bad "fail-arm await: rc=$rc (4 = slept through the abort) $out"
+"$LJ" rm fa1 >/dev/null
+printf 'stamp v1\nlater ERROR in a cleanup step\n' > "$WORK/fa2.log"
+[[ "$(probe file:$WORK/fa2.log --when match --pattern '^stamp ')" == done\|* ]] && ok "fail-arm: a success line BEFORE the failure line → done (first in file order wins)" || bad "fail-arm success-first: $(probe file:$WORK/fa2.log --when match --pattern '^stamp ')"
+printf 'deploy ABORT\nstamp v1\n' > "$WORK/fa3.log"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^stamp ')" == failed\|* ]] && ok "fail-arm: a failure line BEFORE the success line → failed" || bad "fail-arm failure-first: $(probe file:$WORK/fa3.log --when match --pattern '^stamp ')"
+# A SHORT custom arm here, not the default: the probe detail is cut at 400
+# chars and the default arm's ~190-char ERE is echoed in it, so under a long
+# $TMPDIR (a mutation-gate copy) the cut ate the "stamp v1" tail and this case
+# went red on an unmutated tree (measured, bundle 23). The claim is about the
+# F2 clause, not about the default arm.
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^stamp ' --fail-pattern ABORT)" == *"a success line ALSO appears later, at line 2: stamp v1"* ]] \
+    && ok "fail-arm: the LATER success line is SAID in the detail (skeptic F2 on #1784)" || bad "fail-arm F2: $(probe file:$WORK/fa3.log --when match --pattern '^stamp ' --fail-pattern ABORT)"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^zzz')" != *"ALSO appears later"* ]] \
+    && ok "fail-arm: with NO success line, no 'success also appears' claim (control)" || bad "fail-arm F2 control: $(probe file:$WORK/fa3.log --when match --pattern '^zzz')"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^zzz' --fail-pattern none)" == running\|* ]] && ok "fail-arm: --fail-pattern none drops the arm (running)" || bad "fail-arm none"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^zzz' --fail-pattern 'BOOM')" == running\|* ]] && ok "fail-arm: a custom --fail-pattern REPLACES the default (ABORT ignored)" || bad "fail-arm custom ignores default"
+printf 'BOOM\n' >> "$WORK/fa3.log"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^zzz' --fail-pattern 'BOOM')" == failed\|* ]] && ok "fail-arm: a custom --fail-pattern fires on its own line" || bad "fail-arm custom fires"
+[[ "$(probe file:$WORK/fa3.log --when match --pattern '^zzz' --lines0 99)" == failed\|* ]] && ok "fail-arm: a file SHORTER than lines0 (rotated) is read from line 1" || bad "fail-arm rotation: $(probe file:$WORK/fa3.log --when match --pattern '^zzz' --lines0 99)"
+# Skeptic F3 on #1784: Slurm/OOM abort shapes WITHOUT an `error:` prefix,
+# which the bundle-21 default left `running`.
+for _l in '*** JOB 1234567 ON node01 CANCELLED AT 2026-10-08T10:00:00 DUE TO TIME LIMIT ***' \
+          'line 3:  4242 Killed                  python x.py' \
+          'slurmstepd: Detected 1 oom-kill event(s) in StepId=1234567.batch' \
+          'Detected 1 oom_kill event in StepId=1234567.batch' \
+          'State: OUT_OF_MEMORY (exit code 0)'; do
+    printf '%s\n' "$_l" > "$WORK/fa7.log"
+    [[ "$(probe file:$WORK/fa7.log --when match --pattern '^zzz')" == failed\|* ]] \
+        && ok "fail-arm F3: the default fires on '${_l:0:38}…'" || bad "fail-arm F3: $_l → $(probe file:$WORK/fa7.log --when match --pattern '^zzz')"
+done
+# …and a `set -x` trace line never counts, under the default or a custom arm.
+printf '+ grep -q ERROR build.log\n++ echo FATAL\n' > "$WORK/fa8.log"
+[[ "$(probe file:$WORK/fa8.log --when match --pattern '^zzz')" == running\|* ]] \
+    && ok "fail-arm F3: xtrace lines ('+ grep -q ERROR', '++ echo FATAL') do not fire" || bad "fail-arm xtrace: $(probe file:$WORK/fa8.log --when match --pattern '^zzz')"
+[[ "$(probe file:$WORK/fa8.log --when match --pattern '^zzz' --fail-pattern 'FATAL')" == running\|* ]] \
+    && ok "fail-arm F3: an xtrace line does not fire a CUSTOM arm either" || bad "fail-arm xtrace custom: $(probe file:$WORK/fa8.log --when match --pattern '^zzz' --fail-pattern 'FATAL')"
+printf 'ERROR: real failure\n' >> "$WORK/fa8.log"
+[[ "$(probe file:$WORK/fa8.log --when match --pattern '^zzz')" == failed\|*"at line 3"* ]] \
+    && ok "fail-arm F3: a real failure AFTER xtrace lines fires, at its own line number (3)" || bad "fail-arm xtrace then real: $(probe file:$WORK/fa8.log --when match --pattern '^zzz')"
+# Skeptic N2 on PR #1786: the SUCCESS arm skips xtrace lines too.
+printf '+ [[ $st == COMPLETED ]]\n' > "$WORK/fa9.log"
+[[ "$(probe file:$WORK/fa9.log --when match --pattern 'COMPLETED' --fail-pattern none)" == running\|* ]] \
+    && ok "success arm: an xtrace line naming the success word does NOT read done (skeptic N2)" || bad "success xtrace: $(probe file:$WORK/fa9.log --when match --pattern 'COMPLETED' --fail-pattern none)"
+printf 'State: COMPLETED\n' >> "$WORK/fa9.log"
+[[ "$(probe file:$WORK/fa9.log --when match --pattern 'COMPLETED' --fail-pattern none)" == done\|*"State: COMPLETED"* ]] \
+    && ok "success arm: the real success line after an xtrace line reads done, naming the REAL line" || bad "success after xtrace: $(probe file:$WORK/fa9.log --when match --pattern 'COMPLETED' --fail-pattern none)"
+# Bundle 23: the SUCCESS arm is scoped to lines written after `add` too. An OLD
+# success line already in an append-only log used to read `done` on the FIRST
+# probe — a false wake. `resolve` probes the STORED spec, so it is the reader.
+for _fa in default none; do
+    _fx=(); [[ "$_fa" == none ]] && _fx=(--fail-pattern none)
+    printf 'stamp v0 from yesterday\nother\n' > "$WORK/fs-$_fa.log"
+    out=$("$LJ" add file:"$WORK/fs-$_fa.log" --when match --pattern '^stamp ' --id "fs-$_fa" --interval 5 "${_fx[@]}" 2>&1)
+    [[ "$out" == *"first probe: running|"* && "$(jq -r .lines0 "$SPOOL/watches/fs-$_fa.json")" == 2 ]] \
+        && ok "success arm ($_fa fail arm): a success line written BEFORE add does not read done (first probe running, lines0=2)" \
+        || bad "success arm pre-add ($_fa): lines0=$(jq -r .lines0 "$SPOOL/watches/fs-$_fa.json") $out"
+    # Skeptic F1 on #1799: not counted must never be SILENT. If that pre-add line
+    # is THIS job's own success, a quiet watch waits out its TTL (a lost wake).
+    [[ "$out" == *"WARNING: a line matching /^stamp / is ALREADY in $WORK/fs-$_fa.log at line 1, written BEFORE this add"*"monitor/ng longjob rm fs-$_fa"* && "$out" != *"--lines0"* ]] \
+        && ok "success arm ($_fa fail arm): add WARNS that a pre-add line (line 1) matches and is not counted, naming a remedy that runs (longjob rm), never add --lines0" \
+        || bad "success arm pre-add warning ($_fa): $out"
+    [[ "$("$LJ" resolve "fs-$_fa")" == running\|*"PRE-ADD MATCH at line 1"*"stamp v0 from yesterday"*"ng longjob rm"* && "$("$LJ" resolve "fs-$_fa")" != *"--lines0"* ]] \
+        && ok "success arm ($_fa fail arm): the running detail names the PRE-ADD MATCH and its line, never 'no line matching … yet'" \
+        || bad "success arm pre-add detail ($_fa): $("$LJ" resolve "fs-$_fa")"
+    [[ "$("$LJ" resolve "fs-$_fa")" == running\|* ]] \
+        && ok "success arm ($_fa fail arm): the stored spec still reads running with only the OLD success line" \
+        || bad "success arm resolve pre-append ($_fa): $("$LJ" resolve "fs-$_fa")"
+    printf 'stamp v1\n' >> "$WORK/fs-$_fa.log"
+    _r=$("$LJ" resolve "fs-$_fa")
+    [[ "$_r" == terminal\|done* ]] \
+        && ok "success arm ($_fa fail arm): a success line appended AFTER add reads done (must-not-flip control)" \
+        || bad "success arm post-append ($_fa): $_r"
+    [[ "$_r" == *"stamp v1"* && "$_r" != *"stamp v0"* ]] \
+        && ok "success arm ($_fa fail arm): the done detail names the NEW line, never the pre-add one" \
+        || bad "success arm post-append detail ($_fa): $_r"
+    "$LJ" rm "fs-$_fa" >/dev/null
+done
+# Must-not-fire control for the F1 warning: no pre-add match, no WARNING.
+printf 'other\nunrelated\n' > "$WORK/fs-nw.log"
+out=$("$LJ" add file:"$WORK/fs-nw.log" --when match --pattern '^stamp ' --id fs-nw --interval 5 2>&1)
+[[ "$out" == *"first probe: running|"* && "$out" != *"WARNING: a line matching"* && "$out" != *"PRE-ADD MATCH"* ]] \
+    && ok "success arm: NO pre-add-match warning when nothing before the add matches (control)" || bad "success arm warning control: $out"
+"$LJ" rm fs-nw >/dev/null
+# Skeptic N1 on #1799: the WARNING's remedy must RUN. The old text said
+# "re-add with --lines0 0", which `add` rejects (unknown option) and which a
+# text-only assertion could never notice. So EXECUTE the printed command, word
+# for word, from the repo root as the agent would.
+printf 'stamp v0 from yesterday\n' > "$WORK/fs-rm.log"
+out=$("$LJ" add file:"$WORK/fs-rm.log" --when match --pattern '^stamp ' --id fs-rm --interval 5 2>&1)
+_rem=''; [[ "$out" =~ (monitor/ng longjob rm [A-Za-z0-9._-]+) ]] && _rem="${BASH_REMATCH[1]}"
+_rem_out=''; _rem_rc=none
+if [[ -n "$_rem" ]]; then read -r -a _rem_cmd <<<"$_rem"; _rem_out=$(cd "$REPO_ROOT" && "${_rem_cmd[@]}" 2>&1); _rem_rc=$?; fi
+[[ "$_rem" == "monitor/ng longjob rm fs-rm" && "$_rem_rc" == 0 && "$_rem_out" == *"removed fs-rm"* && ! -f "$SPOOL/watches/fs-rm.json" ]] \
+    && ok "success arm: the WARNING's printed remedy RUNS (rc 0, 'removed fs-rm', the watch is gone)" \
+    || bad "success arm remedy run: rem='$_rem' rc=$_rem_rc out=$_rem_out spec=$([[ -f "$SPOOL/watches/fs-rm.json" ]] && echo present || echo gone)"
+"$LJ" rm fs-rm >/dev/null 2>&1
+# The one-shot probe keeps its deliberate --lines0 0 default (whole file), and
+# a file SHORTER than lines0 (rotated) is read from line 1 by the success arm.
+printf 'stamp v0\n' > "$WORK/fs-p.log"
+[[ "$(probe file:$WORK/fs-p.log --when match --pattern '^stamp ')" == done\|* ]] \
+    && ok "success arm: one-shot probe with no --lines0 reads the whole file (deliberate default)" || bad "success probe default"
+[[ "$(probe file:$WORK/fs-p.log --when match --pattern '^stamp ' --lines0 1)" == running\|* ]] \
+    && ok "success arm: probe --lines0 1 reproduces a watch added now (running)" || bad "success probe lines0=1: $(probe file:$WORK/fs-p.log --when match --pattern '^stamp ' --lines0 1)"
+[[ "$(probe file:$WORK/fs-p.log --when match --pattern '^stamp ' --lines0 99)" == done\|* ]] \
+    && ok "success arm: a file SHORTER than lines0 (rotated) is read from line 1" || bad "success rotation: $(probe file:$WORK/fs-p.log --when match --pattern '^stamp ' --lines0 99)"
+# Line numbers stay ABSOLUTE once the success arm reads from lines0+1: with a
+# failure line BEFORE the new success line, the F2 detail names the real line.
+printf 'old\nold\nERROR new\nstamp v2\n' > "$WORK/fs-l.log"
+# (a short --fail-pattern for the same 400-char-cut reason as the F2 case)
+[[ "$(probe file:$WORK/fs-l.log --when match --pattern '^stamp ' --fail-pattern ERROR --lines0 2)" == failed\|*"at line 3"*"at line 4: stamp v2"* ]] \
+    && ok "success arm: line numbers stay absolute under lines0 (failure line 3, later success line 4)" \
+    || bad "success arm absolute lines: $(probe file:$WORK/fs-l.log --when match --pattern '^stamp ' --fail-pattern ERROR --lines0 2)"
+# The xtrace filter is a second grep: a BAD failure pattern must still read as
+# rc 2 (cannot evaluate), never as the second grep's "no match".
+out=$( . "$REPO_ROOT/monitor/longjob-probes.d/file.sh"; lj_probe_main "$WORK/fa8.log" '{"when":"match","pattern":"zzz","fail_pattern":"(","lines0":0}' )
+[[ "$out" == failed\|*"grep rc=2 evaluating the failure arm"* ]] \
+    && ok "fail-arm: a bad failure pattern in a stored spec → failed (cannot evaluate), not running" || bad "fail-arm bad stored pattern: $out"
+printf 'ERRORS: 0\n0 failed, 12 passed\n' > "$WORK/fa4.log"
+[[ "$(probe file:$WORK/fa4.log --when match --pattern '^zzz')" == running\|* ]] && ok "fail-arm: the default does not fire on 'ERRORS: 0' or '0 failed' (control)" || bad "fail-arm benign summary: $(probe file:$WORK/fa4.log --when match --pattern '^zzz')"
+"$LJ" add file:"$WORK/fa4.log" --when match --pattern x --fail-pattern '(' --id fa5 >/dev/null 2>&1; rc=$?
+(( rc == 2 )) && [[ ! -e "$SPOOL/watches/fa5.json" ]] && ok "fail-arm: an invalid --fail-pattern is refused at add (rc 2), no watch written" || bad "fail-arm invalid: rc=$rc"
+"$LJ" add slurm:1234567 --fail-pattern x --id fa6 >/dev/null 2>&1; rc=$?
+(( rc == 2 )) && ok "fail-arm: --fail-pattern on a non-file subject → rc 2" || bad "fail-arm on slurm: rc=$rc"
+
 echo "=== dispatch refuses arguments at once (never a silent forever loop) ==="
 # bundle-2609: `dispatch --repo x` used to run the dispatcher forever, which
 # held test-ng-flag-order.sh's per-sub-verb sweep past a 2400 s ceiling.
@@ -216,6 +422,45 @@ out=$("$LJ" status 2>&1); rc=$?
 out=$("$LJ" add file:"$WORK/never" --id unarmed 2>&1); rc=$?
 (( rc == 3 )) && [[ "$out" == *"WILL NOT WAKE YOU"* && "$out" == *"await unarmed"* ]] && ok "add in an unarmed session: rc 3, says the watch will NOT wake you and names the await fallback" || bad "add unarmed: rc=$rc $out"
 "$LJ" rm unarmed >/dev/null
+
+echo "=== add on an UNWRITABLE spool: a loud refusal, NOTHING watched, a runnable fallback (#1724) ==="
+# A degraded read-only tree used to give `add: cannot write spec` — no path,
+# no reason, rc 2 like a usage slip. The seam is the suite's own: a private
+# NEXUS_STATE_DIR whose spool parent (case 1) or watches dir (case 2) is 0555.
+_ro="$WORK/rostate"; mkdir -p "$_ro/longjob/k2/watches" "$_ro/heartbeat"; chmod 0555 "$_ro/longjob/k2/watches"
+mkdir -p "$_ro/longjob-p"; chmod 0555 "$_ro/longjob-p"
+if [[ -w "$_ro/longjob/k2/watches" ]]; then
+    printf '  SKIP: a 0555 directory is writable here (root?) — the unwritable-spool cases are unmeasured\n'
+else
+    printf 'stamp v0\n' > "$WORK/ro.log"
+    # case 1: the SPOOL cannot be created (its parent is 0555)
+    chmod 0555 "$_ro/longjob"
+    out=$(NEXUS_STATE_DIR="$_ro" NEXUS_LONGJOB_KEY=k1 "$LJ" add file:"$WORK/ro.log" --when match --pattern '^stamp ' --id ro1 2>&1); rc=$?
+    chmod 0755 "$_ro/longjob"
+    (( rc == 2 )) && [[ "$out" == *"add REFUSED — cannot write the spool directory $_ro/longjob/k1/watches: Permission denied"* && "$out" == *"NOTHING IS WATCHED"* ]] \
+        && ok "#1724 spool cannot be created: rc 2, names the path and the reason, says NOTHING IS WATCHED" || bad "#1724 case 1: rc=$rc $out"
+    [[ ! -e "$_ro/longjob/k1" ]] && ok "#1724 case 1: no spool, no spec was left behind" || bad "#1724 case 1 left: $(ls -R "$_ro/longjob/k1" 2>&1)"
+    # case 2: the spool exists, the spec write fails
+    out=$(NEXUS_STATE_DIR="$_ro" NEXUS_LONGJOB_KEY=k2 "$LJ" add file:"$WORK/ro.log" --when match --pattern '^stamp ' --id ro2 2>&1); rc=$?
+    (( rc == 2 )) && [[ "$out" == *"add REFUSED — cannot write the watch spec $_ro/longjob/k2/watches/ro2.json: Permission denied"* && "$out" == *"shell said:"* && "$out" == *"NOTHING IS WATCHED"* ]] \
+        && ok "#1724 spec write fails: rc 2, names the spec path, the reason and the shell's own error text" || bad "#1724 case 2: rc=$rc $out"
+    [[ -z "$(ls -A "$_ro/longjob/k2/watches")" && "$out" != *"added ro2"* && "$out" != *"dispatcher:"* ]] \
+        && ok "#1724 case 2: nothing recorded, and no 'added' / dispatcher line that could read as success" || bad "#1724 case 2 residue: $(ls -A "$_ro/longjob/k2/watches") $out"
+    [[ "$out" == *"run_in_background: true AND timeout: "* && "$out" == *" probe file:"*"--lines0 1"* && "$out" == *"failed) echo \"FAILED"* && "$out" != *"longjob-watch.sh await"* ]] \
+        && ok "#1724: the fallback is a probe loop with a FAILED arm (lines0 kept), never \`await\` (which needs a registered watch)" || bad "#1724 fallback text: $out"
+    # The printed loop RUNS: a success line written after the refused add ends it DONE, rc 0.
+    _loop=$(grep -E '^    d=\$\(\(SECONDS\+' <<<"$out" | sed 's/^    //'); _lf="$WORK/ro-loop.sh"; printf '%s\n' "$_loop" > "$_lf"
+    printf 'stamp v1\n' >> "$WORK/ro.log"
+    _lo=$(NEXUS_ROOT="$FROOT" timeout 60 bash "$_lf" 2>&1); rc=$?
+    (( rc == 0 )) && [[ "$_lo" == "DONE done|"*"stamp v1"* ]] \
+        && ok "#1724: the printed fallback loop runs as printed and ends DONE on the NEW success line (rc 0)" || bad "#1724 loop: rc=$rc out=$_lo loop=$_loop"
+    # POTENCY: the same add on a WRITABLE spool records the watch (so the refusals above are the 0555, not the command).
+    chmod 0755 "$_ro/longjob/k2/watches"
+    out=$(NEXUS_STATE_DIR="$_ro" NEXUS_LONGJOB_KEY=k2 "$LJ" add file:"$WORK/ro.log" --when match --pattern '^stamp ' --id ro2 2>&1); rc=$?
+    (( rc == 0 || rc == 3 )) && [[ -f "$_ro/longjob/k2/watches/ro2.json" && "$out" != *"REFUSED"* ]] \
+        && ok "#1724 POTENCY: the same add on a writable spool records the watch (rc $rc)" || bad "#1724 potency: rc=$rc $out"
+fi
+chmod -R u+w "$_ro" 2>/dev/null
 
 echo "=== ledger verdicts: dead / stale, from planted ledgers ==="
 mkdir -p "$SPOOL"
@@ -230,7 +475,7 @@ echo "=== dispatcher: terminal-only default, transitions on request, unknown par
 : > "$LJ_SACCT_FILE"; : > "$LJ_SQUEUE_FILE"
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out1.txt" 2> "$WORK/err1.txt" &
 D1=$!; DPIDS+=("$D1")
-sleep 2
+_wait_for 30 _armed "$SPOOL" "$D1" || bad "D1 rig: the dispatcher never armed"
 out=$("$LJ" add file:"$WORK/w1" --id w1 --interval 5 --desc "the w1 file" 2>&1); rc=$?
 (( rc == 0 )) && [[ "$out" == *"dispatcher: ARMED"* ]] && ok "add with a live dispatcher: rc 0, says ARMED and that ending the turn is safe" || bad "add armed: rc=$rc $out"
 [[ "$out" == *"first probe: pending|"* ]] && ok "add runs a synchronous first probe and shows it" || bad "first probe missing: $out"
@@ -243,7 +488,9 @@ out=$("$LJ" add file:"$WORK/w1" --id w1 --interval 5 --desc "the w1 file" 2>&1);
 # still expires inside the `sleep 10` that follows, which is what w5 tests.
 "$LJ" add cmd:'exit 1' --id w5 --interval 5 --ttl 4 >/dev/null
 out=$("$LJ" status); [[ "$out" == *"dispatcher=armed"* && "$out" == *"active_watches=5"* ]] && ok "status: armed, 5 active" || bad "status armed: $out"
-sleep 10                             # first poll: w2/w3 pending→running (w2 prints, w3 does not), w4 unknown #1, w5 expired — five probes plus one paced print
+# first poll(s): w2/w3 pending→running (w2 prints, w3 does not), w4 unknown #1,
+# w5 expired. w5 sorts last, so the pass that expires it has probed w2 already.
+_wait_for 60 _reason_is "$SPOOL" w5 expired
 [[ "$(jq -r '.retired_reason' "$SPOOL/watches/w5.json")" == expired ]] && ok "w5 retired: expired" || bad "w5 not yet expired"
 # F1 below needs w1 and w2 to go terminal in ONE pass, so the two touches must
 # land BETWEEN passes. A pass probes in file order (w1 before w2); a touch that
@@ -261,8 +508,8 @@ for _ in $(seq 1 150); do
 done
 (( edge )) || bad "no pass-end ledger write within 30 s: the w1/w2 touches below may land mid-pass (F1 would then be a rig failure, not a pacing one)"
 touch "$WORK/w1"; touch "$WORK/w2"
-sleep 7                              # second poll: w1 done, w2 done, w4 unknown #2 → UNKNOWN
-sleep 6                              # third poll: settle
+# next poll(s): w1 done, w2 done, w4 unknown #2 → UNKNOWN; wait for the pass END that retired the last of them
+_wait_for 90 _retired_settled "$SPOOL" w1 w2 w4 || bad "D1 rig: w1/w2/w4 not all retired and settled within 90 s"
 o=$(cat "$WORK/out1.txt")
 grep -q '^longjob-watch: DONE w1 | record: monitor/longjob-watch.sh show w1 | file:.* \[desc: the w1 file\] — .*exists$' <<<"$o" && ok "w1: DONE line — pointer FIRST, then subject and desc, detail last" || bad "w1 line: $(grep 'DONE w1' <<<"$o")"
 grep -q '^longjob-watch: RUNNING w2 | record: monitor/longjob-watch.sh show w2 | cmd:.*transition pending → running' <<<"$o" && ok "w2 (--notify transitions): pending→running printed" || bad "w2 transition missing"
@@ -274,12 +521,12 @@ grep -q '^longjob-watch: EXPIRED w5 | record: monitor/longjob-watch.sh show w5 |
 c=$(grep -c '^longjob-watch: ' <<<"$o"); (( c == 5 )) && ok "exactly 5 lines printed (w1, w2×2, w4, w5)" || bad "line count $c: $o"
 [[ "$(jq -r .retired_reason "$SPOOL/watches/w4.json")" == unknown ]] && ok "w4 spec retired_reason=unknown" || bad "w4 spec"
 [[ "$(jq -r '.state + "/" + .retired_reason' "$SPOOL/watches/w3.json")" == "running/" ]] && ok "w3 still active, state running (never printed, still tracked)" || bad "w3 spec: $(cat "$SPOOL/watches/w3.json")"
-touch "$WORK/w3"; sleep 7
+touch "$WORK/w3"; _wait_for 60 _retired_settled "$SPOOL" w3
 grep -q '^longjob-watch: DONE w3 ' "$WORK/out1.txt" && ok "w3: DONE printed once its predicate held" || bad "w3 done missing"
 # F4: a detail at the probe's own 400-char cap plus a long desc must still fit under the host's 500-char cut
 # a 250-char target (in the HEAD) + a 200-char probe detail (the cmd probe's own cap) + a long desc: only the DETAIL may be trimmed
 "$LJ" add cmd:"printf '%0400d' 0; exit 2 # $(printf 'x%.0s' $(seq 1 250))" --id w6 --interval 5 --desc "$(printf 'd%.0s' $(seq 1 120))" >/dev/null 2>&1
-sleep 9
+_wait_for 60 _retired_settled "$SPOOL" w6
 l6=$(grep '^longjob-watch: FAILED w6 ' "$WORK/out1.txt"); (( ${#l6} > 0 && ${#l6} <= 480 )) && [[ "$l6" == *"| record: monitor/longjob-watch.sh show w6 |"* ]] && ok "F4: a 250-char target + 200-char detail + 120-char desc composes to ${#l6} chars ≤ 480 with the pointer intact (the head's elements are bounded; the adversarial shapes are in the D3 block)" || bad "F4 long line: ${#l6} chars: ${l6:0:120}…"
 act=$("$LJ" status | grep active_watches); [[ "$act" == "active_watches=0" ]] && ok "every watch retired" || bad "$act"
 if [[ -d "/proc/$D1" ]]; then ok "NEVER EXIT: dispatcher alive after every watch retired (pid $D1)"; else bad "dispatcher exited after the spool emptied"; fi
@@ -292,20 +539,20 @@ t1=$(awk -F'\t' '$2=="w1" && $3=="done"{print $1}' "$SPOOL/events.log"); t2=$(aw
 (( t2 - t1 >= 2 )) && ok "F1: two lines from ONE poll pass are paced ≥ 2 s apart (w1@$t1, w2@$t2) — the host's bucket refills 1 per 2 s, so a burst can never drain it" || bad "F1 pacing: w1@$t1 w2@$t2"
 kill "$D1"; wait "$D1" 2>/dev/null
 if [[ ! -d "/proc/$D1" ]]; then ok "POTENCY: the alive check reads a killed dispatcher as gone" ; else bad "alive check cannot fail"; fi
-sleep 1
 out=$("$LJ" status 2>&1); [[ "$out" == *"dispatcher=dead"* ]] && ok "status after the kill → dead" || bad "status dead: $out"
 
 echo "=== dispatcher: persistent watch, dedup, per-watch cap, session cap + unmute ==="
 export NEXUS_LONGJOB_KEY="t2"; SPOOL2="$NEXUS_STATE_DIR/longjob/t2"
 NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_SESSION_MAX_EVENTS=2 "$LJ" dispatch > "$WORK/out2.txt" 2> "$WORK/err2.txt" &
-D2=$!; DPIDS+=("$D2"); sleep 2
-# p1: persistent, level-triggered: failed while $WORK/down exists, running otherwise
+D2=$!; DPIDS+=("$D2"); _wait_for 30 _armed "$SPOOL2" "$D2" || bad "D2 rig: the dispatcher never armed"
+# p1: persistent, level-triggered: failed while $WORK/down exists, running otherwise.
+# Each step waits for ONE complete pass, begun after the change, that probed p1.
 "$LJ" add cmd:"test -e $WORK/down && exit 2; exit 1" --id p1 --interval 5 --persistent >/dev/null
-sleep 7                                   # poll 1: running (no print: not a transition from failed)
-touch "$WORK/down"; sleep 9               # poll 2: running→failed → print #1   (passes that print are paced: ≥ 2.5 s longer)
-sleep 9                                   # poll 3: failed again → DEDUP, no print
-rm -f "$WORK/down"; sleep 9               # poll 4: failed→running → print #2 (recovery)
-touch "$WORK/down"; sleep 9               # poll 5: running→failed → would be print #3 → SESSION CAP → MUTED line
+_poll_after "$SPOOL2" p1                          # poll 1: running (no print: not a transition from failed)
+touch "$WORK/down"; _poll_after "$SPOOL2" p1      # poll 2: running→failed → print #1
+_poll_after "$SPOOL2" p1                          # poll 3: failed again → DEDUP, no print
+rm -f "$WORK/down"; _poll_after "$SPOOL2" p1      # poll 4: failed→running → print #2 (recovery)
+touch "$WORK/down"; _poll_after "$SPOOL2" p1      # poll 5: running→failed → would be print #3 → SESSION CAP → MUTED line
 o=$(cat "$WORK/out2.txt")
 (( $(grep -c '^longjob-watch: FAILED p1 ' <<<"$o") == 1 )) && ok "persistent: running→failed printed exactly once (dedup on the repeated failed poll)" || bad "p1 failed count: $o"
 grep -q '^longjob-watch: RUNNING p1 .*transition failed → running' <<<"$o" && ok "persistent: failed→running recovery printed" || bad "p1 recovery missing: $o"
@@ -314,21 +561,99 @@ grep -q '^longjob-watch: MUTED — this session.s event cap (2) is reached' <<<"
 grep -q $'\tfailed\tmuted\t' "$SPOOL2/events.log" && ok "the suppressed event is in events.log as muted" || bad "events.log lacks muted row: $(cat "$SPOOL2/events.log")"
 [[ "$(jq -r .muted "$SPOOL2/dispatcher.json")" == 1 ]] && ok "ledger muted=1" || bad "ledger not muted"
 "$LJ" status >/dev/null 2>&1; rc=$?; (( rc == 3 )) && ok "status while muted → rc 3 (not armed-and-well)" || bad "status muted rc=$rc"
-"$LJ" unmute >/dev/null; rm -f "$WORK/down"
-# the flag is consumed at the next pass and the transition prints in it or the one after (paced): poll, bounded
-# the recovery line must appear AFTER the MUTED line (order, not just presence): wait up to 60 s under load
+# your-org/nexus-code#1790: this used to be `unmute; rm down` back to back,
+# then a fixed number of polls. The unmute flag is read at the START of a pass
+# and the subject is probed LATER in it, so when both landed inside one pass
+# (after the flag check, before the probe) the recovery was probed while still
+# muted — logged `muted`, never printed — and stored as `running`; the next
+# pass cleared the mute but saw running → running, no transition, and nothing
+# was ever printed again. The fix ORDERS the two by an EVENT: change the
+# subject only once events.log says the flag was consumed. The deadlines are
+# backstops that turn a hang into a red, never the mechanism. The "#1790
+# forced interleaving" case below shows the old order failing and this one not.
+_unmute_events() { grep -c $'\tdispatcher\tunmute\t' "$1/events.log" 2>/dev/null; }
+_unmute_seen() { (( $(_unmute_events "$1") > $2 )); }
+_n0=$(_unmute_events "$SPOOL2")
+"$LJ" unmute >/dev/null
+_wait_for 120 _unmute_seen "$SPOOL2" "$_n0" \
+    || bad "post-unmute: the dispatcher never consumed the unmute flag (backstop 120 s): flag=$([ -f "$SPOOL2/unmute.flag" ] && echo still-present || echo consumed) now=$(date -u +%s)"
+rm -f "$WORK/down"
+# the recovery line must appear AFTER the MUTED line (order, not just presence)
 _after_mute() { awk '/^longjob-watch: MUTED/{m=NR} /^longjob-watch: RUNNING p1 .*transition failed → running/{r=NR} END{exit !(m>0 && r>m)}' "$WORK/out2.txt"; }
-for i in $(seq 1 120); do _after_mute && break; sleep 0.5; done
-_after_mute && ok "after unmute the next transition is delivered again (a RUNNING line after the MUTED line)" || bad "post-unmute: out2=$(tr '\n' '|' < "$WORK/out2.txt" | cut -c1-200) events=$(cut -f1-4 "$SPOOL2/events.log" | tr '\n' '|') ledger=$(jq -c '{muted,written,note,last_poll}' "$SPOOL2/dispatcher.json") flag=$([ -f "$SPOOL2/unmute.flag" ] && echo still-present || echo consumed) now=$(date -u +%s)"
+_wait_for 120 _after_mute
+# The diagnostic leads with flag= and now=: the CI runner truncates a long
+# line, and #1790's copy lost exactly those two fields.
+_after_mute && ok "after unmute the next transition is delivered again (a RUNNING line after the MUTED line)" || bad "post-unmute: flag=$([ -f "$SPOOL2/unmute.flag" ] && echo still-present || echo consumed) now=$(date -u +%s) ledger=$(jq -c '{muted,written,note,last_poll}' "$SPOOL2/dispatcher.json") events=$(cut -f1-4 "$SPOOL2/events.log" | tail -8 | tr '\n' '|') out2=$(tr '\n' '|' < "$WORK/out2.txt" | cut -c1-200)"
 [[ -d "/proc/$D2" ]] && ok "persistent watch never retires and the dispatcher is still alive" || bad "D2 gone"
 # per-watch cap on a fresh, unmuted dispatcher
 kill "$D2"; wait "$D2" 2>/dev/null
+
+echo "=== #1790 forced interleaving: unmute + subject change inside ONE pass ==="
+# The deterministic reproduction for the post-unmute flake above. q1's probe
+# BLOCKS while $WORK/r-hold exists (after touching r-blocked), so the case can
+# act while the dispatcher is provably INSIDE a pass, past its flag check.
+# OLD order (`unmute; change subject`, both mid-pass): the change is probed
+# while still muted, logged `muted`, stored — and the pass that then clears
+# the mute sees no transition, so the line is LOST for good. NEW order (change
+# the subject only once events.log shows the flag consumed): delivered. Every
+# wait keys on an event; the backstops only turn a hang into a red.
+export NEXUS_LONGJOB_KEY="t2r"; SPOOLR="$NEXUS_STATE_DIR/longjob/t2r"
+NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_SESSION_MAX_EVENTS=1 "$LJ" dispatch > "$WORK/outr.txt" 2>/dev/null &
+DR=$!; DPIDS+=("$DR")
+_wait_for 60 test -f "$SPOOLR/dispatcher.json" || bad "#1790 rig: the dispatcher never wrote its ledger"
+# The hold is BOUNDED (80 × 0.1 s, under the 10 s probe timeout): a case that
+# dies mid-hold must not leave a probe spinning.
+"$LJ" add cmd:"if [ -e $WORK/r-hold ]; then : > $WORK/r-blocked; n=0; while [ -e $WORK/r-hold ] && [ \$n -lt 80 ]; do sleep 0.1; n=\$((n+1)); done; fi; test -e $WORK/r-down && exit 2; exit 1" \
+    --id q1 --interval 5 --persistent >/dev/null
+_q1_state() { [[ "$(jq -r .state "$SPOOLR/watches/q1.json" 2>/dev/null)" == "$1" ]]; }
+_outr_count() { grep -c "$1" "$WORK/outr.txt"; }
+_outr_has() { (( $(_outr_count "$1") >= $2 )); }
+_q1_probed_since() { (( $(jq -r .last_probe "$SPOOLR/watches/q1.json" 2>/dev/null) > $1 )); }
+_q1_hold() {   # block q1's NEXT probe and return once the dispatcher is inside it
+    rm -f "$WORK/r-blocked"; touch "$WORK/r-hold"
+    _wait_for 60 test -e "$WORK/r-blocked" || bad "#1790 rig: q1's probe never reached the hold"
+}
+_wait_for 60 _q1_state running || bad "#1790 rig: q1 never probed running"
+touch "$WORK/r-down"; _wait_for 60 _outr_has '^longjob-watch: FAILED q1 ' 1 || bad "#1790 rig: FAILED #1 never printed"
+rm -f "$WORK/r-down"; _wait_for 60 _outr_has '^longjob-watch: MUTED' 1 || bad "#1790 rig: never muted (cap 1)"
+# --- OLD order, forced: both actions land after the flag check of ONE pass.
+# (reads BEFORE the hold: the window between r-blocked and the release must
+# stay well inside the hold's 8 s bound)
+_lp=$(jq -r .last_probe "$SPOOLR/watches/q1.json"); _n0=$(_unmute_events "$SPOOLR")
+_q1_hold
+"$LJ" unmute >/dev/null; touch "$WORK/r-down"
+rm -f "$WORK/r-hold"
+_wait_for 60 _unmute_seen "$SPOOLR" "$_n0" || bad "#1790 old order: flag never consumed"
+_wait_for 60 _q1_probed_since "$_lp" || bad "#1790 old order: q1 never probed again"
+_lp=$(jq -r .last_probe "$SPOOLR/watches/q1.json")
+_wait_for 60 _q1_probed_since "$_lp"   # one more full pass, now UNMUTED
+(( $(awk '/^longjob-watch: MUTED/{m=1} m && /^longjob-watch: FAILED q1 /{n++} END{print n+0}' "$WORK/outr.txt") == 0 )) \
+    && grep -q $'\tq1\tfailed\tmuted\t' "$SPOOLR/events.log" \
+    && ok "#1790 forced: the OLD order (unmute + change in one pass) LOSES the transition — logged muted, never printed, even after the mute cleared" \
+    || bad "#1790 forced old order: the reproduction did not reproduce: out=$(tr '\n' '|' < "$WORK/outr.txt" | cut -c1-300) events=$(cut -f2-4 "$SPOOLR/events.log" | tail -6 | tr '\n' '|')"
+# Re-mute: the fresh budget (1) is spent by the next line, the one after trips the cap.
+rm -f "$WORK/r-down"; _wait_for 60 _outr_has '^longjob-watch: RUNNING q1 ' 1 || bad "#1790 rig: RUNNING after the unmute never printed"
+touch "$WORK/r-down"; _wait_for 60 _outr_has '^longjob-watch: MUTED' 2 || bad "#1790 rig: never re-muted"
+# --- NEW order, under the SAME forced block: the change waits for the event.
+_n0=$(_unmute_events "$SPOOLR")
+_q1_hold
+"$LJ" unmute >/dev/null
+rm -f "$WORK/r-hold"
+_wait_for 60 _unmute_seen "$SPOOLR" "$_n0" || bad "#1790 new order: flag never consumed"
+rm -f "$WORK/r-down"
+_running_after_last_mute() { awk '/^longjob-watch: MUTED/{m=NR} /^longjob-watch: RUNNING q1 .*transition failed → running/{r=NR} END{exit !(m>0 && r>m)}' "$WORK/outr.txt"; }
+_wait_for 60 _running_after_last_mute
+_running_after_last_mute \
+    && ok "#1790 forced: the NEW order (change the subject only after the unmute event) delivers the transition under the same forced block" \
+    || bad "#1790 forced new order: flag=$([ -f "$SPOOLR/unmute.flag" ] && echo still-present || echo consumed) now=$(date -u +%s) events=$(cut -f2-4 "$SPOOLR/events.log" | tail -6 | tr '\n' '|') out=$(tr '\n' '|' < "$WORK/outr.txt" | cut -c1-300)"
+kill "$DR"; wait "$DR" 2>/dev/null; rm -f "$WORK/r-hold" "$WORK/r-down" "$WORK/r-blocked"
 export NEXUS_LONGJOB_KEY="t3"; SPOOL3="$NEXUS_STATE_DIR/longjob/t3"
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out3.txt" 2>/dev/null &
-D3=$!; DPIDS+=("$D3"); sleep 2
+D3=$!; DPIDS+=("$D3"); _wait_for 30 _armed "$SPOOL3" "$D3" || bad "t3 rig: the dispatcher never armed"
 rm -f "$WORK/down"
 "$LJ" add cmd:"test -e $WORK/down && exit 2; exit 1" --id c1 --interval 5 --persistent --max-events 1 >/dev/null
-sleep 7; touch "$WORK/down"; sleep 9; rm -f "$WORK/down"; sleep 9
+_poll_after "$SPOOL3" c1; touch "$WORK/down"; _poll_after "$SPOOL3" c1; rm -f "$WORK/down"
+_wait_for 90 _retired_settled "$SPOOL3" c1   # the second transition trips the cap and retires c1
 o=$(cat "$WORK/out3.txt")
 (( $(grep -c '^longjob-watch: ' <<<"$o") == 1 )) && ok "per-watch cap 1: the first transition printed, the second suppressed" || bad "watch cap: $o"
 [[ "$(jq -r .retired_reason "$SPOOL3/watches/c1.json")" == event-cap ]] && ok "watch retired with reason event-cap" || bad "cap retire reason: $(jq -c . "$SPOOL3/watches/c1.json")"
@@ -339,7 +664,7 @@ export NEXUS_LONGJOB_KEY="t7"; SPOOL7="$NEXUS_STATE_DIR/longjob/t7"
 "$LJ" add cmd:'exit 0' --id auto-slurm-1 --interval 5 --no-declare >/dev/null 2>&1   # sorts FIRST alphabetically
 "$LJ" add cmd:'exit 0' --id zz-mine --interval 5 >/dev/null 2>&1                    # the agent's own, sorts LAST
 NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_SESSION_MAX_EVENTS=1 "$LJ" dispatch > "$WORK/out7.txt" 2>/dev/null &
-D7=$!; DPIDS+=("$D7"); sleep 9
+D7=$!; DPIDS+=("$D7"); _wait_for 60 _retired_settled "$SPOOL7" auto-slurm-1 zz-mine
 grep -q '^longjob-watch: DONE zz-mine ' "$WORK/out7.txt" && ! grep -q '^longjob-watch: DONE auto-slurm-1 ' "$WORK/out7.txt" && ok "F7: with a budget of 1 the agent's watch got the line and the auto-* one was muted" || bad "F7: $(cat "$WORK/out7.txt")"
 kill "$D7"; wait "$D7" 2>/dev/null
 echo "=== F6: a fatal error inside a poll pass does not kill the dispatcher ==="
@@ -347,12 +672,12 @@ export NEXUS_LONGJOB_KEY="t8"; SPOOL8="$NEXUS_STATE_DIR/longjob/t8"; mkdir -p "$
 # a spec with a NON-NUMERIC interval (valid JSON, id matches the file) — the shape the skeptic measured killing the dispatcher on its first poll
 jq -n '{id:"bad1", kind:"cmd", target:"exit 1", desc:"", session_key:"t8", added_at:0, interval:"abc", ttl:604800, notify:"terminal", persistent:false, max_events:8, unknown_max:5, when:"", pattern:"", size0:0, state:"pending", detail:"", last_probe:0, unknown_streak:0, events:0, retired:false, retired_reason:"", retired_at:0}' > "$SPOOL8/watches/bad1.json"
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out8.txt" 2>/dev/null &
-D8=$!; DPIDS+=("$D8"); sleep 8
+D8=$!; DPIDS+=("$D8"); _wait_for 60 _settled "$SPOOL8" bad1 0   # bad1 probed (last_probe was 0) and that pass ENDED
 [[ -d "/proc/$D8" ]] && ok "F6: dispatcher alive after polling a spec with interval=\"abc\"" || bad "F6: dispatcher died on a non-numeric field"
 grep -q $'\tcorrupt\t' "$SPOOL8/events.log" && ok "F6: the bad field is logged as corrupt and defaulted" || bad "F6 no corrupt row: $(cat "$SPOOL8/events.log")"
 [[ "$(jq -r .note "$SPOOL8/dispatcher.json")" == ok ]] && ok "F6: the pass completed (ledger note ok) — validation, not the subshell, handled it" || bad "F6 note: $(jq -r .note "$SPOOL8/dispatcher.json")"
 # the subshell isolation itself, with a POTENCY control: a pass that dies fatally leaves the loop alive
-"$LJ" add cmd:'exit 0' --id ok1 --interval 5 >/dev/null 2>&1; sleep 7
+"$LJ" add cmd:'exit 0' --id ok1 --interval 5 >/dev/null 2>&1; _wait_for 60 grep -q '^longjob-watch: DONE ok1 ' "$WORK/out8.txt"
 grep -q '^longjob-watch: DONE ok1 ' "$WORK/out8.txt" && ok "F6: a later, healthy watch is still served" || bad "F6: ok1 not served"
 kill "$D8"; wait "$D8" 2>/dev/null
 kill "$D3"; wait "$D3" 2>/dev/null
@@ -360,9 +685,10 @@ kill "$D3"; wait "$D3" 2>/dev/null
 echo "=== the emit path records its own failure (stdout closed) ==="
 export NEXUS_LONGJOB_KEY="t4"; SPOOL4="$NEXUS_STATE_DIR/longjob/t4"
 NEXUS_ROOT="$FROOT" "$LJ" dispatch >&- 2>/dev/null &
-D4=$!; DPIDS+=("$D4"); sleep 2
+D4=$!; DPIDS+=("$D4"); _wait_for 30 _armed "$SPOOL4" "$D4" || bad "t4 rig: the dispatcher never armed"
 "$LJ" add cmd:'exit 0' --id e1 --interval 5 >/dev/null 2>&1
-sleep 8
+_ef_ge1() { local n; n=$(jq -r '.emit_failures // 0' "$1/dispatcher.json" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )); }
+_wait_for 60 _ef_ge1 "$SPOOL4"   # the failed write is counted in the ledger AFTER the write; a dead dispatcher never gets here
 [[ -d "/proc/$D4" ]] && ok "a CLOSED stdout does not kill the dispatcher (SIGPIPE ignored, printf rc read)" || bad "dispatcher died on closed stdout"
 [[ "$(jq -r .emit_failures "$SPOOL4/dispatcher.json")" -ge 1 ]] && ok "ledger emit_failures ≥ 1" || bad "emit_failures: $(cat "$SPOOL4/dispatcher.json")"
 grep -q 'EMIT-FAILED' "$SPOOL4/emit-failures.log" && ok "emit-failures.log names the undelivered line" || bad "emit-failures.log: $(cat "$SPOOL4/emit-failures.log" 2>&1)"
@@ -381,7 +707,7 @@ D4P=$!; DPIDS+=("$D4P")
 sleep 1 < "$WORK/pipe4"          # a reader opens the pipe for one second, then leaves
 sleep 1
 "$LJ" add cmd:'exit 0' --id p1 --interval 5 >/dev/null 2>&1
-sleep 8
+_wait_for 60 _ef_ge1 "$SPOOL4P"
 [[ -d "/proc/$D4P" ]] && ok "an emit into a pipe with NO reader does not kill the dispatcher (trap '' PIPE)" || bad "dispatcher died of SIGPIPE (rc would be 141)"
 [[ "$(jq -r .emit_failures "$SPOOL4P/dispatcher.json" 2>/dev/null)" -ge 1 ]] && ok "…and the EPIPE write is counted as an emit failure" || bad "emit_failures after SIGPIPE: $(cat "$SPOOL4P/dispatcher.json" 2>&1)"
 kill "$D4P" 2>/dev/null; wait "$D4P" 2>/dev/null
@@ -412,27 +738,7 @@ export NEXUS_LONGJOB_KEY="t5"
 # retirement removes the wait: run a dispatcher on t5 and let b2 retire
 NEXUS_ROOT="$FROOT" "$LJ" dispatch >/dev/null 2>&1 &
 D5=$!; DPIDS+=("$D5")
-# A fixed `sleep 7` here and below raced a 5 s poll cadence under load:
-# `--jobs 6` band, Slurm 8478569, 1 red in 3 — `FAIL: F3 unknown` with b4 not
-# yet retired (your-org/nexus-code#1317). Poll instead, until every named
-# watch carries a retired_reason AND the dispatcher has finished the pass that
-# retired it — its end-of-pass ledger write (note exactly "ok", last_poll ≥
-# the latest retired_at). The second half matters: the wait side of a
-# retirement (_resolve_waits) runs AFTER _retire in the same pass, so stopping
-# at the retired_reason alone would read the waits mid-pass and a mutant that
-# wrongly undeclared a non-terminal wait could slip past. Bound 60 s (CHOSEN,
-# as the post-unmute poll above); on timeout it falls through and the
-# assertions below go red on their own evidence — a timeout never passes.
-_retired_settled() {   # <spool> <id>…
-    local sp="$1" id ra lp note maxra=0; shift
-    for id in "$@"; do
-        ra=$(jq -r 'if (.retired_reason // "") != "" then (.retired_at // 0) else empty end' "$sp/watches/$id.json" 2>/dev/null)
-        [[ "$ra" =~ ^[0-9]+$ ]] || return 1
-        (( ra > maxra )) && maxra=$ra
-    done
-    note=$(jq -r '.note // ""' "$sp/dispatcher.json" 2>/dev/null); lp=$(jq -r '.last_poll // 0' "$sp/dispatcher.json" 2>/dev/null)
-    [[ "$note" == ok && "$lp" =~ ^[0-9]+$ ]] && (( lp >= maxra ))
-}
+# (the wait helper _retired_settled is defined at the top, #1317)
 for i in $(seq 1 120); do _retired_settled "$SPOOL5" b2 && break; sleep 0.5; done
 [[ -z "$(jq -r '.external_waits[] | select(.id=="b2") | .id' "$HB")" ]] && ok "retiring b2 removed its external wait" || bad "wait b2 still declared: $(cat "$HB")"
 [[ "$(jq -r '.external_waits[] | select(.id=="b1") | .id' "$HB")" == b1 ]] && ok "the still-running b1 wait is still declared" || bad "b1 wait gone"
@@ -497,13 +803,13 @@ export NEXUS_LONGJOB_KEY="t9"; SPOOL9="$NEXUS_STATE_DIR/longjob/t9"
 for k in $(seq 1 8); do "$LJ" add "file:$WORK/b$k" --id "b$k" --interval 5 >/dev/null 2>&1; touch "$WORK/b$k"; done
 NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_EMIT_MIN_GAP_MS=2500 "$LJ" dispatch > "$WORK/out9.txt" 2>/dev/null &
 D9=$!; DPIDS+=("$D9")
-sleep 12                                   # 8 terminal events × 2.5 s pacing = a ~20 s pass; we are in the middle of it
+_wait_for 30 _lines_ge "$WORK/out9.txt" 2   # 8 terminal events × 2.5 s pacing = a ~20 s pass; 2 lines in, we are in the middle of it
 o9=$(wc -l < "$WORK/out9.txt"); (( o9 >= 2 && o9 <= 7 )) && ok "D1 rig: mid-burst ($o9 of 8 lines written so far) — the pass is genuinely in progress" || bad "D1 rig: $o9 lines at t=12 s (expected 2..7)"
 st=$("$LJ" status 2>&1); [[ "$st" == *"dispatcher=armed"* ]] && ok "D1: ledger-verdict reads ARMED mid-burst (last_poll touched before each paced wait)" || bad "D1: $st"
-lp1=$(jq -r .last_poll "$SPOOL9/dispatcher.json"); sleep 5; lp2=$(jq -r .last_poll "$SPOOL9/dispatcher.json")
+lp1=$(jq -r .last_poll "$SPOOL9/dispatcher.json"); _wait_for 5 _lp_gt "$SPOOL9" "$lp1"; lp2=$(jq -r .last_poll "$SPOOL9/dispatcher.json")   # same 5 s bound as before, ends early
 (( lp2 > lp1 )) && ok "D1 relation guard: last_poll ADVANCED during the burst ($lp1 → $lp2) — the writer keeps its contract inside a pass, not only between passes" || bad "D1: last_poll did not advance ($lp1 → $lp2)"
 out=$("$LJ" add cmd:'exit 1' --id b-late --interval 5 2>&1); rc=$?; (( rc == 0 )) && [[ "$out" == *"dispatcher: ARMED"* ]] && ok "D1: a fresh add mid-burst is told ARMED, rc 0" || bad "D1 add mid-burst: rc=$rc $out"
-sleep 16
+_wait_for 60 _lines_ge "$WORK/out9.txt" 8 '^longjob-watch: DONE b'
 (( $(grep -c '^longjob-watch: DONE b' "$WORK/out9.txt") == 8 )) && ok "D1: all 8 lines written after the burst" || bad "D1: $(grep -c '^longjob-watch: DONE b' "$WORK/out9.txt") of 8"
 kill "$D9"; wait "$D9" 2>/dev/null
 
@@ -526,7 +832,7 @@ kill "$D13"; wait "$D13" 2>/dev/null
 echo "=== R1 relation guard: a probe timeout past the freshness window is refused at start ==="
 export NEXUS_LONGJOB_KEY="t14"; SPOOL14="$NEXUS_STATE_DIR/longjob/t14"
 NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS=100 "$LJ" dispatch > /dev/null 2> "$WORK/err14.txt" &
-D14=$!; DPIDS+=("$D14"); sleep 3
+D14=$!; DPIDS+=("$D14"); _wait_for 30 _svc_is "$SPOOL14" disabled
 [[ -d "/proc/$D14" ]] && [[ "$(jq -r .service "$SPOOL14/dispatcher.json")" == disabled ]] && grep -q 'probe_timeout_seconds (100) exceeds' "$WORK/err14.txt" && ok "R1 guard: probe_timeout 100 s vs poll 5 s → alive, service=disabled, said on stderr (never exits, never claims armed)" || bad "R1 guard: alive=$([ -d /proc/$D14 ] && echo y || echo n) $(cat "$SPOOL14/dispatcher.json" 2>&1 | cut -c1-120) $(cat "$WORK/err14.txt")"
 kill "$D14"; wait "$D14" 2>/dev/null
 
@@ -545,7 +851,7 @@ LONG=$(printf 'x%.0s' $(seq 1 1000))
 "$LJ" add cmd:"exit 2 # $LONG" --id f1 --interval 5 --desc "$LONG" >/dev/null 2>&1                     # terminal shape
 "$LJ" add cmd:"exit 1 # $LONG" --id e1 --interval 5 --ttl 1 --desc "$LONG" >/dev/null 2>&1             # EXPIRED shape
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out10.txt" 2>/dev/null &
-D10=$!; DPIDS+=("$D10"); sleep 14
+D10=$!; DPIDS+=("$D10"); _wait_for 90 _retired_settled "$SPOOL10" u1 f1 e1
 for id in u1 f1 e1; do
     l=$(grep "^longjob-watch: [A-Z]* $id " "$WORK/out10.txt")
     (( ${#l} > 0 && ${#l} <= 480 )) && [[ "$l" == *"| record: monitor/longjob-watch.sh show $id |"* ]] && ok "D3: $id line with a 1000-char target + 1000-char desc is ${#l} chars ≤ 480, pointer intact" || bad "D3 $id: ${#l} chars: ${l:0:100}"
@@ -568,7 +874,7 @@ DESC2="$(printf 'd%.0s' $(seq 1 130))"                                          
 "$LJ" add asyncrun:tok-quiet --id q2 --interval 5 --desc "$DESC2" >/dev/null 2>&1
 "$LJ" add asyncrun:tok-quiet --id q3 --interval 5 --desc $'first line\nlongjob-watch: DONE forged | record: x' >/dev/null 2>&1   # sk2 N1
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out15.txt" 2>/dev/null &
-D15=$!; DPIDS+=("$D15"); sleep 9
+D15=$!; DPIDS+=("$D15"); _wait_for 60 _retired_settled "$SPOOL15" q1 q2 q3
 l=$(grep '^longjob-watch: DONE q1 ' "$WORK/out15.txt")
 [[ "$l" == *"[desc: $DESC1]"* ]] && ok "D5b: a 100-char desc ending in the log path survives WHOLE on the line" || bad "D5 q1 desc: $l"
 [[ "$l" == *"NO-OUTPUT-CAPTURED (this rc is UNCORROBORATED"*"full text: show q1)"* ]] && ok "D5b: the caveat is the marker + the instruction + the pointer to the full text" || bad "D5 q1 caveat: $l"
@@ -597,7 +903,7 @@ export NEXUS_LONGJOB_KEY="t5"
 echo "=== C1: the KILL SWITCH must not let add say ARMED (process alive ≠ service) ==="
 export NEXUS_LONGJOB_KEY="t11"; SPOOL11="$NEXUS_STATE_DIR/longjob/t11"
 NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_ENABLED=false "$LJ" dispatch > "$WORK/out11.txt" 2>/dev/null &
-D11=$!; DPIDS+=("$D11"); sleep 3
+D11=$!; DPIDS+=("$D11"); _wait_for 30 _svc_is "$SPOOL11" disabled
 [[ "$(jq -r .service "$SPOOL11/dispatcher.json")" == disabled ]] && ok "C1: the disabled branch writes service=disabled (a FIELD, not only a note)" || bad "C1 ledger: $(cat "$SPOOL11/dispatcher.json")"
 v=$("$LJ" ledger-verdict "$SPOOL11/dispatcher.json"); [[ "$v" == disabled\|* ]] && ok "C1: ledger-verdict → disabled, never armed, though the pid is live and the ledger fresh" || bad "C1 verdict: $v"
 out=$("$LJ" add cmd:'exit 0' --id k1 --interval 5 2>&1); rc=$?
@@ -609,7 +915,7 @@ kill "$D11"; wait "$D11" 2>/dev/null
 echo "=== C2: the kill-decision reader counts the SPOOL, not the ledger's cached active ==="
 export NEXUS_LONGJOB_KEY="t12"; SPOOL12="$NEXUS_STATE_DIR/longjob/t12"
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out12.txt" 2>/dev/null &
-D12=$!; DPIDS+=("$D12"); sleep 3
+D12=$!; DPIDS+=("$D12"); _wait_for 30 _armed "$SPOOL12" "$D12"
 [[ "$(jq -r .active "$SPOOL12/dispatcher.json")" == 0 ]] && ok "C2 rig: ledger says active=0 before any add" || bad "C2 rig"
 "$LJ" add cmd:'exit 1' --id c2 --interval 600 >/dev/null 2>&1        # a long job; the ledger's active stays 0 until the next completed pass
 v=$("$LJ" ledger-verdict "$SPOOL12/dispatcher.json"); [[ "$v" == armed\|*"|active=1" ]] && ok "C2: ledger-verdict counts active=1 from the spool immediately after add (ledger field still $(jq -r .active "$SPOOL12/dispatcher.json"))" || bad "C2: $v (ledger active=$(jq -r .active "$SPOOL12/dispatcher.json"))"
@@ -716,7 +1022,7 @@ for _i in $(seq 1 80); do [[ "$(jq -r '.service // empty' "$SPA/dispatcher.json"
 DA=$(_lj_pid_of "$SPA"); DPIDS+=("$DA")
 [[ "$(jq -r .owner_pid "$SPA/dispatcher.json" 2>/dev/null)" == "$C1" && "$(jq -r .owner_start "$SPA/dispatcher.json" 2>/dev/null)" == "$(awk '{print $22}' /proc/$C1/stat)" ]] \
     && ok "#1623a the ledger records the owner as pid + start ticks" || bad "#1623a the ledger records the owner as pid + start ticks: $(jq -c . "$SPA/dispatcher.json" 2>&1)"
-sleep 6
+_passes_since "$SPA" 1 $(( $(date +%s) + 1 )) "$DA"   # a full poll loop (owner check included) after now
 [[ -n "$DA" && -d "/proc/$DA" ]] && ok "#1623a control: with its owner alive the dispatcher stays up across a poll" || bad "#1623a control: with its owner alive the dispatcher stays up across a poll"
 kill -9 "$C1"; wait "$C1" 2>/dev/null
 _lj_wait_gone "$DA" 60 && ok "#1623a orphaned dispatcher EXITS once its claude is gone (≤ one poll)" || bad "#1623a orphaned dispatcher EXITS once its claude is gone (≤ one poll): still polling, pid $DA ppid $(awk '{print $4}' /proc/$DA/stat 2>/dev/null)"
@@ -770,7 +1076,7 @@ sleep 1                           # …so the watch is added only once nobody re
 "$LJ" add cmd:'exit 0' --id lost1 --interval 5 --no-first-probe >/dev/null 2>&1
 for _i in $(seq 1 80); do grep -q $'\tlost1\tdone\twrite-failed\t' "$SPD/events.log" 2>/dev/null && break; sleep 0.25; done
 grep -q $'\tlost1\tdone\twrite-failed\t' "$SPD/events.log" && ok "#1623d rig: the terminal line's write FAILED (events: write-failed)" || bad "#1623d rig: the terminal line's write FAILED (events: write-failed): $(cat "$SPD/events.log" 2>&1)"
-sleep 1
+_wait_for 10 _svc_is "$SPD" stdout-closed   # written AFTER the restore
 [[ "$(jq -r '.retired' "$SPD/watches/lost1.json")" == false ]] && ok "#1623d the watch is UN-RETIRED after the failed write (not lost)" || bad "#1623d the watch is UN-RETIRED after the failed write (not lost): $(jq -c '{retired,retired_reason,state}' "$SPD/watches/lost1.json")"
 _wait23 && ok "#1623d its wait is still declared (never resolved for an undelivered result)" || bad "#1623d its wait is still declared (never resolved for an undelivered result): $(jq -c .external_waits "$HB23")"
 [[ "$(jq -r .service "$SPD/dispatcher.json")" == stdout-closed ]] && [[ "$("$LJ" ledger-verdict "$SPD/dispatcher.json")" != armed* ]] && ok "#1623d the deaf dispatcher released the spool: service=stdout-closed, verdict not armed" || bad "#1623d the deaf dispatcher released the spool: service=stdout-closed, verdict not armed: $(jq -c '{service,note}' "$SPD/dispatcher.json") verdict=$("$LJ" ledger-verdict "$SPD/dispatcher.json")"
@@ -779,7 +1085,8 @@ sleep 12
 NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out23d.txt" 2> "$WORK/err23d.txt" &
 DL=$!; DPIDS+=("$DL")
 _lj_wait_pid "$SPD" "$DL" 32 && ! grep -q 'REFUSING' "$WORK/err23d.txt" && ok "#1623d the live dispatcher ARMS at once beside the released one" || bad "#1623d the live dispatcher ARMS at once beside the released one: $(jq -c '{pid,service}' "$SPD/dispatcher.json") err=$(cat "$WORK/err23d.txt")"
-for _i in $(seq 1 60); do grep -q '^longjob-watch: DONE lost1 ' "$WORK/out23d.txt" && break; sleep 0.25; done; sleep 3
+for _i in $(seq 1 60); do grep -q '^longjob-watch: DONE lost1 ' "$WORK/out23d.txt" && break; sleep 0.25; done
+_wait_for 30 _retired_settled "$SPD" lost1   # the pass that printed it has ENDED (its wait is resolved in that pass)
 (( $(grep -c '^longjob-watch: DONE lost1 ' "$WORK/out23d.txt") == 1 )) && ! grep -q 'gone1' "$WORK/out23d.txt" && ok "#1623d the live dispatcher delivers the restored line exactly ONCE, and nothing already delivered" || bad "#1623d the live dispatcher delivers the restored line exactly ONCE, and nothing already delivered: $(cat "$WORK/out23d.txt")"
 ! _wait23 && [[ "$(jq -r .retired_reason "$SPD/watches/lost1.json")" == terminal ]] && ok "#1623d …then the wait resolves and the watch retires terminal" || bad "#1623d …then the wait resolves and the watch retires terminal: waits=$(jq -c .external_waits "$HB23") spec=$(jq -c '{retired,retired_reason}' "$SPD/watches/lost1.json")"
 _lj_kill_tree "$DD"; _lj_kill_tree "$DL"; wait "$DD" "$DL" 2>/dev/null
@@ -820,10 +1127,55 @@ grep -q '^longjob-watch: DONE w1 ' "$WORK/out23e.txt" && ok "#1623e rig: the new
 : > "$REL23"
 for _i in $(seq 1 60); do grep -q $'\tw1\tdone\twrite-failed\t' "$SPE/events.log" 2>/dev/null && break; sleep 0.25; done
 grep -q $'\tw1\tdone\twrite-failed\t' "$SPE/events.log" && ok "#1623e rig: the older dispatcher's write of w1 FAILED" || bad "#1623e rig: the older dispatcher's write of w1 FAILED: $(cut -f2-5 "$SPE/events.log" | tr '\n' '|')"
-sleep 12                            # two of B's polls: a restored-un-retired w1 would be probed (done at once) and printed again
+# two of B's pass ENDS after A's failed write: the second pass began ≥ 5 s after
+# the first ended, so it read w1 after A's restore; a restored-un-retired w1
+# would be probed there (done at once) and printed again.
+_passes_since "$SPE" 2 $(( $(date +%s) + 1 )) "$DEB" || bad "#1623e rig: B did not complete two passes after A's failed write"
 (( $(grep -c '^longjob-watch: DONE w1 ' "$WORK/out23e.txt") == 1 )) && ok "#1623e w1 is delivered exactly ONCE — the failed writer does not un-retire what another dispatcher delivered" || bad "#1623e w1 is delivered exactly ONCE — the failed writer does not un-retire what another dispatcher delivered: $(cat "$WORK/out23e.txt")"
 [[ "$(jq -r '.retired' "$SPE/watches/w1.json")" == true ]] && ok "#1623e w1 stays retired" || bad "#1623e w1 stays retired: $(jq -c '{retired,retired_reason,state}' "$SPE/watches/w1.json")"
 _lj_kill_tree "$CA"; _lj_kill_tree "$CB"; wait "$CA" "$CB" 2>/dev/null
+export NEXUS_LONGJOB_KEY="t1"
+
+echo "=== #1728: a chaperon error backs slurm probes off, bounded, and does not park ==="
+# Two slurm watches with unknown_max 2 against a chaperon that answers every
+# sacct with its jam error. Without the backoff each pass probes BOTH (one
+# sacct each), and after two passes both PARK and EMIT UNKNOWN — the wake that
+# sends agents to poll by hand into the same jam.
+export NEXUS_LONGJOB_KEY="tbo"; SPOOLBO="$NEXUS_STATE_DIR/longjob/tbo"
+export LJ_SACCT_FAIL="$WORK/sacct.fail"; touch "$LJ_SACCT_FAIL"; : > "$LJ_SACCT_CALLS"
+"$LJ" add slurm:1234567 --id bo1 --interval 5 --unknown-max 2 --no-first-probe >/dev/null 2>&1
+"$LJ" add slurm:1234568 --id bo2 --interval 5 --unknown-max 2 --no-first-probe >/dev/null 2>&1
+NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_SLURM_BACKOFF_BASE_SECONDS=30 MONITOR_LONGJOB_SLURM_BACKOFF_LIMIT_SECONDS=600 \
+    "$LJ" dispatch > "$WORK/outbo.txt" 2>/dev/null &
+DBO=$!; DPIDS+=("$DBO"); sleep 16                                   # ≥ 3 passes at poll 5 s
+n_calls=$(grep -c . "$LJ_SACCT_CALLS")
+(( n_calls == 1 )) && ok "#1728: ONE sacct in 16 s for two due watches — the failure stops the pass and the next ones back off" \
+    || bad "#1728: $n_calls sacct calls (want 1): $(tr '\n' ';' < "$LJ_SACCT_CALLS")"
+! grep -q 'UNKNOWN' "$WORK/outbo.txt" && ok "#1728: no watch PARKED/EMITTED UNKNOWN while backing off (unknown_max 2 would have tripped)" \
+    || bad "#1728: emitted during backoff: $(cat "$WORK/outbo.txt")"
+grep -q $'\tdeferred\tnot-printed\t.*chaperon' "$SPOOLBO/events.log" && ok "#1728: the deferral is logged, naming the chaperon error" \
+    || bad "#1728: no deferred event: $(cut -f2-5 "$SPOOLBO/events.log" | tr '\n' '|')"
+kill "$DBO"; wait "$DBO" 2>/dev/null
+# BOUNDED: past the limit (since ≈ 16 s ago, limit 6 s) the unknowns count
+# again, at the normal interval, and the watches park and EMIT.
+NEXUS_ROOT="$FROOT" MONITOR_LONGJOB_SLURM_BACKOFF_BASE_SECONDS=3 MONITOR_LONGJOB_SLURM_BACKOFF_LIMIT_SECONDS=6 \
+    "$LJ" dispatch > "$WORK/outbo2.txt" 2>/dev/null &
+DBO=$!; DPIDS+=("$DBO")
+for _i in $(seq 1 100); do grep -q '^longjob-watch: UNKNOWN bo1 ' "$WORK/outbo2.txt" 2>/dev/null && break; sleep 0.3; done
+grep -q '^longjob-watch: UNKNOWN bo1 .*backoff exhausted' "$WORK/outbo2.txt" && ok "#1728: past the backoff limit the watch PARKS and EMITS UNKNOWN, saying the backoff was exhausted" \
+    || bad "#1728 limit: $(cat "$WORK/outbo2.txt") events=$(cut -f2-5 "$SPOOLBO/events.log" | tail -4 | tr '\n' '|')"
+kill "$DBO"; wait "$DBO" 2>/dev/null
+# RECOVERY: the chaperon answers again; a slurm probe succeeds and clears the state.
+rm -f "$LJ_SACCT_FAIL"; printf 'COMPLETED|0:0\n' > "$LJ_SACCT_FILE"
+"$LJ" add slurm:1234569 --id bo3 --interval 5 --no-first-probe >/dev/null 2>&1
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/outbo3.txt" 2>/dev/null &
+DBO=$!; DPIDS+=("$DBO")
+for _i in $(seq 1 60); do grep -q '^longjob-watch: DONE bo3 ' "$WORK/outbo3.txt" 2>/dev/null && break; sleep 0.3; done
+grep -q '^longjob-watch: DONE bo3 ' "$WORK/outbo3.txt" && [[ ! -e "$SPOOLBO/slurm-backoff" ]] \
+    && ok "#1728: once Slurm answers, the watch delivers DONE and the backoff state is cleared" \
+    || bad "#1728 recovery: out=$(cat "$WORK/outbo3.txt") state=$(cat "$SPOOLBO/slurm-backoff" 2>&1)"
+kill "$DBO"; wait "$DBO" 2>/dev/null
+unset LJ_SACCT_FAIL; : > "$LJ_SACCT_FILE"
 export NEXUS_LONGJOB_KEY="t1"
 
 echo "=== usage refusals ==="

@@ -1566,6 +1566,96 @@ _run_lost lost-always; rc=$?
 assert_eq "#1715-lost BOUND exit 4 — UNDELIVERED once the attempts are spent" "$rc" "4"
 assert_eq "#1715-lost BOUND exactly THREE pastes (FRESH_SPAWN_REPASTE_ATTEMPTS default)" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "3"
 
+# --- Test 1754: the pane says "no turn ran", the TRANSCRIPT says submitted ---
+# your-org/nexus-code#1754: under load the verify read `idle input=blank` for
+# its whole window after a paste that WAS submitted, judged "no turn ran" from
+# the pane alone, and re-pasted — the orchestrator got its brief twice. The
+# session transcript is now consulted before any re-paste or UNDELIVERED.
+# Every arm here is the BOUND arm's pane (every paste reads lost, forever); only
+# what the transcript records on the first Enter differs. The hook writes the
+# record the way Claude Code does: the pasted bytes wrapped in pasted_content
+# tags (measured on a live orchestrator transcript, 2026-10-07).
+# Predicted at base (88848942): the `submitted` arm reds on rc (4, want 0), the
+# paste count (3, want 1) and the log line; the three controls stay green.
+WIT_JSONL="$PROJ_DIR/$PIN_SID.jsonl"
+cat > "$WORK/stub-enter-hook" <<'HOOK'
+#!/bin/bash
+# The paths come from the environment _run_wit exports (the stub passes none).
+w="$WIT_WORK"; mode=$(cat "$w/witness-mode" 2>/dev/null) || exit 0
+[[ -f "$w/witness-written" ]] && exit 0
+: > "$w/witness-written"
+case "$mode" in
+    submitted) ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); src="$w/stub-loaded" ;;
+    other)     ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); src="$w/witness-other" ;;
+    stale)     ts="2020-01-01T00:00:00.000Z";          src="$w/stub-loaded" ;;
+    *) exit 0 ;;
+esac
+jq -c -Rs --arg ts "$ts" '{type: "user", promptSource: "typed", timestamp: $ts,
+    message: {role: "user", content: ("\n\n<pasted_content id=\"t1\">\n" + . + "\n</pasted_content id=\"t1\">\n")}}' \
+    < "$src" >> "$WIT_JSONL"
+HOOK
+chmod +x "$WORK/stub-enter-hook"
+printf 'a synthetic operator message that is not the recovery brief\n' > "$WORK/witness-other"
+_run_wit() {   # <label> <mode> — the BOUND pane, plus a transcript record per <mode>
+    : > "$WIT_JSONL"; rm -f "$WORK/witness-written"
+    printf '%s\n' "$2" > "$WORK/witness-mode"
+    printf '%s\n' "$PIN_SID" > "$PIN_FILE"
+    printf '99\n' > "$WORK/pane-state-lost"
+    # The transcript record is written by a WATCHER outside the tmux stub, on
+    # the Enter the stub already stamps into stub-enter-at. The stub must stay
+    # a PROVEN mock for test-tmux-shim-gate3-safety.sh (an external hook called
+    # from its body is default-deny there, and :933 derives a stub from it).
+    # Bounded at 60 s, and killed once the run returns.
+    rm -f "$WORK/stub-enter-at"
+    ( export WIT_WORK="$WORK" WIT_JSONL
+      for _i in $(seq 1 600); do
+          [[ -s "$WORK/stub-enter-at" ]] && { "$WORK/stub-enter-hook"; break; }
+          sleep 0.1
+      done ) &
+    local _wpid=$! _rc
+    # Hermetic roots: only $HOME/.claude/projects (the fixture's) may answer.
+    ( export WIT_WORK="$WORK" WIT_JSONL; unset CLAUDE_CONFIG_DIR NEXUS_CC_HOME; _run_lost "$1" ); _rc=$?
+    kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null
+    return "$_rc"
+}
+if ! command -v jq >/dev/null 2>&1; then
+    pass "#1754 SKIPPED: jq is absent, so neither the witness nor this fixture can run"
+else
+echo '=== #1754: the transcript records the brief after the paste → delivered, NOT re-pasted ==='
+_run_wit wit-submitted submitted; rc=$?
+_wl=$(cat "$WORK/stderr-1715-wit-submitted.log")
+assert_contains "#1754 this run IS a resume of the pinned session (or the witness has no transcript to read)" "$_wl" "mode=resume sid=$PIN_SID"
+assert_eq "#1754 exit 0 — the brief WAS submitted, whatever the pane read" "$rc" "0"
+assert_eq "#1754 exactly ONE paste — no duplicate brief" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "1"
+assert_eq "#1754 exactly ONE Enter — the paste's own; nothing re-sent" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "1"
+assert_eq "#1754 exactly ONE submission in the transcript" "$(grep -c . "$WIT_JSONL")" "1"
+assert_contains "#1754 the log names the witness as the reason" "$_wl" "the session transcript RECORDS the brief as submitted since the paste"
+
+echo '=== #1754 CONTROL: the transcript records OTHER text after the paste → still re-pasted ==='
+_run_wit wit-other other; rc=$?
+_wl=$(cat "$WORK/stderr-1715-wit-other.log")
+assert_eq "#1754 CONTROL other: exit 4 — unrelated text is not the brief" "$rc" "4"
+assert_eq "#1754 CONTROL other: THREE pastes, exactly as without the witness" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "3"
+assert_contains "#1754 CONTROL other: the witness answered no" "$_wl" "submit witness (session transcript): no"
+
+echo '=== #1754 CONTROL: the brief is in the transcript but stamped BEFORE the paste → still re-pasted ==='
+_run_wit wit-stale stale; rc=$?
+assert_eq "#1754 CONTROL stale: exit 4 — a record older than the paste does not answer for it" "$rc" "4"
+assert_eq "#1754 CONTROL stale: THREE pastes" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "3"
+
+echo '=== #1754 CONTROL: no transcript to read → today'"'"'s behaviour, and the log says the witness was unavailable ==='
+mv "$WIT_JSONL" "$WORK/wit-jsonl-away"
+WIT_JSONL="$WORK/wit-unread.jsonl" _run_wit wit-unknown submitted; rc=$?
+mv "$WORK/wit-jsonl-away" "$PROJ_DIR/$PIN_SID.jsonl"
+_wl=$(cat "$WORK/stderr-1715-wit-unknown.log")
+assert_eq "#1754 CONTROL unknown: exit 4" "$rc" "4"
+assert_eq "#1754 CONTROL unknown: THREE pastes — a missing witness suppresses nothing" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "3"
+assert_contains "#1754 CONTROL unknown: the log says the witness could not be read" "$_wl" "submit witness (session transcript): unknown"
+fi
+: > "$WIT_JSONL"
+rm -f "$WORK/witness-mode" "$WORK/witness-written" "$WORK/stub-enter-hook" "$WORK/pane-state-lost"
+printf '%s\n' "$PIN_SID" > "$PIN_FILE"
+
 echo '=== #1715-lost NEGATIVE: the box holds TYPED text after the paste → NO re-paste, no extra Enter ==='
 printf '99\n' > "$WORK/pane-state-lost"; : > "$WORK/pane-state-lost-draft"; printf 'never\n' > "$WORK/box-render"
 _run_lost lost-draft; rc=$?

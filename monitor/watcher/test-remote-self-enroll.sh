@@ -61,6 +61,14 @@ WORK=$(mktemp -d -t nexus-remote-selfenroll-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 export MONITOR_REMOTE_PRINCIPALS_DIR="$WORK/principals"
 export MONITOR_REMOTE_FROM_CIDR=""    # neutralize config bleed; §9 sets it explicitly
+# …but an EMPTY env var reads as UNSET to `_remote_cfg`, which then consults
+# the resolved nexus.yml: on an operator's host, their real
+# `monitor.remote.from_cidr`. This suite passed there only because its peer
+# address EQUALLED that operator's real pin; with a synthetic peer (#1763) it
+# went red with 23 rc-14 refusals. A config with no remote section is what
+# actually neutralizes it.
+printf 'github:\n  repo: example-org/example-nexus\n' > "$WORK/nexus.yml"
+export NEXUS_CONFIG="$WORK/nexus.yml"
 PDIR="$WORK/principals"
 AK="$PDIR/authorized_keys"
 # Registration IS the enable signal — register the nexus-remote-ssh row.
@@ -85,7 +93,7 @@ hashof() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 # (this script is only ever an sshd forced command) and made every enroll here
 # refuse with 14. The fail-closed-on-unknown-peer property itself is asserted in
 # test-remote-source-enforcement.sh.
-sess()   { local h="$1" soc="${2-}" input="${3-}"; SSH_CLIENT="${SESS_PEER:-140.107.116.184 51234 22022}" SSH_ORIGINAL_COMMAND="$soc" bash "$SESSION" "$h" <<<"$input"; }
+sess()   { local h="$1" soc="${2-}" input="${3-}"; SSH_CLIENT="${SESS_PEER:-198.51.100.84 51234 22022}" SSH_ORIGINAL_COMMAND="$soc" bash "$SESSION" "$h" <<<"$input"; }
 # grep -c prints the count (0 when none) AND exits 1 on no-match; capture the
 # number and swallow the exit (never chain `|| echo 0`, which double-appends).
 enroll_lines() { local n; n=$(grep -c 'enroll-[0-9a-f]\{64\}@nexus-remote' "$AK" 2>/dev/null); printf '%s' "${n:-0}"; }

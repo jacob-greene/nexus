@@ -62,7 +62,12 @@
 #      section), via the canonical resume surface
 #      `monitor/spawn-worker.sh --resume <window>` (issue #197) — never a
 #      hand-rolled `claude --resume`, which loses the env exports every
-#      worker hook needs. A snapshot window counts as an active worker
+#      worker hook needs. The snapshot's windows are joined by the windows
+#      an UNFINISHED prior auto-continue plan still owes (its owner died
+#      mid-walk: `ac_plan_carryover`), because the relaunched watcher
+#      rewrites the snapshot from live tmux DURING the walk — interrupted
+#      after 4 of 12 resumes (2026-10-12, RO8), the next boot saw only 4.
+#      A candidate window (either source) counts as an active worker
 #      iff ALL of:
 #        - it is not infra: the orchestrator window
 #          (`monitor.target_window`), the cockpit window
@@ -356,6 +361,15 @@ AC_TOKEN=""
 # 1 when another live recovery owns the active plan: our walk must not touch
 # the windows that plan still lists as pending (skeptic F1 on #1660).
 AC_DEFER=0
+# Windows an UNFINISHED prior plan still owes (`ac_plan_carryover`), read
+# ONCE, before this run's `ac_plan_begin` replaces that plan. They join the
+# snapshot's windows as candidates and pass the SAME predicate, so a worker
+# that has since wrapped or closed is still not resumed. CARRY_TOKEN is the
+# prior plan's own token: when this run writes no plan of its own (every
+# carried window is up or filtered out), it finishes the prior one with it.
+RECOVER_CARRY=()
+RECOVER_CARRY_TOKEN=""
+RECOVER_CARRY_SET=0
 
 # Operator-engaged windows captured at the very START of recovery
 # (before the watcher relaunch, whose first idle-probe cycle prunes
@@ -776,6 +790,29 @@ _recover_wait_pidfile() {
     return 1
 }
 
+# The nexus environment EVERY launched service starts in (your-org/nexus-code#1764).
+#
+# `svc.sh up` IS this script and `svc.sh start` calls `_recover_launch_service`,
+# so the two launch paths were already one code path — and the service still
+# inherited whatever environment its CALLER happened to have. From an agent
+# shell that is locals-env.sh's full env: GH_CONFIG_DIR scoped to the
+# credential-free dir, NEXUS_OPERATOR_GH_CONFIG_DIR recorded, the gh wrapper
+# fronted on PATH, BASH_ENV pointing at the per-shell re-front. From a cold-boot
+# trigger (SessionStart hook, boot-recover.sh) it is whatever that process was
+# started with, and a deploy watch relaunched that way failed every `git fetch`
+# through the gh credential helper for ~4 h ("no config") while its liveness
+# healthcheck stayed GREEN. Sourcing locals-env.sh — the single source of truth
+# the spawn, watcher and orchestrator launchers already source — inside the
+# supervisor's own shell makes the env a property of the NEXUS, not of whoever
+# ran recovery. Idempotent (it re-fronts, and scopes only once), pure env, and
+# best-effort: a missing file degrades to the old inherited env, never to a
+# failed launch.
+_recover_service_env_prelude() {
+    local le="$_script_dir/locals-env.sh"
+    [[ -r "$le" ]] || return 0
+    printf '. %q >/dev/null 2>&1 || true; ' "$le"
+}
+
 _recover_launch_service() {
     local name="$1" workdir="$2" launch="$3" logfile="$4"
     command -v setsid >/dev/null 2>&1 || { log "setsid unavailable; cannot launch $name headless"; return 1; }
@@ -836,7 +873,7 @@ _recover_launch_service() {
     # `$pf.superseded` deliberately does not end in `.pid`, so the `services/*.pid`
     # globs elsewhere do not pick it up as a live record.
     mv -f "$pf" "$pf.superseded" 2>/dev/null || true
-    setsid bash -c "$inner" </dev/null >>"$lf" 2>&1 &
+    setsid bash -c "$(_recover_service_env_prelude)$inner" </dev/null >>"$lf" 2>&1 &
     # Stamp the launch script's source hash as this service's running
     # version (issue #186) — the comparison anchor for the watcher's
     # version_check drift detection. Best-effort: a service whose
@@ -1502,10 +1539,36 @@ _recover_followup_live() {
 #
 # Non-qualifying windows are logged with the exclusion reason — the
 # loud-on-skip evidence trail.
+# Read the unfinished prior plan's queue once (see RECOVER_CARRY). Idempotent.
+_recover_capture_carryover() {
+    (( RECOVER_CARRY_SET == 1 )) && return 0
+    RECOVER_CARRY_SET=1
+    RECOVER_CARRY=()
+    RECOVER_CARRY_TOKEN=""
+    local w _carry_out="" _carry_rc=0
+    _carry_out=$(ac_plan_carryover "$STATE_DIR") || _carry_rc=$?
+    if (( _carry_rc == 4 )); then
+        # A queue too old to honour is finished, with its own token, so it is
+        # not re-examined at every later boot.
+        log "workers: an unfinished auto-continue plan (epoch $(_ac_owner_field "$STATE_DIR" 5)) is OLDER than ${AC_PLAN_CARRY_MAX_AGE_SECONDS:-21600}s or undated — NOT carried; candidates come from the snapshot alone (#1810 F3)"
+        ac_plan_finish "$STATE_DIR" "$(ac_plan_token "$STATE_DIR")" \
+            && log "workers: the stale auto-continue plan is marked done"
+    fi
+    while IFS= read -r w; do
+        [[ -n "$w" ]] && RECOVER_CARRY+=("$w")
+    done <<<"$_carry_out"
+    if (( ${#RECOVER_CARRY[@]} > 0 )); then
+        RECOVER_CARRY_TOKEN=$(ac_plan_token "$STATE_DIR")
+        log "workers: an UNFINISHED auto-continue plan (owner pid $(_ac_owner_field "$STATE_DIR" 2) gone) still owes ${#RECOVER_CARRY[@]} window(s): ${RECOVER_CARRY[*]} — carrying them forward as candidates"
+    fi
+    return 0
+}
+
 _recover_snapshot_workers() {
     local snap="$STATE_DIR/last-snapshot.txt"
     local actionlog="$STATE_DIR/action-log.jsonl"
-    if [[ ! -f "$snap" ]]; then
+    _recover_capture_carryover
+    if [[ ! -f "$snap" ]] && (( ${#RECOVER_CARRY[@]} == 0 )); then
         log "workers: no snapshot at $snap — nothing to respawn"
         return 0
     fi
@@ -1578,7 +1641,13 @@ _recover_snapshot_workers() {
                 # workdir; skip even if a stray mark exists.
                 log "worker '$name': no spawn record in action log — not nexus-spawned, skipping" ;;
         esac
-    done < <(_recover_snapshot_tmux_windows "$snap")
+    # ORDER IS STABLE (#1810 skeptic F3): the snapshot's windows first, in the
+    # order the base walked them, then each carried window the snapshot does
+    # not already name, in the unfinished plan's row order. A `sort -u` over
+    # the union interleaved carried windows alphabetically and so changed
+    # which windows landed over the cap.
+    done < <({ _recover_snapshot_tmux_windows "$snap"
+               printf '%s\n' "${RECOVER_CARRY[@]+"${RECOVER_CARRY[@]}"}"; } | awk 'NF && !seen[$0]++')
 }
 
 # --- cold boot: resurrect nothing, report everything ------------------------
@@ -1866,6 +1935,7 @@ _recover_write_dropped_manifest() {
 _recover_cold_boot_drop() {
     local -a dropped=()
     local name _why
+    _recover_capture_carryover
     while IFS=$'\t' read -r name _why; do
         [[ -n "$name" ]] && dropped+=("$name")
     done < <(_recover_snapshot_workers)
@@ -1877,6 +1947,13 @@ _recover_cold_boot_drop() {
 
     local archived=''
     archived=$(_recover_archive_state_file "$SNAPSHOT_FILE" "workers") || archived=''
+    # An unfinished auto-continue plan is the other candidate input
+    # (ac_plan_carryover); its windows are in `dropped` above. Retire it for
+    # the same reason as the snapshot, or the next mid-life recovery would
+    # carry the dropped workers back.
+    if [[ -n "$RECOVER_CARRY_TOKEN" ]]; then
+        _recover_archive_state_file "$(ac_plan_path "$STATE_DIR")" "auto-continue" >/dev/null || true
+    fi
     _recover_write_dropped_manifest "$archived" "${dropped[@]+"${dropped[@]}"}"
 
     if (( ${#dropped[@]} == 0 )); then
@@ -1888,6 +1965,59 @@ _recover_cold_boot_drop() {
         # the authoritative dropped-vs-still-alive split right after this.
         log "workers: cold boot — resurrected none; ${#dropped[@]} snapshot candidate(s): ${dropped[*]}"
     fi
+    return 0
+}
+
+# --- read-only incident: the RESUME a restart cannot send -------------------
+#
+# Skeptic F2 residual on your-org/nexus-code#1799. At a read-only onset the
+# watcher pastes every worker "STOP … WAIT for a RESUME note"
+# (_fs_broadcast_workers, monitor/watcher/_fs_guard.sh). All 18 RO onsets in
+# this nexus's watcher.log (2026-09-28..10-10) ended in a sandbox restart, not
+# an in-process heal, so the RESUME is never sent. A worker that was IDLE at
+# onset could not record a new heartbeat on the read-only tree, so its
+# heartbeat still says idle and `spawn-worker.sh --resume` sends no nudge: it
+# comes back with "wait" as its last instruction and nothing will wake it.
+#
+# The ledger is watcher.log itself. The watcher writes it through a fd held
+# from before the incident, and those lines survive: the 2026-10-12 08:35
+# onset's "DEGRADED note #1 … delivered" (08:40) is in the persisted log. The
+# degraded run dir under $TMPDIR does not survive a restart. Read the rotated
+# `.1` too: the watcher relaunch (step 1) rotates a log over 10 MB before this
+# walk runs.
+#
+# Owed iff the window's newest STOP that reached the pane (delivered, or
+# pasted + Enter unconfirmed) is newer than both its newest DELIVERED RESUME
+# and its newest `spawn` action-log event — a resume writes one (mode=resume),
+# so the nudge is sent once, not at every later recovery. Fail direction: an
+# unreadable action log counts as owed (a spurious "continue" costs one turn;
+# a missed one strands the worker). Prints the STOP's timestamp; rc 0 = owed.
+_recover_fs_stop_owed() {
+    local name="$1" wlog="${RECOVER_WATCHER_LOG:-$STATE_DIR/watcher.log}"
+    local alog="$STATE_DIR/action-log.jsonl" f line stop_ts="" ts stop_e spawn_ts spawn_e
+    local sp="] fs-guard: worker broadcast (stop) to ${name} — "
+    local rp="] fs-guard: worker broadcast (resume) to ${name} — delivered"
+    for f in "$wlog.1" "$wlog"; do
+        [[ -r "$f" ]] || continue
+        while IFS= read -r line; do
+            ts="${line#\[}"; ts="${ts%%\]*}"
+            case "$line" in
+                *"${sp}delivered"*|*"${sp}unconfirmed"*) stop_ts="$ts" ;;
+                *"$rp"*) stop_ts="" ;;
+            esac
+        done < <(grep -aF -- " to ${name} — " "$f" 2>/dev/null)
+    done
+    [[ -n "$stop_ts" ]] || return 1
+    stop_e=$(_recover_epoch_of "$stop_ts")
+    [[ -n "$stop_e" ]] || { printf '%s' "$stop_ts"; return 0; }
+    if [[ -r "$alog" ]]; then
+        spawn_ts=$(grep -aF "\"window\":\"$name\"" "$alog" 2>/dev/null \
+            | grep -aF '"event":"spawn"' | tail -n 1 \
+            | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')
+        spawn_e=$(_recover_epoch_of "$spawn_ts")
+        [[ -n "$spawn_e" ]] && (( spawn_e >= stop_e )) && return 1
+    fi
+    printf '%s' "$stop_ts"
     return 0
 }
 
@@ -1910,7 +2040,13 @@ recover_worker() {
     # The plan token rides ONLY on our own call: it is what tells
     # spawn-worker this resume IS the auto-continue the plan announced,
     # rather than a hand resume racing it (exit 27).
-    NEXUS_AUTOCONTINUE_TOKEN="$AC_TOKEN" "$SPAWN_WORKER_BIN" --resume "$name" >&2
+    local -a ro_nudge=()
+    local stop_ts
+    if stop_ts=$(_recover_fs_stop_owed "$name"); then
+        ro_nudge=(--nudge-ro)
+        log "worker '$name': got a read-only STOP at $stop_ts with no RESUME since — resuming with the RO continuation nudge"
+    fi
+    NEXUS_AUTOCONTINUE_TOKEN="$AC_TOKEN" "$SPAWN_WORKER_BIN" --resume "$name" "${ro_nudge[@]+"${ro_nudge[@]}"}" >&2
     local rc=$?
     case "$rc" in
         0)  log "worker '$name': resumed"
@@ -1936,6 +2072,9 @@ _recover_capture_candidates() {
     (( RECOVER_CANDIDATES_SET == 1 )) && return 0
     RECOVER_CANDIDATES=()
     RECOVER_WHY=()
+    # HERE, not only inside _recover_snapshot_workers: that runs in a process
+    # substitution, so the carry globals it sets never reach this shell.
+    _recover_capture_carryover
     local name why
     while IFS=$'\t' read -r name why; do
         [[ -n "$name" ]] || continue
@@ -1987,6 +2126,13 @@ _recover_plan_autocontinue() {
     # unchanged. A candidate past the cap alone still gets a plan, because
     # the brief must SAY it is not coming back (skeptic F2 on #1660).
     if (( ${#rows[@]} == 0 && ${#overcap[@]} == 0 )); then
+        # Every window an unfinished prior plan owed is now up or no longer
+        # qualifies: the queue is drained, so finish that plan (with its own
+        # token) instead of carrying it into every later recovery.
+        if [[ -n "$RECOVER_CARRY_TOKEN" ]] \
+           && ac_plan_finish "$STATE_DIR" "$RECOVER_CARRY_TOKEN"; then
+            log "workers: the unfinished auto-continue plan's queue is drained — marked it done"
+        fi
         return 0
     fi
     AC_TOKEN="$(date +%s).$$.${RANDOM}${RANDOM}"

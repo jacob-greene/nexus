@@ -70,7 +70,7 @@ trap cleanup EXIT
 
 REPO="$WORK/repo"
 mkdir -p "$REPO/pm"
-cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$REPO/pm/"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$REPO/pm/"
 
 cat > "$REPO/pm/mapping.tsv" <<'MAP'
 map	qzcorp	your-org	<your-org>
@@ -216,6 +216,7 @@ OLDTK="$WORK/oldtk"
 mkdir -p "$OLDTK/pm"
 cp "$TOOLKIT/scrub.pl" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$OLDTK/pm/"
 cp "$TOOLKIT/build.sh" "$OLDTK/pm/build-impl.sh"
+cp "$TOOLKIT/verify-build.py" "$OLDTK/pm/"
 cat > "$OLDTK/pm/build.sh" <<'OLDBUILD'
 #!/usr/bin/env bash
 # pre-#1001 surface: the first positional IS the mapping path.
@@ -288,7 +289,7 @@ printf '# comments only, no rows\n' > "$LEDGER"
 # cannot fail is the thing this suite is about.
 NODICT="$WORK/nodict"
 mkdir -p "$NODICT/pm"
-cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$NODICT/pm/"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$TOOLKIT/leak-gate.sh" "$TOOLKIT/sync-base.sh" "$NODICT/pm/"
 printf 'plain\n' > "$NODICT/f.txt"
 ( cd "$NODICT" && git init -q && git config user.email t@t && git config user.name t \
     && git add -A && git commit -qm init ) >/dev/null 2>&1

@@ -130,6 +130,7 @@ sel()  { tmux select-window -t "$1:$2" >/dev/null 2>&1; }
 newwin() { tmux new-window -d -t "$1:" -n "$2" -P -F '#{window_id}' sleep 600; }
 board_up() {   # S with orchestrator, services, worker; optional grouped G
     cleanup_sessions
+    # tmux-fixture-conf-lint: allow-wrapper-pins-f  `tmux` here is the nx_write_tmux_shim written above with `-f "$WORK/tmux.conf"`
     tmux new-session -d -s "$S" -n orchestrator -x 80 -y 24 sleep 600 || return 1
     # The server's PID, recorded while it can still be asked (#1576): leg L
     # below answers "did a server outlive this suite" from these handles. Each
@@ -138,6 +139,7 @@ board_up() {   # S with orchestrator, services, worker; optional grouped G
     tmux display-message -p '#{pid}' >> "$WORK/server.pids" 2>/dev/null || true
     newwin "$S" services >/dev/null; newwin "$S" worker >/dev/null
     tmux set-option -t "$S" automatic-rename off >/dev/null 2>&1 || true
+    # tmux-fixture-conf-lint: allow-live-server  `S` was created on this server one line up, and the PATH shim pins -f anyway
     if [[ "${1-}" == grouped ]]; then tmux new-session -d -t "$S" -s "$G" || return 1; fi
     rm -f "$CAP"
     return 0

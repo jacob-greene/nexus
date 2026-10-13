@@ -24,7 +24,8 @@
 #   2. the manifest must exist and be readable
 #   3. the binary must not be KNOWN to lack `--plugin-dir <path>` (capability
 #      probe, bounded, monitor/_claude-bin.sh:claude_supports_plugin_dir_flag)
-#   4. `claude plugin validate <dir>` must not FAIL (bounded; warnings pass)
+#   4. `claude plugin validate <dir>` must not FAIL (bounded; warnings pass;
+#      a PASS is disk-cached per binary + plugin bytes, see _lj_validate_cache_dir)
 #
 # A PROBE THAT COULD NOT ANSWER IS NOT A "NO" (your-org/nexus-code#1611). Steps
 # 3 and 4 each have a third outcome — the bound fired, or --help printed
@@ -99,6 +100,62 @@ _lj_plugin_log() {   # <window> <verdict> <reason> [<state-dir>]
     printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%s)" "${1:--}" "$2" "${3//$'\n'/ }" "$src" >> "$sd/longjob/arming.log" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# A DISK CACHE OF PASSED VALIDATIONS (your-org/nexus-code#1704)
+# ---------------------------------------------------------------------------
+# `claude plugin validate` used to run on EVERY spawn, uncached, under a 20 s
+# bound: at the 2026-10-10 sandbox boot all 8 spawns TIMED OUT, ~3 min on the
+# serial recovery path, and armed anyway. The answer is a function of two
+# things only — the binary and the plugin's bytes — so it is cached on BOTH:
+#   key = monitor/_claude-bin.sh:_claude_help_key (realpath + size + mtime +
+#         inode of $CLAUDE_BIN, the #1721 scheme) + a cksum over every file
+#         under the plugin dir (path AND content), so a manifest edit, a
+#         dispatch.sh edit, or a cc-update each re-validate.
+# ONLY rc 0 IS WRITTEN. A timeout (124/125/137) is could-not-determine and a
+# failure is a real "no"; neither is ever stored, so both re-validate on the
+# next launch — #1611's rule, as for the --help cache.
+# WHERE and WHEN mirrors _claude_help_cache_dir exactly: an explicit
+# $NEXUS_LONGJOB_VALIDATE_CACHE_DIR when SET (EMPTY disables); otherwise OFF
+# under $NEXUS_TEST_FENCE, OFF unless $CLAUDE_BIN IS this nexus's pinned binary
+# (a stub never writes the default location), and then
+# <state-dir>/longjob-validate-cache, the leaf created only when its parent
+# exists. A read that fails or a file that is not exactly `<key>\nok\n` is
+# ignored and validate runs: the cache can only save a validate, never vouch
+# for one it did not see pass.
+_lj_validate_cache_dir() {   # [<state-dir>] -> the directory; rc 1 = disabled
+    if [[ -n "${NEXUS_LONGJOB_VALIDATE_CACHE_DIR+set}" ]]; then
+        [[ -n "$NEXUS_LONGJOB_VALIDATE_CACHE_DIR" ]] || return 1
+        printf '%s' "$NEXUS_LONGJOB_VALIDATE_CACHE_DIR"
+        return 0
+    fi
+    [[ -z "${NEXUS_TEST_FENCE:-}" ]] || return 1
+    local pinned='' rp=''
+    pinned=$(readlink -f -- "${NEXUS_ROOT:-}/node_modules/.bin/claude" 2>/dev/null) || return 1
+    rp=$(readlink -f -- "${CLAUDE_BIN:-}" 2>/dev/null) || return 1
+    [[ -n "$pinned" && -f "$pinned" && "$rp" == "$pinned" ]] || return 1
+    printf '%s' "${1:-${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}}/longjob-validate-cache"
+}
+
+_lj_validate_key() {   # <plugin-dir> -> "<binary key>|<plugin cksum>"; rc 1 = unkeyable
+    local bk='' ph=''
+    declare -F _claude_help_key >/dev/null 2>&1 || return 1
+    bk=$(_claude_help_key) || return 1
+    # Sorted (path, content) checksums of every regular file, then one cksum
+    # of that list. No pipefail is relied on (a caller's shell options are not
+    # this library's to assume, #721): an enumeration that produced NOTHING
+    # hashes to the empty-input cksum, which is refused as unkeyable.
+    ph=$(cd -- "$1" 2>/dev/null && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r cksum | cksum) || return 1
+    [[ "$ph" =~ ^[0-9]+\ [0-9]+$ && "$ph" != "4294967295 0" ]] || return 1
+    printf '%s|%s' "$bk" "$ph"
+}
+
+_lj_validate_hit() {   # <entry-file> <key> -> rc 0 iff the file is exactly `<key>\nok\n`
+    local k='' a='' extra=''
+    [[ -f "$1" ]] || return 1
+    { IFS= read -r k && IFS= read -r a && ! IFS= read -r extra; } < "$1" 2>/dev/null || return 1
+    [[ "$k" == "$2" && "$a" == ok ]]
+}
+
 longjob_plugin_flag() {
     local win="${1:-${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-}}}"
     local sd="${2:-}"
@@ -139,11 +196,34 @@ longjob_plugin_flag() {
     # — so they are could-not-determine, and since a broken manifest under a
     # binary that has the flag is MEASURED to fail open (header), they arm as
     # `armed-unprobed` (#1611). Only a validator that RAN and FAILED skips.
-    if command -v timeout >/dev/null 2>&1; then tb="timeout -k 2 ${NEXUS_LONGJOB_VALIDATE_TIMEOUT:-20}"; fi
-    # shellcheck disable=SC2086
-    $tb "$CLAUDE_BIN" plugin validate "$dir" >/dev/null 2>&1; rc=$?
+    local vdir='' vkey='' vf='' vtmp='' vcached=''
+    if vdir=$(_lj_validate_cache_dir "$sd") && vkey=$(_lj_validate_key "$dir"); then
+        vf="$vdir/longjob-validate-$(printf '%s' "$vkey" | cksum | tr ' ' '-').v1"
+        _lj_validate_hit "$vf" "$vkey" && vcached=1
+    else
+        vf=''
+    fi
+    if [[ -n "$vcached" ]]; then
+        rc=0
+    else
+        if command -v timeout >/dev/null 2>&1; then tb="timeout -k 2 ${NEXUS_LONGJOB_VALIDATE_TIMEOUT:-20}"; fi
+        # shellcheck disable=SC2086
+        $tb "$CLAUDE_BIN" plugin validate "$dir" >/dev/null 2>&1; rc=$?
+        # Best-effort write of a PASS only (tmp + mv, atomic rename).
+        if (( rc == 0 )) && [[ -n "$vf" ]]; then
+            [[ -d "$vdir" ]] || { [[ -d "$(dirname -- "$vdir")" ]] && mkdir -- "$vdir" 2>/dev/null; }
+            if [[ -d "$vdir" ]]; then
+                vtmp="$vf.tmp.$$"
+                if printf '%s\nok\n' "$vkey" > "$vtmp" 2>/dev/null && mv -f -- "$vtmp" "$vf" 2>/dev/null; then
+                    :
+                else
+                    rm -f -- "$vtmp" 2>/dev/null
+                fi
+            fi
+        fi
+    fi
     case "$rc" in
-        0)  [[ -n "$unprobed" ]] && unprobed="$unprobed; plugin validate passed" ;;
+        0)  [[ -n "$unprobed" ]] && unprobed="$unprobed; plugin validate passed${vcached:+ (cached)}" ;;
         124|125|137)
             echo "_longjob-plugin: 'claude plugin validate' TIMED OUT (rc $rc) — manifest NOT validated; passing --plugin-dir anyway, because a broken manifest is measured to fail open and a skipped flag is silent for the session's life (your-org/nexus-code#1611)." >&2
             unprobed="${unprobed:+$unprobed; }plugin validate TIMED OUT (rc $rc) — manifest not validated" ;;

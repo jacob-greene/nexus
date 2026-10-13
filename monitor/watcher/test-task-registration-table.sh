@@ -66,6 +66,7 @@ _schedule_task bell_windows 30 _v2_task_bell_windows --class cheap
 _schedule_task selection_snapshot 10 _v2_task_selection_snapshot --class cheap
 _schedule_task prune_archive 600 _v2_task_prune_archive --class cheap
 _schedule_task detect_unstick 10 _v2_task_detect_unstick --class medium --async
+_schedule_task decision_surface 5 _v2_task_decision_surface --class medium --async
 _schedule_task snapshot_local 30 _v2_task_snapshot_local --class medium --async
 _schedule_task idle_section 30 _v2_task_idle_section --class expensive --async
 _schedule_task over_limit_scan 60 _v2_task_over_limit_scan --class expensive --async
@@ -122,7 +123,7 @@ n_tasks=$(grep -c . <<<"$actual")
 # 27 since your-org/nexus-code#1528 (w240): `selection_snapshot` is the rolling
 # last-seen window-selection writer the respawn's rule-4 arm reads (10 s, cheap,
 # sync — one `list-windows -a` and one small atomic write per fire).
-[[ "$n_tasks" == 27 ]] && ok "27 tasks registered" || bad "task count" "got $n_tasks, want 27"
+[[ "$n_tasks" == 28 ]] && ok "28 tasks registered" || bad "task count" "got $n_tasks, want 28"
 
 # Every task must declare a cost class — the scheduler's whole priority model
 # reads it, and an unclassified task silently lands in the default bucket.

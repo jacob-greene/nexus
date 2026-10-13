@@ -25,7 +25,10 @@ GUARD="$REPO_ROOT/monitor/tmpfs-guard.sh"
 MG="${TMPFS_GUARD_MG:-$REPO_ROOT/monitor/mutation-gate.sh}"
 
 . "$_test_dir/_test_helpers.sh"
-EXPECTED_ASSERTIONS=99   # +6: your-org/nexus-code#1601 — a SIGKILLed mutation-gate run's workdir is
+EXPECTED_ASSERTIONS=110  # +3: your-org/nexus-code#1772 — the socket dir follows the running uid (measured, named, old flag shape kept).
+                         # +8: your-org/nexus-code#1766 — node_memory hysteresis: raise, hold inside
+                         #     the margin, raise, clear above it, and no raise from the margin alone.
+                         # +6: your-org/nexus-code#1601 — a SIGKILLed mutation-gate run's workdir is
                          #     swept by a later run, only when every attribution axis agrees.
                          # +9: your-org/nexus-code#1601 — every --check walk is bounded, and a
                          #     truncated walk says UNMEASURED / LOWER BOUND instead of a short count.
@@ -45,6 +48,10 @@ export NEXUS_STATE_DIR="$ROOT/.state"
 # operator's config/nexus.yml cannot change what this suite measures.
 cleanup() { exec 7>&- 2>/dev/null; kill "${_HOLD_PID:-}" 2>/dev/null; rm -rf -- "$ROOT"; }
 trap cleanup EXIT
+
+# The operator's short socket dir and Claude Code's per-user dir are named by
+# the RUNNING uid, never a literal one (your-org/nexus-code#1772).
+SOCK="c$(id -u)"; CLA="claude-$(id -u)"
 
 old() {   # <path>… — age every entry (and its contents) 3 days
     find "$@" -exec touch -h -d '3 days ago' -- {} + 2>/dev/null
@@ -76,8 +83,8 @@ mkdir -p "$F/sub/deep"; : > "$F/sub/deep/fresh.txt"; find "$F" -type d -exec tou
 G=$(plant olay-guard-gggggggg);     old "$G"                # old, held ONLY in a child's ENVIRONMENT → keep
 HOLD_DIR="$G/sub" sleep 600 & _HOLD_PID=$!
 N=$(plant "olay-guard-nl$(printf '\n')nl"); old "$N"       # NEWLINE in the name: must be handled, never phantom-logged → REMOVE
-DN=$(plant c71780 3145728);         old "$DN"               # denylisted root   → keep
-DC=$(plant claude-71780);           old "$DC"               # denylisted root   → keep
+DN=$(plant "$SOCK" 3145728);         old "$DN"               # denylisted root   → keep
+DC=$(plant "$CLA");           old "$DC"               # denylisted root   → keep
 mkdir -p "$ROOT/.nexus-trash"
 T_OLD="$ROOT/.nexus-trash/old-binary.20260801"; mkdir -p "$T_OLD"; : > "$T_OLD/f"; old "$T_OLD"
 T_NEW="$ROOT/.nexus-trash/fresh-binary";        mkdir -p "$T_NEW"; : > "$T_NEW/f"
@@ -123,9 +130,9 @@ if [ -S "$S/sub/x.sock" ]; then PASS=$((PASS+1)); echo "  PASS: KEPT: dir holdin
 # denylisted names: with normal families these names are rejected by the
 # allowlist first, so the deny arm never runs and an assertion here could not
 # fail if the denylist were deleted (skeptic mutant M3, 35/35 with no denylist).
-TMPFS_REAP_FAMILIES='^c71780$ ^claude-71780$' "$GUARD" --reap --root "$ROOT" --trash-days 1 >/dev/null 2>&1
-assert_file_exists "KEPT: denylisted c71780 even when the allowlist names it"      "$DN/sub/payload.bin"
-assert_file_exists "KEPT: denylisted claude-71780 even when the allowlist names it" "$DC/sub/payload.bin"
+TMPFS_REAP_FAMILIES="^${SOCK}\$ ^${CLA}\$" "$GUARD" --reap --root "$ROOT" --trash-days 1 >/dev/null 2>&1
+assert_file_exists "KEPT: denylisted c<uid> even when the allowlist names it"      "$DN/sub/payload.bin"
+assert_file_exists "KEPT: denylisted claude-<uid> even when the allowlist names it" "$DC/sub/payload.bin"
 assert_no_file     "REMOVED: old helper dotfile .th-ports.*"  "$P_OLD"
 assert_file_exists "KEPT: young helper dotfile"               "$P_NEW"
 assert_no_file     "TRASH: old entry cleared (_trash.sh finally has a caller)" "$T_OLD"
@@ -144,7 +151,7 @@ USED_PCT=$(df -P -- "$ROOT" 2>/dev/null | awk 'NR==2 { gsub("%","",$5); print $5
 if [[ -n "$USED_PCT" ]] && [ "$USED_PCT" -lt 99 ]; then
     QUIET_WARN=$(( USED_PCT + 1 ))
     out=$("$GUARD" --check --root "$ROOT" --warn-pct "$QUIET_WARN" --high-pct 100 --critical-pct 100 \
-                   --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 100000 2>/dev/null); rc=$?
+                   --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 100000 2>/dev/null); rc=$?
     assert_rc       "under every threshold the check is SILENT (rc 0)" "$rc" 0
     assert_contains "…and the healthy line still REPORTS the entry counts as context" "$out" "context only: entries="
     # THE REGRESSION THAT MATTERS. The fixture root holds far more than the old
@@ -152,7 +159,7 @@ if [[ -n "$USED_PCT" ]] && [ "$USED_PCT" -lt 99 ]; then
     # tripped on exactly that. A count can no longer trip anything, and this is
     # the assertion that says so rather than trusting the flag removal.
     out=$("$GUARD" --check --root "$ROOT" --warn-pct "$QUIET_WARN" --high-pct 100 --critical-pct 100 \
-                   --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 100000 2>/dev/null); rc=$?
+                   --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 100000 2>/dev/null); rc=$?
     assert_rc "an ENTRY COUNT can no longer trigger anything — inventory is not consumption (#1423)" "$rc" 0
 else
     echo "  SKIP: $ROOT is at ${USED_PCT:-?}% — cannot construct a below-threshold arm"
@@ -161,7 +168,7 @@ fi
 # Capacity: thresholds at 0 put any mount in the worst band, so the banding
 # itself is exercised rather than the host's current fullness.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 0 --high-pct 0 --critical-pct 0 \
-               --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 100000 2>/dev/null); rc=$?
+               --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 100000 2>/dev/null); rc=$?
 assert_rc       "over the capacity threshold is a FINDING (rc 100: alive, condition present)" "$rc" 100
 assert_contains "…named tmp_capacity, not 'entries'"        "$out" "tmp_capacity:"
 assert_contains "…banded CRITICAL when past the critical threshold" "$out" "band critical"
@@ -187,17 +194,21 @@ assert_contains "…explicitly saying it decides nothing"          "$out" "decid
 
 # Inodes: its OWN condition with an honest name, never smuggled in as memory.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 101 --high-pct 101 --critical-pct 101 \
-               --mem-avail-low-pct 0 --max-inode-pct 0 --max-c71780-mib 100000 2>/dev/null); rc=$?
+               --mem-avail-low-pct 0 --max-inode-pct 0 --max-socket-root-mib 100000 2>/dev/null); rc=$?
 assert_rc       "the inode ceiling is its own condition and can trip alone" "$rc" 100
 assert_contains "…named 'inodes', not folded into memory"   "$out" "inodes:"
 assert_contains "…and says why it needs a different remedy" "$out" "stops allocation while bytes are still free"
 
 # Node memory: MemAvailable against MemTotal.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 101 --high-pct 101 --critical-pct 101 \
-               --mem-avail-low-pct 100 --max-inode-pct 101 --max-c71780-mib 100000 2>/dev/null); rc=$?
+               --mem-avail-low-pct 100 --max-inode-pct 101 --max-socket-root-mib 100000 2>/dev/null); rc=$?
 assert_rc       "node memory pressure is its own condition"  "$rc" 100
 assert_contains "…named node_memory"                         "$out" "node_memory:"
 assert_contains "…and points at attribution BEFORE assuming it is ours" "$out" "BEFORE assuming it is ours"
+# That raise PERSISTS a hysteresis marker (your-org/nexus-code#1766); drop it
+# so the threshold-100 case above cannot hold node_memory raised into the
+# unrelated cases below.
+rm -f -- "$NEXUS_STATE_DIR/tmpfs-guard.node_memory.raised"
 
 # socket_root: a CONTRACT condition, ON by default, capped at `elevated`, and
 # it must never be described as pressure. What was wrong with it was the
@@ -206,13 +217,13 @@ assert_contains "…and points at attribution BEFORE assuming it is ours" "$out"
 # entry-count leg took 13 — so the stable, actionable leg was re-broadcast
 # every two minutes only because a noisy leg's integer shared its string.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 101 --high-pct 101 --critical-pct 101 \
-               --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 1 2>/dev/null); rc=$?
+               --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 1 2>/dev/null); rc=$?
 assert_rc       "socket-root payload raises a finding by default"        "$rc" 100
 assert_contains "…named as a CONTRACT violation, never as pressure"      "$out" "CONTRACT violation"
 assert_not_contains "…and the HEADLINE does not call it memory pressure" "$out" "is under MEMORY PRESSURE"
 assert_contains "…capped at band elevated so it cannot masquerade as pressure" "$out" "band elevated"
 out=$(SOCKET_ROOT_TRIGGER=0 "$GUARD" --check --root "$ROOT" --warn-pct 101 --high-pct 101 --critical-pct 101 \
-               --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 1 2>/dev/null); rc=$?
+               --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 1 2>/dev/null); rc=$?
 assert_rc       "…and it can be silenced by config without a code change" "$rc" 0
 assert_contains "…still REPORTED on the healthy line when silenced"       "$out" "non-socket payload"
 
@@ -220,7 +231,7 @@ assert_contains "…still REPORTED on the healthy line when silenced"       "$ou
 # whole #1423 P0c mechanism at the producer: a noisy leg must not be able to
 # re-broadcast a quiet one, and it cannot if no leg's numbers are in the key.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 0 --high-pct 0 --critical-pct 101 \
-               --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 1 2>/dev/null)
+               --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 1 2>/dev/null)
 key1=$(printf '%s\n' "$out" | sed -n 's/^finding-key: //p')
 assert_contains "the key names EACH condition with ITS OWN band" "$key1" "socket_root=elevated"
 assert_contains "…including the capacity leg"                    "$key1" "tmp_capacity=high"
@@ -232,7 +243,7 @@ assert_eq       "the condition half of the key contains NO digits from any measu
     "$(printf '%s' "${key1#tmpfs:$ROOT:}" | tr -cd '0-9' | wc -c)" "0"
 # Crossing INTO A WORSE BAND changes the key; that is the one thing that must.
 out=$("$GUARD" --check --root "$ROOT" --warn-pct 0 --high-pct 0 --critical-pct 0 \
-               --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 1 2>/dev/null)
+               --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 1 2>/dev/null)
 key2=$(printf '%s\n' "$out" | sed -n 's/^finding-key: //p')
 assert_contains "a leg crossing into a WORSE band changes the key" "$key2" "tmp_capacity=critical"
 
@@ -401,7 +412,7 @@ rm -rf "$_e1490_dir"
 # `ls`/`find` are replaced by PATH-front stubs that, when ARMED by env, print a
 # little and then hang — the shape of a walk over a 15k-entry /tmp under load.
 # Disarmed they exec the real tool, which is the CONTROL. A walk bounded by
-# `timeout` and then summed as if complete is a SHORT count at rc 0: the c71780
+# `timeout` and then summed as if complete is a SHORT count at rc 0: the c<uid>
 # stub prints 5 x 1 MiB before hanging, so a guard that reads its truncated
 # output as whole reports "5 MiB" as a measurement.
 _s1601=$(mktemp -d)
@@ -409,8 +420,8 @@ _real_find=$(type -P find); _real_ls=$(type -P ls)
 cat > "$_s1601/find" <<STUB
 #!/usr/bin/env bash
 case " \$* " in
-  *"/c71780 -type f"*) if [ -n "\${TG1601_HANG_C:-}" ]; then for i in 1 2 3 4 5; do echo 1048576; done; exec sleep 30; fi ;;
-  *"/c71780 -mindepth 1"*) if [ -n "\${TG1601_HANG_C:-}" ]; then printf ..; exec sleep 30; fi ;;
+  *"/${SOCK} -type f"*) if [ -n "\${TG1601_HANG_C:-}" ]; then for i in 1 2 3 4 5; do echo 1048576; done; exec sleep 30; fi ;;
+  *"/${SOCK} -mindepth 1"*) if [ -n "\${TG1601_HANG_C:-}" ]; then printf ..; exec sleep 30; fi ;;
   *"%u"*) if [ -n "\${TG1601_HANG_META:-}" ]; then exec sleep 30; fi ;;
 esac
 exec "$_real_find" "\$@"
@@ -423,22 +434,93 @@ STUB
 chmod +x "$_s1601/find" "$_s1601/ls"
 _g1601() { PATH="$_s1601:$PATH" CHECK_WALK_TIMEOUT_S=1 ATTRIB_TIMEOUT_S=1 "$GUARD" --check --root "$ROOT" "$@" 2>/dev/null; }
 _healthy_flags=(--warn-pct 101 --high-pct 101 --critical-pct 101 --mem-avail-low-pct 0 --max-inode-pct 101)
-out=$(_g1601 "${_healthy_flags[@]}" --max-c71780-mib 100000); rc=$?
+out=$(_g1601 "${_healthy_flags[@]}" --max-socket-root-mib 100000); rc=$?
 assert_not_contains "#1601 CONTROL: stubs present but DISARMED — no walk is reported partial" "$out" "PARTIAL"
 _t0=$SECONDS
-out=$(TG1601_HANG_LS=1 TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-c71780-mib 100000); rc=$?
+out=$(TG1601_HANG_LS=1 TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-socket-root-mib 100000); rc=$?
 assert_eq "#1601: with every walk HUNG, --check still returns (within 15 s at a 1 s bound)" \
     "$(( SECONDS - _t0 < 15 ? 1 : 0 ))" "1"
 assert_contains "#1601: a timed-out entry walk is UNMEASURED, never a short count" "$out" "entries=?(walk did not finish within 1s)"
-assert_rc "#1601: a partial c71780 sum UNDER the limit decides nothing — rc 0, not a finding" "$rc" 0
+assert_rc "#1601: a partial c<uid> sum UNDER the limit decides nothing — rc 0, not a finding" "$rc" 0
 assert_contains "#1601: …and the healthy line says the contract check is UNDECIDED" "$out" "socket_root contract check is UNDECIDED"
 assert_contains "#1601: …naming the payload as a LOWER BOUND" "$out" "5 MiB is a LOWER BOUND"
-out=$(TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-c71780-mib 1); rc=$?
+out=$(TG1601_HANG_C=1 _g1601 "${_healthy_flags[@]}" --max-socket-root-mib 1); rc=$?
 assert_rc "#1601: a partial sum OVER the limit is still over it — the finding holds (rc 100)" "$rc" 100
 assert_contains "#1601: …stated as AT LEAST, never as the measured payload" "$out" "holds AT LEAST 5 MiB"
-out=$(TG1601_HANG_META=1 _g1601 --warn-pct 0 --high-pct 0 --critical-pct 0 --mem-avail-low-pct 0 --max-inode-pct 101 --max-c71780-mib 100000)
+out=$(TG1601_HANG_META=1 _g1601 --warn-pct 0 --high-pct 0 --critical-pct 0 --mem-avail-low-pct 0 --max-inode-pct 101 --max-socket-root-mib 100000)
 assert_contains "#1601: a timed-out attribution walk prints NO breakdown and says why" "$out" "attribution UNAVAILABLE: the depth-1 walk did not finish within 1s"
 rm -rf "$_s1601"
+
+# ── your-org/nexus-code#1766: node_memory HYSTERESIS ────────────────────────
+# MemAvailable is FAKED by an `awk` shim that swaps /proc/meminfo for a fixture
+# file and passes every other awk call through untouched — no production seam,
+# so the same suite drives the pre-fix guard too. Its own state dir, so the
+# raised marker left by the node_memory case above cannot leak in. The
+# sequence oscillates INSIDE the margin (threshold 15, margin 3 -> clears at
+# 18): 14 raise, 16 hold, 14 raise, 19 clear. Pre-fix, 16 already cleared.
+_s1766=$(mktemp -d "$ROOT/.s1766.XXXXXX")
+_real_awk=$(command -v awk)
+cat > "$_s1766/awk" <<STUB
+#!/usr/bin/env bash
+a=()
+for x in "\$@"; do
+    if [ "\$x" = /proc/meminfo ] && [ -n "\${TG1766_MEMINFO:-}" ]; then a+=("\$TG1766_MEMINFO"); else a+=("\$x"); fi
+done
+exec "$_real_awk" "\${a[@]}"
+STUB
+chmod +x "$_s1766/awk"
+_mem1766() {   # <avail-pct> — MemTotal 1,000,000 kB, so kB/10000 IS the percent
+    printf 'MemTotal: 1000000 kB\nMemAvailable: %s kB\nShmem: 1000 kB\n' "$(( $1 * 10000 ))" > "$_s1766/meminfo"
+    PATH="$_s1766:$PATH" TG1766_MEMINFO="$_s1766/meminfo" NEXUS_STATE_DIR="$_s1766/state" \
+        "$GUARD" --check --root "$ROOT" --warn-pct 101 --high-pct 101 --critical-pct 101 \
+        --mem-avail-low-pct 15 --mem-avail-clear-margin-pct 3 --max-inode-pct 101 --max-socket-root-mib 100000 2>/dev/null
+}
+out=$(_mem1766 14); rc=$?
+assert_rc       "#1766: 14% available (under the 15% line) -> node_memory RAISED" "$rc" 100
+assert_contains "#1766: …and the fixture meminfo is what was read (shim potency)" "$out" "only 14% of MemTotal"
+out=$(_mem1766 16); rc=$?
+assert_rc       "#1766: 16% — above the line but INSIDE the margin — still raised, no clear" "$rc" 100
+assert_contains "#1766: …and it says it is held by hysteresis" "$out" "STILL RAISED by hysteresis"
+out=$(_mem1766 14); rc=$?
+assert_rc       "#1766: back to 14% -> raised (same key, so no re-fire)" "$rc" 100
+out=$(_mem1766 19); rc=$?
+assert_rc       "#1766: 19% (>= 15 + 3) -> CLEARED" "$rc" 0
+assert_contains "#1766: …healthy line reports the fixture reading" "$out" "mem-avail=19%"
+# Never raised: a reading inside the margin is NOT a raise by itself.
+rm -rf "$_s1766/state"
+out=$(_mem1766 16); rc=$?
+assert_rc       "#1766: 16% with no prior raise -> healthy (hysteresis only HOLDS, never raises)" "$rc" 0
+rm -rf "$_s1766"
+
+# ---- #1772: the socket dir is the RUNNING uid's, not one operator's --------
+# An `id` stub reports another uid. Base hardcoded one operator's uid, so on
+# any other host the socket_root contract check measured a directory that did
+# not exist. COVERAGE BOUNDARY: the reaper's PROTECTION of another uid's dir
+# cannot be exercised here — the reaper only touches files owned by `id -u`,
+# so under a stubbed uid nothing is reapable and a "kept" assertion would pass
+# vacuously. Protection of the running uid's dir is the KEPT pair above.
+# Asserted on the finding key and text, not the rc: on a memory-starved node
+# node_memory raises too.
+_s1772=$(mktemp -d /tmp/tg1772.XXXXXX)
+mkdir -p "$_s1772/bin" "$_s1772/root" "$_s1772/state"
+cat > "$_s1772/bin/id" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = "-u" ]; then echo 4242; exit 0; fi
+exec $(command -v id) "\$@"
+STUB
+chmod +x "$_s1772/bin/id"
+mkdir -p "$_s1772/root/c4242/sub"; head -c 3145728 /dev/zero > "$_s1772/root/c4242/sub/payload.bin"
+out=$(PATH="$_s1772/bin:$PATH" NEXUS_STATE_DIR="$_s1772/state" "$GUARD" --check --root "$_s1772/root" \
+          --warn-pct 101 --high-pct 101 --critical-pct 101 --mem-avail-low-pct 0 --max-inode-pct 101 \
+          --max-socket-root-mib 1 2>/dev/null)
+assert_contains "#1772: uid 4242's socket dir is MEASURED (socket_root in the finding key)" \
+    "$(printf '%s\n' "$out" | sed -n 's/^finding-key: //p')" "socket_root=elevated"
+assert_contains "#1772: …and the finding names c4242" "$out" "c4242 holds"
+out=$(PATH="$_s1772/bin:$PATH" NEXUS_STATE_DIR="$_s1772/state" "$GUARD" --check --root "$_s1772/root" \
+          --warn-pct 101 --high-pct 101 --critical-pct 101 --mem-avail-low-pct 0 --max-inode-pct 101 \
+          --max-c4242-mib 1 2>/dev/null)
+assert_contains "#1772: the pre-#1772 flag shape (--max-c<uid>-mib) is still accepted" "$out" "c4242 holds"
+rm -rf "$_s1772"
 
 # Census: the assertion total is pinned EXACTLY (count=exact in
 # summary-honesty.manifest), counted BEFORE this census assertion itself.

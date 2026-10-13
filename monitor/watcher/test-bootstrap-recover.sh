@@ -1971,6 +1971,203 @@ else
 fi
 cleanup_case
 
+# --- Case 41: an interrupted walk's queue survives the next boot -------------
+# 2026-10-12 (RO8): a --continue recovery was resuming 12 workers when a
+# read-only incident hit; the next boot's plan listed 4, because the
+# relaunched watcher had rewritten last-snapshot.txt from live tmux mid-walk
+# and the plan was rebuilt from that alone. Boot 1 here: 5 workers, the
+# walk is KILLED (SIGKILL on its owner pid, so no trap and no finish) on the
+# 3rd resume. The watcher's snapshot then holds only the 2 that came up, and
+# the sandbox restart empties tmux. Boot 2 must still plan — and resume —
+# the 3 unreached workers.
+echo '=== case 41: boot 2 keeps the unfinished plan queue of an interrupted boot 1 ==='
+build_case 41
+seed_healthy_watcher
+seed_snapshot w-a w-b w-c w-d w-e
+for w41 in w-a w-b w-c w-d w-e; do log_event spawn "$w41"; done
+# Resolver half identical to write_spawn_worker_stub; the resume half
+# creates the window, except on the INTERRUPT_AT-th call, where it kills the
+# recovery that owns the plan (its pid is the plan's owner field).
+cat > "$ROOT/monitor/spawn-worker.sh" <<SW
+#!/usr/bin/env bash
+for a in "\$@"; do
+    if [ "\$a" = "--dry-run" ]; then
+        printf 'resolved: window=%s session=sid-%s workdir=%s jsonl=%s nudge=off (heartbeat-absent)\n' \\
+            "\$2" "\$2" "$ROOT/work/\$2" "$ROOT/work/\$2/t.jsonl"
+        exit 0
+    fi
+done
+n=\$(( \$(cat "$ROOT/resume.count" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "$ROOT/resume.count"
+echo "\$*" >> "$SPAWN_CALLS"
+if [ -f "$ROOT/interrupt-at" ] && [ "\$n" = "\$(cat "$ROOT/interrupt-at")" ]; then
+    owner=\$(awk -F'\t' 'NR == 1 { print \$2 }' "$ROOT/monitor/.state/auto-continue-plan.tsv")
+    kill -9 "\$owner"
+    exit 1
+fi
+tmux new-window -n "\$2"
+exit 0
+SW
+chmod +x "$ROOT/monitor/spawn-worker.sh"
+echo 3 > "$ROOT/interrupt-at"
+seed_boot_intent continue
+run_recover
+PLAN41="$ROOT/monitor/.state/auto-continue-plan.tsv"
+if [[ "$RC" == 137 ]] && grep -qP '^#owner\t[0-9]+\t[0-9]+\t[^\t]+\t[0-9]+\trunning\t' "$PLAN41" \
+   && [[ "$(cat "$SPAWN_CALLS")" == $'--resume w-a\n--resume w-b\n--resume w-c' ]]; then
+    pass "precondition: boot 1 was killed on its 3rd resume, plan left running"
+else
+    fail "precondition: rc=$RC calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] plan=$(cat "$PLAN41" 2>/dev/null)"
+fi
+# The watcher's last snapshot before the incident: only what came up. Then
+# the sandbox restart: tmux holds nothing of the old board.
+seed_snapshot w-a w-b
+grep -vxE 'w-[a-e]' "$WINDOWS" > "$WINDOWS.new"; mv "$WINDOWS.new" "$WINDOWS"
+rm -f "$ROOT/interrupt-at" "$ROOT/resume.count" "$SPAWN_CALLS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+AT41="$ROOT/plan-at-orch-spawn"
+miss41=""
+for w41 in w-c w-d w-e; do
+    grep -qP "^$w41\tsid-$w41\tpending\t" "$AT41" 2>/dev/null || miss41+=" $w41"
+done
+if [[ -z "$miss41" ]]; then
+    pass "boot 2's plan still lists the 3 unreached workers (w-c w-d w-e) as pending"
+else
+    fail "boot 2's plan lost:$miss41 — plan=$(cat "$AT41" 2>/dev/null || echo ABSENT)"
+fi
+calls41=$(cat "$SPAWN_CALLS" 2>/dev/null)
+miss41=""
+for w41 in w-a w-b w-c w-d w-e; do
+    grep -qx -- "--resume $w41" <<<"$calls41" || miss41+=" $w41"
+done
+if [[ -z "$miss41" ]] && grep -qP '^#owner\t.*\tdone\t' "$PLAN41" \
+   && ! grep -qP '\tpending\t' "$PLAN41"; then
+    pass "boot 2 resumed all 5 and finished its plan (no row left pending)"
+else
+    fail "boot 2 missed:$miss41 calls=[$calls41] plan=$(cat "$PLAN41")"
+fi
+# A FINISHED plan is not a queue: boot 3 with every window up writes none
+# and carries nothing.
+run_recover --services-only
+if [[ -z "$(cat "$SPAWN_CALLS" 2>/dev/null | sed -n '6,$p')" ]] \
+   && ! grep -q 'UNFINISHED auto-continue plan' "$ROOT/err"; then
+    pass "a done plan is not carried: boot 3 resumed nothing more"
+else
+    fail "boot 3: calls=[$(cat "$SPAWN_CALLS")] err=$(grep -i unfinished "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 41b: a drained queue is finished, not carried forever --------------
+# An unfinished plan (owner dead) whose every window is now up: this recovery
+# has nothing to plan, so it must mark that plan done with its own token.
+echo '=== case 41b: an unfinished plan whose windows are all up is marked done ==='
+build_case 41b
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-b
+echo w-a >> "$WINDOWS"; echo w-b >> "$WINDOWS"
+now41=$(date +%s)
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-a\tsid-w-a\tresumed\t1\tactive\nw-b\tsid-w-b\tpending\t1\tactive\n' "$now41" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qP "^#owner\t999999999\t1\ttok-old\t$now41\tdone\t" "$ROOT/monitor/.state/auto-continue-plan.tsv" \
+   && ! grep -q -- '--resume' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "queue is drained" "$ROOT/err"; then
+    pass "drained: the prior plan is marked done, nothing resumed"
+else
+    fail "drained: plan=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv") calls=$(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 41c: a cold boot retires the unfinished plan with the snapshot -----
+# The carried windows are dropped workers too (named in the manifest), and the
+# plan is archived, so a later mid-life recovery cannot carry them back.
+echo '=== case 41c: cold boot drops the carried windows and archives the plan ==='
+build_case 41c
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(date +%s)" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+seed_boot_intent fresh
+run_recover
+run_recover --services-only
+if ! grep -q -- '--resume' "$SPAWN_CALLS" 2>/dev/null \
+   && [[ ! -e "$ROOT/monitor/.state/auto-continue-plan.tsv" ]] \
+   && compgen -G "$ROOT/monitor/.state/auto-continue-plan.tsv.archived.*" >/dev/null; then
+    pass "cold boot: nothing resumed (then or by the next mid-life run), plan archived"
+else
+    fail "cold boot: calls=$(cat "$SPAWN_CALLS" 2>/dev/null) state=$(ls "$ROOT/monitor/.state")"
+fi
+cleanup_case
+
+# --- Case 41d: a STALE unfinished plan is not a queue (#1810 skeptic F3) ----
+# A worker killed by hand long after the interrupted boot must not be
+# resurrected from that boot's plan. Over the age bound the plan carries
+# nothing and is marked done; inside it, the same plan is carried (control).
+echo '=== case 41d: an unfinished plan older than the age bound is not carried ==='
+build_case 41d
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 25200 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if ! grep -q -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q 'OLDER than 21600s' "$ROOT/err" \
+   && grep -qP '^#owner\t999999999\t1\ttok-old\t[0-9]+\tdone\t' "$ROOT/monitor/.state/auto-continue-plan.tsv"; then
+    pass "stale: a 7 h old plan is not carried (w-c not resumed) and is marked done"
+else
+    fail "stale: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] plan=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv") err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+build_case 41d2
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 3600 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qx -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null; then
+    pass "CONTROL fresh: a 1 h old unfinished plan IS carried (w-c resumed)"
+else
+    fail "CONTROL fresh: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 41e: carried windows do not reorder the snapshot's (#1810 F3) -----
+# Candidates walk in the snapshot's order, then each carried window in the
+# unfinished plan's row order. A `sort -u` over the union would walk
+# w-b w-m w-z; the stable order is w-m (snapshot), then w-z, w-b (plan rows).
+echo '=== case 41e: snapshot order first, then carried windows in plan order ==='
+build_case 41e
+seed_healthy_watcher
+seed_snapshot w-m
+for w41 in w-m w-z w-b; do log_event spawn "$w41"; done
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-z\tsid-w-z\tpending\t1\tactive\nw-b\tsid-w-b\tpending\t1\tactive\n' "$(date +%s)" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+seed_boot_intent continue
+run_recover
+if [[ "$(cat "$SPAWN_CALLS" 2>/dev/null)" == $'--resume w-m\n--resume w-z\n--resume w-b' ]]; then
+    pass "order: snapshot window first, then carried windows in plan row order"
+else
+    fail "order: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)]"
+fi
+cleanup_case
+
 # --- summary ----------------------------------------------------------------
 echo
 echo "passed=$PASS failed=$FAIL"

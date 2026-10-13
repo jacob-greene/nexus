@@ -55,7 +55,7 @@ way: `monitor/ng longjob add slurm:<jobid> --desc "…"`.
 | `slurm:` | job id | sacct reports any terminal state; UNKNOWN if never in accounting |
 | `asyncrun:` | async-run token | the runner wrote its status (`done` rc 0, `failed` otherwise, `failed\|died` if the pid vanished with no status) |
 | `pid:` | pid (start-time pinned at add) | the process is gone — **exit status NOT retained**; use `asyncrun:` when the rc matters |
-| `file:` | path, `--when exists\|grew\|match --pattern ERE` | the predicate holds |
+| `file:` | path, `--when exists\|grew\|match --pattern ERE [--fail-pattern ERE\|none]` | the predicate holds; for `match`, FAILED on a failure-arm line written after the add and before any success line (a default arm applies; `add` prints it) |
 | `cmd:` | a shell command line, re-run each poll | rc 0 done · 1 running · 2 failed · 3 unknown · other failed |
 
 Options: `--desc`, `--id`, `--interval S` (default 60), `--ttl S` (7 days),
@@ -64,6 +64,19 @@ the end), `--persistent` (emit on EVERY transition, never retire — the
 level-triggered tick shape), `--max-events N`, `--unknown-max N`.
 
 `ng longjob list | show <id> | rm <id> | events | status` read the spool.
+
+**A success-only `match` used to sleep through an abort** (2026-10-08: ~2 h on
+a deploy that ABORTed instead of printing its version stamp). `--when match`
+therefore ends FAILED on the first line, written after the add, that matches
+the failure arm (default in `monitor/longjob-probes.d/file.sh`:
+`LJ_FILE_FAIL_DEFAULT`, ABORT…/FATAL/ERROR/FAILED/Traceback/`error:`/`fatal:`),
+unless a success line came first. Lines already in the file at add time never
+count toward failure, and (since bundle 23) never toward success either: an old
+success line in an append-only log no longer reads `done` on the first probe.
+The one-shot `ng longjob probe` still reads the whole file unless you pass
+`--lines0 "$(wc -l < FILE)"`. A benign match costs one wake: re-add with a narrower
+`--fail-pattern`, or `--fail-pattern none` when you have a reason. Specs written
+before this arm existed keep no failure arm.
 
 ## What happens when the watch does NOT fire
 

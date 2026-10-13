@@ -565,6 +565,11 @@ FULL_STATE_CANONICAL_CACHE="${STATE_DIR}/last-full-state-canonical.txt"
 # `_full_state_effective_floor`. Survives restarts (missing ⇒ treated as
 # a fresh streak, so the heartbeat starts responsive after a cold start).
 FULL_STATE_IDLE_ANCHOR="${STATE_DIR}/last-full-state-change.ts"
+# Canonical of the last full-state body composed while the target was HELD
+# (over-limit, /login) and so never pasted (your-org/nexus-code#1770). While
+# held, the backoff compares against THIS, because the emitted cache above
+# stops aging with no paste. Removed by the first successful paste.
+FULL_STATE_HELD_CACHE="${STATE_DIR}/last-full-state-held-canonical.txt"
 # Per-window streak of consecutive full-state polls whose row carried a
 # pane-state READ FAILED (`<window>\t<polls>`), and the set that had reached
 # MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS when the cached canonical was
@@ -1448,10 +1453,16 @@ _bounded_failure_log() {
     # for and a label is not an observation. The two labels are mutually
     # exclusive by construction — one per arm — so the distinction is carried by
     # the label as well as by the text.
+    # The 1-min load average rides on the line (your-org/nexus-code#1698
+    # residual): render cost scales with load, and an investigation without
+    # it has to reconstruct load from elsewhere. Read with the builtin — no
+    # fork on a path that has just run out of time.
+    local _bfl_load="" _bfl_rest
+    { read -r _bfl_load _bfl_rest < /proc/loadavg; } 2>/dev/null || _bfl_load=""
     if (( rc == 124 )); then
-        log "WARN ${ctx}: ${what} TIMED OUT — exceeded ${budget}s and was killed (rc 124); using partial (${cons})"
+        log "WARN ${ctx}: ${what} TIMED OUT — exceeded ${budget}s and was killed (rc 124); using partial (${cons}); load1=${_bfl_load:-?}"
     else
-        log "WARN ${ctx}: ${what} RENDER FAILED — FAILED with rc ${rc} — NOT a timeout, it did not reach the ${budget}s budget; using partial (${cons})"
+        log "WARN ${ctx}: ${what} RENDER FAILED — FAILED with rc ${rc} — NOT a timeout, it did not reach the ${budget}s budget; using partial (${cons}); load1=${_bfl_load:-?}"
     fi
     return 0
 }
@@ -4193,6 +4204,7 @@ bump_heartbeat
 #   target_window          @ 2s    sync   cheap     probe + respawn trigger
 #   orchestrator_liveness  @ 5s    sync   cheap     state machine; spawn forked
 #   pending_decisions      @ 10s   sync   cheap     render_pending_decisions
+#   decision_surface       @ 5s    async  medium    urgent dangerous-rm fast paste (#1768)
 #   bell_windows           @ 30s   sync   cheap     list_bell_windows
 #   detect_unstick         @ 10s   async  medium    detect_and_unstick
 #   snapshot_local         @ 30s   async  medium    snapshot_local
@@ -5051,6 +5063,89 @@ _v2_task_comment_surface() {
     return 0
 }
 
+# _decision_surface_record <rendered-blocks> <surfaced-file> — rewrite the
+# fast-pasted set as the (window, fp) of every block rendered this fire.
+_decision_surface_record() {
+    # The tmp name is fixed BEFORE the redirect: a redirection on an external
+    # command expands in the forked child, where $BASHPID is the child's pid.
+    local tmp="$2.tmp.$BASHPID"
+    awk '/^window=/ { w = $1; f = $2; sub(/^window=/, "", w); sub(/^fp=/, "", f); print w "\t" f }' \
+        <<<"$1" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$2" 2>/dev/null \
+        || rm -f "$tmp" 2>/dev/null
+}
+
+# Sweep-independent URGENT-decision surfacing (your-org/nexus-code#1768).
+# A worker's forwarded dangerous-rm request (#1632) blocks that worker until
+# the orchestrator answers, and its hook DENIES at a deadline (100 s) inside
+# Claude Code's 2-minute countdown — the countdown is the hard cap, so the
+# deadline cannot be lengthened under load. Riding in the compose_emit body
+# put the paste behind the full-state, prelude and compose_report renders
+# (each bounded at 20 s + 2 s per window), and the request reached the
+# orchestrator with ~55 s left. Same shape as `_v2_task_comment_surface`
+# (#562): render the open requests with no pane probe and paste a MINIMAL
+# emit. Each request is fast-pasted ONCE (a successful paste records it in
+# `urgent-decisions-surfaced.tsv`); compose_emit keeps carrying the row every
+# render as before, so this path only moves the first sight earlier.
+_v2_task_decision_surface() {
+    local urgent
+    urgent=$(render_urgent_decisions 2>/dev/null || true)
+    local surfaced="$STATE_DIR/urgent-decisions-surfaced.tsv"
+    if [[ -z "$urgent" ]]; then
+        rm -f "$surfaced" 2>/dev/null || true
+        return 0
+    fi
+    # Keep the blocks whose (window, fp) has not been fast-pasted yet.
+    local fresh
+    fresh=$(awk -v seen="$surfaced" '
+        BEGIN { while ((getline l < seen) > 0) done[l] = 1 }
+        /^window=/ { w = $1; f = $2; sub(/^window=/, "", w); sub(/^fp=/, "", f)
+                     keep = !((w "\t" f) in done) }
+        keep' <<<"$urgent")
+    [[ -n "$fresh" ]] || return 0
+    # A HELD target cannot answer: write nothing, so the next fire after the
+    # hold lifts pastes it. The compose body records the hold (and carries
+    # the row) — repeating that here every 5 s would add only noise.
+    if _over_limit_orchestrator_paused || _auth_hold_active; then
+        log "decision-surface: paste held (target over-limit or in /login); the next fire retries"
+        return 0
+    fi
+    _ensure_watcher_tmp_dir
+    local sig_nonce emit_file="${tmp_dir}/decision-surface.$BASHPID"
+    sig_nonce=$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 6)
+    {
+        printf '=== nexus state changed at %s (urgent-decision) ===\n' "$(date -Is)"
+        printf '*If unsure how to proceed: see CLAUDE.md.*\n'
+        printf -- '--- pending decisions ---\n'
+        printf '%s\n' "$fresh"
+        printf '(read the cited file for full JSON; ack by removing it once answered)\n'
+        printf -- '--- nexus-emit-sig %s %s ---\n' "$(date -Is)" "$sig_nonce"
+    } > "$emit_file"
+    local archive_path
+    archive_path=$(archive_emit "$emit_file" "urgent-decision")
+    log "emit archive=$(basename "$archive_path") reason=urgent-decision (decision-surface fast path)"
+    if paste_with_retry "$TARGET" "$emit_file"; then
+        log "pasted to ${TARGET} (decision-surface)"
+        # Not recorded in the dedup ring: every body here is unique per
+        # request, and an entry would only evict a compose body's hash.
+        _emit_delivery_ok
+        # Every open request is now surfaced; rows that closed drop out here.
+        _decision_surface_record "$urgent" "$surfaced"
+    else
+        local rc=$?
+        _emit_delivery_fail "$rc"
+        if (( rc == 4 )); then
+            # The Enter went out (#1539): record it as surfaced, never re-paste.
+            log "decision-surface: paste submitted but signature not visible; NOT re-pasted"
+            _decision_surface_record "$urgent" "$surfaced"
+        else
+            log "decision-surface: paste failed (rc=$rc); archive only — the next fire retries"
+        fi
+    fi
+    rm -f "$emit_file" 2>/dev/null || true
+    return 0
+}
+
 _v2_task_compose_emit() {
     local stage_dir="$V2_STAGE_DIR"
     local local_snapshot="$stage_dir/snapshot_local.out"
@@ -5127,6 +5222,14 @@ _v2_task_compose_emit() {
         _idle_live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
         if [[ -n "$_idle_live" ]]; then
             idle_now=$(printf '%s' "$idle_now" | _idle_restat_live_windows "$_idle_live")
+            # A section left holding ONLY WITHHELD notes has nothing live to
+            # act on; as a trigger it re-pasted a retired window's retained
+            # footer every compose (your-org/nexus-code b1). Drop it.
+            if declare -F _idle_section_is_withheld_only >/dev/null 2>&1 \
+               && printf '%s\n' "$idle_now" | _idle_section_is_withheld_only; then
+                log "idle section: every row/footer entry WITHHELD (windows gone) — not an emit reason: $(printf '%s' "$idle_now" | tr '\n' ' ' | cut -c1-200)"
+                idle_now=""
+            fi
         fi
     fi
     pending_now=$(cat "$stage_dir/pending_decisions.out" 2>/dev/null || true)
@@ -5134,8 +5237,10 @@ _v2_task_compose_emit() {
 
     # Full-state cadence + identity-check gate.
     local full_state_lines="" full_state_canonical="" full_state_due=0
+    local _fs_age="" _fs_raw="" _fs_live=""
     local last_full_ts now_ts canonical_prelude cached_canonical last_emit_mtime
     local _fs_idle_anchor _fs_idle_dur _fs_eff_floor
+    local _fs_held_cache="${FULL_STATE_HELD_CACHE:-${STATE_DIR}/last-full-state-held-canonical.txt}"
     if (( MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS > 0 )); then
         last_full_ts=0
         if [[ -f "$FULL_STATE_STAMP" ]]; then
@@ -5146,6 +5251,17 @@ _v2_task_compose_emit() {
         if (( now_ts - last_full_ts >= MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS )); then
             full_state_due=1
             full_state_lines=$(cat "$stage_dir/full_state_snap.out" 2>/dev/null || true)
+            # Render age of the SERVED snapshot (b2): the staged file is
+            # written by rename at render completion, so its mtime is when
+            # every row state was true. An inline render below resets it to 0.
+            _fs_age=""
+            if [[ -n "$full_state_lines" ]]; then
+                local _fs_mt
+                _fs_mt=$(date +%s -r "$stage_dir/full_state_snap.out" 2>/dev/null || echo "")
+                if [[ "$_fs_mt" =~ ^[0-9]+$ ]]; then
+                    _fs_age=$(( now_ts - _fs_mt )); (( _fs_age < 0 )) && _fs_age=0
+                fi
+            fi
             # Re-render inline if staging is empty (e.g. very first
             # compose_emit before full_state_snap async completed). These
             # renders probe every worker pane (O(workers)) and can stall under
@@ -5172,7 +5288,9 @@ _v2_task_compose_emit() {
                 _run_bounded "$_ce_to" "$_ce_tmp" render_full_state_snapshot || _ce_rc=$?
                 _bounded_failure_log "$_ce_rc" "$_ce_to" compose_emit "inline full-state render" "cycle NOT blocked"
                 full_state_lines=$(cat "$_ce_tmp" 2>/dev/null || true)
+                _fs_age=0
             fi
+            _fs_raw="$full_state_lines"
             # Stale-snapshot re-stat (watcher-emit-noise, Class 1). The
             # staged full_state_snap.out is up to one async cadence
             # (600s) old, so a window killed since it was rendered
@@ -5181,7 +5299,6 @@ _v2_task_compose_emit() {
             # presents a retired window as live. Cheap (one tmux call);
             # queried once here and reused. Knob-guarded, default on.
             if [[ -n "$full_state_lines" && "${MONITOR_FULL_STATE_RESTAT_WINDOWS:-true}" == "true" ]]; then
-                local _fs_live
                 _fs_live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
                 if [[ -n "$_fs_live" ]]; then
                     full_state_lines=$(printf '%s' "$full_state_lines" \
@@ -5235,8 +5352,25 @@ _v2_task_compose_emit() {
                     log "full-state: pane-state READ FAILED persisted ${MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS:-3}+ polls: $(printf '%s' "$_fs_rf_now" | tr '\n' ' ')"
                 fi
             fi
-            if [[ -f "$FULL_STATE_CANONICAL_CACHE" ]]; then
-                cached_canonical=$(cat "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || true)
+            # THE BACKOFF HOLDS WHILE THE TARGET IS HELD (your-org/nexus-code#1770).
+            # A held body is archived but never pasted, so the emitted cache
+            # never ages and FULL_STATE_STAMP never resets: every due poll found
+            # the floor long elapsed and re-composed a `poll-full-state` body —
+            # 167 of them (~1/min) through one over-limit hold. While held,
+            # compare against the last HELD full-state canonical instead (written
+            # by the hold arms below): an unchanged board waits out the effective
+            # floor, an actionable change still composes at once. The emitted
+            # cache is untouched, so the first paste after the lift is judged
+            # against what the orchestrator actually last SAW. The held side is
+            # projected with the CURRENT persistent READ FAILED set: the emitted
+            # set describes the emitted cache, and mixing them would read as a
+            # change on every poll of the hold.
+            local _fs_cache="$FULL_STATE_CANONICAL_CACHE" _fs_rf_ref="$_fs_rf_then"
+            if [[ -f "$_fs_held_cache" ]] && { _over_limit_orchestrator_paused || _auth_hold_active; }; then
+                _fs_cache="$_fs_held_cache"; _fs_rf_ref="$_fs_rf_now"
+            fi
+            if [[ -f "$_fs_cache" ]]; then
+                cached_canonical=$(cat "$_fs_cache" 2>/dev/null || true)
                 # Compare the ACTIONABLE projections, not the canonicals
                 # (your-org/nexus-code#1736). The canonical carries every
                 # worker's busy/working-background/idle activity; a worker its
@@ -5255,14 +5389,14 @@ _v2_task_compose_emit() {
                 if declare -F _full_state_actionable_projection >/dev/null; then
                     _fs_proj_rc=0
                     _fs_proj_new=$(printf '%s\n' "$full_state_canonical" | _full_state_actionable_projection "$_fs_rf_now") || _fs_proj_rc=1
-                    _fs_proj_old=$(printf '%s\n' "$cached_canonical" | _full_state_actionable_projection "$_fs_rf_then") || _fs_proj_rc=1
+                    _fs_proj_old=$(printf '%s\n' "$cached_canonical" | _full_state_actionable_projection "$_fs_rf_ref") || _fs_proj_rc=1
                 fi
                 if (( _fs_proj_rc != 0 )) || [[ -z "$_fs_proj_new" && -n "$full_state_canonical" ]]; then
                     log "full-state: actionable projection unavailable (rc=${_fs_proj_rc}); comparing full canonicals"
                     _fs_proj_new="$full_state_canonical"; _fs_proj_old="$cached_canonical"
                 fi
                 if [[ "$_fs_proj_new" == "$_fs_proj_old" ]]; then
-                    last_emit_mtime=$(date +%s -r "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || echo 0)
+                    last_emit_mtime=$(date +%s -r "$_fs_cache" 2>/dev/null || echo 0)
                     [[ "$last_emit_mtime" =~ ^[0-9]+$ ]] || last_emit_mtime=0
                     # Adaptive idle backoff. The idle-streak anchor tracks when
                     # the canonical last CHANGED; the effective floor stretches
@@ -5308,6 +5442,19 @@ _v2_task_compose_emit() {
                     && mv "${FULL_STATE_IDLE_ANCHOR}.tmp" "$FULL_STATE_IDLE_ANCHOR" 2>/dev/null || true
             fi
         fi
+    fi
+
+    # SAY WHAT THE SERVED SNAPSHOT CANNOT KNOW (your-org/nexus-code b2): its
+    # render age, the dead rows the restat dropped, and live worker windows it
+    # has no row for. Appended AFTER the canonical and the backoff decision,
+    # so a ticking age never reads as a board change. Display-only.
+    if [[ -n "$full_state_lines" ]] && declare -F _full_state_reconcile_note >/dev/null 2>&1; then
+        local _fs_note _fs_workers=""
+        if [[ -n "$_fs_live" ]]; then
+            _fs_workers=$(_idle_list_worker_windows 2>/dev/null || true)
+        fi
+        _fs_note=$(_full_state_reconcile_note "$_fs_raw" "$_fs_live" "$_fs_workers" "$_fs_age" 2>/dev/null || true)
+        [[ -n "$_fs_note" ]] && full_state_lines+=$'\n'"$_fs_note"
     fi
 
     local local_diff=""
@@ -5487,6 +5634,11 @@ _v2_task_compose_emit() {
                 # first flushed emit (the resume brief) can point the
                 # operator at exactly what was withheld (your-nexus#275).
                 _over_limit_record_held "$(basename "$archive_path")" "$reason"
+                # The full-state backoff's reference while held (#1770).
+                if (( full_state_due == 1 )) && [[ -n "$full_state_canonical" ]]; then
+                    printf '%s' "$full_state_canonical" > "${_fs_held_cache}.tmp" 2>/dev/null \
+                        && mv "${_fs_held_cache}.tmp" "$_fs_held_cache" 2>/dev/null || true
+                fi
             # LOGIN HOLD (your-org/nexus-code#1518). A THIRD ARM in this ladder, and the
             # placement is the design: landing here means the hold inherits, by
             # construction, every stamp this arm does NOT reach — `_emit_delivery_ok`,
@@ -5505,8 +5657,14 @@ _v2_task_compose_emit() {
             elif _auth_hold_active; then
                 log "emit paste HELD: operator is in a /login flow on ${TARGET} — a paste's trailing Enter would answer the dialog and select a login method (your-org/nexus-code#1518). archive=$(basename "$archive_path") reason=${reason}"
                 _auth_hold_record_held "$(basename "$archive_path")" "$reason"
+                if (( full_state_due == 1 )) && [[ -n "$full_state_canonical" ]]; then
+                    printf '%s' "$full_state_canonical" > "${_fs_held_cache}.tmp" 2>/dev/null \
+                        && mv "${_fs_held_cache}.tmp" "$_fs_held_cache" 2>/dev/null || true
+                fi
             elif paste_with_retry "$TARGET" "$emit_body"; then
                 log "pasted to ${TARGET}"
+                # A paste landed: the hold (if any) is over (#1770).
+                rm -f "$_fs_held_cache" 2>/dev/null || true
                 _emit_delivery_ok
                 _compose_emit_record_emit "$emit_body"
                 # Delivery-stamp the request ids this paste actually
@@ -5663,6 +5821,9 @@ _schedule_task prune_archive           600          _v2_task_prune_archive      
 # Async tasks. Each output captured to <name>.out by
 # _scheduler_fire_async (atomic .tmp + rename).
 _schedule_task detect_unstick          10           _v2_task_detect_unstick         --class medium    --async
+# Urgent decisions bypass the compose body (your-org/nexus-code#1768): 5 s
+# cadence, a stat-only no-op unless a dangerous-rm request filed recently.
+_schedule_task decision_surface        5            _v2_task_decision_surface       --class medium    --async
 _schedule_task snapshot_local          30           _v2_task_snapshot_local         --class medium    --async
 _schedule_task idle_section            30           _v2_task_idle_section           --class expensive --async
 _schedule_task over_limit_scan         60           _v2_task_over_limit_scan        --class expensive --async

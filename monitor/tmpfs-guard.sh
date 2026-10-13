@@ -85,7 +85,7 @@
 #                  threshold and an honest name — never smuggled in as
 #                  "memory". This is where the old entry count's legitimate
 #                  half went.
-#   socket_root    non-socket payload in $ROOT/c71780. A CONTRACT violation
+#   socket_root    non-socket payload in $ROOT/c<uid>. A CONTRACT violation
 #                  (your-org/nexus-code#1422), NOT memory pressure — banded
 #                  `elevated` and never higher, so it cannot masquerade as
 #                  pressure. ON by default; `monitor.tmpfs.socket_root_is_trigger=0`
@@ -123,6 +123,17 @@
 #   high 65%       headroom to act.
 #   critical 80%   headroom to panic.
 #   mem_avail 15%  below this the NODE is short of memory, whoever caused it.
+#   mem_avail clear margin 3 points — HYSTERESIS (your-org/nexus-code#1766).
+#                  Once raised, node_memory clears only at threshold + margin
+#                  (18% by default), not the moment it reads one point above
+#                  the line: at exactly the line it flapped 6+ set/clear
+#                  cycles in 3 h on 2026-10-07, each one an alert. 3 is a
+#                  CHOSEN value, not a convention: wider than the observed
+#                  wobble, narrow enough that a real recovery clears within a
+#                  check or two. Knob `monitor.tmpfs.mem_available_clear_margin_pct`
+#                  / `--mem-avail-clear-margin-pct`; 0 restores the old
+#                  clear-at-the-line behaviour. The raised/clear state is the
+#                  guard's own file $STATE_DIR/tmpfs-guard.node_memory.raised.
 #   inode 60%      tmpfs inodes are bounded by memory too; 60% leaves room to
 #                  reap before allocation starts failing.
 #
@@ -142,7 +153,7 @@
 #   3. its basename matches a REGISTERED leak family (allowlist; a name the
 #      allowlist does not enumerate is never touched);
 #   4. it is not on the DENYLIST — names that hold live sockets or live
-#      sessions (c71780, claude-71780, tmux-*, .nexus-trash) are never touched
+#      sessions (c<uid>, claude-<uid>, tmux-*, .nexus-trash) are never touched
 #      whatever the allowlist says (deny arms precede allow arms; #1121);
 #   5. nothing inside it was modified within --older-than-hours (default 24);
 #   6. it contains NO socket file, bound or not — sockets are what the shared
@@ -207,8 +218,18 @@ WARN_PCT=""
 HIGH_PCT=""
 CRIT_PCT=""
 MEM_AVAIL_LOW_PCT=""
+MEM_AVAIL_CLEAR_MARGIN_PCT=""
 MAX_INODE_PCT=""
-MAX_C71780_MIB=""
+MAX_SOCKET_ROOT_MIB=""
+# The operator's short tmux socket dir is `$ROOT/c<uid>` (sockets only, #1422).
+# Its NAME is derived here, never written as a literal (your-org/nexus-code
+# #1772): a hardcoded uid made the socket_root check inert on every other
+# host AND left that host's own socket dir off the reaper's protect-list.
+# Unreadable uid: protect EVERY `c<digits>` dir rather than none, so the
+# error is a dir not reaped, never a live socket deleted.
+_TG_UID=$(id -u 2>/dev/null) || _TG_UID=""
+[[ "$_TG_UID" =~ ^[0-9]+$ ]] || _TG_UID=""
+SOCK_DIR_NAME="c${_TG_UID}"
 INTERVAL_S=""
 REAP_ENABLED=""
 INUSE_FILE=""      # test seam: a precomputed in-use list instead of a /proc walk
@@ -237,8 +258,9 @@ while [ $# -gt 0 ]; do
         --high-pct) HIGH_PCT="${2:?}"; shift 2 ;;
         --critical-pct) CRIT_PCT="${2:?}"; shift 2 ;;
         --mem-avail-low-pct) MEM_AVAIL_LOW_PCT="${2:?}"; shift 2 ;;
+        --mem-avail-clear-margin-pct) MEM_AVAIL_CLEAR_MARGIN_PCT="${2:?}"; shift 2 ;;
         --max-inode-pct) MAX_INODE_PCT="${2:?}"; shift 2 ;;
-        --max-c71780-mib) MAX_C71780_MIB="${2:?}"; shift 2 ;;
+        --max-socket-root-mib|--max-c[0-9]*-mib) MAX_SOCKET_ROOT_MIB="${2:?}"; shift 2 ;;
         --interval-seconds) INTERVAL_S="${2:?}"; shift 2 ;;
         --trash-days) TRASH_DAYS="${2:?}"; shift 2 ;;
         --inuse-file) INUSE_FILE="${2:?}"; shift 2 ;;
@@ -270,14 +292,17 @@ WARN_PCT="${WARN_PCT:-$(cfg monitor.tmpfs.pressure_warn_pct 50)}"
 HIGH_PCT="${HIGH_PCT:-$(cfg monitor.tmpfs.pressure_high_pct 65)}"
 CRIT_PCT="${CRIT_PCT:-$(cfg monitor.tmpfs.pressure_critical_pct 80)}"
 MEM_AVAIL_LOW_PCT="${MEM_AVAIL_LOW_PCT:-$(cfg monitor.tmpfs.mem_available_low_pct 15)}"
+MEM_AVAIL_CLEAR_MARGIN_PCT="${MEM_AVAIL_CLEAR_MARGIN_PCT:-$(cfg monitor.tmpfs.mem_available_clear_margin_pct 3)}"
 MAX_INODE_PCT="${MAX_INODE_PCT:-$(cfg monitor.tmpfs.max_inode_use_pct 60)}"
-MAX_C71780_MIB="${MAX_C71780_MIB:-$(cfg monitor.tmpfs.max_c71780_payload_mib 2048)}"
+# The pre-#1772 key embedded the uid; it is still read (built at run time),
+# so an existing config keeps its value. The uid-free key wins.
+MAX_SOCKET_ROOT_MIB="${MAX_SOCKET_ROOT_MIB:-$(cfg monitor.tmpfs.max_socket_root_payload_mib "$(cfg "monitor.tmpfs.max_c${_TG_UID}_payload_mib" 2048)")}"
 # ON by default — see the socket_root note in the header. Set to 0 to silence
 # it without a code change.
 SOCKET_ROOT_TRIGGER="${SOCKET_ROOT_TRIGGER:-$(cfg monitor.tmpfs.socket_root_is_trigger 1)}"
 INTERVAL_S="${INTERVAL_S:-$(cfg monitor.tmpfs.reap_interval_seconds 3600)}"
 TRASH_DAYS="${TRASH_DAYS:-$(cfg monitor.tmpfs.trash_days 7)}"
-for v in OLDER_H WARN_PCT HIGH_PCT CRIT_PCT MEM_AVAIL_LOW_PCT MAX_INODE_PCT MAX_C71780_MIB SOCKET_ROOT_TRIGGER INTERVAL_S TRASH_DAYS; do
+for v in OLDER_H WARN_PCT HIGH_PCT CRIT_PCT MEM_AVAIL_LOW_PCT MEM_AVAIL_CLEAR_MARGIN_PCT MAX_INODE_PCT MAX_SOCKET_ROOT_MIB SOCKET_ROOT_TRIGGER INTERVAL_S TRASH_DAYS; do
     eval "x=\$$v"
     case "$x" in ''|*[!0-9]*) die "$v must be a non-negative integer (got '$x')" ;; esac
 done
@@ -352,8 +377,13 @@ REAP_FAMILIES="${TMPFS_REAP_FAMILIES:-$(cfg monitor.tmpfs.reap_families "$REAP_F
 
 # The denylist: never touched, whatever the allowlist says. Checked FIRST.
 is_denied() {   # <basename>
+    if [[ -n "$_TG_UID" ]]; then
+        case "$1" in "$SOCK_DIR_NAME"|"$SOCK_DIR_NAME"-*) return 0 ;; esac
+    else
+        case "$1" in c[0-9]*) return 0 ;; esac
+    fi
     case "$1" in
-        c71780|c71780-*|claude-*|tmux-*|.nexus-trash|.X11-unix|.ICE-unix|.font-unix|systemd-*) return 0 ;;
+        claude-*|tmux-*|.nexus-trash|.X11-unix|.ICE-unix|.font-unix|systemd-*) return 0 ;;
     esac
     return 1
 }
@@ -612,7 +642,7 @@ growth_line() {
 ATTRIB_TIMEOUT_S="${ATTRIB_TIMEOUT_S:-120}"
 # EVERY WALK IN --check IS BOUNDED, AND A WALK THAT DID NOT FINISH SAYS SO
 # (your-org/nexus-code#1601). The depth-1 walks of $ROOT (the entry count, the
-# attribution metadata) and of c71780 had no time limit; on 2026-09-21 a /tmp of
+# attribution metadata) and of c<uid> had no time limit; on 2026-09-21 a /tmp of
 # 15,234 depth-1 entries under load ~30 made `--check`, and with it
 # `svc.sh status`, stop returning. A walk bounded by `timeout` and then READ AS
 # COMPLETE is the other half of the same defect: its output is truncated at
@@ -625,7 +655,7 @@ ATTRIB_TIMEOUT_S="${ATTRIB_TIMEOUT_S:-120}"
 # CHECK_WALK_TIMEOUT_S — CHOSEN default 20 s for each DEPTH-1 walk: the 76,453-
 # entry /tmp measured above took under 1 s, so 20 s is a >20x margin under load
 # while keeping the whole check inside a caller's bound (svc.sh status: 20 s per
-# row; the watcher: 60 s). The recursive c71780 payload walk and the attribution
+# row; the watcher: 60 s). The recursive c<uid> payload walk and the attribution
 # `du` keep ATTRIB_TIMEOUT_S; only their TRUNCATION is new here.
 CHECK_WALK_TIMEOUT_S="${CHECK_WALK_TIMEOUT_S:-20}"
 [[ "$CHECK_WALK_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] || CHECK_WALK_TIMEOUT_S=20
@@ -639,7 +669,11 @@ _families_ere() {   # REAP_FAMILIES is space-separated anchored EREs; awk wants 
     for re in $REAP_FAMILIES; do out="${out:+$out|}($re)"; done
     printf '%s' "${out:-^$}"
 }
-_deny_ere() { printf '%s' '^(c71780|c71780-.*|claude-.*|tmux-.*|\.nexus-trash|\.X11-unix|\.ICE-unix|\.font-unix|systemd-.*)$'; }
+_deny_ere() {   # the same set as is_denied; the uid part is digits only, so it needs no escaping
+    local _sock='c[0-9]+|c[0-9]+-.*'
+    [[ -n "$_TG_UID" ]] && _sock="${SOCK_DIR_NAME}|${SOCK_DIR_NAME}-.*"
+    printf '^(%s|claude-.*|tmux-.*|\\.nexus-trash|\\.X11-unix|\\.ICE-unix|\\.font-unix|systemd-.*)$' "$_sock"
+}
 
 attribution_block() {   # <root> <top-n> — renders indented lines on stdout
     local root="$1" top="${2:-8}" work rc=0 nl_count total rb rn cutoff
@@ -770,9 +804,26 @@ do_check() {
         detail+=("tmp_capacity: $ROOT is ${used_pct}% FULL — $(human_kb "$used_kb") of $(human_kb "$size_kb") (warn ${WARN_PCT}% / high ${HIGH_PCT}% / critical ${CRIT_PCT}%). This mount is tmpfs, so those bytes ARE the node's RAM: ${tmp_of_ram_pct:-?}% of MemTotal.")
         [ "$b_cap" -gt "$band" ] && band="$b_cap"
     fi
-    if [[ "$mem_avail_pct" =~ ^[0-9]+$ ]] && [ "$mem_avail_pct" -le "$MEM_AVAIL_LOW_PCT" ]; then
+    # HYSTERESIS (your-org/nexus-code#1766): raise at <= threshold; once
+    # raised, hold until >= threshold + margin. The previous state is this
+    # guard's own marker file. An UNMEASURABLE reading leaves the marker as it
+    # was — "could not read" is neither a raise nor a recovery.
+    local mem_raised_f="$STATE_DIR/tmpfs-guard.node_memory.raised" mem_held=""
+    if [[ "$mem_avail_pct" =~ ^[0-9]+$ ]]; then
+        if [ "$mem_avail_pct" -le "$MEM_AVAIL_LOW_PCT" ]; then
+            mem_held=raised
+        elif [ -e "$mem_raised_f" ] && [ "$mem_avail_pct" -lt $(( MEM_AVAIL_LOW_PCT + MEM_AVAIL_CLEAR_MARGIN_PCT )) ]; then
+            mem_held=held
+        fi
+        if [ -n "$mem_held" ]; then
+            mkdir -p "$STATE_DIR" 2>/dev/null && : > "$mem_raised_f" 2>/dev/null
+        else
+            rm -f -- "$mem_raised_f" 2>/dev/null
+        fi
+    fi
+    if [ -n "$mem_held" ]; then
         conds+=("node_memory"); cond_pairs+=("node_memory=high")
-        detail+=("node_memory: only ${mem_avail_pct}% of MemTotal is available ($(human_kb "$mem_avail") of $(human_kb "$mem_total")); Shmem is $(human_kb "$shmem") (${shmem_pct:-?}% of MemTotal). The NODE is short of memory — read the owner roll-up below BEFORE assuming it is ours.")
+        detail+=("node_memory: only ${mem_avail_pct}% of MemTotal is available ($(human_kb "$mem_avail") of $(human_kb "$mem_total")); Shmem is $(human_kb "$shmem") (${shmem_pct:-?}% of MemTotal). The NODE is short of memory — read the owner roll-up below BEFORE assuming it is ours.$( [ "$mem_held" = held ] && printf ' STILL RAISED by hysteresis: above the %s%% line, but it clears only at %s%% or more (margin %s points, your-org/nexus-code#1766).' "$MEM_AVAIL_LOW_PCT" "$(( MEM_AVAIL_LOW_PCT + MEM_AVAIL_CLEAR_MARGIN_PCT ))" "$MEM_AVAIL_CLEAR_MARGIN_PCT" )")
         [ "$BAND_HIGH" -gt "$band" ] && band="$BAND_HIGH"
     fi
     if [[ "$inode_pct" =~ ^[0-9]+$ ]] && [ "$inode_pct" -ge "$MAX_INODE_PCT" ]; then
@@ -785,28 +836,28 @@ do_check() {
     # violation stays VISIBLE either way; what it no longer does is wake the
     # orchestrator on its own while the mount it lives on is nine-tenths free.
     local socket_over=0 c_partial=''
-    if [ -d "$ROOT/c71780" ]; then
+    if [ -d "$ROOT/$SOCK_DIR_NAME" ]; then
         local c_bytes c_rc=0 ce_rc=0 c_ge=''
         # THE PAYLOAD SUM IS A LOWER BOUND WHEN ITS WALK TIMES OUT (#1601): awk
         # sums whatever `find` printed before the kill, and printed it at rc 0.
         # Taken from `find`'s OWN status (PIPESTATUS[0]), not the pipeline's.
-        c_bytes=$(timeout -k 2 "$ATTRIB_TIMEOUT_S" find "$ROOT/c71780" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
+        c_bytes=$(timeout -k 2 "$ATTRIB_TIMEOUT_S" find "$ROOT/$SOCK_DIR_NAME" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
                   exit "${PIPESTATUS[0]}") || c_rc=$?
         [[ "$c_bytes" =~ ^[0-9]+$ ]] && c_mib=$(( c_bytes / 1048576 ))
         if _timed_out "$c_rc"; then
-            c_partial="the c71780 payload walk did not finish within ${ATTRIB_TIMEOUT_S}s (rc ${c_rc}); ${c_mib:-?} MiB is a LOWER BOUND, not a measurement"
+            c_partial="the $SOCK_DIR_NAME payload walk did not finish within ${ATTRIB_TIMEOUT_S}s (rc ${c_rc}); ${c_mib:-?} MiB is a LOWER BOUND, not a measurement"
             c_ge='AT LEAST '
         fi
-        c_entries=$(timeout -k 2 "$CHECK_WALK_TIMEOUT_S" find "$ROOT/c71780" -mindepth 1 -maxdepth 1 -printf '.' 2>/dev/null | wc -c
+        c_entries=$(timeout -k 2 "$CHECK_WALK_TIMEOUT_S" find "$ROOT/$SOCK_DIR_NAME" -mindepth 1 -maxdepth 1 -printf '.' 2>/dev/null | wc -c
                     exit "${PIPESTATUS[0]}") || ce_rc=$?
         _timed_out "$ce_rc" && c_entries=''
         # A lower bound over the limit is still over it; one under the limit
         # decides nothing and is reported below as UNDECIDED, never as clear.
-        if [[ "$c_mib" =~ ^[0-9]+$ ]] && [ "$c_mib" -gt "$MAX_C71780_MIB" ]; then
+        if [[ "$c_mib" =~ ^[0-9]+$ ]] && [ "$c_mib" -gt "$MAX_SOCKET_ROOT_MIB" ]; then
             socket_over=1
             if [ "$SOCKET_ROOT_TRIGGER" = 1 ]; then
                 conds+=("socket_root"); cond_pairs+=("socket_root=elevated")
-                detail+=("socket_root: $ROOT/c71780 holds ${c_ge}${c_mib} MiB of non-socket payload (limit ${MAX_C71780_MIB} MiB). A CONTRACT violation, NOT memory pressure (your-org/nexus-code#1422): that directory has a short name for the 107-byte sun_path limit and holds sockets and nothing else. Re-derived 2026-09-08: the payload is 100% ours, entirely STALE (0 of ${c_entries:-?} top-level entries modified in 24 h) and concentrated. Silence it with monitor.tmpfs.socket_root_is_trigger=0; it is banded 'elevated' and never higher, so it can never read as pressure.")
+                detail+=("socket_root: $ROOT/$SOCK_DIR_NAME holds ${c_ge}${c_mib} MiB of non-socket payload (limit ${MAX_SOCKET_ROOT_MIB} MiB). A CONTRACT violation, NOT memory pressure (your-org/nexus-code#1422): that directory has a short name for the 107-byte sun_path limit and holds sockets and nothing else. Re-derived 2026-09-08: the payload is 100% ours, entirely STALE (0 of ${c_entries:-?} top-level entries modified in 24 h) and concentrated. Silence it with monitor.tmpfs.socket_root_is_trigger=0; it is banded 'elevated' and never higher, so it can never read as pressure.")
                 [ "$BAND_ELEVATED" -gt "$band" ] && band="$BAND_ELEVATED"
             fi
         fi
@@ -815,7 +866,7 @@ do_check() {
     if [ "$band" -eq "$BAND_OK" ]; then
         [ "$QUIET" = 1 ] || printf 'tmpfs-guard: healthy: %s used=%s%% (%s of %s) inodes=%s%% mem-avail=%s%% | context only: entries=%s th-files=%s%s\n' \
             "$ROOT" "$used_pct" "$(human_kb "$used_kb")" "$(human_kb "$size_kb")" "${inode_pct:-?}" "${mem_avail_pct:-?}" "$entries" "$th" \
-            "$( [ "$socket_over" = 1 ] && printf ' | NOTE c71780 holds %s%s MiB of non-socket payload (contract limit %s MiB, your-org/nexus-code#1422) — reported here rather than raised, because monitor.tmpfs.socket_root_is_trigger is 0' "${c_ge:-}" "$c_mib" "$MAX_C71780_MIB" )$( [ -n "$c_partial" ] && [ "$socket_over" = 0 ] && printf ' | PARTIAL: %s, so the socket_root contract check is UNDECIDED this run (your-org/nexus-code#1601)' "$c_partial" )"
+            "$( [ "$socket_over" = 1 ] && printf ' | NOTE %s holds %s%s MiB of non-socket payload (contract limit %s MiB, your-org/nexus-code#1422) — reported here rather than raised, because monitor.tmpfs.socket_root_is_trigger is 0' "$SOCK_DIR_NAME" "${c_ge:-}" "$c_mib" "$MAX_SOCKET_ROOT_MIB" )$( [ -n "$c_partial" ] && [ "$socket_over" = 0 ] && printf ' | PARTIAL: %s, so the socket_root contract check is UNDECIDED this run (your-org/nexus-code#1601)' "$c_partial" )"
         return 0
     fi
 
@@ -856,7 +907,7 @@ do_check() {
         printf '  top families BY BYTES (never by count — ranking by count is the defect this replaced):\n'
         attribution_block "$ROOT" 8
         printf '  DIAGNOSTIC CONTEXT (decides nothing; here because it is useful once you already know there is pressure): depth-1 entries excluding .th-* = %s; .th-ledger/.th-ports helper files = %s.\n' "$entries" "$th"
-        [ "$socket_over" = 1 ] && printf '  DIAGNOSTIC CONTEXT: %s/c71780 holds %s%s MiB of non-socket payload against a %s MiB contract limit (your-org/nexus-code#1422). Not a trigger unless armed; its bytes are already counted in tmp_capacity above.\n' "$ROOT" "${c_ge:-}" "$c_mib" "$MAX_C71780_MIB"
+        [ "$socket_over" = 1 ] && printf '  DIAGNOSTIC CONTEXT: %s/%s holds %s%s MiB of non-socket payload against a %s MiB contract limit (your-org/nexus-code#1422). Not a trigger unless armed; its bytes are already counted in tmp_capacity above.\n' "$ROOT" "$SOCK_DIR_NAME" "${c_ge:-}" "$c_mib" "$MAX_SOCKET_ROOT_MIB"
         [ -n "$c_partial" ] && printf '  PARTIAL: %s%s (your-org/nexus-code#1601).\n' "$c_partial" "$( [ "$socket_over" = 0 ] && printf ' — the socket_root contract check is UNDECIDED this run' )"
         printf '  remedy: this is a READ-ONLY monitor. Inspect with `monitor/tmpfs-guard.sh --status --root %s`; reaping is NOT armed (your-org/nexus-code#957) and `--reap --dry-run` prints a plan without removing anything.\n' "$ROOT"
     } | emit_both

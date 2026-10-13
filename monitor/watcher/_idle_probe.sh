@@ -61,7 +61,7 @@
 # `#{window_activity}` on any output change in the pane —
 # autosuggest re-renders, cursor blinks, spinner glyph swaps, the
 # status-bar token counter ticking. None of those are engagement.
-# Empirical confirmation on `echo-density` (issue #111): retain.ts
+# Empirical confirmation on `proj-density` (issue #111): retain.ts
 # at 12:43:01, no human/agent input for 18 minutes, yet
 # `#{window_activity}` advanced to 13:00:50 — pane-state at that
 # moment was `autosuggest-only`. So `window_activity > retain.ts`
@@ -832,12 +832,32 @@ _idle_render_probe_seconds_left() {
     printf '%s' "$(( MONITOR_RENDER_PROBE_DEADLINE - _n ))"
 }
 
-# _idle_render_loop_expired — the loop deadline is armed and has passed.
+# _idle_render_loop_expired [reserve] — the loop deadline is armed and has
+# passed, or would pass within <reserve> seconds (default 0): the caller's
+# estimate of what one more window body costs.
 _idle_render_loop_expired() {
     _idle_render_deadline_active || return 1
     [[ "${MONITOR_RENDER_LOOP_DEADLINE:-}" =~ ^[0-9]+$ ]] || return 1
-    local _n; _idle_render_now _n
-    (( _n >= MONITOR_RENDER_LOOP_DEADLINE ))
+    local _n _r="${1:-0}"; _idle_render_now _n
+    [[ "$_r" =~ ^[0-9]+$ ]] || _r=0
+    (( _n + _r >= MONITOR_RENDER_LOOP_DEADLINE ))
+}
+
+# _idle_render_rotate_path — where the deadline-armed render keeps the offset
+# its next render starts from (skeptic F5 on your-org/nexus-code#1799).
+# MONITOR_RENDER_ROTATE_FILE overrides. Best-effort both ways: a missing,
+# unreadable or garbled file reads as 0, a failed write is ignored.
+_idle_render_rotate_path() {
+    printf '%s' "${MONITOR_RENDER_ROTATE_FILE:-${STATE_DIR:-$(_ip_nostate_dir)}/prelude-render-offset}"
+}
+_idle_render_rotate_read() {
+    local _v=""
+    { IFS= read -r _v < "$(_idle_render_rotate_path)"; } 2>/dev/null
+    [[ "$_v" =~ ^[0-9]{1,6}$ ]] || _v=0
+    printf '%s' "$(( 10#$_v ))"
+}
+_idle_render_rotate_write() {
+    { printf '%s\n' "$1" > "$(_idle_render_rotate_path)"; } 2>/dev/null || true
 }
 
 # _idle_render_defer <name> <reason> — record a window the render skipped.
@@ -4307,12 +4327,55 @@ list_really_idle_workers() {
     fi
 
     local name activity_epoch window_index age pane_state pane_line pane_reset_at
+    # Body-aware loop stop (your-org/nexus-code#1698, residual). A window
+    # started just before the loop deadline used to run its WHOLE body —
+    # dozens of substitutions, action-log passes, a report-check fork — which
+    # no deadline covers and the fixed tail reserve cannot absorb under load.
+    # So each window's body is clocked from the top of one iteration to the
+    # top of the next (every `continue` path included), MINUS its pane-state
+    # probe, which is already time-sliced to the probe deadline. A window is
+    # not started unless the longest such body seen in this render (at least
+    # MONITOR_RENDER_WINDOW_FLOOR_SECONDS, default 1) still fits before the
+    # loop deadline; the tail reserve is already subtracted from that deadline.
+    # Whole-second clock: an estimate errs by < 1 s. Skipped windows are
+    # deferred `loop` exactly as before — counted unprobed, never classified.
+    local _rw_start="" _rw_probe=0 _rw_max=0 _rw_now _rw_t0 _rw_body
+    local _rw_floor="${MONITOR_RENDER_WINDOW_FLOOR_SECONDS:-1}"
+    [[ "$_rw_floor" =~ ^[0-9]+$ ]] || _rw_floor=1
+    # ROTATION (skeptic F5 on your-org/nexus-code#1799). The loop stop above
+    # defers the TAIL of the lister's order, and that order does not change
+    # between renders, so under sustained load the SAME last windows were
+    # `unprobed` every time. A deadline-armed render therefore starts where
+    # the previous one stopped: the offset is persisted in
+    # _idle_render_rotate_path, and an absent, unreadable or unwritable file
+    # just means offset 0 (the old order). Only the read-only, deadline-armed
+    # COUNT is rotated; the authoritative recorder keeps lister order.
+    local _rw_order="$worker_windows" _rw_off=0 _rw_n=0 _rw_seen=0 _rw_first_def=""
+    if _idle_render_deadline_active; then
+        _rw_n=$(printf '%s\n' "$worker_windows" | awk -F'\t' 'NF>0 && $1!="" {n++} END {print n+0}')
+        _rw_off=$(_idle_render_rotate_read)
+        if (( _rw_n > 1 && _rw_off % _rw_n > 0 )); then
+            _rw_order=$(printf '%s\n' "$worker_windows" | awk -F'\t' -v k=$(( _rw_off % _rw_n )) '
+                NF>0 && $1!="" { r[n++] = $0 }
+                END { for (i = 0; i < n; i++) print r[(i + k) % n] }')
+        fi
+    fi
     while IFS=$'\t' read -r name activity_epoch window_index; do
         [[ -n "$name" && "$activity_epoch" =~ ^[0-9]+$ ]] || continue
-        # Render deadline (#1698): past the loop deadline a window is not
-        # started at all; the prelude counts it unprobed, never classified.
-        if _idle_render_loop_expired; then
+        _rw_seen=$(( _rw_seen + 1 ))
+        _idle_render_now _rw_now
+        if [[ -n "$_rw_start" ]]; then
+            _rw_body=$(( _rw_now - _rw_start - _rw_probe ))
+            (( _rw_body > _rw_max )) && _rw_max="$_rw_body"
+        fi
+        _rw_start="$_rw_now"; _rw_probe=0
+        # Render deadline (#1698): past the loop deadline — or too close to it
+        # to finish one more body — a window is not started at all; the
+        # prelude counts it unprobed, never classified.
+        if _idle_render_loop_expired "$(( _rw_max > _rw_floor ? _rw_max : _rw_floor ))"; then
             _idle_render_defer "$name" loop
+            [[ -n "$_rw_first_def" ]] || _rw_first_def=$(( _rw_seen - 1 ))
+            _rw_start=""
             continue
         fi
 
@@ -4345,7 +4408,9 @@ list_really_idle_workers() {
         # spawning a second subprocess.
         local probe_target="${window_index:-$name}"
         local pane_orphan_kinds="" pane_content_hash="" pane_bg_cpu=""
+        _idle_render_now _rw_t0
         pane_line=$(_idle_pane_state_line "$probe_target" "$name")
+        _idle_render_now _rw_now; _rw_probe=$(( _rw_now - _rw_t0 ))
         if [[ "$pane_line" == probe=deferred* ]] && _idle_render_deadline_active; then
             _idle_render_defer "$name" "$(_idle_pane_line_field "$pane_line" probe_reason)"
             continue
@@ -5003,7 +5068,12 @@ list_really_idle_workers() {
         fi
 
         printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
-    done <<<"$worker_windows"
+    done <<<"$_rw_order"
+    # Next render starts at the first window this one did not start. A render
+    # that started everything leaves the offset where it was.
+    if [[ -n "$_rw_first_def" ]] && (( _rw_n > 0 )); then
+        _idle_render_rotate_write $(( (_rw_off + _rw_first_def) % _rw_n ))
+    fi
 
     # Persist `current ∪ engagement-log-keys-after-prune` for the
     # next cycle's disappearance check. The union makes the
@@ -5366,14 +5436,22 @@ render_idle_prelude() {
     # awk fallback uses numeric comparison too.
     local max_bytes="${MONITOR_NOTIFICATIONS_LOG_MAX_BYTES:-10485760}"
     _notifications_rotate_if_oversized "$max_bytes"
-    local stamp_path stamp_epoch n_awaiting now
+    #
+    # NO SCOPE ⇒ NO COUNT (your-org/nexus-code#1765). A missing, empty, torn
+    # or unparseable stamp used to fall back to since=0, which counts every
+    # distinct window the log has EVER seen ("2516 awaiting-input"). Without
+    # a readable scope there is no honest answer, so report 0 — the documented
+    # first-render behaviour — and let the stamp written below scope the next
+    # render. An epoch below 1e9 (2001) is a torn PREFIX of a real stamp, not
+    # a scope, and is refused the same way.
+    local stamp_path stamp_epoch="" n_awaiting=0 now
     stamp_path=$(_notifications_stamp_path)
-    stamp_epoch=0
     if [[ -f "$stamp_path" ]]; then
-        stamp_epoch=$(cat "$stamp_path" 2>/dev/null || echo 0)
-        [[ "$stamp_epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]] || stamp_epoch=0
+        stamp_epoch=$(cat "$stamp_path" 2>/dev/null || true)
     fi
-    n_awaiting=$(_notifications_count_distinct_since "$stamp_epoch")
+    if [[ "$stamp_epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( 10#${stamp_epoch%%.*} >= 1000000000 )); then
+        n_awaiting=$(_notifications_count_distinct_since "$stamp_epoch")
+    fi
     now=$(date +%s.%N 2>/dev/null || date +%s)
     # Dry-run (issue #104): caller is computing a canonical-form prelude
     # for the full-state identity check, NOT emitting. Leave the stamp
@@ -5381,8 +5459,15 @@ render_idle_prelude() {
     # window and the operator-facing awaiting-input count is preserved
     # across suppression cycles.
     if [[ -z "${MONITOR_PRELUDE_DRY_RUN:-}" ]]; then
+        # Atomic by rename (#1765): a plain `printf > file` truncates first,
+        # so a concurrent reader (or a write cut short) saw an EMPTY stamp.
+        local _st_tmp="${stamp_path}.$$.tmp"
         mkdir -p "$(dirname "$stamp_path")" 2>/dev/null || true
-        printf '%s' "$now" > "$stamp_path" 2>/dev/null || true
+        if printf '%s' "$now" > "$_st_tmp" 2>/dev/null; then
+            mv -f "$_st_tmp" "$stamp_path" 2>/dev/null || rm -f "$_st_tmp" 2>/dev/null
+        else
+            rm -f "$_st_tmp" 2>/dev/null
+        fi
     fi
 
     local _rd_line
@@ -5678,6 +5763,35 @@ _idle_restat_live_windows() {
                 next
             }
         }
+        # THE RETAINED FOOTER IS A ROW SET TOO (your-org/nexus-code b1). It
+        # names windows exactly as `  - ` rows do, so a footer passed through
+        # untouched reported a retired window as retained (`0 retained` in the
+        # prelude beside `(1 retained windows suppressed: <dead> (…))`), and
+        # its mere presence kept the section non-empty and re-armed a
+        # poll-resurface emit on every compose. Entries are `<name> (<reason>)`
+        # joined by `, ` (the renderer turns commas inside a reason into `;`);
+        # a bare `<name>` is accepted too. Dead entries join the WITHHELD note,
+        # N is recomputed, and a footer with no live entry left is dropped.
+        /^[ \t]*\([0-9]+ retained windows suppressed: .*\)[ \t]*$/ {
+            ind = $0; sub(/\(.*/, "", ind)
+            body = $0
+            sub(/^[ \t]*\([0-9]+ retained windows suppressed: /, "", body)
+            sub(/\)[ \t]*$/, "", body)
+            m = split(body, tok, ", ")
+            ne = 0
+            for (i = 1; i <= m; i++) {
+                if (ne == 0 || tok[i] ~ /^[^ (),]+( \(|$)/) ent[++ne] = tok[i]
+                else ent[ne] = ent[ne] ", " tok[i]
+            }
+            kept = ""; nk = 0
+            for (i = 1; i <= ne; i++) {
+                nm = ent[i]; sub(/ .*/, "", nm)
+                if (nm in L) { kept = kept (nk ? ", " : "") ent[i]; nk++ }
+                else if (!(nm in seen)) { seen[nm] = 1; order[++nd] = nm }
+            }
+            if (nk > 0) printf "%s(%d retained windows suppressed: %s)\n", ind, nk, kept
+            next
+        }
         { print }
         END {
             if (nd > 0) {
@@ -5685,6 +5799,69 @@ _idle_restat_live_windows() {
                 for (i = 1; i <= nd; i++) s = s (i == 1 ? "" : ", ") order[i]
                 printf "  (%d row(s) WITHHELD — the window(s) no longer exist in tmux: %s. This section is rendered asynchronously and was reconciled against the live window set at emit time; do NOT act on a withheld window. your-org/nexus-code#1044)\n", nd, s
             }
+        }
+    '
+}
+
+# True (rc 0) iff a reconciled idle section carries NOTHING but WITHHELD notes
+# (and blanks). Such a section has no live row to act on: counting it as a
+# reason to emit re-pasted a footer about a retired window every compose
+# (observed 10-09..10-12). The caller drops it. Pure: section on stdin.
+_idle_section_is_withheld_only() {
+    awk '
+        /^[ \t]*$/ { next }
+        /^[ \t]*\([0-9]+ row\(s\) WITHHELD / { w = 1; next }
+        { other = 1 }
+        END { exit (w && !other) ? 0 : 1 }
+    '
+}
+
+# Annotate a SERVED full-state snapshot with what the render could not know
+# (your-org/nexus-code b2). The snapshot is rendered async every 600 s and
+# served as current; `_full_state_restat_live_windows` drops dead rows (and
+# must stay rows-only: its output feeds the dedup canonical), but it cannot
+# add a window created since the render, never refreshes a row's state, and
+# said nothing about what it dropped. This prints the notes the reader needs,
+# for appending AFTER the canonical is computed — a render age ticks on every
+# poll and must never read as a board change.
+#   $1  the snapshot body BEFORE restat (rows `  - <name> …`)
+#   $2  live tmux window names (newline-separated; empty ⇒ no WITHHELD claim)
+#   $3  live WORKER window names (newline-separated; empty ⇒ no missing claim)
+#   $4  render age in seconds (empty/non-numeric ⇒ no age line)
+# Empty live sets fail open — no claim — exactly as the restat does.
+_full_state_reconcile_note() {
+    local body="${1:-}" live="${2:-}" workers="${3:-}" age="${4:-}"
+    [[ "$age" =~ ^[0-9]+$ ]] || age=""
+    _FS_BODY="$body" _FS_LIVE="$live" _FS_WORK="$workers" _FS_AGE="$age" awk '
+        BEGIN {
+            n = split(ENVIRON["_FS_LIVE"], a, "\n")
+            for (i = 1; i <= n; i++) if (a[i] != "") { L[a[i]] = 1; haveL = 1 }
+            nb = split(ENVIRON["_FS_BODY"], b, "\n")
+            nd = 0
+            for (i = 1; i <= nb; i++) {
+                if (b[i] !~ /^  - /) continue
+                nm = b[i]; sub(/^  - /, "", nm); sub(/ .*/, "", nm)
+                if (nm == "") continue
+                R[nm] = 1
+                if (haveL && !(nm in L) && !(nm in D)) { D[nm] = 1; dead[++nd] = nm }
+            }
+            nw = split(ENVIRON["_FS_WORK"], w, "\n"); nm2 = 0
+            for (i = 1; i <= nw; i++) {
+                x = w[i]; sub(/\t.*/, "", x)
+                if (x == "" || (x in R) || (x in M)) continue
+                if (haveL && !(x in L)) continue
+                M[x] = 1; miss[++nm2] = x
+            }
+            if (nd > 0) {
+                s = ""; for (i = 1; i <= nd; i++) s = s (i == 1 ? "" : ", ") dead[i]
+                printf "  (%d row(s) WITHHELD — the window(s) no longer exist in tmux: %s. This snapshot is rendered asynchronously and was reconciled against the live window set at emit time; do NOT act on a withheld window.)\n", nd, s
+            }
+            if (nm2 > 0) {
+                s = ""; for (i = 1; i <= nm2; i++) s = s (i == 1 ? "" : ", ") miss[i]
+                printf "  (%d live window(s) not in this snapshot: %s — created after the render, so their state is NOT shown here; probe with `ng pane-state <window>`.)\n", nm2, s
+            }
+            if (ENVIRON["_FS_AGE"] != "")
+                printf "(snapshot rendered %ss ago; every row state is as of the render, not as of this emit)\n", ENVIRON["_FS_AGE"]
         }
     '
 }
@@ -6054,6 +6231,11 @@ render_idle_section() {
             # Truncate to 40 chars (39 + …) so footer stays readable.
             if (length(reason) > 40) reason = substr(reason, 1, 39) "…"
             if (reason == "") reason = "(no reason)"
+            # `, ` is the ENTRY separator, and `_idle_restat_live_windows`
+            # splits on it to reconcile this footer against the live window
+            # set at emit time. A comma inside a reason would split one
+            # entry in two, so reasons carry `;` instead.
+            gsub(/,/, ";", reason)
             n++
             entry = sprintf("%s (%s)", $1, reason)
             out = (out == "" ? entry : out ", " entry)
@@ -6327,6 +6509,76 @@ _decision_reemit_cooldown_seconds() {
     printf '%s' "$cd"
 }
 
+# _drm_render_block <file> <window> <fp> <now> — the emit block for ONE
+# forwarded dangerous-rm request (your-org/nexus-code#1632): a header row,
+# the request's command/cwd/classifier, the seconds left before the worker
+# hook denies, and the exact answer verb. Shared by render_pending_decisions
+# (the compose_emit body) and render_urgent_decisions (the fast path, #1768),
+# so the two surfaces cannot drift apart. No trailing newline.
+_drm_render_block() {
+    local file="$1" win="$2" fp="$3" now="$4" body
+    body=$(jq -r '"    command=\(.command // "")\n    cwd=\(.cwd // "")\n    classifier=\(.classifier // "")\n    deadline-in=\((.deadline_epoch // 0) - '"$now"')s  (then the worker hook DENIES)\n    answer=ng decision-answer \(.window) \(.fingerprint) allow|deny --nonce \(.nonce) [--reason <text>]"' "$file" 2>/dev/null)
+    printf 'window=%s fp=%s kind=dangerous_rm unresolved=true   ANSWER NOW — a worker is blocked on this\n%s\n    file=%s' \
+        "$win" "$fp" "$body" "$file"
+}
+
+# render_urgent_decisions — the OPEN forwarded dangerous-rm requests, rendered
+# for the sweep-independent `decision_surface` fast path
+# (your-org/nexus-code#1768). Pure read: no cooldown state, no reap, no stamp.
+#
+# WHY A SEPARATE RENDER. render_pending_decisions stages these rows every
+# 10 s, but they reach the orchestrator only inside the compose_emit body,
+# which pastes AFTER its full-state, prelude and compose_report renders —
+# each bounded by `_render_budget_seconds` (20 s + 2 s per window), so under
+# load the paste landed ~45 s into a request whose worker hook denies at
+# 100 s. This function needs no pane probe, so its caller can paste within
+# one tick of the request being filed.
+#
+# Open = no tombstone (file or sibling), not `resolved`, deadline not yet
+# reached (a request at its deadline is already denied — pasting it asks for
+# an answer nobody will read), window live (when the live set is readable).
+# Cheap no-op unless the hook's `.urgent` stamp moved in the last
+# MONITOR_URGENT_DECISION_WINDOW_SECONDS (default 600): every request touches
+# it as it files, and none lives past Claude Code's 2-minute countdown.
+render_urgent_decisions() {
+    local dir now win_s urgent_mtime
+    dir=$(_decisions_dir)
+    [[ -d "$dir" && -e "$dir/.urgent" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    now=$(date +%s)
+    win_s="${MONITOR_URGENT_DECISION_WINDOW_SECONDS:-600}"
+    [[ "$win_s" =~ ^[0-9]+$ ]] || win_s=600
+    urgent_mtime=$(date +%s -r "$dir/.urgent" 2>/dev/null || echo 0)
+    [[ "$urgent_mtime" =~ ^[0-9]+$ ]] || urgent_mtime=0
+    (( now - urgent_mtime <= win_s )) || return 0
+
+    local live=""
+    if [[ "${MONITOR_PENDING_SKIP_DEAD_WINDOWS:-true}" == "true" ]]; then
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    fi
+    local _rud_restore_nullglob f bn win fp dl out=""
+    _rud_restore_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob 2>/dev/null
+    for f in "$dir"/*.json; do
+        [[ -e "$f" ]] || continue
+        case "$f" in *.handled.json) continue ;; esac
+        [[ -e "${f%.json}.handled.json" ]] && continue
+        bn=$(basename "$f" .json)
+        [[ "$bn" =~ ^(.+)\.([0-9a-f]{12})$ ]] || continue
+        win="${BASH_REMATCH[1]}"; fp="${BASH_REMATCH[2]}"
+        # One jq per file: kind, resolved and deadline together.
+        dl=$(jq -r 'if .kind == "dangerous_rm" and (.resolved != true) then (.deadline_epoch // 0 | tostring) else "" end' "$f" 2>/dev/null)
+        [[ "$dl" =~ ^[0-9]+$ ]] || continue
+        (( now < dl )) || continue
+        if [[ -n "$live" ]] && ! grep -qxF -- "$win" <<<"$live"; then
+            continue
+        fi
+        out+=$(_drm_render_block "$f" "$win" "$fp" "$now")$'\n'
+    done
+    eval "$_rud_restore_nullglob"
+    printf '%s' "$out"
+}
+
 render_pending_decisions() {
     local dir state_file
     dir=$(_decisions_dir)
@@ -6564,11 +6816,7 @@ render_pending_decisions() {
         # row printed once and then withheld is visible to compose_emit for
         # one 10 s window only.
         if [[ "$kind" == dangerous_rm ]]; then
-            local _drm_j
-            _drm_j=$(jq -r '"    command=\(.command // "")\n    cwd=\(.cwd // "")\n    classifier=\(.classifier // "")\n    deadline-in=\((.deadline_epoch // 0) - '"$now"')s  (then the worker hook DENIES)\n    answer=ng decision-answer \(.window) \(.fingerprint) allow|deny --nonce \(.nonce) [--reason <text>]"' "$file" 2>/dev/null)
-            emit_lines+="window=$win fp=$fp kind=dangerous_rm unresolved=true   ANSWER NOW — a worker is blocked on this"$'\n'
-            emit_lines+="$_drm_j"$'\n'
-            emit_lines+="    file=$file"$'\n'
+            emit_lines+=$(_drm_render_block "$file" "$win" "$fp" "$now")$'\n'
             next_state+="$win"$'\t'"$fp"$'\t'"$now"$'\n'
             continue
         fi

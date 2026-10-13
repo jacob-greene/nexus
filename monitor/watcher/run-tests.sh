@@ -1891,7 +1891,7 @@ run_one() {
     # short, under /tmp, no path element that looks like a test. So ONE short
     # private root serves both variables — `/tmp/nxt-<uid>-<pid>-<rand>` — and
     # is reaped when the suite exits. The `nxt-` prefix is this runner's; it is
-    # never the sockets-only `/tmp/c71780`, and nothing else writes there.
+    # never the sockets-only `/tmp/c$(id -u)`, and nothing else writes there.
     # `_RT_RUNNER_PID`, never `$$`: in the parallel arm `$$` is the xargs
     # child's pid, which a sibling's sweep could not attribute to a live run.
     # The name draws $RANDOM; a collision with a LIVE sibling root is ~3/32768

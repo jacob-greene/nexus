@@ -26,7 +26,7 @@
 # Usage:  CLAUDE_BIN=<binary> monitor/longjob-realauth-probe.sh [--only c0,c7] [--keep]
 # Output: $OUT/RESULTS.md (+ per-case pane scrollback and side files), where
 #         OUT defaults to $TMPDIR/longjob-realauth-<epoch>. Private tmux socket
-#         `-L ljp` under TMUX_TMPDIR=/tmp/c71780 (fits sun_path); sessions are
+#         `-L ljp` under TMUX_TMPDIR=/tmp/c$(id -u) (fits sun_path); sessions are
 #         killed at the end unless --keep.
 set -uo pipefail
 _dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -37,7 +37,7 @@ while (( $# )); do case "$1" in --only) ONLY="$2"; shift 2 ;; --keep) KEEP=1; sh
 . "$NEXUS_ROOT/monitor/_claude-bin.sh"
 [[ -x "${CLAUDE_BIN:-}" ]] || { echo "no CLAUDE_BIN" >&2; exit 2; }
 OUT="${OUT:-${TMPDIR:-/tmp}/longjob-realauth-$(date +%s)}"; mkdir -p "$OUT"
-export TMUX_TMPDIR=/tmp/c71780; mkdir -p "$TMUX_TMPDIR"
+export TMUX_TMPDIR="/tmp/c$(id -u)"; mkdir -p "$TMUX_TMPDIR"
 unset TMUX   # never let the invoking pane's socket leak into a probe session
 "$NEXUS_ROOT/monitor/tmux-socket-fits.sh" --socket ljp --tmpdir "$TMUX_TMPDIR" --quiet || { echo "socket path too long" >&2; exit 3; }
 T() { tmux -L ljp "$@"; }

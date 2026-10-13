@@ -91,7 +91,7 @@ echo '=== Class 1: stale-snapshot re-stat drops dead-window rows ==='
 # 5-window set from the 00:51 self-correcting emit.
 SNAP="  - palantir-genetrends idle 296311s (state=empty)
   - prox-obsp idle 211768s (state=empty)
-  - xiulan-simplify idle 32900s (state=empty)
+  - collab-simplify idle 32900s (state=empty)
   - pubfork-skills idle 320s (state=empty)
   - chat idle 14761s (state=empty)
   - pubfork-skills-skeptic parked-awaiting-skeptic (state=empty; skeptic reviewing — exempt from idle/close)
@@ -99,7 +99,7 @@ SNAP="  - palantir-genetrends idle 296311s (state=empty)
 (full snapshot; transitions only between snapshots)"
 LIVE="palantir-genetrends
 prox-obsp
-xiulan-simplify
+collab-simplify
 chat
 palantir-genetrends-skeptic"
 
@@ -124,7 +124,7 @@ unset MOCK_TMUX_WINDOWS
 echo '=== Class 1: all-live snapshot is unchanged ==='
 LIVE_ALL="palantir-genetrends
 prox-obsp
-xiulan-simplify
+collab-simplify
 pubfork-skills
 chat
 pubfork-skills-skeptic

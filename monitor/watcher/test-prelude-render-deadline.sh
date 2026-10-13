@@ -21,6 +21,12 @@
 #       or FAILED is never counted idle, even when a probe would have said
 #       idle; a deferred line carries no `state=`; and the authoritative
 #       (non-read-only) path never defers, whatever the environment says.
+#   W   a window's BODY outside its probe is budgeted: a render does not START
+#       a window whose body (longest seen so far) cannot finish before the loop
+#       deadline; a slow probe does not count towards that estimate.
+#   R   the deferred tail rotates across renders (skeptic F5 on #1799), and a
+#       missing / garbled / unwritable offset file degrades to lister order.
+#   L   the bounded-failure log line carries the 1-min load average.
 #   P   positive controls: the same idle window IS counted idle when the
 #       budget allows its probe; with no budget the line is byte-identical to
 #       the pre-#1698 format (no `unprobed` axis).
@@ -203,10 +209,106 @@ _out=$(render_idle_prelude 2>/dev/null)
 assert_eq "P2 unbudgeted line is the eleven-axis format" "$_out" \
     "2 busy | 0 idle | 0 retained | 0 idle-too-long | 0 pane-absent | 0 over-limit | 0 orphan-async | 0 interrupted | 0 parked-skeptic | 0 idle-children | 0 awaiting-input"
 
+# ===========================================================================
+echo "=== W. a window's BODY (outside its probe) is budgeted, not just its probe ==="
+# your-org/nexus-code#1698 residual: the loop deadline was checked only at a
+# window's START, so a window begun just before it ran its whole body (action
+# log passes, report-check, …) past the budget, and the outer bound killed the
+# render. The seam: `_engagement_log_lookup`, called once per STARTED window
+# outside the probe, sleeps <body-seconds> on its FIRST call per window (it is
+# called several times per window, from subshells, so a marker file in $SCEN
+# keeps the cost per window fixed). Probes themselves are instant.
+# render_slow_body <budget> <body-seconds>: render_in_budget with that seam.
+render_slow_body() {
+    local b="$1" body="$2" t0 t1
+    t0=$(date +%s)
+    R_OUT=$(MONITOR_RENDER_BUDGET_SECONDS="$b" timeout "$b" bash -c '
+        source "$1/_pane_cache.sh"; source "$1/_idle_probe.sh" 2>/dev/null
+        eval "$(declare -f _engagement_log_lookup | sed "1s/^_engagement_log_lookup/_w_orig_lookup/")"
+        _w_body="$2"
+        _engagement_log_lookup() {
+            [[ -e "$SCEN/body.$1" ]] || { : > "$SCEN/body.$1"; sleep "$_w_body"; }
+            _w_orig_lookup "$@"
+        }
+        render_idle_prelude' _ "$_test_dir" "$body" 2>/dev/null)
+    R_RC=$?
+    t1=$(date +%s); R_SECS=$(( t1 - t0 ))
+}
+
+echo "--- W1 10 s bodies, budget 20 (loop deadline +16): window 2 would start ~+11 and end ~+21"
+# Before the fix window 2 starts (10 < 16), runs to ~20 and the render is
+# killed (rc 124). With it, the longest body seen (10 s) no longer fits before
+# the loop deadline, so windows 2 and 3 are not started: deferred `loop`,
+# counted unprobed exactly as the deadline path always counted them.
+# The seam's sleep precedes the probe, so the probe reserve is zeroed (probe
+# deadline = loop deadline = +16): window 1's probe gets its slice instead of
+# being deferred by the probe path, which would hide the case under test.
+plant_board 3
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 20 10
+assert_eq "W1 the render RETURNED inside its budget (rc 0, not 124)" "$R_RC" "0"
+if (( R_SECS < 20 )); then
+    printf '  PASS: W1 elapsed %ss < budget 20s\n' "$R_SECS"; _th_pass
+else
+    printf '  FAIL: W1 elapsed %ss >= budget 20s\n' "$R_SECS" >&2; _th_fail
+fi
+assert_eq "W1 the windows it could not finish are unprobed (2)" "$(field "$R_OUT" unprobed)" "2"
+assert_eq "W1 …and the one it did start was classified (1 busy)" "$(field "$R_OUT" busy)" "1"
+assert_eq "W1 …and only that one was probed" "$(forks)" "1"
+
+echo "--- W2 positive control: a slow PROBE does not inflate the body estimate"
+# Window 1's probe takes 8 s; the bodies are instant. Probe reserve 0, so the
+# probe and loop deadlines are both +16. The probe is already bounded by the
+# probe deadline, so it is excluded from the estimate: window 2 starts at ~+9
+# (9 + floor 1 < 16) and all three are classified. Were the probe counted, the
+# estimate would be 8 s and 9 + 8 >= 16 would defer windows 2 and 3.
+plant_board 3; echo 8 > "$SCEN/1.sleep"
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_in_budget 20
+assert_eq "W2 the render returned (rc 0)" "$R_RC" "0"
+assert_eq "W2 every window was probed" "$(forks)" "3"
+assert_not_contains "W2 …and none is unprobed" "$R_OUT" "unprobed"
+
+echo "=== R. the deferred tail ROTATES across renders (skeptic F5 on #1799) ==="
+# 5 s bodies, budget 12 (loop deadline +8, probe reserve 0): a render starts
+# one window and defers the other two. In lister order that one was always w1,
+# so w2/w3 were unprobed on every render. Each render must start at the first
+# window the previous one deferred. Bodies sleep once per window (the seam's
+# marker), so the second render's lead window is the fresh one only if the
+# order rotated: without rotation w1 (instant now) leads again.
+first_fork() { sed -n 1p "$FORKS"; }
+plant_board 3
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 12 5
+assert_eq "R1 render 1 starts at w1 (offset absent = lister order)" "$(first_fork)" "1"
+assert_eq "R1 …and records where the next render starts" "$(cat "$STATE_DIR/prelude-render-offset" 2>/dev/null)" "1"
+: > "$FORKS"
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 12 5
+assert_eq "R2 render 2 starts at w2, the first window render 1 deferred" "$(first_fork)" "2"
+: > "$FORKS"
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 12 5
+assert_eq "R3 render 3 starts at w3" "$(first_fork)" "3"
+echo "--- R4 an unwritable / garbled offset file degrades to lister order, never fails the render"
+plant_board 3; echo garbage > "$STATE_DIR/prelude-render-offset"
+MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 12 5
+assert_eq "R4 garbled offset: rc 0" "$R_RC" "0"
+assert_eq "R4 …and lister order (w1 first)" "$(first_fork)" "1"
+plant_board 3
+MONITOR_RENDER_ROTATE_FILE="$WORK/no/such/dir/offset" MONITOR_RENDER_PROBE_RESERVE_SECONDS=0 render_slow_body 12 5
+assert_eq "R4 unwritable offset file: rc 0" "$R_RC" "0"
+
+echo "=== L. the bounded-failure log line carries the 1-min load average ==="
+eval "$(awk '$0 ~ /^_bounded_failure_log\(\) \{/ {c=1} c {print} c && /^\}/ {exit}' "$_test_dir/main.sh")"
+_al=(); log() { _al+=("$1"); }
+_bounded_failure_log 124 20 ctx "the render" "nothing blocked"
+log() { :; }
+if [[ "${_al[0]:-}" =~ \;\ load1=[0-9]+\.[0-9]+$ ]]; then
+    printf '  PASS: L1 TIMED OUT line ends with load1=<loadavg>\n'; _th_pass
+else
+    printf '  FAIL: L1 no load1= on the TIMED OUT line: [%s]\n' "${_al[0]:-}" >&2; _th_fail
+fi
+
 # ---- assertion-count guard -------------------------------------------------
 # No conditional cases: the count is exact. Bump it deliberately; a DROP means
 # a case stopped running.
-_EXPECTED_ASSERTIONS=27
+_EXPECTED_ASSERTIONS=43
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; _th_pass

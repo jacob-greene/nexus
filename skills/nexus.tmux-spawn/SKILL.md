@@ -711,7 +711,7 @@ the full criteria.
 ## Naming convention
 
 Short, descriptive, kebab-case window names tied to the task or
-project: `repro-skills`, `data-mgmt`, `slurm-update`, `kompot-fig3`,
+project: `repro-skills`, `data-mgmt`, `slurm-update`, `proj-fig3`,
 `<shared-node-tool>-list`. The watcher's `tmux list-windows` snapshot surfaces
 the name on the dashboard, so use something a human can identify at a
 glance.
@@ -965,7 +965,7 @@ and separately a `test-helper-honesty` red under three overlapping
 `ng guards-for-diff --run` jobs), and **an accidental `async-run` job
 cannot be stopped by its launcher** (`#1308` §3). Tell each leg to give
 every scratch path a **unique per-leg** directory: a shared one silently
-destroyed a parent's fixtures. **And "scratch" never means `/tmp/c71780`**
+destroyed a parent's fixtures. **And "scratch" never means `/tmp/c$(id -u)`**
 (<your-org>/nexus-code#1422): that directory holds SOCKETS ONLY — its short
 name exists for the 107-byte `sun_path` limit — and briefs that named it
 as general scratch left 16.5 GiB of worker payload there, which the
@@ -973,7 +973,7 @@ tmpfs reaper deliberately never touches. Scratch goes under the session
 scratchpad (`$TMPDIR`, the directory the spawn brief names) or inside the
 leg's own clone; the tmpfs reporter (`tmpfs-check` in
 `monitor/services.registry.example`, `#1441`) now flags non-socket
-bytes under `c71780` as a contract violation.
+bytes under `c$(id -u)` as a contract violation.
 
 ### Why three tiers (orchestrator meta-knowledge)
 

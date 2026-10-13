@@ -527,8 +527,8 @@ that cannot answer returns rc 2 and simply never chains.
 |---|---|---|---|
 | `delivered` | 0 | **the WINDOW** | a receipt was observed — **never merely "the send call returned 0"** |
 | `unknown` | 3 | — | neither delivery nor non-delivery established — **chain halts** |
-| `not-delivered` | 4 | **the MESSAGE** | established negative — **chain may advance** |
-| refused | 1 | — | usage, no such window, dead pane, unstampable ledger |
+| `not-delivered` | 4 | **the MESSAGE** | established negative — **chain may advance**. Includes a ledger the pre-send probe finds unwritable (a read-only tree, <your-org>/nexus-code#1724): nothing was stamped or sent, and the message says `DEGRADED … NOTHING WAS SENT` and names `SendMessage` as the fallback |
+| refused | 1 | — | usage, no such window, dead pane, a stamp that failed AFTER the probe passed |
 
 ### The two codes DO NOT share a scope, and an implementer must know which is which
 

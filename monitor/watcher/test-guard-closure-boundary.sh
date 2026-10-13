@@ -636,6 +636,15 @@ expected_jq=(
     # safe direction — but "designed and safe" is not "unobservable", which is
     # the same line `monitor/_submit_evidence.sh` is listed on above.
     monitor/watcher/_orphan_async.sh
+    # your-org/nexus-code#1754. A DECISION: the respawn's submit witness
+    # (`_respawn_brief_needle` / `_respawn_brief_submitted`) reads the session
+    # transcript with jq. Without jq the needle cannot be built and the witness
+    # answers `unknown jq-absent`, so the post-paste verify keeps the pre-#1754
+    # pane-state verdict, and under load that is the double-submit the witness
+    # exists to prevent. Announced in the respawn log ("submit witness …:
+    # unknown"), never silent. Behaviour DEGRADES to the old one, so it is a
+    # member, not FALLBACK.
+    monitor/watcher/_respawn.sh
     # #719. Two sites of DIFFERENT kinds, which is why the file is listed once
     # and annotated: :577 announces (`unstick_log WARN … action=jq-missing`),
     # :932 is SILENT — the orchestrator-ack fast path is skipped and case B

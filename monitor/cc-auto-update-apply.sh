@@ -4202,6 +4202,12 @@ cmd_restart_orchestrator() {
     # killed pane stay the same window; persistent duplicate orchestrators
     # are in any case reaped by the watcher's _respawn.sh dedup.)
     local waited=0 st="" raw="" target_idx="" forced=0 resolved_seen=0
+    # `waited` is WALL CLOCK (your-org/nexus-code#1798). It used to add only
+    # IDLE_POLL per iteration, so the uncounted `pane-state.sh` probe and window
+    # resolve (3-6 s each under load ~59) stretched a nominal 900 s cap to
+    # 1138-1260 s. The step count is kept as a FLOOR so a stubbed or
+    # interrupted `sleep` still terminates the loop in the same number of steps.
+    local wait_t0=$SECONDS wait_steps=0
     while :; do
         target_idx=$(_resolve_target_index "$TARGET_WINDOW")
         if [[ -z "$target_idx" ]]; then
@@ -4255,7 +4261,9 @@ cmd_restart_orchestrator() {
             break
         fi
         sleep "$IDLE_POLL"
-        waited=$(( waited + IDLE_POLL ))
+        wait_steps=$(( wait_steps + IDLE_POLL ))
+        waited=$(( SECONDS - wait_t0 ))
+        (( waited < wait_steps )) && waited=$wait_steps
     done
     if (( forced )); then
         note "restart: idle-wait cap (${IDLE_WAIT}s) reached, orchestrator busy — FORCE-restarting (window index $target_idx); arming the restart watchdog"

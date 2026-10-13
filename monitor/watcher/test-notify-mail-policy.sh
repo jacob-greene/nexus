@@ -63,8 +63,16 @@ NOTIFY="$R/monitor/notify.sh"
 
 OP="op@example.org"
 RELAY="smtp.nexus-test.invalid"
-FQDN=$(python3 -c 'import socket; print(socket.getfqdn())')
+# The host name is PINNED, never read from the runner (your-org/nexus-code#1757):
+# notify.sh builds its sender from getfqdn(), and on a runner whose FQDN has no
+# dot an address built from it fails the ADDR shape, so the impersonation case
+# below was refused as malformed (rc 5) instead of as impersonation (rc 6) —
+# per runner hostname. A sitecustomize on every subject run fixes the FQDN to a
+# dotted synthetic host; the dotless shape is asserted deliberately further down.
+FQDN="nexus-runner.fixture.invalid"
 SENDER="nexus-monitor@$FQDN"
+mkdir -p "$WORK/host"
+printf 'import socket\nsocket.getfqdn = lambda name="": %s\n' "'$FQDN'" > "$WORK/host/sitecustomize.py"
 
 # The fake module's NAME is assembled, never written literally: the one-path
 # lint (mail-path-lint.sh) scans this file too, and a literal would make it
@@ -127,7 +135,7 @@ _run() {
     rm -f "$WORK/cap" "$WORK/err"
     env -u NEXUS_NOTIFY_QUIET -u NEXUS_EMAIL_TO -u NEXUS_SMTP_HOST -u NEXUS_SMTP_PORT \
         -u NEXUS_CONFIG -u NEXUS_ROOT HOME="$WORK/home" \
-        PYTHONPATH="$WORK/py" FAKE_SMTP_CAPTURE="$WORK/cap" PATH="$WORK/bin:$PATH" \
+        PYTHONPATH="$WORK/py:$WORK/host" FAKE_SMTP_CAPTURE="$WORK/cap" PATH="$WORK/bin:$PATH" \
         NEXUS_PUSHOVER_USER_KEY_FILE="$WORK/absent" NEXUS_PUSHOVER_APP_TOKEN_FILE="$WORK/absent" \
         NEXUS_NOTIFY_TOKEN="$WORK/absent" \
         "$@" bash "$NOTIFY" "${TITLE:-disk full}" "the body" --priority "${PRIO:-emergency}" ${ESF:+--email-status-file "$ESF"} \
@@ -220,6 +228,19 @@ _run;                                                         _refused "the oper
 _cfg "$OP" "monitor"
 _run;                                                         _refused "the operator's login is a token of the sender's name" 6
 
+# ---- ORDERING: a dotless host is MALFORMED before it is IMPERSONATION (#1757) --
+# On a host whose FQDN has no dot, the operator address that equals the sender
+# fails the ADDR shape, and that check runs BEFORE the impersonation check — so
+# the same case is rc 5, not 6. Asserted on purpose here, so the ordering is a
+# pinned property rather than something a runner's hostname decides.
+DOTLESS="runnerdotless"
+mkdir -p "$WORK/dotless"
+printf 'import socket\nsocket.getfqdn = lambda name="": %s\n' "'$DOTLESS'" > "$WORK/dotless/sitecustomize.py"
+_cfg "nexus-monitor@$DOTLESS"
+_run PYTHONPATH="$WORK/py:$WORK/dotless";                     _refused "dotless host, the operator's address IS the sender: malformed first" 5
+assert_contains "dotless host: refused as a MALFORMED operator address, not as impersonation" \
+    "$(cat "$WORK/err")" "unresolved or malformed"
+
 # ---- F1: the operator cannot be CHOSEN through the environment ------------
 _cfg "$OP"
 printf 'notifications:\n  email:\n    address: someone@example.net\n    smtp_host: %s\n' "$RELAY" > "$WORK/evil.yml"
@@ -281,7 +302,7 @@ _run
 assert_rc "a local part that is only a substring of the sender name (us@): rc 0" "$RC" 0
 assert_eq "a local part that is only a substring of the sender name (us@): delivered to it" "$(_field 'r["to_addrs"]')" "['us@example.org']"
 
-EXPECTED_ASSERTIONS=90   # +4: #1652 item 3 (malformed own config); +3: #1703 long host name
+EXPECTED_ASSERTIONS=94   # +4: #1652 item 3 (malformed own config); +3: #1703 long host name; +4: #1757 dotless host
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 assert_eq "assertion TOTAL matches the EXPECTED total — no assertion silently dropped or added" \
     "$TOTAL_ASSERTIONS" "$EXPECTED_ASSERTIONS"

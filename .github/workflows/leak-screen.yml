@@ -1,0 +1,80 @@
+name: leak-screen
+
+# =============================================================================
+# THE PUBLIC-MIRROR LEAK SCREEN, AS ITS OWN NAMED CHECK (<your-org>/nexus-code#1759)
+#
+# Every tracked file ships to the public mirror after the identifier scrub, and
+# a project string should fail the PR that ADDS it, not the export weeks later.
+# `monitor/watcher/test-public-mirror-dictionary-coverage.sh` already does the
+# real thing: it clones this tree, runs `monitor/public-mirror/build.sh` (the
+# scrub) on the clone, stages it, and runs `leak-gate.sh` on the staged built
+# tree, plus the dictionary's consistency invariants and a potency control.
+# It also runs inside the unit band in tests.yml. That is not enough on its own:
+#
+#   - the band takes 40-65 min, and a CANCELLED band (runner apt-mirror stalls
+#     cancelled several on 2026-10-07) carries no leak verdict at all;
+#   - a leak red is one line among ~500 suites, under a check named "unit
+#     suite", which reads as a flake rather than a disclosure.
+#
+# A raw scan of the SOURCE tree with the deny rows is NOT a substitute: the
+# deny rows also match every legitimate source line the scrub rewrites
+# (thousands), so only build-then-gate answers "would this ship a leak?".
+#
+# WHAT THIS DOES NOT DO: it catches only CATEGORIES the dictionary knows. A
+# real identifier of a kind nobody has written a row for passes it, exactly
+# as it passes the export. The synthetic-fixture rule in the Worker floor
+# (#1762) and the shape rows (#1761) address that half.
+#
+# LOGS: the suite reports dictionary rules by LINE NUMBER and strips the
+# offending line's content, never quoting a dictionary value. Keep it so.
+#
+# COST: no apt, no matrix, one job of about a minute. No `paths:` filter and
+# no `branches:` filter, for the reasons conflict-markers.yml gives (#774,
+# #604): a leak can land in any tracked byte, on a PR against any base. No
+# `push` trigger: a merge resolution can introduce a conflict marker that
+# neither parent has, but it cannot introduce a new identifier, so the merge
+# preview checked here is the published content. No `concurrency:` block: the
+# job has no `if:` and always carries a real verdict, so there is no skip-run
+# to evict an expensive one.
+# =============================================================================
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  leak-screen:
+    name: public-mirror leak screen (build + gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # NO DICTIONARY IS A PROPERTY OF THE REPOSITORY, not a failure: the
+      # public mirror excludes mapping.tsv by design, and a fresh operator has
+      # none until they copy mapping.example.tsv. There is nothing to screen
+      # against, and this workflow ships to the mirror, so that case is a
+      # notice. Error direction, stated: a source tree whose dictionary was
+      # DELETED also lands here, green. build.sh cannot run without it, so
+      # the next export fails loudly instead.
+      #
+      # With the dictionary present, exit 77 is the suite DECLINING (no
+      # python3, no git, no temp dir): the screen did not run, which is a red,
+      # never a pass.
+      - name: scrubbed tree passes the leak gate
+        run: |
+          if [ ! -e monitor/public-mirror/mapping.tsv ]; then
+            echo "::notice::no public-mirror dictionary in this repository (mirror or fresh operator): nothing to screen."
+            exit 0
+          fi
+          rc=0
+          bash monitor/watcher/test-public-mirror-dictionary-coverage.sh || rc=$?
+          if [ "$rc" -eq 77 ]; then
+            echo "::error::leak screen DECLINED (exit 77): the screen did not run, so this is not a pass."
+            exit 1
+          fi
+          exit "$rc"

@@ -44,13 +44,24 @@ DEMO_SESSION="${DEMO_SESSION:-cc-demo}"
 STATE_ROOT="${TMPDIR:-/tmp}/cc-harness-demo"
 MOCK_PY="$_self_dir/mock-backend.py"
 
-# trash_path: rename-aside instead of unlink when resetting demo state, so a
-# still-releasing claude over NFS can't make the reset fail with `.nfs`.
+# trash_path: a LAST RESORT only. Demo state is a throwaway and is REMOVED
+# (your-org/nexus-code#1767): trashed, it landed in `$TMPDIR/.nexus-trash`
+# (tmpfs = RAM) and was never cleared. A dying claude may still be writing
+# right after the kill-server, so settle+retry; only state that survives that
+# (an NFS `.nfs` hold) is moved aside, and said so.
 # shellcheck source=../_trash.sh
 . "$REPO_ROOT/monitor/_trash.sh"
 reset_state_root() {
     [[ -e "$STATE_ROOT" ]] || return 0
-    trash_path "$STATE_ROOT" >/dev/null 2>&1 || rm -rf "$STATE_ROOT" 2>/dev/null || true
+    local t
+    rm -rf "$STATE_ROOT" 2>/dev/null
+    [[ -e "$STATE_ROOT" ]] && { sleep 0.3; rm -rf "$STATE_ROOT" 2>/dev/null; }
+    [[ -e "$STATE_ROOT" ]] && { sleep 0.7; rm -rf "$STATE_ROOT" 2>/dev/null; }
+    if [[ -e "$STATE_ROOT" ]]; then
+        t=$(trash_path "$STATE_ROOT" 2>/dev/null) && [[ -n "$t" ]] \
+            && echo "demo.sh: $STATE_ROOT still held; moved aside to $t — clear it with monitor/_trash.sh --clear --root $(dirname "$t")" >&2
+    fi
+    return 0
 }
 
 # Parse flags (order-independent): --here picks the default-socket /

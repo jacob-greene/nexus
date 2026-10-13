@@ -67,7 +67,7 @@ install_acquire_lock() {
 #
 # This was `[ -d "$1/.git" ]`, which is `#1080`'s arm 1 exactly: it tests for a
 # DIRECTORY NAMED `.git`, not for a repository. An interrupted clone leaves
-# `<dir>/.git/objects/` and passes — `work/kompot-milodesc-sk/.git/` on this
+# `<dir>/.git/objects/` and passes — `work/proj-x-sk/.git/` on this
 # host holds precisely that and nothing else. The caller then runs
 # `git -C "$dir" config --get remote.origin.url`, which WALKS UP and answers
 # with the ENCLOSING repository's origin; `install_remote_matches` compares

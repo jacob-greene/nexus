@@ -460,6 +460,30 @@ ck "B7 malformed digest → unknown" \
 ck "B7 unknown window (no heartbeat) → unknown" \
    "$(se_submission_with_digest nosuchwin "$BSTATE" "$EPOCH" "$DIG")" unknown
 
+# ---- B8: NON-ASCII content with a TAB is still matched ------------------
+# jq 1.5 `gsub` drops everything before a match that follows multibyte
+# characters (your-org/nexus-code#1773), so the scan's own canonicaliser
+# mangled the record and a DELIVERED brief read `no`. Every case above is
+# ASCII, which is why it survived. The expected digest is computed here,
+# independently: tab → four spaces, every other byte as written.
+U_MSG=$'brief — résumé 中文\tcol2 — é\tend'
+U_DIG=$(sha_of "${U_MSG//$'\t'/    }")
+{ rec_user "the spawn prompt" "$T_BEFORE"; rec_user "$U_MSG" "$T_AFTER"; } > "$BT"
+ck "B8 non-ASCII + TAB, user record → yes" \
+   "$(se_submission_with_digest bwin "$BSTATE" "$EPOCH" "$U_DIG")" yes
+{ rec_user "the spawn prompt" "$T_BEFORE"; rec_enqueue "$U_MSG" "$T_AFTER"; } > "$BT"
+ck "B8 non-ASCII + TAB, enqueue record → yes" \
+   "$(se_submission_with_digest bwin "$BSTATE" "$EPOCH" "$U_DIG")" yes
+# Controls that must NOT flip: no tab means no match, so jq 1.5 never
+# corrupted it; and a lost non-ASCII paste must still read `no`.
+U_NOTAB='brief — résumé 中文 and é'
+{ rec_user "$U_NOTAB" "$T_AFTER"; } > "$BT"
+ck "B8 control: non-ASCII, no TAB → yes" \
+   "$(se_submission_with_digest bwin "$BSTATE" "$EPOCH" "$(sha_of "$U_NOTAB")")" yes
+{ rec_user "the spawn prompt" "$T_BEFORE"; rec_user "$U_NOTAB" "$T_AFTER"; } > "$BT"
+ck "B8 control: non-ASCII + TAB, lost (other traffic only) → no" \
+   "$(se_submission_with_digest bwin "$BSTATE" "$EPOCH" "$U_DIG")" no
+
 # ===========================================================================
 # PART C — is the digest itself proxy-shaped?
 #

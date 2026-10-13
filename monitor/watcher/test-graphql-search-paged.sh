@@ -359,4 +359,39 @@ assert_contains "a discarded page still escalates (kind=partial)" "$emit"     "w
 assert_not_contains "  and does NOT claim a withheld tail" "$emit" "unknown tail"
 unset MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS
 
+echo "== body whitespace collapse is multibyte-safe on all three surfaces (#1773) =="
+
+# jq 1.5 `gsub` drops text when its match follows multibyte characters:
+# `"é — 中文\nline2"` came back `"é — 中  line2"` (your-org/nexus-code#1773).
+# Every fixture above is ASCII, which is how it survived. Expected values are
+# written out literally here, not computed by the code under test.
+U_BODY='é — 中文\nline2'          # JSON-escaped: a real newline in the body
+U_WANT='  body: é — 中文 line2'
+A_BODY='line one\n\n\tline two\r\nthree'
+A_WANT='  body: line one line two three'
+search_page() {  # search_page <file> <nodes-json>
+    printf '{"data":{"search":{"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[%s]}}}' "$2" > "$1"
+}
+
+reset_h
+search_page "$WORK/pages/1.json" \
+    "{\"number\":31,\"comments\":{\"nodes\":[{\"databaseId\":3100,\"author\":{\"login\":\"operator\"},\"body\":\"$U_BODY\",\"reactions\":{\"nodes\":[]}},{\"databaseId\":3101,\"author\":{\"login\":\"operator\"},\"body\":\"$A_BODY\",\"reactions\":{\"nodes\":[]}}]}}"
+emit=$(_snapshot_issue_comments "")
+assert_contains "issue= non-ASCII body + newline survives intact" "$emit" "$U_WANT"
+assert_contains "  control: ASCII multi-line body collapses runs to one space" "$emit" "$A_WANT"
+
+reset_h
+search_page "$WORK/pages/1.json" \
+    "{\"number\":32,\"comments\":{\"nodes\":[{\"databaseId\":3200,\"author\":{\"login\":\"operator\"},\"body\":\"$U_BODY\",\"reactions\":{\"nodes\":[]}}]},\"reviewThreads\":{\"nodes\":[{\"comments\":{\"nodes\":[{\"databaseId\":3201,\"path\":\"src/x.py\",\"author\":{\"login\":\"operator\"},\"body\":\"$A_BODY\",\"reactions\":{\"nodes\":[]}}]}}]}}"
+emit=$(_snapshot_pr_comments "")
+assert_contains "pr= non-ASCII body + newline survives intact" "$emit" "$U_WANT"
+assert_contains "  control: pr_review= ASCII multi-line body" "$emit" "$A_WANT"
+
+reset_h
+search_page "$WORK/pages/1.json" \
+    "{\"number\":33,\"author\":{\"login\":\"operator\"},\"body\":\"$U_BODY\",\"reactions\":{\"nodes\":[]}},{\"number\":34,\"author\":{\"login\":\"operator\"},\"body\":\"$A_BODY\",\"reactions\":{\"nodes\":[]}}"
+emit=$(_snapshot_new_issues "")
+assert_contains "issue_new= non-ASCII body + newline survives intact" "$emit" "$U_WANT"
+assert_contains "  control: issue_new= ASCII multi-line body" "$emit" "$A_WANT"
+
 th_summary_and_exit

@@ -12,6 +12,8 @@
 #   _nexus_github_incident_escalate, _nexus_fs_incident_record,
 #   _nexus_fs_incident_close_comment   (all monitor/watcher/_lib.sh)
 #   log, STATE_DIR, NEXUS_ROOT, TARGET (main.sh)
+#   _idle_list_worker_windows (monitor/watcher/_idle_probe.sh; the worker
+#   broadcast, your-org/nexus-code#1724 — skipped and logged when absent)
 #
 # THE POINT. On 2026-06-29 and again on 2026-07-09 the project tree went
 # read-only and the watcher did not degrade — it vanished. Both incidents
@@ -45,6 +47,15 @@
 : "${FS_NOTE_NEXT:=0}"
 : "${FS_NOTE_GAP:=0}"
 : "${FS_NOTE_COUNT:=0}"
+# The worker broadcast's carry-over queue (skeptic F4 on #1799): pane names,
+# newline-separated, still owed the current broadcast; see _fs_broadcast_drain.
+# FS_BC_STOPPED = a STOP was broadcast this incident (so a heal owes RESUME).
+: "${FS_BC_QUEUE:=}"
+: "${FS_BC_KIND:=}"
+: "${FS_BC_TEXT:=}"
+: "${FS_BC_N:=0}"
+: "${FS_BC_OK:=0}"
+: "${FS_BC_STOPPED:=0}"
 _FS_GUARD_MONITOR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)
 
 # ---------------------------------------------------------------------------
@@ -67,17 +78,22 @@ _FS_GUARD_MONITOR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pw
 # and in the status file `ng degraded status` reads. There is no raw
 # `send-keys` fallback, on purpose.
 #
-# The status file lives in NEXUS_DEGRADED_RUNDIR (default
-# /tmp/nexus-degraded-<uid>, mode 0700): /tmp is never the detached mount, and
-# a sandbox restart wiping it loses only a live status, never a record.
-_fs_rundir_path() {   # -> the run dir's path; creates nothing (readers use this)
-    printf '%s' "${NEXUS_DEGRADED_RUNDIR:-/tmp/nexus-degraded-$(id -u 2>/dev/null || echo unknown)}"
+# The status file lives in the degraded run dir (mode 0700), resolved by
+# monitor/_degraded-rundir.sh from the session-managed $TMPDIR, never a
+# hardcoded path (operator, 2026-10-10, #1724): small state only, and the
+# scratch tree is never the detached mount. A sandbox restart wiping it loses
+# only a live status, never a record. NEXUS_DEGRADED_RUNDIR overrides.
+# shellcheck source=../_degraded-rundir.sh
+. "$_FS_GUARD_MONITOR_DIR/_degraded-rundir.sh"
+_fs_rundir_path() {   # -> the run dir's path, or rc 1 (no managed place); creates nothing
+    nexus_degraded_rundir
 }
-_fs_status_path() {   # <state_dir> -> its status file's path; creates nothing
-    printf '%s/%s.status' "$(_fs_rundir_path)" "$(printf '%s' "${1:?}" | tr -c 'A-Za-z0-9._-' '_')"
+_fs_status_path() {   # <state_dir> -> its status file's path, or rc 1; creates nothing
+    local d; d=$(_fs_rundir_path) || return 1
+    printf '%s/%s.status' "$d" "$(printf '%s' "${1:?}" | tr -c 'A-Za-z0-9._-' '_')"
 }
 _fs_rundir() {   # -> the run dir (created 0700), or rc 1
-    local d; d=$(_fs_rundir_path)
+    local d; d=$(_fs_rundir_path) || return 1
     ( umask 077; mkdir -p "$d" ) 2>/dev/null
     [[ -d "$d" && -w "$d" ]] || return 1
     printf '%s' "$d"
@@ -129,16 +145,16 @@ _fs_status_write() {
 
 # _fs_note_deliver <text> — paste the note through paste_to_target with a
 # private STATE_DIR. Prints the delivery word; never types anything itself.
-_fs_note_deliver() {
-    local text="$1" fn="${FS_NOTE_PASTE_FN:-paste_to_target}" rd body rc=0
+_fs_note_deliver() {   # <text> [target, default $TARGET]
+    local text="$1" target="${2:-${TARGET:-}}" fn="${FS_NOTE_PASTE_FN:-paste_to_target}" rd body rc=0
     declare -F "$fn" >/dev/null 2>&1 || { printf 'not-delivered (no paste path loaded)'; return 0; }
-    [[ -n "${TARGET:-}" ]] || { printf 'not-delivered (no target)'; return 0; }
+    [[ -n "$target" ]] || { printf 'not-delivered (no target)'; return 0; }
     rd=$(_fs_rundir) || { printf 'not-delivered (no writable run dir)'; return 0; }
     mkdir -p "$rd/paste-state" 2>/dev/null
     body="$rd/note.$$.${RANDOM}.md"
     { printf '%s\n' "$text"; printf -- '--- nexus-emit-sig %s %s ---\n' "$(date -Is)" "fsnote$$${RANDOM}"; } > "$body" 2>/dev/null \
         || { printf 'not-delivered (cannot stage the body)'; return 0; }
-    STATE_DIR="$rd/paste-state" "$fn" "$TARGET" "$body" no-liveness-stamp; rc=$?
+    STATE_DIR="$rd/paste-state" "$fn" "$target" "$body" no-liveness-stamp; rc=$?
     rm -f "$body" 2>/dev/null
     case "$rc" in
         0) printf 'delivered' ;;
@@ -166,12 +182,157 @@ _fs_degraded_note_tick() {
         "next_note=$FS_NOTE_NEXT" "delivery=$delivery" || true
 }
 
+# _fs_broadcast_workers <stop|resume> <seconds> — tell every live WORKER
+# pane, once per transition, that the tree went read-only (stop and wait) or
+# healed (resume). your-org/nexus-code#1724, operator 2026-10-09: "The workers
+# may be informed to stop and wait for restart before commencing their work,
+# so they don't all have to find out the hard way." Before this, each worker
+# discovered the outage by its own failing write, and `ng send` could not
+# broadcast for the orchestrator (its ledger is on the same tree).
+#
+# Same delivery path as the DEGRADED note (_fs_note_deliver: the draft,
+# overlay and dead-pane refusals all apply, writes go to the private run dir),
+# so a worker with an operator draft in its box gets NOTHING typed. These
+# pastes carry no ledger stamp (the ledger is what failed), so a worker's
+# submit of one can read as operator input until the tree heals. Set
+# MONITOR_FS_DEGRADED_BROADCAST=0 to turn the broadcast off.
+#
+# RESUME IS NOT GUARANTEED, and the STOP text says so (skeptic F2 on
+# your-org/nexus-code#1799): all 18 RO onsets in this nexus's watcher.log
+# (2026-09-28..10-10) ended in a sandbox restart, never an in-process heal,
+# and a restarted watcher starts with FS_DEGRADED=0 and a wiped run dir. So a
+# session resumed after a restart must read that as RESUME.
+_fs_broadcast_workers() {
+    local kind="$1" secs="${2:-0}" text name _a _i
+    [[ "${MONITOR_FS_DEGRADED_BROADCAST:-1}" == 0 ]] && return 0
+    declare -F "${FS_WORKER_LIST_FN:-_idle_list_worker_windows}" >/dev/null 2>&1 || {
+        log "fs-guard: worker broadcast ($kind) skipped — no worker lister loaded"; return 0; }
+    if [[ "$kind" == stop ]]; then
+        text="[nexus watcher] The project tree is READ-ONLY (cannot write ${STATE_DIR}). Writes, commits, pushes, ng send, ng longjob and test runs in the tree will fail until the sandbox is restarted from outside. STOP starting new work that writes there: record your resume point in your context, do not retry failing writes in a loop, and WAIT. Continue when EITHER a RESUME note arrives OR your session is resumed after a sandbox restart (the usual end of an outage: a restarted watcher cannot send RESUME). Reach the orchestrator with SendMessage. Details: monitor/ng degraded status"
+    else
+        text="[nexus watcher] RESUME: the project tree is writable again after ${secs}s read-only. Re-run any write that failed during the outage (reports, commits, ledger rows), check that files you staged elsewhere are copied back, then continue your task."
+    fi
+    # A transition supersedes whatever the previous one left queued: a STOP
+    # still owed when the tree heals is moot (they all get RESUME), and vice
+    # versa. Said out loud, so a short tally is never mistaken for refusals.
+    if [[ -n "$FS_BC_QUEUE" ]]; then
+        log "fs-guard: worker broadcast (${FS_BC_KIND}) superseded by ($kind) — $(printf '%s\n' "$FS_BC_QUEUE" | grep -c .) undelivered pane(s) dropped"
+    fi
+    FS_BC_QUEUE=""
+    while IFS=$'\t' read -r name _a _i; do
+        [[ -n "$name" ]] || continue
+        FS_BC_QUEUE+="$name"$'\n'
+    done < <("${FS_WORKER_LIST_FN:-_idle_list_worker_windows}" 2>/dev/null)
+    FS_BC_KIND="$kind"; FS_BC_TEXT="$text"; FS_BC_N=0; FS_BC_OK=0
+    _fs_broadcast_drain
+    return 0
+}
+
+# _fs_broadcast_drain — deliver the queued broadcast for at most
+# MONITOR_FS_BROADCAST_BUDGET_SECONDS (default 30) of this tick, at least one
+# pane per call, and CARRY the rest to the next tick (skeptic F4 on
+# your-org/nexus-code#1799). Each pane is one full paste_to_target — lock,
+# paste, submit confirmation, Enter — measured at ~3.0 s per pane through the
+# real chain on a throwaway tmux server (plain panes, no session id); the
+# primitive's documented worst case is ~9 s plus a 3 s render re-look, under
+# a 20 s lock wait. Serial and unbounded, a 20-pane board stalled the tick
+# for a minute or more, and at HEAL that stall is the scheduler's first tick.
+# Kept in-process rather than in a background child on purpose: the queue is
+# what keeps STOP and RESUME to one pane in order, and what lets a heal drop
+# the STOPs not yet sent. Called from _fs_guard_tick every cycle; a no-op
+# when nothing is queued.
+_fs_broadcast_drain() {
+    [[ -n "$FS_BC_QUEUE" ]] || return 0
+    local budget="${MONITOR_FS_BROADCAST_BUDGET_SECONDS:-30}" t0=$SECONDS name d left
+    [[ "$budget" =~ ^[0-9]+$ ]] || budget=30
+    while [[ -n "$FS_BC_QUEUE" ]]; do
+        name="${FS_BC_QUEUE%%$'\n'*}"; FS_BC_QUEUE="${FS_BC_QUEUE#*$'\n'}"
+        [[ -n "$name" ]] || continue
+        FS_BC_N=$(( FS_BC_N + 1 ))
+        d=$(_fs_note_deliver "$FS_BC_TEXT" "$name")
+        [[ "$d" == delivered ]] && FS_BC_OK=$(( FS_BC_OK + 1 ))
+        log "fs-guard: worker broadcast (${FS_BC_KIND}) to ${name} — ${d}"
+        if [[ -n "$FS_BC_QUEUE" ]] && (( SECONDS - t0 >= budget )); then
+            left=$(printf '%s' "$FS_BC_QUEUE" | grep -c .)
+            log "fs-guard: worker broadcast (${FS_BC_KIND}): ${budget}s tick budget spent after ${FS_BC_N} pane(s); ${left} carried to the next tick"
+            return 0
+        fi
+    done
+    log "fs-guard: worker broadcast (${FS_BC_KIND}): ${FS_BC_OK} of ${FS_BC_N} worker pane(s) delivered"
+    FS_BC_KIND=""; FS_BC_TEXT=""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE PAGE — Pushover → ntfy → SMTP via monitor/notify.sh (RO7, 2026-10-12).
+# A 4 h 45 m read-only incident (03:42–08:28) escalated via
+# [sandbox-notify,github-issue,tmux-display] and NEVER PAGED the operator: no
+# leg of this escalation called notify.sh, the one channel that reaches a phone
+# at 03:42. notify.sh itself needs nothing writable in the tree (measured: rc 0
+# and the push delivered from a chmod a-w copy), so the page is DELIVERED FIRST
+# and the only state it keeps — a rate stamp — is written AFTER, outside the
+# tree (the degraded run dir), and best-effort: no state write can suppress it.
+#
+# THE BOUND. The fire-once latch resets on every recovery, so a tree that
+# flaps RO/RW would page per flap. A page is therefore suppressed while the
+# LAST page is younger than MONITOR_FS_PUSH_MIN_INTERVAL_SECONDS (default 1800,
+# chosen: RO8 recurred 4 h 52 m after RO7's onset and must page; a flap every
+# few seconds pages at most twice an hour). "Last" is the MAX of this process's
+# memory and the stamp, so an unwritable run dir still bounds the one process
+# that escalates; a stamp that cannot be READ never suppresses (send is the
+# safe direction). Emergency priority, so the email leg fires too.
+# Knobs: MONITOR_OPERATOR_ALERT_PUSH_ENABLED (the operator's one push switch),
+# NEXUS_FS_PUSH_CMD (default $NEXUS_ROOT/monitor/notify.sh; tests stub it),
+# MONITOR_FS_PUSH_TIMEOUT_SECONDS (default 45). NEXUS_NOTIFY_QUIET=1 skips it.
+: "${FS_PUSH_LAST:=0}"
+_fs_push_stamp_path() {
+    local d; d=$(_fs_rundir_path) || return 1
+    printf '%s/%s.push' "$d" "$(printf '%s' "${STATE_DIR:-.}" | tr -c 'A-Za-z0-9._-' '_')"
+}
+# _fs_push_page <text> — rc 0 iff a notify.sh backend accepted the page. Sets
+# FS_PUSH_VERDICT (delivered|throttled|skipped:<why>|failed:rc=<n>) rather than
+# printing it: a command-substitution caller would run it in a SUBSHELL and lose FS_PUSH_LAST.
+_fs_push_page() {
+    local text="$1" cmd tmo iv now last st sf rc
+    cmd="${NEXUS_FS_PUSH_CMD:-${NEXUS_ROOT:-}/monitor/notify.sh}"
+    case "${MONITOR_OPERATOR_ALERT_PUSH_ENABLED:-true}" in
+        false|0|no|off|FALSE|NO|OFF) FS_PUSH_VERDICT='skipped:disabled'; return 1 ;;
+    esac
+    [[ "${NEXUS_NOTIFY_QUIET:-0}" == 1 ]] && { FS_PUSH_VERDICT='skipped:NEXUS_NOTIFY_QUIET'; return 1; }
+    [[ -x "$cmd" ]] || { FS_PUSH_VERDICT='skipped:no-notify-cmd'; return 1; }
+    command -v timeout >/dev/null 2>&1 || { FS_PUSH_VERDICT='skipped:no-timeout-on-PATH'; return 1; }
+    iv="${MONITOR_FS_PUSH_MIN_INTERVAL_SECONDS:-1800}"; [[ "$iv" =~ ^[0-9]+$ ]] || iv=1800
+    tmo="${MONITOR_FS_PUSH_TIMEOUT_SECONDS:-45}";      [[ "$tmo" =~ ^[0-9]+$ ]] && (( tmo > 0 )) || tmo=45
+    now=$(date +%s 2>/dev/null || echo 0)
+    last=$FS_PUSH_LAST; [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    sf=$(_fs_push_stamp_path 2>/dev/null) || sf=''
+    st=''; [[ -n "$sf" ]] && { IFS= read -r st < "$sf"; } 2>/dev/null
+    [[ "$st" =~ ^[0-9]+$ ]] && (( st > last )) && last=$st
+    if (( last > 0 && now >= last && now - last < iv )); then
+        FS_PUSH_VERDICT='throttled'; return 1
+    fi
+    # DELIVERY FIRST. No --email-status-file: that is a write, and the only
+    # place a caller usually points it is the tree that just died.
+    timeout "$tmo" "$cmd" "nexus: project FS READ-ONLY — restart the sandbox" "$text" \
+        --priority emergency --require-delivery --quiet >/dev/null 2>&1
+    rc=$?
+    (( rc == 0 )) || { FS_PUSH_VERDICT="failed:rc=$rc"; return 1; }
+    # State AFTER delivery, best-effort, never in the tree.
+    FS_PUSH_LAST=$now
+    if [[ -n "$sf" ]] && _fs_rundir >/dev/null 2>&1; then
+        { printf '%s\n' "$now" > "$sf"; } 2>/dev/null || true
+    fi
+    FS_PUSH_VERDICT=delivered
+    return 0
+}
+
 # Escalate the read-only condition exactly ONCE per incident, over channels
 # that survive a read-only project FS, in preference order:
 #   1. sandbox-notify  — pure PATH resolution + exec; no temp file, no cache
+#   1b. a push PAGE    — monitor/notify.sh (Pushover/ntfy/email); see above
 #   2. a GitHub issue  — mint-token.sh caches under $HOME/.claude, a
 #                        DIFFERENT mount; a warm cache serves read-only
-#   3. a tmux paste    — last resort, only if 1 and 2 both failed
+#   3. a tmux paste    — last resort, only if 1, 1b and 2 all failed
 _fs_escalate_once() {
     (( FS_ESCALATED )) && return 0
     FS_ESCALATED=1
@@ -193,6 +354,14 @@ _fs_escalate_once() {
             chans='stderr'   # logged, NOT delivered — deliberately not `oob`
         fi
     fi
+
+    # The PAGE (RO7): the only leg that reaches a phone. Before GitHub, whose
+    # mint + list + create can take far longer than a push.
+    FS_PUSH_VERDICT=''
+    if _fs_push_page "$text"; then
+        chans="${chans:+$chans,}push"; oob="${oob:+$oob,}push"
+    fi
+    log "fs-guard: push page — ${FS_PUSH_VERDICT:-unknown}"
 
     if _nexus_github_incident_escalate "$NEXUS_ROOT" "$STATE_DIR" \
         "watcher main.sh (degraded)" \
@@ -234,7 +403,7 @@ _fs_escalate_once() {
 # would report HEALTHY during a total outage. That is the exact failure mode
 # this guard exists to prevent.
 _fs_guard_tick() {
-    local now dur
+    local now dur _bc_now=0 _bc_onset
     now=$(date +%s 2>/dev/null || echo 0)
 
     if _nexus_dir_writable "$STATE_DIR"; then
@@ -257,10 +426,17 @@ _fs_guard_tick() {
             fi
             _fs_status_write mode=ok "state_dir=$STATE_DIR" "recovered=$now" \
                 "last_incident_seconds=$dur" "notes=$FS_NOTE_COUNT" || true
+            if (( FS_BC_STOPPED )); then
+                _fs_broadcast_workers resume "$dur"; _bc_now=1
+            else
+                log "fs-guard: read-only for ${FS_DEGRADED_CYCLES} cycle(s) only — no STOP was broadcast, so no RESUME is owed"
+            fi
+            FS_BC_STOPPED=0
             FS_DEGRADED=0; FS_ESCALATED=0; FS_CHANNELS=''
             FS_DEGRADED_CYCLES=0; FS_ONSET=0
             FS_NOTE_NEXT=0; FS_NOTE_GAP=0; FS_NOTE_COUNT=0
         fi
+        (( _bc_now )) || _fs_broadcast_drain
         FS_LAST_OK=$now
         return 0
     fi
@@ -274,8 +450,23 @@ _fs_guard_tick() {
         log "fs-guard: entering read-only DEGRADED mode. The loop stays alive; all project-tree writes are suspended."
         log "fs-guard: this cannot be repaired from inside the sandbox — it needs a restart from OUTSIDE. Never remount, bind, or unshare around it."
         _fs_escalate_once
+        FS_BC_STOPPED=0
     fi
     FS_DEGRADED_CYCLES=$(( FS_DEGRADED_CYCLES + 1 ))
+    # ONSET HYSTERESIS for the board-wide STOP (skeptic note on #1799): the
+    # escalation above fires on the FIRST failed probe, but a paste into every
+    # worker pane waits for MONITOR_FS_BROADCAST_ONSET_CYCLES consecutive
+    # failed probes (default 2), so a one-probe transient pastes nobody. The
+    # cost is one degraded poll (MONITOR_FS_DEGRADED_POLL_SECONDS, default
+    # 15 s) of delay on a STOP for an incident that has, in every one of the
+    # 18 recorded here, lasted until a sandbox restart.
+    _bc_onset="${MONITOR_FS_BROADCAST_ONSET_CYCLES:-2}"
+    [[ "$_bc_onset" =~ ^[0-9]+$ ]] && (( _bc_onset >= 1 )) || _bc_onset=2
+    if (( ! FS_BC_STOPPED && FS_DEGRADED_CYCLES >= _bc_onset )); then
+        FS_BC_STOPPED=1
+        _fs_broadcast_workers stop 0; _bc_now=1
+    fi
+    (( _bc_now )) || _fs_broadcast_drain
     if (( FS_DEGRADED_CYCLES == 1 )); then
         _fs_status_write mode=degraded "state_dir=$STATE_DIR" "onset=$FS_ONSET" \
             "notes=0" "next_note=$(( FS_ONSET + ${MONITOR_FS_DEGRADED_NOTE_BASE_SECONDS:-300} ))" \

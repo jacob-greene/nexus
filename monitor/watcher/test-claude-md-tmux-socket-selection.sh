@@ -172,9 +172,9 @@ _cleanup() {
 trap _cleanup EXIT
 
 mkdir -p "$TDIR"
-env -u TMUX tmux -S "$SOCK" new-session -d -s p1 'sleep 600' 2>/dev/null \
+env -u TMUX tmux -S "$SOCK" -f /dev/null new-session -d -s p1 'sleep 600' 2>/dev/null \
     || th_abort "could not start the -S private server at $SOCK"
-env -u TMUX TMUX_TMPDIR="$TDIR" tmux new-session -d -s p2 'sleep 600' 2>/dev/null \
+env -u TMUX TMUX_TMPDIR="$TDIR" tmux -f /dev/null new-session -d -s p2 'sleep 600' 2>/dev/null \
     || th_abort "could not start the TMUX_TMPDIR private server under $TDIR"
 TSOCK=$(env -u TMUX TMUX_TMPDIR="$TDIR" tmux display-message -p '#{socket_path}' 2>/dev/null)
 

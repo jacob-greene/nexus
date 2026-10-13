@@ -840,9 +840,18 @@ fi
 : > "$NPMLOG"
 
 TRASH="$WORK/trash"; mkdir -p "$TRASH"
-_trash_count() { ls -A "$TRASH" 2>/dev/null | grep -c '' || true; }
+# The gate runs under its OWN TMPDIR, so its prefix's parent is private and
+# BOTH roots trash_path can choose are counted without seeing another agent's
+# entries: the NEXUS_TRASH_DIR given, and the same-filesystem fallback
+# `.nexus-trash` beside the prefix — on a tmpfs $TMPDIR the latter is RAM,
+# which is where #1767's 18.6 GB sat.
+GATE_TMP="$WORK/gt"; mkdir -p "$GATE_TMP"
+_trash_count() {
+    { ls -A "$TRASH" 2>/dev/null; ls -A "$GATE_TMP/.nexus-trash" 2>/dev/null; } | grep -c '' || true
+}
+_trash_base=$(_trash_count)
 run_gate_ver() {   # $@ = extra gate.sh args; the scenario list is one passing stub
-    CCH_GATE_SCENARIOS="$S_PASS" NEXUS_TRASH_DIR="$TRASH" PATH="$NPMBIN:$PATH" \
+    CCH_GATE_SCENARIOS="$S_PASS" NEXUS_TRASH_DIR="$TRASH" PATH="$NPMBIN:$PATH" TMPDIR="$GATE_TMP" \
         bash "$GATE" --version 9.9.9 "$@" 2>&1
 }
 _kept_bin() {   # the claude_bin= field of the LAST kept-prefix line in $1
@@ -854,12 +863,13 @@ _installed_prefix() {   # the prefix the install banner named
 
 # (K1) CONTROL — the default is unchanged: the prefix is torn down on exit and
 #      NO kept-prefix line is printed. Without this, K2 could pass on a gate
-#      that simply stopped cleaning up.
+#      that simply stopped cleaning up. Torn down means REMOVED, not moved to
+#      trash (your-org/nexus-code#1767): the trash count must not grow.
 out=$(run_gate_ver); rc=$?
 pfx=$(_installed_prefix "$out")
 if (( rc == 0 )) && grep -q 'GATE GREEN' <<<"$out" && [[ -n "$pfx" && ! -d "$pfx" ]] \
-   && [[ "$(_trash_count)" == 1 ]] && ! grep -q 'kept-prefix' <<<"$out"; then
-    ok "#1002 K1 CONTROL: without --keep-prefix the prefix is MOVED ASIDE on exit (1 trash entry, path gone) and no kept-prefix line prints"
+   && [[ "$(_trash_count)" == "$_trash_base" ]] && ! grep -q 'kept-prefix' <<<"$out"; then
+    ok "#1002/#1767 K1 CONTROL: without --keep-prefix the prefix is REMOVED on exit (path gone, NO trash entry) and no kept-prefix line prints"
 else
     bad "#1002 K1 default teardown" "rc=$rc prefix=$pfx exists=$([[ -d "$pfx" ]] && echo yes || echo no) trash=$(_trash_count) out=$(grep -E 'GATE |kept-prefix|installing' <<<"$out")"
 fi
@@ -874,8 +884,8 @@ if (( rc == 0 )) && grep -q 'GATE GREEN' <<<"$out" && [[ -n "$kept" && -x "$kept
 else
     bad "#1002 K2 keep-prefix" "rc=$rc kept=$kept exists=$([[ -x "$kept" ]] && echo yes || echo no) out=$(grep -E 'GATE |kept-prefix' <<<"$out")"
 fi
-if [[ -n "$pfx" && "$kept" == "$pfx/node_modules/.bin/claude" ]] && [[ "$(_trash_count)" == 1 ]]; then
-    ok "#1002 K2 …the kept path is <prefix>/node_modules/.bin/claude and the prefix was NOT trashed (trash count unchanged at 1)"
+if [[ -n "$pfx" && "$kept" == "$pfx/node_modules/.bin/claude" ]] && [[ "$(_trash_count)" == "$_trash_base" ]]; then
+    ok "#1002 K2 …the kept path is <prefix>/node_modules/.bin/claude and the prefix was NOT trashed (trash count unchanged)"
 else
     bad "#1002 K2 kept path / trash" "kept=$kept prefix=$pfx trash=$(_trash_count)"
 fi

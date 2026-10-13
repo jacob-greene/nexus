@@ -14,6 +14,9 @@
 # Exit 6 = REFUSED: the index holds an entry whose PUBLISHED content this gate
 #          cannot read, so a PASS would describe a smaller population than the
 #          one being shipped. See the index-entry scan below.
+# Exit 7 = REFUSED: a deny/keep pattern does not compile, or the content scan
+#          itself errored — an empty result from a scan that failed is not a
+#          clean result (your-org/nexus-code#1760).
 #
 # --commit <sha> — the mirror is published as ONE commit per sync, so that
 # commit's MESSAGE and IDENTITIES are published bytes too, and the tree scan
@@ -109,6 +112,33 @@ fi
 DENY=$(awk -F'\t' '$1=="deny"{print $2}' "$MAP" | paste -sd'|')
 KEEP=$(awk -F'\t' '$1=="keep"{print $2}' "$MAP" | paste -sd'|')
 [ -n "$DENY" ] || { echo "leak-gate: empty denylist in $MAP" >&2; exit 2; }
+
+# ---- FAIL CLOSED ON A PATTERN THAT DOES NOT COMPILE (your-org/nexus-code#1760)
+#
+# Every scan below joins the deny rows into ONE alternation and discards
+# grep's stderr. A row that does not compile makes grep exit 2 with an EMPTY
+# stdout, and empty stdout is exactly what "no hits" looks like — so a single
+# malformed row disarmed EVERY row and the gate printed PASS. A bad `keep` row
+# is the same hole from the other side: `grep -vE` exits 2 printing nothing,
+# which deletes every hit. Validated here, per row (so the refusal can name
+# the mapping LINE without quoting the pattern) and combined (what the scans
+# actually run), with the same `grep -E` the scans use. The content scan's
+# `git grep` compiles separately and has its own rc check below.
+_bad_rows=""
+while IFS=$'\t' read -r _ln _kind _pat; do
+    printf '' | grep -E -e "$_pat" >/dev/null 2>&1
+    [ "$?" -ge 2 ] && _bad_rows="${_bad_rows} ${_kind}@line${_ln}"
+done < <(awk -F'\t' '$1=="deny"||$1=="keep"{print NR "\t" $1 "\t" $2}' "$MAP")
+for _combined in "$DENY" ${KEEP:+"$KEEP"}; do
+    printf '' | grep -E -e "$_combined" >/dev/null 2>&1
+    [ "$?" -ge 2 ] && _bad_rows="${_bad_rows} combined-alternation"
+done
+if [ -n "$_bad_rows" ]; then
+    echo "LEAK GATE: REFUSED — mapping pattern(s) do not compile:${_bad_rows}" >&2
+    echo "  A scan with an uncompilable pattern returns no hits at all, so a PASS would be vacuous." >&2
+    echo "  Fix the row(s) in $MAP; nothing was screened." >&2
+    exit 7
+fi
 
 # ---- --commit: THE COMMIT'S METADATA, AND ITS TREE BY BINDING ---------------
 #
@@ -347,7 +377,14 @@ else
     fi
 fi
 
-hits=$(git grep -inE "$DENY" -- . 2>/dev/null)
+hits=$(git grep -inE "$DENY" -- . 2>/dev/null); _gg_rc=$?
+# rc 1 is "no match"; anything above it (128: git could not compile the
+# pattern, or could not read the tree) is NOT a clean scan (#1760). Outside a
+# work tree git grep fails by design and the plain grep below takes over.
+if [ "$_gg_rc" -gt 1 ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "LEAK GATE: REFUSED — the content scan (git grep) failed with rc=$_gg_rc; nothing was screened." >&2
+    exit 7
+fi
 # also scan any file present but untracked (a hand-assembled tree may not be a
 # git checkout); fall back to a plain recursive grep when git-grep finds nothing
 if [ -z "$hits" ] && ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

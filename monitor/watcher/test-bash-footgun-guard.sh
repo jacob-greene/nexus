@@ -1410,6 +1410,104 @@ win tdr-nearname
 run '{"tool_name":"Bash","tool_input":{"command":"rm -rf \"$TMPDIRX\"/y"}}'
 assert_silent "a different variable \$TMPDIRX stays SILENT"
 
+# ── your-org/nexus-code#1744 / #1728: the squeue -j and sbatch --wait rows ──
+echo '=== #1744: squeue -j WARNS; squeue -u filtered by id stays SILENT ==='
+win sqj-bare
+run '{"tool_name":"Bash","tool_input":{"command":"squeue -h -o %T -j 1234567"}}'
+assert_ctx "squeue -h -o %T -j 1234567 WARNS" "[squeue-j]"
+assert_ctx "  …and names the -u remedy" 'Ask for your own jobs and filter by id'
+win sqj-var
+run '{"tool_name":"Bash","tool_input":{"command":"st=$(squeue --jobs=\"$jid\" -h)"}}'
+assert_ctx "squeue --jobs=\"\$jid\" WARNS" "[squeue-j]"
+win sqj-u
+run '{"tool_name":"Bash","tool_input":{"command":"squeue -u \"$USER\" -h -o \"%i %T\" | awk -v t=1234567 \"\\$1 == t\""}}'
+assert_silent "squeue -u filtered by id stays SILENT"
+win sqj-sacct
+run '{"tool_name":"Bash","tool_input":{"command":"sacct -X -n -P -o State -j 1234567"}}'
+assert_silent "sacct -j stays SILENT (only squeue -j is the defect)"
+echo '=== #1728: sbatch --wait WARNS; sbatch --parsable stays SILENT ==='
+win sbw-long
+run '{"tool_name":"Bash","tool_input":{"command":"sbatch --wait -p short job.sh"}}'
+assert_ctx "sbatch --wait WARNS" "[sbatch-wait]"
+win sbw-short
+run '{"tool_name":"Bash","tool_input":{"command":"sbatch -W job.sh"}}'
+assert_ctx "sbatch -W WARNS" "[sbatch-wait]"
+win sbw-parsable
+run '{"tool_name":"Bash","tool_input":{"command":"jid=$(sbatch --parsable job.sh)"}}'
+assert_silent "sbatch --parsable stays SILENT"
+
+# ── bundle 22: `bash -c '<script>'` trips Claude Code's own rm check ──
+echo '=== bundle 22: a quoted -c script WARNS; bash <file> and python heredoc stay SILENT ==='
+win shc-awk
+run '{"tool_name":"Bash","tool_input":{"command":"bash -c '\''cat t.tsv | awk -F\"\\t\" \"{n++} END{print n}\"'\''"}}'
+assert_ctx "bash -c '<awk script>' WARNS" "[shell-c-script]"
+assert_ctx "  …and names the Python remedy" "For read-only aggregation use Python"
+win shc-sh-dq
+run '{"tool_name":"Bash","tool_input":{"command":"cd /x && sh -c \"git show a:b \\| sha256sum\""}}'
+assert_ctx "sh -c \"<script>\" after && WARNS" "[shell-c-script]"
+win shc-file
+run '{"tool_name":"Bash","tool_input":{"command":"f=$(mktemp); printf %s \"$s\" > \"$f\"; bash \"$f\""}}'
+assert_silent "bash \"\$f\" (a script FILE) stays SILENT"
+win shc-py
+run '{"tool_name":"Bash","tool_input":{"command":"python3 - <<'\''EOF'\''\nprint(1)\nEOF"}}'
+assert_silent "a python heredoc stays SILENT"
+win shc-gitc
+run '{"tool_name":"Bash","tool_input":{"command":"git -c user.name=x log -1"}}'
+assert_silent "git -c (a config flag, not a shell) stays SILENT"
+win shc-flash
+run '{"tool_name":"Bash","tool_input":{"command":"my-bash -c \"x\""}}'
+assert_silent "a command merely ENDING in bash (my-bash -c) stays SILENT"
+
+# ── bundle 22: prose in a NON-executed heredoc does not fire the typed-verb rows ──
+echo '=== bundle 22: heredoc prose is not a command; a heredoc fed to a shell still is ==='
+win hd-cat
+run '{"tool_name":"Bash","tool_input":{"command":"cat > notes.md <<'\''EOF'\''\nNever use sbatch --wait here.\nEOF"}}'
+assert_silent "sbatch --wait as PROSE in a cat heredoc stays SILENT"
+win hd-gh
+run '{"tool_name":"Bash","tool_input":{"command":"gh issue comment 1 --body-file - <<EOF\nsqueue -j 1234567 is flaky\nEOF"}}'
+assert_silent "squeue -j as PROSE in a gh --body-file heredoc stays SILENT"
+win hd-shc
+run '{"tool_name":"Bash","tool_input":{"command":"cat > d.md <<-'\''END'\''\n\trun bash -c '\''x | y'\'' then\n\tEND"}}'
+assert_ctx "bash -c as PROSE in a heredoc still WARNS (Claude Code's check fires on prose too; skeptic N3)" "[shell-c-script]"
+win hd-bash
+run '{"tool_name":"Bash","tool_input":{"command":"bash <<'\''EOF'\''\nsbatch --wait job.sh\nEOF"}}'
+assert_ctx "sbatch --wait in a heredoc FED TO bash still WARNS (it executes)" "[sbatch-wait]"
+win hd-after
+run '{"tool_name":"Bash","tool_input":{"command":"cat > f <<'\''EOF'\''\nx\nEOF\nsbatch --wait job.sh"}}'
+assert_ctx "sbatch --wait AFTER a heredoc ends still WARNS" "[sbatch-wait]"
+win hd-other-row
+run '{"tool_name":"Bash","tool_input":{"command":"cat > f <<'\''EOF'\''\nsqueue -j 1\nEOF\nsqueue -h -j 7654321"}}'
+assert_ctx "a real squeue -j after prose mentioning it still WARNS" "[squeue-j]"
+
+# ── skeptic B1 on PR #1786: the stripper must never hide a REAL later command ──
+echo '=== skeptic B1: no shape before a real sbatch --wait may silence it ==='
+for _b1 in 'tr a b <<< foo\nsbatch --wait j.sh' \
+           'echo \"<<EOF\"\nsbatch --wait j.sh' \
+           'x=$((1 << y))\nsbatch --wait j.sh' \
+           'cat <<EOF | bash\nsbatch --wait j.sh\nEOF' \
+           '/bin/bash <<EOF\nsbatch --wait j.sh\nEOF' \
+           'cat > f.sh <<EOF\nsbatch --wait j.sh\nEOF\nbash f.sh' \
+           'cat > n.md <<EOF\nnotes\nsbatch --wait j.sh'; do
+    win "b1-$(printf '%s' "$_b1" | cksum | cut -d' ' -f1)"
+    run '{"tool_name":"Bash","tool_input":{"command":"'"$_b1"'"}}'
+    assert_ctx "B1 WARNS: ${_b1%%\\n*} …" "[sbatch-wait]"
+done
+
+# ── your-org/nexus-code#1791 R1: a heredoc piped through a WRAPPER into a shell executes ──
+echo '=== #1791 R1: | timeout/nice <shell> executes; | cat / | grep stays prose ==='
+win r1-timeout
+run '{"tool_name":"Bash","tool_input":{"command":"cat <<EOF | timeout 60 bash\nsbatch --wait j.sh\nEOF"}}'
+assert_ctx "R1 WARNS: heredoc piped to | timeout 60 bash executes" "[sbatch-wait]"
+win r1-nice
+run '{"tool_name":"Bash","tool_input":{"command":"cat <<EOF | nice -n 5 sh\nsqueue -j 1234567\nEOF"}}'
+assert_ctx "R1 WARNS: heredoc piped to | nice -n 5 sh executes" "[squeue-j]"
+win r1-cat
+run '{"tool_name":"Bash","tool_input":{"command":"cat <<EOF | cat\nNever use sbatch --wait here.\nEOF"}}'
+assert_silent "R1 control: heredoc piped to | cat stays prose"
+win r1-grep
+run '{"tool_name":"Bash","tool_input":{"command":"cat <<EOF | grep bash\nNever use sbatch --wait here.\nEOF"}}'
+assert_silent "R1 control: heredoc piped to | grep bash stays prose (not a wrapper)"
+
 # 206 -> 226: +14 for #1447 (four firing spellings with three message-content
 # pins, four allowlist controls, one row-deleted potency control) and +6 for
 # #1446 (three firing shapes with one message pin, three bounded-form controls).
@@ -1431,7 +1529,18 @@ assert_silent "a different variable \$TMPDIRX stays SILENT"
 # with one message pin, three silent controls incl. its own prescribed form).
 # 282 -> 285: +3 for the #1630 skeptic (quote-before-slash and empty-default
 # shapes fire; a near-name variable stays silent).
-_EXPECTED_ASSERTIONS=285
+# 285 -> 293: +8 for #1744/#1728 (bundle 21: squeue-j two firing shapes with
+# one message pin, two silent controls; sbatch-wait two firing shapes, one
+# silent control).
+# 293 -> 300: +7 for bundle 22's shell-c-script row (two firing shapes with
+# one message pin, four silent controls).
+# 300 -> 306: +6 for bundle 22's heredoc-prose filter (three silent prose
+# shapes, three firing executed/after-heredoc shapes).
+# 306 -> 313: +7 for the PR #1786 skeptic's B1 (six shapes that hid a real
+# command, plus the unterminated heredoc).
+# 313 -> 317: +4 for your-org/nexus-code#1791 R1 (two wrapper-piped shapes
+# that execute, two pipe-to-non-shell controls that stay prose).
+_EXPECTED_ASSERTIONS=317
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; PASS=$((PASS+1))

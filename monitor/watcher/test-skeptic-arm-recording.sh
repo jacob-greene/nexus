@@ -32,7 +32,7 @@
 #   · `.ncpanestate.ledger`: ONE `armed` row against FOUR rounds of review, so
 #     all SIX delivered verdicts read `asserted-not-armed` — the arm never moved
 #     while the report was amended under it.
-#   · `annz36` logged `subject-armed-sha:"-"` at verdict time with NO
+#   · `proj36` logged `subject-armed-sha:"-"` at verdict time with NO
 #     `skeptic-request` event at all: armed by spawn-worker, never by a wrap-up.
 #   · 19 of 64 ledgers print `matched=0 superseded=0`, and 14 of those carry a
 #     non-empty `standing_verdict` — a delivered verdict the supersession

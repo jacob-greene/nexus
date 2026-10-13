@@ -42,7 +42,7 @@ monitor/watcher/_respawn.sh	head	prod	2
 monitor/watcher/_service_health.sh	head	prod	6
 monitor/watcher/_unstick.sh	head	prod	2
 monitor/watcher/launcher.sh	head	prod	1
-monitor/watcher/main.sh	head	prod	7
+monitor/watcher/main.sh	head	prod	8
 monitor/watcher/run-tests.sh	grep-m	prod	2
 monitor/watcher/run-tests.sh	head	prod	1
 monitor/watcher/spawn-fresh-orchestrator.sh	head	prod	2

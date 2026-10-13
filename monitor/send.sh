@@ -92,7 +92,9 @@
 #   NEXUS_PASTE_BIN      paste-followup binary (generic-tmux adapter).
 #
 # Exit (SKILL §5): 0 delivered | 3 unknown (chain halted) | 4 established
-# non-delivery | 1 refused (usage, no window, unstampable ledger) | 2 internal.
+# non-delivery, INCLUDING a ledger the preflight finds unwritable (degraded
+# tree, #1724: nothing was sent, a fallback is licensed) | 1 refused (usage,
+# no window, a stamp that failed after the preflight passed) | 2 internal.
 # --ledger-coverage: 0 complete over the declared transports | 3 a declared
 # transport escapes the ledger. --list: 0 records printed | 1 none.
 #
@@ -714,6 +716,37 @@ fi
 trap '[[ -n "$TMP_PAYLOAD" ]] && rm -f "$TMP_PAYLOAD"' EXIT
 [[ -s "$PAYLOAD" ]] || die "refusing to send an empty message"
 
+# ---- degraded filesystem: refuse LOUDLY before anything is stamped (#1724) --
+# Every send path stamps the ledger first and refuses to send unstamped (#665).
+# On a read-only tree that stamp fails, and it used to surface as
+# `tmux-paste refused (rc=1) — treating as unknown, halting` with rc 3: a
+# verdict that FORBIDS the fallback, about a send that never happened. Measured
+# in the 2026-10-03 and 2026-10-09 RO incidents: the orchestrator could not
+# reach any worker this way, and had to discover SendMessage on its own. So
+# probe the ledger with a FRESH create (never a held fd, see _fs_probe.sh)
+# and, if it fails, say what failed, that NOTHING was sent, and exit 4: an
+# ESTABLISHED non-delivery, which is exactly what licenses a fallback (SKILL §4).
+_ledger_unwritable() {   # -> 0 and the reason on stdout when the ledger cannot take a row
+    local t err
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    t="$STATE_DIR/.ngsend-probe.$$.${RANDOM}"
+    if err=$( { : > "$t"; } 2>&1 ); then
+        rm -f "$t" 2>/dev/null
+        if [[ -e "$STATE_DIR/machine-input.tsv" && ! -w "$STATE_DIR/machine-input.tsv" ]]; then
+            printf '%s' "$STATE_DIR/machine-input.tsv: not writable"; return 0
+        fi
+        return 1
+    fi
+    printf '%s: %s' "$STATE_DIR" "${err##*: }"
+    return 0
+}
+if _why=$(_ledger_unwritable); then
+    say "DEGRADED — the delivery ledger cannot be written (${_why}). See: monitor/ng degraded status (your-org/nexus-code#1724)."
+    say "NOTHING WAS SENT to $WINDOW. This is an ESTABLISHED non-delivery, so a fallback cannot double-deliver."
+    say "FALLBACK: deliver it with SendMessage to '$WINDOW' (address it by the name ListAgents prints). Do not retry ng send until 'ng degraded status' exits 0."
+    exit $RC_NOT_DELIVERED
+fi
+
 # ---- --stamp-only: the supported path for an invoke=agent transport ------
 if (( STAMP_ONLY )); then
     [[ -n "$ONLY_TRANSPORT" ]] || die "--stamp-only needs --transport <name> (the transport you are about to perform yourself)"
@@ -807,7 +840,7 @@ for t in "${TRANSPORTS[@]}"; do
             # double execution, which is strictly worse than not falling back.
             say "$name returned UNKNOWN — halting the chain (a fallback may only fire on a PROVEN negative). Do NOT re-send. Re-check with: ng send $WINDOW --check --nonce $NONCE — or, if this nonce was not captured, ng send $WINDOW --check --last — either answers about $name, the transport that carried this send"
             exit $RC_UNKNOWN ;;
-        *) say "$name refused (rc=$rc) — treating as unknown, halting"; exit $RC_UNKNOWN ;;
+        *) say "$name refused (rc=$rc) — treating as unknown, halting. Read its reason above; if the tree went read-only mid-send, check: monitor/ng degraded status"; exit $RC_UNKNOWN ;;
     esac
 done
 

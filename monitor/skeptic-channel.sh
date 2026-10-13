@@ -150,10 +150,12 @@
 #                                             STANDS: the pending marker is not
 #                                             touched, retire-preflight keeps
 #                                             gating (your-org/nexus-code#845 H)
-#   reset   <task-id>                         open a new round: archive the
+#   reset   <task-id> [--keep-correspondence] open a new round: archive the
 #                                             prior DONE + .answered.md into
 #                                             skeptic/.archive/<task>.reset-<ts>/
-#                                             (no-op rc 0)
+#                                             (no-op rc 0); --keep-correspondence
+#                                             leaves .answered.md (a PARALLEL
+#                                             round is still open, your-nexus#414)
 #   list    <task-id>                         human-readable status table
 #   status  <task-id>                         machine: "open=N ack=A answered=M total=T done=0|1"
 #   nudge   <worker-window> [--task <id>] [--force] [--min-interval S]
@@ -202,7 +204,12 @@
 #       meaningful) and from 10 (the skeptic closed the channel
 #       deliberately). Read the verdict from the skeptic's report and
 #       proceed; do NOT re-enter await (your-org/nexus-code#615).
-#   7   release: REFUSED — the review is pending or could not be ruled out
+#   7   release: REFUSED — the review is POSITIVELY pending (a marker, an
+#       owed delta, an outstanding artefact or a non-settled edge)
+#   8   release: REFUSED — COULD NOT DETERMINE: a ledger probe timed out on
+#       every attempt or could not answer, and nothing positively pending was
+#       seen. NEITHER pending nor clear; re-run the same command, do not
+#       switch verbs (your-org/nexus-code#1771)
 #  14   await: ENDED-WITHOUT-VERDICT — the wait ended (stderr names the cause:
 #       close | resolve | marker-cleared) and the ledger POSITIVELY records no
 #       verdict covering the current arm (`verdicts=0` or `standing_stale=1`).
@@ -215,6 +222,11 @@
 #       10 and 11 are qualified by the ledger in ONE direction: a positive "no
 #       verdict" makes them 14; an absent/unreadable ledger keeps them and says
 #       UNVERIFIED on stderr.
+#  16   close: LEFT OPEN — another round on this target is positively live
+#       (armed while this pairing was in review, or a live reviewer other
+#       than the closer), so no DONE, no `resolved` row, marker untouched
+#       (your-org/your-nexus#414, #1810 skeptic F1). Not a failure to retry:
+#       each open round ends with its own verdict or an operator `resolve`.
 #  10   await: DONE sentinel present AND newer than the task's pending
 #       marker (or no marker) — the skeptic closed the channel for THIS
 #       round; stop looping and proceed to retire. A DONE older than the
@@ -1584,6 +1596,78 @@ cmd_close() {
     local task="${1:-}"; [[ -n "$task" ]] || die "usage: close <task-id>"
     _require_valid_task_key "$task"
     local dir; dir=$(_channel_dir "$task")
+    # ── A CLOSE ENDS ONE PAIRING, NOT EVERY ROUND (your-org/your-nexus#414) ──
+    #
+    # The `resolved` row appended below closes EVERY outstanding arm (it is the
+    # window-keyed release `_skeptic_open_arms` honours wholesale), and DONE
+    # ends the target's await for everyone. With several skeptics reviewing one
+    # target in parallel — five batch skeptics on `mysite-review` — the first
+    # close released its siblings' unreviewed rounds on the ledger and ended
+    # the wait they were answering questions through.
+    #
+    # BUT AN OPEN ARM IS NOT EVIDENCE OF A SIBLING (#1810 skeptic F1). A round
+    # abandoned by a sequential re-arm under a new report path stays open on
+    # the ledger exactly like a parallel sibling's, and keeping the channel open
+    # for it stalls the normal revise-and-re-wrap flow until an operator
+    # `resolve` (the live `.overlay.ledger` holds that shape). So the channel
+    # is kept open only on POSITIVE evidence that another round is live:
+    #
+    #   ORDER  an open arm armed AFTER the closer's own round's arm and BEFORE
+    #          the closer's attributed verdict on it: it was opened while this
+    #          pairing was in flight, so it is a concurrent round. An arm from
+    #          before the closer's own arm is an earlier, superseded round; one
+    #          armed after the verdict is this (retained) reviewer's next round.
+    #   LIVE   a recorded skeptic window for this target, other than the closer,
+    #          is live in tmux (`window`, keyed on provenance records).
+    #
+    # Anything else — no attributed verdict by this closer, no provenance, tmux
+    # not answering — releases as before (the #961 anti-brick path). That is the
+    # pre-#414 behaviour, so the worst case is the base's, never a stall.
+    # Keeping means: no DONE, no `resolved` row, marker untouched, and EXIT 16,
+    # so a caller cannot read a close that did nothing as a success.
+    local _cl_keep_why=""
+    if [[ -e "$PENDING_DIR/.$(_safe "$task").ledger" && -x "$_script_dir/ng" ]]; then
+        local _cl_out="" _cl_rc=0 _cl_open="" _cl_sib="" _cl_live=""
+        local _cl_by="${NEXUS_WORKER_WINDOW:-}"
+        _cl_out=$(NEXUS_STATE_DIR="$STATE_DIR" timeout "${SKEPTIC_CLOSE_PROBE_TIMEOUT:-60}" \
+            "$_script_dir/ng" skeptic-obligations "$task" --state-dir "$STATE_DIR" 2>/dev/null) || _cl_rc=$?
+        if (( _cl_rc == 1 )); then
+            _cl_open=$(sed -n 's/^arm sha=\([0-9a-f]\{64\}\) .*/\1/p' <<<"$_cl_out")
+        fi
+        if [[ -n "$_cl_open" && -n "$_cl_by" ]]; then
+            _cl_sib=$(awk -F'\t' -v by="$_cl_by" -v open="$_cl_open" '
+                BEGIN { n = split(open, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") o[a[i]] = 1 }
+                $1 == "armed" && $2 ~ /^[0-9a-f]{64}$/ { arm[$2] = NR }
+                $1 == "discharged" && $6 == by && $2 ~ /^[0-9a-f]{64}$/ \
+                    && ($7 == "attributed" || $7 == "attributed-by-issue" || $7 == "asserted" || $7 == "asserted-path") \
+                    && ($2 in arm) { own_arm = arm[$2]; own_dis = NR; own = $2 }
+                END {
+                    if (!own_dis) exit 0
+                    for (s in o) if (s != own && (s in arm) && arm[s] > own_arm && arm[s] < own_dis) print s
+                }
+            ' "$PENDING_DIR/.$(_safe "$task").ledger" 2>/dev/null) || _cl_sib=""
+            if [[ -n "$_cl_sib" ]]; then
+                _cl_keep_why="$(grep -c . <<<"$_cl_sib") open round(s) on $task (${_cl_sib:0:12}…) were armed while $_cl_by's own round was in review — after its arm, before its verdict — so they are a sibling's round, not this closer's"
+            fi
+        fi
+        if [[ -n "$_cl_open" && -z "$_cl_keep_why" ]]; then
+            _cl_live=$(cmd_window "$task" 2>/dev/null \
+                | awk -v by="$_cl_by" '$0 ~ / live=1$/ { w = $1; sub(/^skeptic=/, "", w); if (w != by) print w }') || _cl_live=""
+            if [[ -n "$_cl_live" ]]; then
+                _cl_keep_why="a live reviewer other than ${_cl_by:-the closer} ($(tr '\n' ' ' <<<"$_cl_live" | sed 's/ $//')) is still assigned to $task while $(grep -c . <<<"$_cl_open") round(s) are open, so a sibling's round may be among them"
+            fi
+        fi
+    fi
+    if [[ -n "$_cl_keep_why" ]]; then
+        printf 'skeptic-channel: close %s — the channel is LEFT OPEN (exit 16): %s (your-org/your-nexus#414).\n' "$task" "$_cl_keep_why" >&2
+        printf '  No DONE was written, no round was released and the pending marker is untouched.\n' >&2
+        printf '  Each open round ends with its own verdict (ng wrap-up … --skeptic-role --skeptic-subject <report>);\n' >&2
+        printf '  `ng skeptic-obligations %s` lists them, `ng skeptic resolve %s --reason …` releases them on the record.\n' "$task" "$task" >&2
+        "$_script_dir/ng" log-action monitor --event skeptic-close-kept-open \
+            --extra "task=$task" --extra "by=${NEXUS_WORKER_WINDOW:-orchestrator}" \
+            --extra "reason=$_cl_keep_why" >/dev/null 2>&1 || true
+        return 16
+    fi
     mkdir -p "$dir" || die "close: cannot create channel dir: $dir"
     local sentinel="$dir/DONE"
     local tmp; tmp=$(mktemp "$dir/.DONE.XXXXXX") || die "close: mktemp failed"
@@ -1786,6 +1870,19 @@ EOF
         timeout "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}" \
             "$_res_ng_bin" skeptic-obligations "$task" >/dev/null 2>&1 || _res_owed=1
     fi
+    # AND THE EDGES `release` READS (your-org/nexus-code#1771). A reviewer that
+    # owes this window a verdict on a LIVE edge is a pending review: `release`
+    # refuses on it and names THIS verb, so this verb must not answer "nothing
+    # to resolve" about it — that pair was the ping-pong. Only a POSITIVE
+    # answer counts here: a read that could not answer leaves the other probes
+    # to decide, because writing a resolution nobody needed suppresses a later
+    # re-arm (#815), and `release` already owns the could-not-determine reply
+    # (rc 8). The edge is settled below with every other reviewer of $task.
+    local _res_edges="" _res_live_edges=0
+    if _res_edges=$(_creditor_edges_pending "$task" "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}") \
+       && [[ -n "$_res_edges" ]]; then
+        _res_live_edges=1
+    fi
     # THE READER THAT REFUSES THE WRAP-UP MUST BE THE READER THIS VERB CONSULTS
     # (orchestrator, 2026-09-18, merge4 addendum). `ng report-check` settles a
     # `require` window's gate on ONE record — `.<key>.cleared-rationale`, via
@@ -1798,13 +1895,13 @@ EOF
     # and no resolution record exists, the operator's reason IS the record:
     # write it (the audited path below), and say why.
     local _res_require_unsettled=0
-    if [[ ! -e "$marker" && $disposition -eq 0 && $_res_owed -eq 0 && $_delta_flag -eq 0 && $withdraw_delta -eq 0 ]] \
+    if [[ ! -e "$marker" && $disposition -eq 0 && $_res_owed -eq 0 && $_res_live_edges -eq 0 && $_delta_flag -eq 0 && $withdraw_delta -eq 0 ]] \
        && [[ ! -e "$PENDING_DIR/.$(_safe "$task").cleared-rationale" ]] \
        && grep -qE '"skeptic_mode"[[:space:]]*:[[:space:]]*"require"' "$STATE_DIR/windows/$(_safe "$task").json" 2>/dev/null; then
         _res_require_unsettled=1
         printf 'skeptic-channel: task %s was spawned --skeptic require and has NO resolution record — the reader `ng report-check` consults (`_skeptic_resolution_state`) reads it as NOT settled, whatever the ledger shows. Recording this resolution so the two readers agree.\n' "$task" >&2
     fi
-    if [[ ! -e "$marker" && $disposition -eq 0 && $_res_owed -eq 0 && $_delta_flag -eq 0 && $withdraw_delta -eq 0 && $_res_require_unsettled -eq 0 ]]; then
+    if [[ ! -e "$marker" && $disposition -eq 0 && $_res_owed -eq 0 && $_res_live_edges -eq 0 && $_delta_flag -eq 0 && $withdraw_delta -eq 0 && $_res_require_unsettled -eq 0 ]]; then
         # Nothing to clear. Fail loud rather than reporting success: a silent
         # no-op here would let `resolve` become a reflex incantation.
         #
@@ -1900,6 +1997,8 @@ EOF
             printf 'marker   : none (disposition-only release)\n'
         fi
         (( disposition )) && printf 'scope    : also releases retire-preflight check 1c (disposition: second-pass)\n'
+        (( _res_live_edges )) && printf 'scope    : settles the live obligation edge(s) naming %s as creditor (#1771): %s\n' \
+            "$task" "$(cut -f1 <<<"$_res_edges" | paste -sd, -)"
         # skprotosk G1: a resolution that SETTLES A COMPLETED ROUND (no marker,
         # nothing outstanding, a verdict already delivered) declines nothing, so
         # it must not feed the #815 "ALREADY RESOLVED — NOT RE-ARMING" arm: a
@@ -2020,11 +2119,17 @@ EOF
     # correction rests on. Every reviewer of THIS window is discharged; the
     # reason is carried through verbatim so the ledger and the rationale
     # record agree.
+    # The settle is best-effort (resolve still succeeds), but its OUTCOME is
+    # reported: the success line used to say "settled" unconditionally, also
+    # when the settle had failed (skeptic nit on PR #1781).
+    local _res_settle_rc=0 _res_settle_err=""
     if [[ -x "$_script_dir/obligations.sh" ]]; then
-        ( "$_script_dir/obligations.sh" settle --creditor "$task" \
+        _res_settle_err=$( "$_script_dir/obligations.sh" settle --creditor "$task" \
             --by "skeptic-channel.sh resolve" \
             --reason "orchestrator resolved $task's skeptic gate on the record: $reason" \
-            ) >/dev/null 2>&1 || true
+            2>&1 >/dev/null ) || _res_settle_rc=$?
+    else
+        _res_settle_rc=127; _res_settle_err="$_script_dir/obligations.sh is not executable"
     fi
     "$_script_dir/ng" log-action monitor \
         --event skeptic-resolve \
@@ -2033,6 +2138,15 @@ EOF
         --extra "reason=$reason" >/dev/null 2>&1 || true
     if (( had_marker )); then
         printf 'resolved skeptic-pending marker for %s\n' "$task"
+        (( _res_live_edges && _res_settle_rc != 0 )) \
+            && printf 'the live obligation edge(s) from %s are NOT settled: the settle failed (rc %s: %s). Settle them by hand: monitor/obligations.sh settle --creditor %s --reason "<why>"\n' \
+                "$(cut -f1 <<<"$_res_edges" | paste -sd, -)" "$_res_settle_rc" "${_res_settle_err%%$'\n'*}" "$task"
+    elif (( _res_live_edges && _res_settle_rc == 0 )); then
+        printf 'resolved %s'"'"'s pending review: no marker was present, and the live obligation edge(s) from %s are settled\n' \
+            "$task" "$(cut -f1 <<<"$_res_edges" | paste -sd, -)"
+    elif (( _res_live_edges )); then
+        printf 'resolved %s'"'"'s pending review on the record, but the live obligation edge(s) from %s are NOT settled: the settle failed (rc %s: %s). Settle them by hand: monitor/obligations.sh settle --creditor %s --reason "<why>"\n' \
+            "$task" "$(cut -f1 <<<"$_res_edges" | paste -sd, -)" "$_res_settle_rc" "${_res_settle_err%%$'\n'*}" "$task"
     elif (( _res_require_unsettled )); then
         printf 'recorded a settlement of %s'"'"'s completed round (no review was declined): report-check now reads the gate as settled, and a later wrap-up of NEW work ARMS normally — this record does not suppress re-arming\n' "$task"
     else
@@ -2077,6 +2191,38 @@ _write_released() {
     mv -f "$tmp" "$dir/RELEASED" || { rm -f "$tmp"; return 1; }
 }
 
+# _creditor_edges_pending <task> <timeout> — the obligation edges naming <task>
+# as CREDITOR that may still bring a reviewer, one `<debtor>\t<state>` line each.
+# rc 0 = the ledger answered (no lines = none pending); 127 = obligations.sh is
+# not executable; any other rc is the read's own (124/137/143 = timed out).
+#
+# ONE READER FOR BOTH VERBS (your-org/nexus-code#1771). `release` refused on a
+# live edge ("its review is PENDING … that is `resolve`") while `resolve` did
+# not look at edges and answered the same window "nothing to resolve" — so a
+# `request reply --status declined` was refused with --skeptic-resolved ("drop
+# it") and without it ("re-run with it"). Two verbs that disagree about what is
+# pending are a ping-pong by construction; they now ask the same question.
+#
+# `--all`, then DEFAULT-DENY on the state column: only `settled` and the
+# `void-*` family release, so `live`, `unknown` and any state a future revision
+# adds all read as a reviewer that may still be coming. The table's header and
+# its `(N row(s)…)` footer are not rows — the first draft of this check tested
+# the output for non-emptiness and refused EVERY release on the header alone.
+_creditor_edges_pending() {
+    local task="$1" to="$2" edges="" rc=0 st deb rest
+    [[ -x "$_script_dir/obligations.sh" ]] || return 127
+    edges=$(timeout "$to" "$_script_dir/obligations.sh" list --all --creditor "$task" 2>/dev/null) || rc=$?
+    (( rc == 0 )) || return "$rc"
+    while read -r st deb rest; do
+        case "$st" in
+            ""|STATE|\(*) continue ;;
+            settled|void-*) continue ;;
+        esac
+        printf '%s\t%s\n' "$deb" "$st"
+    done <<<"$edges"
+    return 0
+}
+
 # release <task-id> --reason "<why>"   ORCHESTRATOR
 #
 # END AN AWAIT ON A CHANNEL WHOSE GATE IS ALREADY DISCHARGED — and ONLY then.
@@ -2092,8 +2238,10 @@ _write_released() {
 #   · `ng skeptic-obligations` rc 0      (no armed artefact outstanding)
 #   · no LIVE obligation edge names this window as creditor (no reviewer is
 #     mid-pass on it) — `obligations.sh list --live --creditor`
-# and a probe that cannot answer is a refusal, not a pass. `resolve` remains the
-# audited override for a gate that IS armed.
+# and a probe that cannot answer is a refusal, not a pass — exit 8 after a
+# bounded retry of a timed-out read, so its caller can say "the same command
+# again" rather than "the other verb" (your-org/nexus-code#1771). `resolve`
+# remains the audited override for a gate that IS armed.
 cmd_release() {
     local task="" reason=""
     _argloop_prev_r=-1; while (( $# > 0 )); do (( $# != _argloop_prev_r )) || _argloop_stuck "$1"; _argloop_prev_r=$#
@@ -2113,47 +2261,84 @@ cmd_release() {
     (( ${#reason} >= 20 )) || die "release: --reason must be a substantive explanation (>=20 chars) — it is what the released await prints"
     _require_valid_task_key "$task"
     local marker; marker=$(_pending_marker "$task")
-    local -a why=()
+    local -a why=() doubt=()
     [[ -e "$(_delta_owed_file "$task")" ]] && why+=("a resolution recorded a DELTA REVIEW as OWED for $task and it has not landed")
     [[ -e "$marker" ]] && why+=("a skeptic-pending marker exists ($marker) — a review is REQUIRED and pending")
-    if [[ -x "$_script_dir/ng" ]]; then
-        local _rl_rc=0
-        timeout "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}" "$_script_dir/ng" skeptic-obligations "$task" >/dev/null 2>&1 || _rl_rc=$?
-        (( _rl_rc == 0 )) || why+=("\`ng skeptic-obligations $task\` did not report a clear ledger (rc $_rl_rc) — an armed artefact is outstanding, or the probe could not answer")
-    else
-        why+=("monitor/ng is not executable — the ledger could not be asked")
-    fi
-    if [[ -x "$_script_dir/obligations.sh" ]]; then
-        local _rl_edges="" _rl_erc=0
-        # `--all`, then DEFAULT-DENY on the state column: only `settled` and the
-        # `void-*` family release, so `live`, `unknown` and any state a future
-        # revision adds all read as a reviewer that may still be coming. The
-        # table's header and its `(N row(s)…)` footer are not rows — the first
-        # draft of this check tested the output for non-emptiness and refused
-        # EVERY release on the header alone.
-        _rl_edges=$(timeout 60 "$_script_dir/obligations.sh" list --all --creditor "$task" 2>/dev/null) || _rl_erc=$?
-        if (( _rl_erc != 0 )); then
-            why+=("the obligation ledger could not be read (rc $_rl_erc)")
+    # A LEDGER READ THAT TIMED OUT IS DOUBT, NOT A PENDING REVIEW
+    # (your-org/nexus-code#1771). Both probes below used to fold every non-zero
+    # into one rc 7, and `ng request reply --status declined --skeptic-resolved`
+    # answered rc 7 with "drop --skeptic-resolved" — whose own refusal, on a
+    # gate that IS discharged, says "re-run with --skeptic-resolved". Under load
+    # (an `obligations.sh list` read measured past its 60s bound) the caller was
+    # sent between the two refusals with no path out. So: a timed-out read gets
+    # a BOUNDED retry, one per entry of SKEPTIC_RELEASE_PROBE_TIMEOUTS (seconds,
+    # default "60 60"), and a doubt that survives every attempt is exit 8 — still
+    # a refusal (a probe that cannot answer is never a pass), but a distinct one
+    # whose remedy is the SAME command again, never the other verb. A positive
+    # pending answer is not retried: it is an answer.
+    local -a _rl_tos=()
+    read -r -a _rl_tos <<<"${SKEPTIC_RELEASE_PROBE_TIMEOUTS:-60 60}"
+    (( ${#_rl_tos[@]} >= 1 && ${#_rl_tos[@]} <= 5 )) \
+        || die "release: SKEPTIC_RELEASE_PROBE_TIMEOUTS must hold 1-5 timeouts (seconds), got '${SKEPTIC_RELEASE_PROBE_TIMEOUTS:-}'"
+    local _rl_to
+    for _rl_to in "${_rl_tos[@]}"; do
+        [[ "$_rl_to" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "release: SKEPTIC_RELEASE_PROBE_TIMEOUTS entry '$_rl_to' is not a number of seconds"
+    done
+    local _rl_attempt=0 _rl_retry=0
+    local -a _rl_pending=()
+    for _rl_to in "${_rl_tos[@]}"; do
+        _rl_attempt=$(( _rl_attempt + 1 ))
+        doubt=(); _rl_pending=(); _rl_retry=0
+        if [[ -x "$_script_dir/ng" ]]; then
+            local _rl_rc=0
+            timeout "$_rl_to" "$_script_dir/ng" skeptic-obligations "$task" >/dev/null 2>&1 || _rl_rc=$?
+            case "$_rl_rc" in
+                0) : ;;
+                1) _rl_pending+=("\`ng skeptic-obligations $task\` reports an armed artefact OUTSTANDING (rc 1)") ;;
+                124|137|143) doubt+=("\`ng skeptic-obligations $task\` timed out after ${_rl_to}s (rc $_rl_rc)"); _rl_retry=1 ;;
+                *) doubt+=("\`ng skeptic-obligations $task\` could not answer (rc $_rl_rc)") ;;
+            esac
         else
-            local _rl_st _rl_deb _rl_rest
-            while read -r _rl_st _rl_deb _rl_rest; do
-                case "$_rl_st" in
-                    ""|STATE|\(*) continue ;;
-                    settled|void-*) continue ;;
-                esac
-                why+=("obligation edge $_rl_deb -> $task is in state '$_rl_st' — a reviewer is (or may be) mid-pass on it")
-            done <<<"$_rl_edges"
+            doubt+=("monitor/ng is not executable — the ledger could not be asked")
         fi
-    else
-        why+=("monitor/obligations.sh is not executable — live reviewers could not be ruled out")
-    fi
+        local _rl_edges="" _rl_erc=0
+        _rl_edges=$(_creditor_edges_pending "$task" "$_rl_to") || _rl_erc=$?
+        case "$_rl_erc" in
+            0)
+                local _rl_deb _rl_st
+                while IFS=$'\t' read -r _rl_deb _rl_st; do
+                    [[ -n "$_rl_deb" ]] || continue
+                    _rl_pending+=("obligation edge $_rl_deb -> $task is in state '$_rl_st' — a reviewer is (or may be) mid-pass on it")
+                done <<<"$_rl_edges"
+                ;;
+            124|137|143) doubt+=("the obligation ledger read timed out after ${_rl_to}s (rc $_rl_erc)"); _rl_retry=1 ;;
+            127) doubt+=("monitor/obligations.sh is not executable — live reviewers could not be ruled out") ;;
+            *) doubt+=("the obligation ledger could not be read (rc $_rl_erc)") ;;
+        esac
+        # Retry ONLY a timeout, ONLY while nothing is positively pending, and
+        # only while an attempt remains.
+        (( _rl_retry && ${#why[@]} == 0 && ${#_rl_pending[@]} == 0 && _rl_attempt < ${#_rl_tos[@]} )) || break
+        printf 'skeptic-channel: release %s: a ledger read timed out (attempt %d of %d) — retrying.\n' \
+            "$task" "$_rl_attempt" "${#_rl_tos[@]}" >&2
+        sleep 2
+    done
+    (( ${#_rl_pending[@]} )) && why+=("${_rl_pending[@]}")
     if (( ${#why[@]} )); then
-        printf 'skeptic-channel: REFUSING to release the await on %s — its review is PENDING or could not be ruled out:\n' "$task" >&2
+        printf 'skeptic-channel: REFUSING to release the await on %s — its review is PENDING:\n' "$task" >&2
         printf '  - %s\n' "${why[@]}" >&2
+        (( ${#doubt[@]} )) && printf '  - (also could not answer) %s\n' "${doubt[@]}" >&2
         printf '  `release` ends a WAIT on an already-discharged gate; it never discharges one. If the\n' >&2
         printf '  orchestrator is DECLINING the review, that is `ng skeptic resolve %s --reason "…"`\n' "$task" >&2
         printf '  (audited, and it releases the await itself). Nothing was written.\n' >&2
         return 7
+    fi
+    if (( ${#doubt[@]} )); then
+        printf 'skeptic-channel: REFUSING to release the await on %s — COULD NOT DETERMINE whether its review is pending (%d attempt(s)):\n' \
+            "$task" "$_rl_attempt" >&2
+        printf '  - %s\n' "${doubt[@]}" >&2
+        printf '  Nothing positively pending was seen, and nothing was written. This is a ledger that\n' >&2
+        printf '  did not answer (load), not a pending review: re-run the SAME command once it can.\n' >&2
+        return 8
     fi
     _write_released "$task" "skeptic-channel.sh release" "$reason" || die "release: could not write the RELEASED sentinel"
     "$_script_dir/ng" log-action monitor --event skeptic-await-release \
@@ -2222,7 +2407,19 @@ cmd_defer() {
 }
 
 cmd_reset() {
-    local task="${1:-}"; [[ -n "$task" ]] || die "usage: reset <task-id>"
+    local task="${1:-}"; [[ -n "$task" ]] || die "usage: reset <task-id> [--keep-correspondence]"
+    shift
+    # --keep-correspondence (your-org/your-nexus#414): a PARALLEL round is
+    # still open on this target, so its *.answered.md are live, not prior —
+    # archive only the terminal sentinels. `ng skeptic-arm` and the require
+    # wrap-up pass it when the ledger names another open round.
+    local keep_corr=0
+    case "${1:-}" in
+        --keep-correspondence) keep_corr=1; shift ;;
+        "") : ;;
+        *) die "reset: unexpected argument: $(_arg_excerpt "$1")" ;;
+    esac
+    (( $# == 0 )) || die "reset: unexpected argument: $(_arg_excerpt "$1")"
     _require_valid_task_key "$task"
     local dir; dir=$(_channel_dir "$task")
     [[ -d "$dir" ]] || return 0
@@ -2242,7 +2439,7 @@ cmd_reset() {
     # (#469, #511), but it is COUNTED and NAMED separately: a reader budgeting for
     # "stale sentinels" once concluded eight answered rebuttals were destroyed.
     local f n_corr=0
-    for f in "$dir"/*.answered.md; do [[ -e "$f" ]] && { stale+=("$f"); n_corr=$(( n_corr + 1 )); }; done
+    (( keep_corr )) || for f in "$dir"/*.answered.md; do [[ -e "$f" ]] && { stale+=("$f"); n_corr=$(( n_corr + 1 )); }; done
     (( ${#stale[@]} )) || return 0
     local ts archive
     ts=$(date +%Y-%m-%dT%H%M%S 2>/dev/null || _now_iso)

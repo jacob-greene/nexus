@@ -954,6 +954,15 @@ monitor:
     # `dispatch` refuses a config that breaks it (stays alive, service=disabled,
     # says so on stderr). Env: MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS.
     probe_timeout_seconds: 30
+    # Slurm backoff (<your-org>/nexus-code#1728): when a slurm probe cannot reach
+    # Slurm (a chaperon error, or a probe timeout), slurm probes pause for
+    # base·2^k s (k = consecutive failures, capped at 900 s) and those unknowns
+    # do not count toward unknown_max — until limit seconds of continuous
+    # backoff, after which they count again and the watch parks and EMITS.
+    # Envs: MONITOR_LONGJOB_SLURM_BACKOFF_BASE_SECONDS /
+    # MONITOR_LONGJOB_SLURM_BACKOFF_LIMIT_SECONDS.
+    slurm_backoff_base_seconds: 60
+    slurm_backoff_limit_seconds: 1800
     # Minimum gap between two delivered lines (ms). The host's per-monitor
     # rate limiter (2.1.272: 10 batches, refill one per 2000 ms) DISCARDS a
     # burst and delivers only a count — invisible to this side — so the
@@ -1869,7 +1878,7 @@ monitor:
     #   # your campus/LAN, no per-connection edit. Use YOUR network's block;
     #   # the value below is an EXAMPLE (<your-institution> campus), not a universal
     #   # default — substitute your own CIDR.
-    #   from_cidr: "140.107.0.0/16"
+    #   from_cidr: "198.51.0.0/16"
     #
     #   # single client — one address only. This is "max security" ONLY IF that
     #   # address is the CLIENT's own. See the box below before relying on it.

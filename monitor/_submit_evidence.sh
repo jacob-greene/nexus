@@ -136,12 +136,20 @@ _SE_JQ_DELIVERY_TS="(( $_SE_JQ_SELECT | .timestamp // empty ), ( $_SE_JQ_ENQUEUE
 # pair it cannot tell apart is a message that differs from another solely
 # by tab-versus-four-spaces, which is not a distinction any follow-up
 # instruction rests on.
+#
+# `split`/`join`, NEVER `gsub` (your-org/nexus-code#1773). jq 1.5 — this
+# host's — corrupts a string under `sub`/`gsub` when the match follows
+# multibyte characters: measured, `"é—x<TAB>y" | gsub("\t"; "    ")`
+# returns `"    y"`, the whole prefix gone. An em dash before a tab — routine in an agent brief — made the
+# delivered record hash to something else and the scan answer `no` at rc
+# 0. No jq regex may touch message content here; a literal split is
+# byte-exact on every jq.
 _SE_JQ_DELIVERY_B64="((
   $_SE_JQ_SELECT
-  | [(.timestamp // \"\"), ((.message.content | tostring | gsub(\"\\t\"; \"    \")) | @base64)]
+  | [(.timestamp // \"\"), ((.message.content | tostring | split(\"\\t\") | join(\"    \")) | @base64)]
 ), (
   $_SE_JQ_ENQUEUE_SELECT
-  | [(.timestamp // \"\"), ((.content | gsub(\"\\t\"; \"    \")) | @base64)]
+  | [(.timestamp // \"\"), ((.content | split(\"\\t\") | join(\"    \")) | @base64)]
 )) | @tsv"
 
 # How many trailing bytes of a transcript to scan. A live worker

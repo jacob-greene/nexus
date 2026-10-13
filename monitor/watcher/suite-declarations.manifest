@@ -205,6 +205,7 @@ monitor/watcher/test-labsh-reap-stale-builds.sh|unreviewed|census at dev 2a29957
 monitor/watcher/test-launcher-headless.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-launcher-pidfile.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-launcher-replace.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-leak-screen-workflow.sh|declares-none|reviewed 2026-10-07 (your-org/nexus-code#1759): a unit test of ONE file, .github/workflows/leak-screen.yml; it parses the workflow and executes the step's own run: body against a stub suite in its own $WORK, so it reads no repo-wide population
 monitor/watcher/test-lib.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-link-nexus-tools.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-lit-empty-vs-failed.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -293,7 +294,9 @@ monitor/watcher/test-proc-redirect-order.sh|unreviewed|census at dev 2a299572 (2
 monitor/watcher/test-provenance-harness-field.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-prune-rotation.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-public-guard-refusal.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-public-mirror-form-rows.sh|declares-none|reviewed 2026-10-07 (your-org/nexus-code#1761): runs monitor/public-mirror/leak-gate.sh with the dictionary (mapping.tsv) against throwaway fixture repos it builds under its own $WORK; the only repo files it reads are those two, never a population
 monitor/watcher/test-public-mirror-leak-gate-commit.sh|declares-none|reviewed 2026-09-25 (your-org/nexus-code#1006): a unit suite over one throwaway fixture repository it builds under its own $WORK — it runs monitor/public-mirror/leak-gate.sh --commit against commits made there with a synthetic map; every git command it issues is aimed at that fixture, never at this tree, so enrolling it would declare no repo-wide population
+monitor/watcher/test-public-mirror-leak-gate-fail-closed.sh|declares-none|reviewed 2026-10-07 (your-org/nexus-code#1760): runs monitor/public-mirror/leak-gate.sh with a SYNTHETIC map against throwaway fixture repos under its own $WORK; reads no repo-wide population
 monitor/watcher/test-public-mirror-overlay-drift.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-public-mirror-symlink-target.sh|declares-none|reviewed 2026-09-25 (your-org/nexus-code#1301): a unit suite over throwaway fixture repositories it builds under its own $WORK — it runs monitor/public-mirror/leak-gate.sh and a copy of build.sh against them with a synthetic map; every `git ls-files`/`git grep` it performs is aimed at those fixtures, never at this tree, so enrolling it would declare no repo-wide population
 monitor/watcher/test-public-mirror-sync-base.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -355,7 +358,6 @@ monitor/watcher/test-service-health.sh|unreviewed|census at dev 2a299572 (2026-0
 monitor/watcher/test-service-root-guard.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-session-name-from-window.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-settings-json.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/watcher/test-settings-overlay.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-skeptic-answer-body-fidelity.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-skeptic-arm-recording.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-skeptic-channel.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -384,6 +386,8 @@ monitor/watcher/test-stub-claude-classifier-sigpipe.sh|unreviewed|census at dev 
 monitor/watcher/test-supervisor-liveness.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-orphan-reconcile.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-orphans.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-svc-boot-starting.sh|declares-none|reviewed 2026-10-12 (bundle-1012a): drives the real bootstrap-recover.sh --services-only and then monitor/svc.sh status over a fixture registry and state dir it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
+monitor/watcher/test-svc-url-redact.sh|declares-none|reviewed 2026-10-12 (bundle-1012a): drives monitor/svc.sh status end to end over a fixture registry and state dir it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
 monitor/watcher/test-svc-url-warning.sh|declares-none|reviewed 2026-10-05 (your-org/nexus-code#1742): drives monitor/svc.sh status end to end over a fixture registry it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
 monitor/watcher/test-svc.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-target-absent.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -416,6 +420,7 @@ monitor/watcher/test-watcher-singleton-groups.sh|unreviewed|census at dev 2a2995
 monitor/watcher/test-watcher-supervise.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-window-session-id.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-worker-floor-content.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-worker-floor-synthetic-fixtures.sh|declares-none|reviewed 2026-10-07 (your-org/nexus-code#1762): reads four named files (spawn-worker.sh's floor-extraction awk, the worker-defaults and self-fix skills, mapping.tsv's shape rows); no repo-wide population
 monitor/watcher/test-worker-health.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-worker-heartbeat.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-worker-nproc-bound.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads

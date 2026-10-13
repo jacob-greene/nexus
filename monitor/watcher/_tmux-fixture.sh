@@ -111,7 +111,7 @@ nx_real_tmux_bin() {
 # have opposite constraints: ledgers, ports files and fixture trees may live
 # anywhere (a private, reaped TMPDIR is right for them); a tmux socket MUST be
 # short. So the root here is `${TMUX_TMPDIR:-/tmp}` when THAT fits — the
-# runner pins a short per-suite one, and a worker's is `/tmp/c71780`, the
+# runner pins a short per-suite one, and a worker's is `/tmp/c$(id -u)`, the
 # sockets-only directory — else `tmux_socket_short_tmpdir`'s `/tmp/tmux-th-…`.
 # <workdir> is kept in the signature for its callers and is no longer part of
 # the path. The length probe below stays as the BACKSTOP: a path that does not

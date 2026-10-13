@@ -1806,9 +1806,9 @@ fi
 assert_eq "4 terminal waits (TRUNCATED display) → terminal" \
     "$(card_probe "$_cap4")" 'terminal|t=4 r=0 d=0 u=0 c=0 n=4 b=0 x=0'
 
-# annzui2 live shape, measured on this board: 15 waits, every one terminal.
+# projui2 live shape, measured on this board: 15 waits, every one terminal.
 plant_waits 15 0 0
-assert_eq "15 terminal waits → terminal (annzui2 live shape)" \
+assert_eq "15 terminal waits → terminal (projui2 live shape)" \
     "$(card_probe "$(capped_of)")" 'terminal|t=15 r=0 d=0 u=0 c=0 n=15 b=0 x=0'
 
 # guardkey hand-sorted shape: 2 finished, 9 nohup, 2 genuinely indeterminate.
@@ -2219,16 +2219,16 @@ rm -f "$STATE_DIR/idle-state.tsv"
 LOG="$STATE_DIR/action-log.jsonl"
 RETAIN_TS=$(date -Is -d "@$(( OLD_TS + 10 ))")
 cat > "$LOG" <<EOF
-{"ts":"$RETAIN_TS","agent":"monitor","event":"window-retain","window":"repltime-histones","reason":"open-ended-issue-81-prs-await-review"}
+{"ts":"$RETAIN_TS","agent":"monitor","event":"window-retain","window":"proj-alpha-series","reason":"open-ended-issue-81-prs-await-review"}
 EOF
-export MOCK_TMUX_WINDOWS="$(printf 'repltime-histones|%s' "$OLD_TS")"
+export MOCK_TMUX_WINDOWS="$(printf 'proj-alpha-series|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
-export MOCK_PANE_STATE_repltime_histones=idle
+export MOCK_PANE_STATE_proj_alpha_series=idle
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains  "no-wrap-up + retain → retained"      "$out" \
-                 $'repltime-histones\tretained'
+                 $'proj-alpha-series\tretained'
 assert_not_contains "no no-wrap-up row when retained"  "$out" \
-                    $'repltime-histones\tno-wrap-up'
+                    $'proj-alpha-series\tno-wrap-up'
 
 # ---- Test 14: retain does NOT suppress `wrapped-but-stub` -------------
 
@@ -2373,8 +2373,8 @@ out=$(PATH="$STUB_DIR:$PATH" bash -c "
     source '$PROBE'
     list_really_idle_workers() {
         printf 'foo-window\twrapped\t60\t\n'
-        printf 'echo-density\tretained\t3600\tloaded-context-dm-kernel-figures\n'
-        printf 'repltime-histones\tretained\t7200\topen-ended-issue-81-prs-await-review\n'
+        printf 'proj-density\tretained\t3600\tloaded-context-dm-kernel-figures\n'
+        printf 'proj-alpha-series\tretained\t7200\topen-ended-issue-81-prs-await-review\n'
         printf 'nexus-self-fix-wrap-up\tretained\t900\tpost-merge-loaded-context\n'
     }
     render_idle_section
@@ -2383,15 +2383,15 @@ assert_contains  "wrapped row renders normally"          "$out" \
                  "- foo-window wrapped up"
 assert_contains  "footer prefix shows count"             "$out" \
                  "(3 retained windows suppressed:"
-assert_contains  "footer lists echo-density"             "$out" \
-                 "echo-density (loaded-context-dm-kernel-figures)"
-assert_contains  "footer lists repltime-histones"        "$out" \
-                 "repltime-histones (open-ended-issue-81-prs-await-review)"
+assert_contains  "footer lists proj-density"             "$out" \
+                 "proj-density (loaded-context-dm-kernel-figures)"
+assert_contains  "footer lists proj-alpha-series"        "$out" \
+                 "proj-alpha-series (open-ended-issue-81-prs-await-review)"
 assert_contains  "footer lists nexus-self-fix-wrap-up"   "$out" \
                  "nexus-self-fix-wrap-up (post-merge-loaded-context)"
 # Sanity: no per-window "retained" row in the body.
 assert_not_contains "no per-row retained line"            "$out" \
-                    "  - echo-density"
+                    "  - proj-density"
 
 # ---- Test 19: footer truncates long reasons ---------------------------
 
@@ -2446,7 +2446,7 @@ assert_not_contains "cycle 3: betaretain dropped"          "$out3" "betaretain"
 
 # ---- Test 21: retain survives cursor/render activity ------------------
 #
-# Reproduces the echo-density bug from issue #111 directly. The
+# Reproduces the proj-density bug from issue #111 directly. The
 # tmux #{window_activity} epoch advances post retain.ts (autosuggest
 # blink, cursor move, status-bar tick) but pane-state stays idle.
 # Pre-fix, `(( activity_epoch <= retain_ts_epoch ))` consumed the
@@ -3473,19 +3473,31 @@ export MOCK_TMUX_WINDOWS="$(printf 'alpha|%s\nbeta|%s' "$OLD_TS" "$OLD_TS")"
 seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_alpha=busy
 export MOCK_PANE_STATE_beta=busy
-# A cold-start with stamp absent counts only rows newer than 0; with
-# stale rows in the file at PRE_TS this would over-report. The probe
-# guards against that by treating "missing stamp" as "no scope yet"
-# only after stamping NOW — so the second call sees 0 unless new rows
-# arrived. Verify: first call should be 0 awaiting-input (since the
-# stamp absent → epoch 0 means everything counts on the very first
-# pass). Documented trade-off; the assertion below pins the behavior.
+# Missing stamp = no scope yet ⇒ the count is SKIPPED, not taken since 0
+# (your-org/nexus-code#1765). This assertion used to pin "2" — the since=0
+# fallback that rendered "2516 awaiting-input" on a live board.
 run_probe_capture out rc 'render_idle_prelude'
-# First-call semantics: stamp epoch defaults to 0 → all rows in file
-# are "newer than 0" → count both windows. The doc-comment in
-# render_idle_prelude calls this out as the documented trade-off; we
-# expect exactly 2 here.
-assert_contains  "first call counts pre-existing rows"   "$out" "2 awaiting-input"
+assert_contains  "#1765 first call (no stamp) skips the count → 0 awaiting-input" \
+                 "$out" "0 awaiting-input"
+assert_contains  "#1765 first call writes a parseable stamp" \
+                 "$(cat "$STATE_DIR/last-prelude.ts" 2>/dev/null)" "."
+assert_eq        "#1765 stamp write leaves no tmp file behind" \
+                 "$(bash -c 'shopt -s nullglob; f=( "$1"/last-prelude.ts.*.tmp ); echo ${#f[@]}' _ "$STATE_DIR")" "0"
+
+# A torn / empty / unparseable / truncated-prefix stamp is NOT a scope
+# either (#1765): each must skip, never count every row since epoch 0.
+for _torn in '' '   ' 'garbage' '1759' '17.5'; do
+    printf '%s' "$_torn" > "$STATE_DIR/last-prelude.ts"
+    run_probe_capture out_t rc 'render_idle_prelude'
+    assert_contains  "#1765 torn stamp [${_torn}] → 0 awaiting-input" \
+                     "$out_t" "0 awaiting-input"
+done
+# Positive control: a REAL stamp before the rows still counts them, so the
+# zeros above are the guard, not a dead counter.
+printf '%s' "$(( PRE_TS - 1 ))" > "$STATE_DIR/last-prelude.ts"
+run_probe_capture out_pc rc 'render_idle_prelude'
+assert_contains  "#1765 positive control: valid stamp before rows → 2 awaiting-input" \
+                 "$out_pc" "2 awaiting-input"
 
 # Second render right after, no new rows: stamp from the first render
 # is now in place, count drops to 0.

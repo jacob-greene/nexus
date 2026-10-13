@@ -339,7 +339,7 @@ assert_eq "#908 …while a determinate empty tree past grace still resolves to a
 # `list-windows -t 0` reports one window instead of the session's. Both are
 # quiet wrong answers rather than errors you notice.
 _board_sock=$(tmux display-message -p '#{socket_path}' 2>/dev/null || printf '')
-tmux -L "$_SOCK" new-session -d -s 0 -n alpha 'sleep 600' 2>/dev/null
+tmux -L "$_SOCK" -f /dev/null new-session -d -s 0 -n alpha 'sleep 600' 2>/dev/null
 _mine_sock=$(tmux -L "$_SOCK" display-message -p '#{socket_path}' 2>/dev/null || printf '')
 if [[ -n "$_mine_sock" && "$_mine_sock" != "$_board_sock" ]]; then
     _SOCKET_PROVEN_PRIVATE=1
@@ -561,6 +561,7 @@ if [[ "${_SOCKET_PROVEN_PRIVATE:-0}" == 1 && -n "${SHIM:-}" ]]; then
     # suite's, so it is MEASURED via `display-message` (tmux's own answer) and
     # the arms SKIP rather than fail if the fixture did not land that way.
     # Asking the resolver instead would pin the defect as expected behaviour.
+    # tmux-fixture-conf-lint: allow-live-server  the server was started at the `-f /dev/null` new-session above; -f is read only at server start
     tmux -L "$_SOCK" new-session -d -s two -n charlie 'sleep 600' 2>/dev/null
     _cur_sess=$(command tmux -L "$_SOCK" display-message -p '#{session_name}' 2>/dev/null || printf '')
     # NO `| awk … exit` HERE. An early-exit reader closes the pipe, and under

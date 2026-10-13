@@ -459,7 +459,12 @@ else
             while IFS= read -r s; do
                 [ -n "$s" ] || continue
                 n_checked=$((n_checked+1))
-                hits=$( cd "$TREE" && git grep -inF -- "$s" 2>/dev/null )
+                # -I: BINARY files are never scrubbed, by design (#1812) — a
+                # short SOURCE occurring by chance inside compressed bytes is
+                # not a rule that failed to fire, and "fixing" it is what
+                # corrupted the mirror's image. Binaries are screened instead
+                # by the leak gate's deny scan (no -I) and by binaries.tsv.
+                hits=$( cd "$TREE" && git grep -I -inF -- "$s" 2>/dev/null )
                 # Discount exactly what leak-gate.sh discounts. A SOURCE that is
                 # a prefix of a form the dictionary deliberately protects (the
                 # sentinel round-trip restores it verbatim) is not a rule that

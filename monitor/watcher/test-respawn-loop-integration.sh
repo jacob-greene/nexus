@@ -228,6 +228,7 @@ trap 'tmux -L "$SOCK_NAME" kill-server 2>/dev/null || true' EXIT
 # live nexus tmux. Set PATH and NEXUS_ROOT globally on this private
 # server so every new window picks them up. Safe because -g here
 # scopes to OUR socket only — the live nexus server is unaffected.
+# tmux-fixture-conf-lint: allow-wrapper-pins-f  $TMUX_BIN_WRAPPER is the nx_write_tmux_shim written above with `-f "$F/tmux.conf"`
 "$TMUX_BIN_WRAPPER" new-session -d -s "$SESSION" -c "$F"
 require_server "setenv"
 "$TMUX_BIN_WRAPPER" setenv -g PATH "$F/.bin:$PATH"

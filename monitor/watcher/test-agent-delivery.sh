@@ -137,8 +137,13 @@ ck "B2d …but it WAS sent" "$(grep -c '^t1 ' "$SENDLOG")" "1"
 chmod 000 "$ST/machine-input.tsv" 2>/dev/null
 out=$(run "$W" --stamp-only --transport t1 --message hi); rc=$?
 chmod 644 "$ST/machine-input.tsv" 2>/dev/null
-ck "B3 an unstampable ledger REFUSES (rc 1)" "$rc" "1"
-ckc "B4 …and says why" "$out" "refusing to send unstamped"
+# Since your-org/nexus-code#1724 the pre-send ledger probe catches this before
+# any stamp is attempted: rc 4 (an ESTABLISHED non-delivery, nothing stamped or
+# sent), not the old rc 1 from the stamp's own `die`. The property is unchanged
+# — refused, the reason named, nothing sent (B5).
+ck "B3 an unstampable ledger REFUSES as an established non-delivery (rc 4)" "$rc" "4"
+ckc "B4 …and says why" "$out" "the delivery ledger cannot be written"
+ckc "B4b …and that nothing was sent" "$out" "NOTHING WAS SENT"
 ck "B5 …and NOTHING was sent" "$(wc -l < "$SENDLOG" | tr -d ' ')" "0"
 
 # ===========================================================================
@@ -466,7 +471,7 @@ unset FAKE_TRANSPORTS
 # reports a clean green. A FLOOR does not catch that; only an exact comparison
 # does. Update this number deliberately when adding an arm; a mismatch is a
 # red, not a warning.
-EXPECTED_ASSERTIONS=59
+EXPECTED_ASSERTIONS=60   # +1 at #1724: B4b (nothing was sent)
 _run_total=$(( PASS + FAIL ))
 assert_eq "assertion count is exactly what this suite declares" "$_run_total" "$EXPECTED_ASSERTIONS"
 

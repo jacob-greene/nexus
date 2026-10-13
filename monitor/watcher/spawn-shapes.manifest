@@ -72,6 +72,7 @@ monitor/watcher/entry.sh#1	bare	n/a	no-sendkeys	not-a-spawn	Inside a heredoc pri
 monitor/watcher/_respawn.sh#2	command	n/a	sendkeys	not-a-spawn	Log-message string ("tmux new-window failed for '$target'").
 monitor/watcher/_respawn.sh#1	command	agent	sendkeys	production-spawn	Orchestrator respawn. $launcher is the generated /tmp/nexus-respawn-launch-*.sh, which ends in `exec claude`, so the pane root becomes the agent.
 monitor/watcher/test-bootstrap-recover.sh#1	bare	shell	sendkeys	fixture-other	Inside a stub spawn-worker.sh that only has to make a WINDOW APPEAR; nothing classifies its pane.
+monitor/watcher/test-bootstrap-recover.sh#2	bare	shell	sendkeys	fixture-other	Inside case 41's stub spawn-worker.sh (#1801 recovery carry-over): it counts resume calls and only has to make a WINDOW APPEAR; nothing classifies its pane.
 monitor/watcher/test-integration/_harness.sh#1	command	agent	sendkeys	harness-spawn	harness_spawn_worker_shape `command`: `exec env … $HARNESS_BIN/claude`. Models _respawn.sh.
 monitor/watcher/test-integration/_harness.sh#2	command	shell	sendkeys	harness-spawn	harness_open_worker_window: `exec <sh>` leaves a lone shell at the pane root, then harness_send_worker_launcher send-keys the launcher. Models spawn-worker.sh (#789).
 monitor/watcher/test-integration/test-graceful-exit-relaunch.sh#1	command	agent	no-sendkeys	harness-spawn	Re-spawns the stub claude into a recycled window by the command form.

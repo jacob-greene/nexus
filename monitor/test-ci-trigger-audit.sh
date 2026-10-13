@@ -136,8 +136,10 @@ echo "--- 1b. positive control: same files, base dev, run observed ---"
 #         reached dev landed in CHANGELOG.md, which no other workflow's filter
 #         matches. An unfiltered workflow is gating for every PR by
 #         construction, so it belongs in every positive control.
+#   #1759 leak-screen.yml gates every pull request for the same reason: a
+#         project string can land in any tracked byte.
 #
-# In both cases supplying the shorter list made this control fail with rc=4
+# In every case supplying the shorter list made this control fail with rc=4
 # NO-VERDICT — correctly. The fixture is what was stale, not the audit; adding
 # the observed run is the fix, and weakening the assertion would have been the
 # bug.
@@ -145,6 +147,7 @@ echo "--- 1b. positive control: same files, base dev, run observed ---"
   printf '.github/workflows/tests.yml\tcompleted\tsuccess\n'
   printf '.github/workflows/tests-slow-integration.yml\tcompleted\tsuccess\n'
   printf '.github/workflows/conflict-markers.yml\tcompleted\tsuccess\n'
+  printf '.github/workflows/leak-screen.yml\tcompleted\tsuccess\n'
 } > "$TMP/observed-tests.txt"
 run_audit "$REAL_WF" "dev" "$TMP/changed-593.txt" "$TMP/observed-tests.txt"
 if (( RC == 0 )) && grep -q 'OK: every workflow that should have gated' <<<"$OUT"; then

@@ -78,7 +78,7 @@ export TMPDIR="$WORK"
 # exercise the source arm override this with their own planted root.
 export NRS_SOURCE_ROOT="$WORK/quietsrc"
 mkdir -p "$NRS_SOURCE_ROOT/monitor/.state" "$NRS_SOURCE_ROOT/reports"
-unset NRS_SOURCE_CONTENDED
+unset NRS_SOURCE_CONTENDED NRS_BAND_CONTENDED
 
 # PRE-RUN SWEEP (your-org/nexus-code#1511). Until #1511 the attribution block
 # below planted its `test-zz-attr-*.sh` fixtures INTO THE LIVE CHECKOUT at
@@ -256,6 +256,66 @@ cnew2=$(mk_target cnew2 'mkdir -p "'"$cempty"'/monitor/.state/heartbeat"' 'echo 
 out=$(NRS_SOURCE_ROOT="$cempty" "$TOOL" probe "$cnew2" 2>&1); rc=$?
 assert_contains "contended + EMPTY .state: a NEW path still gates as LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
 assert_not_contains "…and is never misread as REMOVED" "$out" "REMOVED monitor/.state/heartbeat"
+
+echo "=== contention is sampled BEFORE the suite: a planted config/nexus.yml neither demotes its own appends nor latches across the band (#1718) ==="
+# The discriminator used to be read AFTER the suite ran, and config/nexus.yml
+# sits outside the snapshot scope — so a suite that PLANTED one demoted its own
+# append to UNATTRIBUTED and read hermetic, and every later suite in the band
+# inherited the demotion. Measured by the #1716 skeptic: rc 0, hermetic 2,
+# leaked-at-source 0, for two suites that both appended.
+plantroot="$WORK/plantsrc"; mkdir -p "$plantroot/monitor/.state" "$plantroot/reports"
+printf 'old\n' > "$plantroot/monitor/.state/action-log.jsonl"
+planter=$(mk_target planter \
+    'mkdir -p "'"$plantroot"'/config"; : > "'"$plantroot"'/config/nexus.yml"' \
+    'echo more >> "'"$plantroot"'/monitor/.state/action-log.jsonl"' 'exit 0')
+follower=$(mk_target follower 'echo more >> "'"$plantroot"'/monitor/.state/action-log.jsonl"' 'exit 0')
+out=$(NRS_SOURCE_ROOT="$plantroot" "$TOOL" band "$planter" "$follower" 2>&1); rc=$?
+assert_eq "planter: its OWN append still gates — LEAK-AT-SOURCE, not demoted by the nexus.yml it planted" "$(_verdict_of "$planter")" "LEAK-AT-SOURCE"
+assert_contains "…and the plant itself is named as a NEW source path" "$out" "> NEW config/nexus.yml"
+# The NEW config/nexus.yml line alone would make the verdict LEAK-AT-SOURCE, so
+# the append is checked in the planter's OWN block: gated (`>`), not `?`.
+_planter_block=$(awk -v s="--- $planter" '$0==s {on=1; next} on && /^--- / {exit} on' <<<"$out")
+assert_contains "…and its append is GATED in its own block, not demoted to UNATTRIBUTED" "$_planter_block" "> GREW +5B monitor/.state/action-log.jsonl"
+assert_eq "follower: the demotion does NOT latch onto the next suite in the band" "$(_verdict_of "$follower")" "LEAK-AT-SOURCE"
+assert_contains "band: the summary counts both source leaks" "$out" "leaked-at-source 2"
+assert_contains "band: the summary counts UNATTRIBUTED, here zero" "$out" "unattributed (contended source root, NOT gated): 0 path(s) in 0 suite(s)"
+assert_eq "band: exit 1" "$rc" "1"
+# CONTROL, must NOT flip: a root that was ALREADY configured before the band
+# started is still contended — the demotion stays, and is now COUNTED.
+printf 'old\n' > "$cont/monitor/.state/action-log.jsonl"
+out=$(NRS_SOURCE_ROOT="$cont" "$TOOL" band "$cappender" 2>&1); rc=$?
+assert_eq "control: a pre-configured root still demotes the append (hermetic)" "$(_verdict_of "$cappender")" "hermetic"
+assert_eq "control: …and does not gate (exit 0)" "$rc" "0"
+assert_contains "control: …but the band summary now COUNTS the demotion" "$out" "unattributed (contended source root, NOT gated): 1 path(s) in 1 suite(s)"
+
+echo "=== a background STRAGGLER is waited for, so its write is blamed on the suite that left it (#1718) ==="
+# Blame used to go to "the suite between the snapshots": a write from a
+# process suite A left running landed after A's after-snapshot and was pinned
+# on suite B (GREW), while A read hermetic — and under B's allow-source-leak
+# marker it would have been absorbed silently. The probe now waits, bounded,
+# for A's PROCESS GROUP to drain before the after-snapshot, and kills what is
+# left at the deadline. Selected by pgid + session, never by argv.
+stragroot="$WORK/stragsrc"; mkdir -p "$stragroot/monitor/.state" "$stragroot/reports"
+printf 'old\n' > "$stragroot/monitor/.state/shared.log"
+late=$(mk_target late \
+    '( sleep 1; echo late >> "'"$stragroot"'/monitor/.state/shared.log" ) >/dev/null 2>&1 &' 'exit 0')
+quiet=$(mk_target quiet 'exit 0')
+out=$(NRS_STRAGGLER_GRACE=10 NRS_SOURCE_ROOT="$stragroot" "$TOOL" band "$late" "$quiet" 2>&1); rc=$?
+assert_eq "a straggler's write inside the grace is blamed on the suite that LEFT it" "$(_verdict_of "$late")" "LEAK-AT-SOURCE"
+assert_eq "…and the next suite is hermetic" "$(_verdict_of "$quiet")" "hermetic"
+assert_contains "…and the straggler is reported" "$out" "STRAGGLER"
+# A straggler still alive at the deadline is KILLED, so it cannot write into
+# the next suite's window. It waits for a file the NEXT suite creates, which
+# is the skeptic's mis-blame shape made deterministic.
+printf 'old\n' > "$stragroot/monitor/.state/shared.log"
+waiter=$(mk_target waiter \
+    '( while [ ! -e "'"$WORK"'/strag-go" ]; do sleep 0.1; done; echo late >> "'"$stragroot"'/monitor/.state/shared.log" ) >/dev/null 2>&1 &' 'exit 0')
+trigger=$(mk_target trigger ': > "'"$WORK"'/strag-go"' 'sleep 1' 'exit 0')
+out=$(NRS_STRAGGLER_GRACE=2 NRS_SOURCE_ROOT="$stragroot" "$TOOL" band "$waiter" "$trigger" 2>&1); rc=$?
+assert_eq "a straggler alive past the grace does NOT get its write blamed on the next suite" "$(_verdict_of "$trigger")" "hermetic"
+assert_contains "…it is reported as killed at the deadline" "$out" "STRAGGLER — killed"
+assert_contains "…and counted in the band summary" "$out" "stragglers: 1 suite(s)"
+rm -f "$WORK/strag-go"
 
 # ---------------------------------------------------------------------------
 echo "=== a QUOTED marker is fixture DATA, not a declaration (#1454) ==="

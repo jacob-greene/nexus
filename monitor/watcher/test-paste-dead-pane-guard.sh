@@ -209,7 +209,7 @@ _names_refusal() {
 new_server() {                      # new_server <suffix> -> sets $SOCK
     SOCK="nexus-test-$$-$1"      # no issue number: see the $WORK note above
     _SOCKS+=("$SOCK")
-    env -u TMUX "$TMUX_BIN" -L "$SOCK" new-session -d -s m -n base 'sleep 120' 2>/dev/null
+    env -u TMUX "$TMUX_BIN" -L "$SOCK" -f /dev/null new-session -d -s m -n base 'sleep 120' 2>/dev/null
 }
 tx() { local s="$1"; shift; env -u TMUX "$TMUX_BIN" -L "$s" "$@"; }
 server_alive() { tx "$1" list-sessions >/dev/null 2>&1; }

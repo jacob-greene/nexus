@@ -76,10 +76,10 @@ assert_eq "127.0.0.1 no cidr → PASS" "$(guard 127.0.0.1 '')" "PASS"
 assert_eq "::1 no cidr → PASS"       "$(guard ::1 '')"       "PASS"
 
 echo "== 2. routable IP without from_cidr is REFUSED (fail-closed) =="
-assert_eq "140.107.222.134 no cidr → REFUSE" "$(guard 140.107.222.134 '')" "REFUSE"
+assert_eq "198.51.100.34 no cidr → REFUSE" "$(guard 198.51.100.34 '')" "REFUSE"
 
 echo "== 3. routable IP with from_cidr passes =="
-assert_eq "routable + /32 pin → PASS" "$(guard 140.107.222.134 '10.0.0.5/32')" "PASS"
+assert_eq "routable + /32 pin → PASS" "$(guard 198.51.100.34 '10.0.0.5/32')" "PASS"
 assert_eq "routable + range pin → PASS" "$(guard 10.1.2.3 '10.1.0.0/16')" "PASS"
 
 echo "== 4. wildcard bind is REFUSED even with from_cidr =="
@@ -104,25 +104,25 @@ assert_eq "::1 loopback still PASS (not wildcard)" "$(guard '::1' '')"          
 assert_eq "specific IPv6 + cidr → PASS"         "$(guard '2001:db8::1' 'fe80::/10')"                            "PASS"
 
 echo "== 5. refusal message is actionable =="
-msg=$(MONITOR_REMOTE_BIND_ADDRESS="140.107.222.134" bash -c "source '$LIB'; _remote_bind_guard" 2>&1)
+msg=$(MONITOR_REMOTE_BIND_ADDRESS="198.51.100.34" bash -c "source '$LIB'; _remote_bind_guard" 2>&1)
 assert_contains "names from_cidr as the fix" "$msg" "from_cidr"
 assert_contains "offers the loopback fallback" "$msg" "loopback"
 wmsg=$(MONITOR_REMOTE_BIND_ADDRESS="0.0.0.0" bash -c "source '$LIB'; _remote_bind_guard" 2>&1)
 assert_contains "wildcard refusal names all interfaces" "$wmsg" "ALL interfaces"
 
 echo "== 6. explicit any-source from_cidr is ACCEPTED on a routable bind =="
-assert_eq "routable + 0.0.0.0/0 → PASS" "$(guard 140.107.222.134 '0.0.0.0/0')" "PASS"
-assert_eq "routable + ::/0 → PASS"       "$(guard 140.107.222.134 '::/0')"       "PASS"
-assert_eq "routable + broad subnet /16 → PASS" "$(guard 140.107.222.134 '140.107.0.0/16')" "PASS"
+assert_eq "routable + 0.0.0.0/0 → PASS" "$(guard 198.51.100.34 '0.0.0.0/0')" "PASS"
+assert_eq "routable + ::/0 → PASS"       "$(guard 198.51.100.34 '::/0')"       "PASS"
+assert_eq "routable + broad subnet /16 → PASS" "$(guard 198.51.100.34 '198.51.0.0/16')" "PASS"
 assert_eq "routable + /8 → PASS" "$(guard 10.1.2.3 '10.0.0.0/8')" "PASS"
 # EMPTY still fails closed even though /0 is now allowed — the two are distinct.
-assert_eq "routable + EMPTY still → REFUSE" "$(guard 140.107.222.134 '')" "REFUSE"
+assert_eq "routable + EMPTY still → REFUSE" "$(guard 198.51.100.34 '')" "REFUSE"
 
 echo "== 7. a malformed from_cidr is REFUSED (typo must not degrade to no-pin) =="
-assert_eq "routable + garbage → REFUSE"        "$(guard 140.107.222.134 'not-a-cidr')" "REFUSE"
-assert_eq "routable + bare IP no prefix → REFUSE" "$(guard 140.107.222.134 '10.0.0.5')" "REFUSE"
-assert_eq "routable + octet>255 → REFUSE"      "$(guard 140.107.222.134 '999.1.1.1/8')" "REFUSE"
-assert_eq "routable + prefix>32 → REFUSE"      "$(guard 140.107.222.134 '10.0.0.0/33')" "REFUSE"
+assert_eq "routable + garbage → REFUSE"        "$(guard 198.51.100.34 'not-a-cidr')" "REFUSE"
+assert_eq "routable + bare IP no prefix → REFUSE" "$(guard 198.51.100.34 '10.0.0.5')" "REFUSE"
+assert_eq "routable + octet>255 → REFUSE"      "$(guard 198.51.100.34 '999.1.1.1/8')" "REFUSE"
+assert_eq "routable + prefix>32 → REFUSE"      "$(guard 198.51.100.34 '10.0.0.0/33')" "REFUSE"
 # A malformed pin is rejected even on a loopback bind (defence-in-depth).
 assert_eq "loopback + garbage → REFUSE"        "$(guard 127.0.0.1 'not-a-cidr')" "REFUSE"
 

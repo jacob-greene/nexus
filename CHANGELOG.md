@@ -384,7 +384,7 @@ closes the hole it documented rather than repaired.
 comment says it is "the ONLY thing that restores the block" for a
 second-or-later pass — so every re-validation round, the rounds that exist
 *because* something was already found wrong, armed with nothing the ledger could
-credit. Measured on the live board: `annz36` logged `subject-armed-sha:"-"` at
+credit. Measured on the live board: `proj36` logged `subject-armed-sha:"-"` at
 verdict time with no `skeptic-request` event at all, and `.ncpanestate.ledger`
 carries ONE `armed` row against FOUR rounds of review, so all six delivered
 verdicts read `asserted-not-armed` — the arm never moved while the report was

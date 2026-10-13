@@ -401,6 +401,33 @@ same walk-up as a silent-hook hazard (`#1174`). All three now ask
 `monitor/watcher/test-repo-root-provenance.sh` reverts each caller to its
 pre-fix form and requires the assertion to flip.
 
+### Fixture CONTENT: synthetic stand-ins, never the incident's real values
+
+Every suite here ships to the public mirror, scrubbed only of the identifier
+categories the dictionary already names (`<your-org>/nexus-code#1762`). A
+fixture reproduced from a real incident carries that incident's sample IDs,
+project paths, window names, Slurm job ids, UIDs and hostnames, and a
+category nobody has written down passes the leak gate. On 2026-10-07 a real
+sample ID and a project folder name had been public for weeks before anyone
+noticed. So replace them WHILE writing the test:
+
+| real | stand-in |
+|---|---|
+| sample ID | `SAMPLE_A`, `SAMPLE_B` |
+| project path / name | `/data/proj-x/`, `proj-x` |
+| window name | `w1`, `w1-sk`, `orch` |
+| Slurm job id | `1234567` |
+| UID | `1000` (`/tmp/c1000`) |
+| hostname | `node01` |
+| IP address | `192.0.2.10` (RFC 5737 documentation range) |
+
+Keep what the assertion keys on (the SHAPE: an underscore-and-digits id, a
+two-segment path, a `-sk` suffix), and change the VALUE. For a captured
+`.ansi` pane, edit the text runs and leave the SGR escape sequences alone,
+since those are what pane-state parses. The leak gate's shape rows
+(`test-public-mirror-form-rows.sh`) are a backstop for known shapes, not a
+licence to paste.
+
 ## The axis your harness cannot reach — a guard can be INERT and green
 
 **A guard whose answer depends on a property of the ENVIRONMENT that no test
@@ -530,6 +557,12 @@ enrolled-vs-tracked ratio anywhere: the figure moved within a single day while
 the tool prints on the run you actually did.
 
 ## Editing the workspace `CLAUDE.md` itself
+
+**Your branch's `CLAUDE.md` edit is NOT auto-loaded into your own session.**
+A worker in a nexus-code clone under `work/` runs with `claudeMdExcludes` for
+`<root>/work/**` (<your-org>/nexus-code#1779), so the PRIMARY's contract is
+loaded and your clone's copy is not. When a test or a behaviour depends on the
+edited text, read the file deliberately.
 
 Three conventions are enforced by guards, so getting them wrong is a red rather
 than a review comment.

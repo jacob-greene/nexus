@@ -40,9 +40,9 @@ set -uo pipefail
 _cch_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CCH_REPO_ROOT=$(cd "$_cch_self_dir/../.." && pwd)
 
-# trash_path: rename-aside instead of unlink for teardown, so a still-
-# releasing claude config dir over NFS can't make `rm` fail with
-# `.nfs`/"Directory not empty".
+# trash_path: a LAST RESORT only, for a run dir that a holder still pins
+# after the settle+retry rm (NFS `.nfs` silly-rename). Teardown REMOVES the
+# throwaway run dir (your-org/nexus-code#1767) — see cch_teardown.
 # shellcheck source=../_trash.sh
 . "$CCH_REPO_ROOT/monitor/_trash.sh"
 CCH_MOCK_PY="$_cch_self_dir/mock-backend.py"
@@ -684,15 +684,22 @@ cch_teardown() {
         _cch_await_gone "${CCH_TEARDOWN_GRACE:-10}" "${_cch_await[@]}" || true
     fi
     if [[ -n "${CCH_DIR:-}" && -d "${CCH_DIR:-}" ]]; then
-        # Move the run dir aside (rename) instead of rm: the killed claude
-        # may still be releasing its config dir, and over NFS unlink would
-        # silly-rename open files to `.nfs*` and make rm report "Directory
-        # not empty". A same-fs rename always succeeds regardless of holders;
-        # the entry is reaped later by `_trash.sh --clear`. Fall back to the
-        # old settle+retry rm if trashing is unavailable.
-        trash_path "$CCH_DIR" >/dev/null 2>&1 \
-            || { sleep 0.3; rm -rf "$CCH_DIR" 2>/dev/null \
-                || { sleep 0.7; rm -rf "$CCH_DIR" 2>/dev/null || true; }; }
+        # REMOVE the run dir, never trash it (your-org/nexus-code#1767). It
+        # is a throwaway THIS run created, and trash_path landed it in
+        # `$TMPDIR/.nexus-trash` — tmpfs, i.e. RAM — where nothing ever
+        # cleared it (one gate run left 18.6 GB). The pane processes were
+        # awaited above, so nothing should still hold it; settle+retry
+        # covers a straggler's late write ("Directory not empty"). Only if
+        # the dir SURVIVES that (an NFS `.nfs` hold) is it moved aside, and
+        # then LOUDLY, naming the entry, so it is never silent RAM.
+        rm -rf "$CCH_DIR" 2>/dev/null
+        [[ -e "$CCH_DIR" ]] && { sleep 0.3; rm -rf "$CCH_DIR" 2>/dev/null; }
+        [[ -e "$CCH_DIR" ]] && { sleep 0.7; rm -rf "$CCH_DIR" 2>/dev/null; }
+        if [[ -e "$CCH_DIR" ]]; then
+            local _cch_t
+            _cch_t=$(trash_path "$CCH_DIR" 2>/dev/null) && [[ -n "$_cch_t" ]] \
+                && echo "cch_teardown: $CCH_DIR is still held after 3 removals; moved aside to $_cch_t — clear it with monitor/_trash.sh --clear --root $(dirname "$_cch_t")" >&2 || true
+        fi
     fi
 }
 

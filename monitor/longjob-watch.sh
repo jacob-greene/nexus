@@ -184,6 +184,8 @@
 #                        [--ttl S] [--notify terminal|transitions] [--persistent]
 #                        [--max-events N] [--unknown-max N]
 #                        [--when exists|grew|match] [--pattern ERE]      (file:)
+#                        [--fail-pattern ERE|none]   (file: --when match; a
+#                        default failure arm applies — see longjob-probes.d/file.sh)
 #                        [--no-declare] [--no-first-probe]   (hook use: the launch
 #                        hook already declared the wait; skip the sync probe)
 #   longjob-watch.sh run [--desc TEXT] [--id ID] [--notify …] -- <cmd…>
@@ -195,6 +197,7 @@
 #   longjob-watch.sh resolve <id>                  → "<class>|<detail>" for the
 #                                                   orphan-async resolver
 #   longjob-watch.sh probe <kind>:<target> [--when W] [--pattern ERE] [--size0 N]
+#                          [--fail-pattern ERE|none] [--lines0 N]
 #                                                  → "<state>|<detail>", one shot
 #   longjob-watch.sh await <id> [--timeout S]      block until terminal; for
 #                                                   `run_in_background` when the
@@ -216,7 +219,10 @@
 # Exit codes (every verb but dispatch, which never exits — a missing jq keeps
 # it alive polling nothing, and a fatal error inside a poll pass is isolated
 # in a subshell; see cmd_dispatch):
-#   0  ok              2  usage / no such watch / unresolvable session key
+#   0  ok              2  usage / no such watch / unresolvable session key /
+#                         add REFUSED: the spool is unwritable — NOTHING is
+#                         watched; stderr names the path, the reason and a
+#                         runnable probe loop (your-org/nexus-code#1724)
 #   3  add: registered but the dispatcher is NOT ARMED in this session — the
 #      watch is recorded and will NOT wake you; stdout names the fallback
 #   await: 0 done · 1 failed · 3 unknown/parked/expired · 4 timeout
@@ -270,6 +276,19 @@ WATCH_MAX_EVENTS=$(_cfg MONITOR_LONGJOB_WATCH_MAX_EVENTS monitor.longjob.watch_m
 UNKNOWN_MAX=$(_cfg MONITOR_LONGJOB_UNKNOWN_MAX monitor.longjob.unknown_max 5)
 TTL_SECONDS=$(_cfg MONITOR_LONGJOB_TTL_SECONDS monitor.longjob.ttl_seconds 604800)
 PROBE_TIMEOUT=$(_cfg MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS monitor.longjob.probe_timeout_seconds 30)
+# SLURM BACKOFF (your-org/nexus-code#1728 item 1). When a slurm probe cannot
+# reach Slurm — the sandbox chaperon's "failed to read chaperon response", or a
+# probe that TIMED OUT — every further slurm probe this pass is skipped and the
+# next ones wait base·2^k seconds (capped at 900). The jam of 2026-10-02 was a
+# metastable backlog that drained only once agents stopped polling; a poller
+# that keeps asking at full rate is what holds it up. Such an `unknown` does not
+# count toward unknown_max while the backoff lasts, so a jam does not PARK
+# every slurm watch and wake every agent into polling by hand. It is bounded:
+# after limit seconds of continuous backoff the unknowns count again, and the
+# watch parks and EMITS as before — a Slurm that never comes back cannot hold a
+# waiter asleep until the TTL.
+SLURM_BACKOFF_BASE=$(_cfg MONITOR_LONGJOB_SLURM_BACKOFF_BASE_SECONDS monitor.longjob.slurm_backoff_base_seconds 60)
+SLURM_BACKOFF_LIMIT=$(_cfg MONITOR_LONGJOB_SLURM_BACKOFF_LIMIT_SECONDS monitor.longjob.slurm_backoff_limit_seconds 1800)
 (( POLL_SECONDS < 5 )) && POLL_SECONDS=5
 # `await` runs under the Bash tool's run_in_background, and since Claude Code
 # 2.1.285 the harness STOPS that call at the call's own `timeout` (default
@@ -294,6 +313,32 @@ _await_fallback() {   # <id> [await-seconds]
         "$(( (s + BG_SLACK_S) * 1000 ))" "$1" "$s"
     printf 'It re-invokes you with rc 0 done, 1 failed, 3 unknown, 4 timeout (4: re-enter the same call). A harness STOP notice (<status>killed</status>, "background time limit") is not a verdict on the job either: re-run the call above. --timeout is capped at %ss (one background Bash call cannot outlive %ss); a job longer than that belongs to an ARMED ng longjob watch.\n' \
         "$AWAIT_MAX_S" "$BG_CEIL_S"
+}
+# _add_refuse_unwritable <what> <path> <shell-error> <subject> [probe args…]
+# — `add` could not record the watch (your-org/nexus-code#1724: a degraded,
+# read-only tree). It used to die `add: cannot write spec`, which names
+# neither the path nor the reason and reads like a usage slip, while the
+# agent ends its turn believing something is watching. Now LOUD: what failed,
+# the shell's own error text, that NOTHING is watched, and a runnable wait
+# that needs no spool — `probe` reads the subject directly and writes
+# nothing. `await` is NOT that fallback: it takes the id of a REGISTERED
+# watch and refuses anything else (`no such watch`). Exit 2, unchanged.
+_add_refuse_unwritable() {
+    local what="$1" path="$2" err="$3" subject="$4"; shift 4
+    local reason="${err##*: }" pargs="" a s="$AWAIT_DEFAULT_S"
+    [[ -n "$reason" ]] || reason="unknown (the shell printed nothing)"
+    for a in "$subject" "$@"; do pargs+=" $(printf '%q' "$a")"; done
+    {
+        printf 'longjob-watch: add REFUSED — cannot write the %s %s: %s\n' "$what" "$path" "$reason"
+        [[ -n "$err" ]] && printf '  shell said: %s\n' "${err//$'\n'/ | }"
+        printf 'NOTHING IS WATCHED: no spec was recorded and no external wait was declared, so no dispatcher, no await and no orphan-async resolver knows about %s. Do NOT end your turn expecting a wake.\n' "$subject"
+        printf 'Likely a read-only / degraded tree (your-org/nexus-code#1724) or a permissions fault on %s.\n' "$SPOOL"
+        printf 'Wait on the subject yourself; `probe` needs no spool. EITHER one Bash call with run_in_background: true AND timeout: %s (ms), which re-invokes you when it ends (rc 0 done, 1 failed, 3 unknown, 4 timeout: re-run it):\n' "$(( (s + BG_SLACK_S) * 1000 ))"
+        printf '    d=$((SECONDS+%s)); u=0; while :; do o=$(%s probe%s); case "${o%%%%|*}" in done) echo "DONE $o"; exit 0;; failed) echo "FAILED $o"; exit 1;; unknown) u=$((u+1)); ((u>=%s)) && { echo "UNKNOWN $o"; exit 3; };; *) u=0;; esac; ((SECONDS>=d)) && { echo "TIMEOUT $o"; exit 4; }; sleep %s; done\n' \
+            "$s" "$_lj_dir/longjob-watch.sh" "$pargs" "$UNKNOWN_MAX" "$DEFAULT_INTERVAL"
+        printf 'OR the same loop in a Monitor (capped at 30 min: re-arm it on expiry; its end line says DONE, FAILED, UNKNOWN or TIMEOUT). Either way the FAILED arm is what wakes you on a failure.\n'
+    } >&2
+    exit 2
 }
 # A ledger is FRESH while its last_poll is younger than 3 × the poll cadence
 # the ledger ITSELF records + 30 s (see _ledger_verdict) — the reader's own
@@ -628,11 +673,36 @@ _dispatch_wait_for_ledger() {
 _declare_wait()    { [[ -n "$WINDOW_NAME" && -x "$_lj_dir/declare-wait.sh" ]] && NEXUS_WORKER_WINDOW="$WINDOW_NAME" NEXUS_STATE_DIR="$STATE_DIR" "$_lj_dir/declare-wait.sh" longjob "$1" "${2:-longjob watch}" >/dev/null 2>&1 || true; }
 _undeclare_wait()  { [[ -n "$WINDOW_NAME" && -x "$_lj_dir/declare-wait.sh" ]] && NEXUS_WORKER_WINDOW="$WINDOW_NAME" NEXUS_STATE_DIR="$STATE_DIR" "$_lj_dir/declare-wait.sh" --remove longjob "$1" >/dev/null 2>&1 || true; }
 
+# _file_fail_arm <set 0|1> <value> → the failure-arm ERE for a `file: --when
+# match` watch on stdout (empty = none). Unset → the probe's default, read from
+# the probe file itself so there is ONE copy; `none` → empty. A pattern grep
+# cannot compile is refused here (rc 2) rather than discovered at the first
+# poll, and an unloadable default refuses too: silently dropping the arm is the
+# exact lost-wake this exists to close.
+_file_fail_arm() {
+    local set="$1" v="$2" d
+    if (( set == 0 )); then
+        # shellcheck disable=SC1090,SC1091
+        d=$( . "$PROBES_DIR/file.sh" >/dev/null 2>&1 && printf '%s' "${LJ_FILE_FAIL_DEFAULT:-}" )
+        [[ -n "$d" ]] || { printf 'longjob-watch: cannot load LJ_FILE_FAIL_DEFAULT from %s — refusing a match watch with no failure arm (pass --fail-pattern <ERE> or none)\n' "$PROBES_DIR/file.sh" >&2; return 2; }
+        v="$d"
+    elif [[ "$v" == none ]]; then
+        return 0
+    elif [[ -z "$v" ]]; then
+        printf 'longjob-watch: --fail-pattern needs an ERE (or none)\n' >&2; return 2
+    fi
+    grep -E -q -- "$v" </dev/null 2>/dev/null; (( $? <= 1 )) || { printf 'longjob-watch: --fail-pattern /%s/ is not a valid ERE\n' "$v" >&2; return 2; }
+    printf '%s' "$v"
+}
+
 # ---- verbs --------------------------------------------------------------------
 cmd_add() {
-    _require_spool
+    # The key is checked now; the spool is CREATED just before the write, so a
+    # spool that cannot be created is refused with the subject in hand (#1724).
+    [[ -n "$SPOOL" ]] || _require_spool
     local subject="" desc="" id="" interval="$DEFAULT_INTERVAL" ttl="$TTL_SECONDS" notify=terminal persistent=0
     local max_events="$WATCH_MAX_EVENTS" unknown_max="$UNKNOWN_MAX" when="" pattern="" no_declare=0 no_first_probe=0
+    local fail_pattern="" fail_set=0
     _argloop_prev_1=-1; while (( $# )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --desc) desc="${2:-}"; shift 2 ;;
@@ -647,6 +717,7 @@ cmd_add() {
             --unknown-max) unknown_max="${2:-}"; shift 2 ;;
             --when) when="${2:-}"; shift 2 ;;
             --pattern) pattern="${2:-}"; shift 2 ;;
+            --fail-pattern) fail_pattern="${2:-}"; fail_set=1; shift 2 ;;
             -h|--help) _usage; exit 0 ;;
             --*) die "add: unknown option $1" ;;
             *) [[ -z "$subject" ]] || die "add: one subject only (got '$subject' and '$1')"; subject="$1"; shift ;;
@@ -666,7 +737,8 @@ cmd_add() {
     [[ -e "$(_spec_path "$id")" ]] && die "add: watch $id already exists (rm it first)"
 
     # Kind-specific normalisation at ADD time, where the information exists.
-    local size0=0
+    local size0=0 lines0=0
+    (( fail_set )) && [[ "$kind" != file ]] && die "add: --fail-pattern applies only to file: --when match"
     case "$kind" in
         pid)
             if [[ "$target" != *:* ]]; then
@@ -679,7 +751,18 @@ cmd_add() {
             when="${when:-exists}"
             case "$when" in exists|grew|match) ;; *) die "add: --when must be exists|grew|match" ;; esac
             [[ "$when" == match && -z "$pattern" ]] && die "add: --when match needs --pattern ERE"
-            [[ "$when" == grew && -e "$target" ]] && { size0=$(stat -c %s -- "$target" 2>/dev/null) || size0=0; } ;;
+            [[ "$when" == grew && -e "$target" ]] && { size0=$(stat -c %s -- "$target" 2>/dev/null) || size0=0; }
+            if [[ "$when" == match ]]; then
+                fail_pattern=$(_file_fail_arm "$fail_set" "$fail_pattern") || exit 2
+                # Only lines written AFTER this add count, toward failure AND
+                # toward success: recorded for EVERY match, including
+                # --fail-pattern none, or an old success line already in an
+                # append-only log reads `done` on the first probe (bundle 23).
+                [[ -f "$target" ]] && { lines0=$(wc -l < "$target" 2>/dev/null) || lines0=0; }
+                [[ "$lines0" =~ ^[0-9]+$ ]] || lines0=0
+            elif (( fail_set )); then
+                die "add: --fail-pattern applies only to file: --when match"
+            fi ;;
         slurm)
             # The job-id shape is the PROBE's predicate, sourced, never a copy
             # here (your-org/nexus-code#1727): `0` passed the old copy, and a
@@ -703,21 +786,61 @@ cmd_add() {
                  --arg now "$now" --arg interval "$interval" --arg ttl "$ttl" --arg notify "$notify" \
                  --arg persistent "$persistent" --arg max "$max_events" --arg umax "$unknown_max" \
                  --arg when "$when" --arg pattern "$pattern" --arg size0 "$size0" --arg key "$SESSION_KEY" \
+                 --arg fail "$fail_pattern" --arg lines0 "$lines0" \
            '{id:$id, kind:$kind, target:$target, desc:$desc, session_key:$key,
              added_at:($now|tonumber), interval:($interval|tonumber), ttl:($ttl|tonumber),
              notify:$notify, persistent:($persistent=="1"), max_events:($max|tonumber),
              unknown_max:($umax|tonumber), when:$when, pattern:$pattern, size0:($size0|tonumber),
+             fail_pattern:$fail, lines0:($lines0|tonumber),
              state:"pending", detail:"registered, not yet probed", last_probe:0, unknown_streak:0,
              events:0, retired:false, retired_reason:"", retired_at:0}')
-    _spec_write "$(_spec_path "$id")" "$spec" || die "add: cannot write spec"
+    local -a _pargs=()
+    if [[ "$kind" == file ]]; then
+        _pargs=(--when "$when")
+        [[ -n "$pattern" ]] && _pargs+=(--pattern "$pattern")
+        [[ "$when" == grew ]] && _pargs+=(--size0 "$size0")
+        # The default failure arm is left implicit: `probe` applies the same one.
+        if [[ "$when" == match ]]; then
+            if [[ -z "$fail_pattern" ]]; then _pargs+=(--fail-pattern none)
+            elif (( fail_set )); then _pargs+=(--fail-pattern "$fail_pattern"); fi
+            _pargs+=(--lines0 "$lines0")
+        fi
+    fi
+    local _werr
+    _werr=$(mkdir -p "$SPOOL/watches" 2>&1) \
+        || _add_refuse_unwritable "spool directory" "$SPOOL/watches" "$_werr" "$kind:$target" "${_pargs[@]}"
+    if ! _werr=$(_spec_write "$(_spec_path "$id")" "$spec" 2>&1); then
+        rm -f "$(_spec_path "$id").$$.tmp" 2>/dev/null
+        _add_refuse_unwritable "watch spec" "$(_spec_path "$id")" "$_werr" "$kind:$target" "${_pargs[@]}"
+    fi
     (( no_declare )) || _declare_wait "$id" "${desc:-$kind:$target}"
     printf 'added %s  %s:%s  interval=%ss notify=%s%s\n' "$id" "$kind" "$target" "$interval" "$notify" "$( (( persistent )) && printf ' persistent')"
+    if [[ "$kind" == file && "$when" == match ]]; then
+        if [[ -n "$fail_pattern" ]]; then
+            printf 'failure arm: /%s/%s — a matching line written after now (and before a success line) ends the watch FAILED, so an abort wakes you\n' \
+                "$fail_pattern" "$( (( fail_set )) || printf ' (the default; --fail-pattern <ERE> to replace, none to drop)')"
+        else
+            printf 'failure arm: NONE (--fail-pattern none) — if the producer fails without writing /%s/, this watch never wakes you before its TTL\n' "$pattern"
+        fi
+    fi
     # A synchronous first probe so the caller sees what the dispatcher will
     # see — and so a subject that is ALREADY terminal is visible now rather
     # than on the first poll.
+    local first=""
     if (( no_first_probe == 0 )); then
-        local first; first=$(_probe "$kind" "$target" "$spec")
+        first=$(_probe "$kind" "$target" "$spec")
         printf 'first probe: %s\n' "$first"
+    elif [[ "$kind" == file && "$when" == match ]] && (( lines0 > 0 )); then
+        first=$(_probe "$kind" "$target" "$spec")   # only to look for a pre-add match
+    fi
+    # A success line already in the file at add time is NOT counted (bundle 23
+    # scoping). Say so LOUDLY, here, where the agent is still looking (skeptic
+    # F1 on your-org/nexus-code#1799): if it is this job's own success, the
+    # watch would otherwise wait out its TTL.
+    if [[ "$first" == "running|PRE-ADD MATCH at line "* ]]; then
+        local _pl="${first#*PRE-ADD MATCH at line }"; _pl="${_pl%% *}"
+        printf 'WARNING: a line matching /%s/ is ALREADY in %s at line %s, written BEFORE this add, and it is NOT counted. If that line is THIS job finishing, the job is already DONE and this watch would wait until its TTL: act on the result, then remove the watch: monitor/ng longjob rm %s\n' \
+            "$pattern" "$target" "$_pl" "$id"
     fi
     [[ "$kind" == pid ]] && printf 'note: a pid: subject cannot report an EXIT STATUS (the parent reaps it); for a status, launch via monitor/async-run.sh and watch asyncrun:<token>\n'
     local v; v=$(_ledger_verdict)
@@ -848,11 +971,23 @@ cmd_resolve() {
 cmd_probe() {
     local subject="${1:-}"; shift || true
     [[ "$subject" == *:* ]] || die "probe: <kind>:<target> required"
-    local kind="${subject%%:*}" target="${subject#*:}" when="" pattern="" size0=0
+    local kind="${subject%%:*}" target="${subject#*:}" when="" pattern="" size0=0 fail_pattern="" fail_set=0 lines0=0
     _argloop_prev_2=-1; while (( $# )); do (( $# != _argloop_prev_2 )) || _argloop_stuck "$1"; _argloop_prev_2=$#
-        case "$1" in --when) when="${2:-}"; shift 2 ;; --pattern) pattern="${2:-}"; shift 2 ;; --size0) size0="${2:-}"; shift 2 ;; *) die "probe: unknown option $1" ;; esac
+        case "$1" in --when) when="${2:-}"; shift 2 ;; --pattern) pattern="${2:-}"; shift 2 ;; --size0) size0="${2:-}"; shift 2 ;;
+            --fail-pattern) fail_pattern="${2:-}"; fail_set=1; shift 2 ;; --lines0) lines0="${2:-}"; shift 2 ;;
+            *) die "probe: unknown option $1" ;; esac
     done
-    local spec; spec=$(jq -n --arg when "${when:-exists}" --arg pattern "$pattern" --arg size0 "$size0" '{when:$when, pattern:$pattern, size0:($size0|tonumber)}')
+    [[ "$lines0" =~ ^[0-9]+$ ]] || die "probe: --lines0 must be an integer"
+    # The same failure-arm DEFAULT as `add` — but not always the same ANSWER: a
+    # watch counts only lines written after its add (`.lines0`, in BOTH arms),
+    # and a one-shot probe has no add time, so --lines0 defaults to 0 and an OLD
+    # failure OR success line in an append-only log counts here (skeptic F4 on
+    # PR #1784; the success arm since bundle 23). That default is
+    # deliberate: it lets you test a pattern against a log you already have.
+    # Pass --lines0 "$(wc -l < FILE)" to reproduce what a watch added now sees.
+    if [[ "$kind" == file && "$when" == match ]]; then fail_pattern=$(_file_fail_arm "$fail_set" "$fail_pattern") || exit 2; fi
+    local spec; spec=$(jq -n --arg when "${when:-exists}" --arg pattern "$pattern" --arg size0 "$size0" --arg fail "$fail_pattern" --arg lines0 "$lines0" \
+        '{when:$when, pattern:$pattern, size0:($size0|tonumber), fail_pattern:$fail, lines0:($lines0|tonumber)}')
     _probe "$kind" "$target" "$spec"; printf '\n'
 }
 
@@ -1064,6 +1199,13 @@ _poll_once() {
         case "${f##*/}" in auto-*) autos+=("$f") ;; *) files+=("$f") ;; esac
     done
     files+=("${autos[@]}")
+    # The Slurm backoff state: "<until> <k> <since>" in the spool, because each
+    # pass runs in a subshell and keeps nothing in memory.
+    local bo_file="$SPOOL/slurm-backoff" bo_until=0 bo_k=0 bo_since=0 bo_line=""
+    { read -r bo_line < "$bo_file"; } 2>/dev/null || bo_line=""
+    if [[ "$bo_line" =~ ^([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]]; then
+        bo_until=${BASH_REMATCH[1]}; bo_k=${BASH_REMATCH[2]}; bo_since=${BASH_REMATCH[3]}
+    fi
     for f in "${files[@]}"; do
         [[ -f "$f" ]] || continue
         spec=$(cat "$f" 2>/dev/null) || continue
@@ -1094,6 +1236,9 @@ _poll_once() {
         [[ "$streak" =~ ^[0-9]+$ ]] || { streak=0; _bad="$_bad unknown_streak"; }
         [[ -n "$_bad" ]] && _log_event "$id" corrupt not-printed "non-numeric field(s):$_bad — defaults used"
         (( now - last < interval )) && continue
+        # Inside a Slurm backoff window a slurm watch is not probed at all (and
+        # its last_probe is not moved, so it is due the moment the window ends).
+        [[ "$kind" == slurm ]] && (( $(_now) < bo_until )) && continue
         # ON-TIME HEARTBEAT (R1): a probe can block for probe_timeout_seconds
         # and a pass of them emits nothing; touch the ledger before a probe
         # whenever poll_seconds have elapsed since the last write.
@@ -1109,6 +1254,27 @@ _poll_once() {
             line=$(_compose_line EXPIRED "$id" "$kind:$target" "TTL reached; the wait stays declared — re-add to keep watching" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
         else
             out=$(_probe "$kind" "$target" "$spec"); new_state="${out%%|*}"; detail="${out#*|}"
+            if [[ "$kind" == slurm ]]; then
+                if [[ "$new_state" == unknown && ( "$detail" == *chaperon* || "$detail" == "probe timed out"* ) ]]; then
+                    local bo_now; bo_now=$(_now)
+                    (( bo_since > 0 )) || bo_since=$bo_now
+                    if (( bo_now - bo_since < SLURM_BACKOFF_LIMIT )); then
+                        local bo_wait=$(( SLURM_BACKOFF_BASE << (bo_k < 4 ? bo_k : 4) ))
+                        (( bo_wait > 900 )) && bo_wait=900
+                        bo_k=$(( bo_k + 1 )); bo_until=$(( bo_now + bo_wait ))
+                        printf '%s %s %s\n' "$bo_until" "$bo_k" "$bo_since" > "$bo_file" 2>/dev/null || true
+                        _log_event "$id" deferred not-printed "Slurm unreachable ($detail): slurm probes back off ${bo_wait}s (step $bo_k, ${SLURM_BACKOFF_LIMIT}s limit; not counted toward unknown_max)"
+                        continue
+                    fi
+                    # EXHAUSTED: probe at the normal interval again and let the
+                    # unknowns count, so the watch parks and emits.
+                    bo_until=0
+                    detail="$detail (Slurm backoff exhausted after $(( bo_now - bo_since ))s; counting toward unknown_max)"
+                elif (( bo_k > 0 )); then
+                    _log_event dispatcher slurm-backoff-cleared not-printed "a slurm probe answered ($new_state) after $bo_k backoff step(s)"
+                    rm -f "$bo_file"; bo_until=0; bo_k=0; bo_since=0
+                fi
+            fi
             # `pre` is the spec as it stands AFTER the probe and BEFORE this
             # pass writes it — see the write-failed restore below for why the
             # restore must use this and not `spec` (read before the probe).

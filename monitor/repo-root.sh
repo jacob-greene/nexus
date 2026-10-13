@@ -12,7 +12,7 @@
 #
 # The guard a careful author reaches for CERTIFIES THE WRONG THING:
 #
-#     git -C work/liver-coembed-cohort rev-parse --is-inside-work-tree  -> true
+#     git -C work/proj-x rev-parse --is-inside-work-tree  -> true
 #
 # truthfully, because it IS inside the nexus's work tree. Measured on `dev` @
 # `50c36ef`: 57 of 881 directories under `work/` report the nexus's own HEAD as
@@ -211,7 +211,7 @@ rr_classify() {
         # top-EMPTY trichotomy below — `bare`, `gitdir-itself`, `inside-gitdir`
         # — was DEAD CODE. `bare` is a YES verdict, so `rr_require_own_root`
         # refused a legitimate bare repository (this nexus has a live one,
-        # `work/lab-wiki.git`); the NO arms degraded to UNDETERMINED. This host
+        # `work/proj-wiki.git`); the NO arms degraded to UNDETERMINED. This host
         # defaults to git 2.17.1 and CI runs 2.55.0, so the predicate was
         # correct exactly where it was developed and wrong everywhere it ran.
         #
@@ -295,7 +295,7 @@ rr_classify() {
             # — a permissive SAFE arm returning before the DENY arm that would
             # have caught it, and a WRITE hole in the class this file exists to
             # close: `git-https-setup --repo bare.git/hooks/deep` was measured
-            # NOT REFUSED. `work/lab-wiki.git` on this host is a real bare
+            # NOT REFUSED. `work/proj-wiki.git` on this host is a real bare
             # repo, so it was live rather than theoretical.
             #
             # WHY THE IMMUNITY CLAIM WAS WRONG, because that is the reusable

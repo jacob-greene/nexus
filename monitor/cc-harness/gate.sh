@@ -93,8 +93,8 @@ fi
 # shellcheck source=../_cc-hold-policy.sh
 [[ -r "$REPO_ROOT/monitor/_cc-hold-policy.sh" ]] && . "$REPO_ROOT/monitor/_cc-hold-policy.sh"
 
-# trash_path: rename-aside instead of unlink, so tearing down a throwaway
-# prefix never trips on a held-open inode (`.nfs`/EBUSY over NFS).
+# trash_path: a LAST RESORT only, for a prefix still held after the
+# settle+retry rm in cleanup() (your-org/nexus-code#1767).
 # shellcheck source=../_trash.sh
 . "$REPO_ROOT/monitor/_trash.sh"
 
@@ -121,12 +121,18 @@ fi
 cleanup_prefix=""
 cleanup_npm_cache=""
 cleanup_transcripts=""
-# Move the throwaway prefix aside (rename) rather than rm — a scenario's
-# claude may still be releasing files on NFS, where unlink would `.nfs`-lock
-# and rm would fail. trash_path always succeeds via same-fs rename; the
-# entry is reaped later by `_trash.sh --clear`. Fall back to rm if trashing
-# is somehow unavailable. A throwaway npm cache we created (see below) is
-# also reaped here so a gate run leaves no temp-dir litter behind.
+# REMOVE the throwaway prefix, never trash it (your-org/nexus-code#1767).
+# It used to be moved aside with trash_path, which on this host lands in
+# `$TMPDIR/.nexus-trash` — tmpfs, i.e. RAM — and nothing ever cleared it: one
+# gate run left 18.6 GB. Trash exists for a binary a LIVE process may still
+# map (monitor/_trash.sh); this prefix's claude is only ever run by the
+# harness scenarios, and cleanup() runs on EXIT, after every scenario's
+# cch_teardown has awaited (TERM, then KILL) its pane processes. So by now
+# nothing should map it, and on a local filesystem an unlink of a mapped file
+# succeeds anyway. rm, with a settle+retry; only a prefix that SURVIVES that
+# (an NFS `.nfs` hold) is moved aside, loudly and by name, rather than kept
+# silently in RAM. A throwaway npm cache we created (see below) is also
+# reaped here so a gate run leaves no temp-dir litter behind.
 cleanup() {
     if [[ -n "$cleanup_prefix" && -d "$cleanup_prefix" ]]; then
         if (( keep_prefix )); then
@@ -136,7 +142,13 @@ cleanup() {
             # obligation it leaves behind.
             echo "gate.sh: prefix KEPT (--keep-prefix): $cleanup_prefix — candidate binary at $cleanup_prefix/node_modules/.bin/claude; remove the prefix yourself when done (trash_path, or rm -rf on a local filesystem)." >&2
         else
-            trash_path "$cleanup_prefix" >/dev/null 2>&1 || rm -rf "$cleanup_prefix" 2>/dev/null || true
+            rm -rf "$cleanup_prefix" 2>/dev/null
+            [[ -e "$cleanup_prefix" ]] && { sleep 0.5; rm -rf "$cleanup_prefix" 2>/dev/null; }
+            if [[ -e "$cleanup_prefix" ]]; then
+                local _t
+                _t=$(trash_path "$cleanup_prefix" 2>/dev/null) && [[ -n "$_t" ]] \
+                    && echo "gate.sh: prefix still held after 2 removals; moved aside to $_t — clear it with monitor/_trash.sh --clear --root $(dirname "$_t")" >&2 || true
+            fi
         fi
     fi
     if [[ -n "$cleanup_npm_cache" && -d "$cleanup_npm_cache" ]]; then

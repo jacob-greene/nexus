@@ -61,7 +61,7 @@ trap cleanup EXIT
 # --- build a hermetic fixture repo ------------------------------------------
 REPO="$WORK/repo"
 mkdir -p "$REPO/pm"
-cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$REPO/pm/"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$TOOLKIT/leak-gate.sh" "$REPO/pm/"
 
 # Synthetic dictionary. `secretorg` sorts before `zzz_after.txt` on purpose so
 # the corruption regression (files after the mapping leak) is exercised.
@@ -348,7 +348,7 @@ rm -rf "$pdir"
 # reference rules without the rename took a suite from 34 passed / 0 failed to
 # 11 / 23.
 rn_repo="$WORK/rnrepo"; mkdir -p "$rn_repo/pm/overlay" "$rn_repo/sub"
-cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$rn_repo/pm/"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$TOOLKIT/leak-gate.sh" "$rn_repo/pm/"
 cat > "$WORK/rn-map.tsv" <<'MAP'
 map	install-qz-pack	install-pub-pack	install-pub-pack
 deny	install-qz-pack
@@ -382,7 +382,7 @@ fi
 # the rc 5 under test. A fixture that fails for a reason other than the one you
 # are asserting is a green you cannot spend.
 rn2="$WORK/rnrepo2"; mkdir -p "$rn2/pm/overlay" "$rn2/sub"
-cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$rn2/pm/"
+cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$TOOLKIT/leak-gate.sh" "$rn2/pm/"
 cp "$WORK/rn-map.tsv" "$rn2/pm/mapping.tsv"
 printf 'run ./sub/install-qz-pack.sh to install\n' > "$rn2/README.md"
 printf '#!/bin/sh\necho installing\n' > "$rn2/sub/install-qz-pack.sh"

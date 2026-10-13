@@ -286,15 +286,15 @@ a hook or your task prompt points you there.
     with `monitor/tmux-socket-fits.sh --socket <name>` (exit 3 =
     too long, naming the measured length); `--suggest` prints a
     dir that fits. Keep it short: `/tmp/<brief>`, never the
-    scratchpad — **for the SOCKET DIRECTORY ONLY.** `/tmp/c71780` and
+    scratchpad — **for the SOCKET DIRECTORY ONLY.** `/tmp/c$(id -u)` and
     any short `TMUX_TMPDIR` you pick hold tmux sockets and nothing
     else; everything else you write goes under `$TMPDIR` (see the
-    `/tmp/c71780` bullet below for why it is safe to name now) or inside
+    `/tmp/c$(id -u)` bullet below for why it is safe to name now) or inside
     your clone. Measured 2026-09-03: workers who
-    read "put scratch in `/tmp/c71780`" literally left **16.5 GiB** of
+    read "put scratch in `/tmp/c$(id -u)`" literally left **16.5 GiB** of
     per-window payload in a directory whose short name exists for the
     108-byte `sun_path` limit, and `monitor/tmpfs-guard.sh --check`
-    now goes UNHEALTHY above `monitor.tmpfs.max_c71780_payload_mib`
+    now goes UNHEALTHY above `monitor.tmpfs.max_socket_root_payload_mib`
     (<your-org>/nexus-code#1422).
   - **Never hand-roll a mutation gate** — `monitor/mutation-gate.sh
     --suite <f> --list`, then `--line N`. **That form mutates the SUITE
@@ -317,6 +317,22 @@ a hook or your task prompt points you there.
     `--allow-dirty` (`#1001`). Throwaway clones only.
 - **`ng send` returning `UNKNOWN` is not a licence to re-send** (a fallback fires only on rc 4);
   resolve it after the fact with `ng send <window> --check --last` (or `--list`, then `--check --nonce <hex>`).
+- **When the project tree goes READ-ONLY, stop and wait; do not fight it**
+  (<your-org>/nexus-code`#1724`). On the operator's host the sandbox's rw
+  bind detached from the filer every few days in 2026-09/10 (minutes to
+  18 h). The signs: `EROFS` / `Read-only
+  file system` on a write, a watcher note `The project tree is READ-ONLY`,
+  `ng send` exiting **4** with `DEGRADED — the delivery ledger cannot be
+  written … NOTHING WAS SENT`, or `ng longjob add` refusing. Then: stop
+  starting work that writes to the tree (commits, pushes, reports, suites,
+  `sbatch`), record your resume point in your context, reach the
+  orchestrator with `SendMessage` (rc 4 means nothing was sent, so that
+  fallback cannot double-deliver), and wait. Continue when EITHER the
+  watcher's `RESUME` note arrives OR your session is resumed after a
+  sandbox restart: that is how outages usually end, and a restarted
+  watcher cannot send RESUME. `monitor/ng degraded status` says which mode you are in. Nothing
+  inside the sandbox can repair it; never remount, bind or unshare around it.
+  On RESUME, redo the writes that failed.
 - **`sandbox-notify "<msg>"`** on blocker / ready / done. It delivers
   ATTENTION, not content: the real tool discards its argument and emits
   a bare BEL, so the operator learns that *something* happened, never
@@ -415,6 +431,92 @@ a hook or your task prompt points you there.
   terminal state. This closes `#1523`'s shape: `async-run.sh` retains
   an rc and re-invokes nobody, and `asyncrun:<token>` is the wake it
   lacked. `skills/nexus.longjob/SKILL.md` for the rest.
+  **A wait that matches only the SUCCESS line never wakes on an abort.**
+  Measured 2026-10-08: a wait on a deploy's version-stamp line slept
+  ~2 h while the deploy ABORTed. Prefer a subject with its own failure
+  state (`asyncrun:`, `slurm:`) over a file the producer writes.
+  `add file:<log> --when match` now carries a default FAILURE arm
+  (ABORT…, FATAL, ERROR, FAILED, Traceback, `error:`, `fatal:` on lines
+  written after the add); `add` prints it, and `--fail-pattern <ERE>`
+  replaces it. A `Monitor` until-loop or a `cmd:` probe gets no such
+  default: give it a failure arm yourself
+  (`grep -qE 'stamp|ABORT|ERROR' log`), then read which line matched.
+- **An in-process sub-agent is NOT woken by its own Monitor or background
+  notification while you, its lead, are idle** (<your-org>/nexus-code`#1794`,
+  Claude Code 2.1.293). The harness queues the notification in the parent
+  session and delivers it only when something else wakes the sub-agent.
+  Measured 2026-10-09: a run finished green at 17:07 and its helper idled
+  3 h 41 min until a nudge; every notification that session that arrived
+  while the helper was idle waited for an unrelated message. So a sub-agent
+  must never END ITS TURN waiting on a notification: it waits in a FOREGROUND
+  bounded call that polls the job's own status (`async-run.sh --status`,
+  `sacct`, the output file), and a job that outlives that belongs to the
+  lead. Put this rule in every sub-agent brief. A lead with sub-agents in
+  flight polls their jobs too, and does not trust the notification alone.
+- **Never pass a large file as an `sbatch` ARGUMENT to a shell
+  script, and never block an agent shell on Slurm**
+  (<your-org>/nexus-code`#1778`, `#1728`). MEASURED 2026-10-08: the
+  sandbox job wrapper runs a shell script as `/bin/bash -s -- <args>`
+  with the script on stdin, and that `execve` blocks in the kernel
+  reading the FIRST POSITIONAL as if it were the script. A 7.8 GB data
+  file there stalls the job before line 1, at 100% CPU, plateaued near
+  3.5 GB read, and it IGNORES SIGKILL. The reader is an endpoint-security
+  LSM, attributed BY INFERENCE (not measured) to CrowdStrike Falcon.
+  Nothing errors: the job sits RUNNING with only the sandbox banner in
+  its log, and four builds were lost blaming the node, the staging and
+  `--mem`. Remedy, both forms measured: put the paths in a FILE (a small
+  manifest or config) and pass that, or make the job a python-shebang
+  script FILE (the wrapper runs those from a temp file; `python3 -`
+  with the script on stdin stalled too). **Do not reach for the environment instead: the sandbox
+  sbatch wrapper silently DROPS the submitting shell's exported
+  variables** (measured: a job ignored the exported version-override
+  variables and ran its default build), and `--export` through the wrapper
+  is UNVERIFIED — do not rely on it until someone measures it.
+  Separately, `sbatch --wait` and a foreground `srun` hold the shared
+  Slurm chaperon for the whole wait: one 42 s hold seeded a 22-minute
+  jam that blocked every agent's `sbatch`/`squeue`/`sacct`. Submit
+  with `--parsable` and let the longjob watch wake you.
+- **A Slurm job must not read or write the session scratchpad or
+  `$TMPDIR`, and its wrapper must end with the real step's exit code**
+  (<your-org>/nexus-code`#1778`). `/tmp` on the login node is invisible to
+  compute nodes. A wrapper whose last command is an `echo` then reports
+  `COMPLETED 0:0` for a job that produced nothing (measured: job
+  10186371). Put job I/O under the project tree, `/hpc/temp` or
+  `/loc/scratch/$SLURM_JOB_ID`, and end the script with `exit $rc` of
+  the step that did the work.
+- **On this cluster `--mem` is NOT enforced: size a job by its CORE share**
+  (measured 2026-10-09). `scontrol show config` reports
+  `SelectTypeParameters=CR_CORE` (memory is not a consumable resource) and
+  `ConstrainRAMSpace=no`, so the cgroup does not cap RAM. A 16-CPU job with
+  `--mem 400G` used ~680 GB of a shared node and was not killed; the node's
+  `AllocMem` stayed 0. The jobs that pay are your neighbours'. Treat `--mem`
+  as documentation. Read your own cluster before trusting this:
+  `scontrol show config | grep -E 'SelectTypeParameters|ConstrainRAMSpace'`.
+  When those say CR_CORE and `no`, request CPUs for the memory you need:
+  a node's `RealMemory / CPUTot` from `scontrol show node <node>` is the
+  per-core share (about 19 GB per core on the 36-core, 700 GB nodes measured
+  here). Otherwise use `--exclusive`, or restructure the job to stream or
+  chunk. Measure the peak first with `/usr/bin/time -v <cmd>` (Maximum
+  resident set size) on a small input.
+- **Do read-only aggregation in Python or a script FILE, never in a
+  `bash -c '<script>'`** (nexus-code bundle 22). Claude Code's own
+  removal check flags a `-c` script it cannot parse as one that "runs
+  rm", even with no `rm` in it, and the flag is a PERMISSION DIALOG: an
+  unattended agent stalls until the operator approves it or it
+  auto-denies (once 37 s from auto-deny, 2026-10-09). The nexus cannot
+  change that check. Measured over this host's transcripts, 2026-09-30
+  to 10-09: 11 denials, all on `bash -c`/`sh -c` calls (11 of 940), and
+  0 of 30,564 other Bash calls, including 1,283 `bash <file>` and 3,937
+  Python heredocs. None of the 11 contained `rm`, and 6 had no `awk`
+  (`git show … | sha256sum` tripped it). Approved dialogs leave no
+  error behind, so 11 is a FLOOR. A skeptic's wider census found ONE more,
+  on no `-c` at all: a heredoc whose BODY quoted `bash -c`. So a brief
+  or report that quotes this rule goes through the Write tool, never an
+  unquoted heredoc in a Bash call. Instead: run the pipeline directly,
+  use `python3 - <<'EOF'`, or write the script with `mktemp` and run
+  `bash "$f"`; that last form is what "run it under bash" means
+  wherever CLAUDE.md says so. **Put this rule in every in-process
+  sub-agent's prompt**: sub-agents do not receive this floor.
 - **Never `| head` an existence query over a large tree, never
   recurse into `reports/`, and route anything that might run long
   through `async-run.sh`** (<your-org>/nexus-code`#1446`). `grep -r … |
@@ -431,22 +533,31 @@ a hook or your task prompt points you there.
   3 rather than vouch for a zero it cannot see. And a child at ~0% CPU
   for an hour is BLOCKED on the filesystem, not computing —
   `pane-state` now says so (`bg_wedged=1`).
-- **`/tmp/c71780` holds SOCKETS ONLY** (<your-org>/nexus-code`#1422`).
+- **`/tmp/c$(id -u)` holds SOCKETS ONLY** (<your-org>/nexus-code`#1422`).
   Its short name exists for the 107-byte `sun_path` limit and nothing
   else; it held 16.5 GiB of per-worker scratch because briefs handed it
   out as general scratch. Scratch goes under `$TMPDIR`, the directory
   your brief names, or inside your clone —
-  never under `/tmp/c71780`, which the tmpfs reaper deliberately never
+  never under `/tmp/c$(id -u)`, which the tmpfs reaper deliberately never
   touches because live sockets are exactly what it must not delete.
   **`$TMPDIR` is set for you, and you check it once** (<your-org>/nexus-code`#1628`):
   Claude Code leaves TMPDIR UNSET, so `$TMPDIR/x` used to be `/x` at the
   sandbox ROOT, at rc 0 (three stray writes in one session), and
   `rm -rf $TMPDIR/foo` is `rm -rf /foo`. The nexus shell prelude now sets a
-  private per-user directory (`/tmp/claude-<uid>/tmp`, mode 0700) in every
-  agent shell whose TMPDIR is unset or empty, and warns on stderr when it
-  cannot. Run `echo "TMPDIR=[$TMPDIR]"` once; if it prints `[]`, stop and
-  say so rather than writing through it. In anything destructive, write
-  `"${TMPDIR:?}/<path>"`, which fails LOUD when empty.
+  private directory (mode 0700) in every agent shell whose TMPDIR is unset
+  or empty, and warns on stderr when it cannot. Run `echo "TMPDIR=[$TMPDIR]"`
+  once; if it prints `[]`, stop and say so rather than writing through it.
+  In anything destructive, write `"${TMPDIR:?}/<path>"`, which fails LOUD
+  when empty. **It is PER AGENT only if a launcher set it**: a spawned
+  agent gets `/tmp/claude-<uid>/tmp/agent-<window>`; a hand-launched
+  session, or one started before this change, shares
+  `/tmp/claude-<uid>/tmp` with every agent of this uid, and in-process
+  sub-agents always share their parent's. Measured 2026-10-08: a skeptic
+  and its lead both wrote `$TMPDIR/wrap2.out` at once, and the merged file
+  showed the skeptic posting the lead's comment. Name scratch with
+  `mktemp` (`mktemp "${TMPDIR:?}/<what>.XXXXXX"`), never a bare generic
+  name, and quote the authoritative record (`wrap-up-output/<window>/last`),
+  not a scratch copy.
 - **An orphan left by your OWN backgrounded Bash call is stopped
   with `TaskStop`, not with a signal — and the guard that refuses
   it is right.** Backgrounding makes that shell its own SESSION
@@ -493,6 +604,18 @@ a hook or your task prompt points you there.
   presented as convention is re-derived by nobody downstream, human or
   agent, so the one number nobody chose deliberately is also the one
   number nobody checks.
+- **Test fixtures use SYNTHETIC stand-ins, written in while you write the
+  test** (<your-org>/nexus-code`#1762`). A captured `.ansi` pane, a log
+  excerpt or a reproduced command line carries the REAL identifiers of the
+  incident it came from. Replace them at the moment you paste:
+  sample IDs → `SAMPLE_A`; project paths and names → `/data/proj-x/`,
+  `proj-x`; window names → `w1`, `w1-sk`; Slurm job ids → `1234567`;
+  UIDs → `1000`; hostnames → `node01`; IPs → `192.0.2.x` (RFC 5737).
+  Keep the SHAPE the test asserts on, change the VALUE. Measured
+  2026-10-07: a real sample ID and a project folder name, pasted into two
+  fixtures, reached the public mirror. The leak gate only knows categories
+  someone has written down, so a new real identifier ships until it is
+  noticed, and a public disclosure cannot be recalled.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures

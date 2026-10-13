@@ -1551,7 +1551,7 @@ _retry_pending_heads_up() {
 # Case B waits for a reset EPOCH (probed, else heuristic and clamped to
 # RATELIMIT_HEURISTIC_MIN). Nothing invalidated that epoch when the limit was
 # lifted some OTHER way. Measured 2026-10-04 (operator nexus, watcher-unstick.log):
-# `proj-b7pot`/`proj-subreg` detected 21:37:23/21:37:35, cascade scheduled for
+# `proj-w1`/`proj-w2` detected 21:37:23/21:37:35, cascade scheduled for
 # 22:07:25 (heuristic 30 min); the operator switched account at ~21:45 and the
 # orchestrator recovered through the over-limit path at 21:48:06, while both
 # workers stayed at the menu until a human pressed Escape. (Bounded by the 30-min

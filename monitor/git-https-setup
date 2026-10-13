@@ -80,7 +80,7 @@ fi
 #
 #   * arm 1 tested for a DIRECTORY NAMED `.git`, not for a repository. An
 #     interrupted clone leaves `<dir>/.git/objects/` and passes — and that is
-#     not a synthetic worry: `work/kompot-milodesc-sk/.git/` on this host
+#     not a synthetic worry: `work/proj-x-sk/.git/` on this host
 #     holds exactly `objects/` and nothing else.
 #   * arm 2 returns `true` when discovery WALKS UP. It answers "is this path
 #     somewhere inside some repo", never "is this path its own repo".

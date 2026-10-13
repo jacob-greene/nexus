@@ -43,7 +43,7 @@
 # whenever the scratch dir happens to sit there — and it then resolved to the
 # operator's PRIMARY. Measured: 321 fixture rows (res-win, stamp-win,
 # other-name) in the primary's action log, the latest from a mutation-gate
-# workdir under work/rmsk-band; and mutation baselines red because the copied
+# workdir under work/proj-x; and mutation baselines red because the copied
 # tree took the primary's identity. So a test harness (run-tests.sh,
 # mutation-gate.sh, _test_helpers.sh) exports NEXUS_TEST_FENCE=<its scratch
 # root>, and under a fence an ancestor OUTSIDE the fence is never a primary:

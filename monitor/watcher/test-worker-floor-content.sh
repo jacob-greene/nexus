@@ -10,7 +10,7 @@
 #   * never `| head` an existence query over a large tree; never recurse
 #     into `reports/`; anything long goes through async-run.sh (three workers
 #     wedged >5h in one session, every pane reading working-background);
-#   * `/tmp/c71780` holds SOCKETS ONLY (16.5 GiB of worker payload landed
+#   * `/tmp/c$(id -u)` holds SOCKETS ONLY (16.5 GiB of worker payload landed
 #     there because briefs handed it out as scratch).
 #
 # This suite pins that the floor carries them and — the half that makes it a
@@ -35,7 +35,7 @@ must=(
   'Never `| head` an existence query'
   'monitor/ng report-grep'
   'async-run.sh'
-  '/tmp/c71780` holds SOCKETS ONLY'
+  '/tmp/c$(id -u)` holds SOCKETS ONLY'
   'bg_wedged=1'
   # your-org/nexus-code#1523: a retained rc is not an armed wake. The floor
   # must NAME what re-invokes a parked agent (run_in_background / Monitor) and

@@ -172,7 +172,33 @@ _pt_killtree() {
     for p in $(_pt_tree "$1" | tac); do kill -KILL "$p" 2>/dev/null; done
     wait "$1" 2>/dev/null
 }
-_pt_cleanup() { local p; for p in "${_PT_ROOTS[@]:-}"; do [[ -n "$p" ]] && _pt_killtree "$p"; done; }
+# THE FAKE CLAUDE LIVES AS LONG AS THE TEST SAYS, NOT AS LONG AS A CLOCK SAYS.
+# It used to be `… & sleep 240`, and c1 is read again ~340 lines after it was
+# spawned: in a 680 s run under load it had exited by then, and the S-young /
+# S-legacy reads came back `state=absent evidence=pid-gone` (bundle 23). Now
+# its foreground blocks until _pt_cleanup kills the tree (bottom-up).
+# It must FORK NOTHING: K3 and the rig-2 rows compare member digests 2.5 s
+# apart, and a `while …; do sleep 1; done` foreground churned a child every
+# second and turned both red (measured). So the foreground is the builtin
+# `read` on a FIFO opened read-write (an O_RDWR open never blocks, and no one
+# writes): no child at all, ended by _pt_cleanup's kill, with `-t 3600` as the
+# backstop for a SIGKILLed suite that runs no trap.
+mkfifo "$WORK/rig-life.fifo"
+_PT_LIFE="read -r -t 3600 _ <> $WORK/rig-life.fifo"
+# _pt_cleanup records every pid of every tree (pid + start ticks) BEFORE the
+# kill and counts the survivors after it into _PT_LEFT, so "no orphan" is a
+# measurement rather than a hope.
+_pt_cleanup() {
+    local p q st; local -a seen=()
+    for p in "${_PT_ROOTS[@]:-}"; do
+        [[ -n "$p" ]] || continue
+        for q in $(_pt_tree "$p"); do st=$(_pt_st "$q"); [[ -n "$st" ]] && seen+=("$q:$st"); done
+        _pt_killtree "$p"
+    done
+    _PT_SEEN=${#seen[@]}; _PT_LEFT=0
+    for q in "${seen[@]:-}"; do [[ -n "$q" && "$(_pt_st "${q%%:*}")" == "${q#*:}" ]] && _PT_LEFT=$(( _PT_LEFT + 1 )); done
+    _PT_ROOTS=()
+}
 trap 'declare -F _pt_cleanup >/dev/null && _pt_cleanup; rm -rf "$WORK"' EXIT
 _pt_st() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 _pt_field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$1"; }
@@ -207,7 +233,7 @@ _pt_run() {   # <pane pid> [extra pane-state args…]
     "$PS" --fixture "${_PT_FIX:-$FIX}" --name ljw --heartbeat-file "$HB" --now "$NOW" --heartbeat-staleness 100000 --heartbeat-turn-end-staleness 100000 --heartbeat-async-staleness 100000 --pane-pid "$pp" "$@" 2>&1
 }
 if command -v pgrep >/dev/null 2>&1 && [[ -r /proc/$$/stat ]] && cp "$(command -v bash)" "$_pt_h_dir/claude" 2>/dev/null; then
-    _pt_spawn "$_PT_DISP & sleep 240"; _pt_c1="$_pt_claude"
+    _pt_spawn "$_PT_DISP & $_PT_LIFE"; _pt_c1="$_pt_claude"
     _pt_d1=$(_pt_find_disp "$_pt_c1") && _pt_ok=1
 fi
 if (( _pt_ok == 1 )); then
@@ -267,7 +293,7 @@ if (( _pt_ok == 1 )); then
     [[ "$out" == state=idle* ]] && ok "control: the same no-footer pane with 0 active → idle (the hold is the watch, not the dispatcher)" || bad "no footer, 0 active: $out"
 
     echo "--- K2: the exclusion never removes a REAL root ---"
-    _pt_spawn "$_PT_DISP & bash -c 'while :; do sleep 30; done' & sleep 240"; _pt_c2="$_pt_claude"
+    _pt_spawn "$_PT_DISP & bash -c 'while :; do sleep 30; done' & $_PT_LIFE"; _pt_c2="$_pt_claude"
     _pt_d2=$(_pt_find_disp "$_pt_c2"); ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d2" "$(_pt_st "$_pt_d2")"
     out=$(_pt_run "$_pt_c2")
     [[ "$out" == state=working-background* && "$out" == *"bg_shells=1 "* && "$out" == *"bg_longjob=1"* && "$(_pt_field "$out" bg_cmd)" == *sleep_30* ]] \
@@ -279,7 +305,7 @@ if (( _pt_ok == 1 )); then
 
     echo "--- K3: a STATIC real shell beside the churning dispatcher reads STATIC (#1460) ---"
     mkfifo "$WORK/fifo"
-    _pt_spawn "$_PT_DISP & bash -c 'read x < $WORK/fifo; true' & sleep 240"; _pt_c3="$_pt_claude"
+    _pt_spawn "$_PT_DISP & bash -c 'read x < $WORK/fifo; true' & $_PT_LIFE"; _pt_c3="$_pt_claude"
     _pt_d3=$(_pt_find_disp "$_pt_c3"); ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d3" "$(_pt_st "$_pt_d3")"
     a=$(_pt_run "$_pt_c3"); sleep 2.5; b=$(_pt_run "$_pt_c3")
     # The digest is per-run, so it rides on a note, never in the label (#1574:
@@ -294,7 +320,7 @@ if (( _pt_ok == 1 )); then
     # The fake await sleeps 60 s, as a real one polls: two samples 2.5 s apart must not straddle a re-fork.
     mkdir -p "$WORK/monitor"; printf '#!/usr/bin/env bash\nwhile :; do sleep 60; done\n' > "$WORK/monitor/skeptic-channel.sh"; chmod +x "$WORK/monitor/skeptic-channel.sh"
     _PT_AWAIT="bash -c \"source /dev/null && eval '$WORK/monitor/skeptic-channel.sh await ljw' < /dev/null && pwd\""
-    _pt_spawn "$_PT_DISP & $_PT_AWAIT & sleep 240"; _pt_c4="$_pt_claude"
+    _pt_spawn "$_PT_DISP & $_PT_AWAIT & $_PT_LIFE"; _pt_c4="$_pt_claude"
     _pt_d4=$(_pt_find_disp "$_pt_c4"); ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d4" "$(_pt_st "$_pt_d4")"
     sleep 1; a=$(_pt_run "$_pt_c4"); sleep 2.5; b=$(_pt_run "$_pt_c4")
     [[ "$a" == state=working-background* && "$a" == *"bg_shells=1 "* && "$a" == *"bg_infra=1 "* && "$a" == *"bg_quiesce=1"* && "$a" == *"bg_longjob=1"* ]] \
@@ -305,7 +331,7 @@ if (( _pt_ok == 1 )); then
     # 152-byte scratch TMPDIR). Assert what the case is ABOUT instead: the label is present, is not the
     # dispatcher's loop, and EQUALS the label of a no-dispatcher CONTROL — the same await, same $WORK,
     # taken in this rig — so whatever the cut leaves, it is the await's.
-    _pt_spawn "$_PT_AWAIT & sleep 240"; _pt_c4c="$_pt_claude"
+    _pt_spawn "$_PT_AWAIT & $_PT_LIFE"; _pt_c4c="$_pt_claude"
     for _i in $(seq 1 40); do ctl=$(_pt_run "$_pt_c4c"); [[ "$ctl" == *"bg_infra=1 "* ]] && break; sleep 0.25; done
     _cmd_a=$(_pt_field "$a" bg_cmd); _cmd_c=$(_pt_field "$ctl" bg_cmd)
     [[ -n "$_cmd_a" && "$_cmd_a" != "-" && "$_cmd_a" != *sleep_1* && "$_cmd_a" == "$_cmd_c" ]] \
@@ -339,7 +365,7 @@ if (( _pt_ok == 1 )); then
     fi
 
     echo "--- K4 (sk2 F2): the root must be a shell BELOW claude; a launcher shell ABOVE claude vouches for nothing ---"
-    bash -c "bash -c '$_pt_h_dir/claude -c \"sleep 300 & bash -c \\\"while :; do sleep 30; done\\\" & sleep 240\" & wait' & wait" >/dev/null 2>&1 &
+    bash -c "bash -c '$_pt_h_dir/claude -c \"sleep 300 & bash -c \\\"while :; do sleep 30; done\\\" & $_PT_LIFE\" & wait' & wait" >/dev/null 2>&1 &
     _pt_p4=$!; _PT_ROOTS+=("$_pt_p4"); _pt_l4=""; _pt_c5=""; _pt_s4=""
     for _i in $(seq 1 80); do
         _pt_l4=$(pgrep -n -P "$_pt_p4" 2>/dev/null); [[ -n "$_pt_l4" ]] && _pt_c5=$(pgrep -n -P "$_pt_l4" -x claude 2>/dev/null)
@@ -361,7 +387,7 @@ if (( _pt_ok == 1 )); then
     # A ledger pid that is not a shell — what a dispatcher that EXEC'd into
     # something else would look like (pid and ticks kept). PREDICTED FLIP for
     # "delete the hop-1 shell check": this row goes `idle`; nothing else moves.
-    _pt_spawn "bash -c 'sleep 300; true' & sleep 240"; _pt_c6="$_pt_claude"; _pt_x6=""
+    _pt_spawn "bash -c 'sleep 300; true' & $_PT_LIFE"; _pt_c6="$_pt_claude"; _pt_x6=""
     for _i in $(seq 1 80); do
         for _w in $(pgrep -P "$_pt_c6" -x bash 2>/dev/null); do
             for _k in $(pgrep -P "$_w" -x sleep 2>/dev/null); do [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == "sleep 300 " ]] && _pt_x6="$_k"; done
@@ -384,7 +410,7 @@ if (( _pt_ok == 1 )); then
     # `sleep 600` with it: `idle` over live work. PREDICTED FLIP for "delete the
     # co-tenant loop": both rows go `idle`; K1 (a wrapper with no co-tenant)
     # stays `idle` either way, which is what makes it the control.
-    _pt_spawn "bash -c 'bash -c \"while :; do sleep 1; done\" & sleep 600; true' & sleep 240"; _pt_c7="$_pt_claude"
+    _pt_spawn "bash -c 'bash -c \"while :; do sleep 1; done\" & sleep 600; true' & $_PT_LIFE"; _pt_c7="$_pt_claude"
     if _pt_d7=$(_pt_find_disp "$_pt_c7"); then
         ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d7" "$(_pt_st "$_pt_d7")"
         out=$(_pt_run "$_pt_c7")
@@ -396,7 +422,7 @@ if (( _pt_ok == 1 )); then
     fi
     # The co-tenant one level ABOVE the dispatcher's parent: every chain node up
     # to the root is examined, not only the first.
-    _pt_spawn "bash -c 'bash -c \"bash -c \\\"while :; do sleep 1; done\\\"; true\" & sleep 600; true' & sleep 240"; _pt_c8="$_pt_claude"; _pt_d8=""
+    _pt_spawn "bash -c 'bash -c \"bash -c \\\"while :; do sleep 1; done\\\"; true\" & sleep 600; true' & $_PT_LIFE"; _pt_c8="$_pt_claude"; _pt_d8=""
     for _i in $(seq 1 80); do
         for _w in $(pgrep -P "$_pt_c8" -x bash 2>/dev/null); do for _m in $(pgrep -P "$_w" -x bash 2>/dev/null); do for _k in $(pgrep -P "$_m" -x bash 2>/dev/null); do
             [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == *"sleep 1;"* ]] && _pt_d8="$_k"
@@ -436,7 +462,7 @@ if (( _pt_ok == 1 )); then
         env -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW -u NEXUS_LONGJOB_KEY -u NEXUS_LONGJOB_SESSION_ID \
             NEXUS_ROOT="$REPO_ROOT" CLAUDE_CODE_SESSION_ID="$sid" NEXUS_LONGJOB_WINDOW=ljw \
             MONITOR_LONGJOB_POLL_SECONDS=5 MONITOR_LONGJOB_ENABLED=true _LJ="$_LJ" \
-            "$_pt_h_dir/claude" -c "$payload & sleep 240" >/dev/null 2>&1 &
+            "$_pt_h_dir/claude" -c "$payload & $_PT_LIFE" >/dev/null 2>&1 &
         _lj_claude=$!; _PT_ROOTS+=("$_lj_claude")
         led="$NEXUS_STATE_DIR/longjob/sid-$sid/dispatcher.json"
         for i in $(seq 1 160); do
@@ -524,7 +550,7 @@ if (( _pt_ok == 1 )); then
     # born_ticks one tick BEFORE that child's start — the same tree reads idle,
     # so the S-old row's verdict is the born_ticks comparison, not the tree.
     _PT_DISP_HELD='bash -c "bash -c \"sleep 300 & while :; do sleep 1; done\" ; true"'
-    _pt_spawn "$_PT_DISP_HELD & sleep 240"; _pt_c9="$_pt_claude"; _pt_h9=""
+    _pt_spawn "$_PT_DISP_HELD & $_PT_LIFE"; _pt_c9="$_pt_claude"; _pt_h9=""
     if _pt_d9=$(_pt_find_disp "$_pt_c9"); then
         for _i in $(seq 1 80); do
             for _k in $(pgrep -P "$_pt_d9" -x sleep 2>/dev/null); do [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == "sleep 300 " ]] && _pt_h9="$_k"; done
@@ -556,6 +582,9 @@ if (( _pt_ok == 1 )); then
         && ok "#1565 S-legacy MUST-NOT-FLIP: a born_ticks that is not a number is read as a ledger that predates the field → idle, as before (stated error direction: no board-wide freeze)" \
         || bad "#1565 S-legacy: $out"
     _pt_cleanup
+    (( _PT_SEEN > 0 && _PT_LEFT == 0 )) \
+        && ok "rig cleanup: every process of the fake-claude trees is gone ($_PT_SEEN recorded by pid + start ticks, killed bottom-up, 0 survive)" \
+        || bad "rig cleanup: $_PT_LEFT of $_PT_SEEN recorded processes survived the bottom-up kill (an orphan)"
 else
     printf '  SKIP: no pgrep or no /proc — the process-tree cases are unmeasured here\n'
 fi
@@ -648,7 +677,7 @@ ledger "sid-$SID" "$(( $(date +%s) - 100000 ))" 0
 _h1727 'sbatch j.sh' 'Submitted batch job 123459'
 [[ "$(_na_ctx)" == *"job(s) 123459: "*"rc=3"*"NOT ARMED"* ]] && ok "#1727 a recorded watch whose dispatcher is NOT ARMED (stale ledger, add rc 3) is reported, not swallowed" || bad "#1727 add rc 3 silent: '$H_OUT'"
 
-# ONLY THE ID SBATCH ITSELF PRINTS MAY ARM (#1727 core). The proj-overlay2
+# ONLY THE ID SBATCH ITSELF PRINTS MAY ARM (#1727 core). The proj-w3
 # shape: a NON-substituted `sbatch --parsable` beside `grep -c` lines whose bare
 # `1`s were read as the job id (slurm:1).
 ledger "sid-$SID" "$(date +%s)" 0

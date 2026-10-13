@@ -539,7 +539,7 @@ _remote_bind_guard() {
     # accepted here: breadth is a conscious operator choice, malformation is not.
     if [[ -n "$cidr" ]] && ! _remote_cidr_is_valid "$cidr"; then
         printf 'remote: REFUSING monitor.remote.from_cidr=%s — not a well-formed CIDR.\n' "$cidr" >&2
-        printf '  Use e.g. 140.107.0.0/16 (a subnet), %s/32 (one client), or 0.0.0.0/0 (any source).\n' "$bind" >&2
+        printf '  Use e.g. 198.51.0.0/16 (a subnet), %s/32 (one client), or 0.0.0.0/0 (any source).\n' "$bind" >&2
         return 1
     fi
     # Routable (non-loopback) bind is SENSITIVE: from_cidr is REQUIRED. Empty is
@@ -548,7 +548,7 @@ _remote_bind_guard() {
         printf 'remote: REFUSING bind_address=%s without monitor.remote.from_cidr — a routable bind\n' "$bind" >&2
         printf '  is SENSITIVE access; pin the source range. Recommended: your campus/LAN subnet,\n' >&2
         printf '  set once — e.g.\n' >&2
-        printf '    monitor.remote.from_cidr: "140.107.0.0/16"   (a broad subnet)\n' >&2
+        printf '    monitor.remote.from_cidr: "198.51.0.0/16"   (a broad subnet)\n' >&2
         printf '  tighten to "%s/32" for a single client (max security), or "0.0.0.0/0" to allow\n' "$bind" >&2
         printf '  ANY source (conscious opt-in — exposes the pre-auth SSH surface to the whole\n' >&2
         printf '  reachable network). Or bind loopback (127.0.0.1) and reach it via an SSH\n' >&2
@@ -1199,12 +1199,12 @@ _remote_live_host_key() {
 #
 # WHY `command -v` WAS NOT ENOUGH, measured on the live nexus 2026-08-24:
 # name-service resolution for our own uid failed inside the sandbox (`getent
-# passwd 71780` rc 2), and `ssh`/`ssh-keygen` call `getpwuid()` at startup and
+# passwd 10000` rc 2), and `ssh`/`ssh-keygen` call `getpwuid()` at startup and
 # abort — while `ssh-keyscan`, which does not, kept working. `command -v ssh`
 # succeeded throughout: the binary was PRESENT and merely refused to RUN.
 # Presence is a proxy for usability and the two came apart.
 #
-#     ssh -V   → No user exists for uid 71780   (rc 255)
+#     ssh -V   → No user exists for uid 10000   (rc 255)
 #
 # `-V` is the check because it is the cheapest invocation that still traverses
 # the startup path where that abort lives (≈5 ms, no socket, no config, no
@@ -1395,7 +1395,7 @@ _remote_verify_live_host_key() {
 # VALIDATED AGAINST THE ORACLE, not derived from the spec: run on this nexus's
 # own host key once ssh-keygen was usable again, all three implementations
 # below and `ssh-keygen -lf` agree exactly —
-#   SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU
+#   SHA256:vtAv+bY//ucx6gAep3zsWpb0xGssKiFRrvpJFCJy5SI
 # `test-remote-instrument-potency.sh` re-runs that known-answer comparison
 # wherever ssh-keygen is present, so the equivalence is checked rather than
 # asserted, and a divergence reddens instead of silently printing a wrong

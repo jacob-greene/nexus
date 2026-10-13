@@ -25,6 +25,8 @@ the failure mode; this design closes it.
 | `scrub.pl` | Yes | Data-driven substitution engine (reads a mapping; hardcodes nothing). Matches **case-insensitively** and preserves the match's case shape. |
 | `build.sh` | Yes | Applies the scrub to the current checkout in place; skips `exclude` paths in the scrub loop, then drops them and **verifies they are gone** (exit 3 otherwise). **Dry run by default** — `--yes` to act (exit 6 without it), refuses a dirty tree (exit 7) unless `--allow-dirty`, and refuses (exit 8) when it cannot establish a work-tree root (#1001). |
 | `leak-gate.sh` | Yes | Fails on any surviving denied token **in file contents or in a file PATH**, and on any `exclude`-listed dictionary path still present in the tree (reads `deny`/`keep`/`exclude` from the mapping). **Refuses (exit 5)** rather than answering when the index and working tree disagree. `--commit <sha>` also screens that commit's message and author/committer identities, and refuses (exit 5) a commit whose tree is not the scanned index. |
+| `verify-build.py` | Yes | Run by `build.sh` after the scrub: every binary byte-identical to source AND reviewed in `binaries.tsv` (exit 11), every scrubbed shell/Python/JSON/YAML file still parses where its source did (exit 10). |
+| `binaries.tsv` | Yes | The REVIEWED binaries, by path and blob sha. Names only public paths and object ids. |
 | `overlay/renames.tsv` | **No** (excluded) | Post-scrub PATH renames, for basenames that carry an internal identifier in the file NAME. |
 | `overlay/files/` | **No** (excluded) — installed copies ship | Mirror-only files carried in source, laid out at their public path and installed by `file` rows in `overlay/manifest.tsv` (#1557). |
 | `README.md` | Yes | This file. |
@@ -99,6 +101,30 @@ mid-run* corrupts the dictionary for every file processed afterwards — the
 it never ships: `build.sh` drops it and hard-fails (exit 3) if the drop did not
 take, and `leak-gate.sh` fails if any `exclude` path is present in the scanned
 tree. The shipped, generic stand-in is `mapping.example.tsv`.
+
+## Binaries are never scrubbed, and a scrub may not break code (#1812)
+
+The scrub is a case-insensitive TEXT substitution. Run over a binary it matches
+by chance: one three-character dictionary token occurs twice inside the docs
+organigram's compressed JPEG data, and from 2026-09-17 the mirror shipped that
+image 8 bytes long and corrupt, with every gate green (a corrupted image carries
+fewer denied tokens, not more). So:
+
+- `build.sh` skips every file git classifies as binary (`git ls-files --eol`
+  = `i/-text`) and ships it **verbatim**;
+- `verify-build.py` then fails the build (**exit 11**) if any binary differs
+  from its source blob, or is not listed in `binaries.tsv` at its current blob
+  sha. A new or changed binary is a human decision: look at it (pixels and
+  metadata), then add or update its row, drop it with an `exclude`, or replace
+  it in source. The leak gate still greps every binary's bytes;
+- it also fails the build (**exit 10**) if a scrubbed shell, Python, JSON or
+  YAML file no longer parses where its source parsed. The remedy is in the
+  dictionary: anchor the rule, or reword the source generically. Never ship a
+  substitution that breaks code.
+
+Dialing the scrub down never means screening less: `deny` rows and the leak
+gate are unchanged, and a binary now needs a review row where it used to pass
+by being mangled.
 
 ## Usage (ongoing sync)
 
@@ -322,6 +348,29 @@ It prints `base_source_sha`, `base_tree`, `base_dir`, `gate`, `renames`,
 base does not pass its own leak gate. A commit whose dictionary it cannot read
 reports `gate=UNCHECKED`, never `gate=clean` — "could not check" and "checked
 and clean" do not share a spelling here.
+
+The merge itself, as run for the 2026-10-13 sync (`BASE` = sync-base.sh's
+dir, `THEIRS` = the built and staged clone; guard every variable, because an
+empty sha here once turned the setup into a hard reset):
+
+```bash
+bt=$(git -C "$BASE" write-tree); tt=$(git -C "$THEIRS" write-tree)
+git -C "$BASE"   update-ref refs/heads/nx-base   "$(git -C "$BASE"   commit-tree "${bt:?}" -m base)"
+git -C "$THEIRS" update-ref refs/heads/nx-theirs "$(git -C "$THEIRS" commit-tree "${tt:?}" -m theirs)"
+git clone <public-remote> M && cd M                      # ours = the mirror's HEAD
+git fetch -q "$BASE" nx-base:refs/nx/base && git fetch -q "$THEIRS" nx-theirs:refs/nx/t0
+o=$(git commit-tree "HEAD^{tree}" -p refs/nx/base -m ours)   # re-parent both sides on the base,
+t=$(git commit-tree "${tt:?}"     -p refs/nx/base -m theirs) # so the merge base IS scrub_old
+git checkout -q --detach "${o:?}" && git merge --no-commit --no-ff "${t:?}"
+# resolve, git add -A, leak-gate, lint the merged workflows, then commit-tree on the mirror HEAD
+```
+
+A conflict is a mirror-side hand edit meeting a source change. Prefer the
+source side when it is the cleaner one (the scrub now does what the hand edit
+did); keep the hand edit when it genericizes something the dictionary still
+does not. A mirror-side edit that did NOT conflict is carried silently: diff the
+mirror against the base (`diff -rq -x .git BASE M`) and re-decide any that a
+later source change made stale.
 
 **The base it builds will contain values the current dictionary would strip.**
 That is correct and is the whole point: it reproduces the artifact the previous

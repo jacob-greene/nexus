@@ -100,13 +100,22 @@ gp_handle "$@"
 # OR follow a line ending in `\` (a continuation of an awk command).
 _AVL_RE='(^|[[:space:]])-v[[:space:]]+[A-Za-z_][A-Za-z0-9_]*="?\$'
 _avl_scan() {
-    local f="$1" rel="${1#"$ROOT"/}" prev_cont=0 n=0 line code raw
+    local f="$1" rel="${1#"$ROOT"/}" prev_cont=0 n=0 rec code raw
     # Comments are stripped ONCE for the whole file so a `#` inside quotes is
     # not a comment (shf_strip_comments is the shared quote machine); the
     # stripped text keeps its line count, so numbers below are real lines.
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        n=$(( n + 1 ))
-        code="$line"
+    #
+    # ONE awk pass PRE-FILTERS the stripped text (your-org/nexus-code#1704).
+    # The bash loop used to visit every line (~400k over the corpus, ~80 s of
+    # bash per scan); now it sees only lines containing the literal `-v`, which
+    # `_AVL_RE` REQUIRES, so the filter is an exact superset and drops nothing
+    # the ERE could match. The continuation state `prev_cont` depends on the
+    # line BEFORE, which the filter may have dropped, so awk carries it over
+    # every line and hands it along as `NR:prev_cont:code`. Proven
+    # byte-identical against the per-line loop on the full corpus.
+    while IFS= read -r rec; do
+        n=${rec%%:*}; rec=${rec#*:}
+        prev_cont=${rec%%:*}; code=${rec#*:}
         if [[ "$code" =~ $_AVL_RE ]] \
            && { [[ "$code" =~ (^|[^A-Za-z0-9_./-])awk([[:space:]]|$) ]] || (( prev_cont )); }; then
             # The exemption marker lives in a trailing COMMENT, which the
@@ -120,8 +129,9 @@ _avl_scan() {
                 printf '%s:%d:%s\n' "$rel" "$n" "$raw"
             fi
         fi
-        if [[ "$code" =~ \\$ ]]; then prev_cont=1; else prev_cont=0; fi
-    done < <(shf_strip_comments "$f" 2>/dev/null)
+    done < <(shf_strip_comments "$f" 2>/dev/null \
+             | awk '{ if (index($0, "-v")) printf "%d:%d:%s\n", NR, pc, $0
+                      pc = ($0 ~ /\\$/) ? 1 : 0 }')
 }
 
 mode=report

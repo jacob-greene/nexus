@@ -32,6 +32,8 @@ watcher/test-pane-state-longjob-discount.sh	<(sed
 watcher/test-pane-state-longjob-discount.sh	<(sed
 watcher/test-recover-pidfile-sync.sh	$br
 watcher/test-recover-pidfile-sync.sh	$br
+watcher/test-recover-service-gh-env.sh	$1
+watcher/test-recover-service-gh-env.sh	$2
 watcher/test-run-tests-accounting-verdict.sh	<(sed
 watcher/test-skeptic-channel.sh	$1
 watcher/test-skeptic-channel.sh	$1

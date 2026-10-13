@@ -111,7 +111,12 @@ disposition: no-further-pass | second-pass   # REQUIRED whenever the wrap-up run
                          # and delete the line only when no skeptic is required.
                          # Absent is fine then; UNREADABLE is refused (only those
                          # two values parse — `merge`, `credible`, `revise` do NOT).
-fanout: <N> spawned / <M> returned   # optional; validated only when present, M <= N
+fanout: <N> spawned / <M> returned   # optional; validated only when present, M <= N.
+                         # M counts subagents that RETURNED, used or not. If the
+                         # report sets some returned results aside, append
+                         # ` / <K> used` (K <= M): all returned with K < M gets a
+                         # neutral note, never the INCOMPLETE line
+                         # (<your-org>/nexus-code#1140).
 ---
 
 # {Title}

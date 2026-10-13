@@ -363,7 +363,7 @@ _CMDSUBST_SBATCH_ERE='(\$\(|`)[^)`]*\bsbatch\b'
 # ONLY THE ID SBATCH ITSELF PRINTS MAY ARM (your-org/nexus-code#1727 core). A
 # `--parsable` row's id field accepts ANY bare-integer stdout line, and the hook
 # sees the whole tool call's stdout, not sbatch's. `sbatch --parsable j.sh;
-# grep -c x f` prints the id AND a count; proj-overlay2 armed `slurm:1` from two
+# grep -c x f` prints the id AND a count; proj-w3 armed `slurm:1` from two
 # `grep -c` lines exactly so. So a bare number is trusted only when EVERY
 # command segment of the call (split on ; && || | & and newlines) is an sbatch
 # or a command that prints nothing to stdout here: cd, export, module/ml,

@@ -438,11 +438,13 @@ declare -a _NON_SUITE_PATHS=(
     'monitor/watcher/test-integration/_harness.sh'
     'monitor/watcher/test-integration/stub-claude.sh'
     'monitor/watcher/test-integration/_renderer_scrape_check.sh'
+    'monitor/watcher/test-integration/_rv_load_classify.sh'
 )
 declare -a _NON_SUITE_WHY=(
     'sourced library — builds the integration fixture; runs no assertions of its own'
     'a stub `claude` binary the integration scenarios exec; not a test'
     'sourced library — the three-outcome renderer-scrape check test-realmodel-overlimit.sh calls (#1530); its own assertions live in test-realmodel-overlimit-unmeasured.sh'
+    'sourced library — the load-arm verdict test-realmodel-respawn-verify.sh calls (#1795); its own assertions live in test-rv-load-classify.sh'
 )
 _is_non_suite() {   # <path> -> rc 0 if DECLARED a non-suite above
     local p="$1" d
@@ -887,6 +889,12 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # monitor/watcher/test-fs-degraded-note.sh, the watcher's repeating DEGRADED
 # note and `ng degraded status`; and monitor/watcher/test-requests-dir.sh, the
 # request-inbox resolver and its one-composer lint.
+# SEVEN ENTRANTS at the bundle-1007a seam (your-org/nexus-code#1759, #1760,
+# #1761, #1762, #1764, #1768, #1771), all fully protected at birth (ledger=yes
+# via `th_summary_and_exit`, count=exact via an EXPECTED census). Two of them
+# (test-recover-service-gh-env, test-request-decline-ledger-timeout) were
+# written count=none and RAISED to the protected form rather than recorded as
+# unprotected.
 PROTECTED='monitor/cc-harness/test-cc-harness-gate-coverage-trackedness.sh
 monitor/test-obligations.sh
 monitor/test-window-key.sh
@@ -1030,6 +1038,7 @@ monitor/watcher/test-public-mirror-overlay-drift.sh
 monitor/watcher/test-public-mirror-overlay-files.sh
 monitor/watcher/test-public-mirror-symlink-target.sh
 monitor/watcher/test-public-mirror-sync-base.sh
+monitor/watcher/test-public-mirror-verify-build.sh
 monitor/watcher/test-realmodel-overlimit-unmeasured.sh
 monitor/watcher/test-recover-pidfile-sync.sh
 monitor/watcher/test-registry-unreadable-refusal.sh
@@ -1106,7 +1115,21 @@ monitor/watcher/test-svc-url-warning.sh
 monitor/watcher/test-lint-suites-declare-population.sh
 monitor/watcher/test-doctor.sh
 monitor/watcher/test-fs-degraded-note.sh
-monitor/watcher/test-requests-dir.sh'
+monitor/watcher/test-requests-dir.sh
+monitor/watcher/test-leak-screen-workflow.sh
+monitor/watcher/test-public-mirror-form-rows.sh
+monitor/watcher/test-public-mirror-leak-gate-fail-closed.sh
+monitor/watcher/test-urgent-decision-surface.sh
+monitor/watcher/test-worker-floor-synthetic-fixtures.sh
+monitor/watcher/test-recover-service-gh-env.sh
+monitor/watcher/test-request-decline-ledger-timeout.sh
+monitor/watcher/test-svc-boot-starting.sh
+monitor/watcher/test-svc-url-redact.sh
+monitor/watcher/test-tmux-fixture-conf-lint.sh
+monitor/watcher/test-rv-load-classify.sh
+monitor/watcher/test-bootstrap-recover-ro-nudge.sh
+monitor/watcher/test-skeptic-parallel-rounds.sh
+monitor/watcher/test-host-pin-lint.sh'
 
 _corpus_verdict() {   # <scanned> <indep> <pinned> -> rc 0 sound, rc 1 + reason
     local scanned="$1" indep="$2" pinned="$3"

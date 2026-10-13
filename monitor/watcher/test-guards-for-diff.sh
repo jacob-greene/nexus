@@ -1190,7 +1190,47 @@ if [[ "$discovered" == "$recorded" ]]; then
     # to the pin above), 294 with the suite declaring and no row, 295 with the
     # row written: TWO added, ZERO removed. Selection rate over the last 120
     # first-parent commits of 88c5bf81 (0 empty): 100/120 base, 100/120 head.
-    _TGFD_POP_EXPECTED=295
+    # +9 for bundle-1007a's three declaring suites (your-org/nexus-code#1764,
+    # #1768, #1771): their own suite paths plus six sentinels no other row named
+    # (gh-shim.sh, locals-env.sh, svc.sh, request-channel.sh, obligations.sh,
+    # _obligations.sh). MEASURED as a SET DIFFERENCE (`comm` of the sorted
+    # `--population` emits): the clean base worktree at origin/dev 88848942
+    # gives 295, equal to the pin committed there; the bundle-1007a head gives
+    # 304 with the rows committed. NINE added, ZERO removed. Selection rate over
+    # the last 120 first-parent commits of 88848942 (0 empty): 98/120 base,
+    # 99/120 head.
+    # +2 for bundle-1008a (your-org/nexus-code#1779): test-settings-overlay.sh
+    # declares (resolve-settings.sh + _respawn.sh), bringing its own suite path
+    # and monitor/resolve-settings.sh, which no other row named (_respawn.sh
+    # already was). MEASURED as a SET DIFFERENCE (`comm` of the sorted
+    # `--population` emits): the clean base worktree at origin/dev e868a2b4
+    # gives 304, equal to the pin committed there; the bundle-1008a head
+    # a1947cac gives 306. TWO added, ZERO removed. Selection rate over the last
+    # 120 first-parent commits of e868a2b4 (0 empty): 99/120 base, 99/120 head.
+    # +8 for bundle-1012a (your-org/nexus-code#1795, #1800-#1809): five new
+    # declaring suites (test-bootstrap-recover-ro-nudge, test-host-pin-lint,
+    # test-rv-load-classify, test-skeptic-parallel-rounds,
+    # test-tmux-fixture-conf-lint) plus three sentinels no other row named
+    # (host-pin-lint.sh, services.registry.example,
+    # test-integration/_rv_load_classify.sh). MEASURED as a SET DIFFERENCE
+    # (`comm -3` of the sorted `--population` emits): the clean base worktree
+    # at origin/dev 1f053a9c gives 306, equal to the pin committed there; the
+    # bundle-1012a head gives 314. EIGHT added, ZERO removed. Selection rate
+    # over the last 120 first-parent commits of 1f053a9c (0 empty), counted
+    # with a DRAINING reader (`| wc -l`; a `| grep -q` under pipefail read 99
+    # on both sides, one SIGPIPE false negative): 100/120 base, 100/120 head.
+    # +3 net for the public-mirror dial-down (your-org/nexus-code#1812):
+    # test-public-mirror-verify-build.sh declares (build.sh, scrub.pl,
+    # verify-build.py, binaries.tsv), bringing its own suite path and three
+    # sentinels no other row named (scrub.pl, verify-build.py, binaries.tsv).
+    # MEASURED as a SET DIFFERENCE (`comm -3` of the sorted `--population`
+    # emits of this suite): the fix rebased onto origin/dev 8cc318c1 (pin 314
+    # there) gives 317. FOUR added, ONE removed: the
+    # overlay manifest stopped being a test-public-mirror-overlay-files.sh
+    # sentinel, because a public export excludes it and the declared-sentinel
+    # check then failed every probe on the mirror. Selection rate not
+    # re-measured for this change.
+    _TGFD_POP_EXPECTED=317
     _n_pop=$( gp_render "" 2>/dev/null | sort -u | "$REAL_GREP" -c . )
     _n_nosent=$(
         gp_population() { printf '%s\n' "$INDEX" "$PROTO" "$MANIFEST"
@@ -1364,6 +1404,13 @@ echo "=== 3. selection: a scanned file selects, an unscanned one says so out lou
 
 printf 'monitor/ng\n' > "$WORK/changed-ng.txt"
 out=$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-ng.txt" 2>&1); rc=$?
+# KEPT for §4b's must-not-fire control, which used to re-run this IDENTICAL
+# command (same changed list, same full index, same tree) and so re-probed every
+# declaring guard a second time (your-org/nexus-code#1704). The untracked
+# warning that control asserts absent is a function of the CHANGED LIST alone
+# (guards-for-diff.sh computes it before the probe loop), and the only thing
+# that differs on disk by then is an untracked plant that list does not name.
+out_ng=$out
 assert_rc "a diff touching monitor/ng selects at least one guard (rc 0)" "$rc" 0
 assert_contains "…and it is the guard whose population monitor/ng is in (#803 occurrence 1)" \
     "$out" "test-ambient-shell-option-scope.sh"
@@ -1498,15 +1545,45 @@ assert_eq "…and none is named as an undeclared sweeper (named:${_tgfd_still_na
 _U_ADD="$_PLANT/definitely-not-added-yet.sh"
 printf '#!/usr/bin/env bash\n# planted untracked fixture\n' > "$REPO_ROOT/$_U_ADD"
 printf '%s\n' "$_U_ADD" > "$WORK/changed-untracked.txt"
-uout=$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-untracked.txt" 2>&1)
+
+# A PLANTED STUB GUARD, shared by §4b and §4c (your-org/nexus-code#1704).
+#
+# §4b used to run the FULL index (every declaring guard's `--population`, ~140
+# serial probes) and §4c ran the REAL test-early-exit-reader-manifest.sh twice
+# under `--run` (~375 s per run) — while every assertion in both checks only
+# the index's OWN classification: the UNTRACKED warning (computed from the
+# changed list before any probe), the BLIND TO / UNVERIFIED downgrade, and the
+# exit codes 4 and 0. None of that depends on which real guard is behind it, so
+# this stub stands in for one exactly as §4d's planted guard already does. It
+# declares the SAME tracked path §4c's diff names, so it is selected by it, and
+# it lives INSIDE the repo for §4d's reason (`gp_render` refuses a population
+# path that does not resolve under the repo root, and `gp_handle` prepends the
+# guard's own path).
+#
+# What is deliberately NOT lost: §3 above still runs the full index over the
+# real tree twice, §2 still probes every manifest row for real, and §5 still
+# drives a REAL guard's probe through the `--suites-from` seam.
+_gfd_stub="$_PLANT/test-zz-1054-stub-guard.sh"
+cat > "$REPO_ROOT/$_gfd_stub" <<GUARD
+#!/usr/bin/env bash
+source "$REPO_ROOT/monitor/_guard_population.sh"
+gp_population() { printf '%s\n' "monitor/watcher/early-exit-readers.sh"; }
+gp_handle "\$@"
+exit 0
+GUARD
+printf '%s\n' "$_gfd_stub" > "$WORK/suites-stub.txt"
+
+uout=$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-untracked.txt" \
+        --suites-from "$WORK/suites-stub.txt" 2>&1)
 assert_contains "an untracked changed file is NAMED as untracked, not silently excluded" \
     "$uout" "$_U_ADD"
 assert_contains "…with the reason and the remedy" \
     "$uout" "CANNOT SEE these"
 # The control: a TRACKED file must NOT raise the warning, or it would fire on
-# every run and mean nothing.
+# every run and mean nothing. `$out_ng` is §3a's full-index run of this exact
+# command — see where it is kept for why re-running it measured nothing new.
 assert_not_contains "a tracked-only diff raises no untracked warning (the control)" \
-    "$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-ng.txt" 2>&1)" \
+    "$out_ng" \
     "UNTRACKED ("
 
 # 4c. THE SELECTED DIRECTION (your-org/nexus-code#1054). 4b above covers
@@ -1537,17 +1614,20 @@ _U_BLIND="$_PLANT/test-zz-1054-not-added.sh"
 printf '#!/usr/bin/env bash\n# planted untracked fixture\n' > "$REPO_ROOT/$_U_BLIND"
 printf 'monitor/watcher/early-exit-readers.sh\n%s\n' "$_U_BLIND" \
     > "$WORK/changed-blind.txt"
-printf 'monitor/watcher/test-early-exit-reader-manifest.sh\n' > "$WORK/suites-eer.txt"
+# The planted stub from §4b, not the real early-exit-reader-manifest guard: see
+# the stub's comment. Every assertion below is about the index's verdict
+# classification, which the stub reaches exactly as the real guard did —
+# selected via the same tracked path, blind to the same untracked plant, green.
 bout=$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-blind.txt" \
-        --suites-from "$WORK/suites-eer.txt" --run 2>&1); brc=$?
+        --suites-from "$WORK/suites-stub.txt" --run 2>&1); brc=$?
 assert_contains "the SELECTED listing names what the guard is BLIND TO" \
     "$bout" "BLIND TO (untracked, absent from its population): $_U_BLIND"
 assert_contains "the VERDICT itself is downgraded, not merely warned beside" \
-    "$bout" "UNVERIFIED monitor/watcher/test-early-exit-reader-manifest.sh"
+    "$bout" "UNVERIFIED $_gfd_stub"
 assert_contains "…and says which tree the green is actually about" \
     "$bout" "its population does not contain"
 assert_not_contains "a downgraded guard does NOT also print PASS" \
-    "$bout" "    PASS monitor/watcher/test-early-exit-reader-manifest.sh"
+    "$bout" "    PASS $_gfd_stub"
 assert_eq "…and --run exits 4, distinct from 0/2/3 so it cannot read as a clearance" \
     "$brc" "4"
 assert_contains "the exit is labelled as not a clearance" \
@@ -1556,9 +1636,9 @@ assert_contains "the exit is labelled as not a clearance" \
 # THE MUST-NOT-FIRE CONTROL. Same guard, same command, tracked-only diff.
 printf 'monitor/watcher/early-exit-readers.sh\n' > "$WORK/changed-tracked-only.txt"
 tout=$(cd "$REPO_ROOT" && bash "$INDEX" --changed-files "$WORK/changed-tracked-only.txt" \
-        --suites-from "$WORK/suites-eer.txt" --run 2>&1); trc=$?
+        --suites-from "$WORK/suites-stub.txt" --run 2>&1); trc=$?
 assert_contains "a tracked-only diff still yields a real PASS" \
-    "$tout" "    PASS monitor/watcher/test-early-exit-reader-manifest.sh"
+    "$tout" "    PASS $_gfd_stub"
 assert_not_contains "…and no UNVERIFIED verdict (the qualifier must not fire on every run)" \
     "$tout" "UNVERIFIED monitor/"
 assert_not_contains "…and no BLIND TO line" "$tout" "BLIND TO"
@@ -1590,9 +1670,9 @@ assert_eq "…and it exits 0, a genuine clearance" "$trc" "0"
 # ===========================================================================
 echo "=== 4d. a DELETED path is not an untracked one — existence is the only variable (#1179) ==="
 
-#     THE GUARD HERE IS A PLANTED TRIVIAL ONE, not the real
-#     early-exit-reader-manifest §4c uses, and that is a deliberate choice in
-#     both directions. It ISOLATES the variable — the verdict then depends on
+#     THE GUARD HERE IS A PLANTED TRIVIAL ONE (as §4b/§4c's stub now is too;
+#     §4c once ran the real early-exit-reader-manifest), and that is a
+#     deliberate choice in both directions. It ISOLATES the variable — the verdict then depends on
 #     nothing but the index's own classification, where borrowing a real guard
 #     would make this section's result contingent on that guard's corpus — and
 #     it costs milliseconds instead of a corpus walk per arm, which matters

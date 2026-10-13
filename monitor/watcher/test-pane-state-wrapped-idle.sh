@@ -72,7 +72,7 @@ run()   { "$HELPER" --fixture "$1" --window 9 --name testwin --active 0 2>&1; }
 # ---------------------------------------------------------------------------
 echo "=== case 1: the real captured bytes — a wrapped worker's idle pane ==="
 # Rows 3-9 of this fixture are a byte-for-byte capture of a live wrapped
-# worker (window kompot-272F-merge) taken while it was parked in the
+# worker (window proj-x-merge) taken while it was parked in the
 # defect. Only the transcript line was neutralised. This is the whole
 # bug: if it classifies, the board drains.
 F657="$FIX_DIR/idle-wrapped-bare-chevron-657.ansi"

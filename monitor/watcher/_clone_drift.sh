@@ -79,6 +79,8 @@
 #   MONITOR_CLONE_DRIFT_HOURS     hour threshold (default 24)
 #   _CLONE_DRIFT_GIT_BIN          git (test-injectable)
 #   _CLONE_DRIFT_GH_BIN           gh  (test-injectable)
+#   _CLONE_DRIFT_RETRY_PAUSE_SECONDS  pause before the one ls-remote retry
+#                                 (default 2; test-injectable, #1769)
 #   NEXUS_TEST_NOW                clock override (test-injectable)
 
 [[ -n "${_CLONE_DRIFT_SOURCED:-}" ]] && return 0
@@ -200,6 +202,20 @@ _clone_drift_probe() {
     local lsr rc tip=""
     lsr=$(_clone_drift_bounded "${_CLONE_DRIFT_GIT_BIN:-git}" -C "$root" \
               ls-remote origin "refs/heads/$branch" 2>/dev/null); rc=$?
+    # ONE RETRY on a failed ls-remote (your-org/nexus-code#1769). A single
+    # non-zero exit was transient network or credential-helper latency under
+    # load four times in two days, each followed by a clean manual ls-remote,
+    # and each raised a loud UNKNOWN. Retry only on a non-zero rc: an rc-0
+    # EMPTY answer is the remote positively saying the branch is absent, and
+    # retrying would not change it. A second failure still reports unknown
+    # with the SECOND rc. The 2 s pause is a chosen value, not a convention.
+    if (( rc != 0 )); then
+        local pause="${_CLONE_DRIFT_RETRY_PAUSE_SECONDS:-2}"
+        [[ "$pause" =~ ^[0-9]+$ ]] || pause=2
+        (( pause > 0 )) && sleep "$pause"
+        lsr=$(_clone_drift_bounded "${_CLONE_DRIFT_GIT_BIN:-git}" -C "$root" \
+                  ls-remote origin "refs/heads/$branch" 2>/dev/null); rc=$?
+    fi
     if (( rc == 0 )) && [[ -n "$lsr" ]]; then
         tip="${lsr%%[[:space:]]*}"
     fi

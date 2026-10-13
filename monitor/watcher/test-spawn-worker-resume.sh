@@ -372,12 +372,56 @@ assert_eq       "exit 0 on slug drift"            "$rc" "0"
 assert_contains "stderr warns about the mismatch" "$out" "workdir/session mismatch"
 assert_contains "dry-run reports the found jsonl" "$out" "jsonl=$OTHER_PROJ/$UUID_DRIFT.jsonl"
 
-echo '=== -p with --resume is refused ==='
+echo '=== -p with --resume: the file becomes the continuation message ==='
 echo task > "$WORK/p.txt"
-out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --dry-run 2>&1)
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" -p "$WORK/p.txt" --dry-run 2>&1)
 rc=$?
-assert_eq       "exit 5 on -p with --resume"  "$rc" "5"
-assert_contains "stderr explains -p invalid"  "$out" "-p is not valid with --resume"
+assert_eq       "--resume -p --dry-run exits 0"       "$rc" "0"
+assert_contains "dry-run names the prompt-file nudge" "$out" "nudge=on (prompt-file)"
+
+echo '=== --resume with a FRESH-ONLY flag is refused by name (exit 28) ==='
+# Each of these was accepted and silently DROPPED at rc 0 before: a loop of
+# resumes read as successful while the flag did nothing.
+for _fo in "-r $WORK/p.txt" "--print-prompt" "--kind interactive" "--kind=interactive" \
+           "--topic t" "--skeptic require" "--skeptic-depth 1" \
+           "--skeptic-target w1" "--skeptic-orig w1" "--reply-to abc" \
+           "--skeptic-role --skeptic-target w1" "--issue 7 --reply-to abc"; do
+    # shellcheck disable=SC2086  # word-splitting the flag+value is the point
+    out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" $_fo --dry-run 2>&1); rc=$?
+    _fo_flag=${_fo%% *}; _fo_flag=${_fo_flag%%=*}
+    assert_eq       "exit 28 on --resume $_fo"            "$rc" "28"
+    assert_contains "stderr names $_fo_flag"              "$out" "does not support $_fo_flag"
+done
+
+echo '=== a leftover positional is refused, in BOTH modes (exit 28) ==='
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" stray-word --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on resume + stray positional" "$rc" "28"
+assert_contains "stderr names the stray word"          "$out" "unexpected argument 'stray-word'"
+out=$("$SCRIPT" -n control-win -c "$WORKDIR" -p "$WORK/p.txt" stray-word --print-prompt 2>&1); rc=$?
+assert_eq       "exit 28 on fresh + stray positional"  "$rc" "28"
+
+echo '=== -p conflicts with --no-nudge / --nudge-ro; unreadable / empty -p ==='
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --no-nudge --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on -p + --no-nudge"          "$rc" "28"
+assert_contains "stderr names --no-nudge"             "$out" "cannot be combined with --no-nudge"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --nudge-ro --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on -p + --nudge-ro"          "$rc" "28"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/no-such.txt" --dry-run 2>&1); rc=$?
+assert_eq       "exit 4 on unreadable -p"             "$rc" "4"
+printf '  \n' > "$WORK/blank.txt"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/blank.txt" --dry-run 2>&1); rc=$?
+assert_eq       "exit 4 on whitespace-only -p"        "$rc" "4"
+
+echo '=== usage: explicit help is rc 0, a user error is rc != 0 ==='
+out=$("$SCRIPT" --help 2>&1); rc=$?
+assert_eq       "--help exits 0"                      "$rc" "0"
+assert_contains "--help prints usage"                 "$out" "usage: monitor/spawn-worker.sh"
+out=$("$SCRIPT" -h 2>&1); rc=$?
+assert_eq       "-h exits 0"                          "$rc" "0"
+out=$("$SCRIPT" -x 2>&1); rc=$?
+assert_eq       "unknown short option exits 5"        "$rc" "5"
+out=$("$SCRIPT" -n w1 2>&1); rc=$?
+assert_eq       "missing -c/-p exits 5"               "$rc" "5"
 
 echo '=== --resume without a value is refused ==='
 out=$("$SCRIPT" --resume 2>&1)
@@ -526,6 +570,14 @@ assert_not_contains "--no-nudge overrides busy"      "$body" "$NUDGE_MARKER"
 printf '{"state":"idle_prompt","last_activity":1765400000,"window":"%s"}\n' "$HB_DIR/$WIN.json" > "$HB_DIR/$WIN.json"
 body=$(_resume_launcher_body --nudge)
 assert_contains "--nudge forces on idle"             "$body" "$NUDGE_MARKER"
+# --nudge-ro (skeptic F2 residual on #1799): bootstrap-recover passes it for a
+# worker whose read-only STOP never got a RESUME; an idle heartbeat must not
+# suppress it, and the text must say the wait is over.
+body=$(_resume_launcher_body --nudge-ro)
+assert_contains "--nudge-ro nudges an idle worker"   "$body" "read-only incident is over"
+assert_contains "--nudge-ro says to redo failed writes" "$body" "Re-run any write that failed"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" --nudge-ro --dry-run 2>&1)
+assert_contains "dry-run shows nudge=on (ro-incident)" "$out" "nudge=on (ro-incident)"
 
 echo '=== dry-run reports the nudge decision ==='
 printf '{"state":"busy","last_activity":1765400000,"window":"%s"}\n' "$WIN" > "$HB_DIR/$WIN.json"
@@ -534,6 +586,48 @@ assert_contains "dry-run shows nudge=on for busy"    "$out" "nudge=on (heartbeat
 rm -f "$HB_DIR/$WIN.json"
 out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" --dry-run 2>&1)
 assert_contains "dry-run shows nudge=off when no heartbeat" "$out" "nudge=off (heartbeat-absent)"
+
+echo '=== --resume -p delivers the file VERBATIM as the continuation message ==='
+# Hostile bytes on purpose: a quote, a command substitution, a backtick and a
+# second line. None may reach the launcher's SOURCE; all must reach claude.
+MSG_FILE="$WORK/resume-msg.txt"
+printf 'RESUME_P_MARKER say "hi" $(touch %s/PWNED) `id`\nsecond line\n' "$WORK" > "$MSG_FILE"
+printf '{"state":"idle_prompt","last_activity":1765400000,"window":"%s"}\n' "$WIN" > "$HB_DIR/$WIN.json"
+: > "$STUB_LOG"
+rm -f "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt
+out=$("$SCRIPT" --resume "$WIN" -c "$WORKDIR" -p "$MSG_FILE" --model test-model-1 2>&1); rc=$?
+assert_eq       "--resume -p spawn exits 0"           "$rc" "0"
+assert_contains "stderr advertises nudge=on (prompt-file)" "$out" "nudge=on (prompt-file)"
+_rl=( "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh )
+_rp=( "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt )
+if [[ -e "${_rl[0]}" && -e "${_rp[0]}" ]]; then
+    body=$(cat "${_rl[@]}")
+    assert_contains     "launcher passes the message after --resume <sid>" "$body" "--resume \"$UUID_REPORT\" \"\$resume_msg\""
+    assert_contains     "launcher pins --model on resume"   "$body" "--model \"test-model-1\""
+    assert_not_contains "message bytes never enter the launcher source" "$body" "RESUME_P_MARKER"
+    assert_not_contains "no fixed nudge text alongside -p"  "$body" "$NUDGE_MARKER"
+    if cmp -s "$MSG_FILE" "${_rp[0]}"; then
+        printf '  PASS: staged message is byte-identical to -p\n'; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: staged message differs from -p\n' >&2; FAIL=$(( FAIL + 1 ))
+    fi
+    # Execute the launcher's OWN read-back line and compare what claude would
+    # receive: the line must be the one that runs, not a description of it.
+    _readline=$(grep -E '^resume_msg=' "${_rl[0]}")
+    _got=$(eval "$_readline"; printf '%s' "$resume_msg")
+    assert_eq "read-back equals the file (command-substitution strips the final newline)" \
+              "$_got" "$(cat "$MSG_FILE")"
+    if [[ -e "$WORK/PWNED" ]]; then
+        printf '  FAIL: message content was EXECUTED\n' >&2; FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: message content was not executed\n'; PASS=$(( PASS + 1 ))
+    fi
+    assert_eq "read-back line removes the staged file" "$(test -e "${_rp[0]}" && echo present || echo gone)" "gone"
+else
+    printf '  FAIL: --resume -p did not stage a launcher + prompt file\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+rm -f "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt "$HB_DIR/$WIN.json"
 
 # ---- Test 11: fresh-spawn mode is unaffected ----------------------------
 

@@ -36,6 +36,11 @@ PERM_HOOK="$REPO_ROOT/monitor/hooks/notify-permission.sh"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+# A case that makes the state dir unwritable now relocates to the degraded run
+# dir (#1724), which by default is the SHARED managed tree: a real cooldown
+# stamp there from any earlier call would silence a case here. Pin it to this
+# run (T31 removes the pin on purpose).
+export NEXUS_DEGRADED_RUNDIR="$WORK/degraded-rundir"
 
 OBS="$WORK/obs"; mkdir -p "$OBS"
 HITS="$WORK/hits.log"
@@ -729,5 +734,57 @@ assert_eq "T29: sustained newer load starves none of the 14 initially-deferred o
 # And the backlog still fully converges to delivery (no message stranded).
 t29_rem=$(cat "$STATE"/notify-cooldown/failure.batch* 2>/dev/null | grep -c 'old-') || t29_rem=0
 assert_eq "T29: every initially-deferred old has drained off disk" "$t29_rem" "0"
+
+# ─── T30: an UNWRITABLE state dir (degraded tree) — ring, relocate, say so ────
+# your-org/nexus-code#1724. On the 2026-10-09 read-only tree every write here
+# failed; `printf … >> f 2>/dev/null` reports a failed OPEN before the
+# `2>/dev/null` applies, so each call sprayed raw `Permission denied` /
+# `Read-only file system` lines, and the bell went out with no cooldown and no
+# record. A 0555 dir stands in for the RO mount. BOTH DIRECTIONS: the bell must
+# still ring (a degraded tree must never deafen the operator), the cooldown
+# must still hold from the relocated state, and stderr must carry ONE named
+# DEGRADED line instead of raw shell errors.
+echo '=== T30: degraded state dir relocates to the run dir, rings, and says so (#1724) ==='
+_fresh_state t30; : > "$HITS"; chmod 0555 "$STATE"
+T30_RUN="$WORK/t30-rundir"; t30_err="$WORK/t30.err"; : > "$t30_err"
+_t30_ring() {
+    env -u NEXUS_ROOT -u NEXUS_LOCALS -u NEXUS_STATE_DIR \
+        -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW \
+        PATH="$OBS:$PATH" NEXUS_NOTIFY_STATE_DIR="$STATE" NEXUS_DEGRADED_RUNDIR="$T30_RUN" \
+        NEXUS_NOTIFY_ANCESTRY_SCAN=0 NEXUS_NOTIFY_INCIDENT_WINDOW=0 \
+        bash "$GATE" "$1" >/dev/null 2>>"$t30_err"
+}
+_t30_ring 'cc-auto-update: candidate 9.9.9 available'
+_t30_ring 'cc-auto-update: candidate 9.9.8 available'
+assert_contains "T30: the first message still RANG on a degraded tree" \
+    "$(cat "$HITS")" "candidate 9.9.9 available"
+assert_not_contains "T30: the cooldown still HELD (relocated state), so the second did not ring" \
+    "$(cat "$HITS")" "candidate 9.9.8 available"
+assert_contains "T30: the decision log moved to the run dir" \
+    "$(cat "$T30_RUN/notify/notify-decisions.jsonl" 2>/dev/null)" '"verdict":"ring"'
+assert_contains "T30: stderr names the DEGRADED condition and the fallback dir" \
+    "$(cat "$t30_err")" "DEGRADED — $STATE is not writable"
+assert_not_contains "T30: no raw shell redirect error leaked" \
+    "$(cat "$t30_err")" "Permission denied"
+assert_eq "T30: nothing was written into the unwritable dir" \
+    "$(find "$STATE" -mindepth 1 | wc -l | tr -d ' ')" "0"
+chmod 0755 "$STATE"
+
+# ─── T31: with NO override, the fallback is DERIVED from the managed $TMPDIR ──
+# Operator, 2026-10-10 (#1724): no hardcoded fallback location. A per-agent
+# TMPDIR leaf resolves to the managed tree's shared root, so every agent and
+# the watcher agree on one place.
+echo '=== T31: degraded fallback derives from the managed $TMPDIR, never a literal path (#1724) ==='
+_fresh_state t31; : > "$HITS"; chmod 0555 "$STATE"
+T31_M="$WORK/t31base/claude-1000/tmp"; mkdir -p "$T31_M/agent-w1"; t31_err="$WORK/t31.err"; : > "$t31_err"
+env -u NEXUS_ROOT -u NEXUS_LOCALS -u NEXUS_STATE_DIR -u NEXUS_DEGRADED_RUNDIR \
+    -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW \
+    PATH="$OBS:$PATH" NEXUS_NOTIFY_STATE_DIR="$STATE" TMPDIR="$T31_M/agent-w1" \
+    NEXUS_NOTIFY_ANCESTRY_SCAN=0 NEXUS_NOTIFY_INCIDENT_WINDOW=0 \
+    bash "$GATE" 'cc-auto-update: candidate 9.9.6 available' >/dev/null 2>>"$t31_err"
+assert_contains "T31: the decision log landed under the managed tree derived from TMPDIR" \
+    "$(cat "$T31_M/nexus-degraded/notify/notify-decisions.jsonl" 2>/dev/null)" '"verdict":"ring"'
+assert_contains "T31: stderr names that derived dir" "$(cat "$t31_err")" "$T31_M/nexus-degraded/notify"
+chmod 0755 "$STATE"
 
 th_summary_and_exit

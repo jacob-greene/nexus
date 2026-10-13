@@ -369,6 +369,66 @@ fi
 #
 # `block` still outranks everything and short-circuits: it exits 2, so the tool
 # does not run and the advisory rows are moot.
+# HEREDOC PROSE IS NOT A COMMAND (nexus-code bundle 22). A row that keys on a
+# verb an agent TYPES (`squeue -j`, `sbatch --wait`) also matched the same words
+# written as PROSE into a heredoc body — a comment, a report, an issue body — and
+# one advisory false positive was observed. Rows named in _PROSE_BLIND_TAGS match
+# against the command with NON-EXECUTED heredoc bodies removed. Chosen as a
+# per-row opt-in, not global: the tmux and kill rows must keep seeing everything.
+# `shell-c-script` is deliberately NOT here: Claude Code's own removal check
+# fired on `bash -c` written as heredoc PROSE (skeptic N3 on PR #1786), so for
+# that row the prose IS the hazard.
+#
+# The stripper must never hide a REAL command (skeptic B1 on PR #1786: six shapes
+# silenced a later top-level `sbatch --wait`). So, in this order:
+#   * a `<<` that never meets its terminator line was not a heredoc (a quoted
+#     "<<EOF", a herestring, a shift): its buffered lines are PUT BACK;
+#   * `<<<` (herestring) and a `<<` inside `(( ))` never open one;
+#   * a heredoc whose body EXECUTES is kept: fed to a shell or an interpreter,
+#     by name or by absolute path (`/bin/bash <<EOF`), piped into one
+#     (`cat <<EOF | bash`), or written to a script file (`cat > f.sh <<EOF`).
+# COVERAGE BOUNDARY: a body written to a file with any other name and executed
+# LATER (`cat > job <<EOF … EOF; bash job`) is still read as prose.
+_PROSE_BLIND_TAGS=' squeue-j sbatch-wait '
+_strip_prose_heredocs() { # <cmd> → the cmd minus non-executed heredoc bodies
+    local line term="" out="" held=""
+    local re_open='(^|[^<])<<-?[[:space:]]*["'"'"']?([A-Za-z_][A-Za-z0-9_]*)'
+    local re_arith='\(\([^)]*<<'
+    local _ip='(bash|sh|zsh|dash|ksh|ssh|srun|sbatch|exec|env|xargs|python[0-9.]*|perl|ruby|node)'
+    local re_exec="(^|[;&|(\`/]|[[:space:]])${_ip}([[:space:]][^<]*)?<<"
+    # A command WRAPPER may sit between the pipe and the interpreter
+    # (`| timeout 60 bash`, `| nice -n 5 sh`, `| sudo bash`; your-org/nexus-code#1791 R1).
+    # An ALLOWLIST of wrapper words, not "any words": `| grep bash` or
+    # `| tee notes sh` must stay prose. Error directions: a wrapper missing here
+    # reads an executed body as prose (a LOST warn-only advisory, the pre-#1791
+    # state); a non-wrapper allowed here reads prose as executed (one extra
+    # advisory, the pre-bundle-22 state). The list errs toward the first.
+    local _wrapped='' _wrap='([^|;&[:space:]]*/)?(timeout|nice|nohup|sudo|doas|stdbuf|ionice|time|command|setsid|taskset|chrt)'
+    local _wrapped="(${_wrap}([[:space:]]+[^|;&[:space:]]+)*[[:space:]]+)?" # a wrapper and its args
+    local re_pipe="<<.*[|][[:space:]]*${_wrapped}([^[:space:]]*/)?${_ip}([[:space:]]|\$)"
+    local re_script='>[[:space:]]*[^[:space:]<>]+[.](sh|bash|zsh|py)([[:space:]]|$)'
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ -n "$term" ]; then
+            held+="$line"$'\n'
+            if [ "${line#"${line%%[![:space:]]*}"}" = "$term" ]; then term=""; held=""; fi
+            continue
+        fi
+        out+="$line"$'\n'
+        # Capture the delimiter BEFORE any other test: a later `=~`, even a
+        # failed one, resets BASH_REMATCH.
+        if [[ "$line" =~ $re_open ]]; then
+            term="${BASH_REMATCH[2]}"
+            if [[ "$line" =~ $re_arith ]] || [[ "$line" =~ $re_exec ]] \
+               || [[ "$line" =~ $re_pipe ]] || [[ "$line" =~ $re_script ]]; then term=""; fi
+        fi
+    done <<<"$1"
+    # No terminator: it was not a heredoc. Put the lines back.
+    [ -n "$term" ] && out+="$held"
+    printf '%s' "$out"
+}
+_cmd_prose=$_cmd
+[[ "$_cmd" == *'<<'* ]] && _cmd_prose=$(_strip_prose_heredocs "$_cmd")
+
 if [ -f "$_pattern_file" ]; then
     while IFS='|' read -r tag severity cmd_re message; do
         [ -z "${tag// /}" ] && continue
@@ -383,7 +443,9 @@ if [ -f "$_pattern_file" ]; then
         # should have had. Substitution happens after field splitting, so the
         # separator semantics are untouched.
         cmd_re=${cmd_re//\\p/|}
-        [[ "$_cmd" =~ $cmd_re ]] || continue
+        _subj=$_cmd
+        case "$_PROSE_BLIND_TAGS" in *" $tag "*) _subj=$_cmd_prose ;; esac
+        [[ "$_subj" =~ $cmd_re ]] || continue
         # `unbounded-command-wait` (your-org/nexus-code#1447) keys on the LOOP
         # SHAPE, deliberately not on the predicate, so the population is not
         # "predicates somebody thought of". The four exemptions below are the

@@ -27,7 +27,7 @@
 # every operator nexus on this machine competes for the same address (127.0.0.1
 # included; it is NOT private to a sandbox). On 2026-07-29 our daemon died with
 # a container restart, another operator's nexus-remote-ssh took
-# 140.107.222.134:22022 during the downtime, and THIS SCRIPT returned 0 for
+# 198.51.100.34:22022 during the downtime, and THIS SCRIPT returned 0 for
 # 2h30m — because an `SSH-2.0-*` banner from ANY sshd satisfied it. Worse, a
 # 15-line socket server emitting eight bytes of `SSH-2.0-` also satisfied it: the
 # check was PROTOCOL-aware while its own comments claimed identity-awareness,
@@ -206,7 +206,7 @@ identity_gate() {
             # carry the line — from the rc-1 arm — and it CONTRADICTED the
             # verdict printed two lines above it:
             #
-            #   socket owner uid:71780 held by "sshd",pid=19516,fd=3 (inside this namespace)
+            #   socket owner uid:10000 held by "sshd",pid=19516,fd=3 (inside this namespace)
             #
             # It is EVIDENCE, NOT A VERDICT, and deliberately does not vote.
             # In-namespace + our uid rules out ANOTHER OPERATOR (a foreign

@@ -94,6 +94,8 @@ mkdir -p "$STATE_DIR/heartbeat" "$STATE_DIR/user-prompt" "$PROJ_DIR" "$BIN"
 #   STUB_STAMP_ON_ENTER   which Enter writes an advanced UserPromptSubmit stamp
 #   STUB_BOX_CLEARS_ON_ENTER  which Enter empties the input box WITHOUT writing a
 #                         record (the Enter took; nothing can confirm it)
+#   STUB_ROTATE_SID_ON_ENTER  which Enter rotates the heartbeat to a NEW session
+#                         (the window was resumed mid-paste; your-org/nexus-code#1787)
 cat > "$BIN/tmux" <<'STUB'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -160,6 +162,11 @@ case "${1:-}" in
               # not about text still sitting in the box; without this knob the
               # held stand-in would turn every such case into a positive hold.
               : > "$STUB_TRANSCRIPT.submitted"
+          fi
+          if [[ "${STUB_ROTATE_SID_ON_ENTER:-0}" != "0" && "$n" == "${STUB_ROTATE_SID_ON_ENTER}" ]]; then
+              printf '{"state":"busy","last_activity":%s,"session_id":"%s","window":"%s"}\n' \
+                  "$(date +%s)" "${STUB_ROTATED_SID:?}" "$STUB_WINDOW" \
+                  > "$STUB_STATE_DIR/heartbeat/$STUB_WINDOW.json"
           fi
           if [[ "${STUB_STAMP_ON_ENTER:-0}" != "0" && "$n" == "${STUB_STAMP_ON_ENTER}" ]]; then
               printf '%s\t%s\n' "$(( $(date +%s) + 1 ))" "$STUB_SID" \
@@ -231,6 +238,8 @@ run_paste() {
         NEXUS_CC_HOME="$CC_HOME" \
         PASTE_NG_BIN=/bin/true \
         STUB_BOX_CLEARS_ON_ENTER="${STUB_BOX_CLEARS_ON_ENTER:-0}" \
+        STUB_ROTATE_SID_ON_ENTER="${STUB_ROTATE_SID_ON_ENTER:-0}" \
+        STUB_ROTATED_SID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" \
         NEXUS_PASTE_PANE_STATE_BIN="$BIN/pane-state-held" PD_HELD_CHECK_SECONDS=0.2 \
         PASTE_CONFIRM_TIMEOUT_SECONDS="${TIMEOUT_S:-2}" \
         PASTE_CONFIRM_POLL_SECONDS=0.05 \
@@ -359,18 +368,15 @@ assert_not_contains "does not report submitted" "$OUT" ": submitted"
 # ── 12. Session-id changed under us (window resumed mid-paste) → 3 ───────
 echo "## 12. stale session-id, heartbeat rotates → exit 3, not a false negative"
 reset_case
-# The stub rotates the heartbeat to a new session on the first Enter.
-cat > "$BIN/rotate-hb" <<ROT
-#!/usr/bin/env bash
-printf '{"state":"busy","last_activity":%s,"session_id":"%s","window":"%s"}\n' \
-    "\$(date +%s)" "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" "$WINDOW" \
-    > "$STATE_DIR/heartbeat/$WINDOW.json"
-ROT
-chmod +x "$BIN/rotate-hb"
-( sleep 0.4; "$BIN/rotate-hb" ) &
-_rot=$!
-STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 run_paste OUT RC
-wait "$_rot" 2>/dev/null || true
+# The stub rotates the heartbeat to a new session ON THE FIRST ENTER — an
+# EVENT, not a timer (your-org/nexus-code#1787). The rotation used to come from
+# a background `( sleep 0.4; rotate-hb ) &` racing the script's startup: under
+# load the script read the heartbeat AFTER the rotation, baselined the NEW
+# session, found no transcript for it and exited 3 through the UNVERIFIABLE
+# arm, so `exit code is 3` passed while the churn assertion failed (2 of 3 runs
+# at load ~70). The first Enter is, by construction, after the baseline read
+# and before the post-budget re-read, so only the churn arm can answer here.
+STUB_ROTATE_SID_ON_ENTER=1 STUB_SUBMIT_ON_ENTER=0 STUB_BOX_CLEARS_ON_ENTER=1 run_paste OUT RC
 assert_eq       "exit code is 3"        "$RC" "3"
 assert_contains "names the session churn" "$OUT" "session-id changed under us"
 

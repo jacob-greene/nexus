@@ -48,7 +48,7 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # tree, the mutant is a copy). Default: the real script.
 SPAWN_REAL="${SPAWN_WORKER_UNDER_TEST:-$_test_dir/../spawn-worker.sh}"
 BK_REAL="$_test_dir/../_bookkeeping.sh"
-EXPECTED_ASSERTIONS=87
+EXPECTED_ASSERTIONS=88
 
 command -v jq >/dev/null 2>&1 || { echo "test: jq required" >&2; exit 2; }
 [ -r "$SPAWN_REAL" ] || { echo "test: not readable: $SPAWN_REAL" >&2; exit 2; }
@@ -148,6 +148,40 @@ TMUX_STUB
 chmod +x "$STUB_BIN/tmux"
 printf '#!/bin/bash\nexit 0\n' > "$STUB_BIN/claude"; chmod +x "$STUB_BIN/claude"
 
+# sleep + date stubs. The wait properties (arms A, E, H) are asserted on what
+# the spawn ASKED to wait, never on elapsed wall-clock (your-org/nexus-code#1788):
+# elapsed seconds measure the host — the same path took 7-9 s at load ~70
+# against fixed 6 s ceilings — while the requested waits are a property of the
+# code. `sleep` LOGS every requested duration, then really sleeps. With
+# FAKE_CLOCK set (arm E only) time is VIRTUAL: `sleep` advances the clock file
+# instead of sleeping and `date +%s` reads it, so the budget loop's deadline is
+# reached after exactly budget/0.5 polls whatever the host load — a real clock
+# lets load spend the budget inside pane-state calls, which hides an overshoot.
+# Every other `date` call passes through to the real binary.
+export SLEEP_LOG="$WORK/sleep.log" REAL_SLEEP_FOR_STUBS REAL_DATE_FOR_STUBS
+REAL_SLEEP_FOR_STUBS=$(command -v sleep); REAL_DATE_FOR_STUBS=$(command -v date)
+[ -x "$REAL_SLEEP_FOR_STUBS" ] && [ -x "$REAL_DATE_FOR_STUBS" ] || { echo "test: no sleep/date binary on PATH" >&2; exit 2; }
+cat > "$STUB_BIN/sleep" <<'SLEEP_STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$SLEEP_LOG"
+if [ -n "${FAKE_CLOCK:-}" ]; then
+    awk -v d="$1" '{ printf "%.3f\n", $1 + d }' "$FAKE_CLOCK" > "$FAKE_CLOCK.t" && mv "$FAKE_CLOCK.t" "$FAKE_CLOCK"
+    # A loop that ignores its deadline would busy-spin on a host it shares;
+    # past 40 polls (10x the expected 4) the virtual sleep is throttled for real.
+    [ "$(wc -l < "$SLEEP_LOG")" -gt 40 ] && exec "$REAL_SLEEP_FOR_STUBS" "$@"
+    exit 0
+fi
+exec "$REAL_SLEEP_FOR_STUBS" "$@"
+SLEEP_STUB
+cat > "$STUB_BIN/date" <<'DATE_STUB'
+#!/bin/bash
+if [ -n "${FAKE_CLOCK:-}" ] && [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then
+    awk '{ printf "%d\n", $1 }' "$FAKE_CLOCK"; exit 0
+fi
+exec "$REAL_DATE_FOR_STUBS" "$@"
+DATE_STUB
+chmod +x "$STUB_BIN/sleep" "$STUB_BIN/date"
+
 # pane-state stub: emits the scripted lines in order, then repeats the last;
 # logs every call; on an overlay line runs $PS_ON_OVERLAY (arm B's competing
 # writer, which drops the seeded key exactly when the dialog is "seen").
@@ -170,7 +204,7 @@ DROP_KEY="jq --arg d \"$NESTED\" 'del(.projects[\$d].hasTrustDialogAccepted)' \"
 
 reset_arm() {   # $1 = scripted pane-state lines (newline-separated)
     printf '%s\n' "$1" > "$PS_SCRIPT"
-    : > "$PS_CURSOR"; : > "$PS_LOG"; : > "$TMUX_LOG"; echo 9 > "$TMUX_WIN"
+    : > "$PS_CURSOR"; : > "$PS_LOG"; : > "$TMUX_LOG"; : > "$SLEEP_LOG"; echo 9 > "$TMUX_WIN"
     rm -rf "$CFG_DIR/projects" "$TMPD"/* 2>/dev/null   # rm -rf on a symlink removes the LINK, not its target
     jq -n --arg p "$FAKE_NEXUS" '{theme:"dark", projects:{($p):{hasTrustDialogAccepted:true}}}' > "$CFG"
 }
@@ -181,6 +215,9 @@ spawn() {   # $1 = window name; per-arm env via the `K=V spawn …` prefix form 
 }
 tmux_count() { grep -c "^$1" "$TMUX_LOG" 2>/dev/null || true; }
 ps_calls()   { wc -l < "$PS_LOG" | tr -d ' '; }
+sleep_calls() { wc -l < "$SLEEP_LOG" | tr -d ' '; }
+# yes when the total requested sleep is <= $1 seconds (awk: the durations are fractional)
+sleep_total_le() { awk -v cap="$1" '{ t += $1 } END { print (t <= cap + 1e-9 ? "yes" : "no (" t "s requested)") }' "$SLEEP_LOG"; }
 key_now()    { jq -r --arg d "$NESTED" '.projects[$d].hasTrustDialogAccepted // "ABSENT"' "$CFG"; }
 keeps_left() { find "$TMPD" -maxdepth 1 \( -name '*.keep' -o -name '*.stamp' \) | wc -l | tr -d ' '; }
 # `n=$(…) || n=0`, not `grep -c … || echo 0`: `grep -c` already prints 0 on no
@@ -192,7 +229,7 @@ elog()       { local f="$FAKE_NEXUS/monitor/.state/action-log.jsonl" n; n=$( [ -
 # ---- ARM A: a fine pane -------------------------------------------------
 echo '=== ARM A: a worker that boots fine is neither killed nor delayed ==='
 reset_arm $'state=empty active=0\nstate=idle active=0'
-t0=$(date +%s); out=$(spawn wA); rc=$?; el=$(( $(date +%s) - t0 ))
+out=$(spawn wA); rc=$?
 assert_eq "A: spawn exits 0" "$rc" "0"
 assert_contains "A: the check reports the positive state it stopped on" "$out" "reached state=idle"
 assert_contains "A: the spawned: line is printed" "$out" "spawned: window=wA"
@@ -201,7 +238,11 @@ assert_eq "A: exactly one window was created" "$(tmux_count new-window)" "1"
 assert_eq "A: the launcher was sent once" "$(tmux_count send-keys)" "1"
 assert_eq "A: pane-state consulted until the first positive state (2 calls)" "$(ps_calls)" "2"
 assert_eq "A: no kept launcher/prompt/stamp files linger" "$(keeps_left)" "0"
-[ "$el" -le 6 ] && _th_pass || { printf '  FAIL: A: the fine path took %ss (expected <= 6)\n' "$el" >&2; _th_fail; }
+# "Not delayed" as a property: one poll interval between the two scripted
+# states and no wait after the positive one. The count is also the sleep
+# instrument's positive control — it must SEE the loop's one sleep.
+assert_eq "A: exactly one poll sleep (the instrument sees the loop)" "$(sleep_calls)" "1"
+assert_eq "A: no wait past the first positive state (<= one 0.5s poll interval requested)" "$(sleep_total_le 0.5)" "yes"
 launcher=$(find "$TMPD" -maxdepth 1 -name 'spawn-launcher-wA.*.sh' -print -quit)
 assert_file_exists "A: the generated launcher is on disk (the stub tmux never ran it)" "$launcher"
 assert_eq "A: the launcher sets CLAUDE_CODE_SANDBOXED=1 on the claude invocation (primary fix)" \
@@ -259,12 +300,16 @@ assert_eq "D: pane-state consulted once" "$(ps_calls)" "1"
 # ---- ARM E: empty forever -> unverified, never a failure --------------------
 echo '=== ARM E: `empty` for the whole budget -> UNVERIFIED, exit 0, no kill ==='
 reset_arm 'state=empty active=0'
-t0=$(date +%s); out=$(NEXUS_SPAWN_TRUST_VERIFY_SECONDS=2 spawn wE); rc=$?; el=$(( $(date +%s) - t0 ))
+"$REAL_DATE_FOR_STUBS" +%s > "$WORK/clock"   # an INTEGER start, so 4 x 0.5 lands exactly on the deadline
+out=$(FAKE_CLOCK="$WORK/clock" NEXUS_SPAWN_TRUST_VERIFY_SECONDS=2 spawn wE); rc=$?
 assert_eq "E: spawn exits 0" "$rc" "0"
 assert_contains "E: the outcome is UNVERIFIED, stated as not a failure" "$out" "UNVERIFIED: no positive pane state within 2s"
 assert_contains "E: the spawned: line is printed" "$out" "spawned: window=wE"
 assert_eq "E: nothing was killed" "$(tmux_count kill-window)" "0"
-[ "$el" -le 7 ] && _th_pass || { printf '  FAIL: E: budget 2s but the spawn took %ss\n' "$el" >&2; _th_fail; }
+# The budget HONOURED, on the virtual clock: polled for the whole 2s and not
+# a poll longer — four 0.5s sleeps, then the deadline check fires. Fewer is a
+# budget cut short; more is an overshoot (what the old `took 8s` ceiling meant).
+assert_eq "E: the 2s budget is spent exactly (4 x 0.5s polls on the virtual clock)" "$(sleep_calls)" "4"
 assert_eq "E: the unverified outcome reached the ACTION LOG" "$(elog spawn-trust-unverified)" "1"
 
 # ---- ARM F: disabled ---------------------------------------------------------
@@ -290,11 +335,13 @@ assert_eq "G: the refusal reached the ACTION LOG with its reason" \
 # ---- ARM H: the window key cannot be resolved -------------------------------
 echo '=== ARM H: tmux cannot resolve the window key -> UNVERIFIED quickly, exit 0 ==='
 reset_arm 'state=idle active=0'
-t0=$(date +%s); out=$(TMUX_NOKEY=1 spawn wH); rc=$?; el=$(( $(date +%s) - t0 ))
+out=$(TMUX_NOKEY=1 spawn wH); rc=$?
 assert_eq "H: spawn exits 0" "$rc" "0"
 assert_contains "H: the outcome names the unresolvable key" "$out" "could not resolve window @9 to a pane-state key"
 assert_eq "H: pane-state was never consulted" "$(ps_calls)" "0"
-[ "$el" -le 6 ] && _th_pass || { printf '  FAIL: H: took %ss (expected <= 6)\n' "$el" >&2; _th_fail; }
+# "Quickly" as a property: it gives up on the 3-failure tolerance (two 0.5s
+# sleeps between three attempts), never by waiting out the 20s default budget.
+assert_eq "H: gave up on the failure tolerance, not the budget (<= 1s of sleep requested)" "$(sleep_total_le 1)" "yes"
 
 # ---- ARM I: structural --------------------------------------------------------
 echo '=== ARM I: structure — both sites, the precondition before the kill, the exemption named ==='

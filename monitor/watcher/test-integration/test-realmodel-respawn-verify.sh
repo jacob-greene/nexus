@@ -79,6 +79,8 @@ set -uo pipefail
 _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_self_dir/../_test_helpers.sh"
 . "$_self_dir/../../cc-harness/_lib.sh"
+# The `load` arm's verdict, as a unit (your-org/nexus-code#1795).
+. "$_self_dir/_rv_load_classify.sh"
 # CCH_SUBJECT_MON points the DRIVEN code at another tree's monitor/ — the
 # potency seam: aimed at a tree whose verify never sends the recovery Enter,
 # the `drop` arm goes RED. The rig (harness, helpers, pane reader) stays this
@@ -367,7 +369,39 @@ report_arm load "$TR"
 assert_eq "load: the resume presented an INDETERMINATE reading after the paste (or this arm tests nothing)" "$(( $(n_outside "$TR") > 0 ))" "1"
 echo "  NOTE: load: _respawn_orchestrator rc=$rc, requests +$(grew_by "$(nreq)" "$r0") (not asserted: an oversized history can kill the turn before the mock — see above)"
 assert_eq "load: exactly ONE submission was recorded — the brief left the box once, not zero times, not twice" "$(grew_by "$(nrec)" "$s0")" "1"
-assert_contains "load: the verify stage WAITED on the indeterminate reading instead of giving up" "$(cat "$TR")" "waiting for the box to read as the brief"
+# THE ARM'S PRECONDITION IS CHECKED, NOT ASSUMED (your-org/nexus-code#1795).
+# Under host load the box can render before the STRICT check first looks, so
+# no INDETERMINATE reading ever reaches it and the waiting line cannot appear —
+# on any build. Red on 2.1.295 and 2.1.296 alike (2026-10-10), every outcome
+# assertion green. That shape is UNMEASURED (exit 69 below), not a FAIL; every
+# other shape keeps the assertion. `rv_load_classify` documents the split and
+# is driven on synthetic traces by monitor/watcher/test-rv-load-classify.sh.
+RV_LOAD_VERDICT=$(rv_load_classify "$TR")
+echo "  NOTE: load: verify-stage classification: $RV_LOAD_VERDICT"
+RV_LOAD_UNMEASURED=0
+case "$RV_LOAD_VERDICT" in
+    unmeasured*)
+        RV_LOAD_UNMEASURED=1
+        {
+            echo "  UNMEASURED: load: no INDETERMINATE reading reached the strict check (${RV_LOAD_VERDICT#unmeasured }) —"
+            echo "              the arm's precondition (the load outlasts the paste, its Enter AND the one"
+            echo "              INDETERMINATE retry) was not met on this host, so whether the verify stage WAITS"
+            echo "              was not exercised. Not a pass. The scenario exits 69 unless something else FAILED."
+        } >&2 ;;
+    *)
+        assert_contains "load: the verify stage WAITED on the indeterminate reading instead of giving up" "$(cat "$TR")" "waiting for the box to read as the brief" ;;
+esac
+# POTENCY: the classification can still say FAIL. A planted trace in the
+# pre-#1674 shape (the strict check reads `empty` and STOPS, logging
+# INDETERMINATE) must not come back unmeasured — or the UNMEASURED arm above
+# would be a way for the defect this arm exists to catch to stop reddening.
+_rv_pot="$CCH_DIR/trace-load-potency"
+{
+    echo "LOG post-paste verify: no submit-evidence after 1s (last state='empty'); state='empty' is INDETERMINATE (not 'the box is clear') — pressing ONE Enter, the pre-#1596 behaviour narrowed to no-evidence, unsubmitted; box: ''; retrying Enter once"
+    echo "PS state=empty active=1"
+    echo "LOG post-paste verify: typed-retry stopped — state='empty' is INDETERMINATE (a resumed pane may still be loading) — no Enter on it"
+} > "$_rv_pot"
+assert_eq "load: POTENCY — the classification still FAILS a strict check that gave up on INDETERMINATE (pre-#1674 shape)" "$(rv_load_classify "$_rv_pot" | cut -d' ' -f1)" "fail"
 close_orch
 
 # ---- assertion-count guard (count=exact, summary-honesty) -------------------
@@ -375,10 +409,20 @@ close_orch
 # COUNTED, not skipped), so the total is a constant: 3 arms × boot_orch's two
 # waits = 6; ctl 1 wait + 6; drop 1 wait + 8; draft 8 (incl. its wait).
 # MEASURED at 30 on 2.1.280, not arithmetic alone. The `load` arm (#1674) adds
-# boot_orch's 2 waits + 1 wait + 3 = 6, so 36.
-EXPECTED_ASSERTIONS=36
+# boot_orch's 2 waits + 1 wait + 3 = 6, so 36. #1795 adds the potency row
+# (+1, always) and makes the WAITED row conditional: it is not asserted when
+# the arm is UNMEASURED (-1 then), so 37 or 36.
+EXPECTED_ASSERTIONS=$(( 37 - RV_LOAD_UNMEASURED ))
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 # ONE physical line, deliberately (the summary-honesty classifier reads it so).
 assert_eq "assertion TOTAL matches EXPECTED_ASSERTIONS — no assertion silently dropped or added" "$TOTAL_ASSERTIONS" "$EXPECTED_ASSERTIONS"
 
+# AN UNMEASURED ARM CANNOT FINISH GREEN (#1795; the #1530 convention of
+# test-realmodel-overlimit.sh): 69 is ENVSKIP to run-tests.sh and UNMEASURED,
+# counted RED, to cc-harness/gate.sh. A FAIL anywhere still wins.
+if (( RV_LOAD_UNMEASURED )) && (( FAIL == 0 )); then
+    printf '=== summary: %d passed, %d failed — and the load arm UNMEASURED ===\n' "$PASS" "$FAIL"
+    echo "ENV: the resume's load did not outlast the INDETERMINATE retry on this host, so the strict wait was not exercised (your-org/nexus-code#1795). Exit 69 — not a pass, not a product failure." >&2
+    exit 69
+fi
 th_summary_and_exit

@@ -1529,7 +1529,7 @@ if [[ -r "$self_dir/_obligations.sh" ]]; then
         printf '  OR, if the pairing ended some other way, say so on the record:\n' >&2
         printf '      monitor/ng obligation settle --debtor %q --reason "<why this reviewer is no longer owed>"\n' "$win_name" >&2
         printf '  Inspect it first: monitor/ng obligation list --debtor %q\n' "$win_name" >&2
-        # THE TWO-LEDGER DESYNC (your-org/nexus-code#1156, the `annzmerge` /
+        # THE TWO-LEDGER DESYNC (your-org/nexus-code#1156, the `projmerge` /
         # `overlaycontent` case). This edge lives in `$STATE_DIR/obligations`;
         # the skeptic ledger is a SECOND record of the same dependency, and it
         # can be fully settled — matching hash, `attributed`, verdict recorded —

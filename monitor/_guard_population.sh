@@ -458,8 +458,9 @@ gp_untracked_matching() {   # <root> <extended-regex> -> repo-relative paths
             # construct `monitor/watcher/early-exit-readers.sh` enumerates, and
             # writing one HERE would have been this bundle's own subject matter
             # re-instantiated inside its remedy: it reddened
-            # test-early-exit-reader-manifest.sh, which reddened
-            # test-guards-for-diff.sh through its --run arm. `sed` without a `q`
+            # test-early-exit-reader-manifest.sh, which then also reddened
+            # test-guards-for-diff.sh through its --run arm (§4c ran that real
+            # guard until #1704 gave it a stub). `sed` without a `q`
             # DRAINS its input, so it cannot close the pipe early. Same fix, and
             # the same reasoning, as the `hits=` line in guards-for-diff.sh.
             tr '\0' '\n' < "$textlist" \

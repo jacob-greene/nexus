@@ -1708,9 +1708,11 @@ else
     }
     semi new-window -d -t p -n w1-sk >/dev/null 2>&1
     semi new-window -d -t p -n nx-fix >/dev/null 2>&1
+    # tmux-fixture-conf-lint: allow-live-server  the server was started by the `-f "$TMUXCONF"` start_server above
     semi new-session -d -s s1x -n keep >/dev/null 2>&1
     semi set -s 'command-alias[99]' 'nxs=send-keys' >/dev/null 2>&1
 
+    # tmux-fixture-conf-lint: allow-live-server  the server was started by the `-f "$TMUXCONF"` start_server above
     semi new-session -d -s nx -n nx >/dev/null 2>&1
     semi rename-window -t nx:nx base >/dev/null 2>&1
     semi new-window -d -t nx -n nx-fix2 >/dev/null 2>&1
@@ -1808,6 +1810,7 @@ else
     SEMI_PATH=$(semi display-message -p '#{socket_path}' 2>/dev/null)
     abort_if_board "$SEMI_PATH" "run the F2 row"
     semi split-window -d -t 1s:far >/dev/null 2>&1; semi select-pane -t 1s:far.1 >/dev/null 2>&1
+    # tmux-fixture-conf-lint: allow-live-server  the server was started by the `-f "$TMUXCONF"` start_server two lines up
     sleep 1.1; semi new-session -d -s p -n base >/dev/null 2>&1; semi new-window -d -t p:2 -n other >/dev/null 2>&1
     out=$(semi_shim kill-pane -t 1)
     assert_contains "REAL #1583 F2: kill-pane -t 1 landing in ANOTHER session's current window is REFUSED" "$out" "REFUSING"

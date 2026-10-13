@@ -498,7 +498,7 @@ context-utilisation threshold, scope match — live in
 Interaction with engagement-log: the retain-consume gate
 deliberately reads only the engagement-log, *not* tmux
 `#{window_activity}`. Issue `#111` documented the
-`echo-density` case where `window_activity` advanced 18 min past
+`proj-density` case where `window_activity` advanced 18 min past
 `retain.ts` with no human or agent input — autosuggest
 re-renders alone. Anchoring retain-consume to engagement-only
 keeps retained workers from thrashing the suppressed-set footer

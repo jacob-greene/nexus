@@ -101,6 +101,24 @@ whose only visible bypass is hand-deleting it is a guard that trains its own
 bypass, which is why `resolve` exists and writes a rationale beside the
 record.
 
+**Several rounds can be open on ONE target at once** (<your-org>/<your-nexus>#414).
+A round is an open `armed` row on the ledger, one per deliverable (issue, report
+path) and keyed by its sha; the pending marker is their AGGREGATE. So parallel
+batch skeptics on one window are supported, with three rules: each reviewer
+files its verdict with `--skeptic-subject <the report it reviewed>`, which
+closes only that round and leaves the marker while any other round is open
+(the banner says `open rounds : N other round(s) still open`); its
+report-predates-round check is measured against ITS round's arm, not a
+sibling's newer one; and `skeptic close` leaves the channel OPEN (no `DONE`, no
+release, **exit 16**) only on positive evidence that another round is live: an
+open arm armed after the closer's own round's arm and before its verdict, or a
+live recorded reviewer other than the closer. An earlier round abandoned by a
+sequential re-arm under a new report path is released as before (#1810 F1). `ng skeptic-arm` opening
+a sibling round archives only the terminal sentinels and leaves the live
+`*.answered.md`. The target retires only when every round is closed: the last
+verdict releases the marker, or `ng skeptic resolve` releases them all on the
+record. A marker with no ledger is a legacy single round and behaves as before.
+
 **Ask the ledger which kind of "missing" this is before you do anything.**
 
 ```zsh

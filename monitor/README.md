@@ -197,7 +197,7 @@ Three pieces:
        `window_activity` without representing real
        engagement. The empirical motivation is documented
        inline at the top of `monitor/watcher/_idle_probe.sh`
-       (issue #111: `echo-density` retain consumed inside 30
+       (issue #111: `proj-density` retain consumed inside 30
        min despite no human or agent interaction).
 
      `wrapped-but-stub`, `idle-too-long`, `pane-absent`, and
@@ -2454,13 +2454,18 @@ it (bootstrap, recovery, watcher hosting) keeps evolving.
 (`watcher`, with its real tri-state liveness `UP`/`STALE`/`DOWN`
 from `_watcher_alive` + heartbeat age; `orchestrator`, window
 presence + turn-end heartbeat age, supervised by the watcher), then
-every registered service with live `UP`/`DOWN` (its healthcheck), a
+every registered service with live `UP`/`DOWN` (its healthcheck), or
+`STARTING` when the healthcheck fails but a LIVE supervisor started less
+than `SVC_STARTUP_GRACE_SECONDS` (default 300) ago (a just-relaunched
+service warming up after a restart is not down: do not restart it), a
 `SUPERVISOR` column reading the headless pidfile (`pid:N` alive /
 `stale` / `-`), and a final untruncated `DETAIL` column: for an UP
-labsh JupyterLab service the full tokened, directly-openable URL
-(`http://<fqdn>:<port>/lab?token=…` — internal lab cockpit, so the
-token is shown deliberately; missing token degrades to the bare URL),
-else the healthcheck-derived endpoint-or-PID.
+labsh JupyterLab service its URL, else the healthcheck-derived or
+`.deploy/endpoint` URL, else a PID. A URL query parameter whose name
+ends in token / key / secret / password / passwd is NEVER printed: its
+value is replaced by `<redacted: see monitor/.state/services/<name>.url>`,
+and that file (mode 0600) holds the full, directly-openable URL
+(`cat` it to open JupyterLab).
 It repaints **in place** (no clear-screen flicker, on the alternate
 screen so refreshes never pollute scrollback) and reacts to
 single keypresses: `1`-`9` tails that service's log, `0` the
@@ -2704,6 +2709,8 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `.state/decisions/`          | One file per pending decision: `<window>.<fp>.json` (issue #129). Written atomically by `hooks/decision-emit.sh` on every Notification. Each file carries `{ts, window, session_id, kind, prompt_excerpt, tool_context, fingerprint, unresolved?}`. The orchestrator removes the file once the prompt has been answered; `Stop` hook stamps `unresolved=true` on anything still present at turn-end. `*.handled.json` siblings are honoured as tombstones (audit copy after answering). | no |
 | `.state/pending-tool/`       | Per-window single-file snapshot of the most-recent PreToolUse for sensitive tools (`Bash|Write|Edit|NotebookEdit`): `<window>.json` with `{tool, input_summary, ts}`. Overwritten on each new PreToolUse; cleared by PostToolUse. Read opportunistically by `hooks/decision-emit.sh` to embed `tool_context` in the decision file. | no |
 | `.state/pending-decisions-emit-state.tsv` | Cooldown bookkeeping for `render_pending_decisions`. Rows: `<window>\t<fp>\t<last_emit_epoch>`. Re-emit gated by `DECISION_REEMIT_COOLDOWN_SECONDS` (default 300). Pruned each cycle to only rows whose decision file still exists. | no |
+| `.state/urgent-decisions-surfaced.tsv` | `<window>\t<fp>` of every open forwarded dangerous-rm request the `decision_surface` fast path has already pasted (<your-org>/nexus-code#1768), so each request is fast-pasted once; rewritten on each successful paste, removed when no request is open. The compose body still carries the row every render. The fast path is a stat-only no-op unless `.state/decisions/.urgent` moved in the last `MONITOR_URGENT_DECISION_WINDOW_SECONDS` (default 600). | no |
+| `.state/last-full-state-held-canonical.txt` | Canonical of the last full-state body composed while the target was HELD (over-limit or `/login`) and therefore not pasted (<your-org>/nexus-code#1770). While held, the full-state backoff compares against this instead of the emitted cache, so an unchanged held board waits out the effective floor rather than re-composing every due poll. Removed by the first successful paste. | no |
 | `.state/worker-notifications.jsonl` | Shared append-only JSONL log of every Notification across all workers (`{event, notification, window, ts}`). Read by `render_idle_prelude` for the `N awaiting-input` counter. Rotated at `MONITOR_NOTIFICATIONS_LOG_MAX_BYTES`. The per-decision file under `.state/decisions/` is the actionable surface; this is the aggregate. | no |
 | `.state/last-change.txt`     | Cache of the most recent emit body | no |
 | `.state/last-emit-stable-hash` | sha256 hex of the last successfully-pasted emit body in its canonical (timestamp-stripped) form. Read by `_compose_emit_should_suppress` to decide whether the candidate emit duplicates the previous one; advanced by `_compose_emit_record_emit` on every successful paste. Atomic tmp+rename writes. Missing/empty ⇒ no anchor; next eligible emit pastes and seeds the file. | no |

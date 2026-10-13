@@ -7,7 +7,7 @@
 #
 # WHY THIS SUITE EXISTS. On 2026-07-29 nexus-remote-ssh died with an
 # agent-sandbox container restart, another operator's nexus-remote-ssh on the
-# same shared host took 140.107.222.134:22022 during the downtime, and every
+# same shared host took 198.51.100.34:22022 during the downtime, and every
 # surface reported healthy for 2h30m — because `remote-ssh-health.sh` accepted
 # ANY `SSH-2.0-*` banner while documenting itself as "IDENTITY-AWARE". The loser
 # of a port race reports healthy while serving nothing. The bind:port is
@@ -1050,7 +1050,7 @@ assert_not_contains "…never accepts protocol-only evidence for it" "$g2" "acce
 # The bytes above are the ORIGINAL ssh-gibberish fixture: a client that fails
 # every invocation because it cannot execute. On 2026-08-24 that was not a
 # hypothetical — a corrupted passwd file inside the sandbox made the real `ssh`
-# behave exactly like this (`No user exists for uid 71780`, rc 255, for `-V` as
+# behave exactly like this (`No user exists for uid 10000`, rc 255, for `-V` as
 # much as for the probe), and this endpoint was reported as `a FOREIGN sshd
 # holds 127.0.0.1:22100` for 22 minutes while the daemon served continuously.
 #
@@ -1061,7 +1061,7 @@ assert_not_contains "…never accepts protocol-only evidence for it" "$g2" "acce
 # the wording.
 cat > "$WORK/ssh-cannot-start" <<'STUB'
 #!/usr/bin/env bash
-echo "No user exists for uid 71780" >&2
+echo "No user exists for uid 10000" >&2
 exit 255
 STUB
 chmod +x "$WORK/ssh-cannot-start"

@@ -26,7 +26,7 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 . "$_test_dir/../_guard_population.sh"
 gp_population() {
-    printf '%s\n' monitor/_agents-md-guard.sh monitor/spawn-worker.sh
+    printf '%s\n' monitor/_agents-md-guard.sh monitor/spawn-worker.sh monitor/resolve-settings.sh
 }
 gp_handle "$@"
 # shellcheck source=_test_helpers.sh
@@ -218,7 +218,53 @@ assert_not_contains "B3 root CLAUDE.md: suppressed, no prompt line" "$prompt" "U
 assert_contains "B3 root CLAUDE.md: stderr note names the file" "$err" "note — $FN/work/proj/AGENTS.md present but not loaded"
 
 
-EXPECTED_ASSERTIONS=40
+# ============ C. foreign instruction-file EXCLUDES at spawn (#1779) ===========
+# With monitor/resolve-settings.sh present, spawn-worker resolves the settings
+# with --nexus-root: the effective file excludes every CLAUDE.md / AGENTS.md /
+# .claude/rules under <root>/work (measured on cc 2.1.293: a nested CLAUDE.md
+# otherwise loads on a single-file `cat`), and defaults the AGENTS.md fallback
+# off, so the B1 file is no longer loaded. Base spawn-worker never passes the
+# flag: no excludes are written.
+echo "C. spawn-time instruction-file excludes"
+rm -f "$FN/CLAUDE.md"
+cp "$MON/resolve-settings.sh" "$FN/monitor/resolve-settings.sh"; chmod +x "$FN/monitor/resolve-settings.sh"
+STATE_EFF="$FN/monitor/.state/settings/worker-settings.effective.json"
+rm -f "$STATE_EFF"
+prompt=$(NEXUS_SPAWN_KEEP_PRINT_SETTINGS=1 spawn "$FN/work/proj"); rc=$?; err=$(cat "$WORK/spawn.err")
+assert_rc       "C1 --print-prompt rc 0" "$rc" 0
+assert_contains "C1 reached composition" "$prompt" "TASK_TOKEN_1671"
+# --print-prompt is the no-side-effect seam: the effective file goes to a
+# private temp dir named on stderr, NEVER the state dir (for a run from a
+# checkout that is the SOURCE tree — CI's decoy gate; skeptic on #1781).
+assert_eq "C1 --print-prompt wrote nothing under the state dir" \
+    "$([[ -e "$STATE_EFF" ]] && echo written || echo absent)" "absent"
+EFF=$(sed -n 's/^spawn-worker: --print-prompt: settings resolved to \(.*\) (not under the state dir)$/\1/p' <<<"$err")
+assert_eq "C1 effective settings excludes <root>/work/**/CLAUDE.md" \
+    "$(jq -r '.claudeMdExcludes[]?' "$EFF" 2>/dev/null | grep -cxF "$FN/work/**/CLAUDE.md")" "1"
+assert_eq "C1 effective settings excludes <root>/work/**/AGENTS.md" \
+    "$(jq -r '.claudeMdExcludes[]?' "$EFF" 2>/dev/null | grep -cxF "$FN/work/**/AGENTS.md")" "1"
+assert_not_contains "C1 AGENTS.md fallback off: no UNTRUSTED line" "$prompt" "UNTRUSTED AGENTS.md"
+assert_not_contains "C1 excludes applied: no UNPROTECTED line" "$prompt" "UNPROTECTED INSTRUCTION FILES"
+# C1b: without the keep knob the private temp dir is REMOVED at exit (skeptic
+# nit on PR #1781: one leaked dir per dry run). C1 above kept it on purpose.
+[[ "$EFF" == /*/spawn-print-settings.*/settings/*.effective.json ]] && rm -rf -- "${EFF%/settings/*}"
+spawn "$FN/work/proj" >/dev/null; err=$(cat "$WORK/spawn.err")
+# The path is read whatever the trailing note says, so this flips on a LEAKED
+# dir, not on the wording (a pre-fix tree prints no "removed at exit").
+EFF2=$(sed -n 's/^spawn-worker: --print-prompt: settings resolved to \(.*\) (not under the state dir.*)$/\1/p' <<<"$err")
+assert_eq "C1b the --print-prompt temp dir is named, then removed at exit" \
+    "$([[ -n "$EFF2" ]] && { [[ -e "$EFF2" ]] && echo leaked || echo removed; } || echo unnamed)" "removed"
+# C2: a root the excludes cannot name literally (a glob metacharacter): the
+# spawn still proceeds, warns, and tells the worker.
+G="$WORK/g[1]"; mkdir -p "$G"; cp -a "$FN" "$G/fn"; rm -rf "$G/fn/monitor/.state"
+prompt=$(env -u NEXUS_ROOT -u NEXUS_STATE_DIR TMPDIR="$WORK/spawn-tmp" \
+    "$G/fn/monitor/spawn-worker.sh" -n amg-win -c "$G/fn/work/proj" -p "$WORK/task.txt" --print-prompt 2>"$WORK/spawn.err"); rc=$?
+err=$(cat "$WORK/spawn.err")
+assert_rc       "C2 degraded resolve still spawns (rc 0)" "$rc" 0
+assert_contains "C2 prompt tells the worker it is UNPROTECTED" "$prompt" "UNPROTECTED INSTRUCTION FILES"
+assert_contains "C2 stderr WARNING says NOT excluded" "$err" "are NOT excluded for this worker"
+
+EXPECTED_ASSERTIONS=51
 TOTAL=$(( PASS + FAIL ))
 assert_eq "assertion TOTAL matches the expected total" "$TOTAL" "$EXPECTED_ASSERTIONS"
 

@@ -144,7 +144,7 @@ assert_rc "a '..' segment in the registry workdir normalises → rc 0" "$(run_or
 # ------------------------------------------------------- t_shape_undercount --
 # The registry-basename rule must catch a launch script whose name does NOT
 # match the `*-supervised.sh` shape. This nexus really has one
-# (`run-supervised-xiulan.sh`), which is why the population is a UNION.
+# (`run-supervised-collab.sh`), which is why the population is a UNION.
 new_case shape
 mkdir -p "$CASE_ROOT/work/svc-x"
 printf '#!/bin/sh\n' > "$CASE_ROOT/work/svc-x/run-odd-name.sh"

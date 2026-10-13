@@ -83,10 +83,14 @@ lj_probe_main() {
     # Refused BEFORE `sacct` runs: `sacct -j 0` is not a question about any job.
     lj_slurm_jobid_valid "$target" || { printf 'unknown|not a Slurm job id: %s (never polled)' "$target"; return 0; }
     command -v sacct >/dev/null 2>&1 || { printf 'unknown|sacct not on PATH'; return 0; }
-    local out rc state exit_code
-    out=$(sacct -X -n -P -o State,ExitCode -j "$target" 2>/dev/null); rc=$?
+    local out rc state exit_code ef err=""
+    # stderr is KEPT (to a private file) so a chaperon failure can say so: the
+    # dispatcher backs off on it (your-org/nexus-code#1728).
+    ef=$(mktemp "${TMPDIR:-/tmp}/lj-sacct-err.XXXXXX" 2>/dev/null) || ef=""
+    out=$(sacct -X -n -P -o State,ExitCode -j "$target" 2>"${ef:-/dev/null}"); rc=$?
+    if [[ -n "$ef" ]]; then { IFS= read -r err < "$ef"; } 2>/dev/null; rm -f "$ef"; fi
     if (( rc != 0 )); then
-        printf 'unknown|sacct rc=%s' "$rc"; return 0
+        printf 'unknown|sacct rc=%s%s' "$rc" "${err:+: ${err:0:160}}"; return 0
     fi
     local rows="$out"
     out="${out%%$'\n'*}"

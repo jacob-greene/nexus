@@ -64,7 +64,7 @@ The watcher writes a backoff file at `monitor/.state/graphql-backoff-<surface>` 
 tmux list-windows
 # 0: services
 # 1: orchestrator*    ← orchestrator should be here
-# 2: kompot-fig3
+# 2: proj-fig3
 # ...
 
 cat monitor/.state/watcher-target  # what the watcher thinks the target is

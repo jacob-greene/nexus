@@ -103,7 +103,11 @@
 # subtree, so a compute child under an await loop still counts as infra. Its
 # ONE consumer is the cc-update restart gate (`_restart_eligible`), which may
 # kill the orchestrator between turns only when `bg_quiesce >= bg_shells`.
-# Errs toward 0 (not quiescent) on anything it cannot parse.
+# Errs toward 0 (not quiescent) on anything it cannot parse. Also counted
+# (your-org/nexus-code#1797): the session's OWN longjob plugin monitor, a root
+# whose whole payload is `bash "<…>/longjob-plugin/dispatch.sh"` AND under which
+# the dispatcher argv is found. It is permanent, so without this arm no session
+# carrying one could ever read quiescent.
 #
 # COVERAGE BOUNDARY, narrower than a first reading suggests (w234sk F3). Two
 # things this count does not see:
@@ -874,6 +878,13 @@ _has_menu_dialog_frame() {
     local plain="$1"
     local footer_re='(Enter|Esc) to [a-z]'
 
+    # (0) NORMALISE, never decide: drop a trailing agent-teams teammate list
+    # before any condition below reads the frame (your-org/nexus-code#1785;
+    # see `_strip_agent_teams_footer`). This is not a SAFE arm — nothing
+    # returns here — so it cannot shadow (a)–(d): a real dialog above the list
+    # is judged on exactly the rows it would have had without the list.
+    plain=$(_strip_agent_teams_footer "$plain")
+
     # (a) navigation footer within the last 3 non-blank rows — OR (a') the
     # FOOTERLESS variant, a select menu that TERMINATES the pane
     # (your-org/nexus-code#1687; see `_has_footerless_menu_frame`).
@@ -1064,6 +1075,56 @@ _has_footerless_menu_frame() {
         sibs=$(( sibs + 1 ))
     done
     (( sibs >= 1 ))
+}
+
+# THE AGENT-TEAMS FOOTER (your-org/nexus-code#1785). With agent teams open,
+# Claude Code 2.1.293 paints the teammate list BELOW the prompt box and its
+# status row, as the last rows of the pane:
+#
+#     ● main
+#   ❯ ◯ w1-helper  Synthetic helper task one              idle
+#     ◯ w2-helper  Synthetic helper task two              running
+#
+# That is Claude Code's own select idiom — a `❯ ` cursor row plus siblings in
+# its column, terminating the pane — so (a') read an IDLE pane as
+# `blocked overlay=dialog`, and the watcher re-raised an answered decision.
+#
+# THE STRUCTURAL FACT: a maximal trailing run of rows, each a teammate row
+# (`●`/`◯` glyph, optionally under the `❯ ` cursor), that includes the
+# leader's `● main` row. Requiring `● main` is what keeps a real dialog that
+# happened to use `●`/`◯` as radio glyphs out of this exclusion.
+#
+# ERROR DIRECTIONS, stated. OVER-STRIP (a dialog read as not-a-dialog): only a
+# select dialog whose LAST option is literally a `● main` row — none is known;
+# glyph-styled options ABOVE the `● main` row are kept (the walk stops there). UNDER-STRIP (stays `blocked`, the pre-#1785
+# behaviour, never kill-authorised): a teammate list rendered with different
+# glyphs, without a `main` row, or with any non-teammate row painted under it.
+# Only TRAILING rows are removed, so a dialog ABOVE the list is untouched.
+_strip_agent_teams_footer() {
+    local plain="$1"
+    local -a lines=()
+    local line
+    while IFS= read -r line; do lines+=("$line"); done <<<"$plain"
+    local n=${#lines[@]} i start=-1 has_main=0
+    local mate_re='^ *(❯ +)?(●|◯) +[^ ]'
+    local main_re='^ *(❯ +)?● +main( |$)'
+    # The run's TOP is the `● main` row (Claude Code paints the leader first):
+    # the walk STOPS there, so `●`/`◯` rows ABOVE it — a radio-glyph dialog
+    # directly over the list — are never part of the strip (skeptic F3 on
+    # your-org/nexus-code#1799: a bottom-anchored walk ate such a dialog and
+    # the pane read empty/absent, which paste-followup does not refuse).
+    for (( i = n - 1; i >= 0; i-- )); do
+        [[ "${lines[i]}" =~ ^[[:space:]]*$ ]] && { (( start < 0 )) && continue; break; }
+        [[ "${lines[i]}" =~ $mate_re ]] || break
+        start=$i
+        [[ "${lines[i]}" =~ $main_re ]] && { has_main=1; break; }
+    done
+    if (( start < 0 || has_main == 0 )); then
+        printf '%s\n' "$plain"
+        return 0
+    fi
+    (( start == 0 )) && return 0
+    printf '%s\n' "${lines[@]:0:start}"
 }
 
 # Name the dialog `_has_menu_dialog_frame` just detected. NAMING ONLY — the
@@ -3175,6 +3236,10 @@ _pane_background_shells() {
     local wait_roots=" " stale_roots=" "
     # #1627: roots holding a longjob-watch dispatcher argv (see bg_longjob_kept).
     local lj_kept_roots=" "
+    # #1797: roots whose OWN eval'd payload is exactly the longjob plugin
+    # monitor's launch (`bash "<…>/longjob-plugin/dispatch.sh"`). Quiescent for
+    # the restart gate only when the dispatcher is ALSO found under them.
+    local lj_plugin_roots=" "
     # Oldest background-shell subtree ROOT start time, in clock ticks since
     # boot (`/proc/<pid>/stat` field 22). Converted to an epoch by the caller
     # side of this function. This is what makes the with-children episode age
@@ -3279,10 +3344,13 @@ _pane_background_shells() {
                 # command found on a descendant says nothing about what the root
                 # runs before or after it.
                 if (( is_root == 1 )) && [[ -n "$cmdl" ]]; then
-                    local _payload
-                    if _payload=$(_pane_root_payload "$cmdl") \
-                       && _pane_payload_is_pure_wait "$_payload"; then
-                        wait_roots="${wait_roots}${pid} "
+                    local _payload=""
+                    if _payload=$(_pane_root_payload "$cmdl"); then
+                        if _pane_payload_is_pure_wait "$_payload"; then
+                            wait_roots="${wait_roots}${pid} "
+                        elif _pane_payload_is_longjob_plugin "$_payload"; then
+                            lj_plugin_roots="${lj_plugin_roots}${pid} "
+                        fi
                     fi
                 fi
                 # #1208: harvest every async-run ref this node names, attributed
@@ -3405,8 +3473,25 @@ _pane_background_shells() {
         [[ -n "$rp" ]] || continue
         case "$stale_roots" in *" $rp "*) quiesce=$(( quiesce + 1 )); continue ;; esac
         case "$alien_roots" in *" $rp "*) continue ;; esac
-        case "$wait_roots"  in *" $rp "*) quiesce=$(( quiesce + 1 )) ;; esac
+        case "$wait_roots"  in *" $rp "*) quiesce=$(( quiesce + 1 )); continue ;; esac
     done <<< "$root_descs"
+    # #1797: the session's OWN longjob plugin monitor. It is permanent by
+    # design (#1535), so as a non-quiescent root it made `bg_quiesce >=
+    # bg_shells` unreachable for every session that carries one, and every
+    # cc-update orchestrator restart waited out its cap and FORCED (measured
+    # 2026-10-09 and 10-10: `bg_shells=1 … bg_quiesce=0 bg_longjob_kept=1`).
+    # Killing it loses nothing: the watches live in their spec files and the
+    # respawned session's plugin monitor re-arms. Counted here, outside the
+    # alien test, because its probes (sacct, a `cmd:` probe) are its own
+    # children and are equally disposable. BOTH conditions, so neither an argv
+    # look-alike nor a renamed launcher qualifies alone: the root's whole
+    # payload is the plugin launch AND the dispatcher argv is under it.
+    local _lr
+    for _lr in $lj_plugin_roots; do
+        case "$lj_kept_roots" in *" $_lr "*) ;; *) continue ;; esac
+        case "$wait_roots$stale_roots" in *" $_lr "*) continue ;; esac
+        quiesce=$(( quiesce + 1 ))
+    done
     local members_digest="-"
     if [[ -n "$members" ]]; then
         members_digest=$(printf '%s\n' $members | sort | cksum | cut -d' ' -f1)
@@ -3580,6 +3665,15 @@ _pane_payload_is_pure_wait() {
 _pane_cmd_is_longjob_dispatch() {
     local re='^[^[:space:]]+[[:space:]]+([^[:space:]]*/)?longjob-watch\.sh[[:space:]]+dispatch[[:space:]]*$'
     [[ "$1" =~ $re ]]
+}
+
+# _pane_payload_is_longjob_plugin <payload> — rc 0 iff a root's peeled payload is
+# EXACTLY the longjob plugin monitor's launch, `bash "<…>/longjob-plugin/dispatch.sh"`
+# (quotes optional), measured live 2026-10-12 on Claude Code 2.1.29x. Anything
+# before or after it (`; make`) refuses, as `_pane_payload_is_pure_wait` does.
+_pane_payload_is_longjob_plugin() {
+    local re='^[[:space:]]*bash[[:space:]]+"?[^"[:space:];&|<>()`$]*/longjob-plugin/dispatch\.sh"?[[:space:]]*$'
+    [[ "${1:-}" =~ $re ]]
 }
 
 _pane_cmd_is_protocol_wait() {
@@ -3872,7 +3966,7 @@ _classify_from_heartbeat() {
 # i.e. ` · <cmd> · 1 shell, 1 monitor · ← for agents`. The two
 # counters share one ` · … · ` segment, joined by `, `. Standalone
 # forms are ` · 2 shells · ` (no monitor) and ` · 1 monitor · ` (no
-# shell). This was the paper-benchmark false-idle root cause: a worker
+# shell). This was the proj-x false-idle root cause: a worker
 # idling between turns with a live background shell only ever shows
 # the status-line form (the spinner "still running" form appears only
 # during active tool execution), and the old regex matched neither

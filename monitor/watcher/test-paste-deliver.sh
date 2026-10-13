@@ -396,9 +396,14 @@ drive() {   # drive E|W|U|R <file>   (W = E through paste_with_retry)
         case "$who" in
             E) eval "$(sed -n '/^_paste_to_target_unlocked() {/,/^}/p' "$MON/watcher/main.sh")"
                _paste_to_target_unlocked orchestrator "$f" ;;
-            W) for _fn in paste_to_target _paste_to_target_unlocked paste_with_retry; do
-                   eval "$(sed -n "/^$_fn() {/,/^}/p" "$MON/watcher/main.sh")"
-               done
+            # Each extraction names its function VERBATIM, unrolled from a loop
+            # over `$_fn`: undefined-helper-lint reads a literal `<name>() {`
+            # as deliberate extraction, and a pattern built from a variable is
+            # invisible to it (it reddened the lint once another sourcing suite
+            # stubbed paste_with_retry, your-org/nexus-code#1768).
+            W) eval "$(sed -n '/^paste_to_target() {/,/^}/p' "$MON/watcher/main.sh")"
+               eval "$(sed -n '/^_paste_to_target_unlocked() {/,/^}/p' "$MON/watcher/main.sh")"
+               eval "$(sed -n '/^paste_with_retry() {/,/^}/p' "$MON/watcher/main.sh")"
                paste_with_retry orchestrator "$f" ;;
             U) eval "$(sed -n '/^_paste_line_to_window() {/,/^}/p' "$MON/watcher/_unstick.sh")"
                _paste_line_to_window orchestrator "$(cat "$f")" ;;

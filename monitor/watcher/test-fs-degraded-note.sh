@@ -181,11 +181,177 @@ assert_eq "N5 …and the run dir was NOT created (status writes nothing)" "$([[ 
 out=$(bash "$MON/ng" degraded status --help 2>&1); rc=$?
 assert_eq "N5 ng routes 'degraded status' (usage rc 2, not 'not implemented')" "$rc" "2"
 
+echo '=== N6: onset broadcasts STOP to every worker pane, heal broadcasts RESUME (#1724) ==='
+# N6-N9 pin the STOP to the FIRST degraded cycle; the default onset hysteresis
+# (2 cycles, skeptic note on #1799) is N10's subject.
+export MONITOR_FS_BROADCAST_ONSET_CYCLES=1
+# The operator's 2026-10-09 ask: tell workers to stop and wait, so they do not
+# each find out by a failing write. Workers come from the watcher's own lister
+# (seamed); delivery is the same refusal-respecting paste path as N2.
+chmod 0555 "$RO_STATE"
+bc_paste() {
+    printf '%s|%s|%s\n' "$1" "$STATE_DIR" "$(head -1 "$2")" >> "$WORK/bc.log"
+    [[ "$1" == w2 ]] && return 7    # w2 has an operator draft: refused, nothing typed
+    return 0
+}
+bc_workers() { printf 'w1\t0\t1\nw2\t0\t2\nw3-sk\t0\t3\n'; }
+_reset; : > "$LOG"; : > "$WORK/bc.log"
+_nexus_critical_alarm() { return 0; }
+STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+    FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers \
+    NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+bc=$(cat "$WORK/bc.log")
+# Count WORKER targets only. The one-shot escalation's last-resort notice to
+# the ORCHESTRATOR also goes through this paste function whenever no
+# out-of-band channel answered — correctly — and whether one answers depends
+# on the caller's PATH (an agent shell's BASH_ENV prelude puts sandbox-notify
+# there; CI has none). Counting every READ-ONLY line was green in every agent
+# shell and red in all four CI bands at 7ebd7d29 (4 vs 3, and 1 vs 0 in N7).
+assert_eq "N6 onset: one STOP paste per worker pane (3)" \
+    "$(grep -vc '^orchestrator|' <<<"$bc")" "3"
+assert_contains "N6 the STOP note tells the worker to WAIT" "$bc" "w1|$WORK/run/paste-state|[nexus watcher] The project tree is READ-ONLY"
+assert_contains "N6 …and pastes with the PRIVATE run dir, never the read-only tree" "$bc" "w3-sk|$WORK/run/paste-state|"
+# Skeptic F2 on #1799: every recorded outage ended in a sandbox restart, which
+# never sends RESUME, so the STOP note must say a resumed session counts.
+assert_contains "N6 the STOP note says a session resumed after a sandbox restart means continue" \
+    "$(grep '^w1|' "$WORK/bc.log")" "OR your session is resumed after a sandbox restart"
+assert_contains "N6 the refused pane is logged as refused (nothing typed)" "$(cat "$LOG")" "worker broadcast (stop) to w2 — refused"
+assert_contains "N6 the tally names delivered of total" "$(cat "$LOG")" "worker broadcast (stop): 2 of 3 worker pane(s) delivered"
+# A second degraded cycle must NOT re-broadcast (once per transition).
+: > "$WORK/bc.log"
+STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+    FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers \
+    NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+assert_eq "N6 a second degraded cycle does not re-broadcast STOP" "$(grep -vc '^orchestrator|' "$WORK/bc.log")" "0"
+# Heal: RESUME to every worker.
+chmod 0755 "$RO_STATE"; : > "$WORK/bc.log"
+_nexus_fs_incident_record() { return 0; }; _nexus_fs_incident_close_comment() { return 0; }
+STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+    FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers _fs_guard_tick >/dev/null
+assert_eq "N6 heal: one RESUME paste per worker pane" "$(grep -c 'RESUME: the project tree is writable again' "$WORK/bc.log")" "3"
+
+echo '=== N7: MONITOR_FS_DEGRADED_BROADCAST=0 turns it off; a missing lister is logged, not fatal ==='
+chmod 0555 "$RO_STATE"; _reset; : > "$LOG"; : > "$WORK/bc.log"
+STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator MONITOR_FS_DEGRADED_BROADCAST=0 \
+    FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers \
+    NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+assert_eq "N7 broadcast off: no worker paste" "$(grep -vc '^orchestrator|' "$WORK/bc.log")" "0"
+_reset; : > "$LOG"
+STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+    FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=no_such_lister_fn \
+    NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+assert_contains "N7 no lister: skipped and logged" "$(cat "$LOG")" "worker broadcast (stop) skipped — no worker lister loaded"
+chmod 0755 "$RO_STATE"
+
+echo '=== N8: the degraded run dir is DERIVED from the managed $TMPDIR, never a literal path (#1724) ==='
+# Operator, 2026-10-10 (#1724 c6105428034): small state only, under the
+# session-managed scratch tree; no hardcoded location. Run in subshells with
+# the suite's own NEXUS_DEGRADED_RUNDIR override removed.
+rd() { ( unset NEXUS_DEGRADED_RUNDIR; [ "$1" = - ] && unset TMPDIR || export TMPDIR="$1"; nexus_degraded_rundir; echo "|rc=$?" ); }
+M="$WORK/base/claude-1000/tmp"
+assert_eq "N8 a per-agent leaf maps to the managed tree's shared root (watcher and agents agree)" "$(rd "$M/agent-w1")" "$M/nexus-degraded|rc=0"
+assert_eq "N8 …with a trailing slash too" "$(rd "$M/agent-w1-sk/")" "$M/nexus-degraded|rc=0"
+assert_eq "N8 the managed root itself is used as is" "$(rd "$M")" "$M/nexus-degraded|rc=0"
+assert_eq "N8 a caller's own TMPDIR is used as is (the fallback lives UNDER \$TMPDIR)" "$(rd "$WORK/own-tmp")" "$WORK/own-tmp/nexus-degraded|rc=0"
+# No TMPDIR is the WATCHER's state (skeptic N2 on #1799): derived by the same
+# tmpdir.sh every agent shell runs, under a fixture base so the real
+# /tmp/claude-<uid> is never touched.
+assert_eq "N8 no TMPDIR and no override: DERIVED from the managed tree (tmpdir.sh), the watcher's case" \
+    "$( NEXUS_TMPDIR_BASE="$WORK/tb8" rd - )" "$WORK/tb8/claude-$(id -u)/tmp/nexus-degraded|rc=0"
+out=$( NEXUS_TMPDIR_BASE=rel rd - 2>"$WORK/n8.err" )
+assert_eq "N8 no managed place can be established (unusable base): rc 1, NO path is guessed" "$out" "|rc=1"
+assert_contains "N8 …and the refusal is LOUD, naming #1628" "$(cat "$WORK/n8.err")" "your-org/nexus-code#1628"
+assert_eq "N8 NEXUS_DEGRADED_RUNDIR overrides the derivation" "$( NEXUS_DEGRADED_RUNDIR=/x/y TMPDIR="$M/agent-w1" nexus_degraded_rundir )" "/x/y"
+# Mechanism has no literal fallback left: a status path with no managed place is a REFUSAL.
+out=$( unset NEXUS_DEGRADED_RUNDIR TMPDIR; export NEXUS_TMPDIR_BASE=rel; _fs_status_path "$RO_STATE" 2>/dev/null; echo "|rc=$?" )
+assert_eq "N8 _fs_status_path refuses (rc 1, no path) when there is no managed place" "$out" "|rc=1"
+assert_eq "N8 no hardcoded /tmp/nexus-degraded fallback remains in the resolver or its users" \
+    "$(grep -lE '/tmp/nexus-degraded' "$MON/_degraded-rundir.sh" "$_dir/_fs_guard.sh" "$MON/degraded-status.sh" "$MON/notifywrap/sandbox-notify" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+echo '=== N9: the WATCHER shape (no TMPDIR, no override, no agent key) still delivers end to end (#1724, skeptic N2) ==='
+# Every case above pins NEXUS_DEGRADED_RUNDIR, which is exactly why a resolver
+# that returned rc 1 without TMPDIR stayed green while the live watcher (no
+# TMPDIR in its environ) would deliver NOTHING. This runs the onset tick and a
+# due note in the watcher's environment shape: TMPDIR, NEXUS_DEGRADED_RUNDIR,
+# NEXUS_TMPDIR_AGENT, BASH_ENV and TZ all unset, a fixture NEXUS_TMPDIR_BASE.
+D9="$WORK/tb9/claude-$(id -u)/tmp/nexus-degraded"
+bc9_paste() { printf '%s|%s|%s\n' "$1" "$STATE_DIR" "$(head -1 "$2")" >> "$WORK/bc9.log"; return 0; }
+bc9n_paste() { printf 'target=%s state_dir=%s\n' "$1" "$STATE_DIR" >> "$WORK/bc9n.log"; return 0; }
+bc9_workers() { printf 'w1\t0\t1\nw2\t0\t2\n'; }
+_reset; : > "$LOG"; : > "$WORK/bc9.log"; : > "$WORK/bc9n.log"; chmod 0555 "$RO_STATE"
+(
+    unset NEXUS_DEGRADED_RUNDIR TMPDIR NEXUS_TMPDIR_AGENT BASH_ENV TZ
+    export NEXUS_TMPDIR_BASE="$WORK/tb9"
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+        FS_NOTE_PASTE_FN=bc9_paste FS_WORKER_LIST_FN=bc9_workers \
+        NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+    reset_note 1000
+    STATE_DIR="$RO_STATE" TARGET=orchestrator FS_NOTE_PASTE_FN=bc9n_paste \
+        NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_degraded_note_tick 1300
+    printf 'TMPDIR=%s TZ=%s\n' "${TMPDIR-<unset>}" "${TZ-<unset>}" > "$WORK/n9.env"
+)
+chmod 0755 "$RO_STATE"
+_n9_status="$D9/$(printf '%s' "$RO_STATE" | tr -c 'A-Za-z0-9._-' '_').status"
+assert_eq "N9 the status file is written under the DERIVED run dir" "$([[ -s "$_n9_status" ]] && echo written || echo "absent: $_n9_status")" "written"
+assert_contains "N9 the worker STOP broadcast reaches every worker (2 of 2)" "$(cat "$LOG")" "worker broadcast (stop): 2 of 2 worker pane(s) delivered"
+assert_contains "N9 …pasting with the derived run dir's paste state" "$(cat "$WORK/bc9.log")" "w1|$D9/paste-state|"
+assert_contains "N9 the due note is DELIVERED to the orchestrator from the derived run dir" "$(cat "$WORK/bc9n.log")" "target=orchestrator state_dir=$D9/paste-state"
+assert_contains "N9 the caller's TMPDIR is still unset afterwards (the derivation ran in a subshell)" "$(cat "$WORK/n9.env")" "TMPDIR=<unset> "
+assert_contains "N9 the caller's TZ is still unset afterwards (tmpdir.sh's TZ export did not leak)" "$(cat "$WORK/n9.env")" "TZ=<unset>"
+
+echo '=== N10: onset HYSTERESIS — a one-probe transient pastes NO worker; the 2nd failed probe does (#1799) ==='
+unset MONITOR_FS_BROADCAST_ONSET_CYCLES
+h_paste() { printf '%s|%s\n' "$1" "$(head -1 "$2")" >> "$WORK/h.log"; return 0; }
+h_workers() { printf 'w1\t0\t1\nw2\t0\t2\n'; }
+h_tick() {
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+        FS_NOTE_PASTE_FN=h_paste FS_WORKER_LIST_FN=h_workers \
+        NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+}
+_reset; FS_BC_QUEUE=""; FS_BC_STOPPED=0; : > "$LOG"; : > "$WORK/h.log"
+chmod 0555 "$RO_STATE"; h_tick
+assert_eq "N10 first failed probe: NO worker paste" "$(grep -vc '^orchestrator|' "$WORK/h.log")" "0"
+chmod 0755 "$RO_STATE"; h_tick
+assert_eq "N10 healed after one probe: no RESUME either" "$(grep -vc '^orchestrator|' "$WORK/h.log")" "0"
+assert_contains "N10 …and the log says why" "$(cat "$LOG")" "no STOP was broadcast, so no RESUME is owed"
+_reset; : > "$WORK/h.log"
+chmod 0555 "$RO_STATE"; h_tick; h_tick
+assert_eq "N10 second consecutive failed probe: STOP to both workers" \
+    "$(grep -c '^w[12]|\[nexus watcher\] The project tree is READ-ONLY' "$WORK/h.log")" "2"
+chmod 0755 "$RO_STATE"; h_tick
+assert_eq "N10 …and the heal then owes and sends RESUME to both" "$(grep -c '^w[12]|\[nexus watcher\] RESUME' "$WORK/h.log")" "2"
+
+echo '=== N11: the broadcast is BOUNDED per tick and the rest CARRIED, in order (#1799 F4) ==='
+s_paste() { printf '%s|%s\n' "$1" "$(head -1 "$2")" >> "$WORK/s.log"; sleep 1; return 0; }
+s_workers() { printf 'w1\t0\t1\nw2\t0\t2\nw3\t0\t3\nw4\t0\t4\n'; }
+s_tick() {
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+        MONITOR_FS_BROADCAST_ONSET_CYCLES=1 MONITOR_FS_BROADCAST_BUDGET_SECONDS=1 \
+        FS_NOTE_PASTE_FN=s_paste FS_WORKER_LIST_FN=s_workers \
+        NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+}
+_reset; FS_BC_QUEUE=""; FS_BC_STOPPED=0; : > "$LOG"; : > "$WORK/s.log"
+chmod 0555 "$RO_STATE"; s_tick
+n1=$(grep -c '^w[0-9]|' "$WORK/s.log")
+assert_eq "N11 onset tick stops at the 1 s budget (1 pane, the rest owed)" "$n1" "1"
+assert_contains "N11 …and logs the carry" "$(cat "$LOG")" "3 carried to the next tick"
+s_tick; s_tick; s_tick
+assert_eq "N11 later ticks drain it: w1..w4, each once, in order" \
+    "$(grep -o '^w[0-9]' "$WORK/s.log" | tr '\n' ' ')" "w1 w2 w3 w4 "
+assert_contains "N11 the tally comes when the queue drains" "$(cat "$LOG")" "worker broadcast (stop): 4 of 4 worker pane(s) delivered"
+# A heal with STOPs still queued drops them and RESUMEs everyone, never a STOP after it.
+_reset; FS_BC_QUEUE=""; FS_BC_STOPPED=0; : > "$LOG"; : > "$WORK/s.log"
+s_tick
+chmod 0755 "$RO_STATE"; : > "$WORK/s.log"; s_tick; s_tick; s_tick; s_tick
+assert_eq "N11 heal mid-STOP: no STOP is pasted after the heal" "$(grep -c 'READ-ONLY' "$WORK/s.log")" "0"
+assert_eq "N11 …every worker gets RESUME" "$(grep -c '|\[nexus watcher\] RESUME' "$WORK/s.log")" "4"
+assert_contains "N11 …and the dropped STOPs are said out loud" "$(cat "$LOG")" "superseded by (resume) — 3 undelivered pane(s) dropped"
+
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, count=exact): a
 # dropped or added assertion is a FAIL, never a quieter green.
-#   N1 2 | N2 11 | N3 fixture 1 + 3 drafts x 3 + N3c 2 | N4 3 | N5 8. The root path
+#   N1 2 | N2 11 | N3 fixture 1 + 3 drafts x 3 + N3c 2 | N4 3 | N5 8 | N6 8 | N7 2 | N8 10 | N9 6 | N10 5 | N11 7. The root path
 #   exits at its th_skip before any assertion, so it never reaches this guard.
-EXPECTED=$(( 2 + 11 + 12 + 3 + 8 ))
+EXPECTED=$(( 2 + 11 + 12 + 3 + 8 + 8 + 2 + 10 + 6 + 5 + 7 ))
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

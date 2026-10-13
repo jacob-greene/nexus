@@ -69,7 +69,7 @@ gp_handle "$@"
 # ASSERTION CENSUS (your-org/nexus-code#807): counted BEFORE the census
 # assertion itself. Adopted from the start rather than opted out of in
 # summary-honesty.manifest. An aborted plant never reaches it; th_abort is red.
-EXPECTED_ASSERTIONS=61
+EXPECTED_ASSERTIONS=79
 
 PASS=0
 FAIL=0
@@ -107,7 +107,7 @@ UNITS="$WORK/units.sh"
 : > "$UNITS"
 FNS=(_pane_comm_is_shell _pane_ticks_to_epoch _pane_cmd_is_protocol_wait
      _pane_cmd_descriptor _pane_asyncrun_refs _pane_asyncrun_ref_is_died
-     _pane_root_payload _pane_payload_is_pure_wait _pane_cmd_is_longjob_dispatch _pane_background_shells)
+     _pane_root_payload _pane_payload_is_pure_wait _pane_cmd_is_longjob_dispatch _pane_payload_is_longjob_plugin _pane_background_shells)
 for fn in "${FNS[@]}"; do
     sed -n "/^${fn}() {/,/^}/p" "$HELPER" >> "$UNITS"
     printf '\n' >> "$UNITS"
@@ -335,6 +335,75 @@ settle "$pp" 1 sleep
 read -r c4 _ r4 _ _ s4 q4 _ < <(walk "$pp")
 ck "L4 one background-shell root" "$c4" "1"
 ck "L4 work not yet started disqualifies it" "$q4" "0"
+
+# --- #1797: the session's own longjob plugin monitor ------------------------
+# Every nexus session carries ONE host-armed plugin monitor (#1535): a Claude
+# Code shell whose eval'd payload is `bash "<root>/monitor/longjob-plugin/
+# dispatch.sh"`, which execs `bash <root>/monitor/longjob-watch.sh dispatch`
+# (measured live 2026-10-12). It is permanent, so before #1797 it was a
+# non-quiescent root forever and every orchestrator restart forced at the cap.
+# L5 is the positive; L6-L8 each differ by ONE variable and must refuse.
+mkdir -p "$WORK/lj/monitor/longjob-plugin" "$WORK/ljfake/monitor/longjob-plugin"
+printf '#!/usr/bin/env bash\nuntil ! %s; do sleep %d; done\n' \
+    "$WORK/bin/watcher-supervise-tick.sh" "$LIFE" > "$WORK/lj/monitor/longjob-watch.sh"
+printf '#!/usr/bin/env bash\nexec bash "$(cd "$(dirname "$0")/.." && pwd)/longjob-watch.sh" dispatch\n' \
+    > "$WORK/lj/monitor/longjob-plugin/dispatch.sh"
+# L7's launcher has the plugin's NAME but runs no dispatcher.
+printf '#!/usr/bin/env bash\nuntil ! %s; do sleep %d; done\n' \
+    "$WORK/bin/watcher-supervise-tick.sh" "$LIFE" > "$WORK/ljfake/monitor/longjob-plugin/dispatch.sh"
+chmod +x "$WORK/lj/monitor/longjob-watch.sh" "$WORK/lj/monitor/longjob-plugin/dispatch.sh" \
+         "$WORK/ljfake/monitor/longjob-plugin/dispatch.sh"
+LJ_LAUNCH="bash \"$WORK/lj/monitor/longjob-plugin/dispatch.sh\""
+
+echo "=== L5: POSITIVE — the longjob plugin monitor root, dispatcher beneath (#1797) ==="
+plant ": QMARK5 && eval '$LJ_LAUNCH' < /dev/null && :" || th_abort "L5 plant did not report its pid"
+pp="$PLANTED"
+settle "$pp" 1 sleep
+read -r c5 _ r5 _ _ s5 q5 k5 _ < <(walk "$pp")
+ck "L5 one background-shell root" "$c5" "1"
+ck "L5 the dispatcher is found under it (lj_kept)" "$k5" "1"
+ck "L5 that root is quiescent" "$q5" "1"
+rc=0; _restart_bg_all_quiescent "bg_shells=$c5 bg_reliable=$r5 bg_cpu=79 bg_quiesce=$q5 bg_longjob_kept=$k5" || rc=$?
+ck "L5 the restart gate accepts a pane holding only its plugin monitor" "$rc" "0"
+
+echo "=== L6: L5 plus a second root doing real work (one variable) ==="
+plant ": QMARK6A && eval '$LJ_LAUNCH' < /dev/null && :" \
+      ": QMARK6B && eval 'timeout $LIFE tail -f /dev/null' < /dev/null && :" \
+    || th_abort "L6 plant did not report its pid"
+pp="$PLANTED"
+settle "$pp" 2 sleep tail
+read -r c6 _ r6 _ _ s6 q6 _ < <(walk "$pp")
+ck "L6 two background-shell roots" "$c6" "2"
+ck "L6 only the plugin root is quiescent" "$q6" "1"
+rc=0; _restart_bg_all_quiescent "bg_shells=$c6 bg_reliable=$r6 bg_cpu=1 bg_quiesce=$q6" || rc=$?
+ck "L6 the restart gate REFUSES a pane holding real work beside the plugin" "$rc" "1"
+
+echo "=== L7: the plugin's launch NAME with no dispatcher beneath (one variable) ==="
+plant ": QMARK7 && eval 'bash \"$WORK/ljfake/monitor/longjob-plugin/dispatch.sh\"' < /dev/null && :" \
+    || th_abort "L7 plant did not report its pid"
+pp="$PLANTED"
+settle "$pp" 1 sleep
+read -r c7 _ r7 _ _ s7 q7 k7 _ < <(walk "$pp")
+ck "L7 one background-shell root" "$c7" "1"
+ck "L7 no dispatcher under it" "$k7" "0"
+ck "L7 a look-alike launch is NOT quiescent" "$q7" "0"
+
+echo "=== L8: L5 but work queued after the launch in the same payload (one variable) ==="
+plant ": QMARK8 && eval '$LJ_LAUNCH; python3 -c 1' < /dev/null && :" || th_abort "L8 plant did not report its pid"
+pp="$PLANTED"
+settle "$pp" 1 sleep
+read -r c8 _ r8 _ _ s8 q8 k8 _ < <(walk "$pp")
+ck "L8 the dispatcher is found under it" "$k8" "1"
+ck "L8 a payload that is more than the launch is NOT quiescent" "$q8" "0"
+
+echo "=== U-LJ: _pane_payload_is_longjob_plugin accept/reject ==="
+ulj() { local rc=0; _pane_payload_is_longjob_plugin "$3" || rc=$?; ck "$2" "$rc" "$1"; }
+ulj 0 "ULJ1 quoted launch" 'bash "/x/monitor/longjob-plugin/dispatch.sh"'
+ulj 0 "ULJ2 unquoted launch" 'bash /x/monitor/longjob-plugin/dispatch.sh'
+ulj 1 "ULJ3 a trailing command refuses" 'bash /x/monitor/longjob-plugin/dispatch.sh; make'
+ulj 1 "ULJ4 a leading command refuses" 'make; bash /x/monitor/longjob-plugin/dispatch.sh'
+ulj 1 "ULJ5 another script refuses" 'bash /x/monitor/longjob-plugin/dispatch.sh.bak'
+ulj 1 "ULJ6 a substitution in the path refuses" 'bash "$(make)/longjob-plugin/dispatch.sh"'
 
 echo "=== E1: pane-state.sh emits bg_quiesce on the live L1 tree ==="
 idle_fixture="$_repo_root/$_Q_FIXTURE_REL"

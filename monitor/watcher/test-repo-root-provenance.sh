@@ -135,7 +135,7 @@ assert_eq "a path that exists but is NOT a directory is NO" \
 # DENY arm that would have caught the same input, i.e. `#1121` in the file
 # whose header cites `#1121`. It was a WRITE hole in the class this PR exists
 # to close: `git-https-setup --repo bare.git/hooks/deep` was NOT refused, and
-# `work/lab-wiki.git` on this host is a real bare repo.
+# `work/proj-wiki.git` on this host is a real bare repo.
 #
 # Depth is varied on purpose: a fix that special-cases only the immediate
 # child would pass a single-depth test.

@@ -145,6 +145,50 @@ for probe in "$WORK/definitely-not-a-repo|dev" "$WORK/badbranch|nope-nope" "$WOR
 done
 assert_eq "all 3 blind probes refused to report currency" "$_blind_cases" "3"
 
+echo "== transient ls-remote failure is retried once (#1769) =="
+
+# A stub git whose `ls-remote` fails the first <N> times (rc 128, git's
+# own fatal code) and then defers to the real git; every other verb goes
+# straight through. The counter file makes the attempt count observable,
+# so the retry is asserted as having HAPPENED rather than inferred from
+# the verdict alone.
+_real_git_bin=$(command -v git)
+cat > "$WORK/git-flaky" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do
+    if [[ "\$a" == ls-remote ]]; then
+        n=\$(cat "$WORK/flaky-count" 2>/dev/null || echo 0)
+        n=\$(( n + 1 )); echo "\$n" > "$WORK/flaky-count"
+        if (( n <= \$(cat "$WORK/flaky-fails") )); then exit 128; fi
+        break
+    fi
+done
+exec "$_real_git_bin" "\$@"
+STUB
+chmod +x "$WORK/git-flaky"
+export _CLONE_DRIFT_RETRY_PAUSE_SECONDS=0
+
+C=$(build_fixture flaky 3 3)
+echo 1 > "$WORK/flaky-fails"; rm -f "$WORK/flaky-count"
+line=$(_CLONE_DRIFT_GIT_BIN="$WORK/git-flaky" _clone_drift_probe "$C" dev)
+assert_eq "ls-remote fails once then succeeds -> up-to-date, not unknown" \
+    "$(verdict_of "$line")" "up-to-date"
+assert_eq "  ls-remote was attempted exactly twice" "$(cat "$WORK/flaky-count" 2>/dev/null)" "2"
+
+echo 2 > "$WORK/flaky-fails"; rm -f "$WORK/flaky-count"
+line=$(_CLONE_DRIFT_GIT_BIN="$WORK/git-flaky" _clone_drift_probe "$C" dev)
+assert_eq "ls-remote fails twice -> still unknown" "$(verdict_of "$line")" "unknown"
+assert_contains "  detail carries the failing rc" "$line" "ls-remote_rc=128"
+assert_eq "  and no third attempt" "$(cat "$WORK/flaky-count" 2>/dev/null)" "2"
+
+# Negative control: an rc-0 EMPTY answer (branch absent) is the remote's
+# positive answer, not a transient — it must NOT be retried.
+echo 0 > "$WORK/flaky-fails"; rm -f "$WORK/flaky-count"
+line=$(_CLONE_DRIFT_GIT_BIN="$WORK/git-flaky" _clone_drift_probe "$C" no-such-branch)
+assert_eq "absent branch (rc 0, empty) -> unknown" "$(verdict_of "$line")" "unknown"
+assert_eq "  and is asked once, not retried" "$(cat "$WORK/flaky-count" 2>/dev/null)" "1"
+unset _CLONE_DRIFT_RETRY_PAUSE_SECONDS
+
 echo "== origin-URL slug parsing (real function, before it is shadowed) =="
 
 C=$(build_fixture slugs 2 2)

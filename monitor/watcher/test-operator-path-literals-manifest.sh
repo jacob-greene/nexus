@@ -40,6 +40,19 @@ gp_population() {
 }
 gp_handle "$@"
 
+# A PUBLIC EXPORT has no subject for this guard. The mirror's scrub rewrites
+# the very operator paths this classifier looks for (into a generic layout
+# with one segment fewer, which its pattern does not describe), the manifest's
+# rows name a file the export excludes, and the planted fixtures are scrubbed
+# the same way. Red there was a statement about the scrub, not about the
+# public tree (your-org/nexus-code#1812). The signature is the toolkit's
+# private half — mapping.tsv and overlay/ — both absent, as build.sh leaves it.
+_pm="$_repo_root/monitor/public-mirror"
+if [[ -d "$_pm" && ! -e "$_pm/mapping.tsv" && ! -e "$_pm/overlay" ]]; then
+    echo "SKIP: public export — the operator-path layout this guard enumerates is scrubbed by design; the guard runs on the source tree"
+    exit 77
+fi
+
 WORK=$(mktemp -d -t nexus-opl-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 

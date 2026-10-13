@@ -3244,6 +3244,32 @@ else
     fail "force-restart-on-cap wrong (rc=$rc)"
 fi
 
+# 20w. THE IDLE CAP IS WALL CLOCK (your-org/nexus-code#1798). It used to count
+#      only the IDLE_POLL sleeps, so the probe's own time was free: a probe
+#      that takes 2 s under IDLE_WAIT=4 / POLL=1 was queried at waited=0,1,2,3,4
+#      — FIVE probes, ~14 s for a 4 s cap. Counted on the wall clock, the cap is
+#      crossed after the third probe. Asserted as an INVOCATION COUNT, an upper
+#      bound that load can only make SMALLER (slower probes cross the cap
+#      sooner), never as a timing margin (#557).
+ROOT="$WORK/a20w"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash
+echo "pane-state $*" >> %q
+sleep 2
+echo "state=busy active=1"
+' \
+    "$ROOT/calls.log" > "$ROOT/pane-state"
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=4 bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >>"$ROOT/producer.log" 2>&1
+rc=$?
+ps_calls=$(grep -c '^pane-state ' "$ROOT/calls.log" 2>/dev/null) || ps_calls=0
+if (( rc == 0 )) && (( ps_calls >= 1 && ps_calls <= 3 )) \
+   && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
+    pass "#1798 idle cap counts wall clock: forced after $ps_calls probe(s) of a 2 s probe at a 4 s cap (step-counted: 5)"
+else
+    fail "#1798 idle cap is not wall clock (rc=$rc, pane-state queries=$ps_calls, want 1..3 and forced)"
+fi
+
 # 20p. THE DUPLICATE-CLAIMANT PANE-PID GUARD (your-org/nexus-code#1400) had NO
 #      test (merge4sk G5 on #1568): the default stub answers no `#{pane_pid}`,
 #      so in every fixture the guard DISARMED itself and the unconditional kill

@@ -758,7 +758,7 @@ _filter_cross_repo_surface() {
 # jumping on it.
 #
 # COLLAPSED-BODY NOTE. By the time a body reaches this filter the
-# emitter has already run `gsub("[\n\r\t]+"; " ")`, so newlines are
+# emitter has already run `_collapse_ws` (each \n/\r/\t run → one space), so newlines are
 # spaces and the original line structure is gone. "First non-empty line
 # is exactly /skip" therefore re-expresses, losslessly for every
 # operator-given case, as "the body, after trimming leading whitespace,
@@ -1189,6 +1189,26 @@ _graphql_search_partial_log() {
     printf '%s\n' "$now" > "$marker" 2>/dev/null || true
 }
 
+# Every run of one or more \n / \r / \t in a body becomes ONE space,
+# and nothing else changes — the semantics of `gsub("[\n\r\t]+"; " ")`,
+# WITHOUT jq regex (your-org/nexus-code#1773). jq 1.5, this host's,
+# corrupts a string under `sub`/`gsub` when the match follows multibyte
+# characters: measured, `"é — 中文\nline2"` came back `"é — 中  line2"`,
+# so any comment carrying an em dash before a line break was forwarded
+# with text missing. A literal split is byte-exact on every jq. Map \r and
+# \t to \n, split, and drop the EMPTY INTERIOR segments (each is one extra
+# separator inside a run); the first and last are kept even when empty, so
+# a leading or trailing run still yields its one space. Linear in the
+# body, unlike an explode/reduce that appends per codepoint. Prepended to
+# each of the three snapshot programs below.
+_GH_JQ_COLLAPSE_WS='def _collapse_ws:
+  (split("\r") | join("\n")) | (split("\t") | join("\n"))
+  | split("\n")
+  | if length <= 2 then join(" ")
+    else ([.[0]] + (.[1:-1] | map(select(length > 0))) + [.[-1]]) | join(" ")
+    end;
+'
+
 _snapshot_issue_comments() {
     local processed_content="$1"
     _graphql_backoff_active issue_comments && return 0
@@ -1253,7 +1273,7 @@ _snapshot_issue_comments() {
     # jq consumes the page file as a STREAM of JSON documents (one per
     # line), so the per-comment filter below is unchanged from the
     # single-query shape — each page is just another document.
-    jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" '
+    jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" "$_GH_JQ_COLLAPSE_WS"'
         ($processed | split("\n") | map(select(. != ""))) as $ids
         | .data.search.nodes[]?
         | .number as $n
@@ -1264,7 +1284,7 @@ _snapshot_issue_comments() {
                   | length) == 0)
         | (.databaseId | tostring) as $cid
         | select(($ids | index("comment:" + $cid)) | not)
-        | (.body // "" | gsub("[\n\r\t]+"; " ")) as $b
+        | (.body // "" | _collapse_ws) as $b
         | "issue=\($n) id=\(.databaseId) author=\(.author.login)\n  body: "
           + (if ($b | length) > 400 then ($b[0:400] + "…") else $b end)
       ' < "$_pages" 2>/dev/null
@@ -1340,7 +1360,7 @@ _snapshot_pr_comments() {
     # Author filter is NOT applied here — `_filter_to_user_author`
     # downstream is the single chokepoint (issue #86).
     printf '%s' "$_stdout" \
-    | jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" '
+    | jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" "$_GH_JQ_COLLAPSE_WS"'
         ($processed | split("\n") | map(select(. != ""))) as $ids
         | .data.search.nodes[]? as $node
         | $node.number as $n
@@ -1355,7 +1375,7 @@ _snapshot_pr_comments() {
                   | length) == 0)
         | (.c.databaseId | tostring) as $cid
         | select(($ids | index("comment:" + $cid)) | not)
-        | (.c.body // "" | gsub("[\n\r\t]+"; " ")) as $b
+        | (.c.body // "" | _collapse_ws) as $b
         | (if .kind == "pr_review"
            then "pr_review=\($n) id=\(.c.databaseId) author=\(.c.author.login) path=\(.path // "?")"
            else "pr=\($n) id=\(.c.databaseId) author=\(.c.author.login)"
@@ -1409,7 +1429,7 @@ _snapshot_new_issues() {
     # keep `_filter_to_user_author` the single chokepoint for the
     # rule (issue #86).
     printf '%s' "$_stdout" \
-    | jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" '
+    | jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" "$_GH_JQ_COLLAPSE_WS"'
         ($processed | split("\n") | map(select(. != ""))) as $ids
         | .data.search.nodes[]?
         | select(([.reactions.nodes[]?
@@ -1418,7 +1438,7 @@ _snapshot_new_issues() {
                   | length) == 0)
         | (.number | tostring) as $n
         | select(($ids | index("issue:" + $n)) | not)
-        | (.body // "" | gsub("[\n\r\t]+"; " ")) as $b
+        | (.body // "" | _collapse_ws) as $b
         | "issue_new=\($n) id=\($n) author=\(.author.login)\n  body: "
           + (if ($b | length) > 400 then ($b[0:400] + "…") else $b end)
       ' 2>/dev/null

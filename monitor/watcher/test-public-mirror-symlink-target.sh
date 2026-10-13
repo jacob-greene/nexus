@@ -248,6 +248,7 @@ if mkrepo "$WORK/e"; then
     mkdir -p "$WORK/tool/overlay"
     cp -- "$BUILD" "$WORK/tool/build.sh"
     cp -- "$SRC_ROOT/monitor/public-mirror/scrub.pl" "$WORK/tool/scrub.pl"
+    cp -- "$SRC_ROOT/monitor/public-mirror/verify-build.py" "$WORK/tool/verify-build.py"
     if cmp -s "$BUILD" "$WORK/tool/build.sh"; then
       pass "E: the build.sh under test is byte-identical to the tracked one"
     else
@@ -315,6 +316,7 @@ if mkrepo "$WORK/f"; then
   mkdir -p "$WORK/toolf/overlay"
   cp -- "$BUILD" "$WORK/toolf/build.sh"
   cp -- "$SRC_ROOT/monitor/public-mirror/scrub.pl" "$WORK/toolf/scrub.pl"
+  cp -- "$SRC_ROOT/monitor/public-mirror/verify-build.py" "$WORK/toolf/verify-build.py"
   _ftop=$(cd "$WORK/f" && git rev-parse --show-toplevel 2>/dev/null)
   _freal=$(cd "$WORK/f" && pwd -P)
   if [ -n "$_ftop" ] && [ "$_ftop" = "$_freal" ]; then

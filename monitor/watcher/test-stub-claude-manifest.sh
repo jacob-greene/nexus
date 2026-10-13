@@ -226,11 +226,24 @@ _verdict_entailed() {   # <path> <step> <pin> <guard> <disposition> -> 0 ok / 1 
 #                so — counted and named, never a silent pass and never a red.
 #   BROKEN       the store COULD answer and the citation does not hold. The one
 #                failure.
+# A PUBLIC EXPORT (the mirror: `build.sh` drops mapping.tsv and overlay/) is a
+# squash of source with none of source's history, so a cited commit is absent
+# by construction — the same answer a shallow store gives, and treated the same
+# way. Keyed on the export's signature rather than on "commit missing", so in a
+# source clone a mistyped sha stays BROKEN (your-org/nexus-code#1812).
+# Asked of the repo BEING CHECKED, never hoisted to this suite's own tree: the
+# planted-repository controls below call _verify_citation on other stores.
+_no_source_history() {   # <repo> -> rc 0 when that store cannot hold the cited history
+    local pm="$1/monitor/public-mirror"
+    [[ "$(git -C "$1" rev-parse --is-shallow-repository 2>/dev/null)" == true ]] && return 0
+    [[ -d "$pm" && ! -e "$pm/mapping.tsv" && ! -e "$pm/overlay" ]]
+}
+
 _verify_citation() {   # <repo> <path> <blob> <commit> -> one of the four words
     local r="$1" vp="$2" vb="$3" vc="$4" now at
     now=$(git -C "$r" hash-object -- "$vp" 2>/dev/null) || now=""
     if [[ -n "$now" && "$now" == "$vb"* ]]; then printf CURRENT; return; fi
-    if [[ "$(git -C "$r" rev-parse --is-shallow-repository 2>/dev/null)" == true ]]; then
+    if _no_source_history "$r"; then
         printf UNVERIFIABLE; return
     fi
     # `git rev-parse <ref>:<path>` POLLUTES STDOUT on a missing path rather than
@@ -341,8 +354,8 @@ assert_eq "R1 control: a genuine step-2 pinned row is ACCEPTED" \
 # than hypothetical — it is precisely how a green would come back from a store
 # that checked nothing. In a SHALLOW store the assertion is inverted, because
 # there the honest answer is that none of them could be checked.
-if [[ "$(git -C "$REPO_ROOT" rev-parse --is-shallow-repository 2>/dev/null)" == true ]]; then
-    printf '  NOTE: SHALLOW object store — %d historical citation(s) are UNVERIFIABLE here.\n' \
+if _no_source_history "$REPO_ROOT"; then
+    printf '  NOTE: SHALLOW object store, or a PUBLIC EXPORT without source history — %d historical citation(s) are UNVERIFIABLE here.\n' \
         "$rows_unverifiable"
     printf '        Not a clearance: a depth-1 checkout holds the tip tree and nothing else,\n'
     printf '        so this arm did not run. Re-run in a full clone to exercise it.\n'

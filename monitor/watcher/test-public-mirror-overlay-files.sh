@@ -37,6 +37,16 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 TOOLKIT="$REPO_ROOT/monitor/public-mirror"
 LINT="$REPO_ROOT/monitor/lint-workflows.py"
+# A PUBLIC EXPORT (the mirror, or a fresh fork of it) ships the toolkit WITHOUT
+# its private half: `mapping.tsv` and `overlay/` are `exclude` rows, dropped by
+# build.sh by design. There §1 has no subject — the real manifest is not in the
+# tree — and is SKIPPED by name, while §2/§3 (fixtures, throwaway repos) still
+# run. Both paths absent is the signature; one absent is a broken source tree
+# and still fails below. The mirror's CI was red on this from 2026-10-07: the
+# population named overlay/manifest.tsv, its probe errored, and every
+# guards-for-diff consumer refused (your-org/nexus-code#1812).
+PUBLIC_EXPORT=0
+[ ! -e "$TOOLKIT/mapping.tsv" ] && [ ! -e "$TOOLKIT/overlay" ] && PUBLIC_EXPORT=1
 PY="${PYTHON:-python3}"
 
 # overlay_file_rows <manifest> -> "TARGET<TAB>SOURCE<TAB>NF" per `file` row.
@@ -54,13 +64,15 @@ is_workflow_target() { case "$1" in .github/workflows/*/*) return 1;; .github/wo
 
 . "$_test_dir/../_guard_population.sh"
 gp_population() {
-    printf '%s\n' monitor/public-mirror/build.sh monitor/public-mirror/scrub.pl \
-        monitor/public-mirror/overlay/manifest.tsv monitor/lint-workflows.py
+    printf '%s\n' monitor/public-mirror/build.sh monitor/public-mirror/scrub.pl monitor/lint-workflows.py
+    [ "$PUBLIC_EXPORT" = 1 ] || printf '%s\n' monitor/public-mirror/overlay/manifest.tsv
     carried_files "$TOOLKIT/overlay" | sed 's|^|monitor/public-mirror/overlay/|'
 }
 gp_handle "$@"
 
-for f in build.sh scrub.pl overlay/manifest.tsv; do
+_need="build.sh scrub.pl overlay/manifest.tsv"
+[ "$PUBLIC_EXPORT" = 1 ] && _need="build.sh scrub.pl"
+for f in $_need; do
     [[ -r "$TOOLKIT/$f" ]] || { echo "missing $TOOLKIT/$f" >&2; exit 2; }
 done
 [[ -r "$LINT" ]] || { echo "missing $LINT" >&2; exit 2; }
@@ -143,6 +155,10 @@ AU001_WF=$(printf '%s' "$CLEAN_WF" | grep -vF 'sources.list.d')
 
 # ── §1  THE REAL MANIFEST ───────────────────────────────────────────────
 echo '=== §1 the real manifest: layout, orphans, and a lint of every carried workflow ==='
+if [ "$PUBLIC_EXPORT" = 1 ]; then
+    th_skip "§1 layout/orphan check of the real manifest" "public export: overlay/ is excluded by design, there is no real manifest to read"
+    th_skip "§1 lint of every carried workflow" "public export: the carried files ship at their public paths, linted by the tree's own workflow lint"
+else
 REAL_M="$TOOLKIT/overlay/manifest.tsv"
 viol=$(check_layout "$REAL_M" "$TOOLKIT/overlay")
 assert_eq "§1 every file row follows files/<TARGET>, and nothing under overlay/files/ is orphaned" "$viol" ""
@@ -166,6 +182,7 @@ else
         printf '  FAIL: §1 carried workflow lint rc %s (0 wanted):\n%s\n' "$LINT_RC" "$LINT_OUT" >&2; _th_fail
     fi
 fi
+fi   # PUBLIC_EXPORT
 
 # ── §2  THE SAME CHECKER, ON FIXTURES ───────────────────────────────────
 echo '=== §2 the enumeration, layout/orphan checks and lint arm fire on fixtures ==='
@@ -204,7 +221,7 @@ assert_contains "§2 a carried file no row installs is flagged as an orphan" "$v
 fixture() {   # <name> <manifest-body> -> repo path
     local repo="$WORK/$1"
     mkdir -p "$repo/pm/overlay/files/.github/workflows" "$repo/secret"
-    cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$repo/pm/"
+    cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$repo/pm/"
     cat > "$repo/pm/mapping.tsv" <<'MAP'
 map	fixtureorg	public-org	<public-org>
 deny	fixtureorg
@@ -325,6 +342,7 @@ assert_eq "no top-level <entry>/<entry> self-link exists in the repo" "$leaks" "
 # EXPECTED-COUNT GUARD.
 #   §1 2 · §2 7 · §3a 8 · §3b 3 · §3c 3 · §3d 7 · §3e 4 · §3f 5 · §3g 2 · leak 1
 EXPECTED=$(( 2 + 7 + 8 + 3 + 3 + 7 + 4 + 5 + 2 + 1 ))
+[ "$PUBLIC_EXPORT" = 1 ] && EXPECTED=$(( EXPECTED - 2 ))   # §1's two, SKIPPED by name above
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

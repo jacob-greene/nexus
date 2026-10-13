@@ -94,7 +94,8 @@
 #                # pre-flight report-check (intentional checkpoint).
 #                # FAN-OUT (your-org/nexus-code#1140): if the session
 #                # transcript records `Agent` spawns, the frontmatter
-#                # must carry `fanout: N spawned / M returned`; M < N is
+#                # must carry `fanout: N spawned / M returned` (M =
+#                # RETURNED; optional `/ K used`, K <= M); M < N is
 #                # stated in the link comment. GUARDS (#1459): runs
 #                # `guards-for-diff --quiet` and names each selected
 #                # guard the report omits — automatic for a report under
@@ -2075,6 +2076,13 @@ _wrapup_dispositions() {
     ' "$f"
 }
 
+# The ONE `fanout:` grammar, shared by report-check and the wrap-up gate so
+# the two cannot drift (your-org/nexus-code#1140; `used`: #1780, where a
+# used count written as `returned` printed a false INCOMPLETE footer):
+#     <N> spawned / <M> returned [/ <K> used]
+# BASH_REMATCH: [1]=N, [2]=M, [4]=K (empty when the optional field is absent).
+_NG_FANOUT_RE='^([0-9]+)[[:space:]]+spawned[[:space:]]*/[[:space:]]*([0-9]+)[[:space:]]+returned([[:space:]]*/[[:space:]]*([0-9]+)[[:space:]]+used)?$'
+
 cmd_report_check() {
     _help_check "$@"
     local path=""
@@ -2167,15 +2175,25 @@ cmd_report_check() {
         fi
         # `fanout:` is OPTIONAL (an absent field is not an authoring error,
         # #684) but when present it must be the one shape `ng wrap-up` reads
-        # (your-org/nexus-code#1140): `<N> spawned / <M> returned`, M <= N.
+        # (your-org/nexus-code#1140): `<N> spawned / <M> returned`, M <= N,
+        # optionally `/ <K> used`, K <= M — RETURNED and USED are distinct
+        # counts, and conflating them published a false INCOMPLETE line.
         if grep -qE '^fanout:' <<<"$fm"; then
             local fanout
             fanout=$(awk -F': *' '/^fanout:/{sub(/^fanout: */, ""); print; exit}' <<<"$fm")
-            if [[ "$fanout" =~ ^([0-9]+)[[:space:]]+spawned[[:space:]]*/[[:space:]]*([0-9]+)[[:space:]]+returned$ ]]; then
-                (( BASH_REMATCH[2] > BASH_REMATCH[1] )) \
-                    && missing+=("frontmatter field: fanout (returned ${BASH_REMATCH[2]} exceeds spawned ${BASH_REMATCH[1]})")
+            if [[ "$fanout" =~ $_NG_FANOUT_RE ]]; then
+                # BASE 10, always: a zero-padded `08` is an arithmetic ERROR in
+                # bash (octal), which made both comparisons false and so
+                # DISABLED the checks rather than failing them (bundle 21).
+                local _fn _fm _fk=""
+                _fn=$(( 10#${BASH_REMATCH[1]} )); _fm=$(( 10#${BASH_REMATCH[2]} ))
+                [[ -n "${BASH_REMATCH[4]}" ]] && _fk=$(( 10#${BASH_REMATCH[4]} ))
+                (( _fm > _fn )) \
+                    && missing+=("frontmatter field: fanout (returned $_fm exceeds spawned $_fn)")
+                [[ -n "$_fk" ]] && (( _fk > _fm )) \
+                    && missing+=("frontmatter field: fanout (used $_fk exceeds returned $_fm)")
             else
-                missing+=("frontmatter field: fanout (must be '<N> spawned / <M> returned', got '${fanout}')")
+                missing+=("frontmatter field: fanout (must be '<N> spawned / <M> returned' or '<N> spawned / <M> returned / <K> used', got '${fanout}')")
             fi
         fi
         # ── `disposition:` — VALIDATED AT WRITE TIME (your-org/nexus-code#836)
@@ -3640,7 +3658,7 @@ _skeptic_open_arms() {
             # edit arms N rounds against ONE file, and no single verdict can
             # ever close N arms: every discharge lands `ambiguous-N-arms-
             # outstanding`, which renders identically to a skeptic that never
-            # answered. Measured on the live `.annzpr11.ledger` (three arms,
+            # answered. Measured on the live `.projpr11.ledger` (three arms,
             # one path, `ambiguous-3-arms-outstanding`) and reproduced at
             # `989b888`.
             #
@@ -3770,6 +3788,40 @@ _skeptic_open_arms_for_issue() {
     printf '%s' "$out"
 }
 
+# _skeptic_sibling_open_arms <pending-dir> <key> <sha> <issue> <report-path>
+# PARALLEL ROUNDS ON ONE TARGET (your-org/your-nexus#414). The still-open
+# arms that belong to a DIFFERENT round than the one named here, one per line:
+# open arms whose sha is not <sha> and whose last `armed` row is not the same
+# DELIVERABLE (issue, report path) — a same-deliverable arm is an earlier
+# revision of THIS round, which the supersede rule in `_skeptic_open_arms`
+# already folds into it. Empty output when there are none; rc 1 + no output
+# when the ledger is absent or unreadable (callers then keep their pre-#414
+# single-round behaviour, which is what a legacy marker is: one round).
+#
+# Five batch skeptics on `mysite-review` were each armed against their own
+# fix log, and every round-opening write treated the target as having ONE
+# round: `skeptic-arm` archived the live siblings' answered correspondence,
+# and each verdict `rm`ed the one marker every sibling's await was parked on.
+_skeptic_sibling_open_arms() {
+    local dir="$1" key="$2" sha="${3:-}" issue="${4:--}" rpath="${5:--}" f arms
+    f=$(_skeptic_ledger_file "$dir" "$key")
+    [[ -r "$f" ]] || return 1
+    arms=$(_skeptic_open_arms "$dir" "$key") || return 1
+    [[ -n "$arms" ]] || return 0
+    awk -F'\t' -v me="$sha" -v iss="${issue:--}" -v rp="${rpath:--}" -v open="$arms" '
+        BEGIN { n = split(open, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") { o[a[i]] = 1; ord[++m] = a[i] } }
+        $1 == "armed" && $2 ~ /^[0-9a-f]{64}$/ && ($2 in o) { di[$2] = $4; dp[$2] = $5 }
+        END {
+            for (i = 1; i <= m; i++) {
+                s = ord[i]
+                if (s == me) continue
+                if (rp != "-" && rp != "" && dp[s] == rp && di[s] == iss) continue
+                print s
+            }
+        }
+    ' "$f" 2>/dev/null || return 1
+}
+
 # _skeptic_record_discharge <pending-dir> <key> <verdict> <issue> <by> [asserted-sha] [asserted-path]
 # Record that the obligation on <key> was discharged by a verdict, naming the
 # artefact ONLY when the ledger can say which one. Returns 0 always: a
@@ -3859,7 +3911,7 @@ _skeptic_record_discharge() {
             # them off the arm — so the assertion is refused as
             # `asserted-not-armed` even though the reviewer named exactly the
             # thing that was armed. Measured five times on the live
-            # `.annzfix.ledger` and reproduced at `989b888`.
+            # `.projfix.ledger` and reproduced at `989b888`.
             #
             # When the PATH matches a still-open arm on the same issue, the
             # verdict attributes to THAT arm. `sha` becomes the ARMED sha, so
@@ -4246,14 +4298,14 @@ _skeptic_file_rearm_adjudication() {
 # verdict that had in fact been DELIVERED, by four different mechanisms, and
 # every one of them printed the same refusal:
 #
-#   annzfix       5 x `asserted-not-armed`  the report was AMENDED after arming,
+#   projfix       5 x `asserted-not-armed`  the report was AMENDED after arming,
 #                                           so the content hash moved off the arm
-#   annzpr11      `ambiguous-3-arms-…`      3 wrap-ups armed 3 rounds against ONE
+#   projpr11      `ambiguous-3-arms-…`      3 wrap-ups armed 3 rounds against ONE
 #                                           report path; one discharge cannot
 #                                           close three arms
 #   devred        discharged + resolved,    a wrap-up RE-ARMED a closed chain,
 #                 then a later `armed`      20 min after close
-#   annzmerge     `asserted-not-armed`      + a live edge in the OTHER ledger
+#   projmerge     `asserted-not-armed`      + a live edge in the OTHER ledger
 #   clmd          `asserted`, then a LATER   the reviewer re-derived both findings
 #                 `asserted-not-armed`       against a head that moved MID-REVIEW,
 #                                            and amending its report to publish
@@ -5546,9 +5598,30 @@ _wrapup_skeptic_step() {
         # outstanding, which is the shut direction. Only a POSITIVE "older than
         # the newest arm" refuses; an unparseable stamp is stated and lets the
         # verdict through, because a brick teaches the rm bypass.
+        #
+        # THE ROUND IS THE ONE THIS VERDICT ATTRIBUTES TO, NOT THE NEWEST ARM
+        # (your-org/your-nexus#414). With several rounds open on one target, the
+        # newest arm is usually a SIBLING's: a batch skeptic whose report was
+        # started before the next batch was armed was refused for "predating"
+        # a round it never claimed. So the dry run that says which arm this
+        # verdict would close runs FIRST, and that arm's own timestamp is the
+        # bar. Anything that does not attribute to an armed sha (no subject,
+        # asserted-not-armed, ambiguous) keeps the newest-arm bar, unchanged.
+        _SK_DISCHARGE_WOULD_SHA=""; _SK_DISCHARGE_WOULD_ARMS=""
         if [[ -n "$_sk_reviewed_key" ]]; then
-            local _sk_arm_ep _sk_rep_ep _sk_arm_ts
-            _sk_arm_ts=$(_skeptic_last_arm_ts "$pending_dir" "$_sk_reviewed_key") || _sk_arm_ts=""
+            _SK_DISCHARGE_DRYRUN=1 _skeptic_record_discharge "$pending_dir" "$_sk_reviewed_key" \
+                "$verdict" "$issue" "${source_window:-skeptic}" "$_sk_asserted" "$_sk_subject_path"
+        fi
+        if [[ -n "$_sk_reviewed_key" ]]; then
+            local _sk_arm_ep _sk_rep_ep _sk_arm_ts="" _sk_round_row=""
+            case "$_SK_DISCHARGE_DETAIL" in
+                attributed|attributed-by-issue|asserted|asserted-path)
+                    _sk_round_row=$(_skeptic_arm_detail "$pending_dir" "$_sk_reviewed_key" "$_SK_DISCHARGE_WOULD_SHA") \
+                        || _sk_round_row=""
+                    [[ -n "$_sk_round_row" ]] && _sk_arm_ts=$(cut -f3 <<<"$_sk_round_row") ;;
+            esac
+            [[ -n "$_sk_arm_ts" ]] \
+                || { _sk_arm_ts=$(_skeptic_last_arm_ts "$pending_dir" "$_sk_reviewed_key") || _sk_arm_ts=""; }
             _sk_arm_ep=$(date -d "$_sk_arm_ts" +%s 2>/dev/null) || _sk_arm_ep=""
             _sk_rep_ep=$(stat -c %Y "${_SK_REPORT_PATH:-/nonexistent}" 2>/dev/null) || _sk_rep_ep=""
             if [[ "$_sk_arm_ep" =~ ^[0-9]+$ && "$_sk_rep_ep" =~ ^[0-9]+$ ]] && (( _sk_rep_ep < _sk_arm_ep )); then
@@ -5573,9 +5646,6 @@ _wrapup_skeptic_step() {
         # at all there is nothing to name and the verdict is recorded as before
         # (`no-arm-on-record` / `no-open-arm` — the irreplaceable fact).
         if [[ -n "$_sk_reviewed_key" ]]; then
-            _SK_DISCHARGE_WOULD_SHA=""; _SK_DISCHARGE_WOULD_ARMS=""
-            _SK_DISCHARGE_DRYRUN=1 _skeptic_record_discharge "$pending_dir" "$_sk_reviewed_key" \
-                "$verdict" "$issue" "${source_window:-skeptic}" "$_sk_asserted" "$_sk_subject_path"
             if [[ "$_SK_DISCHARGE_WOULD_SHA" == "-" && -n "$_SK_DISCHARGE_WOULD_ARMS" ]]; then
                 echo "ng wrap-up: REFUSING to record a verdict that names NO artefact while $reviewed has arm(s) outstanding ($_SK_DISCHARGE_DETAIL)." >&2
                 echo "  A sha=- verdict can be attributed to nothing, and the reviewed window can then satisfy its" >&2
@@ -5591,7 +5661,21 @@ _wrapup_skeptic_step() {
             && _skeptic_record_discharge "$pending_dir" "$_sk_reviewed_key" \
                    "$verdict" "$issue" "${source_window:-skeptic}" "$_sk_asserted" \
                    "$_sk_subject_path"
-        local _sk_disch_key _sk_disch_seen=""
+        # ONE VERDICT RELEASES ONE ROUND (your-org/your-nexus#414). The marker
+        # is the AGGREGATE of the reviewed key's rounds: it stays while the
+        # ledger still holds an open arm there — a sibling round, armed against
+        # a different deliverable, that THIS verdict did not close. Before,
+        # the `rm` below ran whatever the ledger said, so the first of five
+        # batch verdicts on `mysite-review` dropped the marker the other four
+        # rounds' await and parked-exemption were reading (retire-preflight's
+        # ledger check 1be still refused; every marker reader did not).
+        # Only the REVIEWED key: it is the one whose discharge was recorded
+        # above. No ledger, or one that cannot be read, is a legacy single
+        # round and is released exactly as before.
+        local _sk_disch_key _sk_disch_seen="" _sk_rounds_left=""
+        if [[ -n "$_sk_reviewed_key" ]]; then
+            _sk_rounds_left=$(_skeptic_open_arms "$pending_dir" "$_sk_reviewed_key" 2>/dev/null) || _sk_rounds_left=""
+        fi
         for _sk_disch_key in \
             "$( [[ -n "$reviewed" && "$reviewed" != "<unknown-target>" ]] && wk_encode "$reviewed" )" \
             "$orig_safe" "$sw_safe"
@@ -5599,6 +5683,9 @@ _wrapup_skeptic_step() {
             [[ -n "$_sk_disch_key" ]] || continue
             [[ "$_sk_disch_seen" == *"|$_sk_disch_key|"* ]] && continue
             _sk_disch_seen="${_sk_disch_seen}|$_sk_disch_key|"
+            if [[ "$_sk_disch_key" == "$_sk_reviewed_key" && -n "$_sk_rounds_left" ]]; then
+                continue
+            fi
             rm -f "$pending_dir/${_sk_disch_key}" 2>/dev/null || true
         done
 
@@ -5682,6 +5769,12 @@ _wrapup_skeptic_step() {
                  printf '                  the path, then re-run this wrap-up.\n' ;;
             *)   printf 'ledger          : not recorded — no reviewed target to key on\n' ;;
         esac
+        if [[ -n "$_sk_rounds_left" ]]; then
+            printf 'open rounds     : %s other round(s) still open on %s — its pending marker is KEPT\n' \
+                "$(grep -c . <<<"$_sk_rounds_left")" "$reviewed"
+            printf '                  (your-org/your-nexus#414). This verdict closed only its own round;\n'
+            printf '                  `ng skeptic-obligations %s` lists the rest.\n' "$reviewed"
+        fi
 
         # Bounded recursion. A second-pass skeptic is warranted only when
         # this pass found SUBSTANTIVE NEW issues (suspect/refuted verdict,
@@ -6842,8 +6935,17 @@ _wrapup_skeptic_step() {
             # correspondence reached nobody. A failed reset is reported, not
             # swallowed; the marker below is written either way (refusing side).
             if [[ -n "$source_window" ]]; then
-                local _wu_reset_out="" _wu_reset_rc=0
-                _wu_reset_out=$("$_script_dir/skeptic-channel.sh" reset "$source_window" 2>&1) || _wu_reset_rc=$?
+                local _wu_reset_out="" _wu_reset_rc=0 _wu_sib="" _wu_sha=""
+                local -a _wu_reset_flags=()
+                # A parallel round on another deliverable is live, not prior:
+                # keep its answered correspondence (your-org/your-nexus#414).
+                _wu_sha=$(_skeptic_artefact_sha "${_SK_REPORT_PATH:-}") || _wu_sha=""
+                if [[ -n "$_wu_sha" && -n "$sw_safe" ]]; then
+                    _wu_sib=$(_skeptic_sibling_open_arms "$pending_dir" "$sw_safe" "$_wu_sha" \
+                        "$issue" "${_SK_REPORT_PATH:-}" 2>/dev/null) || _wu_sib=""
+                fi
+                [[ -n "$_wu_sib" ]] && _wu_reset_flags=(--keep-correspondence)
+                _wu_reset_out=$("$_script_dir/skeptic-channel.sh" reset "$source_window" "${_wu_reset_flags[@]}" 2>&1) || _wu_reset_rc=$?
                 [[ -n "$_wu_reset_out" ]] && printf '%s\n' "$_wu_reset_out"
                 (( _wu_reset_rc == 0 )) || printf 'WARNING: archiving the prior skeptic round for %s FAILED (rc=%s) — its DONE/answered files may still be in the channel (#469).\n' \
                     "$source_window" "$_wu_reset_rc"
@@ -8051,7 +8153,7 @@ _skeptic_window_reports() {
 # is the ONLY thing that restores the block". So every re-validation round — the
 # rounds that exist BECAUSE something was already found wrong — established an
 # armed state with no subject attached, and no verdict against it could be
-# credited. Measured on the live board: `annz36` logged
+# credited. Measured on the live board: `proj36` logged
 # `subject-armed-sha:"-"` at verdict time with no `skeptic-request` event at all,
 # and `ncpanestate` carries ONE `armed` row against four rounds of review, so all
 # six of its delivered verdicts read `asserted-not-armed` — the arm never moved
@@ -8150,7 +8252,7 @@ cmd_skeptic_arm() {
     # marker is the gate, and failing toward a shut gate is the safe side.
     local _rec_rc=0
     _skeptic_record_arm "$pend" "$key" "$sha" "$issue" "$rp" || _rec_rc=$?
-    _skeptic_arm_open_round "$sd" "$pend" "$key" "$window" "$depth" open
+    _skeptic_arm_open_round "$sd" "$pend" "$key" "$window" "$depth" open "$sha" "$issue" "$rp"
     if (( _rec_rc != 0 )); then
         printf 'ng skeptic-arm: the arm row was NOT recorded for %s (append to %s failed — a read-only or full state dir?): no subject is on record, so a verdict cannot be attributed to this artefact. The round was opened anyway (the marker is the gate). Exit 5 (#1719).\n' \
             "$window" "$(_skeptic_ledger_file "$pend" "$key")" >&2
@@ -8181,8 +8283,23 @@ cmd_skeptic_arm() {
 # a recursion depth another writer chose.
 _skeptic_arm_open_round() {
     local sd="$1" pend="$2" key="$3" window="$4" depth="$5" mode="$6"
+    local r_sha="${7:-}" r_issue="${8:-}" r_path="${9:-}"
     local marker="$pend/$key"
     if [[ "$mode" == "open" ]]; then
+        # A SIBLING ROUND'S CORRESPONDENCE IS NOT THE PRIOR ROUND'S
+        # (your-org/your-nexus#414). With another round still open on this
+        # target — a parallel skeptic on a different deliverable — its
+        # `*.answered.md` are live, so only the terminal sentinels are archived.
+        local -a _reset_flags=()
+        local _sib=""
+        if [[ -n "$r_sha" ]]; then
+            _sib=$(_skeptic_sibling_open_arms "$pend" "$key" "$r_sha" "$r_issue" "$r_path" 2>/dev/null) || _sib=""
+        fi
+        if [[ -n "$_sib" ]]; then
+            _reset_flags=(--keep-correspondence)
+            printf 'ng skeptic-arm: %s other round(s) are still open on %s — their answered correspondence stays in the channel (#414).\n' \
+                "$(grep -c . <<<"$_sib")" "$window" >&2
+        fi
         # THE ARCHIVE PATH IS PRINTED, NOT DISCARDED (your-org/nexus-code#1609).
         # This used to be `>/dev/null 2>&1 || true`: `reset` MOVES the prior
         # round's DONE and its whole `*.answered.md` correspondence into
@@ -8193,7 +8310,7 @@ _skeptic_arm_open_round() {
         # on the ledger (see ORDER above), so it is reported, loudly, and the
         # marker is still written — more refusing, never less.
         local _reset_out="" _reset_rc=0
-        _reset_out=$(NEXUS_STATE_DIR="$sd" "$_script_dir/skeptic-channel.sh" reset "$window" 2>&1) || _reset_rc=$?
+        _reset_out=$(NEXUS_STATE_DIR="$sd" "$_script_dir/skeptic-channel.sh" reset "$window" "${_reset_flags[@]}" 2>&1) || _reset_rc=$?
         [[ -n "$_reset_out" ]] && printf 'ng skeptic-arm: %s\n' "$_reset_out" >&2
         if (( _reset_rc != 0 )); then
             printf 'ng skeptic-arm: WARNING — archiving the prior round for %s FAILED (rc=%s); its DONE or answered files may still sit in the channel, so `await` can read them as this round'"'"'s (#469).\n' \
@@ -10006,7 +10123,10 @@ _cmd_wrap_up_recorded() {
 # SPAWNED half is measurable from the session transcript: every `Agent` tool
 # use is a spawn. So the gate MEASURES spawns and REQUIRES the author to
 # declare the returned count in the report frontmatter:
-#     fanout: <N> spawned / <M> returned
+#     fanout: <N> spawned / <M> returned [/ <K> used]
+# M counts subagents that RETURNED; the optional K (<= M) counts the results
+# the report USES. All returned with some set aside (M == N, K < M) gets a
+# neutral line, never the INCOMPLETE one.
 # Undeclared with N > 0 -> REFUSED (the number to write is printed). Declared
 # with a spawned count that disagrees with the transcript -> REFUSED. Declared
 # short (M < N) -> the link comment CARRIES the incompleteness. A verdict on a
@@ -10069,7 +10189,7 @@ PY
 }
 _WU_FANOUT_LINE=""
 _wu_fanout_preflight() {   # <report> ; sets _WU_FANOUT_LINE; rc 1 = refuse
-    local report="$1" sid transcript spawned declared d_spawned d_returned
+    local report="$1" sid transcript spawned declared d_spawned d_returned d_used
     _WU_FANOUT_LINE=""
     sid=$(_wu_frontmatter_field "$report" session-id | tr -d ' \t')
     declared=$(_wu_frontmatter_field "$report" fanout)
@@ -10084,8 +10204,11 @@ _wu_fanout_preflight() {   # <report> ; sets _WU_FANOUT_LINE; rc 1 = refuse
     }
     [[ "$spawned" =~ ^[0-9]+$ ]] || spawned=0
     if [[ -n "$declared" ]]; then
-        if [[ "$declared" =~ ^([0-9]+)[[:space:]]+spawned[[:space:]]*/[[:space:]]*([0-9]+)[[:space:]]+returned$ ]]; then
-            d_spawned="${BASH_REMATCH[1]}"; d_returned="${BASH_REMATCH[2]}"
+        if [[ "$declared" =~ $_NG_FANOUT_RE ]]; then
+            # Base 10: `08` is an octal ERROR in (( )), which reads as false and
+            # silently skips every comparison below (bundle 21).
+            d_spawned=$(( 10#${BASH_REMATCH[1]} )); d_returned=$(( 10#${BASH_REMATCH[2]} ))
+            d_used="${BASH_REMATCH[4]}"; [[ -n "$d_used" ]] && d_used=$(( 10#$d_used ))
         else
             printf 'ng wrap-up: REFUSED — `fanout:` is malformed (%s); write `fanout: %s spawned / <returned> returned` (your-org/nexus-code#1140).\n' \
                 "$declared" "$spawned" >&2
@@ -10104,13 +10227,23 @@ _wu_fanout_preflight() {   # <report> ; sets _WU_FANOUT_LINE; rc 1 = refuse
             printf 'ng wrap-up: REFUSED — `fanout:` declares more returned (%s) than spawned (%s) (your-org/nexus-code#1140).\n' "$d_returned" "$d_spawned" >&2
             return 1
         fi
+        if [[ -n "$d_used" ]] && (( d_used > d_returned )); then
+            printf 'ng wrap-up: REFUSED — `fanout:` declares more used (%s) than returned (%s) (your-org/nexus-code#1140).\n' "$d_used" "$d_returned" >&2
+            return 1
+        fi
+        # All returned but some set aside: a NEUTRAL statement, never the
+        # INCOMPLETE line — the evidence set is complete, the report chose
+        # among it (your-org/nexus-code#1140).
+        if [[ -n "$d_used" ]] && (( d_returned == d_spawned && d_used < d_returned )); then
+            _WU_FANOUT_LINE="Fan-out: all ${d_spawned} subagents returned; ${d_used} of them are used by this report (the rest are set aside in the report) (your-org/nexus-code#1140)."
+        fi
         return 0
     fi
     if (( spawned > 0 )); then
         printf 'ng wrap-up: REFUSED — this session spawned %s subagent(s) (`Agent` tool uses in %s) and the report declares no `fanout:`. Add to the frontmatter:\n' \
             "$spawned" "$transcript" >&2
         printf '    fanout: %s spawned / <returned> returned\n' "$spawned" >&2
-        printf '  where <returned> is how many delivered a result this report USES. A verdict on a partial fan-out is not wrong to publish; it is wrong to publish silently (your-org/nexus-code#1140).\n' >&2
+        printf '  where <returned> is how many subagents RETURNED a result, whether or not the report uses it. If the report sets some returned results aside, append ` / <used> used` (used <= returned). A verdict on a partial fan-out is not wrong to publish; it is wrong to publish silently (your-org/nexus-code#1140).\n' >&2
         return 1
     fi
     return 0

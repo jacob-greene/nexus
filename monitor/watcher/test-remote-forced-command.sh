@@ -82,7 +82,7 @@ export NEXUS_CONFIG="$WORK/nexus.yml"
 # Present as sshd would present it, so gate 3 is exercised rather than tripped.
 # The fail-closed-on-unknown-peer behaviour itself is asserted directly in
 # test-remote-source-enforcement.sh, so nothing is lost by supplying it here.
-export SSH_CLIENT="140.107.116.184 51234 22022"
+export SSH_CLIENT="198.51.100.84 51234 22022"
 # Registration IS the enable signal (no MONITOR_REMOTE_ENABLED flag): the
 # wrapper gates on the nexus-remote-ssh row in services.registry. Register it.
 export NEXUS_SERVICES_REGISTRY="$WORK/services.registry"

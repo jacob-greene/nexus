@@ -147,12 +147,12 @@ _arm()  { printf 'armed\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" >> "$PEND/.$1.led
 _disc() { printf 'discharged\t%s\t%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "$6" "$7" >> "$PEND/.$1.ledger"; }
 _res()  { printf 'resolved\t-\t%s\t%s\t%s\n' "$2" "$3" "$4" >> "$PEND/.$1.ledger"; }
 
-# 1 — the report was AMENDED after arming (annzfix)
+# 1 — the report was AMENDED after arming (projfix)
 _arm  evfix-amended "$SHA_A" 2026-08-28T14:08:49-07:00 339 reports/amended.md
 for t in 14:51:38 14:53:07 14:53:37 14:54:27 15:00:53; do
     _disc evfix-amended "$SHA_B" "2026-08-28T${t}-07:00" check 339 evfix-amended-sk asserted-not-armed
 done
-# 2 — three rounds armed against ONE report path (annzpr11)
+# 2 — three rounds armed against ONE report path (projpr11)
 _arm  evfix-ambig "$SHA_A" 2026-08-28T15:46:04-07:00 339 reports/pr11.md
 _arm  evfix-ambig "$SHA_B" 2026-08-28T15:59:23-07:00 339 reports/pr11.md
 _arm  evfix-ambig "$SHA_C" 2026-08-28T16:17:59-07:00 339 reports/pr11.md
@@ -162,7 +162,7 @@ _arm  evfix-rearm "$SHA_A" 2026-08-27T23:18:16-07:00 1094 reports/devred.md
 _disc evfix-rearm "$SHA_A" 2026-08-27T23:52:33-07:00 check 1094 evfix-rearm-sk attributed
 _res  evfix-rearm 2026-08-28T16:23:48-07:00 "skeptic-channel.sh close" "channel closed by the reviewer"
 _arm  evfix-rearm "$SHA_D" 2026-08-28T16:43:31-07:00 1138 reports/devred.md
-# 4 — the HAPPY path in this ledger (overlaycontent / annzmerge)
+# 4 — the HAPPY path in this ledger (overlaycontent / projmerge)
 _arm  evfix-attributed "$SHA_A" 2026-08-28T15:54:10-07:00 338 reports/overlay.md
 _disc evfix-attributed "$SHA_A" 2026-08-28T16:35:22-07:00 check 338 evfix-attributed-sk attributed
 # CONTROL A — an arm and nothing else
@@ -436,7 +436,7 @@ assert_eq "the two 1be reasons DIFFER" \
 
 echo
 echo '=== The TWO-LEDGER desync is named on the obligation edge (#845 gate) ==='
-# `annzmerge` / `overlaycontent`: the skeptic ledger is fully settled — matching
+# `projmerge` / `overlaycontent`: the skeptic ledger is fully settled — matching
 # hash, `attributed` — while `$STATE_DIR/obligations` still holds a live edge.
 # The old refusal said "discharge with a verdict", i.e. redo work already done.
 if [[ -r "$REPO_ROOT/monitor/_obligations.sh" ]]; then

@@ -32,7 +32,7 @@
 # already too long. Nothing warns you; you just get reds.
 #
 # ---------------------------------------------------------------------------
-# MEASURED ON THIS HOST, not asserted. tmux 2.6, uid 71780, Linux 5.4.0:
+# MEASURED ON THIS HOST, not asserted. tmux 2.6, uid <uid>, Linux 5.4.0:
 #
 #   * python `socket.bind` on a 107-byte path succeeds; 108 fails
 #     `AF_UNIX path too long`. Same boundary through tmux itself: a composed
@@ -64,12 +64,12 @@
 #     caller, not on the limit.
 #
 #   * `TMPDIR` does NOT participate. With `TMUX_TMPDIR` unset and
-#     `TMPDIR=/tmp/c71780/tmpdirprobe`, the socket landed at
-#     `/tmp/tmux-71780/probeA`. Only `TMUX_TMPDIR`, else `/tmp`.
+#     `TMPDIR=/tmp/c<uid>/tmpdirprobe`, the socket landed at
+#     `/tmp/tmux-<uid>/probeA`. Only `TMUX_TMPDIR`, else `/tmp`.
 #
 #   * `-L` HONOURS `TMUX_TMPDIR` EVEN WHEN `$TMUX` IS SET. Measured inside a
-#     live pane (`TMUX=/tmp/tmux-71780/default,12,0`): `TMUX_TMPDIR=$T tmux -L
-#     wt new-session` created `$T/tmux-71780/wt`. This matters because the
+#     live pane (`TMUX=/tmp/tmux-<uid>/default,12,0`): `TMUX_TMPDIR=$T tmux -L
+#     wt new-session` created `$T/tmux-<uid>/wt`. This matters because the
 #     socket-precedence rule recorded elsewhere in this repo — `-L`/`-S` >
 #     `$TMUX` > `TMUX_TMPDIR` > default (`#644`) — is about WHICH SERVER a
 #     bare call reaches, not about which DIRECTORY an explicit `-L` resolves

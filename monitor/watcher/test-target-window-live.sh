@@ -128,6 +128,7 @@ wait_pane_dead() {
     return 1
 }
 
+# tmux-fixture-conf-lint: allow-wrapper-pins-f  FTMUX carries `-f "$WORK/tmux.conf"` (its definition above)
 "${FTMUX[@]}" new-session -d -s main -n base 'sleep 300'
 
 # ---- 1. a live window reads PRESENT -------------------------------
@@ -208,6 +209,7 @@ echo '=== real tmux: session scope preserved (-s, not -a) ==='
 "${FTMUX[@]}" kill-window -t orchestrator 2>/dev/null || true
 "${FTMUX[@]}" set-option -g remain-on-exit off 2>/dev/null || true
 "${FTMUX[@]}" new-window -d -n orchestrator 'sleep 300'      # live, in session `main`
+# tmux-fixture-conf-lint: allow-wrapper-pins-f  FTMUX carries `-f "$WORK/tmux.conf"` (its definition above)
 "${FTMUX[@]}" new-session -d -s elsewhere -n zz-other-session-only 'sleep 300'
 sleep 0.3
 # Precondition, asserted rather than assumed: tmux's notion of the

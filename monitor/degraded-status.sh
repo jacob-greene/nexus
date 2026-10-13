@@ -5,8 +5,8 @@
 #
 # TWO SOURCES, printed separately because they can disagree:
 #   watcher:  the status file the watcher keeps in its run dir OUTSIDE the
-#             tree (monitor/watcher/_fs_guard.sh: NEXUS_DEGRADED_RUNDIR,
-#             default /tmp/nexus-degraded-<uid>) — mode, onset, the errno of
+#             tree (monitor/_degraded-rundir.sh: derived from the managed
+#             $TMPDIR; NEXUS_DEGRADED_RUNDIR overrides) — mode, onset, the errno of
 #             its last note, how many notes went out and whether each was
 #             delivered or refused. This is where a note the orchestrator pane
 #             REFUSED (an operator draft in the box) can still be read.

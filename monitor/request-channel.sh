@@ -279,7 +279,7 @@ _validate_id() {
 #
 # The mint used `_chan_safe` (= `wk_encode`), whose escape is `%XX`, while
 # `_validate_id` — and `remote-forced-command.sh`'s await/fetch — accept only
-# `[A-Za-z0-9_-]`. So `--slug proj-S0.2` minted `…-proj-S0%2E2`, a request that
+# `[A-Za-z0-9_-]`. So `--slug proj-x0.2` minted `…-proj-x0%2E2`, a request that
 # `ack`/`reply`/`fail`/`show` all refused: the channel printed an id it could
 # not address. The mint is narrowed rather than the validator widened, because
 # the validator is the path-confinement guard and it has a second copy on the
@@ -1194,6 +1194,18 @@ cmd_reply() {
                         local _rl_reason; _rl_reason=$(tr '\n' ' ' < "$bodyfile" | sed 's/  */ /g; s/^ //; s/ $//')
                         _rl_out=$("$_rl_bin" release "$req_origin" \
                             --reason "spawn-skeptic request $id DECLINED by the orchestrator (gate asserted already discharged): $_rl_reason" 2>&1) || _rl_rc=$?
+                        if (( _rl_rc == 8 )); then
+                            # COULD NOT DETERMINE is not PENDING (your-org/nexus-code#1771).
+                            # Sending this caller to "drop --skeptic-resolved" sent them
+                            # to `resolve`, whose refusal on a discharged gate sends
+                            # them back here: two refusals, no path. `release` has
+                            # already retried the timed-out read; name the ONE remedy.
+                            rm -f "$bodyfile"
+                            printf 'request-channel: --skeptic-resolved asserts %s'"'"'s gate is ALREADY discharged, and the ledger could not answer (release rc 8: it timed out or failed on every attempt) — REFUSING to record the decline.\n' "$req_origin" >&2
+                            printf '%s\n' "$_rl_out" | sed 's/^/  /' >&2
+                            printf '  Nothing was written, and nothing was found pending. Re-run THIS SAME command once the ledger answers; dropping --skeptic-resolved will not help on a discharged gate.\n' >&2
+                            exit 6
+                        fi
                         if (( _rl_rc != 0 )); then
                             rm -f "$bodyfile"
                             printf 'request-channel: --skeptic-resolved asserts %s'"'"'s gate is ALREADY discharged, and that could not be confirmed (release rc %s) — REFUSING to record the decline.\n' "$req_origin" "$_rl_rc" >&2
@@ -1202,6 +1214,10 @@ cmd_reply() {
                             exit 6
                         fi
                         printf 'request-channel: released any await on %s'"'"'s own channel — a declined review closes that chain.\n' "$req_origin" >&2
+                        # Relay what release said, including a timed-out read it
+                        # retried (#1771): a slow ledger is worth seeing even when it
+                        # answered in the end.
+                        [[ -n "$_rl_out" ]] && printf '%s\n' "$_rl_out" | sed 's/^/  release: /' >&2
                     fi
                 else
                     [[ -n "$req_origin" ]] || { printf 'request-channel: spawn-skeptic decline for id %s has no `origin` in its frontmatter; cannot resolve a gate without a window\n' "$id" >&2; exit 6; }

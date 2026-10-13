@@ -109,6 +109,9 @@ EXIT CODES
   6  DRY RUN — nothing was modified, and you did not pass --yes
   7  REFUSED — the working tree has uncommitted changes
   8  REFUSED — cannot establish a git work-tree root (would scrub the caller's cwd)
+  10 a scrubbed shell/Python/JSON/YAML file no longer parses where its source did
+  11 a binary was rewritten, or is not reviewed in binaries.tsv at its current blob
+  12 verify-build.py could not run
 USAGE
         --) shift; [ $# -gt 0 ] && _MAP_ARG="$1"; break ;;
         -*) echo "build.sh: unknown flag: $1" >&2; exit 2 ;;
@@ -390,10 +393,27 @@ is_excl(){ local f; for f in "${EXCL[@]}"; do [ "$f" = "$1" ] && return 0; done;
 
 scrub_one(){ case "$1" in *.md|*.yml|*.yaml) perl "$SCRUB" "$MAP" angle;; *) perl "$SCRUB" "$MAP" bare;; esac; }
 
-# 1. scrub every non-symlink, non-excluded tracked file in place, preserving mode
+# BINARY files are NEVER scrubbed (your-org/nexus-code#1812). The scrub is a
+# case-insensitive TEXT substitution; on compressed data a short SOURCE token
+# matches by chance. Measured: a three-character token matched twice inside a
+# JPEG's entropy-coded data, the scrub inserted 8 bytes, and the mirror shipped
+# a corrupt image for weeks while every gate read clean. Binaries are copied
+# verbatim and must instead be REVIEWED by blob sha in binaries.tsv, which
+# verify-build.py enforces below (with an independent byte-identity check).
+# "Binary" is git's own classification (`ls-files --eol` = i/-text), the same
+# one `git grep` and `git diff` use.
+declare -A BINS=()
+while IFS= read -r -d '' _rec; do
+  case "$_rec" in "i/-text "*) BINS["${_rec#*$'\t'}"]=1;; esac
+done < <(git ls-files --eol -z)
+is_bin(){ [ -n "${BINS[$1]+x}" ]; }
+
+# 1. scrub every non-symlink, non-excluded, non-binary tracked file in place,
+#    preserving mode
 while IFS= read -r f; do
   is_sym "$f" && continue
   is_excl "$f" && continue
+  is_bin "$f" && continue
   [ -f "$f" ] || continue
   m=$(git ls-files -s -- "$f" | awk '{print $1}')
   scrub_one "$f" < "$f" > "$f.__s" && mv "$f.__s" "$f"
@@ -458,6 +478,21 @@ for ex in "${EXCL[@]}"; do
   fi
 done
 [ "$survivors" -eq 0 ] || { echo "build.sh: $survivors excluded path(s) still present; refusing to proceed." >&2; exit 3; }
+
+# 3b. VERIFY THE SCRUB DID NOT BREAK WHAT IT TOUCHED (your-org/nexus-code#1812).
+#    Runs while the INDEX still holds the pre-scrub source and the working tree
+#    holds the output (the renames below re-stage paths, so it must run first).
+#    Every binary must be byte-identical to its source blob AND reviewed in
+#    binaries.tsv; every scrubbed shell/Python/JSON/YAML file must still parse
+#    wherever its source parsed. Exit 10 = parse regression, 11 = a binary was
+#    rewritten or is unreviewed. A substitution that breaks code is fixed in the
+#    mapping (anchor it, or reword the source generically), never shipped.
+python3 "$_here/verify-build.py" "$_here/binaries.tsv"; _vb_rc=$?
+case "$_vb_rc" in
+  0) ;;
+  10|11) echo "build.sh: verify-build.py refused the output (exit $_vb_rc); refusing to proceed." >&2; exit "$_vb_rc" ;;
+  *) echo "build.sh: verify-build.py could not check the output (exit $_vb_rc); refusing to proceed." >&2; exit 12 ;;
+esac
 
 # 4. PATH RENAMES (post-scrub). A few basenames carry an internal identifier in
 #    the FILE NAME, which no amount of in-file substitution can reach. The

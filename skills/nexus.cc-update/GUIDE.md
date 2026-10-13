@@ -2267,6 +2267,29 @@ Hook events NOT covered by any scenario — `PostToolUse`, `Notification`,
 `PermissionRequest`, `UserPromptSubmit` — remain `source-inspection`.
 Say so; do not round them up to `gate`.
 
+**Instruction-file loading under `work/` (<your-org>/nexus-code#1779,
+#1671).** A cloned repo's CLAUDE.md, AGENTS.md or `.claude/rules/` file
+loads as PROJECT INSTRUCTIONS when an agent reads a file below it. That
+happens on Read and, since 2.1.293, on a single-file
+`cat`/`head`/`tail`/`sed -n`/`grep` in Bash. The nexus guard is a
+SETTINGS key, `claudeMdExcludes`, which `resolve-settings.sh --nexus-root`
+writes for workers and for the respawned orchestrator. Both halves are
+the harness's, so flag and re-measure any changelog entry that:
+- names CLAUDE.md, AGENTS.md, `.claude/rules`, "instruction file(s)",
+  "memory files" or `claudeMdExcludes`;
+- adds a tool or command that "now loads" nested files;
+- changes which settings sources may set `claudeMdExcludes` (2.1.293
+  strips it from launch-folder settings, which is what makes it safe
+  against a cloned repo).
+The measurement is `monitor/cc-harness/probe-instruction-files.sh` with
+`CLAUDE_BIN=<candidate>`: 17 arms, exit 0 only if every arm matches
+2.1.293's measured table. A mismatch on an `EXCLUDED` arm means the guard
+no longer holds and is a BLOCK until it is understood. A mismatch that
+only adds a new load route (for example `tail` or a pipeline starting to
+load) is covered by the guard, and needs only the table updated. The
+probe is not in the gate: it costs ~10 minutes, so run it when such an
+entry appears.
+
 ### 2e. CLI flags the nexus depends on
 
 Spawn surfaces invoke the binary with these — confirm each still works:

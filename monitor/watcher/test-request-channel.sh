@@ -656,7 +656,7 @@ echo "== 22. every id \`file\` prints is accepted by show/ack/reply (#1699) =="
 # of byte the old `%XX` mint produced — punctuation, path separators, space,
 # the escape character itself, multibyte UTF-8, and option-shaped / traversal-
 # shaped text. Each is filed twice: once acked, once replied.
-_rt_slugs=( 'proj-S0.2' 'a/b' 'has space' '100%' 'é✓ü' '-lead' '..' '../escape' 'a.b.c_d-e' )
+_rt_slugs=( 'proj-x0.2' 'a/b' 'has space' '100%' 'é✓ü' '-lead' '..' '../escape' 'a.b.c_d-e' )
 _rt_i=0
 for _rt_s in "${_rt_slugs[@]}"; do
     _rt_i=$((_rt_i + 1))
@@ -680,14 +680,14 @@ for _rt_s in "${_rt_slugs[@]}"; do
 done
 # The observed id, byte for byte: the dot is spelled inside the alphabet.
 export CHAN_TS_OVERRIDE=20260930T212144Z
-_rt_obs=$("$RC" file --origin proj-port-cc --kind spawn-skeptic --slug 'proj-S0.2' --message body)
+_rt_obs=$("$RC" file --origin proj-w5 --kind spawn-skeptic --slug 'proj-x0.2' --message body)
 # Identity on an already-valid slug: no existing id shape moves.
 _rt_id=$("$RC" file --origin w --kind question --slug 'keep_me-AS-is' --message body)
 # Two slugs that map to one stem in one second: distinct ids, never a shared file.
 _rt_c1=$("$RC" file --origin w --kind question --slug 'a.b'   --message one)
 _rt_c2=$("$RC" file --origin w --kind question --slug 'a_2Eb' --message two)
 unset CHAN_TS_OVERRIDE
-assert_eq "22: observed slug proj-S0.2 mints an addressable id" "$_rt_obs" "20260930T212144Z-proj-port-cc-proj-S0_2E2"
+assert_eq "22: observed slug proj-x0.2 mints an addressable id" "$_rt_obs" "20260930T212144Z-proj-w5-proj-x0_2E2"
 assert_eq "22: an already-valid slug is minted unchanged"      "$_rt_id"  "20260930T212144Z-w-keep_me-AS-is"
 assert_eq "22: a.b maps to a_2Eb"                              "$_rt_c1" "20260930T212144Z-w-a_2Eb"
 assert_eq "22: literal a_2Eb in the same second is disambiguated" "$_rt_c2" "20260930T212144Z-w-a_2Eb-01"

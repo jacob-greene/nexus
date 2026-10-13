@@ -116,7 +116,7 @@ trap 'rm -rf "$WORK"' EXIT
 fixture() {
     local repo="$WORK/$1"
     mkdir -p "$repo/pm"
-    cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$repo/pm/"
+    cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/verify-build.py" "$repo/pm/"
     cat > "$repo/pm/mapping.tsv" <<'MAP'
 map	fixtureorg/thing	public-org/thing	<public-org>/thing
 map	fixtureorg	public-org	<public-org>
@@ -259,7 +259,14 @@ mkdir -p "$ng"
 printf 'work that must survive
 ' > "$ng/precious.txt"
 before=$(fingerprint "$ng")
-ng_out=$( cd "$ng" && bash "$TOOLKIT/build.sh" --yes 2>&1 ); ng_rc=$?
+# An EXPLICIT, readable fixture mapping, outside the non-git dir: the mapping
+# check runs first (exit 2), so relying on the default `$TOOLKIT/mapping.tsv`
+# made this section answer a question about the DICTIONARY rather than the
+# work-tree root. On a public export that file is excluded by design, and §7
+# read exit 2 there (your-org/nexus-code#1812).
+ng_map="$WORK/s7-mapping.tsv"
+printf 'map\tzzsecret\tzzpublic\n' > "$ng_map"
+ng_out=$( cd "$ng" && bash "$TOOLKIT/build.sh" --yes "$ng_map" 2>&1 ); ng_rc=$?
 after=$(fingerprint "$ng")
 assert_eq       "§7 a non-git cwd exits 8, not 0"                "$ng_rc" "8"
 assert_eq       "§7 …and the directory is byte-identical after"  "$after" "$before"

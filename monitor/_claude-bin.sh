@@ -103,6 +103,179 @@ else
     _CLAUDE_TIMEOUT_BIN=""
 fi
 
+# ---------------------------------------------------------------------------
+# ONE `--help` PER PROCESS, AND A DISK CACHE OF COMPLETED ANSWERS
+# (your-org/nexus-code#1721)
+# ---------------------------------------------------------------------------
+# Both probes below read the SAME help text, and on a spawn they are asked in
+# the same process (`--name`, then `--plugin-dir`). Each used to run its own
+# `--help`, so a loaded login node paid the bound twice per launch, and every
+# launcher paid it again because nothing outlived the process. Measured on
+# another operator's board (your-org/your-nexus#395): 4 of 5 orchestrator
+# boots at load ~130-144 logged `armed-unprobed` behind two TIMED OUT --help
+# probes — correct outcomes, read by the operator as failures.
+#
+# _claude_help_answers resolves BOTH answers from ONE source, in order:
+#   1. this process's memo, keyed on $CLAUDE_BIN — set only by 2 or 3;
+#   2. the disk cache, keyed on realpath($CLAUDE_BIN) + size + mtime + inode;
+#   3. ONE bounded `--help`, whose COMPLETED answers are memoised and written
+#      to the disk cache.
+# A probe that did NOT complete (timeout, or no bytes) is memoised NOWHERE —
+# not in this process, not on disk. That is #1611's rule ("UNKNOWN IS NEVER
+# CACHED … the next ask may find an idle node"), kept whole: a second ask in
+# the same process after an UNKNOWN re-probes, so on a loaded node the two
+# timeouts of one launch remain two. What this buys is that the slow case
+# becomes RARE: after the first COMPLETED probe of a binary, no launch of that
+# binary runs `--help` at all, on any load.
+#
+# WHY THE KEY IS SOUND. A binary only changes at a cc-update, which replaces
+# the file the symlink resolves to (new realpath, size or mtime) — so the key
+# cannot outlive the bytes that produced the answer. The bet it makes is that
+# `--help` is a function of the binary alone; a stub whose help text varies by
+# ENVIRONMENT at one fixed path breaks that bet, which is why the cache is OFF
+# under a test fence (below).
+#
+# WHERE: $NEXUS_CLAUDE_HELP_CACHE_DIR when SET (the EMPTY string disables the
+# disk cache — `${VAR+set}`, as for the timeout seam above); otherwise
+# ${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}/claude-help-cache, and NOT AT
+# ALL when $NEXUS_TEST_FENCE is set (a suite never writes a real .state, and a
+# fixture stub must not inherit another case's answer; a suite that tests the
+# cache names its directory explicitly). The leaf directory is created only
+# when its parent exists, so a fixture NEXUS_ROOT with no .state stays clean.
+# Writes are tmp + mv in the same directory (atomic rename). A read that
+# fails, or a file that is not exactly `<key>\n<yes|no> <yes|no>\n` for THIS
+# key, is ignored and the probe runs — a cache can only ever save a probe,
+# never supply an answer it cannot vouch for.
+_claude_help_cache_dir() {   # -> the directory; rc 1 = disk cache disabled
+    if [[ -n "${NEXUS_CLAUDE_HELP_CACHE_DIR+set}" ]]; then
+        [[ -n "$NEXUS_CLAUDE_HELP_CACHE_DIR" ]] || return 1
+        printf '%s' "$NEXUS_CLAUDE_HELP_CACHE_DIR"
+        return 0
+    fi
+    [[ -z "${NEXUS_TEST_FENCE:-}" ]] || return 1
+    # FENCED AT THE SOURCE, not per suite: the default location serves ONLY
+    # this nexus's own pinned binary. A stub or fixture binary (every suite
+    # that drives _claude-bin.sh) is never cached by default, whether or not
+    # the suite sourced _test_helpers.sh and so got NEXUS_TEST_FENCE. Measured:
+    # test-respawn.sh, which does not, wrote the cache into the decoy root in
+    # CI's fixture-band decoy gate, and would write the LIVE primary's .state
+    # from an agent shell (your-org/nexus-code#1721, skeptic on #1781).
+    local pinned='' rp=''
+    pinned=$(readlink -f -- "$NEXUS_ROOT/node_modules/.bin/claude" 2>/dev/null) || return 1
+    rp=$(readlink -f -- "${CLAUDE_BIN:-}" 2>/dev/null) || return 1
+    [[ -n "$pinned" && -f "$pinned" && "$rp" == "$pinned" ]] || return 1
+    printf '%s' "${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}/claude-help-cache"
+}
+
+_claude_help_key() {   # -> "<size> <mtime.ns> <inode> <realpath>"; rc 1 = unkeyable
+    local rp='' st=''
+    rp=$(readlink -f -- "$CLAUDE_BIN" 2>/dev/null) || return 1
+    [[ -n "$rp" && -f "$rp" ]] || return 1
+    st=$(stat -L -c '%s %.9Y %i' -- "$rp" 2>/dev/null) || return 1
+    # Validate the SHAPE: a `stat` without %.9Y prints something else at rc 0,
+    # and an unvalidated key would still "match" itself on the next read.
+    [[ "$st" =~ ^[0-9]+\ [0-9]+(\.[0-9]+)?\ [0-9]+$ ]] || return 1
+    printf '%s %s' "$st" "$rp"
+}
+
+# _claude_help_answers
+#   rc 0  COMPLETED: $_CLAUDE_HELP_ANS_NAME and $_CLAUDE_HELP_ANS_PLUGIN_DIR
+#         are `yes`/`no` (from the memo, the disk cache, or one --help).
+#   rc 1  NOT completed: $_CLAUDE_HELP_FAIL is `timeout` or `empty`, and
+#         $_CLAUDE_HELP_RC is the status. Nothing was memoised or written.
+# The warnings stay in the two callers, which decide per FLAG what an answer
+# or an UNKNOWN means; this function only establishes what the binary said.
+_claude_help_answers() {
+    _CLAUDE_HELP_FAIL=''
+    _CLAUDE_HELP_RC=0
+    if [[ -n "${_CLAUDE_HELP_MEMO_BIN:-}" && "$_CLAUDE_HELP_MEMO_BIN" == "$CLAUDE_BIN" ]]; then
+        return 0
+    fi
+    local dir='' key='' f='' k='' a='' extra='' help_out='' _rc=0 _bounded=0 tmp=''
+    if dir=$(_claude_help_cache_dir) && key=$(_claude_help_key); then
+        f="$dir/claude-help-$(printf '%s' "$key" | cksum | tr ' ' '-').v1"
+        if [[ -f "$f" ]] \
+           && { IFS= read -r k && IFS= read -r a && ! IFS= read -r extra; } < "$f" 2>/dev/null \
+           && [[ "$k" == "$key" && "$a" =~ ^(yes|no)\ (yes|no)$ ]]; then
+            _CLAUDE_HELP_ANS_NAME="${BASH_REMATCH[1]}"
+            _CLAUDE_HELP_ANS_PLUGIN_DIR="${BASH_REMATCH[2]}"
+            _CLAUDE_HELP_MEMO_BIN="$CLAUDE_BIN"
+            return 0
+        fi
+    else
+        f=''
+    fi
+
+    # Capture BEFORE testing: `cmd | grep` would report grep's status, not
+    # claude's, and a claude that failed to run would read as "no such flag"
+    # (CLAUDE.md, pipeline-status entry). $_rc is read on the very next line
+    # because anything executing in between is a write to $?.
+    if [[ -n "$_CLAUDE_TIMEOUT_BIN" ]]; then
+        _bounded=1
+        help_out=$("$_CLAUDE_TIMEOUT_BIN" -k 2 "$NEXUS_CLAUDE_HELP_TIMEOUT" "${CLAUDE_BIN}" --help 2>/dev/null)
+        _rc=$?
+    else
+        # No `timeout` on this host: the #1289 wedge is UNBOUNDED again. Say so
+        # rather than degrade in silence — a missing bound is exactly the
+        # condition whose whole symptom is that nothing appears to be wrong.
+        echo "_claude-bin: no 'timeout' binary found — probing '${CLAUDE_BIN} --help' UNBOUNDED. On the watcher respawn path a hang here holds the in-flight guard and the orchestrator stays dead (your-org/nexus-code#1289)." >&2
+        help_out=$("${CLAUDE_BIN}" --help 2>/dev/null)
+        _rc=$?
+    fi
+
+    # A TIMEOUT IS NOT "THE BINARY SAID NO" — and it is not even in the
+    # callee's vocabulary (your-org/nexus-code#1248). `timeout` INJECTS 124
+    # (TERM fired), 137 (KILL after the `-k` grace) or 125 (`timeout` itself
+    # failed). Measured on this host, GNU coreutils 8.28. Tested as a SET and
+    # FIRST, before any look at content: a probe that had to be killed already
+    # cost the respawn lock, and whatever partial bytes it flushed are not an
+    # answer. The `_bounded` gate matters — without it, an UNBOUNDED claude
+    # that happened to exit 124 would be mislabelled a timeout.
+    if (( _bounded )) && { (( _rc == 124 )) || (( _rc == 125 )) || (( _rc == 137 )); }; then
+        _CLAUDE_HELP_FAIL=timeout
+        _CLAUDE_HELP_RC=$_rc
+        return 1
+    fi
+    if [[ -z "$help_out" ]]; then
+        _CLAUDE_HELP_FAIL=empty
+        _CLAUDE_HELP_RC=$_rc
+        return 1
+    fi
+    # ONLY A COMPLETE, rc-0 ANSWER IS AN ANSWER (#1611's rule, skeptic on
+    # #1781). A --help that printed a partial usage and then failed would read
+    # as "no" for both flags, and with the disk cache that "no" would outlive
+    # the process: every later launch drops --name and --plugin-dir until the
+    # binary changes. The real binary's --help exits 0 (2.1.293, measured), so
+    # this costs nothing on the path that matters.
+    if (( _rc != 0 )); then
+        _CLAUDE_HELP_FAIL=incomplete
+        _CLAUDE_HELP_RC=$_rc
+        return 1
+    fi
+
+    _CLAUDE_HELP_ANS_NAME=no
+    _CLAUDE_HELP_ANS_PLUGIN_DIR=no
+    case "$help_out" in *"--name <name>"*)       _CLAUDE_HELP_ANS_NAME=yes ;; esac
+    case "$help_out" in *"--plugin-dir <path>"*) _CLAUDE_HELP_ANS_PLUGIN_DIR=yes ;; esac
+    _CLAUDE_HELP_MEMO_BIN="$CLAUDE_BIN"
+
+    # Best-effort write: a cache that cannot be written costs the next launch
+    # one probe, nothing more, so a failure here is silent by design.
+    if [[ -n "$f" ]]; then
+        [[ -d "$dir" ]] || { [[ -d "$(dirname -- "$dir")" ]] && mkdir -- "$dir" 2>/dev/null; }
+        if [[ -d "$dir" ]]; then
+            tmp="$f.tmp.$$"
+            if printf '%s\n%s %s\n' "$key" "$_CLAUDE_HELP_ANS_NAME" "$_CLAUDE_HELP_ANS_PLUGIN_DIR" > "$tmp" 2>/dev/null \
+               && mv -f -- "$tmp" "$f" 2>/dev/null; then
+                :
+            else
+                rm -f -- "$tmp" 2>/dev/null
+            fi
+        fi
+    fi
+    return 0
+}
+
 # claude_supports_name_flag
 #
 # Capability probe for `-n/--name <name>` ("Set a display name for this
@@ -168,65 +341,44 @@ fi
 # that in production; test-session-name-from-window.sh probes several different
 # binaries, and gets a fresh answer each time because every probe runs in its
 # own `( … )` subshell rather than by clearing the cache. A caller that must
-# re-ask in ONE shell has to unset $_CLAUDE_NAME_FLAG_CACHED itself.
-# The cache is not exported, so a child process re-probes (one `--help` per
-# spawned launcher, which is the intended cost).
+# re-ask in ONE shell has to unset $_CLAUDE_NAME_FLAG_CACHED itself — and,
+# to re-PROBE the same $CLAUDE_BIN rather than reuse its completed --help,
+# $_CLAUDE_HELP_MEMO_BIN as well (that memo IS keyed on $CLAUDE_BIN).
+# The flag cache is not exported. Underneath it, the `--help` itself is shared
+# with claude_supports_plugin_dir_flag and cached ON DISK per binary
+# (_claude_help_answers above, your-org/nexus-code#1721), so a child process
+# re-ASKS but does not re-PROBE once any process has completed a probe of
+# that binary; the warnings below still fire once per process.
 claude_supports_name_flag() {
     _CLAUDE_NAME_FLAG_UNKNOWN_REASON=''
     if [[ -n "${_CLAUDE_NAME_FLAG_CACHED:-}" ]]; then
         [[ "$_CLAUDE_NAME_FLAG_CACHED" == "yes" ]] && return 0
         return 1
     fi
-    local help_out='' _rc=0 _bounded=0
-    # Capture BEFORE testing: `cmd | grep` would report grep's status, not
-    # claude's, and a claude that failed to run would read as "no such flag"
-    # (CLAUDE.md, pipeline-status entry). `local` is declared SEPARATELY from
-    # the assignment for the same family of reason: `local x=$(cmd)` returns
-    # `local`'s status, not the command's, and $_rc is read on the very next
-    # line because anything executing in between is a write to $?.
-    if [[ -n "$_CLAUDE_TIMEOUT_BIN" ]]; then
-        _bounded=1
-        help_out=$("$_CLAUDE_TIMEOUT_BIN" -k 2 "$NEXUS_CLAUDE_HELP_TIMEOUT" "${CLAUDE_BIN}" --help 2>/dev/null)
-        _rc=$?
-    else
-        # No `timeout` on this host: the #1289 wedge is UNBOUNDED again. Say so
-        # rather than degrade in silence — a missing bound is exactly the
-        # condition whose whole symptom is that nothing appears to be wrong.
-        echo "_claude-bin: no 'timeout' binary found — probing '${CLAUDE_BIN} --help' UNBOUNDED. On the watcher respawn path a hang here holds the in-flight guard and the orchestrator stays dead (your-org/nexus-code#1289)." >&2
-        help_out=$("${CLAUDE_BIN}" --help 2>/dev/null)
-        _rc=$?
-    fi
-
-    # A TIMEOUT IS NOT "THE BINARY SAID NO" — and it is not even in the
-    # callee's vocabulary (your-org/nexus-code#1248). `timeout` INJECTS 124
-    # (TERM fired) or, with -k, 137 (KILL after the grace). Measured on this
-    # host, GNU coreutils 8.28. Both are indistinguishable from a claude exit
-    # code unless they are named here, so they are checked FIRST and BEFORE
-    # any look at content: a probe that had to be killed already cost the
-    # respawn lock, and whatever partial bytes it flushed are not an answer.
-    # The `_bounded` gate matters — without it, an UNBOUNDED claude that
-    # happened to exit 124 would be mislabelled a timeout.
-    # The SET, as in claude_supports_plugin_dir_flag: 125 is `timeout` itself
-    # failing, also not the callee's answer.
-    if (( _bounded )) && { (( _rc == 124 )) || (( _rc == 125 )) || (( _rc == 137 )); }; then
-        _CLAUDE_NAME_FLAG_UNKNOWN_REASON="--help probe TIMED OUT (rc ${_rc}, bound ${NEXUS_CLAUDE_HELP_TIMEOUT}s) — capability not established"
-        echo "_claude-bin: '${CLAUDE_BIN} --help' TIMED OUT after ${NEXUS_CLAUDE_HELP_TIMEOUT}s (killed, rc ${_rc}) — --name support is UNKNOWN, not 'unsupported'; not cached, PASSING --name on the pinned binary's word. If this binary lacks it the launch fails at once with 'error: unknown option' (your-org/nexus-code#1047, #1611's rule; bound per #1289)." >&2
-        return 0
-    fi
-    if [[ -z "$help_out" ]]; then
+    if ! _claude_help_answers; then
+        if [[ "$_CLAUDE_HELP_FAIL" == timeout ]]; then
+            # A degraded probe, NOT an error (your-org/nexus-code#1721): the
+            # binary was not slow to say no, it was not heard at all, and the
+            # launch proceeds on the pinned binary's word. Worded so that the
+            # operator reading it on a loaded node does not file it as a fault.
+            _CLAUDE_NAME_FLAG_UNKNOWN_REASON="--help probe TIMED OUT (rc ${_CLAUDE_HELP_RC}, bound ${NEXUS_CLAUDE_HELP_TIMEOUT}s) — capability not established"
+            echo "_claude-bin: degraded probe, not an error — '${CLAUDE_BIN} --help' did not answer within ${NEXUS_CLAUDE_HELP_TIMEOUT}s (TIMED OUT, killed, rc ${_CLAUDE_HELP_RC}; a loaded node?). --name support is UNKNOWN, not 'unsupported'; not cached; passing --name on the pinned binary's word. Only if this binary lacks it does the launch fail, at once, with 'error: unknown option' (your-org/nexus-code#1047, #1611's rule; bound per #1289)." >&2
+            return 0
+        fi
         # Could not ask, and NOT for want of time: the binary ran (or could not
         # be run) and printed nothing. Fail CLOSED on the FLAG (omit it),
         # loudly, as before — this is not the load case the TIMEOUT arm above
         # bets on, and test-session-name-from-window.sh section 4 pins it. But
         # NOT cached: it is no answer about the flag either, so the next ask
         # re-probes rather than inheriting it (skeptic pass on #1626).
-        _CLAUDE_NAME_FLAG_UNKNOWN_REASON="--help produced no output (rc ${_rc}) — capability not established"
-        echo "_claude-bin: could not read '${CLAUDE_BIN} --help' (rc ${_rc}) — NOT passing --name (not cached); this session will self-name from its cwd basename and will not be addressable by its tmux window name (your-org/nexus-code#1047)." >&2
+        _CLAUDE_NAME_FLAG_UNKNOWN_REASON="--help did not complete (${_CLAUDE_HELP_FAIL}, rc ${_CLAUDE_HELP_RC}) — capability not established"
+        echo "_claude-bin: could not read '${CLAUDE_BIN} --help' (rc ${_CLAUDE_HELP_RC}) — NOT passing --name (not cached); this session will self-name from its cwd basename and will not be addressable by its tmux window name (your-org/nexus-code#1047)." >&2
         return 1
     fi
-    case "$help_out" in
-        *"--name <name>"*) _CLAUDE_NAME_FLAG_CACHED=yes; return 0 ;;
-    esac
+    if [[ "$_CLAUDE_HELP_ANS_NAME" == yes ]]; then
+        _CLAUDE_NAME_FLAG_CACHED=yes
+        return 0
+    fi
     _CLAUDE_NAME_FLAG_CACHED=no
     echo "_claude-bin: this claude does not support '--name' — NOT passing it; this session will self-name from its cwd basename and will not be addressable by its tmux window name (your-org/nexus-code#1047)." >&2
     return 1
@@ -260,10 +412,12 @@ claude_supports_name_flag() {
 # not tell' collapses into 'no'".
 #
 # UNKNOWN IS NEVER CACHED — only a COMPLETED probe is memoised in
-# $_CLAUDE_PLUGIN_DIR_FLAG_CACHED (cache lifetime as documented above). A
-# caller that asks again in the same shell re-probes, which is the point: the
-# next ask may find an idle node. The reason is left in
-# $_CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON for the caller to log.
+# $_CLAUDE_PLUGIN_DIR_FLAG_CACHED (cache lifetime as documented above), and
+# only a COMPLETED `--help` reaches the shared memo or the disk cache
+# (_claude_help_answers, your-org/nexus-code#1721). A caller that asks again
+# in the same shell re-probes, which is the point: the next ask may find an
+# idle node. The reason is left in $_CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON for
+# the caller to log.
 #
 # WHAT THE CALLER DOES WITH UNKNOWN is policy and lives in
 # monitor/_longjob-plugin.sh (it arms, logged `armed-unprobed`). This function
@@ -271,38 +425,29 @@ claude_supports_name_flag() {
 # unsupported flag is FATAL to `claude` (`error: unknown option`, exit 1 —
 # measured, see claude_supports_name_flag's header), so UNKNOWN is not "safe to
 # pass" in general; it is safe only where the binary is known to be the pinned
-# one, and that argument is made at the call site, not here.
+# one, and that argument is made at the call site, not here. The stderr line
+# names that policy all the same, worded as a DEGRADED PROBE rather than an
+# error (#1721): it is what the operator reads, and it read as a fault.
 claude_supports_plugin_dir_flag() {
     _CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON=''
     if [[ -n "${_CLAUDE_PLUGIN_DIR_FLAG_CACHED:-}" ]]; then
         [[ "$_CLAUDE_PLUGIN_DIR_FLAG_CACHED" == "yes" ]] && return 0
         return 1
     fi
-    local help_out='' _rc=0 _bounded=0
-    if [[ -n "$_CLAUDE_TIMEOUT_BIN" ]]; then
-        _bounded=1
-        help_out=$("$_CLAUDE_TIMEOUT_BIN" -k 2 "$NEXUS_CLAUDE_HELP_TIMEOUT" "${CLAUDE_BIN}" --help 2>/dev/null)
-        _rc=$?
-    else
-        help_out=$("${CLAUDE_BIN}" --help 2>/dev/null)
-        _rc=$?
-    fi
-    # The SET the wrapper can inject with `-k 2` and the default signal: 124
-    # (TERM fired), 137 (KILL after the grace), 125 (`timeout` itself failed).
-    # Tested as a set, never as `== 124` (CLAUDE.md TIMEOUT-STATUS-INJECTION).
-    if (( _bounded )) && { (( _rc == 124 )) || (( _rc == 125 )) || (( _rc == 137 )); }; then
-        _CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON="--help probe TIMED OUT (rc ${_rc}, bound ${NEXUS_CLAUDE_HELP_TIMEOUT}s) — capability not established"
-        echo "_claude-bin: '${CLAUDE_BIN} --help' TIMED OUT after ${NEXUS_CLAUDE_HELP_TIMEOUT}s (killed, rc ${_rc}) — --plugin-dir support is UNKNOWN, not 'unsupported'; not cached (your-org/nexus-code#1611)." >&2
+    if ! _claude_help_answers; then
+        if [[ "$_CLAUDE_HELP_FAIL" == timeout ]]; then
+            _CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON="--help probe TIMED OUT (rc ${_CLAUDE_HELP_RC}, bound ${NEXUS_CLAUDE_HELP_TIMEOUT}s) — capability not established"
+            echo "_claude-bin: degraded probe, not an error — '${CLAUDE_BIN} --help' did not answer within ${NEXUS_CLAUDE_HELP_TIMEOUT}s (TIMED OUT, killed, rc ${_CLAUDE_HELP_RC}; a loaded node?). --plugin-dir support is UNKNOWN, not 'unsupported'; not cached; a launch path that arms on it passes --plugin-dir on the pinned binary's word (armed-unprobed; your-org/nexus-code#1611, #1721)." >&2
+            return 2
+        fi
+        _CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON="--help did not complete (${_CLAUDE_HELP_FAIL}, rc ${_CLAUDE_HELP_RC}) — capability not established"
+        echo "_claude-bin: degraded probe — could not read '${CLAUDE_BIN} --help' (rc ${_CLAUDE_HELP_RC}). --plugin-dir support is UNKNOWN, not 'unsupported'; not cached; a launch path that arms on it passes --plugin-dir on the pinned binary's word (armed-unprobed; your-org/nexus-code#1611, #1721)." >&2
         return 2
     fi
-    if [[ -z "$help_out" ]]; then
-        _CLAUDE_PLUGIN_DIR_FLAG_UNKNOWN_REASON="--help produced no output (rc ${_rc}) — capability not established"
-        echo "_claude-bin: could not read '${CLAUDE_BIN} --help' (rc ${_rc}) — --plugin-dir support is UNKNOWN, not 'unsupported'; not cached (your-org/nexus-code#1611)." >&2
-        return 2
+    if [[ "$_CLAUDE_HELP_ANS_PLUGIN_DIR" == yes ]]; then
+        _CLAUDE_PLUGIN_DIR_FLAG_CACHED=yes
+        return 0
     fi
-    case "$help_out" in
-        *"--plugin-dir <path>"*) _CLAUDE_PLUGIN_DIR_FLAG_CACHED=yes; return 0 ;;
-    esac
     _CLAUDE_PLUGIN_DIR_FLAG_CACHED=no
     echo "_claude-bin: this claude does not support '--plugin-dir' (its --help was read and does not list it) — NOT passing it; this session will have NO longjob-watch dispatcher and cannot be woken by a long job (your-org/nexus-code#1535)." >&2
     return 1

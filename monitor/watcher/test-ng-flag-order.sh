@@ -430,11 +430,18 @@ _order_sensitive() {   # <ng> <verb...>  → rc0 when flag-first is rejected and
     local -a arities=(1 2) n
     for n in "${arities[@]}"; do
         local -a pos=("$POS1"); (( n == 2 )) && pos=("$POS1" "$POS2")
-        NG_BIN="$ng" run_ng sw_o sw_e sw_r "$@" "${pos[@]}" --repo "$BAD"
-        local last_bad=0; _names_a_supplied_token "$sw_e" && last_bad=1
+        # Flags-FIRST runs first, and flags-last only when flags-first was
+        # rejected: the finding is `first_bad && !last_bad`, so a clean
+        # flags-first already decides this arity. Same verdict, half the `ng`
+        # invocations on a clean sweep; each costs 0.5-4 s at load ~75, and the
+        # full four-per-verb sweep pushed this suite past the 1200 s local
+        # ceiling (your-org/nexus-code#1789).
         NG_BIN="$ng" run_ng sw_o sw_e sw_r "$@" --repo "$BAD" "${pos[@]}"
         local first_bad=0; _names_a_supplied_token "$sw_e" && first_bad=1
-        (( first_bad == 1 && last_bad == 0 )) && return 0
+        (( first_bad )) || continue
+        NG_BIN="$ng" run_ng sw_o sw_e sw_r "$@" "${pos[@]}" --repo "$BAD"
+        local last_bad=0; _names_a_supplied_token "$sw_e" && last_bad=1
+        (( last_bad == 0 )) && return 0
     done
     return 1
 }
@@ -652,10 +659,14 @@ _sweep() {   # <ng-binary> <hits-out> [verb …]; prints nothing, writes offende
     # the value would die with the function. Measured — it failed exactly so.
     local ng="$1" out="$2"; shift 2
     local v sv verbs
-    verbs=$( (( $# )) && printf '%s\n' "$@" || _dispatch_verbs )
+    verbs=$( (( $# )) && printf '%s\n' "$@" || printf '%s\n' "$_DISPATCH_VERBS" )
     : > "$out"
+    _SWEEP_VERBS=0
     while IFS= read -r v; do
-        local subs; subs=$(_subs_for "$v")
+        [[ -n "$v" ]] || continue
+        _SWEEP_VERBS=$(( _SWEEP_VERBS + 1 ))
+        local subs
+        if [[ -n "${_SUBS_OF[$v]+set}" ]]; then subs=${_SUBS_OF[$v]}; else subs=$(_subs_for "$v"); fi
         if [[ -n "$subs" ]]; then
             for sv in $subs; do
                 _order_sensitive "$ng" "$v" "$sv" && printf 'ng %s %s\n' "$v" "$sv" >> "$out"
@@ -717,7 +728,7 @@ _install_delegated_into_fixture() {
             cp "$_test_dir/../$tgt" "$FAKE_NEXUS/monitor/$tgt"
             chmod +x "$FAKE_NEXUS/monitor/$tgt"
         done < <(_delegates_for "$v")
-    done < <(_dispatch_verbs)
+    done <<<"$_DISPATCH_VERBS"
     # POSITIVE CONTROL on the exclusion above: the fixture must be able to
     # mint AFTER the installer has run. Without this, a future edit that
     # re-clobbers the stub silently restores the old dependency and the
@@ -744,10 +755,25 @@ _install_delegated_into_fixture() {
         done
     done
 }
+# THE POPULATIONS, BUILT ONCE (your-org/nexus-code#1704). The verb list and
+# every verb's sub-verb pairs are a pure function of $NG_SRC and the scripts
+# beside it, which nothing in this file modifies (every plant below goes into
+# $FAKE_NEXUS). They used to be re-derived by each consumer — the installer,
+# VERB_COUNT, B-REACH, B-DOC and every `_sweep` — at ~19 s a rebuild under
+# load. Each consumer now reads these, so the enumeration they reconcile is
+# also literally the same one.
+_DISPATCH_VERBS=$(_dispatch_verbs)
+declare -A _PAIRS_OF=() _SUBS_OF=()
+while IFS= read -r _v; do
+    [[ -n "$_v" ]] || continue
+    _PAIRS_OF[$_v]=$(_subs_pairs_for "$_v")
+    _SUBS_OF[$_v]=$(printf '%s\n' "${_PAIRS_OF[$_v]}" | gawk 'NF{print $2}' | sort -u)
+done <<<"$_DISPATCH_VERBS"
+
 _install_delegated_into_fixture
 
 NG_BIN="$NG"
-VERB_COUNT=$(_dispatch_verbs | wc -l)
+VERB_COUNT=$(printf '%s\n' "$_DISPATCH_VERBS" | grep -c .)
 if (( VERB_COUNT >= 40 )); then
     pass "B the sweep enumerated a plausible verb population ($VERB_COUNT dispatcher verbs [$(_slack "$VERB_COUNT" 40)])"
 else
@@ -778,8 +804,8 @@ while IFS= read -r _v; do
         [[ "$_tgt" != '-' ]] && _B_ACTUAL+="$_tgt $_sv"$'\n'
         run_ng rch_o rch_e rch_r "$_v" "$_sv" --repo "$BAD"
         [[ "$rch_e" == *'not found or not executable'* ]] && printf 'ng %s %s\n' "$_v" "$_sv" >> "$WORK/unreachable.txt"
-    done < <(_subs_pairs_for "$_v")
-done < <(_dispatch_verbs)
+    done <<<"${_PAIRS_OF[$_v]}"
+done <<<"$_DISPATCH_VERBS"
 assert_empty "B-REACH every sub-verb reaches its own parser, none dies at a delegator gate" "$(<"$WORK/unreachable.txt")"
 
 # B-REACH-POP — the NON-VACUITY OF THE ABOVE, DERIVED (your-org/nexus-code#943).
@@ -845,13 +871,13 @@ assert_empty "B-REACH-POP …and the probe invented none the scripts do not disp
 : > "$WORK/undocumented-gap.txt"
 _B_DOC=0
 while IFS= read -r _v; do
-    _probed=" $(_subs_for "$_v" | tr '\n' ' ')"
+    _probed=" $(printf '%s\n' "${_SUBS_OF[$_v]}" | tr '\n' ' ')"
     while IFS= read -r _d; do
         [[ -n "$_d" ]] || continue
         _B_DOC=$(( _B_DOC + 1 ))
         [[ "$_probed" == *" $_d "* ]] || printf 'ng %s %s\n' "$_v" "$_d" >> "$WORK/undocumented-gap.txt"
     done < <(_subs_documented_for "$_v")
-done < <(_dispatch_verbs)
+done <<<"$_DISPATCH_VERBS"
 assert_empty "B-DOC every sub-verb ng --help documents is one the sweep probes" "$(<"$WORK/undocumented-gap.txt")"
 if (( _B_DOC >= 16 )); then
     pass "B-DOC …and the documentation axis found sub-verbs to reconcile ($_B_DOC [$(_slack "$_B_DOC" 16)])"
@@ -861,6 +887,11 @@ fi
 
 _sweep "$NG" "$WORK/sweep-live.txt"
 assert_empty "B no verb is ORDER-SENSITIVE (flag-first rejected, flag-last accepted)" "$(<"$WORK/sweep-live.txt")"
+# The LIVE sweep walked the WHOLE dispatcher population. This is the
+# non-vacuity the planted control below used to supply as a side effect, when
+# it re-swept every verb: it now sweeps only the planted one (#1704), so the
+# default (no-verb-list) enumeration path is pinned here instead.
+assert_eq "B the live sweep walked every dispatcher verb" "$_SWEEP_VERBS" "$VERB_COUNT"
 
 # B POSITIVE CONTROL — the sweep must be able to SEE the defect. Without this
 # the assertion above is an absence produced by a probe nobody proved works,
@@ -913,7 +944,11 @@ assert s.count(new) == 1, "plant anchor missing/not unique"
 open(dst, 'w').write(s.replace(new, old, 1))
 PY
 chmod +x "$PLANTED_NG"
-_sweep "$PLANTED_NG" "$WORK/sweep-planted.txt"
+# Only the PLANTED verb (#1704): the control's job is to prove the
+# discriminator FIRES on a planted defect. The plant touches cmd_show alone,
+# and the live sweep above already proved every other verb clean on the
+# unmodified binary, so re-sweeping ~60 verbs here re-measured that.
+_sweep "$PLANTED_NG" "$WORK/sweep-planted.txt" show
 assert_eq "B CONTROL the sweep detects a planted old-shape verb" \
     "$(<"$WORK/sweep-planted.txt")" "ng show"
 NG_BIN="$NG"
@@ -1561,7 +1596,8 @@ assert_eq "every population floor in this file is declared in its inventory" \
 # ---------------------------------------------------------------------------
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, ledger=yes level).
 #   5  Part A: two controls, the property, the delegated non-vacuity, the population sanity check
-# + 2  Part B: the dispatcher-driven sweep + its population sanity check
+# + 3  Part B: the dispatcher-driven sweep + its population sanity check
+#        + the live sweep walked every dispatcher verb (#1704)
 # + 3  Part B-REACH: sub-verbs reach their parser (#906 N1), plus the DERIVED
 #        population reconciliation both ways (#943)
 # + 2  Part B-DOC:  the documentation axis reconciles + non-vacuity (#906 N2)
@@ -1587,7 +1623,7 @@ assert_eq "every population floor in this file is declared in its inventory" \
 # + 3  Part E: the BEHAVIOURAL axis (#911 F-A) — the planted-raw-echo control,
 #        the cap over the probe table, and the probe-count non-vacuity
 # + 1  the bound inventory is complete (#943)
-EXPECTED=$(( 5 + 2 + 3 + 2 + 1 + 3 + 1 + 3 + 16 + 3 + 9 + 3 + 1 ))
+EXPECTED=$(( 5 + 3 + 3 + 2 + 1 + 3 + 1 + 3 + 16 + 3 + 9 + 3 + 1 ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

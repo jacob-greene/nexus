@@ -57,6 +57,14 @@
 #   HOLD  both "re-pasted" rows, "a CHANGED decision snaps", "a NEW request
 #         beside a standing one snaps" (base snaps on everything)
 #
+# #1770, case 10, PREDICTED against base 88848942 (no held reference):
+#   FLIP  "<= 12 held full-state composes in 4 h" (base: one per due compose)
+#   FLIP  "the held heartbeat recorded the held reference" (no such file)
+#   HOLD  precondition "the hold arm was reached", "nothing pasted while
+#         held", "the EMITTED cache is untouched", "a pane going ABSENT while
+#         held composes at once", "after the lift the next due poll pastes",
+#         "the held reference is removed" (absent on base too)
+#
 # Run: bash monitor/watcher/test-full-state-actionable-backoff.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
 
@@ -408,6 +416,49 @@ printf 'request=r1 origin=w1 kind=question priority=normal\nrequest=r2 origin=w2
 FAKE_NOW=$(( FAKE_NOW + 1 )); tick
 assert_eq "a NEW request beside a standing one snaps the anchor back" "$(anchor)" "$FAKE_NOW"
 : > "$V2_STAGE_DIR/requests_poll.out"
+
+# ---------------------------------------------------------------------------
+echo "=== case 10: the backoff holds while the target is HELD (#1770) ==="
+# An over-limit hold archives every composed body and pastes none, so the
+# emitted cache never ages; on base every due poll re-composed a full-state
+# body (167 in one live hold, ~1/min). Drive 4 h of a held, unchanged board at
+# the 60 s compose cadence with the full-state check due on every compose
+# (production: nothing resets FULL_STATE_STAMP while held).
+HELD_CACHE="$STATE_DIR/last-full-state-held-canonical.txt"
+HELDS="$W/helds"; : > "$HELDS"
+_over_limit_record_held() { printf '%s %s\n' "$FAKE_NOW" "$2" >> "$HELDS"; }
+due_poll                                # settle: the board's current state is emitted
+: > "$PASTES"
+emitted_ino=$(stat -c %i "$FULL_STATE_CANONICAL_CACHE")
+_over_limit_orchestrator_paused() { return 0; }
+held_tick() {   # one compose at FAKE_NOW; pin the held cache's mtime if rewritten
+    local b a
+    b=$(stat -c %i "$HELD_CACHE" 2>/dev/null || echo none)
+    tick
+    a=$(stat -c %i "$HELD_CACHE" 2>/dev/null || echo none)
+    [[ "$a" != none && "$a" != "$b" ]] && touch -d "@$FAKE_NOW" "$HELD_CACHE"
+    return 0
+}
+TH=$FAKE_NOW
+while (( FAKE_NOW < TH + 4 * 3600 )); do FAKE_NOW=$(( FAKE_NOW + 60 )); held_tick; done
+n_held=$(awk '$2 == "poll-full-state"' "$HELDS" | wc -l)
+echo "    held poll-full-state composes in 4 h: $n_held"
+assert_ge "precondition: the hold arm was reached (a held heartbeat composed)" "$n_held" 1
+assert_le "<= 12 held full-state composes in 4 h of an unchanged held board" "$n_held" 12
+assert_eq "nothing pasted while held" "$(paste_count)" 0
+assert_eq "the held heartbeat recorded the held reference" "$( [[ -s "$HELD_CACHE" ]] && echo present || echo absent )" present
+assert_eq "the EMITTED cache is untouched while held" "$(stat -c %i "$FULL_STATE_CANONICAL_CACHE")" "$emitted_ino"
+# An actionable change during the hold still composes at once.
+: > "$HELDS"; ABSENT[w2]=1
+FAKE_NOW=$(( FAKE_NOW + 60 )); printf '%s\n' $(( FAKE_NOW - 600 )) > "$FULL_STATE_STAMP"; held_tick
+assert_eq "a pane going ABSENT while held composes at once" "$(awk '{print $2}' "$HELDS")" "poll-full-state"
+unset 'ABSENT[w2]'
+# The lift: the next due poll pastes (judged against what was last SEEN), and
+# the held reference is dropped.
+_over_limit_orchestrator_paused() { return 1; }
+FAKE_NOW=$(( FAKE_NOW + 60 )); printf '%s\n' $(( FAKE_NOW - 600 )) > "$FULL_STATE_STAMP"; tick
+assert_eq "after the lift the next due poll pastes the full state" "$(awk '{print $2}' "$PASTES")" "reason=poll-full-state"
+assert_eq "…and the held reference is removed" "$( [[ -e "$HELD_CACHE" ]] && echo present || echo absent )" absent
 
 # ---------------------------------------------------------------------------
 echo "=== case 6: without the projection the gate fails toward EMITTING ==="

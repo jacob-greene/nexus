@@ -161,6 +161,25 @@ ck  "P6 NO row in the clone (the old fallback did not quietly return)" "$(rows "
 ck  "P6 nothing was sent"                                        "$(rows "$SENDLOG")" "0"
 mv "$WORK/nr.aside" "$C/monitor/_nexus-root.sh"
 
+echo '=== P7: an UNWRITABLE ledger (degraded tree, #1724) is refused LOUDLY as rc 4, nothing sent ==='
+# A 0555 state dir stands in for the read-only mount (EACCES instead of EROFS:
+# the preflight is errno-agnostic, as _fs_probe.sh is). Before #1724's send leg
+# this reached the transport, whose own stamp died, and send.sh reported
+# `refused (rc=1) — treating as unknown, halting` at rc 3: a verdict that
+# forbids the one fallback that is safe, about a send that never happened.
+reset; RO="$WORK/ro-state"; mkdir -p "$RO/windows"; cp "$P/monitor/.state/windows/$W.json" "$RO/windows/"
+chmod 0555 "$RO"
+ro_send() { (cd "$C" && env -u NEXUS_ROOT NEXUS_STATE_DIR="$RO" FAKE_SENDLOG="$SENDLOG" FAKE_CLONE_MON="$C/monitor" \
+    FAKE_PASTE="$PASTE" NEXUS_HARNESS_DIR="$C/harness" bash "$C/monitor/${1:-send.sh}" "$W" --message hi 2>&1; echo "rc=$?"); }
+out7=$(ro_send)
+ck  "P7 rc 4 (established non-delivery: a fallback is licensed)"  "$(sed -n 's/^rc=//p' <<<"$out7")" "4"
+ckc "P7 says DEGRADED"                                           "$out7" "DEGRADED"
+ckc "P7 names the unwritable ledger dir"                         "$out7" "$RO"
+ckc "P7 says NOTHING WAS SENT"                                   "$out7" "NOTHING WAS SENT"
+ckc "P7 names the fallback (SendMessage)"                        "$out7" "SendMessage"
+ckn "P7 does not claim UNKNOWN (which would forbid the fallback)" "$out7" "treating as unknown"
+ck  "P7 the transport was never invoked"                         "$(rows "$SENDLOG")" "0"
+
 echo '=== C1-C3: --ledger-coverage NAMES the gap instead of reading as no-send ==='
 # A Claude Code peer declares tmux-paste (shell) AND cc-sendmessage (agent). A
 # delivery through the second writes no row unless the agent ran --stamp-only,
@@ -226,8 +245,18 @@ if mutate nohand 's|^    export NEXUS_ROOT="$NEXUS_PRIMARY"|    :|'; then
        "$(rows "$P/monitor/.state/machine-input.tsv")" "1"
 fi
 
+chmod 0555 "$RO"
+# M3 — the preflight removed: the old shape (transport reached, stamp dies).
+reset
+if mutate nopre 's|^if _why=$(_ledger_unwritable); then|if false; then|'; then
+    out7m=$(ro_send send-nopre.sh)
+    ckn "M3 killed: without the preflight the rc is NOT 4"        "$(sed -n 's/^rc=//p' <<<"$out7m")" "4"
+    ckn "M3 …and nothing says NOTHING WAS SENT"                   "$out7m" "NOTHING WAS SENT"
+fi
+chmod 0755 "$RO"
+
 # ---- the assertion COUNT, compared EXACTLY (#821 axis B) -----------------
-EXPECTED_ASSERTIONS=43   # +1 at your-org/nexus-code#1428: P3 gained the library-absent refusal
+EXPECTED_ASSERTIONS=53   # +1 at your-org/nexus-code#1428: P3 gained the library-absent refusal; +10 at #1724: P7 (7) and M3 (applied + 2)
 _run_total=$(( PASS + FAIL ))
 assert_eq "assertion count is exactly what this suite declares" "$_run_total" "$EXPECTED_ASSERTIONS"
 

@@ -30,7 +30,7 @@ pin). Choose along a breadth ladder:
 
 - **Broad subnet — recommended set-once default.** Pin your campus/LAN block once
   and any client on it can reach the auth stage; no per-client lookup. E.g.
-  `140.107.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
+  `198.51.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
   network). Broader than any one client **by construction** — defence in depth,
   never a client identity control.
 - **`/32` — one address, and READ THE NEXT PARAGRAPH before calling it "max

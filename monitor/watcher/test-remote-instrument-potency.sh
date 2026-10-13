@@ -3,17 +3,17 @@
 #
 # THE DEFECT, measured on the live nexus at 2026-08-24 17:48 -07:00. Name
 # service resolution for our own uid failed inside the sandbox — `getent passwd
-# 71780` rc 2, our passwd record absent — and `ssh`/`ssh-keygen` call
+# 10000` rc 2, our passwd record absent — and `ssh`/`ssh-keygen` call
 # `getpwuid()` at startup and abort:
 #
-#     ssh -V                 → No user exists for uid 71780   (rc 255)
-#     ssh-keygen -lf <ours>  → No user exists for uid 71780
+#     ssh -V                 → No user exists for uid 10000   (rc 255)
+#     ssh-keygen -lf <ours>  → No user exists for uid 10000
 #     ssh-keyscan …          → WORKS  (it does not call getpwuid)
 #
 # `_remote_verify_live_host_key` then returned:
 #
 #     rc=1  detail: reached the listener but could not verify it is ours;
-#           unclassified probe result: No user exists for uid 71780
+#           unclassified probe result: No user exists for uid 10000
 #
 # rc 1 is DEFINITE FOREIGN and is explicitly NOT operator-overridable, so the
 # healthcheck escalated `nexus-remote-ssh` to DOWN — against a daemon that had
@@ -187,7 +187,7 @@ detail_of() { printf '%s' "${1#*$'\t'}"; }
 
 # ── 1. THE REPRODUCTION ─────────────────────────────────────────────────
 echo "== 1. a client that CANNOT START is UNKNOWN, not FOREIGN =="
-NOUSER=$(make_stub ssh-nouser 255 'No user exists for uid 71780')
+NOUSER=$(make_stub ssh-nouser 255 'No user exists for uid 10000')
 
 # First: this fixture reproduces the PUBLISHED behaviour and not a lookalike.
 # Pinned against the live measurement so a fixture that drifted from the
@@ -198,7 +198,7 @@ pre=$(REMOTE_SSH_BIN="$NOUSER" bash -c '
     printf "%s" "$out"
 ' _)
 assert_eq "the fixture emits the live wording verbatim" \
-    "$pre" "No user exists for uid 71780"
+    "$pre" "No user exists for uid 10000"
 
 r=$(probe_with "$NOUSER")
 assert_eq "the binary is PRESENT, so command -v cannot catch this" \
@@ -209,7 +209,7 @@ assert_not_contains "…and it does NOT claim to have reached the listener" \
 assert_contains "…the detail names the INSTRUMENT as the thing that failed" \
     "$(detail_of "$r")" "could not run"
 assert_contains "…and quotes the client's own diagnostic for the operator" \
-    "$(detail_of "$r")" "No user exists for uid 71780"
+    "$(detail_of "$r")" "No user exists for uid 10000"
 
 # ── 2. THE NEGATIVE CONTROL THAT MATTERS ────────────────────────────────
 # Delete the terminal arm and case 1 passes; this case is what makes that fix
@@ -427,7 +427,7 @@ cat >"$WORK/ssh-counting-broken" <<'EOF'
 _is_probe=0
 for a in "$@"; do case "$a" in UserKnownHostsFile=*) _is_probe=1 ;; esac; done
 (( _is_probe )) && echo probe >> "$SSH_CALL_LOG" || echo potency >> "$SSH_CALL_LOG"
-echo 'No user exists for uid 71780' >&2
+echo 'No user exists for uid 10000' >&2
 exit 255
 EOF
 chmod +x "$WORK/ssh-counting-broken"

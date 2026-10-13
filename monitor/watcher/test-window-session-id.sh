@@ -70,7 +70,7 @@ fi
 # A workdir WITH UNDERSCORES, and a project dir named the way Claude Code
 # actually names it: BOTH `/` and `_` mapped to `-`. The old sed produced
 # the first form and the real dir is the second, which is the whole bug.
-WD='/shared/your-lab-m/user/operator/nexus/work/kompot_revisions-272Fmerge'
+WD='/data/lab_x/user/op/nexus/work/proj-x-merge'   # synthetic; the '_' is the point (#1812: a real path scrubbed to a '_'-free form made this case vacuous on the mirror)
 OLD_SLUG=$(printf '%s' "$WD" | sed 's|/|-|g')
 REAL_SLUG=$(printf '%s' "$WD" | sed 's|[/_]|-|g')
 mkdir -p "$CC/projects/$REAL_SLUG"

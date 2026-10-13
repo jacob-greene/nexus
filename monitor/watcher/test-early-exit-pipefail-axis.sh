@@ -30,8 +30,8 @@
 # A quoted heredoc does NOT help — quoting changes what the SHELL does, and the
 # classifier never runs the shell; it reads bytes. So the fixture lines are
 # assembled from pieces at run time, and section D asserts the outcome that
-# actually matters: adding this file left the real classifier's row count
-# unchanged.
+# actually matters: this file books no row — neither in the committed manifest
+# nor when its current text is classified.
 #
 # Run: bash monitor/watcher/test-early-exit-pipefail-axis.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -226,11 +226,50 @@ echo '=== D: this suite did not enrol ITSELF (the self-inflicted direction) ==='
 _tracked=0
 git -C "$REPO_ROOT" ls-files --error-unmatch monitor/watcher/test-early-exit-pipefail-axis.sh >/dev/null 2>&1 && _tracked=1
 assert_eq "D: this suite is TRACKED, so the row check below is not vacuous" "$_tracked" "1"
-_self=$( cd "$REPO_ROOT" && bash monitor/watcher/early-exit-readers.sh 2>/dev/null \
-         | grep -cF 'test-early-exit-pipefail-axis.sh' ) || true
-assert_eq "D: the real classifier books NO row for this control suite" "$_self" "0"
+# NO FULL-CORPUS CLASSIFICATION HERE (your-org/nexus-code#1704). This used to
+# run the classifier over the whole real tree (~800 files, the suite's dominant
+# cost) to ask about ONE file — and through `| grep -c` with stderr discarded,
+# so a classifier that DIED returned `0` and passed: the exact vacuity `rows_for`
+# above was rewritten to close. The question is now answered twice, cheaply,
+# with the two halves covering different failure routes:
+#
+#   D1  the COMMITTED manifest carries no row for this file. The manifest suite
+#       (`test-early-exit-reader-manifest.sh`) proves that manifest byte-equal
+#       to a live full classification of the real tree, so this is the
+#       real-tree answer INCLUDING pipefail inheritance from any sourcer — but
+#       only as of the last time the manifest was regenerated.
+#   D2  this file's CURRENT text, classified alone in a fresh fixture repo,
+#       books no site — with the producer's rc tested. It catches an unstaged
+#       bad edit before anyone regenerates the manifest, and the fixture copy
+#       is tracked BY CONSTRUCTION, so it is never vacuous. It cannot see
+#       inheritance from a real sourcer; D1 does.
+#
+# COVERAGE CHANGE, stated: a bad edit to this file is now caught here by D2 and,
+# for the real-tree view, by the manifest suite going red — rather than by this
+# suite alone re-deriving the real tree. A stale manifest that already wrongly
+# lists this file is caught by D1 directly.
+_man_rows=$(grep -cF 'monitor/watcher/test-early-exit-pipefail-axis.sh' \
+            "$REPO_ROOT/monitor/watcher/early-exit-readers.manifest" 2>/dev/null); _man_rc=$?
+# grep -c: rc 1 is "no match" (the answer we want), rc 2 is "could not read".
+[ "$_man_rc" -le 1 ] || _man_rows="MANIFEST-UNREADABLE-rc$_man_rc"
+assert_eq "D1: the committed manifest books NO row for this control suite" "$_man_rows" "0"
 
-EXPECTED=$(( 2 + 3 + 12 + 2 + 7 + 2 ))
+SELF="$WORK/self"
+mkdir -p "$SELF/monitor/watcher"
+cp "$REPO_ROOT/monitor/watcher/early-exit-readers.sh" "$REPO_ROOT/monitor/watcher/_shell_quotes.awk" \
+   "$REPO_ROOT/monitor/watcher/test-early-exit-pipefail-axis.sh" "$SELF/monitor/watcher/"
+cp "$REPO_ROOT/monitor/shell-files.sh" "$SELF/monitor/"
+git -C "$SELF" init -q 2>/dev/null
+git -C "$SELF" add -A >/dev/null 2>&1
+_self=$( cd "$SELF" && bash monitor/watcher/early-exit-readers.sh --sites 2>/dev/null ); _self_rc=$?
+if [ "$_self_rc" != 0 ]; then
+    _self="CLASSIFIER-FAILED-rc$_self_rc"
+else
+    _self=$(grep -cF 'test-early-exit-pipefail-axis.sh' <<<"$_self" || true)
+fi
+assert_eq "D2: this suite's own text, classified alone, books NO site" "$_self" "0"
+
+EXPECTED=$(( 2 + 3 + 12 + 2 + 7 + 3 ))
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

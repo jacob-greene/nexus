@@ -93,6 +93,17 @@ The rules:
   freshness.
 - An `/healthz` route that returns your marker is the simplest way to
   satisfy all four.
+- **Progress, not only liveness, for a loop whose every iteration can
+  fail.** A watch or poller that catches its own errors and sleeps keeps
+  a fresh heartbeat and a live pid while it achieves nothing. A
+  pid-plus-freshness check then stays GREEN through an outage of the
+  thing it watches: an evidence-site watch read healthy through repeated
+  `FETCH-FAILED` iterations (2026-10-07). Have the loop record a
+  consecutive-failure count beside its heartbeat (reset on success,
+  written tmp+mv) and fail the healthcheck once it reaches N. Choose N
+  knowingly and say why: one transient fetch failure is not an outage.
+  `svc.sh` needs nothing new for this. Its contract is the healthcheck's
+  exit code, so the counter belongs to the service, not to the cockpit.
 
 ## 4. Supervision
 

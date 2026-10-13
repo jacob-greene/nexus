@@ -8,7 +8,7 @@
 # enclosing primary. Right for a worker; wrong for a hermetic tree. A fixture
 # nexus built by `mktemp -d` sits under `work/` whenever its TMPDIR does, and
 # mutation-gate.sh put the suite's TMPDIR at `<--workdir>/tmp` (#1601): with a
-# --workdir under work/rmsk-band, the resume suite's fixture spawns re-rooted
+# --workdir under work/proj-x, the resume suite's fixture spawns re-rooted
 # onto the operator's primary and appended their spawn rows to its production
 # action log — 321 rows, window names res-win / stamp-win / other-name. The same
 # walk made the gate's tree COPY take the primary's identity, so every baseline

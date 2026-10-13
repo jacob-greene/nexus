@@ -103,10 +103,27 @@ echo "== 4. POLARITY: advisory exits 0 on a flagged corpus; --strict exits 1; st
 bash "$LINT" --scan "$P" >/dev/null 2>&1; rc=$?
 assert_eq "advisory (--scan) exits 0 even with 7 sites" "$rc" "0"
 # --strict scans the REAL population, which is not clean today; the polarity
-# claim is asserted on the exit code alone and the count is not pinned.
-bash "$LINT" --strict >/dev/null 2>&1; rc=$?
-[[ "$rc" == 0 || "$rc" == 1 ]] && assert_eq "--strict exits 0 or 1 (never an unhandled status)" "0" "0" \
-                             || assert_eq "--strict exits 0 or 1 (never an unhandled status)" "$rc" "0-or-1"
+# claim is asserted on the exit code and the count is not pinned.
+#
+# ONE FULL-CORPUS SCAN SERVES SECTIONS 4 AND 5 (your-org/nexus-code#1704). This
+# suite used to scan the real corpus twice — `--strict` here for its rc, and the
+# default report mode in section 5 for its header — and each scan strips
+# comments from ~800 files. The two modes share every line of the scan and of
+# the header `printf`; they differ only in `mode=` and the exit polarity. So the
+# strict run's OUTPUT is kept and section 5 reads its header from it. Coverage
+# change, stated: the default (report) mode is no longer run over a POPULATED
+# corpus by this suite — only its empty-population refusal (section 6). What
+# that mode alone does (the `mode=report` label and the trailing ADVISORY
+# line) was never asserted; its header assertions now read the strict run's
+# header, which the same `printf` produces.
+strict_out=$(bash "$LINT" --strict 2>/dev/null); rc=$?
+# Stronger than "0 or 1": the rc must AGREE with the flagged count the same run
+# printed — 1 iff it flagged anything — so a strict mode that stopped flipping
+# (or flipped on a clean corpus) fails here rather than passing as "0 or 1".
+_strict_n=$(printf '%s\n' "$strict_out" | sed -n 's/^awk -v <shell expansion> sites: \([0-9][0-9]*\) flagged.*/\1/p')
+_strict_want=unparsed
+[[ "$_strict_n" =~ ^[0-9]+$ ]] && { (( _strict_n > 0 )) && _strict_want=1 || _strict_want=0; }
+assert_eq "--strict exits 1 iff its own report flagged sites (never an unhandled status)" "$rc" "$_strict_want"
 
 echo "== 5. POPULATION SANITY: the shared predicate, over the whole tracked tree"
 pop=$(bash "$LINT" --files 2>/dev/null)
@@ -124,7 +141,7 @@ else _th_fail; printf '  FAIL: population is %d files — below the 400 floor, t
 # The count printed by a report run must equal the enumerator's own count —
 # the two are computed by the same function, so a disagreement means the
 # report is describing a different corpus than it walked.
-rep=$(bash "$LINT" 2>/dev/null | sed -n '1p')
+rep=$(printf '%s\n' "$strict_out" | sed -n '1p')     # the section-4 scan's header, not a second scan
 assert_contains "the report header names the same population size the enumerator returns" "$rep" "population $n_pop shell files"
 assert_contains "the report header carries the ref it was measured at" "$rep" "ref "
 

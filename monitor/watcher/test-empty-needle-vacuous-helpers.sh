@@ -176,6 +176,13 @@ gp_handle "$@"
 # 2. FUNCTION DEFINITIONS inside them, all three of bash's productions.
 #    Emits  <file>\t<name>\t<start>\t<end>.
 _ENV_AWK='
+# A body still open at the end of a file must NOT bleed into the next file:
+# the first `^}` of the next file would close it under the WRONG FILENAME, with a
+# line window from the first file. Measured (bundle 23): a one-line
+# `run_mut() { (…); }` left a body open at EOF, and an edit that shifted its
+# start line moved the bled window onto a verdict-bearing region of the next
+# suite, which the parser then (rightly) refused, as `<next file>:run_mut`.
+FNR == 1 { inbody = 0 }
 !inbody {
   name = ""
   if (match($0, /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_:.-]*([ \t]|\(|\{|$)/)) {

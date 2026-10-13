@@ -22,8 +22,12 @@
 # CASES
 #   A  a stub that writes 0.6 s after HUP/TERM: after teardown (and a settle
 #      longer than the stub's delay) NO remnant exists — and the bookkeeping
-#      DID land, inside the moved dir (the positive control: the stub really
-#      wrote, it just wrote before the move).
+#      DID land before the removal (the positive control: the stub records the
+#      write in a marker OUTSIDE the run dir, so it survives the removal).
+#   C  your-org/nexus-code#1767: teardown REMOVES the throwaway run dir; it
+#      leaves NO entry under either trash root (the NEXUS_TRASH_DIR it is
+#      given, or the `.nexus-trash` beside the run dir that trash_path falls
+#      back to across a device boundary — which on a tmpfs $TMPDIR is RAM).
 #   B  a stub that IGNORES HUP and TERM: teardown still returns, within the
 #      chosen bound (grace + KILL wait), and still leaves no remnant. The
 #      bound is what keeps "await" from becoming "hang"; and the process is
@@ -69,13 +73,14 @@ printf '%s\n' "$$" > "$cfg/stub.ready"
 _bye() {
     sleep 0.6
     mkdir -p "$cfg/projects/-stub-proj" 2>/dev/null
-    printf '{"type":"exit"}\n' > "$cfg/projects/-stub-proj/stub-sid.jsonl"
+    printf '{"type":"exit"}\n' > "$cfg/projects/-stub-proj/stub-sid.jsonl" \
+        && : > "__MARK__"
     exit 0
 }
 if [[ "$mode" == deaf ]]; then trap '' HUP TERM; else trap _bye HUP TERM; fi
 while :; do sleep 0.1; done
 EOF
-    sed -i "s/__MODE__/$2/" "$1"
+    sed -i -e "s/__MODE__/$2/" -e "s|__MARK__|$SHORT/late-write-$2.landed|" "$1"
     chmod +x "$1"
 }
 
@@ -143,8 +148,8 @@ assert_eq "A precondition: the stub was running in the pane before teardown" "$C
 sleep 1.5    # > the stub's 0.6 s delay: a late write has had time to land
 assert_eq "A no /tmp/cc-harness-* remnant after teardown (the late write did not re-create it)" \
     "$( [[ -e "$CASE_DIR" ]] && echo "REMNANT: $(find "$CASE_DIR" -type f 2>/dev/null | tr '\n' ' ')" || echo none )" "none"
-landed=$(find "$NEXUS_TRASH_DIR" -path '*/cfg/projects/-stub-proj/stub-sid.jsonl' 2>/dev/null | wc -l)
-assert_eq "A positive control: the bookkeeping DID land — inside the moved-aside dir" "$landed" "1"
+assert_eq "A positive control: the late bookkeeping write DID land (marker outside the run dir)" \
+    "$( [[ -e "$SHORT/late-write-late.landed" ]] && echo landed || echo missing )" "landed"
 reap_stub "$SPID" "$SST"
 
 echo "=== B: a claude that ignores HUP and TERM — the wait is BOUNDED ==="
@@ -158,7 +163,17 @@ assert_eq "B teardown returned within the bound (grace + KILL wait), took ${CASE
     "$( (( CASE_MS < 8000 )) && echo bounded || echo "UNBOUNDED ${CASE_MS}ms" )" "bounded"
 assert_eq "B …and still left no remnant" "$( [[ -e "$CASE_DIR" ]] && echo remnant || echo none )" "none"
 
-EXPECTED_ASSERTIONS=7
+echo "=== C: teardown REMOVES the run dir — no trash growth (#1767) ==="
+# Both trash roots trash_path can choose: the given NEXUS_TRASH_DIR, and the
+# same-filesystem fallback `<run dir's parent>/.nexus-trash` (= $SHORT here).
+_trash_entries() {
+    { ls -A "$NEXUS_TRASH_DIR" 2>/dev/null; ls -A "$SHORT/.nexus-trash" 2>/dev/null; } | grep -c '' || true
+}
+assert_eq "C after cases A and B, no entry under either trash root" "$(_trash_entries)" "0"
+assert_eq "C …and no cc-harness-* run dir is left in \$TMPDIR either (removed, not relocated)" \
+    "$(find "$SHORT" -maxdepth 1 -name 'cc-harness-*' 2>/dev/null | grep -c '' || true)" "0"
+
+EXPECTED_ASSERTIONS=9
 TOTAL=$(( PASS + FAIL ))
 assert_eq "assertion TOTAL matches the expected total" "$TOTAL" "$EXPECTED_ASSERTIONS"
 

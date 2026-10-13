@@ -19,9 +19,19 @@
 set -uo pipefail
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# The files whose behaviour this suite asserts: the resolver, and the
+# orchestrator-respawn caller of it (your-org/nexus-code#1779).
+# shellcheck disable=SC1091
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' monitor/resolve-settings.sh monitor/watcher/_respawn.sh
+}
+gp_handle "$@"
 . "$_test_dir/_test_helpers.sh"
 
 RESOLVER="$_test_dir/../resolve-settings.sh"
+# The resolver writes under ${NEXUS_STATE_DIR:-<dir>/.state}: never the live one.
+unset NEXUS_STATE_DIR
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -177,5 +187,102 @@ a=$("$RESOLVER" "$BASE"); sum_a=$(md5sum < "$a")
 b=$("$RESOLVER" "$BASE"); sum_b=$(md5sum < "$b")
 assert_eq "same path both times" "$a" "$b"
 assert_eq "same content both times" "$sum_a" "$sum_b"
+
+# ---- --nexus-root: foreign instruction files under work/ (your-org/nexus-code#1779) ----
+# The resolver writes `claudeMdExcludes` for <root>/work so a cloned repo's
+# CLAUDE.md / AGENTS.md / .claude/rules never load as PROJECT INSTRUCTIONS
+# (measured on cc 2.1.293: a single-file `cat` under a nested CLAUDE.md loads
+# it; the key, passed via --settings, suppresses it). Base resolvers do not
+# know the flag: they read `--nexus-root` as the settings path (rc 3).
+ROOT="$WORK/nexus"; mkdir -p "$ROOT/work"
+EFF="$WORK/monitor/.state/settings/worker-settings.effective.json"
+
+echo "== --nexus-root, no overlay: excludes written, path is the effective file =="
+write_base
+rm -f "$LOCAL" "$EFF"
+got=$("$RESOLVER" --nexus-root "$ROOT" "$BASE" 2>/dev/null); rc=$?
+assert_rc "resolves cleanly with --nexus-root" "$rc" "0"
+assert_eq "emits the generated effective path" "$got" "$EFF"
+ex=$(jq -r '.claudeMdExcludes[]?' "$got" 2>/dev/null)
+for n in CLAUDE.md CLAUDE.local.md .claude/CLAUDE.md AGENTS.md .claude/AGENTS.md '.claude/rules/**'; do
+    assert_eq "excludes $ROOT/work/**/$n" "$(grep -cxF -- "$ROOT/work/**/$n" <<<"$ex")" "1"
+done
+# The root's OWN contract must stay loadable: no pattern may match it.
+# Non-vacuous: an EMPTY list also names no root file, so it must not pass.
+assert_eq "no pattern names the root CLAUDE.md (list non-empty)" \
+    "$(if [[ -n "$ex" ]]; then grep -cxF -- "$ROOT/CLAUDE.md" <<<"$ex"; else echo empty-list; fi)" "0"
+assert_eq "every pattern sits under <root>/work/" \
+    "$(grep -vc "^$ROOT/work/" <<<"$ex")" "0"
+assert_eq "AGENTS.md fallback defaulted off" \
+    "$(jq -r '.pluginConfigs["agents-md@builtin"].options.instructionFiles' "$got" 2>/dev/null)" "claude-md"
+assert_eq "tracked hooks survive the injection" \
+    "$(jq -r '.hooks.Stop[0].hooks[0].command' "$got" 2>/dev/null)" "heartbeat.sh"
+
+echo "== --nexus-root + overlay: overlay wins, existing excludes kept (union) =="
+write_base
+cat > "$LOCAL" <<'JSON'
+{ "model": "claude-opus-5", "claudeMdExcludes": ["/elsewhere/CLAUDE.md"],
+  "pluginConfigs": { "agents-md@builtin": { "options": { "instructionFiles": "claude-md-and-agents-md" } } } }
+JSON
+got=$("$RESOLVER" --nexus-root "$ROOT" "$BASE" 2>/dev/null); rc=$?
+assert_rc "resolves cleanly" "$rc" "0"
+assert_eq "operator model pin present" "$(jq -r '.model' "$got" 2>/dev/null)" "claude-opus-5"
+assert_eq "operator's own exclude kept" \
+    "$(jq -r '.claudeMdExcludes[]?' "$got" 2>/dev/null | grep -cxF /elsewhere/CLAUDE.md)" "1"
+assert_eq "and the root's excludes added" \
+    "$(jq -r '.claudeMdExcludes[]?' "$got" 2>/dev/null | grep -cxF "$ROOT/work/**/CLAUDE.md")" "1"
+assert_eq "operator's instructionFiles mode kept" \
+    "$(jq -r '.pluginConfigs["agents-md@builtin"].options.instructionFiles' "$got" 2>/dev/null)" "claude-md-and-agents-md"
+
+echo "== --nexus-root degraded: rc 11, path still printed, reason on stderr =="
+write_base
+rm -f "$LOCAL"
+mkdir -p "$WORK/gl[ob]/work"
+err=$("$RESOLVER" --nexus-root "$WORK/gl[ob]" "$BASE" 2>&1 >/dev/null)
+got=$("$RESOLVER" --nexus-root "$WORK/gl[ob]" "$BASE" 2>/dev/null); rc=$?
+assert_rc "glob-metacharacter root → rc 11" "$rc" "11"
+assert_eq "  still prints the tracked path (the spawn proceeds)" "$got" "$BASE"
+assert_contains "  and says the files are NOT excluded" "$err" "NOT excluded"
+got=$("$RESOLVER" --nexus-root "$WORK/no-such-root" "$BASE" 2>/dev/null); rc=$?
+assert_rc "missing root → rc 11" "$rc" "11"
+assert_eq "  still prints the tracked path" "$got" "$BASE"
+# No jq on PATH and no overlay: the excludes are the only jq work, so rc 11
+# with the tracked path, never a refusal that would stop the spawn.
+NOJQ="$WORK/nojq-bin"; mkdir -p "$NOJQ"
+got=$(PATH="$NOJQ" /bin/bash "$RESOLVER" --nexus-root "$ROOT" "$BASE" 2>/dev/null); rc=$?
+assert_rc "no jq, no overlay → rc 11" "$rc" "11"
+assert_eq "  still prints the tracked path" "$got" "$BASE"
+# Overlay present but the excludes cannot be built: the overlay still wins.
+printf '{"model":"claude-opus-5"}' > "$LOCAL"
+got=$("$RESOLVER" --nexus-root "$WORK/gl[ob]" "$BASE" 2>/dev/null); rc=$?
+assert_rc "overlay + unbuildable excludes → rc 11" "$rc" "11"
+assert_eq "  the overlay is still applied" "$(jq -r '.model' "$got" 2>/dev/null)" "claude-opus-5"
+rm -f "$LOCAL"
+
+echo "== control: without --nexus-root nothing changes (must NOT flip) =="
+write_base
+rm -f "$LOCAL" "$EFF"
+got=$("$RESOLVER" "$BASE"); rc=$?
+assert_rc "plain call still rc 0" "$rc" "0"
+assert_eq "plain call still a pure pass-through" "$got" "$BASE"
+
+echo "== orchestrator respawn passes --nexus-root (_respawn_resolve_settings_flag) =="
+# The orchestrator reads files under work/ too; its --settings must carry the
+# same excludes. R2/R3 pin the rc-11 acceptance: a degraded resolve keeps the
+# printed path (the overlay, when present) instead of the bare tracked file.
+RN="$WORK/rn"; mkdir -p "$RN/monitor" "$RN/work"
+cp "$RESOLVER" "$RN/monitor/resolve-settings.sh"; chmod +x "$RN/monitor/resolve-settings.sh"
+printf '{"hooks":{}}\n' > "$RN/monitor/orchestrator-settings.json"
+flag=$( . "$_test_dir/_respawn.sh" >/dev/null 2>&1; _respawn_resolve_settings_flag "$RN" )
+f=${flag#--settings }
+assert_eq "R1 respawn --settings carries <root>/work/**/CLAUDE.md" \
+    "$(jq -r '.claudeMdExcludes[]?' "$f" 2>/dev/null | grep -cxF "$RN/work/**/CLAUDE.md")" "1"
+RG="$WORK/r[g]"; mkdir -p "$RG"; cp -a "$RN" "$RG/n"; rm -rf "$RG/n/monitor/.state"
+flag=$( . "$_test_dir/_respawn.sh" >/dev/null 2>&1; _respawn_resolve_settings_flag "$RG/n" )
+assert_eq "R2 degraded (glob root), no overlay: the tracked file" "$flag" "--settings $RG/n/monitor/orchestrator-settings.json"
+printf '{"model":"claude-opus-5"}\n' > "$RG/n/monitor/orchestrator-settings.local.json"
+flag=$( . "$_test_dir/_respawn.sh" >/dev/null 2>&1; _respawn_resolve_settings_flag "$RG/n" )
+assert_eq "R3 degraded + overlay: the overlay still reaches the orchestrator" \
+    "$(jq -r '.model' "${flag#--settings }" 2>/dev/null)" "claude-opus-5"
 
 th_summary_and_exit
