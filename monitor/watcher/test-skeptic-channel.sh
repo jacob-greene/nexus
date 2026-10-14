@@ -1812,6 +1812,26 @@ assert_eq "#1523 POTENCY: with the wake sentence stripped, the needle is absent"
 
 
 
+# Synchronise on the await's OWN state, not on a sleep (#1818). An await is
+# PARKED once `.await-heartbeat` exists in its channel: the loop writes it only
+# after the singleton claim (`.await-owner`), the TERM trap, the entry probe
+# that records the marker as SEEN and the DEFERRED check — so its appearance is
+# a happens-before edge for all four. A fixed sleep only guessed at that and
+# went red under load (bundle 24): an await that starts late is TERMed before
+# its trap exists (143, not 12), or misses the marker it was meant to have
+# seen. The 60 s deadline is a CEILING for a broken run, not the expected
+# time; a green run returns in about a second. The caller removes any earlier
+# heartbeat first, so a previous await's beat cannot stand in for this one's.
+_await_wait_parked() {  # <channel-dir> <pid> — rc 0 once parked; 1 if it exited first or the ceiling passed
+    local end=$(( SECONDS + 60 ))
+    while (( SECONDS < end )); do
+        [[ -e "$1/.await-heartbeat" ]] && return 0
+        kill -0 "$2" 2>/dev/null || return 1
+        sleep 0.1
+    done
+    return 1
+}
+
 # ═══ #1178 — A DISPLACED WAITER MUST BE TOLD, IN A DOCUMENTED CODE ══════════
 #
 # `#615`'s one-live-waiter lock reaps the incumbent with an untrapped
@@ -1837,9 +1857,13 @@ _w1178="$WORK/w1178"; rm -rf "$_w1178"; mkdir -p "$_w1178"
 # test-skeptic-round-identity.sh. A real review always has a marker.
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" init d1178 >/dev/null 2>&1
 mkdir -p "$_w1178/state/skeptic/pending"; printf '1' > "$_w1178/state/skeptic/pending/d1178"
+_c1178=$(NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" dir d1178)
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" await d1178 --timeout 45 --interval 1 \
     > "$_w1178/d1178.out" 2>&1 &
-_v1178=$!; sleep 4
+_v1178=$!
+# PARKED, not slept on (#1818): a victim that starts after the displacer has
+# claimed becomes the displacer itself, and every role below inverts.
+_await_wait_parked "$_c1178" "$_v1178"; assert_eq "#1178 the victim await is PARKED (claim + TERM trap) before the displacer arms" "$?" "0"
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" await d1178 --timeout 3 --interval 1 >/dev/null 2>&1
 _d1178_rc=$?
 wait "$_v1178" 2>/dev/null; _v1178_rc=$?
@@ -1861,9 +1885,11 @@ assert_contains "#1178 …and the reaper leaves a line naming victim and displac
 # kill, a `timeout` wrapper — must be UNCHANGED. Without this the fix could
 # simply be "always exit 12", which would hide every other TERM.
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" init e1178 >/dev/null 2>&1
+_ce1178=$(NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" dir e1178)
 NEXUS_STATE_DIR="$_w1178/state" bash "$CHAN" await e1178 --timeout 45 --interval 1 \
     > "$_w1178/e1178.out" 2>&1 &
-_o1178=$!; sleep 3
+_o1178=$!
+_await_wait_parked "$_ce1178" "$_o1178"; assert_eq "#1178 CONTROL: the await is PARKED, so its 143 comes from the handler, not from a TERM that beat the trap" "$?" "0"
 kill -TERM "$_o1178" 2>/dev/null; wait "$_o1178" 2>/dev/null; _o1178_rc=$?
 assert_eq "#1178 CONTROL: a NON-displacement TERM still exits 143, unchanged" "$_o1178_rc" "143"
 # …and the documented codes either side are untouched.
@@ -2183,11 +2209,13 @@ echo '=== #1360: the TERM handler reads the DURABLE displacement record; the dis
 # fallback with an empty stderr — 3 in 40 CI bands, always the same trio.
 # Plant the record the displacer writes (owner = a pid that does not exist,
 # a .await-displaced row naming this victim) and TERM the victim.
+# Synchronised by _await_wait_parked (defined before #1178 above), not a sleep.
 _w1360="$WORK/w1360"; mkdir -p "$_w1360"
 NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" init d1360 >/dev/null 2>&1
-NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" await d1360 --timeout 45 --interval 1 > "$_w1360/v.out" 2>&1 &
-_v1360=$!; sleep 3
 _c1360=$(NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" dir d1360)
+NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" await d1360 --timeout 45 --interval 1 > "$_w1360/v.out" 2>&1 &
+_v1360=$!
+_await_wait_parked "$_c1360" "$_v1360"; assert_eq "#1360 the victim await is PARKED (claim + TERM trap in place) before it is displaced" "$?" "0"
 echo 999999 > "$_c1360/.await-owner"
 printf 'ts=%s victim=%s displacer=%s task=%s\n' "$(date +%s)" "$_v1360" 999999 d1360 >> "$_c1360/.await-displaced"
 kill -TERM "$_v1360" 2>/dev/null; wait "$_v1360" 2>/dev/null; _v1360_rc=$?
@@ -2197,18 +2225,23 @@ assert_contains "#1360 …and the victim still names the displacer on its own st
 # displaced row for THIS victim is not a displacement (a stale owner file from
 # a prior round, an operator TERM) — still 143.
 NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" init e1360 >/dev/null 2>&1
+_ce1360=$(NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" dir e1360)
 NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" await e1360 --timeout 45 --interval 1 > "$_w1360/e.out" 2>&1 &
-_e1360=$!; sleep 3
-echo 999999 > "$(NEXUS_STATE_DIR="$_w1360/state" bash "$CHAN" dir e1360)/.await-owner"
+_e1360=$!
+_await_wait_parked "$_ce1360" "$_e1360"; assert_eq "#1360 CONTROL: the await is PARKED, so its 143 comes from the handler, not from a TERM that beat the trap" "$?" "0"
+echo 999999 > "$_ce1360/.await-owner"
 kill -TERM "$_e1360" 2>/dev/null; wait "$_e1360" 2>/dev/null; _e1360_rc=$?
 assert_eq "#1360 CONTROL: a foreign owner pid with NO displaced row for this victim is still 143" "$_e1360_rc" "143"
 
 echo '=== #845 claim H: defer releases THIS wait (exit 13) while the requirement STANDS ==='
 _w845="$WORK/w845h"; mkdir -p "$_w845/state/skeptic/pending"
 NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" init h845 >/dev/null 2>&1
+_c845=$(NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" dir h845)
+# Synchronised by _await_wait_parked (defined before #1178 above), not a sleep.
 echo 1 > "$_w845/state/skeptic/pending/h845"
 NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" await h845 --timeout 45 --interval 1 > "$_w845/h.out" 2> "$_w845/h.err" &
-_h845=$!; sleep 2
+_h845=$!
+_await_wait_parked "$_c845" "$_h845"; assert_eq "#845H the await is PARKED (heartbeat written) before defer arrives" "$?" "0"
 NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" defer h845 --reason 'run the band on the merged tree first' --until 'a green band is linked' >/dev/null 2>&1; _d845_rc=$?
 wait "$_h845" 2>/dev/null; _h845_rc=$?
 assert_eq "#845H defer exits 0" "$_d845_rc" "0"
@@ -2219,8 +2252,11 @@ assert_eq "#845H THE POINT: the pending marker is UNTOUCHED (retire-preflight ke
 assert_eq "#845H the record is CONSUMED, so one defer releases one wait" "$([[ -e "$(NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" dir h845)/.await-deferred" ]] && echo present || echo absent)" "absent"
 NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" defer h845 >/dev/null 2>&1; assert_eq "#845H defer without --reason is refused (rc 1)" "$?" "1"
 # 11 still requires the MARKER to go — a re-entered await is not released by the consumed defer
+rm -f "$_c845/.await-heartbeat"   # the first await's beat must not stand in for this one's
 NEXUS_STATE_DIR="$_w845/state" bash "$CHAN" await h845 --timeout 45 --interval 1 > "$_w845/h2.out" 2>&1 &
-_h845b=$!; sleep 2; rm -f "$_w845/state/skeptic/pending/h845"; wait "$_h845b" 2>/dev/null
+_h845b=$!
+_await_wait_parked "$_c845" "$_h845b"; assert_eq "#845H CONTROL: the re-entered await is PARKED, having SEEN the marker" "$?" "0"
+rm -f "$_w845/state/skeptic/pending/h845"; wait "$_h845b" 2>/dev/null
 assert_eq "#845H CONTROL: after re-entry, removing the marker is still what yields 11" "$?" "11"
 assert_contains "#845H the exit-code contract documents 13" "$(sed -n '/^# Exit codes:/,/^# State dir resolution/p' "$CHAN")" "13"
 
@@ -2277,10 +2313,14 @@ echo '=== #1426 residuals: IDENTITY, not a name — start-time in .await-owner, 
 # no start-time, is refused outright.
 _w1426b="$WORK/w1426b"; mkdir -p "$_w1426b/state"
 NEXUS_STATE_DIR="$_w1426b/state" bash "$CHAN" init i1426 >/dev/null 2>&1
+_ci1426=$(NEXUS_STATE_DIR="$_w1426b/state" bash "$CHAN" dir i1426)
 NEXUS_STATE_DIR="$_w1426b/state" bash "$CHAN" await i1426 --timeout 40 --interval 1 >/dev/null 2>&1 &
 _ident1426=$!
-sleep 2
-_owner1426="$(NEXUS_STATE_DIR="$_w1426b/state" bash "$CHAN" dir i1426)/.await-owner"
+# PARKED, not slept on (#1818): `.await-owner` is written by the claim, so a
+# late-starting await left it absent and the `read` below aborted the whole
+# suite under `set -u`.
+_await_wait_parked "$_ci1426" "$_ident1426"; assert_eq "#1426 the identity await is PARKED (.await-owner claimed) before it is read" "$?" "0"
+_owner1426="$_ci1426/.await-owner"
 read -r _opid1426 _ost1426 < "$_owner1426"
 assert_eq "#1426 .await-owner records TWO fields: pid and start-time" \
     "$([[ "$_opid1426" =~ ^[0-9]+$ && "$_ost1426" =~ ^[0-9]+$ ]] && echo yes || echo no)" "yes"

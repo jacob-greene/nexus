@@ -1178,6 +1178,49 @@ kill "$DBO"; wait "$DBO" 2>/dev/null
 unset LJ_SACCT_FAIL; : > "$LJ_SACCT_FILE"
 export NEXUS_LONGJOB_KEY="t1"
 
+echo "=== #1794: --for-lead — a sub-agent's watch wakes the LEAD, and says whom to re-task ==="
+# An in-process sub-agent shares its lead's CLAUDE_CODE_SESSION_ID, so its add
+# lands in the lead's spool and the lead is woken. Each assertion below has a
+# potency twin on the SAME rig differing only by --for-lead.
+export NEXUS_LONGJOB_KEY="t1794"; SPFL="$NEXUS_STATE_DIR/longjob/t1794"
+out=$("$LJ" add file:"$WORK/fl0" --id fl0 --for-lead w1-sub 2>&1); rc=$?
+(( rc == 3 )) && [[ "$out" == *"You are a SUB-AGENT (--for-lead w1-sub)"* && "$out" == *"await fl0 --timeout "*" with Bash timeout: 600000"* ]] \
+    && ok "#1794 NOT ARMED + --for-lead: rc 3 and the FOREGROUND await is named (a backgrounded call does not wake a sub-agent)" || bad "#1794 unarmed for-lead: rc=$rc $out"
+out=$("$LJ" add file:"$WORK/fl0b" --id fl0b 2>&1)
+[[ "$out" != *"SUB-AGENT"* ]] && ok "#1794 potency: the same unarmed add WITHOUT --for-lead carries no sub-agent note" || bad "#1794 plain unarmed add: $out"
+[[ "$(jq -r .handoff "$SPFL/watches/fl0.json")/$(jq -r .handoff "$SPFL/watches/fl0b.json")" == "w1-sub/" ]] \
+    && ok "#1794 spec records handoff=w1-sub, and an empty handoff without the flag" || bad "#1794 spec handoff: $(jq -c . "$SPFL/watches/fl0.json")"
+"$LJ" rm fl0 >/dev/null; "$LJ" rm fl0b >/dev/null
+for _bad in 'w1 sub' '-w1' "$(printf 'a%.0s' $(seq 1 65))" ''; do
+    "$LJ" add file:"$WORK/fl0" --id flbad --for-lead "$_bad" >/dev/null 2>&1; rc=$?
+    (( rc == 2 )) && [[ ! -e "$SPFL/watches/flbad.json" ]] && ok "#1794 --for-lead '${_bad:0:12}' (not a SendMessage name) → rc 2, nothing recorded" || bad "#1794 bad name '${_bad:0:12}': rc=$rc"
+    rm -f "$SPFL/watches/flbad.json"
+done
+NEXUS_ROOT="$FROOT" "$LJ" dispatch > "$WORK/out1794.txt" 2> "$WORK/err1794.txt" &
+DFL=$!; DPIDS+=("$DFL"); _wait_for 30 _armed "$SPFL" "$DFL" || bad "#1794 rig: the dispatcher never armed"
+out=$("$LJ" add file:"$WORK/fl1" --id fl1 --interval 5 --for-lead w1-sub 2>&1); rc=$?
+(( rc == 0 )) && [[ "$out" == *"THE LEAD is woken"* && "$out" == *"SendMessage to: w1-sub"* && "$out" != *"safe to end your turn"* ]] \
+    && ok "#1794 ARMED + --for-lead: rc 0, says the LEAD is woken, never 'safe to end your turn'" || bad "#1794 armed for-lead: rc=$rc $out"
+out=$("$LJ" add file:"$WORK/fl2" --id fl2 --interval 5 2>&1)
+[[ "$out" == *"safe to end your turn"* && "$out" != *"THE LEAD"* ]] && ok "#1794 potency: a plain add on the same rig still says 'safe to end your turn'" || bad "#1794 plain armed add: $out"
+"$LJ" add cmd:"echo '!! boom'; exit 2" --id fl3 --interval 5 --for-lead w1-sub >/dev/null 2>&1
+"$LJ" add cmd:'exit 1' --id fl4 --interval 5 --ttl 4 --for-lead w1-sub >/dev/null 2>&1
+out=$(NEXUS_WORKER_WINDOW=lj-w1794 "$LJ" run --for-lead w1-sub --id fl5 -- true 2>&1); rc=$?
+[[ "$(jq -r .handoff "$SPFL/watches/fl5.json" 2>/dev/null)" == w1-sub ]] && ok "#1794 run --for-lead passes the name through to the watch" || bad "#1794 run for-lead: rc=$rc $out"
+touch "$WORK/fl1" "$WORK/fl2"
+_wait_for 90 _retired_settled "$SPFL" fl1 fl2 fl3 fl4 || bad "#1794 rig: fl1..fl4 not all retired within 90 s"
+o=$(cat "$WORK/out1794.txt")
+grep -q '^longjob-watch: DONE fl1 | for sub-agent w1-sub: SendMessage(to: w1-sub) | record: monitor/longjob-watch.sh show fl1 | file:' <<<"$o" \
+    && ok "#1794 the wake line names the sub-agent to re-task, right after the id and before the record pointer" || bad "#1794 fl1 line: $(grep 'DONE fl1' <<<"$o")"
+grep -q '^longjob-watch: DONE fl2 | record: ' <<<"$o" && ! grep -q 'fl2.*for sub-agent' <<<"$o" \
+    && ok "#1794 potency: the plain watch's wake line carries no sub-agent clause" || bad "#1794 fl2 line: $(grep 'fl2' <<<"$o")"
+grep -q '^longjob-watch: boom | FAILED fl3 | for sub-agent w1-sub: SendMessage(to: w1-sub) | record: ' <<<"$o" \
+    && ok "#1794 an ALERT-first line keeps the sub-agent clause" || bad "#1794 fl3 alert line: $(grep 'fl3' <<<"$o")"
+grep -q '^longjob-watch: EXPIRED fl4 | for sub-agent w1-sub: SendMessage(to: w1-sub) | record: ' <<<"$o" \
+    && ok "#1794 an EXPIRED line keeps the sub-agent clause" || bad "#1794 fl4 expired line: $(grep 'fl4' <<<"$o")"
+kill "$DFL"; wait "$DFL" 2>/dev/null
+export NEXUS_LONGJOB_KEY="t1"
+
 echo "=== usage refusals ==="
 "$LJ" add nosuch:x >/dev/null 2>&1; rc=$?; (( rc == 2 )) && ok "add with an unknown kind → rc 2" || bad "add unknown kind rc=$rc"
 "$LJ" add file:/x --notify sometimes >/dev/null 2>&1; rc=$?; (( rc == 2 )) && ok "add with a bad --notify → rc 2" || bad "bad notify rc=$rc"

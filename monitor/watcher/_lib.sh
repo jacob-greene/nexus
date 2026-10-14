@@ -3012,6 +3012,12 @@ _nexus_window_has_orchestrator() {
 # <= 2. Verb invocations (`svc.sh status`, `svc.sh restart watcher`)
 # carry more arguments and never match; a claude whose PROMPT quotes
 # svc.sh has argc >> 2 and never matches either.
+#
+# ONE trailing `--show-secrets` is stripped first (your-org/nexus-code#1821):
+# every cockpit launcher passes it, so without this a flagged cockpit was
+# invisible here and the duplicate-cockpit guards (svc.sh's peer check,
+# entry.sh) would start a second one. Only that exact flag, only once, only
+# LAST — `svc.sh --show-secrets status` still ends in a verb and never matches.
 _nexus_pid_is_cockpit() {
     local pid="${1:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -3022,6 +3028,9 @@ _nexus_pid_is_cockpit() {
     # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
     { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
         < "/proc/$pid/cmdline"; } 2>/dev/null
+    if (( ${#argv[@]} >= 2 )) && [[ "${argv[${#argv[@]}-1]}" == --show-secrets ]]; then
+        unset 'argv[${#argv[@]}-1]'
+    fi
     (( ${#argv[@]} >= 1 && ${#argv[@]} <= 2 )) || return 1
     case "${argv[${#argv[@]}-1]}" in
         */svc.sh|svc.sh) return 0 ;;

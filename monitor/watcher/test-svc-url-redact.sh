@@ -20,6 +20,19 @@
 #   R5  a pre-existing file at mode 644 is rewritten at 600
 #   R6  state dir unwritable → still redacted, cell says "not saved" (the
 #       failure direction is "less convenient", never "leaked")
+#   J1  `jupyter-up.sh` (per-project) ready banner: the token from `labsh url`
+#       is absent from stdout AND stderr; the banner names the 0600 file — the
+#       same leak, one script over (it printed `URL (with token): …`)
+#   J2  …that file is the cockpit's own ($STATE/services/<name>.url), mode
+#       600, holding the full URL
+#   J3  the --root banner likewise (service `jupyterlab`)
+#   J4  svc.sh's helper cannot be loaded → the whole query is withheld
+#   S1  `--show-secrets status` → the cell shows the full URL (endpoint and
+#       labsh token), other rows unchanged (your-org/nexus-code#1821)
+#   S2  …and the 0600 file is still written with the full URL
+#   S3  SVC_SHOW_SECRETS=1 is the env equivalent; `--force --show-secrets`
+#       and `--show-secrets --force` both parse
+#   S4  SVC_SHOW_SECRETS=yes (anything but an exact 1) still REDACTS
 #
 # Synthetic secrets only (SECRETX…); every healthcheck is `exit 0`, so no
 # port is touched. Private TMUX_TMPDIR: no live board is read.
@@ -58,9 +71,10 @@ printf '%s\t%s\t%s\t%s\n' \
     r5svc "$W/r5" 'echo run' 'exit 0' \
     > "$REG"
 
-run_status() {   # → sets OUT ERR RC
-    env -u TMUX TMUX_TMPDIR="$W/tmx" NEXUS_ROOT="$W/root" NEXUS_STATE_DIR="$STATE" \
-        NEXUS_SERVICES_REGISTRY="$REG" timeout 120 bash "$SVC" status > "$W/out" 2> "$W/err"
+run_status() {   # [<svc.sh args before the verb>…] → sets OUT ERR RC
+    env -u TMUX -u SVC_SHOW_SECRETS TMUX_TMPDIR="$W/tmx" NEXUS_ROOT="$W/root" NEXUS_STATE_DIR="$STATE" \
+        NEXUS_SERVICES_REGISTRY="$REG" ${SHOW_ENV:+SVC_SHOW_SECRETS="$SHOW_ENV"} \
+        timeout 120 bash "$SVC" "$@" status > "$W/out" 2> "$W/err"
     RC=$?
     OUT=$(<"$W/out"); ERR=$(<"$W/err")
 }
@@ -101,8 +115,69 @@ chmod 700 "$STATE/services"
 assert_not_contains "R6 unwritable: the token is still absent" "$OUT$ERR" "SECRETX1"
 assert_contains     "R6 …and the cell says the URL was not saved" "$(row r1svc)" "?token=<redacted: full URL not saved>"
 
+echo '=== jupyter-up.sh never prints the token it activates ==='
+# cmd_up's banner path, driven for real: jupyter-up.sh is sourced (its dispatch
+# is BASH_SOURCE-guarded), `labsh`/`uv` are PATH stubs, and only the steps that
+# would build kernels, edit the registry or launch a server are stubbed out.
+UP="$_dir/../jupyter-up.sh"
+mkdir -p "$W/jbin" "$W/jproj/.jupyter" "$W/nohelper"
+printf '#!/bin/sh\n[ "$1" = url ] && echo "http://localhost:1/lab?token=SECRETJU1"\nexit 0\n' > "$W/jbin/labsh"
+printf '#!/bin/sh\nexit 0\n' > "$W/jbin/uv"
+chmod +x "$W/jbin/labsh" "$W/jbin/uv"
+jup_up() {   # <root-mode 0|1> <service-name> [nohelper] → sets OUT ERR RC
+    local j_root="$1" j_name="$2" j_helper="${3:-}"
+    ( set --   # jupyter-up.sh parses "$@" at source time
+      export PATH="$W/jbin:$PATH" NEXUS_ROOT="$W/root" NEXUS_STATE_DIR="$STATE" \
+             NEXUS_SERVICES_REGISTRY="$REG" TMUX_TMPDIR="$W/tmx"
+      unset TMUX SVC_SHOW_SECRETS   # sourced svc.sh reads it (#1821)
+      # shellcheck source=../jupyter-up.sh
+      source "$UP"
+      PROJECT_DIR="$W/jproj"; ROOT_MODE="$j_root"; NO_START=0
+      [[ "$j_helper" == nohelper ]] && _script_dir="$W/nohelper"
+      service_name_for() { echo "$j_name"; }
+      _registry_must_be_readable() { :; }; ensure_kernel() { :; }
+      ensure_root_kernels() { :; }; migrate_legacy_root() { :; }
+      persist_opts() { :; }; ensure_registry_row() { :; }
+      recover_service() { echo healthy; }; _await_health_or_converge() { return 0; }
+      cmd_up ) > "$W/out" 2> "$W/err"
+    RC=$?
+    OUT=$(<"$W/out"); ERR=$(<"$W/err")
+}
+jup_up 0 jupyter-jproj
+assert_eq           "J1 the activation succeeded"          "$RC" "0"
+assert_not_contains "J1 the token is absent from stdout+stderr" "$OUT$ERR" "SECRETJU1"
+assert_contains     "J1 the banner names the 0600 file"    "$OUT" "URL:                http://localhost:1/lab?token=<redacted: see $STATE/services/jupyter-jproj.url>"
+assert_eq           "J2 the cockpit's file holds the full URL" "$(cat "$STATE/services/jupyter-jproj.url" 2>/dev/null)" 'http://localhost:1/lab?token=SECRETJU1'
+assert_eq           "J2 …at mode 600"                      "$(mode "$STATE/services/jupyter-jproj.url")" "600"
+jup_up 1 jupyterlab
+assert_not_contains "J3 --root: the token is absent from stdout+stderr" "$OUT$ERR" "SECRETJU1"
+assert_contains     "J3 --root: the banner names jupyterlab's 0600 file" "$OUT" "?token=<redacted: see $STATE/services/jupyterlab.url>"
+jup_up 0 jupyter-jnohelp nohelper
+assert_not_contains "J4 no helper: the token is still absent" "$OUT$ERR" "SECRETJU1"
+assert_contains     "J4 …and the whole query is withheld" "$OUT" "URL:                http://localhost:1/lab?<withheld: redaction helper unavailable>"
+
+
+echo '=== --show-secrets: the cockpit shows the URL unredacted (#1821) ==='
+rm -f "$STATE/services/r1svc.url"
+run_status --show-secrets
+assert_eq           "S1 rc 0"                             "$RC" "0"
+assert_contains     "S1 the endpoint URL is shown in full" "$(row r1svc)" 'http://localhost:1/app?token=SECRETX1&view=a#frag'
+assert_contains     "S1 the labsh token is shown"         "$(row r3svc)" "/lab?token=SECRETJ3"
+assert_not_contains "S1 no redaction placeholder anywhere" "$OUT" "<redacted"
+assert_contains     "S1 a URL with nothing secret is untouched" "$(row n1svc)" "http://localhost:1/plain?view=a&tokenized=no"
+assert_eq           "S2 the 0600 file is still written"   "$(cat "$STATE/services/r1svc.url" 2>/dev/null)" 'http://localhost:1/app?token=SECRETX1&view=a#frag'
+assert_eq           "S2 …at mode 600"                     "$(mode "$STATE/services/r1svc.url")" "600"
+SHOW_ENV=1 run_status
+assert_contains     "S3 SVC_SHOW_SECRETS=1 shows the token" "$(row r1svc)" "?token=SECRETX1&"
+run_status --force --show-secrets
+assert_contains     "S3 --force --show-secrets parses"    "$(row r1svc)" "?token=SECRETX1&"
+run_status --show-secrets --force
+assert_contains     "S3 --show-secrets --force parses"    "$(row r1svc)" "?token=SECRETX1&"
+SHOW_ENV=yes run_status
+assert_not_contains "S4 SVC_SHOW_SECRETS=yes still redacts" "$OUT$ERR" "SECRETX1"
+
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, count=exact).
-EXPECTED=21
+EXPECTED=41
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

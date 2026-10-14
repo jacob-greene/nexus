@@ -363,7 +363,7 @@ if (( ENTRY_RC == 0 )) \
    && [[ -f "$marker" ]] \
    && grep -q '^context: watcher' "$marker" \
    && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
-   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: <cockpit>"* ]]; then
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: --show-secrets"* ]]; then
     pass "out-of-sandbox + --i-accept-no-sandbox → rc=0, warning, marker recorded, bring-up runs"
 else
     fail "out-of-sandbox accept: rc=$ENTRY_RC marker=$([[ -f "$marker" ]] && echo yes || echo no) svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
@@ -418,7 +418,7 @@ if (( ENTRY_RC == 0 )) \
    && [[ -n "$archived" && "$(tr -d '[:space:]' < "$archived")" == "$PIN_SID" ]] \
    && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
    && [[ "$ENTRY_SVC_LOG" == *"NEXUS_ROOT=$ROOT"* ]] \
-   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: <cockpit>"* ]] \
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: --show-secrets"* ]] \
    && [[ "$windows" == "services" ]] \
    && [[ -z "$ENTRY_CLAUDE_LOG" ]]; then
     pass "cold start (default): pin archived (content intact), svc.sh up + cockpit with NEXUS_ROOT, window renamed 'services', claude never invoked"
@@ -434,7 +434,7 @@ PRESEED_WINDOWS="some-other-window" run_entry "$ROOT"
 if (( ENTRY_RC == 0 )) \
    && [[ "$ENTRY_ERR" == *"no prior session pin"* ]] \
    && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
-   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: <cockpit>"* ]]; then
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: --show-secrets"* ]]; then
     pass "cold start without pin: no archive attempted, stack up + cockpit still run"
 else
     fail "cold start no-pin: rc=$ENTRY_RC svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
@@ -825,7 +825,7 @@ ROOT=$(make_fixture)
 SVC_UP_RC=1 PRESEED_WINDOWS="some-other-window" run_entry "$ROOT"
 if (( ENTRY_RC == 0 )) \
    && [[ "$ENTRY_ERR" == *"'svc.sh up' exited non-zero"* ]] \
-   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: <cockpit>"* ]]; then
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: --show-secrets"* ]]; then
     pass "svc.sh up failure: loud warning, operator still lands in the cockpit"
 else
     fail "up failure: rc=$ENTRY_RC svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
@@ -909,6 +909,7 @@ if (( ENTRY_RC == 0 )) \
    && [[ "$ENTRY_ERR" == *"cockpit is already running"* ]] \
    && [[ "$windows" == $'mine\nservices' ]] \
    && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
+   && [[ "$ENTRY_SVC_LOG" != *"svc.sh called: --show-secrets"* ]] \
    && [[ "$ENTRY_SVC_LOG" != *"<cockpit>"* ]]; then
     pass "live peer cockpit: bring-up ran, rename + second cockpit skipped (rc=0)"
 else
@@ -917,6 +918,54 @@ fi
 # `|| true` is load-bearing: run_entry leaves errexit ON (its set +e /
 # set -e bracket), and `wait` on a TERM-killed child returns 143 —
 # without the guard the whole suite dies here with rc=143.
+kill "$FAKE_COCKPIT_PID" 2>/dev/null || true
+wait "$FAKE_COCKPIT_PID" 2>/dev/null || true
+rm -rf "$ROOT"
+
+# --- 15: a peer cockpit launched WITH --show-secrets is still a cockpit -----
+# your-org/nexus-code#1821: every cockpit launcher now passes --show-secrets,
+# so the cockpit's argv is [bash, .../svc.sh, --show-secrets]. Identity used to
+# require argc <= 2 ending in svc.sh, which would make a flagged cockpit
+# invisible here and start a SECOND one.
+ROOT=$(make_fixture)
+mkdir -p "$ROOT/fakecockpit"
+printf '#!/usr/bin/env bash\nsleep 60\n' > "$ROOT/fakecockpit/svc.sh"
+bash "$ROOT/fakecockpit/svc.sh" --show-secrets &
+FAKE_COCKPIT_PID=$!
+sleep 0.2
+PRESEED_WINDOWS=$'mine\nservices' PRESEED_CURRENT=1 PRESEED_PANES="%5|$FAKE_COCKPIT_PID|@2|services" run_entry "$ROOT"
+windows=$(<"$ENTRY_STATE_DIR/tmux-windows.txt")
+if (( ENTRY_RC == 0 )) \
+   && [[ "$ENTRY_ERR" == *"cockpit is already running"* ]] \
+   && [[ "$windows" == $'mine\nservices' ]] \
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
+   && [[ "$ENTRY_SVC_LOG" != *"svc.sh called: --show-secrets"* ]]; then
+    pass "flagged peer cockpit (svc.sh --show-secrets) is recognised: no second cockpit"
+else
+    fail "flagged peer cockpit: rc=$ENTRY_RC windows='$windows' svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
+fi
+kill "$FAKE_COCKPIT_PID" 2>/dev/null || true
+wait "$FAKE_COCKPIT_PID" 2>/dev/null || true
+rm -rf "$ROOT"
+
+# --- 16: a VERB invocation carrying --show-secrets is NOT a cockpit --------
+# The control for 15: the strip is one trailing flag only, so
+# `svc.sh --show-secrets status` still ends in a verb and must not block the
+# cockpit launch.
+ROOT=$(make_fixture)
+mkdir -p "$ROOT/fakecockpit"
+printf '#!/usr/bin/env bash\nsleep 60\n' > "$ROOT/fakecockpit/svc.sh"
+bash "$ROOT/fakecockpit/svc.sh" --show-secrets status &
+FAKE_COCKPIT_PID=$!
+sleep 0.2
+PRESEED_WINDOWS=$'mine\nother' PRESEED_CURRENT=1 PRESEED_PANES="%5|$FAKE_COCKPIT_PID|@2|other" run_entry "$ROOT"
+if (( ENTRY_RC == 0 )) \
+   && [[ "$ENTRY_ERR" != *"cockpit is already running"* ]] \
+   && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: --show-secrets"* ]]; then
+    pass "verb invocation 'svc.sh --show-secrets status' is not mistaken for a cockpit"
+else
+    fail "verb-not-cockpit: rc=$ENTRY_RC svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
+fi
 kill "$FAKE_COCKPIT_PID" 2>/dev/null || true
 wait "$FAKE_COCKPIT_PID" 2>/dev/null || true
 rm -rf "$ROOT"

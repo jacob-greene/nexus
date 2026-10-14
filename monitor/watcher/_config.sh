@@ -862,7 +862,7 @@ MONITOR_VERSION_SELF_LOOP_LIMIT="${MONITOR_VERSION_SELF_LOOP_LIMIT:-$("$_cfg" mo
 MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS="${MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS:-$("$_cfg" monitor.version_restart.self_loop_window_seconds 3600)}"
 [[ "$MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS=3600
 # The tmux window hosting the services cockpit TUI (the drift ask
-# names it; `tmux new-window -n services 'monitor/svc.sh'` is the
+# names it; `tmux new-window -n services 'monitor/svc.sh --show-secrets'` is the
 # documented launch in svc.sh's header).
 MONITOR_COCKPIT_WINDOW="${MONITOR_COCKPIT_WINDOW:-$("$_cfg" monitor.cockpit_window services)}"
 # Continuous service-health watch (service-health-watch). The

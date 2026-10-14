@@ -140,9 +140,11 @@ Use the log when the dashboard summary feels off ("when did that worker actually
 The GitHub dashboard answers "what is the nexus *doing*?"; the local cockpit answers "is the nexus *running*?". `./watcher` leaves it open in the `services` tmux window after boot, and you can open it anywhere:
 
 ```bash
-monitor/svc.sh            # live auto-refreshing cockpit (read-only)
-monitor/svc.sh status     # one status table, then exit (scriptable)
+monitor/svc.sh --show-secrets   # live auto-refreshing cockpit (read-only), URLs unredacted
+monitor/svc.sh status           # one status table, then exit (scriptable); secrets redacted
 ```
+
+`--show-secrets` (or `SVC_SHOW_SECRETS=1`) shows a URL's secret query parameters, such as the JupyterLab `?token=`, so the link can be copied straight from the cockpit. Every cockpit launcher passes it. Without it, a bare `svc.sh` and `svc.sh status` redact the value and name the mode-0600 `monitor/.state/services/<name>.url` file that holds the full URL (<your-org>/nexus-code#1821).
 
 One row per piece of the stack — the **watcher** (headless service; tri-state liveness from its heartbeat) and the **orchestrator** (watcher-managed; window presence + turn-end heartbeat age) pinned on top, then every service registered in `monitor/services.registry`. Single-key controls:
 

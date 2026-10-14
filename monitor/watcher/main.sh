@@ -4969,6 +4969,46 @@ _compose_gh_now() {
     return 0
 }
 
+# Reconcile the async-staged idle section ($1) for this compose and print
+# what compose_emit should use as idle_now (possibly empty — and an empty
+# idle_now is not an emit reason). Extracted from _v2_task_compose_emit so
+# the decision is driven behaviourally by test-emit-partial-honesty.sh B5e
+# (your-org/nexus-code#1808) rather than grepped. `log` writes to stderr,
+# so calling this via `$( … )` is safe.
+#
+# RECONCILE THE ASYNC-STAGED IDLE SECTION AGAINST THE LIVE WINDOW SET
+# (your-org/nexus-code#1044). This body is up to one `idle_section` cadence
+# (30 s) old, so a window that died since it was rendered lingers here as a
+# live row — and the `--- tmux ---` section of the SAME emit, computed
+# fresh, has already dropped it. That is how one message came to assert a
+# window both gone and present, and to instruct the orchestrator to "ANSWER
+# it in the pane; do NOT relaunch or close" for a pane that did not exist.
+#
+# The full-state snapshot has been reconciled this way since the 2026-07-21
+# emit; the idle section is its sibling and was simply never enrolled.
+# Withheld rows are NAMED by the filter, not silently dropped.
+# Knob-guarded, default on, mirroring MONITOR_FULL_STATE_RESTAT_WINDOWS.
+_compose_idle_now() {
+    local idle_now="${1:-}"
+    if [[ -n "$idle_now" && "${MONITOR_IDLE_RESTAT_WINDOWS:-true}" == "true" ]] \
+       && declare -F _idle_restat_live_windows >/dev/null 2>&1; then
+        local _idle_live
+        _idle_live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+        if [[ -n "$_idle_live" ]]; then
+            idle_now=$(printf '%s' "$idle_now" | _idle_restat_live_windows "$_idle_live")
+            # A section left holding ONLY WITHHELD notes has nothing live to
+            # act on; as a trigger it re-pasted a retired window's retained
+            # footer every compose (your-org/nexus-code b1). Drop it.
+            if declare -F _idle_section_is_withheld_only >/dev/null 2>&1 \
+               && printf '%s\n' "$idle_now" | _idle_section_is_withheld_only; then
+                log "idle section: every row/footer entry WITHHELD (windows gone) — not an emit reason: $(printf '%s' "$idle_now" | tr '\n' ' ' | cut -c1-200)"
+                idle_now=""
+            fi
+        fi
+    fi
+    printf '%s' "$idle_now"
+}
+
 # Lightweight, sweep-independent operator-comment surfacing
 # (your-org/nexus-code#562 — the symptom fix). Eligible-comment
 # surfacing needs the GITHUB POLL RESULT, not pane state; coupling it
@@ -5203,35 +5243,7 @@ _v2_task_compose_emit() {
     # the two paths from double-pasting the same comment.
     gh_now=$(_compose_gh_now)
     bell_now=$(cat "$stage_dir/bell_windows.out" 2>/dev/null || true)
-    idle_now=$(cat "$stage_dir/idle_section.out" 2>/dev/null || true)
-    # RECONCILE THE ASYNC-STAGED IDLE SECTION AGAINST THE LIVE WINDOW SET
-    # (your-org/nexus-code#1044). This body is up to one `idle_section` cadence
-    # (30 s) old, so a window that died since it was rendered lingers here as a
-    # live row — and the `--- tmux ---` section of the SAME emit, computed
-    # fresh, has already dropped it. That is how one message came to assert a
-    # window both gone and present, and to instruct the orchestrator to "ANSWER
-    # it in the pane; do NOT relaunch or close" for a pane that did not exist.
-    #
-    # The full-state snapshot has been reconciled this way since the 2026-07-21
-    # emit; the idle section is its sibling and was simply never enrolled.
-    # Withheld rows are NAMED by the filter, not silently dropped.
-    # Knob-guarded, default on, mirroring MONITOR_FULL_STATE_RESTAT_WINDOWS.
-    if [[ -n "$idle_now" && "${MONITOR_IDLE_RESTAT_WINDOWS:-true}" == "true" ]] \
-       && declare -F _idle_restat_live_windows >/dev/null 2>&1; then
-        local _idle_live
-        _idle_live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
-        if [[ -n "$_idle_live" ]]; then
-            idle_now=$(printf '%s' "$idle_now" | _idle_restat_live_windows "$_idle_live")
-            # A section left holding ONLY WITHHELD notes has nothing live to
-            # act on; as a trigger it re-pasted a retired window's retained
-            # footer every compose (your-org/nexus-code b1). Drop it.
-            if declare -F _idle_section_is_withheld_only >/dev/null 2>&1 \
-               && printf '%s\n' "$idle_now" | _idle_section_is_withheld_only; then
-                log "idle section: every row/footer entry WITHHELD (windows gone) — not an emit reason: $(printf '%s' "$idle_now" | tr '\n' ' ' | cut -c1-200)"
-                idle_now=""
-            fi
-        fi
-    fi
+    idle_now=$(_compose_idle_now "$(cat "$stage_dir/idle_section.out" 2>/dev/null || true)")
     pending_now=$(cat "$stage_dir/pending_decisions.out" 2>/dev/null || true)
     requests_now=$(cat "$stage_dir/requests_poll.out" 2>/dev/null || true)
 

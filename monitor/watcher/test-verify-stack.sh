@@ -66,7 +66,8 @@ svc_healthy()   { : > "$WORK/svc-ok"; }
 svc_unhealthy() { rm -f "$WORK/svc-ok"; }
 
 run_verify() {  # extra args forwarded; short timeout so failures are fast
-    PATH="$WORK/stub-bin:$PATH" \
+    # VS_EXTRA_PATH: a per-case stub dir put FIRST (Cases 11c/11d's `timeout`).
+    PATH="${VS_EXTRA_PATH:+$VS_EXTRA_PATH:}$WORK/stub-bin:$PATH" \
     NEXUS_STATE_DIR="$WORK/state" \
     NEXUS_SERVICES_REGISTRY="$WORK/services.registry" \
     RECOVER_TARGET_WINDOW=orchestrator \
@@ -260,8 +261,12 @@ assert_not_contains "never claims convergence" "$T_OUT" "stack converged"
 assert_eq "returned at the first round, not at the 40 s deadline" "$(( T_ELAPSED < 25 ))" 1
 
 echo '=== Case 11: building + ANOTHER service down ⇒ rc 1, both named ==='
+# `--timeout 0` is exactly ONE round, and the first round is exempt from the
+# deadline, so every probe in it gets --check-timeout: what this case asserts
+# no longer depends on how far a loaded runner gets before the deadline
+# (#1813). The later-round paths are Cases 11b-11d, each forced by a seam.
 fresh_watcher; orch_present; write_build_registry $'broken\tfalse'
-timed_verify --timeout 8 --poll 1
+timed_verify --timeout 0 --poll 1
 assert_eq "rc 1 (a real failure outranks BUILDING)" "$T_RC" "1"
 assert_contains "names the broken service" "$T_OUT" "broken"
 assert_contains "still lists the build as BUILDING" "$T_OUT" "BUILDING"
@@ -292,6 +297,90 @@ for d in /proc/[0-9]*; do
     a0=$( { tr '\0' '\n' < "$d/cmdline" | sed -n 1p; } 2>/dev/null )
     [[ "$a0" == "$leak_tag3" ]] && kill "${d#/proc/}" 2>/dev/null
 done
+
+# --- #1813: the cold-build probe DENIED or CUT is never a `down` verdict ------
+# The CI failure: round 1 saw jlab BUILDING; in round 2 jlab's healthcheck ran
+# with the last of the budget, so the cold-build probe after it got no cap
+# (`_probe_cap` rc 1) and the row fell through to `down` — "services: jlab,
+# broken (down; …)", with no BUILDING anywhere. Forced here by a `timeout`
+# shim placed first on PATH (it wraps the real one), never by runner speed:
+#   burn  — from round 2 on, jlab's HEALTHCHECK answers its real (failing) rc
+#           only after sleeping its full cap. The cap is min(--check-timeout,
+#           seconds left), so the deadline has passed when it returns, on any
+#           host, and the cold-build probe after it is denied.
+#   cut   — from round 2 on, the COLD-BUILD PROBE itself is cut by its cap:
+#           it sleeps that cap, as a real cut does, then returns 124 (what
+#           `timeout` returns when it fires). The deadline has passed when it
+#           returns, so no later round can re-label the row.
+#   cutfirst — every cold-build probe returns 124 at once (Case 11e, which
+#           runs exactly one round, `--timeout 0`).
+REAL_TIMEOUT=$(command -v timeout)
+mkdir -p "$WORK/stub-timeout"
+cat > "$WORK/stub-timeout/timeout" <<SH
+#!/usr/bin/env bash
+# argv: -k <grace> <cap> bash -c <script>   (verify-stack's _bounded)
+mode=\$(cat "$WORK/timeout-mode" 2>/dev/null)
+if [[ "\$mode" == burn && "\${VS_HEALTH:-}" == false && "\${VS_WD:-}" == "$BWD" ]]; then
+    if [[ -e "$WORK/burn-armed" ]]; then
+        "$REAL_TIMEOUT" "\$@"; rc=\$?
+        sleep "\$3"; : > "$WORK/burn-fired"; exit "\$rc"
+    fi
+    : > "$WORK/burn-armed"
+fi
+if [[ "\$mode" == cut && -n "\${VS_EVIDENCE:-}" ]]; then
+    [[ -e "$WORK/cut-armed" ]] && { sleep "\$3"; : > "$WORK/cut-fired"; exit 124; }
+    : > "$WORK/cut-armed"
+fi
+if [[ "\$mode" == cutfirst && -n "\${VS_EVIDENCE:-}" ]]; then
+    : > "$WORK/cut-fired"; exit 124
+fi
+exec "$REAL_TIMEOUT" "\$@"
+SH
+chmod +x "$WORK/stub-timeout/timeout"
+reset_shim() { rm -f "$WORK"/burn-armed "$WORK"/burn-fired "$WORK"/cut-armed "$WORK"/cut-fired; printf '%s\n' "$1" > "$WORK/timeout-mode"; }
+
+echo '=== Case 11c (#1813): the healthcheck consumes the budget ⇒ the denied cold-build probe is never DOWN ==='
+fresh_watcher; orch_present; write_build_registry $'broken\tfalse'
+reset_shim burn
+VS_EXTRA_PATH="$WORK/stub-timeout"
+timed_verify --timeout 6 --poll 1
+unset VS_EXTRA_PATH
+echo "    elapsed=${T_ELAPSED}s rc=$T_RC"
+assert_eq "fixture precondition: a later round's jlab healthcheck consumed the budget" "$([[ -e "$WORK/burn-fired" ]] && echo yes)" "yes"
+assert_eq "rc 1 (broken is down; an unclassified build never certifies)" "$T_RC" "1"
+assert_contains "names the broken service" "$T_OUT" "broken"
+assert_contains "still lists the build as BUILDING from its last observation" "$T_OUT" "jlab (labsh cold build pid $BPID"
+assert_contains "says the cold-build probe was not re-run" "$T_OUT" "cold-build probe not run — deadline reached"
+assert_not_contains "jlab is never reported as plain down" "$T_OUT" "services: jlab,"
+assert_not_contains "a denied probe never certifies convergence" "$T_OUT" "stack converged"
+assert_not_contains "nor rc-3 convergence" "$T_OUT" "every other service healthy"
+
+echo '=== Case 11d (#1813): the cold-build probe CUT by its cap ⇒ unclassified, never DOWN ==='
+fresh_watcher; orch_present; write_build_registry $'broken\tfalse'
+reset_shim cut
+VS_EXTRA_PATH="$WORK/stub-timeout"
+timed_verify --timeout 6 --poll 1
+unset VS_EXTRA_PATH
+echo "    elapsed=${T_ELAPSED}s rc=$T_RC"
+assert_eq "fixture precondition: a later round's cold-build probe was cut" "$([[ -e "$WORK/cut-fired" ]] && echo yes)" "yes"
+assert_eq "rc 1 (broken is down)" "$T_RC" "1"
+assert_contains "still lists the build as BUILDING from its last observation" "$T_OUT" "jlab (labsh cold build pid $BPID"
+assert_contains "says the cold-build probe timed out" "$T_OUT" "cold-build probe timed out"
+assert_not_contains "jlab is never reported as plain down" "$T_OUT" "services: jlab,"
+
+echo '=== Case 11e (#1813): denied cold-build probe with NO prior BUILDING ⇒ unclassified, not BUILDING ==='
+# Fail-closed half: with no earlier observation to keep, the row is blocking
+# and says why it is unclassified — it is never promoted to BUILDING.
+fresh_watcher; orch_present; write_build_registry $'broken\tfalse'
+reset_shim cutfirst            # cut in round 1: no round ever saw BUILDING
+VS_EXTRA_PATH="$WORK/stub-timeout"
+timed_verify --timeout 0 --poll 1
+unset VS_EXTRA_PATH
+assert_eq "fixture precondition: the first round's cold-build probe was cut" "$([[ -e "$WORK/cut-fired" ]] && echo yes)" "yes"
+assert_eq "rc 1" "$T_RC" "1"
+assert_contains "names jlab as unclassified" "$T_OUT" "jlab (unhealthy, NOT classified: cold-build probe timed out"
+assert_not_contains "never reported as BUILDING" "$T_OUT" "BUILDING"
+rm -f "$WORK/timeout-mode"
 
 echo '=== Case 12: build already BOUND a URL ⇒ not building ⇒ rc 1 (predicate fails closed) ==='
 echo 'Jupyter Server is running at: http://127.0.0.1:9/lab' > "$BWD/.jupyter/labsh.bg.log"

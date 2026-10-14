@@ -186,7 +186,7 @@ run_ng() {
 # File + claim a request; print its id. The claim is what the watcher does.
 new_claimed_request() {
     local slug="$1" id
-    id=$(printf 'How many FOXP3+ cells are in the V6 object?\n' \
+    id=$(printf 'How many MARKER1+ cells are in the demo object?\n' \
         | env -u NEXUS_ROOT NEXUS_STATE_DIR="$STATE_DIR" "$CHAN" file \
               --origin remote-operator-client --kind question \
               --reply required --slug "$slug" -) || return 1
@@ -208,19 +208,19 @@ trigger: request 20260723T000000Z-remote-operator-client-demo
 status: completed
 ---
 
-# Channel answer: FOXP3+ counts in the V6 object
+# Channel answer: MARKER1+ counts in the demo object
 
 ## Summary
 
-ANSWER_TOKEN_9f3c: there are 7 FOXP3+ regulatory T cells in the V6
-object. FOXP3 is on the measured panel, so this is a measured count
+ANSWER_TOKEN_9f3c: there are 7 MARKER1+ cells in the demo
+object. MARKER1 is on the measured panel, so this is a measured count
 rather than an imputed one, and the number is directly comparable
 across the cohort.
 
 ## What Was Done
 
-- Loaded the V6 store and subset to FOXP3-positive cells.
-- Confirmed FOXP3 is panel-measured rather than imputed.
+- Loaded the demo store and subset to MARKER1-positive cells.
+- Confirmed MARKER1 is panel-measured rather than imputed.
 - Cross-checked the count against the within-sample layer.
 - Recorded the query so the number is reproducible.
 - Verified no duplicate cell ids inflate the count.
@@ -235,7 +235,7 @@ Nothing for this request.
 
 ## How to Resume
 
-Re-run the notebook cell tagged foxp3-count.
+Re-run the notebook cell tagged marker-count.
 EOF
 }
 write_report "$REPORT"
@@ -281,11 +281,11 @@ echo '=== W2: --answer-file replaces the Summary as the reply body ==='
 
 ID2=$(new_claimed_request "w2-question")
 ANSWER="$WORK/answer.tsv"
-printf 'sample\tfoxp3_cells\nMH1\t7\nBE_2306\t41\n' > "$ANSWER"
+printf 'sample\tmarker_cells\nSAMPLE_A\t7\nSAMPLE_B\t41\n' > "$ANSWER"
 run_ng stdout stderr rc wrap-up --reply-to "$ID2" "$REPORT" --answer-file "$ANSWER"
 assert_eq       "--answer-file wrap-up exits 0"       "$rc" "0"
 results=$(chan fetch "$ID2" results)
-assert_contains "results carry the answer file bytes" "$results" "BE_2306	41"
+assert_contains "results carry the answer file bytes" "$results" "SAMPLE_B	41"
 assert_not_contains "results do NOT carry the Summary" "$results" "ANSWER_TOKEN_9f3c"
 assert_contains "results still carry the report footer" "$results" "report: $REPORT"
 assert_eq "still NO gh invocation" "$(wc -c < "$GH_CAPTURE" | tr -d ' ')" "0"

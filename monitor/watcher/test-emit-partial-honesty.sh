@@ -472,7 +472,7 @@ has "…and the live row is kept"              "$out" "livewin idle 300s"
 echo "=== B5. the retained FOOTER is reconciled too: dead entries are WITHHELD, not passed through ==="
 # Formerly asserted the DEFECT: the footer passed through untouched, so a
 # retired window was reported as retained (prelude `0 retained` beside
-# `(1 retained windows suppressed: learn-lm-dsk (…))`) and the stale footer
+# `(1 retained windows suppressed: w9-sk (…))`) and the stale footer
 # re-armed a poll-resurface emit every compose (b1, observed 10-09..10-12).
 SECTION4='  - deadA idle 10s WITHOUT wrap-up — consider follow-up paste
   (3 retained windows suppressed: a, b, c)'
@@ -482,15 +482,15 @@ has   "…its windows join the WITHHELD note, in order" "$out" "4 row(s) WITHHEL
 hasnt "…and the dead row does not survive"            "$out" "deadA idle 10s"
 
 echo "=== B5b. a MIXED footer keeps its live entries, recomputes N, names the dead ==="
-FOOT='(2 retained windows suppressed: livewin (wrap-up-pending), learn-lm-dsk (wrap-up-x))'
+FOOT='(2 retained windows suppressed: livewin (wrap-up-pending), w9-sk (wrap-up-x))'
 out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows "$LIVE")
 has   "live entry kept with N recomputed to 1" "$out" "(1 retained windows suppressed: livewin (wrap-up-pending))"
-has   "…the dead entry is WITHHELD and named" "$out" "1 row(s) WITHHELD — the window(s) no longer exist in tmux: learn-lm-dsk"
-out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows $'livewin\nlearn-lm-dsk')
+has   "…the dead entry is WITHHELD and named" "$out" "1 row(s) WITHHELD — the window(s) no longer exist in tmux: w9-sk"
+out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows $'livewin\nw9-sk')
 assert_eq "MUST-NOT-FIRE: all-live footer is byte-identical" "$out" "$FOOT"
 
 echo "=== B5c. a section holding ONLY WITHHELD notes is not an emit reason ==="
-out=$(printf '%s\n' '(1 retained windows suppressed: learn-lm-dsk (wrap-up-x))' | _idle_restat_live_windows "$LIVE")
+out=$(printf '%s\n' '(1 retained windows suppressed: w9-sk (wrap-up-x))' | _idle_restat_live_windows "$LIVE")
 if printf '%s\n' "$out" | _idle_section_is_withheld_only; then ok "all-dead footer → withheld-only (dropped by compose)"
 else bad "all-dead footer section still counts as content: [$out]"; fi
 out=$(printf '%s\n' "$FOOT" | _idle_restat_live_windows "$LIVE")
@@ -498,9 +498,35 @@ if printf '%s\n' "$out" | _idle_section_is_withheld_only; then bad "a live foote
 else ok "MUST-NOT-FIRE: a live entry beside a WITHHELD note keeps the section"; fi
 if printf '%s\n' '' | _idle_section_is_withheld_only; then bad "an empty section was classed withheld-only"
 else ok "MUST-NOT-FIRE: an empty section is not 'withheld-only'"; fi
+
+echo "=== B5e. compose's idle reconcile, DRIVEN: withheld-only → empty idle_now; one live row → kept (#1808) ==="
+# Formerly a grep of compose_emit's source for `_idle_section_is_withheld_only;
+# then`, which a negated test, a deleted `idle_now=""` or a branch moved
+# outside the reconcile all satisfied. Now the real decision code is plucked
+# from main.sh and run against a stubbed live window set.
+eval "$(_pluck_fn _compose_idle_now "$_MAIN")"
+assert_eq "_compose_idle_now was plucked (non-vacuous)" "$(declare -F _compose_idle_now >/dev/null && echo ok || echo missing)" "ok"
+tmux() { [[ "$1" == list-windows ]] && printf '%s\n' orchestrator livewin services; }
+_b5e_log=$(mktemp)
+log() { printf '%s\n' "$*" >> "$_b5e_log"; }
+out=$(_compose_idle_now '(1 retained windows suppressed: w9-sk (wrap-up-x))')
+assert_eq "withheld-only section → idle_now EMPTY (no emit reason)" "$out" ""
+has "…and the drop is LOGGED"            "$(cat "$_b5e_log")" "WITHHELD (windows gone) — not an emit reason"
+has "…naming the withheld window"        "$(cat "$_b5e_log")" "no longer exist in tmux: w9-sk"
+: > "$_b5e_log"
+out=$(_compose_idle_now "$FOOT")
+has "MUST-NOT-FIRE: one live footer entry keeps idle_now non-empty" "$out" "(1 retained windows suppressed: livewin (wrap-up-pending))"
+has "…with the dead entry still NAMED as withheld"                 "$out" "WITHHELD — the window(s) no longer exist in tmux: w9-sk"
+assert_eq "…and no drop is logged" "$(cat "$_b5e_log")" ""
+out=$(_compose_idle_now '  - livewin idle 300s WITHOUT wrap-up — consider follow-up paste')
+assert_eq "MUST-NOT-FIRE: an all-live row passes through byte-identical" "$out" "  - livewin idle 300s WITHOUT wrap-up — consider follow-up paste"
+out=$(MONITOR_IDLE_RESTAT_WINDOWS=false _compose_idle_now '(1 retained windows suppressed: w9-sk (wrap-up-x))')
+assert_eq "knob off → the stale section is passed through, not dropped" "$out" "(1 retained windows suppressed: w9-sk (wrap-up-x))"
+rm -f "$_b5e_log"; unset -f tmux; log() { :; }
+# The one link left textual: compose_emit takes idle_now from this function.
 _ce_body=$(_pluck_fn _v2_task_compose_emit "$_MAIN")
 assert_eq "the compose body was plucked (non-vacuous)" "$( (( $(printf '%s\n' "$_ce_body" | wc -l) > 100 )) && echo ok || echo empty)" "ok"
-has "compose_emit drops a withheld-only idle section" "$_ce_body" '_idle_section_is_withheld_only; then'
+has "compose_emit takes idle_now from _compose_idle_now" "$_ce_body" 'idle_now=$(_compose_idle_now "$(cat "$stage_dir/idle_section.out"'
 
 echo "=== B5d. a comma inside a retained REASON cannot split an entry ==="
 list_idle_transitions() { printf 'livewin\tretained\t0\twrap-up, then await (x)\n'; }
@@ -556,7 +582,7 @@ else bad "row survived: [$(cat "$sf")] — the tracker DOES need a reaper; revis
 # This is the same protection this branch relied on elsewhere, and it is not
 # decoration: `test-summary-honesty-manifest` flagged this very file as
 # `ledger=no::count=none` when it was first written.
-_EXPECTED_ASSERTIONS=113
+_EXPECTED_ASSERTIONS=122
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; _th_pass

@@ -203,6 +203,7 @@ _over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1;
 paste_with_retry() { printf '%s %s\n' "$FAKE_NOW" "$(head -n1 "$2")" >> "$PASTES"; return 0; }
 _emit_delivery_ok() { :; }; _compose_emit_record_emit() { :; }; requests_commit_emitted() { :; }
 _respawn_loop_reset() { :; }; _respawn_consec_reset() { :; }
+eval "$(_extract_fn "$MAIN_SH" _compose_idle_now)"   # compose_emit calls it (#1815)
 eval "$(_extract_fn "$MAIN_SH" _v2_task_compose_emit)"
 declare -F _v2_task_compose_emit >/dev/null || { echo "FATAL: could not extract _v2_task_compose_emit from main.sh" >&2; exit 1; }
 

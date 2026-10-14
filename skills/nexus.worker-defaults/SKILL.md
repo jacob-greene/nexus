@@ -443,16 +443,17 @@ a hook or your task prompt points you there.
   (`grep -qE 'stamp|ABORT|ERROR' log`), then read which line matched.
 - **An in-process sub-agent is NOT woken by its own Monitor or background
   notification while you, its lead, are idle** (<your-org>/nexus-code`#1794`,
-  Claude Code 2.1.293). The harness queues the notification in the parent
-  session and delivers it only when something else wakes the sub-agent.
-  Measured 2026-10-09: a run finished green at 17:07 and its helper idled
-  3 h 41 min until a nudge; every notification that session that arrived
-  while the helper was idle waited for an unrelated message. So a sub-agent
-  must never END ITS TURN waiting on a notification: it waits in a FOREGROUND
-  bounded call that polls the job's own status (`async-run.sh --status`,
-  `sacct`, the output file), and a job that outlives that belongs to the
-  lead. Put this rule in every sub-agent brief. A lead with sub-agents in
-  flight polls their jobs too, and does not trust the notification alone.
+  Claude Code 2.1.293). Measured 2026-10-09: a run finished green at 17:07
+  and its helper idled 3 h 41 min until a nudge. So a sub-agent never ENDS
+  ITS TURN waiting on a notification. **The LEAD owns the wake**: a
+  sub-agent shares its lead's `CLAUDE_CODE_SESSION_ID`, so
+  `ng longjob run|add … --for-lead <its SendMessage name>` lands in the
+  lead's spool and wakes the LEAD with a line naming whom to `SendMessage`;
+  the sub-agent hands the watch id to the lead and ends its turn, and the
+  lead re-tasks it on the wake. A shorter wait, or `add` answering NOT
+  ARMED (rc 3), stays in the sub-agent as a FOREGROUND bounded call:
+  `ng longjob await <id> --timeout 540` with Bash timeout 600000, re-entered
+  on rc 4. Put this rule in every sub-agent brief.
 - **Never pass a large file as an `sbatch` ARGUMENT to a shell
   script, and never block an agent shell on Slurm**
   (<your-org>/nexus-code`#1778`, `#1728`). MEASURED 2026-10-08: the
@@ -480,8 +481,8 @@ a hook or your task prompt points you there.
   `$TMPDIR`, and its wrapper must end with the real step's exit code**
   (<your-org>/nexus-code`#1778`). `/tmp` on the login node is invisible to
   compute nodes. A wrapper whose last command is an `echo` then reports
-  `COMPLETED 0:0` for a job that produced nothing (measured: job
-  10186371). Put job I/O under the project tree, `/hpc/temp` or
+  `COMPLETED 0:0` for a job that produced nothing (measured on a real
+  job). Put job I/O under the project tree, `/hpc/temp` or
   `/loc/scratch/$SLURM_JOB_ID`, and end the script with `exit $rc` of
   the step that did the work.
 - **On this cluster `--mem` is NOT enforced: size a job by its CORE share**

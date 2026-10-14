@@ -385,6 +385,8 @@ assert_contains "id-less record: resolves the id at paste time instead" \
     "$sec1" 'wid=$(tmux list-windows'
 assert_contains "id-less record: still restarts the cockpit" \
     "$sec1" "tmux new-window -dn services"
+assert_contains "id-less record: the relaunched cockpit shows secrets (#1821)" \
+    "$sec1" "monitor/svc.sh --show-secrets"
 # ID-targeted recipe (2026-06-11 incident: a name/index-aimed kill from
 # the orchestrator destroyed the orchestrator's own window): with a
 # window_id recorded, the surfaced kill targets the immutable @id.
@@ -393,6 +395,7 @@ _version_write_drift_record "$EM_ID" cockpit OLDHASH NEWHASH "cockpit running ol
 sec_id=$(_version_emit_section "$EM_ID" "$ROOT")
 assert_contains "id record: kill targets the window ID" "$sec_id" "tmux kill-window -t @42"
 assert_contains "id record: new-window still uses the name" "$sec_id" "new-window -dn services"
+assert_contains "id record: the relaunched cockpit shows secrets (#1821)" "$sec_id" "monitor/svc.sh --show-secrets"
 assert_contains "id record: recipe explains the ID targeting" "$sec_id" "window ID of 'services'"
 _version_write_drift_record "$EM" cockpit OLDHASH NEWERHASH "cockpit running old code" services
 sec3=$(_version_emit_section "$EM" "$ROOT")

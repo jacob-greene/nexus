@@ -188,7 +188,9 @@
 #                        default failure arm applies — see longjob-probes.d/file.sh)
 #                        [--no-declare] [--no-first-probe]   (hook use: the launch
 #                        hook already declared the wait; skip the sync probe)
-#   longjob-watch.sh run [--desc TEXT] [--id ID] [--notify …] -- <cmd…>
+#                        [--for-lead NAME]   (an in-process SUB-AGENT's add: the
+#                        wake goes to the LEAD, never to you — see below)
+#   longjob-watch.sh run [--desc TEXT] [--id ID] [--notify …] [--for-lead NAME] -- <cmd…>
 #                        launch a LOCAL command via async-run.sh (rc retained)
 #                        AND watch its token — the one-liner for a long local job
 #   longjob-watch.sh list | show <id> | rm <id> | events [N] | status
@@ -212,6 +214,17 @@
 #                                                   census (bundle-2609sk3 F1); tests use a
 #                                                   hermetic NEXUS_STATE_DIR. NOT ARMED →
 #                                                   use `await`, which writes no ledger.
+#
+# SUB-AGENTS (your-org/nexus-code#1794). An in-process sub-agent (the Agent
+# tool) inherits its lead's CLAUDE_CODE_SESSION_ID, so its add lands in the
+# LEAD's spool and the lead's dispatcher prints the wake into the LEAD's
+# conversation; the sub-agent itself is never woken. `--for-lead NAME` (NAME =
+# the sub-agent's SendMessage name) records that, puts "for sub-agent NAME:
+# SendMessage(to: NAME)" at the head of every wake line, and makes `add` say
+# who will be woken instead of "safe to end your turn". The sub-agent returns
+# the watch id to its lead and ends its turn (the lead re-tasks it on the
+# wake), or waits in the FOREGROUND: `await <id> --timeout S` (≤ 600 s per
+# Bash call, re-enter on rc 4).
 #
 # Subject kinds:  slurm:<jobid>  asyncrun:<token>  pid:<pid>[:<starttime>]
 #                 file:<path>    cmd:<shell command line>
@@ -304,6 +317,8 @@ BG_CEIL_S=$(_bg_s "${BASH_MAX_TIMEOUT_MS:-}" 7200)
 BG_SLACK_S=$(( PROBE_TIMEOUT + 30 ))
 AWAIT_DEFAULT_S=$(( BG_DEFAULT_S - BG_SLACK_S ))
 AWAIT_MAX_S=$(( BG_CEIL_S - BG_SLACK_S ))
+# A FOREGROUND await (a sub-agent's only wait, #1794) fits one 600 s Bash call.
+AWAIT_FG_S=$(( 600 - BG_SLACK_S ))
 # The runnable fallback for <id>: the await line AND the Bash `timeout` (ms) it
 # needs, plus how to read a harness stop. One place, so the two NOT-ARMED arms
 # cannot drift apart.
@@ -313,6 +328,12 @@ _await_fallback() {   # <id> [await-seconds]
         "$(( (s + BG_SLACK_S) * 1000 ))" "$1" "$s"
     printf 'It re-invokes you with rc 0 done, 1 failed, 3 unknown, 4 timeout (4: re-enter the same call). A harness STOP notice (<status>killed</status>, "background time limit") is not a verdict on the job either: re-run the call above. --timeout is capped at %ss (one background Bash call cannot outlive %ss); a job longer than that belongs to an ARMED ng longjob watch.\n' \
         "$AWAIT_MAX_S" "$BG_CEIL_S"
+}
+# A sub-agent is not woken by a BACKGROUNDED call either (#1794): the
+# fallback above re-invokes its LEAD's conversation, so say the foreground form.
+_subagent_note() {   # <handoff> <id>
+    [[ -n "$1" ]] || return 0
+    printf 'You are a SUB-AGENT (--for-lead %s): a run_in_background call does NOT wake you (#1794). Run the await in the FOREGROUND instead — monitor/longjob-watch.sh await %s --timeout %s with Bash timeout: 600000 — and re-enter on rc 4, or return the id to your lead.\n' "$1" "$2" "$AWAIT_FG_S"
 }
 # _add_refuse_unwritable <what> <path> <shell-error> <subject> [probe args…]
 # — `add` could not record the watch (your-org/nexus-code#1724: a degraded,
@@ -702,7 +723,7 @@ cmd_add() {
     [[ -n "$SPOOL" ]] || _require_spool
     local subject="" desc="" id="" interval="$DEFAULT_INTERVAL" ttl="$TTL_SECONDS" notify=terminal persistent=0
     local max_events="$WATCH_MAX_EVENTS" unknown_max="$UNKNOWN_MAX" when="" pattern="" no_declare=0 no_first_probe=0
-    local fail_pattern="" fail_set=0
+    local fail_pattern="" fail_set=0 handoff=""
     _argloop_prev_1=-1; while (( $# )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --desc) desc="${2:-}"; shift 2 ;;
@@ -718,6 +739,7 @@ cmd_add() {
             --when) when="${2:-}"; shift 2 ;;
             --pattern) pattern="${2:-}"; shift 2 ;;
             --fail-pattern) fail_pattern="${2:-}"; fail_set=1; shift 2 ;;
+            --for-lead) handoff="${2:-}"; [[ -n "$handoff" ]] || die "add: --for-lead needs the sub-agent's SendMessage name"; shift 2 ;;
             -h|--help) _usage; exit 0 ;;
             --*) die "add: unknown option $1" ;;
             *) [[ -z "$subject" ]] || die "add: one subject only (got '$subject' and '$1')"; subject="$1"; shift ;;
@@ -734,6 +756,8 @@ cmd_add() {
     case "$notify" in terminal|transitions) ;; *) die "add: --notify must be terminal or transitions" ;; esac
     if [[ -z "$id" ]]; then id=$(_new_id); fi
     [[ "$id" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "add: --id must match [A-Za-z0-9._-]{1,64}"
+    # The SendMessage name grammar; it lands on the wake line, so it is bounded.
+    [[ -z "$handoff" || "$handoff" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || die "add: --for-lead must be the sub-agent's SendMessage name ([A-Za-z0-9][A-Za-z0-9_-]{0,63}), got '$handoff'"
     [[ -e "$(_spec_path "$id")" ]] && die "add: watch $id already exists (rm it first)"
 
     # Kind-specific normalisation at ADD time, where the information exists.
@@ -786,8 +810,8 @@ cmd_add() {
                  --arg now "$now" --arg interval "$interval" --arg ttl "$ttl" --arg notify "$notify" \
                  --arg persistent "$persistent" --arg max "$max_events" --arg umax "$unknown_max" \
                  --arg when "$when" --arg pattern "$pattern" --arg size0 "$size0" --arg key "$SESSION_KEY" \
-                 --arg fail "$fail_pattern" --arg lines0 "$lines0" \
-           '{id:$id, kind:$kind, target:$target, desc:$desc, session_key:$key,
+                 --arg fail "$fail_pattern" --arg lines0 "$lines0" --arg handoff "$handoff" \
+           '{id:$id, kind:$kind, target:$target, desc:$desc, session_key:$key, handoff:$handoff,
              added_at:($now|tonumber), interval:($interval|tonumber), ttl:($ttl|tonumber),
              notify:$notify, persistent:($persistent=="1"), max_events:($max|tonumber),
              unknown_max:($umax|tonumber), when:$when, pattern:$pattern, size0:($size0|tonumber),
@@ -846,6 +870,11 @@ cmd_add() {
     local v; v=$(_ledger_verdict)
     case "${v%%|*}" in
         armed)
+            if [[ -n "$handoff" ]]; then
+                printf 'dispatcher: ARMED — %s. The next poll (≤ %ss) picks this watch up. THE LEAD is woken on its terminal state, NOT you (a sub-agent is not woken by its session'"'"'s notifications, #1794); the wake line names you (SendMessage to: %s). Return the id %s to your lead and end your turn, or wait in the FOREGROUND: monitor/longjob-watch.sh await %s --timeout %s (Bash timeout: 600000; re-enter on rc 4).\n' \
+                    "${v#*|}" "$POLL_SECONDS" "$handoff" "$id" "$id" "$AWAIT_FG_S"
+                return 0
+            fi
             printf 'dispatcher: ARMED — %s. The next poll (≤ %ss) picks this watch up; you will be woken by a task notification on its terminal state. It is safe to end your turn.\n' "${v#*|}" "$POLL_SECONDS"
             return 0 ;;
         muted)
@@ -854,12 +883,12 @@ cmd_add() {
         disabled)
             printf 'dispatcher: NOT ARMED (disabled) — %s\n' "${v#*|}"
             printf 'THIS WATCH WILL NOT WAKE YOU: the dispatcher process is alive but NOT SERVING (the kill switch monitor.longjob.enabled / MONITOR_LONGJOB_ENABLED, or an unscoped launch). The watch is recorded and declared as an external wait.\n'
-            _await_fallback "$id"
+            _await_fallback "$id"; _subagent_note "$handoff" "$id"
             return 3 ;;
         *)
             printf 'dispatcher: NOT ARMED (%s) — %s\n' "${v%%|*}" "${v#*|}"
             printf 'THIS WATCH WILL NOT WAKE YOU. It is recorded (and declared as an external wait, so the watcher'"'"'s orphan-async loop can resolve it later), but nothing in this session is polling the spool.\n'
-            _await_fallback "$id"
+            _await_fallback "$id"; _subagent_note "$handoff" "$id"
             printf 'Then report the unarmed session: monitor/longjob-watch.sh status.\n'
             return 3 ;;
     esac
@@ -1046,7 +1075,7 @@ cmd_run() {
         case "$1" in
             --desc) desc="${2:-}"; shift 2 ;;
             --id) id="${2:-}"; shift 2 ;;
-            --notify|--interval|--ttl|--max-events|--unknown-max) extra+=("$1" "${2:-}"); shift 2 ;;
+            --notify|--interval|--ttl|--max-events|--unknown-max|--for-lead) extra+=("$1" "${2:-}"); shift 2 ;;
             --) shift; break ;;
             --*) die "run: unknown option $1 (options go before --, the command after)" ;;
             *) break ;;
@@ -1104,7 +1133,7 @@ _emit() {   # <line> → 0 printed, 1 write failed (recorded)
 # host's cap with margin). Nothing that tells the agent what to DO is ever
 # past the cut.
 LINE_MAX=480
-_compose_line() {   # <STATE> <id> <kind:target> <clause> <detail> <desc>
+_compose_line() {   # <STATE> <id> <kind:target> <clause> <detail> <desc> [<handoff>]
     # Every element of the head is BOUNDED (skeptic D3: an unbounded `cmd:`
     # target grew the line to 1232 chars and the clamp below was no bound):
     # subject ≤ 100, clause ≤ 120, desc ≤ 120. The ID IS NOT BOUNDED HERE and
@@ -1134,7 +1163,11 @@ _compose_line() {   # <STATE> <id> <kind:target> <clause> <detail> <desc>
     (( ${#subj} > 100 )) && subj="${subj:0:99}…"
     (( ${#clause} > 120 )) && clause="${clause:0:119}…"
     (( ${#dsc} > 120 )) && dsc="${dsc:0:119}…"
-    local head="longjob-watch: $1 $2 | record: monitor/longjob-watch.sh show $2 | $subj"
+    # A sub-agent's watch (--for-lead, #1794) wakes the LEAD, so who to
+    # re-task leads the line, right after the id: a ≤ 64-char validated name.
+    local _for=""
+    [[ -n "${7:-}" ]] && _for=" | for sub-agent $7: SendMessage(to: $7)"
+    local head="longjob-watch: $1 $2$_for | record: monitor/longjob-watch.sh show $2 | $subj"
     # AN ALERT GOES FIRST (ncbundle4sk on #1635). A probe whose detail begins
     # `!! ` (after cmd.sh's `rc=N ` prefix) is saying "act on this", and at the
     # tail of a line whose state word is DONE it read as a success ~250 chars
@@ -1145,7 +1178,7 @@ _compose_line() {   # <STATE> <id> <kind:target> <clause> <detail> <desc>
     if [[ -n "$_alert" ]]; then
         _alert="${_alert//$'\n'/ }"; _alert="${_alert//$'\r'/ }"
         (( ${#_alert} > 160 )) && _alert="${_alert:0:159}…"
-        local _al="longjob-watch: $_alert | $1 $2 | record: monitor/longjob-watch.sh show $2 | $subj"
+        local _al="longjob-watch: $_alert | $1 $2$_for | record: monitor/longjob-watch.sh show $2 | $subj"
         [[ -n "$clause" ]] && _al="$_al | $clause"
         (( ${#_al} > LINE_MAX )) && _al="${_al:0:$(( LINE_MAX - 1 ))}…"
         printf '%s' "$_al"
@@ -1183,7 +1216,7 @@ _log_event() { printf '%s\t%s\t%s\t%s\t%s\n' "$(_now)" "$1" "$2" "$3" "${4//$'\n
 
 # One pass over the spool. Globals it advances: EMITTED, EMIT_FAILURES, MUTED.
 _poll_once() {
-    local f id kind target spec state prev detail now last interval persistent notify events maxev ttl added umax streak
+    local f id kind target spec state prev detail now last interval persistent notify events maxev ttl added umax streak handoff
     local active=0 retired=0 out new_state line printed resolve pre mine cur
     now=$(_now)
     # `unmute` grants a FRESH budget of session_max_events; without the
@@ -1219,7 +1252,7 @@ _poll_once() {
         notify=$(printf '%s' "$spec" | jq -r '.notify // "terminal"'); events=$(printf '%s' "$spec" | jq -r '.events // 0')
         maxev=$(printf '%s' "$spec" | jq -r '.max_events // 8'); ttl=$(printf '%s' "$spec" | jq -r '.ttl // 604800')
         added=$(printf '%s' "$spec" | jq -r '.added_at // 0'); umax=$(printf '%s' "$spec" | jq -r '.unknown_max // 5')
-        streak=$(printf '%s' "$spec" | jq -r '.unknown_streak // 0')
+        streak=$(printf '%s' "$spec" | jq -r '.unknown_streak // 0'); handoff=$(printf '%s' "$spec" | jq -r '.handoff // empty')
         [[ "$id" == "$(basename "$f" .json)" ]] || { _log_event "$(basename "$f" .json)" corrupt not-printed "id mismatch in spec; skipped"; continue; }
         # Validate every numeric BEFORE the first (( )): a non-numeric value in a
         # spec is a bash-FATAL unbound-variable error inside arithmetic, which
@@ -1251,7 +1284,7 @@ _poll_once() {
             pre=$(cat "$f" 2>/dev/null)
             new_state=failed; detail="watch EXPIRED after ${ttl}s without a terminal state (TTL); the subject may still be running — re-add to keep watching"
             _retire "$f" "$id" expired "$new_state" "$detail" "$now"; retired=$(( retired + 1 )); active=$(( active - 1 ))
-            line=$(_compose_line EXPIRED "$id" "$kind:$target" "TTL reached; the wait stays declared — re-add to keep watching" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
+            line=$(_compose_line EXPIRED "$id" "$kind:$target" "TTL reached; the wait stays declared — re-add to keep watching" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
         else
             out=$(_probe "$kind" "$target" "$spec"); new_state="${out%%|*}"; detail="${out#*|}"
             if [[ "$kind" == slurm ]]; then
@@ -1283,7 +1316,7 @@ _poll_once() {
                 streak=$(( streak + 1 ))
                 if (( streak >= umax )); then
                     _retire "$f" "$id" unknown unknown "$detail" "$now"; retired=$(( retired + 1 )); active=$(( active - 1 ))
-                    line=$(_compose_line UNKNOWN "$id" "$kind:$target" "PARKED after $streak consecutive unknown probes (not probed again): check the subject yourself, then re-add or rm" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
+                    line=$(_compose_line UNKNOWN "$id" "$kind:$target" "PARKED after $streak consecutive unknown probes (not probed again): check the subject yourself, then re-add or rm" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
                     streak=0
                 else
                     _update "$f" "$new_state" "$detail" "$now" "$streak" 0
@@ -1294,11 +1327,11 @@ _poll_once() {
                     done|failed)
                         if [[ "$persistent" == "true" ]]; then
                             _update "$f" "$new_state" "$detail" "$now" 0 0
-                            [[ "$new_state" != "$prev" ]] && line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "persistent: $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
+                            [[ "$new_state" != "$prev" ]] && line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "persistent: $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
                         else
                             _retire "$f" "$id" terminal "$new_state" "$detail" "$now"; retired=$(( retired + 1 )); active=$(( active - 1 ))
                             resolve=1
-                            line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
+                            line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
                         fi ;;
                     pending|running)
                         _update "$f" "$new_state" "$detail" "$now" 0 0
@@ -1307,7 +1340,7 @@ _poll_once() {
                         # watcher supervisor answers while LATCHED (ncbundle4sk
                         # on #1635: latched → UP was silent).
                         if [[ "$new_state" != "$prev" ]] && { [[ "$notify" == transitions ]] || { [[ "$persistent" == "true" && ( "$prev" == failed || "$prev" == done ) ]]; }; }; then
-                            line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "transition $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')")
+                            line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "transition $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
                         fi ;;
                 esac
             fi

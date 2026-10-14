@@ -63,8 +63,8 @@ bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 # A SKIP is an assertion that was NOT MEASURED on this host. It is printed on
 # stderr, counted in the assertion total (so the count guard cannot certify
 # its loss), and named in the verdict line — never folded into PASS
-# (your-org/nexus-code#1477: the non-hermetic arm below is the one case that
-# legitimately cannot run where there is no Claude Code home).
+# (your-org/nexus-code#1477; today the pty arms of case 13 are the ones that
+# legitimately cannot run where `script` is absent).
 skip() { printf '  SKIP: %s\n' "$1" >&2; SKIP=$(( SKIP + 1 )); }
 
 [[ -x "$ASSERT" ]]                            || { echo "missing assert-shims-wrapped.sh" >&2; exit 1; }
@@ -1208,71 +1208,92 @@ fi
 rm -rf "$SB9/monitor/newwrap" "$DEC9/newtool"   # leave SB9 as the later cases expect it
 
 # ---------------------------------------------------------------------------
-# Case 12 — NON-HERMETIC: the REAL host's newest snapshot (your-org/nexus-code#1477).
+# Case 12 — the UNSEAMED discovery route, hermetically (your-org/nexus-code#1477).
 #
-# Every snapshot case above plants a synthetic snapshot into a synthetic CC
-# home through the NEXUS_CC_HOME seam. That seam is what makes those cases
-# honest — and it is ALSO what made the outage class unobservable: no hermetic
-# case can notice that the newest snapshot on THIS host belongs to a session
-# that was never nexus-launched. So this case drops the seam, lets the guard
-# select the way a real spawn does (the mtime proxy — ancestry is disabled so
-# the suite's OWN tool shell does not stand in for "the newest on the host"),
-# and asserts the guard's behaviour against the host's actual state:
+# Every snapshot case above plants a synthetic snapshot through the
+# NEXUS_CC_HOME seam, and the seam bypasses the route a real spawn takes: the
+# mtime pick over `$CLAUDE_CONFIG_DIR` and then `$HOME/.claude`. #1477's outage
+# went through THAT route, which is why the suite was green for its whole
+# length. This case drops the seam and drives that route — but over synthetic
+# homes, never the host's.
 #
-#   newest snapshot nexus-fronted   -> no snapshot objection (a refusal here is a
-#                                      TRUE #652 finding about this host, and the
-#                                      case is right to go red)
-#   newest snapshot FOREIGN         -> the #1477 warning, rc 0, no refusal — the
-#                                      live outage condition, handled
-#   no snapshot on this host (CI)   -> SKIPPED, LOUDLY and COUNTED: the arm is
-#                                      unmeasured here, not passed
+# It used to read the REAL host's newest snapshot instead, so its verdict was a
+# property of whatever session last wrote a snapshot on the machine, not of the
+# code: measured (bundle 25), pointing CLAUDE_CONFIG_DIR at a decoy home whose
+# newest snapshot was nexus-fronted but buried turned it red with the code
+# unchanged, and it skipped on CI. Whether THIS host is in the outage condition
+# right now is a health question, answered by running the guard itself:
+#     NEXUS_ASSERT_NO_ANCESTRY=1 monitor/assert-shims-wrapped.sh
 #
-# Independent discovery, so the case does not ask the guard to grade itself:
-# the same two homes the guard consults, `ls -t`, and a provenance grep for a
-# `monitor/*wrap` dir in the LAST `export PATH=` — the guard's own definition,
-# re-derived rather than read back.
+#   (a) $HOME/.claude, CLAUDE_CONFIG_DIR unset, a CLEAN nexus snapshot
+#                                   -> selected via the mtime route; no objection
+#   (b) CLAUDE_CONFIG_DIR -> a FOREIGN snapshot, HOME as in (a)
+#                                   -> CLAUDE_CONFIG_DIR outranks HOME; WARN, rc 0
+#   (c) CLAUDE_CONFIG_DIR -> a nexus snapshot BURIED behind a decoy
+#                                   -> REFUSE (rc 1): the route can go red
+#   (d) no output names a shell-snapshots path outside this suite's sandbox
+# The live probes run (case 11's bash chain), so (b)'s "clean" is observed.
 # ---------------------------------------------------------------------------
-HOST_SNAP=""
-for _cch in ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} "$HOME/.claude"; do
-    [[ -d "$_cch/shell-snapshots" ]] || continue
-    HOST_SNAP=$(bash -c 'ls -t "$1"/shell-snapshots/snapshot-*.sh 2>/dev/null | head -1' _ "$_cch")
-    [[ -n "$HOST_SNAP" ]] && break
-done
-if [[ -z "$HOST_SNAP" || ! -r "$HOST_SNAP" ]]; then
-    skip "non-hermetic #1477 (1/2): no Claude Code shell snapshot on this host — the real-host provenance arm is UNMEASURED here (CI has no CC home); not a pass"
-    skip "non-hermetic #1477 (2/2): the guard's verdict on the host's newest snapshot is UNMEASURED for the same reason"
+H12="$SB/h12/home"; CC12F="$SB/h12/cc-foreign"; CC12B="$SB/h12/cc-buried"
+_mk_snapshot "$H12/.claude" "$SB9/monitor/ghwrap:$SB9/monitor/pipwrap:$DEC9:/usr/bin:/bin"
+_mk_snapshot "$CC12F"       "$DEC9:/usr/bin:/bin"
+_mk_snapshot "$CC12B"       "$DEC9:$SB9/monitor/ghwrap:$SB9/monitor/pipwrap:/usr/bin:/bin"
+_snap12_f() { printf '%s/shell-snapshots/snapshot-zsh-1-test.sh' "$1"; }
+SNAP12_ALL=""
+# Sets SNAP_OUT / SNAP_RC as globals. Same chain as _snap_live, with every
+# snapshot-selecting variable removed and HOME replaced, so the guard reaches
+# its own discovery over the homes this case built.
+_snap_unseamed() {  # _snap_unseamed [VAR=val …]
+    SNAP_OUT=$(env -u NEXUS_PREV_BASH_ENV -u NEXUS_INHERITED_PATH -u NEXUS_INHERITED_PATH_PID \
+        -u NEXUS_INHERITED_PATH_UPSTREAM -u NEXUS_INHERITED_PATH_UPSTREAM_PID \
+        -u NEXUS_PATH_FRONT_OFF -u NEXUS_LOCALS -u NEXUS_IS_ORCHESTRATOR -u NEXUS_SPAWNER_SNAPSHOT \
+        -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW \
+        -u NEXUS_CC_HOME -u NEXUS_ASSERT_SNAPSHOT -u CLAUDE_CONFIG_DIR \
+        BASH_ENV="$REPO_ROOT/monitor/shellenv/bash_env.sh" PATH="$_p9_wrapped" HOME="$H12" \
+        NEXUS_ROOT="$SB9" NEXUS_SHIMWRAP_GLOB="$SB9/monitor/*wrap" \
+        NEXUS_ASSERT_GH_SHELL="$BASH_BIN" SHELL="$BASH_BIN" \
+        NEXUS_ASSERT_SKIP_NPROC=1 NEXUS_ASSERT_NO_ANCESTRY=1 "$@" \
+        bash "$ASSERT" 2>&1)
+    SNAP_RC=$?
+    SNAP12_ALL+="$SNAP_OUT"$'\n'
+}
+
+_snap_unseamed
+if [[ "$SNAP_OUT" == *"snapshot leg examined $(_snap12_f "$H12/.claude") — selected via: newest in $H12/.claude "* ]]; then
+    ok "#1477 unseamed (a): with no seam and CLAUDE_CONFIG_DIR unset, the guard picks \$HOME/.claude's snapshot by the mtime route a real spawn uses"
 else
-    HOST_PATH=$(sed -n 's/^[[:space:]]*export PATH=//p' "$HOST_SNAP" | tail -1 | sed 's/^"//; s/"$//')
-    HOST_PROV=foreign
-    grep -Eq '(^|:)[^:]*/monitor/[A-Za-z0-9_.-]*wrap(:|$)' <<<"$HOST_PATH" && HOST_PROV=nexus
-    printf '  NOTE: real host newest snapshot: %s (mtime %s) — provenance by independent grep: %s\n' \
-        "$HOST_SNAP" "$(stat -c %y "$HOST_SNAP" 2>/dev/null | cut -c1-16)" "$HOST_PROV"
-    _repo_front="$REPO_ROOT/monitor/ghwrap:$REPO_ROOT/monitor/pipwrap:$REPO_ROOT/monitor/notifywrap:$REPO_ROOT/monitor/tmuxwrap"
-    HOST_OUT=$(env -u NEXUS_CC_HOME -u NEXUS_ASSERT_SNAPSHOT -u NEXUS_SPAWNER_SNAPSHOT -u NEXUS_IS_ORCHESTRATOR \
-        -u NEXUS_PREV_BASH_ENV -u NEXUS_INHERITED_PATH -u NEXUS_INHERITED_PATH_PID \
-        -u NEXUS_INHERITED_PATH_UPSTREAM -u NEXUS_INHERITED_PATH_UPSTREAM_PID -u NEXUS_PATH_FRONT_OFF \
-        PATH="$_repo_front:$PATH" NEXUS_ROOT="$REPO_ROOT" ZDOTDIR="$REPO_ROOT/monitor/shellenv" \
-        NEXUS_ASSERT_GH_SHELL="$ZSH_BIN" SHELL="$ZSH_BIN" NEXUS_ASSERT_SKIP_NPROC=1 NEXUS_ASSERT_NO_ANCESTRY=1 \
-        "$ASSERT" 2>&1); HOST_RC=$?
-    if [[ "$HOST_OUT" == *"snapshot leg examined $HOST_SNAP "* ]]; then
-        ok "non-hermetic #1477: unseamed, the guard selected the SAME file this case found independently (${HOST_SNAP##*/}) — the mtime route, as a real spawn uses it"
-    else
-        bad "non-hermetic selection" "the guard did not examine $HOST_SNAP; output: $HOST_OUT"
-    fi
-    case "$HOST_PROV" in
-        nexus)
-            if [[ "$HOST_OUT" != *"frozen tool-shell snapshot resolves"* && "$HOST_RC" != 1 ]]; then
-                ok "non-hermetic #1477: this host's newest snapshot is nexus-fronted and the snapshot leg does not object (rc=$HOST_RC)"
-            else
-                bad "non-hermetic BURIAL" "the newest snapshot on THIS host is nexus-fronted but BURIED — a real #652 condition on this host (rc=$HOST_RC): $HOST_OUT"
-            fi ;;
-        foreign)
-            if [[ "$HOST_RC" == "0" && "$HOST_OUT" == *"READ AS FOREIGN"* && "$HOST_OUT" != *"REFUSING SPAWN"* ]]; then
-                ok "non-hermetic #1477: this host is in the LIVE outage condition (newest snapshot is foreign) and the guard WARNS instead of refusing — the fix, observed on the real surface"
-            else
-                bad "non-hermetic FOREIGN" "the newest snapshot on THIS host is foreign and the guard did not handle it as #1477 requires (rc=$HOST_RC): $HOST_OUT"
-            fi ;;
-    esac
+    bad "#1477 unseamed (a) selection" "expected the \$HOME/.claude snapshot via the mtime route: $SNAP_OUT"
+fi
+if [[ "$SNAP_RC" == "0" && "$SNAP_OUT" != *"frozen tool-shell snapshot resolves"* ]]; then
+    ok "#1477 unseamed (a): a clean nexus-fronted snapshot draws no objection (rc 0)"
+else
+    bad "#1477 unseamed (a) verdict" "expected rc 0 and no snapshot objection, got rc=$SNAP_RC: $SNAP_OUT"
+fi
+
+_snap_unseamed CLAUDE_CONFIG_DIR="$CC12F"
+if [[ "$SNAP_OUT" == *"snapshot leg examined $(_snap12_f "$CC12F") — selected via: newest in $CC12F "* ]]; then
+    ok "#1477 unseamed (b): CLAUDE_CONFIG_DIR outranks \$HOME/.claude — its snapshot is the one examined"
+else
+    bad "#1477 unseamed (b) selection" "expected the CLAUDE_CONFIG_DIR snapshot to be examined: $SNAP_OUT"
+fi
+if [[ "$SNAP_RC" == "0" && "$SNAP_OUT" == *"READ AS FOREIGN"* && "$SNAP_OUT" != *"REFUSING SPAWN"* ]]; then
+    ok "#1477 unseamed (b): the outage condition through the real route — a FOREIGN newest snapshot WARNS, rc 0, no refusal"
+else
+    bad "#1477 unseamed (b) verdict" "expected the #1477 foreign warning and rc 0, got rc=$SNAP_RC: $SNAP_OUT"
+fi
+
+_snap_unseamed CLAUDE_CONFIG_DIR="$CC12B"
+if [[ "$SNAP_RC" == "1" && "$SNAP_OUT" == *"frozen tool-shell snapshot resolves"* && "$SNAP_OUT" == *"$(_snap12_f "$CC12B")"* ]]; then
+    ok "#1477 unseamed (c) CONTROL: a BURIED nexus snapshot reached through the real route is REFUSED (rc 1) — the route can go red"
+else
+    bad "#1477 unseamed (c) control" "expected a burial refusal (rc 1) naming $(_snap12_f "$CC12B"), got rc=$SNAP_RC: $SNAP_OUT"
+fi
+
+_snap12_foreign=$(grep -oE '[^ ]*/shell-snapshots/[^ ]*' <<<"$SNAP12_ALL" | grep -vF -e "$SB/" | sort -u)
+if [[ -z "$_snap12_foreign" && "$SNAP12_ALL" == *"/shell-snapshots/"* ]]; then
+    ok "#1477 unseamed (d): HERMETIC — every snapshot path the guard named lies inside this suite's sandbox"
+else
+    bad "#1477 unseamed (d) hermetic" "the guard named snapshot paths outside $SB: ${_snap12_foreign:-<none named at all>}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1395,7 +1416,7 @@ fi
 # it — "expected for this host" is exactly the shape of a check that asserts a
 # proxy. A number that cannot move with the host cannot launder a missing
 # assertion.
-EXPECT=59   # +3: case 11 (g)/(h), the w225 skeptic's F1/F2 arms; +6: case 8, the #652/#654 ambient-surface control (arms A/B/C)
+EXPECT=63   # +3: case 11 (g)/(h), the w225 skeptic's F1/F2 arms; +6: case 8, the #652/#654 ambient-surface control (arms A/B/C)
             # +3: case 13, the tty-detached KILLABLE probe — the pty positive
             #     control, the no-controlling-tty observation (or two loud,
             #     COUNTED skips without `script`), and the kill-at-timeout+grace arm
@@ -1403,8 +1424,9 @@ EXPECT=59   # +3: case 11 (g)/(h), the w225 skeptic's F1/F2 arms; +6: case 8, th
             # +7: case 9b, the #1383 one-hop-up channel (arms D/E/F)
             # +13: case 11, #1477 FOREIGN vs BURIAL, the self-heal path, the
             #      spawner-carried route, and the measured foreign+dirty arm
-            # +2: case 12, the NON-HERMETIC real-host arm — measured, or
-            #     SKIPPED loudly and COUNTED (a skip is in RAN below)
+            # +6: case 12, the UNSEAMED discovery route over synthetic homes
+            #     (a)x2 (b)x2 (c) (d) — it replaced a 2-arm read of the REAL
+            #     host's snapshot, whose verdict moved with the host (bundle 25)
 (( HAVE_ZSH ))            && EXPECT=$(( EXPECT + 11 ))  # cases 1-4, plus 4b's
                                                         # self-prefixing-alias
                                                         # pair + its negative

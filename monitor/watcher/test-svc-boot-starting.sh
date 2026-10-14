@@ -4,7 +4,7 @@
 # never `DOWN`.
 #
 # THE INCIDENT (2026-10-12, four sandbox restarts). myviewer, jupyterlab,
-# paper-radar-serve and nexus-remote-ssh "came back DOWN" after every restart
+# svc-a and nexus-remote-ssh "came back DOWN" after every restart
 # and were restarted by hand each time. Recovery had NOT missed them:
 # bootstrap-recover.sh relaunched every one (fresh pid records, live
 # supervisors, their logs show them binding). But it brings the ORCHESTRATOR up

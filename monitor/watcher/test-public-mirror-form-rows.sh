@@ -15,6 +15,19 @@
 #   S2  each separator form (none - _ space .) of each such row FAILS the gate
 #   D1  >= 1 digit-shape row exists              (non-vacuity; base: 0)
 #   D2  a token synthesised from each digit-shape row FAILS the gate
+#   D3  the same token in the form that actually LEAKED — after a literal `\n`
+#       inside a printf string (`printf 'a\n<ID>\t1'`) — FAILS the gate too.
+#       A leading `\b` cannot fire there (`n` is a word character), so a
+#       digit-shape row opens with `(\b|\\[nt])` (#1820 skeptic F1).
+#   D4  the token inside a COMPOSITE (`smp0_<token>_r1`) FAILS the gate too:
+#       `_` is a word character, so neither a leading nor a trailing `\b` can
+#       fire there, and the composite is how these IDs are written. The rows
+#       are bracketed by `(^|[^A-Za-z0-9]|\\[nt])` and `([^A-Za-z0-9]|$)`
+#       (#1829 skeptic, mirror-ids-sk).
+#   D5  census: every deny row carrying a `[0-9]{` quantifier was parsed as a
+#       digit-shape row by D2. Counted from the raw column, NOT through the
+#       anchor-stripping parser, so an anchor spelling the parser does not know
+#       is a red rather than a row that silently left the population.
 #
 # Run: bash monitor/watcher/test-public-mirror-form-rows.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0. Exit 77 = declined to run.
@@ -87,11 +100,14 @@ done < <(awk -F'\t' '$1=="deny"{print NR "\t" $2}' "$REAL_MAP")
 (( n_sep_rows >= 1 )) && pass "S1: $n_sep_rows separator-class deny row(s) found (non-vacuous)" \
                       || fail "S1: no separator-class deny row found — S2 tested nothing"
 
-# A digit-shape row: optional \b, a LITERAL prefix, [0-9]{n} or [0-9]{n,},
-# optional \b. Synthesise the minimum-length all-zero token.
+# A digit-shape row: an optional leading anchor (\b, the escape-aware
+# (\b|\\[nt]), or the composite-aware (^|[^A-Za-z0-9]|\\[nt])), a LITERAL
+# prefix, [0-9]{n} or [0-9]{n,}, and an optional trailing \b or ([^A-Za-z0-9]|$).
+# Synthesise the minimum-length all-zero token.
 n_digit_rows=0
 while IFS=$'\t' read -r ln pat; do
-    core=${pat#\\b}; core=${core%\\b}
+    core=${pat#'(^|[^A-Za-z0-9]|\\[nt])'}; core=${core#'(\b|\\[nt])'}; core=${core#\\b}
+    core=${core%'([^A-Za-z0-9]|$)'}; core=${core%\\b}
     [[ "$core" =~ ^([A-Za-z_]+)\[0-9\]\{([0-9]+),?\}$ ]] || continue
     n_digit_rows=$((n_digit_rows+1))
     tok="${BASH_REMATCH[1]}$(printf '%0*d' "${BASH_REMATCH[2]}" 0)"
@@ -102,6 +118,23 @@ while IFS=$'\t' read -r ln pat; do
     else
         fail "D2: fixture for mapping line $ln could not be built"
     fi
+    # The LEAKED form, byte for byte in shape: a printf format string whose
+    # previous field ends in a literal backslash-n (#1820 skeptic F1).
+    if mkrepo "$WORK/dig" "printf 'sample\\tcount\\n${tok}\\t7\\n'"; then
+        run_gate "$REAL_MAP" "$WORK/dig"
+        [ "$GRC" -eq 1 ] && pass "D3: mapping line $ln fires on its token after a literal \\n in a printf string" \
+                         || fail "D3: mapping line $ln MISSES its token after a literal \\n (rc=$GRC) — the leaked form"
+    else
+        fail "D3: fixture for mapping line $ln could not be built"
+    fi
+    # The COMPOSITE form: word characters (`_`) on BOTH sides of the token.
+    if mkrepo "$WORK/dig" "path/smp0_${tok}_r1/counts.h5"; then
+        run_gate "$REAL_MAP" "$WORK/dig"
+        [ "$GRC" -eq 1 ] && pass "D4: mapping line $ln fires on its token inside a composite (_<token>_)" \
+                         || fail "D4: mapping line $ln MISSES its token inside a composite (rc=$GRC)"
+    else
+        fail "D4: fixture for mapping line $ln could not be built"
+    fi
 done < <(awk -F'\t' '$1=="deny"{print NR "\t" $2}' "$REAL_MAP")
 (( n_digit_rows >= 1 )) && pass "D1: $n_digit_rows digit-shape deny row(s) found (non-vacuous)" \
                         || fail "D1: no digit-shape deny row found — sample-ID shapes are unguarded"
@@ -110,10 +143,14 @@ done < <(awk -F'\t' '$1=="deny"{print NR "\t" $2}' "$REAL_MAP")
 # the deny column, not the loops' own counters), so a loop that silently
 # skipped a row is a census mismatch rather than a smaller green.
 _rows_sep=$(awk -F'\t' '$1=="deny"{p=$2; sub(/^\\b/,"",p); sub(/\\b$/,"",p); if (p ~ /^[A-Za-z0-9]+\[[^]]+\]\?[A-Za-z0-9]+$/) n++} END{print n+0}' "$REAL_MAP")
-_rows_dig=$(awk -F'\t' '$1=="deny"{p=$2; sub(/^\\b/,"",p); sub(/\\b$/,"",p); if (p ~ /^[A-Za-z_]+\[0-9\]\{[0-9]+,?\}$/) n++} END{print n+0}' "$REAL_MAP")
+_rows_dig=$(awk -F'\t' '$1=="deny" && index($2,"[0-9]{")>0 {n++} END{print n+0}' "$REAL_MAP")
+(( n_digit_rows == _rows_dig )) \
+    && pass "D5: all $_rows_dig deny rows carrying a [0-9]{ quantifier were tested as digit-shape rows" \
+    || fail "D5: $_rows_dig deny rows carry a [0-9]{ quantifier but only $n_digit_rows were tested — an anchor the parser does not know"
+
 # THE ASSERTION TOTAL IS EXACT: an assertion that silently stops running (a
 # section that aborted, a loop over an empty set) is a red, not a smaller green.
-EXPECTED=$(( 2 + _rows_sep + _rows_dig ))
+EXPECTED=$(( 3 + _rows_sep + 3 * _rows_dig ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: assertion census %d != EXPECTED %d — an assertion did not run, or one was added without updating EXPECTED\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

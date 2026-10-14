@@ -446,6 +446,30 @@ _await_health_or_converge() {
     return 0
 }
 
+# _redacted_access_url <url> <service-name> — the ready banner's URL with its
+# token VALUE replaced. The banner printed `URL (with token): …/lab?token=<the
+# live token>`, so the credential landed in every agent transcript that ran
+# an activation — the same leak your-org/nexus-code#1803 closed for
+# `svc.sh status`, one script over. ONE implementation of the rule: svc.sh's
+# svc_redact_url, sourced in a subshell (svc.sh's dispatch is BASH_SOURCE-
+# guarded, and the subshell keeps its globals out of this script). The full
+# URL lands in the SAME mode-0600 file the cockpit writes,
+# $STATE_DIR/services/<name>.url, and the placeholder names it. If the helper
+# cannot be loaded, the whole query is withheld: the failure direction is
+# "less convenient", never "leaked".
+_redacted_access_url() {
+    local url="$1" name="$2" out
+    if out=$(source "$_script_dir/svc.sh" >/dev/null 2>&1 \
+             && declare -F svc_redact_url >/dev/null \
+             && svc_redact_url "$url" "$name") && [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    elif [[ "$url" == *\?* ]]; then
+        printf '%s?<withheld: redaction helper unavailable>' "${url%%\?*}"
+    else
+        printf '%s' "$url"
+    fi
+}
+
 # --- verbs -------------------------------------------------------------------
 
 cmd_up() {
@@ -498,12 +522,13 @@ cmd_up() {
 
     local url
     url=$(cd "$PROJECT_DIR" && labsh url 2>/dev/null) || url='(run `labsh url` in the project)'
+    url=$(_redacted_access_url "$url" "$name")
     if (( ROOT_MODE )); then
         cat <<EOF
 
   ROOT JupyterLab service '$name' is UP (rooted at $PROJECT_DIR).
 
-  URL (with token):   $url
+  URL:                $url
   Token file:         $PROJECT_DIR/.jupyter/token
   Service log:        $PROJECT_DIR/.jupyter/labsh-service.log
   Kernel crawl log:   $PROJECT_DIR/.jupyter/labsh-periodic.log
@@ -527,7 +552,7 @@ EOF
 
   JupyterLab service '$name' is UP.
 
-  URL (with token):   $url
+  URL:                $url
   Token file:         $PROJECT_DIR/.jupyter/token
   Service log:        $PROJECT_DIR/.jupyter/labsh-service.log
 

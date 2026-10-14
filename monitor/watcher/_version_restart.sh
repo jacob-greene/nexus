@@ -731,7 +731,7 @@ _version_emit_section() {
                 # if the resolve comes back empty the `&&` chain stops and
                 # nothing is killed, which is the correct outcome.
                 if [[ -n "$window_id" ]]; then
-                    printf '  tmux kill-window -t %s && tmux new-window -dn %s %q\n' \
+                    printf '  tmux kill-window -t %s && tmux new-window -dn %s %q --show-secrets\n' \
                         "$window_id" "${window:-services}" \
                         "${nexus_root:+$nexus_root/}monitor/svc.sh"
                     printf '(%s is the window ID of %s, resolved at detection — ID-targeted so a mis-aim cannot hit another window.)\n' \
@@ -739,7 +739,7 @@ _version_emit_section() {
                 else
                     printf '  wid=$(tmux list-windows -F "#{window_id}|#{window_name}" | awk -F"|" -v n=%q "\$2==n {print \$1; exit}")\n' \
                         "${window:-services}"
-                    printf '  [ -n "$wid" ] && tmux kill-window -t "$wid" && tmux new-window -dn %s %q\n' \
+                    printf '  [ -n "$wid" ] && tmux kill-window -t "$wid" && tmux new-window -dn %s %q --show-secrets\n' \
                         "${window:-services}" \
                         "${nexus_root:+$nexus_root/}monitor/svc.sh"
                     printf '(The window ID could not be resolved at detection, so the recipe resolves it at paste time. It is deliberately NOT name-targeted: `tmux kill-window -t %s` can resolve to a DIFFERENT window, which is the 2026-06-11 incident. If $wid comes back empty nothing is killed.)\n' \

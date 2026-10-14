@@ -2121,13 +2121,13 @@ seed_snapshot w-a
 log_event spawn w-a
 log_event spawn w-c
 echo w-a >> "$WINDOWS"
-printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 25200 ))" \
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 180000 ))" \
     > "$ROOT/monitor/.state/auto-continue-plan.tsv"
 run_recover --services-only
 if ! grep -q -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null \
-   && grep -q 'OLDER than 21600s' "$ROOT/err" \
+   && grep -q 'OLDER than 172800s' "$ROOT/err" \
    && grep -qP '^#owner\t999999999\t1\ttok-old\t[0-9]+\tdone\t' "$ROOT/monitor/.state/auto-continue-plan.tsv"; then
-    pass "stale: a 7 h old plan is not carried (w-c not resumed) and is marked done"
+    pass "stale: a 50 h old plan is not carried (w-c not resumed) and is marked done"
 else
     fail "stale: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] plan=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv") err=$(grep -i 'auto-continue' "$ROOT/err")"
 fi
@@ -2145,6 +2145,25 @@ if grep -qx -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null; then
     pass "CONTROL fresh: a 1 h old unfinished plan IS carried (w-c resumed)"
 else
     fail "CONTROL fresh: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+# 41d3 (#1811): a plan as old as the LONGEST measured RO outage (18.06 h,
+# onset to the next `watcher up:`) is still a queue. The 6 h first default
+# dropped it, and with it the workers the interrupted recovery owed.
+build_case 41d3
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 65100 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qx -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null \
+   && ! grep -q 'OLDER than' "$ROOT/err"; then
+    pass "long outage: an 18.1 h old unfinished plan IS carried (w-c resumed, #1811)"
+else
+    fail "long outage: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] err=$(grep -i 'auto-continue' "$ROOT/err")"
 fi
 cleanup_case
 

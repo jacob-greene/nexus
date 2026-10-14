@@ -65,8 +65,14 @@ run it again). The activate path either way:
 3. **Start** — launches `monitor/labsh-supervised.sh` headless through
    recovery's own idempotent decision path (healthy / already
    supervised → leave alone; never a second server).
-4. **Report** — waits for the healthcheck, prints the tokenized URL,
-   the token path, and the agent quickstart.
+4. **Report** — waits for the healthcheck, prints the access URL with
+   its token REDACTED, the token path, and the agent quickstart. The
+   full tokened URL goes to `monitor/.state/services/<name>.url` (mode
+   0600), which the banner names — the same file `svc.sh status` writes
+   (<your-org>/nexus-code#1803). Never `cat` that file, `labsh url` or the
+   token file in an agent session: whatever a tool prints lands in the
+   transcript, and from there in reports and issue comments. Hand the
+   operator the file PATH.
 
 Then interact through labsh, exactly as `<yourlab>.labsh` documents:
 
@@ -95,7 +101,7 @@ notebook paths still resolve against the agent's cwd):
 cd work/myproj
 monitor/labsh-root.sh notebook attach analysis.ipynb --kernel-name proj-myproj
 monitor/labsh-root.sh kernel exec -n analysis.ipynb 'CODE'   # stateful
-monitor/labsh-root.sh url                                    # root server URL
+monitor/labsh-root.sh url                                    # root server URL — prints the TOKEN; operator use only
 ```
 
 The `--kernel-name proj-<project>` on the FIRST attach is what binds
@@ -148,7 +154,7 @@ report the ambiguity and refuse — disambiguate with `-k PID`.
   Default matches labsh: `0.0.0.0` + token auth — fine on the campus
   network, and the activation output warns like labsh does.
 - **Human + agent on the same kernel?** Built in: the human opens the
-  printed URL and works in the browser; the agent `labsh kernel exec`s
+  URL from the 0600 file the banner names and works in the browser; the agent `labsh kernel exec`s
   against the same kernel from the CLI. Same server, same namespace.
   If the human already started `labsh` by hand, activation ADOPTS that
   server rather than starting a second one.
@@ -159,8 +165,9 @@ report the ambiguity and refuse — disambiguate with `-k PID`.
   next start. Kernels do NOT survive a server bounce — long-lived
   state that must survive restarts belongs in files, not kernel memory.
 - **Token rotated?** (`labsh token --rotate`) The healthcheck fails,
-  the supervisor bounces the server, the new token applies. Re-fetch
-  the URL with `labsh url`. Running kernels are lost (above).
+  the supervisor bounces the server, the new token applies. Re-run
+  `jupyter-up.sh` (or `svc.sh status`) to refresh the 0600 URL file;
+  the operator reads it there. Running kernels are lost (above).
 - **Done with the project?** `monitor/jupyter-up.sh DIR --down` stops
   everything AND removes the registry row — otherwise boot recovery
   resurrects it. `svc.sh stop jupyter-<name>` stops WITHOUT
@@ -208,6 +215,6 @@ never sees. (Tests/fixtures override via `NEXUS_SERVICES_REGISTRY`
 
 Troubleshooting starts with `monitor/svc.sh logs <name>` (tails the
 supervisor log and jupyter's own stdout together); `monitor/svc.sh
-status` shows the tokened access URL in the `DETAIL` column while the
-service is UP. The full lifecycle is documented in
+status` shows the access URL, token redacted, in the `DETAIL` column while
+the service is UP, and names the 0600 file holding the full URL. The full lifecycle is documented in
 `monitor/README.md` ("JupyterLab as a service").

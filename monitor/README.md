@@ -2462,10 +2462,16 @@ service warming up after a restart is not down: do not restart it), a
 `stale` / `-`), and a final untruncated `DETAIL` column: for an UP
 labsh JupyterLab service its URL, else the healthcheck-derived or
 `.deploy/endpoint` URL, else a PID. A URL query parameter whose name
-ends in token / key / secret / password / passwd is NEVER printed: its
+ends in token / key / secret / password / passwd is redacted BY DEFAULT: its
 value is replaced by `<redacted: see monitor/.state/services/<name>.url>`,
-and that file (mode 0600) holds the full, directly-openable URL
-(`cat` it to open JupyterLab).
+and that file (mode 0600) holds the full, directly-openable URL.
+The cockpit is launched with `--show-secrets` (or `SVC_SHOW_SECRETS=1`),
+which shows the URL unredacted so the operator can copy the JupyterLab
+link straight from the pane (<your-org>/nexus-code#1821): the token is only
+reachable inside the internal network, and agents already have full
+access to the service. Every cockpit launcher (`watcher/entry.sh`, the
+cockpit-drift restart recipe, svc.sh's own refusal recipe) passes it; a
+bare `svc.sh` and `svc.sh status` still redact.
 It repaints **in place** (no clear-screen flicker, on the alternate
 screen so refreshes never pollute scrollback) and reacts to
 single keypresses: `1`-`9` tails that service's log, `0` the
@@ -2493,7 +2499,7 @@ and agents always get the full table.
 primitives (same decision paths, no second implementation):
 
 ```bash
-tmux new-window -n services 'monitor/svc.sh'   # the dashboard
+tmux new-window -n services 'monitor/svc.sh --show-secrets'   # the dashboard
 monitor/svc.sh status            # one-shot table, scriptable
 monitor/svc.sh up                # idempotent whole-stack bring-up
 monitor/svc.sh up --no-services  # nexus core only: watcher (+ its
@@ -2554,7 +2560,7 @@ re-run):
 
 ```bash
 monitor/jupyter-up.sh --root                    # ROOT session: one server, all project kernels
-monitor/jupyter-up.sh /path/to/project          # per-project: activate + print URL
+monitor/jupyter-up.sh /path/to/project          # per-project: activate + print URL (token redacted; full URL in .state/services/<name>.url, 0600)
 monitor/jupyter-up.sh /path/to/project --status # one-line status
 monitor/jupyter-up.sh /path/to/project --down   # deactivate (stop + deregister)
 ```
@@ -2643,7 +2649,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `bootstrap-recover.sh`       | Idempotent full-stack recovery after a restart: relaunches the watcher if unhealthy + each registered infra service that is unhealthy with no live supervisor. Services run HEADLESS (`setsid`-detached, no window); idempotency keyed off a per-service pidfile (`$NEXUS_STATE_DIR/services/<name>.pid`, alive + cmdline-matched), with a legacy tmux window honoured as a second leave-it-alone signal. Driven by `services.registry`. `--dry-run` / `--list` / `--services-only` / `--no-services` (= `--watcher-only`: core only, skip all services; combining it with `--services-only` is rejected). | yes |
 | `svc.sh`                     | The stable user-facing stack surface: flicker-free read-only dashboard (core `watcher` + `orchestrator` rows pinned over the registry services; single-key log tailing into one reused, focus-preserving tmux split) PLUS explicit verbs — `status` / `up` (idempotent whole-stack bring-up via `bootstrap-recover.sh`; the watcher then spawns/revives the orchestrator) / `start` / `stop` (process-group TERM) / `restart` / `logs`. Reuses recovery's primitives; sandbox-agnostic (prefix `agent-sandbox` explicitly). Tests: `watcher/test-svc.sh` | yes |
 | `services.registry.example`  | Annotated template for the operator-local `services.registry` (gitignored): one TAB-separated `name⇥workdir⇥launch-cmd⇥healthcheck` line (plus an optional 5th `⇥logfile` for the `svc.sh` cockpit) per infra service that `bootstrap-recover.sh` should bring back. Also the source of truth for which windows the idle-sweep exempts as infra (not dead workers) | yes |
-| `jupyter-up.sh`              | One-command activation of a labsh JupyterLab as a registry-managed service. Per-project: ensures kernel (`labsh kernel add` / `--venv` register), maintains the `jupyter-<project>` row. `--root`: the single work-root session `jupyterlab` with all project kernels via the crawl. Launches via `recover_service`, waits healthy, prints URL + agent quickstart. `--down` deactivates (stop + deregister), `--status` one-liner. See "JupyterLab as a service" above + `skills/nexus.jupyter/SKILL.md` | yes |
+| `jupyter-up.sh`              | One-command activation of a labsh JupyterLab as a registry-managed service. Per-project: ensures kernel (`labsh kernel add` / `--venv` register), maintains the `jupyter-<project>` row. `--root`: the single work-root session `jupyterlab` with all project kernels via the crawl. Launches via `recover_service`, waits healthy, prints the URL with its token redacted (full URL in the 0600 `.state/services/<name>.url` file svc.sh also writes) + agent quickstart. `--down` deactivates (stop + deregister), `--status` one-liner. See "JupyterLab as a service" above + `skills/nexus.jupyter/SKILL.md` | yes |
 | `jupyter-kernel-crawl.sh`    | Shallow `work/*/` sweep for the root session: registers each project venv as kernelspec `proj-<dir>` (`labsh kernel register`), prunes `proj-*` specs whose interpreter is gone, refuses name collisions. Idempotent, flock-guarded, per-project failures never abort the sweep | yes |
 | `labsh-root.sh`              | Project-agent door into the root session: exports `JUPYTER_CONFIG_DIR`/`JUPYTER_DATA_DIR` at the work root and execs labsh, so attach/exec/url work from inside any `work/<project>` | yes |
 | `labsh-supervised.sh`        | Foreground watchdog a `jupyter-*` registry row launches: probes `jupyter-health.sh` every `LABSH_SVC_INTERVAL` s, bounces the labsh server after `LABSH_SVC_FAILS` consecutive failures, persists actual port/scheme to `.jupyter/labsh-service.env`, adopts hand-started servers, runs the optional `.jupyter/labsh-service.periodic` hook async every `LABSH_SVC_PERIODIC_EVERY` intervals, TERM → `labsh stop`. Tests: `watcher/test-jupyter-service.sh` | yes |

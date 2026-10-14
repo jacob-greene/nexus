@@ -56,6 +56,13 @@
 #                            look like a crash loop. Also via SVC_FORCE=1.
 #                            A refusal exits 75 (not 1), so a caller can tell
 #                            "deliberately not done" from "tried and failed".
+#   svc.sh --show-secrets [<verb> …]
+#                            do NOT redact secret-named URL query parameters
+#                            (a JupyterLab `?token=`) in the URL cell. Every
+#                            launcher of the services COCKPIT passes it; the
+#                            default for a bare `svc.sh` and for `status`
+#                            stays REDACTING. Also via SVC_SHOW_SECRETS=1.
+#                            May be combined with --force, in either order.
 #   svc.sh orphans           READ-ONLY: list supervisor processes with ppid 1
 #                            whose source path no registry row names, or which
 #                            run from outside $NEXUS_ROOT (a retired clone, an
@@ -99,7 +106,9 @@
 # Launch the dashboard as its own tmux window (name must match
 # monitor.services_window, default `services`, so the watcher's
 # idle probe exempts it from the dead-worker sweep):
-#   tmux new-window -n services 'monitor/svc.sh'
+#   tmux new-window -n services 'monitor/svc.sh --show-secrets'
+# (--show-secrets: the cockpit is where the operator copies the JupyterLab
+# URL from, so it shows tokens; see the URL-cell comment below, #1821.)
 #
 # Env:
 #   NEXUS_ROOT  — live nexus root the registry + logs + state are read
@@ -107,6 +116,7 @@
 #                 Point it at a checkout to drive the cockpit off that
 #                 tree.
 #   SVC_REFRESH — dashboard auto-refresh interval, seconds (default 5).
+#   SVC_SHOW_SECRETS — 1 = same as --show-secrets (default 0: redact).
 
 set -uo pipefail
 
@@ -126,6 +136,11 @@ REFRESH="${SVC_REFRESH:-5}"
 # Override the cold-build guard (_coldbuild_guard). Set by `--force`, or by a
 # non-interactive caller exporting SVC_FORCE=1.
 SVC_FORCE="${SVC_FORCE:-0}"
+
+# Show secret-named URL query parameters unredacted (svc_redact_url). Set by
+# `--show-secrets`, or by exporting SVC_SHOW_SECRETS=1. Only an exact `1`
+# disables redaction: any other value redacts, the safe direction.
+SVC_SHOW_SECRETS="${SVC_SHOW_SECRETS:-0}"
 
 # Reuse the recovery path's primitives so health/launch/liveness
 # semantics match exactly. bootstrap-recover.sh guards its main behind
@@ -312,13 +327,13 @@ svc_supervisor() {
 # A JUST-LAUNCHED SERVICE IS NOT DOWN (2026-10-12 sandbox restarts).
 #
 # Measured on 2026-10-12: across four sandbox restarts, myviewer, jupyterlab,
-# paper-radar-serve and nexus-remote-ssh "came back DOWN" and were restarted by
+# svc-a and nexus-remote-ssh "came back DOWN" and were restarted by
 # hand every time. They were not missed by recovery. bootstrap-recover.sh
 # relaunched every one of them (fresh pid records, live supervisors), but it
 # spawns the ORCHESTRATOR FIRST and the services after it, so the resumed
 # orchestrator's first `svc.sh status` sampled them seconds after launch. Their
 # healthchecks had not passed yet (myviewer serves ~5 s after launch,
-# paper-radar-serve ~10 s, nexus-remote-ssh's wrapper waits ~2-7 s before
+# svc-a ~10 s, nexus-remote-ssh's wrapper waits ~2-7 s before
 # exec'ing sshd, a labsh cold build takes minutes), and this table printed the
 # same red `DOWN` it prints for a dead service. The hand restart then killed a
 # warm-up that was about to succeed: myviewer answered its first curl with 200
@@ -579,6 +594,18 @@ svc_detail_url() {
 # Over-matching is the safe direction and is accepted: a parameter named
 # `monkey=` is redacted too. NOT covered: a password in URL userinfo
 # (`https://user:pw@host`) — no registered service uses that shape.
+#
+# THE COCKPIT SHOWS IT ANYWAY (your-org/nexus-code#1821, operator 2026-10-13).
+# The cockpit is where the operator goes to copy the JupyterLab URL, so a
+# redacted cell there sent them to a `cat` for the one thing the pane exists
+# to show. `--show-secrets` (or SVC_SHOW_SECRETS=1) returns the URL unchanged,
+# and every launcher of the cockpit passes it. The operator's reasoning, kept
+# so nobody re-litigates it: the token is reachable only from inside the
+# internal network, and agents already have full access to the service it
+# guards, so showing it to an agent exposes nothing new. The DEFAULT stays
+# redacting — a bare `svc.sh` and `svc.sh status` — so the shared transcript
+# path (agents running `status`) does not copy the credential by habit.
+# The 0600 `.url` file is still written when secrets are shown.
 SVC_SECRET_PARAM_RE='(token|key|secret|password|passwd)$'
 
 svc_url_file() { printf '%s/services/%s.url' "$STATE_DIR" "$1"; }
@@ -622,6 +649,10 @@ svc_redact_url() {
         fi
     done
     if (( ! hit )); then printf '%s' "$url"; return 0; fi
+    if [[ "$SVC_SHOW_SECRETS" == 1 ]]; then
+        [[ -n "$name" ]] && _svc_save_secret_url "$name" "$url"
+        printf '%s' "$url"; return 0
+    fi
     if [[ -n "$name" ]] && _svc_save_secret_url "$name" "$url"; then
         ph="<redacted: see $(svc_url_file "$name")>"
     else
@@ -1437,7 +1468,7 @@ the orchestrator's absence from the watcher and blocks recovery.
 The window has been renamed off '$TARGET_WINDOW' (unless a live
 orchestrator shares it) so the watcher can respawn the real orchestrator.
 Run the cockpit in its own window instead:
-  tmux new-window -dn $SERVICES_WINDOW $0
+  tmux new-window -dn $SERVICES_WINDOW $0 --show-secrets
 MSG
             exit 4
         fi
@@ -2687,10 +2718,15 @@ main() {
     # --force: override the cold-build guard (see _coldbuild_guard). Accepted
     # before the verb so `svc.sh --force restart jupyterlab` reads naturally.
     # Also honoured via the SVC_FORCE env var, for non-interactive callers.
-    if [[ "${1:-}" == "--force" ]]; then
-        SVC_FORCE=1
-        shift
-    fi
+    # --show-secrets: do not redact URL secrets (#1821). Leading global flags
+    # are accepted in either order.
+    while (( $# > 0 )); do
+        case "$1" in
+            --force)        SVC_FORCE=1; shift ;;
+            --show-secrets) SVC_SHOW_SECRETS=1; shift ;;
+            *) break ;;
+        esac
+    done
 
     case "${1:-}" in
         -h|--help)        usage ;;

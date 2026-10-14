@@ -387,7 +387,7 @@ monitor/watcher/test-supervisor-liveness.sh|unreviewed|census at dev 2a299572 (2
 monitor/watcher/test-svc-orphan-reconcile.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-orphans.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-boot-starting.sh|declares-none|reviewed 2026-10-12 (bundle-1012a): drives the real bootstrap-recover.sh --services-only and then monitor/svc.sh status over a fixture registry and state dir it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
-monitor/watcher/test-svc-url-redact.sh|declares-none|reviewed 2026-10-12 (bundle-1012a): drives monitor/svc.sh status end to end over a fixture registry and state dir it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
+monitor/watcher/test-svc-url-redact.sh|declares-none|reviewed 2026-10-12 (bundle-1012a): drives monitor/svc.sh status end to end over a fixture registry and state dir it builds in a temp dir, with a private TMUX_TMPDIR, and jupyter-up.sh's ready banner by sourcing it with labsh/uv PATH stubs (bundle 25); no repo-wide population
 monitor/watcher/test-svc-url-warning.sh|declares-none|reviewed 2026-10-05 (your-org/nexus-code#1742): drives monitor/svc.sh status end to end over a fixture registry it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
 monitor/watcher/test-svc.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-target-absent.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads

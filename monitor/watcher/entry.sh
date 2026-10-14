@@ -461,4 +461,5 @@ fi
 # (the watcher and services are setsid-detached).
 tmux rename-window -t "$OWN_WINDOW_ID" "$SERVICES_WINDOW" 2>/dev/null || true
 echo "watcher: opening the service cockpit (q quits the view; the stack keeps running)" >&2
-exec "$_monitor_dir/svc.sh"
+# --show-secrets: the cockpit shows the JupyterLab token (your-org/nexus-code#1821).
+exec "$_monitor_dir/svc.sh" --show-secrets

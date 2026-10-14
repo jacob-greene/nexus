@@ -49,6 +49,10 @@
 #     deadline cannot run past it by more than the kill grace;
 #   * a probe whose turn comes after the deadline is SKIPPED and reported
 #     "not checked — deadline reached" — never as healthy;
+#   * a failing labsh row whose COLD-BUILD probe is denied by the deadline or
+#     cut by its cap is UNCLASSIFIED — never `down`, never BUILDING on its own;
+#     a BUILDING verdict an earlier round observed is kept, with its age, and
+#     still blocks convergence (your-org/nexus-code#1813);
 #   * the timeout summary REUSES the last round's verdicts rather than running
 #     every healthcheck again (the old summary did: one more full round).
 #
@@ -252,28 +256,40 @@ _check_orchestrator() {
 }
 
 # One service's verdict: prints `healthy`, `building <pid> <age> <token>`,
-# `timeout <cap>`, `skipped` or `down`.
+# `timeout <cap>`, `skipped`, `down`, or `unclassified <why> <hc>`.
+#
+# `unclassified` (your-org/nexus-code#1813): the healthcheck FAILED (<hc> is
+# `down` or `timeout <cap>`) on a row that may be a labsh cold build, and the
+# cold-build probe that would tell them apart did not answer — <why> is
+# `deadline` (no cap was left for it: the healthcheck used the last of the
+# budget) or `probe-timeout:<cap>` (cut by its own cap). Reporting that as
+# `down` turned a build round 1 had SEEN into a plain DOWN row on a loaded
+# 2-CPU runner. It is never healthy and never BUILDING by itself; the caller
+# keeps an earlier BUILDING observation, as it does for a skipped row.
 _service_verdict() {
-    local workdir="$1" launch="$2" health="$3" cap cap2 rc ev pid age
+    local workdir="$1" launch="$2" health="$3" cap cap2 rc prc ev pid age hc
     cap=$(_probe_cap) || { echo skipped; return; }
     VS_WD="$workdir" VS_HEALTH="$health" \
         _bounded "$cap" '_recover_service_healthy "$VS_WD" "$VS_HEALTH"' >/dev/null 2>&1
     rc=$?
     (( rc == 0 )) && { echo healthy; return; }
+    if (( rc == 124 || rc == 137 )); then hc="timeout $cap"; else hc=down; fi
     # Unhealthy (or its check timed out): is a labsh cold build in flight?
     # Asked of the SHARED predicate, in a bounded child — it walks /proc.
     if (( COLD_BUILD_CEILING > 0 )) && _vs_is_labsh_row "$launch" "$health" \
-         && [[ -r "$LABSH_EVIDENCE" && -d "$workdir/.jupyter" ]] \
-         && cap2=$(_probe_cap); then
+         && [[ -r "$LABSH_EVIDENCE" && -d "$workdir/.jupyter" ]]; then
+        cap2=$(_probe_cap) || { echo "unclassified deadline $hc"; return; }
         # In flight AND protected by the shared verdict (rc 1 = PROTECTED) ⇒
         # prints "<pid> <age> <token>"; released or unestablished ⇒ nothing.
         ev=$(VS_WD="$workdir" VS_EVIDENCE="$LABSH_EVIDENCE" VS_CEIL="$COLD_BUILD_CEILING" \
-             _bounded "$cap2" 'source "$VS_EVIDENCE" && ev=$(labsh_build_in_progress "$VS_WD") && read -r p a <<<"$ev" && ! v=$(labsh_build_release "$p" "$a" "$VS_WD" "$VS_CEIL") && printf "%s %s %s" "$p" "$a" "${v%% *}"' 2>/dev/null) \
-            && read -r pid age tok <<<"$ev" \
+             _bounded "$cap2" 'source "$VS_EVIDENCE" && ev=$(labsh_build_in_progress "$VS_WD") && read -r p a <<<"$ev" && ! v=$(labsh_build_release "$p" "$a" "$VS_WD" "$VS_CEIL") && printf "%s %s %s" "$p" "$a" "${v%% *}"' 2>/dev/null)
+        prc=$?
+        (( prc == 124 || prc == 137 )) && { echo "unclassified probe-timeout:$cap2 $hc"; return; }
+        (( prc == 0 )) && read -r pid age tok <<<"$ev" \
             && [[ "$pid" =~ ^[0-9]+$ && "$age" =~ ^[0-9]+$ && -n "$tok" ]] \
             && { echo "building $pid $age $tok"; return; }
     fi
-    if (( rc == 124 || rc == 137 )); then echo "timeout $cap"; else echo down; fi
+    echo "$hc"
 }
 
 # Per-round service state, kept so the timeout summary reports what the LAST
@@ -296,7 +312,7 @@ declare -A SVC_LAST_V=() SVC_LAST_AT=()
 # non-zero) is never rc 0 — it sets SERVICES_NOT_CHECKED (#1266), in THIS
 # scope rather than in a `$( )` subshell, so the flag cannot be silently lost.
 _check_services() {
-    local rows rc name workdir launch health logfile v pid age
+    local rows rc name workdir launch health logfile v pid age why hc
     SVC_BAD=''; SVC_BUILDING=''
     rows=$(_recover_parse_registry "$SERVICES_REGISTRY" 2>/dev/null); rc=$?
     if (( rc != 0 )); then
@@ -310,7 +326,28 @@ _check_services() {
         [[ -z "$name" ]] && continue
         v=$(_service_verdict "$workdir" "$launch" "$health")
         seen=''
-        if [[ "$v" == skipped ]]; then
+        if [[ "$v" == unclassified\ * ]]; then
+            # #1813: the healthcheck still fails and the cold-build probe did
+            # not answer. Never converged (blocks rc 0 and rc 3, like a skip);
+            # an earlier BUILDING observation is KEPT, with its age, and the
+            # row's last observation is not overwritten by a non-answer.
+            skipped_any=1
+            read -r _ why _ <<<"$v"
+            case "$why" in
+                deadline)        why='cold-build probe not run — deadline reached' ;;
+                probe-timeout:*) why="cold-build probe timed out after ${why#probe-timeout:}s" ;;
+            esac
+            if [[ "${SVC_LAST_V[$name]:-}" == building\ * ]]; then
+                v="${SVC_LAST_V[$name]}"
+                ago=$(( SECONDS - ${SVC_LAST_AT[$name]:-$SECONDS} ))
+                seen="healthcheck still failing; $why; BUILDING last observed ${ago}s ago"
+            else
+                hc=${v#unclassified * }
+                [[ "$hc" == timeout\ * ]] && hc="healthcheck timed out after ${hc#timeout }s" || hc='healthcheck failing'
+                SVC_BAD+="${SVC_BAD:+, }$name (unhealthy, NOT classified: $why; $hc)"
+                continue
+            fi
+        elif [[ "$v" == skipped ]]; then
             skipped_any=1
             if [[ -n "${SVC_LAST_V[$name]:-}" ]]; then
                 v="${SVC_LAST_V[$name]}"

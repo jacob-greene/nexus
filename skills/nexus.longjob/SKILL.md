@@ -65,6 +65,30 @@ level-triggered tick shape), `--max-events N`, `--unknown-max N`.
 
 `ng longjob list | show <id> | rm <id> | events | status` read the spool.
 
+**From an in-process SUB-AGENT (the Agent tool) — the LEAD owns the wake**
+(<your-org>/nexus-code#1794). A sub-agent is not woken by its session's
+notifications while its lead is idle, and it shares the lead's
+`CLAUDE_CODE_SESSION_ID`, so its watch lands in the LEAD's spool and the
+lead's dispatcher wakes the LEAD. Say so with `--for-lead <its SendMessage
+name>` on `add` or `run`:
+
+    monitor/ng longjob run --for-lead sa1794 --desc "longjob suite" -- bash monitor/watcher/test-longjob-watch.sh
+
+The wake line then leads with whom to re-task —
+`longjob-watch: DONE <id> | for sub-agent sa1794: SendMessage(to: sa1794) | record: …`
+— and `add` stops saying "safe to end your turn". The sub-agent hands the id
+to the lead and ends its turn; the lead `SendMessage`s it on the wake. To
+wait itself instead (a short job, or `add` rc 3 NOT ARMED), it blocks in the
+FOREGROUND, never `run_in_background`:
+`monitor/ng longjob await <id> --timeout 540` with Bash timeout 600000,
+re-entered on rc 4. Evidence for the shared key (2026-10-13, cc 2.1.296): a
+sub-agent's shell had the lead's `CLAUDE_CODE_SESSION_ID`, its transcript sat
+under `<that id>/subagents/`, and its `add` was printed by the dispatcher
+whose ledger names the lead's `claude` pid as owner. That line arrived in the
+LEAD's conversation. The idle wake is MEASURED too (2026-10-13, cc 2.1.296):
+a sub-agent's timed watch (deadline 02:00:53) was printed at 02:01:01 and
+re-invoked the lead, idle since ~01:59:40 with nothing running, at 02:01:04.
+
 **A success-only `match` used to sleep through an abort** (2026-10-08: ~2 h on
 a deploy that ABORTed instead of printing its version stamp). `--when match`
 therefore ends FAILED on the first line, written after the add, that matches

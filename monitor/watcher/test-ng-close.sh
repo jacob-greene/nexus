@@ -166,11 +166,18 @@ calls=$(<"$CAPTURE")
 assert_contains  "pre-close comment POST embeds --repo" "$calls" "/repos/other-org/other-repo/issues/42/comments"
 
 echo '=== ng close --repo refuses a cwd/REPO mismatch without --repo ==='
-# Run from INSIDE this checkout (origin your-org/nexus-code) against the
+# Run from a FIXTURE repo whose origin is a GitHub repo other than the
 # stubbed $REPO default-org/default-repo: the #108 guard must now fire for
-# `close` exactly as it does for every other write verb.
+# `close` exactly as it does for every other write verb. The fixture carries
+# its own origin, so the verdict does not depend on the checkout's remote (a
+# clone with a local-path origin read this case red; nxrelease2-sk, #1819).
+MISMATCH_CWD="$WORK/mismatch-origin"
+mkdir -p "$MISMATCH_CWD"
+git -C "$MISMATCH_CWD" init -q
+th_require_fixture_repo "$MISMATCH_CWD" "ng close cwd-mismatch fixture"
+git -C "$MISMATCH_CWD" remote add origin "https://github.com/other-org/fixture-repo.git"
 mismatch_err=$(
-    env -u TMUX -u TMUX_PANE -u NEXUS_ROOT -u NEXUS_CONFIG -u HOME \
+    cd "$MISMATCH_CWD" && env -u TMUX -u TMUX_PANE -u NEXUS_ROOT -u NEXUS_CONFIG -u HOME \
         NEXUS_STATE_DIR="$WORK/state" NG_CLOSE_CAPTURE="$CAPTURE" \
         PATH="$STUB_DIR:$PATH" "$NG" close 42 2>&1 >/dev/null || true
 )

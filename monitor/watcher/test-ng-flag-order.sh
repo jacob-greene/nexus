@@ -351,7 +351,7 @@ run_ng() {
     local _o="$1" _e="$2" _r="$3"; shift 3
     local ot et
     ot=$(mktemp); et=$(mktemp)
-    ( cd "$NEUTRAL" && run_hermetic NEXUS_ROOT="$FAKE_NEXUS" NEXUS_STATE_DIR="$WORK/state" \
+    ( cd "$NEUTRAL" && run_hermetic NEXUS_ROOT="$FAKE_NEXUS" NEXUS_STATE_DIR="${_RUN_NG_STATE:-$WORK/state}" \
         PATH="$STUB_DIR:$PATH" -- "${NG_BIN:-$NG}" "$@" </dev/null ) >"$ot" 2>"$et"
     local rc=$?
     printf -v "$_o" '%s' "$(<"$ot")"; printf -v "$_e" '%s' "$(<"$et")"; printf -v "$_r" '%s' "$rc"
@@ -428,6 +428,7 @@ _names_a_supplied_token() {   # <stderr>
 _order_sensitive() {   # <ng> <verb...>  → rc0 when flag-first is rejected and flag-last is not
     local ng="$1"; shift
     local -a arities=(1 2) n
+    _OS_GATE=0
     for n in "${arities[@]}"; do
         local -a pos=("$POS1"); (( n == 2 )) && pos=("$POS1" "$POS2")
         # Flags-FIRST runs first, and flags-last only when flags-first was
@@ -437,6 +438,9 @@ _order_sensitive() {   # <ng> <verb...>  → rc0 when flag-first is rejected and
         # full four-per-verb sweep pushed this suite past the 1200 s local
         # ceiling (your-org/nexus-code#1789).
         NG_BIN="$ng" run_ng sw_o sw_e sw_r "$@" --repo "$BAD" "${pos[@]}"
+        # B-REACH reads this: a delegator gate dies before any argument is
+        # parsed, so the flags-first probe sees it exactly as a bare probe would.
+        [[ "$sw_e" == *'not found or not executable'* ]] && _OS_GATE=1
         local first_bad=0; _names_a_supplied_token "$sw_e" && first_bad=1
         (( first_bad )) || continue
         NG_BIN="$ng" run_ng sw_o sw_e sw_r "$@" "${pos[@]}" --repo "$BAD"
@@ -653,14 +657,29 @@ _subs_documented_for() {   # <verb> → sub-verbs named on `ng --help`'s index
         }' | sort -u
 }
 
+# THE SWEEP RUNS IN PARALLEL SHARDS (your-org/nexus-code#1789). Measured at
+# load ~35-40: 451 `ng` invocations, median 0.58 s, max 1.9 s, and NOT ONE
+# waiting on a sleep, a lock, a network call or a `timeout` — the cost is
+# `ng`'s own start-up (a ~16k-line script parsed, plus the config lookups it
+# spawns) paid once per invocation. Nothing per verb can be stubbed away, so
+# the invocations are spread over $_SWEEP_JOBS shards instead. Each shard has
+# its OWN state dir, so no two verbs can meet on a lock or a state file, and
+# the probe set is unchanged: every item still gets exactly the invocations
+# `_order_sensitive` gives it serially.
+_SWEEP_JOBS=${NG_FLAG_ORDER_JOBS:-4}
+[[ "$_SWEEP_JOBS" =~ ^[1-9][0-9]*$ ]] || _SWEEP_JOBS=4
 _sweep() {   # <ng-binary> <hits-out> [verb …]; prints nothing, writes offenders
     # Output variable names must NOT collide with run_ng's own locals
     # (`_o/_e/_r`): `printf -v "$_e"` would then assign to run_ng's LOCAL and
     # the value would die with the function. Measured — it failed exactly so.
+    #
+    # Also writes <hits-out>.gate: each SUB-verb whose probe died at a
+    # delegator gate (`not found or not executable`), for B-REACH.
     local ng="$1" out="$2"; shift 2
-    local v sv verbs
+    local v sv verbs k i done_n=0 shard_n
+    local -a items=() it
     verbs=$( (( $# )) && printf '%s\n' "$@" || printf '%s\n' "$_DISPATCH_VERBS" )
-    : > "$out"
+    : > "$out"; : > "$out.gate"
     _SWEEP_VERBS=0
     while IFS= read -r v; do
         [[ -n "$v" ]] || continue
@@ -668,13 +687,43 @@ _sweep() {   # <ng-binary> <hits-out> [verb …]; prints nothing, writes offende
         local subs
         if [[ -n "${_SUBS_OF[$v]+set}" ]]; then subs=${_SUBS_OF[$v]}; else subs=$(_subs_for "$v"); fi
         if [[ -n "$subs" ]]; then
-            for sv in $subs; do
-                _order_sensitive "$ng" "$v" "$sv" && printf 'ng %s %s\n' "$v" "$sv" >> "$out"
-            done
+            for sv in $subs; do items+=("$v $sv"); done
         else
-            _order_sensitive "$ng" "$v" && printf 'ng %s\n' "$v" >> "$out"
+            items+=("$v")
         fi
     done <<<"$verbs"
+    for (( k = 0; k < _SWEEP_JOBS; k++ )); do
+        (
+            _RUN_NG_STATE="$WORK/state-sweep-$k"
+            n=0
+            for (( i = k; i < ${#items[@]}; i += _SWEEP_JOBS )); do
+                read -r -a it <<<"${items[i]}"
+                if _order_sensitive "$ng" "${it[@]}"; then
+                    printf '%d\tng %s\n' "$i" "${items[i]}" >> "$out.hits.$k"
+                fi
+                (( ${#it[@]} == 2 && _OS_GATE )) && printf '%d\tng %s\n' "$i" "${items[i]}" >> "$out.gate.$k"
+                n=$(( n + 1 ))
+            done
+            # The completion record is written LAST: a shard that died part
+            # way leaves no record, and the reconciliation below says so
+            # instead of reading its missing hits as a clean sheet.
+            printf '%d\n' "$n" > "$out.done.$k"
+        ) &
+    done
+    wait
+    for (( k = 0; k < _SWEEP_JOBS; k++ )); do
+        shard_n=$(cat "$out.done.$k" 2>/dev/null)
+        [[ "$shard_n" =~ ^[0-9]+$ ]] || { fail "sweep shard $k of $_SWEEP_JOBS left no completion record — its verdicts are missing, not clean"; continue; }
+        done_n=$(( done_n + shard_n ))
+    done
+    (( done_n == ${#items[@]} )) \
+        || fail "sweep probed $done_n of ${#items[@]} items — a shard stopped early"
+    # Original enumeration order, so a finding reads the same at any -j.
+    # Named per shard, never globbed: a shard with no hits writes no file, and
+    # under nullglob a `cat` over an empty glob would read stdin instead.
+    for (( k = 0; k < _SWEEP_JOBS; k++ )); do cat "$out.hits.$k" 2>/dev/null; done | sort -n | cut -f2- > "$out"
+    for (( k = 0; k < _SWEEP_JOBS; k++ )); do cat "$out.gate.$k" 2>/dev/null; done | sort -n | cut -f2- > "$out.gate"
+    rm -f "$out".hits.* "$out".gate.* "$out".done.*
     return 0
 }
 
@@ -784,7 +833,14 @@ fi
 # TALK to what it enumerates (your-org/nexus-code#906 N1). A sub-verb whose
 # script is missing from the fixture dies at the delegator's gate in BOTH
 # orders — perfectly symmetric, perfectly silent, and counted as covered.
-: > "$WORK/unreachable.txt"
+#
+# The probe is the LIVE SWEEP's own flags-first invocation of each sub-verb
+# (your-org/nexus-code#1789): a delegator gate fires before any argument is
+# parsed, so `<v> <sv> --repo X <pos>` dies there exactly as the bare
+# `<v> <sv> --repo X` this block used to run separately did — and that separate
+# pass was ~75 more `ng` start-ups for an answer the sweep already had. The
+# sweep runs HERE, ahead of B-REACH; its verdict is still asserted only below.
+_sweep "$NG" "$WORK/sweep-live.txt"
 _B_SUBS=0; _B_ACTUAL=""
 while IFS= read -r _v; do
     # PAIRS, not a sub-verb list beside a single target
@@ -795,18 +851,17 @@ while IFS= read -r _v; do
     # row and neither direction of B-REACH-POP has to be relaxed.
     #
     # The DELEGATED half is the half that can die at a gate; the inline
-    # dispatchers (script column `-`) are probed too (they cost nothing and the
-    # property is the same) but they could never make this assertion bite, so
+    # dispatchers (script column `-`) are gate-checked too (the sweep probes
+    # them anyway and the property is the same) but they could never make this
+    # assertion bite, so
     # only the delegated rows are reconciled below.
     while IFS=' ' read -r _tgt _sv; do
         [[ -n "$_sv" ]] || continue
         _B_SUBS=$(( _B_SUBS + 1 ))
         [[ "$_tgt" != '-' ]] && _B_ACTUAL+="$_tgt $_sv"$'\n'
-        run_ng rch_o rch_e rch_r "$_v" "$_sv" --repo "$BAD"
-        [[ "$rch_e" == *'not found or not executable'* ]] && printf 'ng %s %s\n' "$_v" "$_sv" >> "$WORK/unreachable.txt"
     done <<<"${_PAIRS_OF[$_v]}"
 done <<<"$_DISPATCH_VERBS"
-assert_empty "B-REACH every sub-verb reaches its own parser, none dies at a delegator gate" "$(<"$WORK/unreachable.txt")"
+assert_empty "B-REACH every sub-verb reaches its own parser, none dies at a delegator gate" "$(<"$WORK/sweep-live.txt.gate")"
 
 # B-REACH-POP — the NON-VACUITY OF THE ABOVE, DERIVED (your-org/nexus-code#943).
 #
@@ -885,7 +940,6 @@ else
     fail "B-DOC only $_B_DOC documented sub-verbs — the second axis is broken, so the line above is vacuous"
 fi
 
-_sweep "$NG" "$WORK/sweep-live.txt"
 assert_empty "B no verb is ORDER-SENSITIVE (flag-first rejected, flag-last accepted)" "$(<"$WORK/sweep-live.txt")"
 # The LIVE sweep walked the WHOLE dispatcher population. This is the
 # non-vacuity the planted control below used to supply as a side effect, when

@@ -1550,7 +1550,7 @@ _recover_capture_carryover() {
     if (( _carry_rc == 4 )); then
         # A queue too old to honour is finished, with its own token, so it is
         # not re-examined at every later boot.
-        log "workers: an unfinished auto-continue plan (epoch $(_ac_owner_field "$STATE_DIR" 5)) is OLDER than ${AC_PLAN_CARRY_MAX_AGE_SECONDS:-21600}s or undated — NOT carried; candidates come from the snapshot alone (#1810 F3)"
+        log "workers: an unfinished auto-continue plan (epoch $(_ac_owner_field "$STATE_DIR" 5)) is OLDER than ${AC_PLAN_CARRY_MAX_AGE_SECONDS:-${AC_PLAN_CARRY_MAX_AGE_DEFAULT:-172800}}s or undated — NOT carried; candidates come from the snapshot alone (#1810 F3)"
         ac_plan_finish "$STATE_DIR" "$(ac_plan_token "$STATE_DIR")" \
             && log "workers: the stale auto-continue plan is marked done"
     fi

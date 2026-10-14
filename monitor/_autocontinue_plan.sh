@@ -196,13 +196,22 @@ ac_plan_token() { _ac_owner_field "$1" 4; }
 # carries nothing: neither is ours to take over.
 #
 # AGE BOUND (#1810 skeptic F3): a plan older than <max-age-s> (default
-# AC_PLAN_CARRY_MAX_AGE_SECONDS, 21600 = 6 h) is NOT carried, rc 4 — a worker
-# killed by hand days later must not be resurrected from a stale queue. A plan
-# is normally consumed at the very next boot, and today's 24 RO onsets each
-# ended in a restart within hours. An epoch that does not parse carries
-# nothing (rc 4 too): the base behaviour, never a guess.
+# AC_PLAN_CARRY_MAX_AGE_SECONDS, else AC_PLAN_CARRY_MAX_AGE_DEFAULT) is NOT
+# carried, rc 4 — a worker killed by hand days later must not be resurrected
+# from a stale queue. An epoch that does not parse carries nothing (rc 4 too):
+# the base behaviour, never a guess.
+#
+# The bound must outlast an RO outage, because an interrupted recovery's plan
+# waits on disk until the next boot (#1811). Measured 2026-10-13 over
+# monitor/.state/watcher.log (2026-09-21..10-13; the rotated copy before it
+# holds no RO line): 24 incidents, RO onset to the next `watcher up:`, max
+# 18.06 h, then 14.03 h and 6.73 h. The first default, 6 h, dropped all three.
+# We chose 48 h: 2.7x the measured maximum, room for an outage that spans a
+# weekend night, and still short of "days later". Onset-to-restart
+# over-counts the outage itself, which errs toward a longer bound.
+AC_PLAN_CARRY_MAX_AGE_DEFAULT=172800
 ac_plan_carryover() {
-    local path rc=0 epoch now max="${2:-${AC_PLAN_CARRY_MAX_AGE_SECONDS:-21600}}"
+    local path rc=0 epoch now max="${2:-${AC_PLAN_CARRY_MAX_AGE_SECONDS:-$AC_PLAN_CARRY_MAX_AGE_DEFAULT}}"
     path=$(ac_plan_path "$1")
     ac_plan_active "$1" || rc=$?
     (( rc == 1 )) || return 1
