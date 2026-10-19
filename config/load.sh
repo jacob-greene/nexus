@@ -33,7 +33,7 @@
 #   3  python3 / pyyaml missing
 #   4  --check-identity / --validate: a required key resolves to its
 #      nexus.example.yml placeholder (or, for --validate, is present but
-#      empty)
+#      empty, or `status_surface` is malformed / names an unknown kind)
 
 set -euo pipefail
 
@@ -252,6 +252,27 @@ if key in ('--check-identity', '--validate'):
               file=sys.stderr)
         print(f"  resolved config: {path}", file=sys.stderr)
         sys.exit(4)
+
+    # --- status_surface (your-org/nexus-code#1839) ----------------------------
+    # An enum, so an unknown kind is REFUSED, never read as the default: a
+    # typo for `external` would otherwise restore the very dashboard nudges
+    # the operator opted out of, with nothing saying why. A scalar
+    # `status_surface: external` is refused too — the dotted read of
+    # `status_surface.kind` cannot see inside it and returns the default.
+    # Absent is the default (overview-dashboard) and is fine.
+    if key == '--validate' and 'status_surface' in cfg:
+        ss = cfg['status_surface']
+        ss_kinds = ('overview-dashboard', 'external')
+        ss_err = None
+        if not isinstance(ss, dict):
+            ss_err = "status_surface must be a mapping (status_surface: {kind: ...}), got %r" % (ss,)
+        elif 'kind' in ss and ss['kind'] not in ss_kinds:
+            ss_err = "status_surface.kind = %r is not one of: %s" % (ss['kind'], ', '.join(ss_kinds))
+        if ss_err:
+            print("load.sh: REFUSING — " + ss_err, file=sys.stderr)
+            print("  See the status_surface note in config/nexus.example.yml.", file=sys.stderr)
+            print(f"  resolved config: {path}", file=sys.stderr)
+            sys.exit(4)
 
     if bad:
         what = 'nexus identity' if key == '--check-identity' else 'nexus config'

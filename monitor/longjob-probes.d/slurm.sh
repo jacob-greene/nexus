@@ -78,16 +78,81 @@ lj_slurm_squeue_state() {
         $1 == t || index($1, t "_") == 1 || index($1, t "+") == 1 { print $2; exit }'
 }
 
+# --time IS NOT A BOUND HERE (your-org/nexus-code#1841). `scontrol show
+# config` reported `OverTimeLimit = 2160 min` (2026-10-15): Slurm lets a job
+# run up to 36 h past its --time, and a `--time 06:00:00` job ran 13 h 52 m.
+# So a RUNNING row whose ElapsedRaw (seconds) exceeds its TimelimitRaw
+# (minutes) carries LJ_SLURM_OVERTIME_MARK in its detail; the dispatcher keys
+# its ONE overtime warning per watch on that literal (longjob-watch.sh,
+# `.overtime_warned`). A limit that is not an integer (UNLIMITED,
+# Partition_Limit, blank, an old two-field row) is no limit: no mark.
+LJ_SLURM_OVERTIME_MARK='PAST ITS --time'
+_lj_hm() { printf '%dh%02dm' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )); }
+# _lj_slurm_overtime <elapsed-seconds> <limit-minutes> → the clause, or nothing
+_lj_slurm_overtime() {
+    [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+$ ]] || return 0
+    (( $1 > $2 * 60 )) || return 0
+    printf '%s: elapsed %s > limit %s, and OverTimeLimit lets Slurm continue it (scontrol show config | grep OverTimeLimit)' \
+        "$LJ_SLURM_OVERTIME_MARK" "$(_lj_hm "$1")" "$(_lj_hm $(( $2 * 60 )))"
+}
+
+# THE PAYLOAD'S OWN EXIT CODE OUTRANKS SLURM (your-org/nexus-code#1841). A node
+# whose resolver failed (`getaddrinfo` for the controller) held jobs RUNNING or
+# COMPLETING after their payload had exited, so a watch on Slurm state alone
+# slept on a finished job. `add slurm:<id> --payload-rc <file>` records an
+# absolute path in `.payload_rc`; the job script's last lines write the real
+# step's rc there (`echo "$rc" > FILE; exit "$rc"`). When the file holds an
+# integer the payload is over: RUNNING/COMPLETING (or no answer from Slurm)
+# becomes done/failed by that rc, flagged `RUNNING after payload end`. A file
+# that is not an integer 0..255 is REFUSED, never read as a number: `unknown`
+# while Slurm says the job is live (so the bounded unknown retry rides out a
+# torn write and then EMITS), and an `IGNORED` note beside a terminal Slurm
+# verdict. A pending job keeps its pending (an rc before the job ran is stale).
 lj_probe_main() {
+    local target="$1" spec="${2:-}" verdict prc="" v="" st det
+    verdict=$(_lj_slurm_verdict "$target")
+    [[ -n "$spec" ]] && prc=$(printf '%s' "$spec" | jq -r '.payload_rc // empty' 2>/dev/null)
+    if [[ -z "$prc" || ! -e "$prc" ]] || ! lj_slurm_jobid_valid "$target"; then
+        printf '%s' "$verdict"; return 0
+    fi
+    st="${verdict%%|*}"; det="${verdict#*|}"
+    { IFS= read -r v < "$prc"; } 2>/dev/null || true
+    v="${v%$'\r'}"; v="${v%%[[:space:]]}"
+    # An exit code is 0..255; a longer digit string would wrap in (( )).
+    if [[ ! "$v" =~ ^[0-9]{1,3}$ ]] || (( 10#$v > 255 )); then
+        case "$st" in
+            done|failed) printf '%s|%s; payload-rc file %s IGNORED: holds '"'"'%s'"'"', not an exit code' "$st" "$det" "$prc" "${v:0:40}" ;;
+            pending) printf '%s' "$verdict" ;;
+            *) printf 'unknown|payload-rc file %s holds '"'"'%s'"'"', not an exit code (0..255) — refused; Slurm says: %s' "$prc" "${v:0:40}" "$det" ;;
+        esac
+        return 0
+    fi
+    local pst=done; (( 10#$v == 0 )) || pst=failed
+    case "$st" in
+        running|unknown)
+            # The verdict leads: _probe cuts a detail at 400 chars, and a
+            # deep path must not push it past the cut.
+            printf '%s|payload rc=%s: RUNNING after payload end (Slurm still says %s) — the allocation is held; read the output, then scancel %s (rc from %s)' \
+                "$pst" "$v" "${det%%;*}" "$target" "$prc" ;;
+        done)
+            if [[ "$pst" == failed ]]; then printf 'failed|payload rc=%s (from %s) although Slurm says %s' "$v" "$prc" "$det"
+            else printf 'done|%s; payload rc=0' "$det"; fi ;;
+        failed) printf 'failed|%s; payload rc=%s' "$det" "$v" ;;
+        *) printf '%s' "$verdict" ;;
+    esac
+    return 0
+}
+
+_lj_slurm_verdict() {
     local target="$1"
     # Refused BEFORE `sacct` runs: `sacct -j 0` is not a question about any job.
     lj_slurm_jobid_valid "$target" || { printf 'unknown|not a Slurm job id: %s (never polled)' "$target"; return 0; }
     command -v sacct >/dev/null 2>&1 || { printf 'unknown|sacct not on PATH'; return 0; }
-    local out rc state exit_code ef err=""
+    local out rc state exit_code el="" tl="" ot="" ef err=""
     # stderr is KEPT (to a private file) so a chaperon failure can say so: the
     # dispatcher backs off on it (your-org/nexus-code#1728).
     ef=$(mktemp "${TMPDIR:-/tmp}/lj-sacct-err.XXXXXX" 2>/dev/null) || ef=""
-    out=$(sacct -X -n -P -o State,ExitCode -j "$target" 2>"${ef:-/dev/null}"); rc=$?
+    out=$(sacct -X -n -P -o State,ExitCode,ElapsedRaw,TimelimitRaw -j "$target" 2>"${ef:-/dev/null}"); rc=$?
     if [[ -n "$ef" ]]; then { IFS= read -r err < "$ef"; } 2>/dev/null; rm -f "$ef"; fi
     if (( rc != 0 )); then
         printf 'unknown|sacct rc=%s%s' "$rc" "${err:+: ${err:0:160}}"; return 0
@@ -121,18 +186,20 @@ lj_probe_main() {
         while IFS= read -r line; do
             [[ -n "$line" ]] || continue
             n=$((n + 1))
-            c="${line%%|*}"
+            IFS='|' read -r c exit_code el tl _ <<< "$line"
             case "${c%% *}" in
                 PENDING|CONFIGURING|REQUEUED|RESV_DEL_HOLD) np=$((np + 1)) ;;
-                RUNNING|COMPLETING|SUSPENDED|SIGNALING|STAGE_OUT|RESIZING) nr=$((nr + 1)) ;;
+                RUNNING|COMPLETING|SUSPENDED|SIGNALING|STAGE_OUT|RESIZING)
+                    nr=$((nr + 1))
+                    [[ -n "$ot" ]] || ot=$(_lj_slurm_overtime "$el" "$tl") ;;
                 COMPLETED) nd=$((nd + 1)) ;;
                 *)  # the known failure states AND the unrecognised default arm
-                    nf=$((nf + 1)); [[ -n "$first_bad" ]] || first_bad="$c exit=${line#*|}" ;;
+                    nf=$((nf + 1)); [[ -n "$first_bad" ]] || first_bad="$c exit=$exit_code" ;;
             esac
         done <<< "$rows"
         local tally="array/het set of $n rows: $nd completed, $nf failed, $nr running, $np pending"
         if (( nr > 0 )); then
-            printf 'running|%s%s' "$tally" "${first_bad:+ (first failure so far: $first_bad)}"
+            printf 'running|%s%s%s' "$tally" "${first_bad:+ (first failure so far: $first_bad)}" "${ot:+; a running row is $ot}"
         elif (( np > 0 )); then
             printf 'pending|%s%s' "$tally" "${first_bad:+ (first failure so far: $first_bad)}"
         elif (( nf > 0 )); then
@@ -142,12 +209,13 @@ lj_probe_main() {
         fi
         return 0
     fi
-    state="${out%%|*}"; exit_code="${out#*|}"
+    IFS='|' read -r state exit_code el tl _ <<< "$out"
     case "${state%% *}" in
         PENDING|CONFIGURING|REQUEUED|RESV_DEL_HOLD)
             printf 'pending|%s' "$state" ;;
         RUNNING|COMPLETING|SUSPENDED|SIGNALING|STAGE_OUT|RESIZING)
-            printf 'running|%s' "$state" ;;
+            ot=$(_lj_slurm_overtime "$el" "$tl")
+            printf 'running|%s%s' "$state" "${ot:+; $ot}" ;;
         COMPLETED)
             printf 'done|COMPLETED exit=%s' "$exit_code" ;;
         FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|BOOT_FAIL|DEADLINE|PREEMPTED|CANCELLED|REVOKED|SPECIAL_EXIT)

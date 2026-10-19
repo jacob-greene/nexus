@@ -1293,7 +1293,7 @@ assert_ctx "the grep-ANY over a two-job sacct (17 minutes early) WARNS" "AN UNBO
 assert_ctx "  …and the message states the EXISTENTIAL-vs-UNIVERSAL rule" "grep -q\` IS EXISTENTIAL"
 win ucw-sacct-loop
 run '{"tool_name":"Bash","tool_input":{"command":"for j in 1 2; do until s=$(sacct -j $j -X -n -o State | tr -d '"'"' '"'"'); [[ \"$s\" =~ ^(COMPLETED|FAILED).*$ ]]; do sleep 120; done; done"}}'
-assert_ctx "a predicate that itself contains ';' (the jcfull sacct loop) WARNS" "AN UNBOUNDED WAIT ON A COMMAND PREDICATE"
+assert_ctx "a predicate that itself contains ';' (the jfullw sacct loop) WARNS" "AN UNBOUNDED WAIT ON A COMMAND PREDICATE"
 win ucw-newline
 run '{"tool_name":"Bash","tool_input":{"command":"until gh run view 1 --json status -q .status '"$_P"' grep -q completed\ndo sleep 60\ndone"}}'
 assert_ctx "the newline spelling (no semicolons) WARNS" "AN UNBOUNDED WAIT ON A COMMAND PREDICATE"

@@ -16,12 +16,12 @@ ST="$WORK/state"; mkdir -p "$ST/skeptic/pending" "$WORK/bin"
 # A stub tmux: two windows present, one of them a live pairing's worker.
 cat > "$WORK/bin/tmux" <<'STUB'
 #!/usr/bin/env bash
-case "$*" in *list-windows*) printf 'orchestrator\nolaysci\n' ;; *) exit 1 ;; esac
+case "$*" in *list-windows*) printf 'orchestrator\nolayw1\n' ;; *) exit 1 ;; esac
 STUB
 chmod +x "$WORK/bin/tmux"
 # Three markers: one live (window present), two orphaned (absent) — one of them
 # OLD and one FRESH, so age visibly does not decide the verdict.
-echo 1 > "$ST/skeptic/pending/olaysci"
+echo 1 > "$ST/skeptic/pending/olayw1"
 echo 1 > "$ST/skeptic/pending/audit337";  touch -d '30 days ago' "$ST/skeptic/pending/audit337"
 echo 1 > "$ST/skeptic/pending/fresh-orphan"
 echo 1 > "$ST/skeptic/pending/.hidden-sidecar"
@@ -30,7 +30,7 @@ printf '{"ts":"2026-08-27T00:19:34-07:00","agent":"monitor","event":"window-clos
 echo '=== 1. classification by PRESENCE, not age ==='
 out=$(PATH="$WORK/bin:$PATH" NEXUS_STATE_DIR="$ST" bash "$NG" skeptic-orphans 2>"$WORK/err"); rc=$?
 assert_eq "exit 0 = looked" "$rc" "0"
-assert_contains "the live pairing's marker is live (window present)"      "$out" "marker=olaysci window_present=yes verdict=live"
+assert_contains "the live pairing's marker is live (window present)"      "$out" "marker=olayw1 window_present=yes verdict=live"
 assert_contains "the 30-day-old marker is orphaned"                        "$out" "marker=audit337 window_present=no verdict=orphaned"
 assert_contains "the FRESH absent-window marker is orphaned too (age does not decide)" "$out" "marker=fresh-orphan window_present=no verdict=orphaned"
 assert_contains "the action log's last row for the window is carried"     "$out" "marker=audit337 window_present=no verdict=orphaned age_s="

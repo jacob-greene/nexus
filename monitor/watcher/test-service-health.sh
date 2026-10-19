@@ -28,6 +28,9 @@
 #   emit         re-nag guarded (identical status:attempts suppressed);
 #                ALWAYS reports the policy + full current state (grace /
 #                restart attempt + outcome / escalation).
+#   stop request a `svc.sh stop` sentinel suspends the whole DOWN machine
+#                (no incident, no restart, no emit); an incident open when it
+#                lands is closed; withdrawn ⇒ restarts resume (#1827).
 #   generator    `ng service-incident` emits all five required sections
 #                from the recorded state + the verbatim event timeline,
 #                including the restart policy.
@@ -1002,6 +1005,83 @@ emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
 assert_contains "reconcile breadcrumb surfaced" "$emit" "RECONCILED"
 assert_no_file  "incident closed" "$SHDIR/myservice.state"
 stop_supervisor
+
+# ===========================================================================
+# STOPPED BY REQUEST (your-org/nexus-code#1827). `svc.sh stop <name>` writes a
+# sentinel beside the pidfile; while it stands a DOWN service is not an outage:
+# no incident, no restart, no emit. Measured before the fix: a stop meant to
+# hold an auto-deploy was auto-restarted (attempt 1/3) within ~3 min. The
+# literal path is pinned here (not `_sh_stop_sentinel`) so the suite also pins
+# the layout svc.sh writes — test-svc.sh case 18 pins the writer side.
+STOPSF="$SVCPIDDIR/myservice.stop-requested"
+write_stop() { printf 'at=%s\niso=%s\nby=%s\n' "${1:-1000}" "2026-10-13T16:05:00-07:00" "w1" > "$STOPSF"; }
+reset_stop() { reset_incon; rm -f "$STOPSF"; }
+echo
+echo "## stopped by request ⇒ never restarted, no incident, no emit (#1827)"
+reset_stop
+assert_eq "the module's sentinel path is the layout svc.sh writes" \
+    "$(declare -F _sh_stop_sentinel >/dev/null && _sh_stop_sentinel myservice)" "$STOPSF"
+rm -f "$OKFLAG"; write_stop
+_shlog=$( { NEXUS_TEST_NOW=6000 _service_health_check_tick; } 2>&1 )
+NEXUS_TEST_NOW=6040 _service_health_check_tick 2>/dev/null     # past grace (30)
+NEXUS_TEST_NOW=6400 _service_health_check_tick 2>/dev/null     # past cooldown (300)
+assert_eq      "no svc.sh restart while stopped by request" "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_no_file "no incident .state for a requested stop" "$SHDIR/myservice.state"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_eq      "nothing surfaced to the orchestrator" "$erc" "1"
+assert_contains "log reports 'stopped by request since <ts>'" "$_shlog" "stopped by request since 2026-10-13T16:05:00-07:00"
+assert_eq      "stopped-by-request recorded ONCE across three ticks" \
+    "$(grep -c 'stopped-by-request' "$SHDIR/myservice.events" 2>/dev/null)" "1"
+assert_file_exists "the sentinel is left standing" "$STOPSF"
+
+echo
+echo "## a stop landing mid-incident closes the incident instead of restarting (#1827)"
+reset_stop
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=7000 _service_health_check_tick 2>/dev/null     # grace
+assert_eq "PRECONDITION: incident open in grace" "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+write_stop
+NEXUS_TEST_NOW=7040 _service_health_check_tick 2>/dev/null     # would have restarted
+assert_eq      "no restart after the stop request" "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_no_file "the open incident record is closed" "$SHDIR/myservice.state"
+assert_contains "the event names the closed incident" "$(cat "$SHDIR/myservice.events")" "closed the open 'grace' incident"
+
+echo
+echo "## NEGATIVE CONTROL: request cleared (svc.sh start) ⇒ a dead service is restarted as before"
+# The stopped state above leaves its sidecar; clearing only the sentinel is
+# exactly what `svc.sh start|restart` does.
+rm -f "$STOPSF"
+NEXUS_TEST_NOW=8000 _service_health_check_tick 2>/dev/null     # fresh incident, grace
+NEXUS_TEST_NOW=8040 _service_health_check_tick 2>/dev/null     # past grace → act
+assert_eq "restart issued once the request is withdrawn" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+assert_no_file "the once-per-stop sidecar is retired with the request" "$SHDIR/myservice.stop-noted"
+
+echo
+echo "## a request is SUPERSEDED only by a supervisor launched AFTER it (#1827)"
+reset_stop
+touch "$OKFLAG"; start_supervisor
+write_stop; touch -d '@1000000000' "$PIDFILE"                   # pidfile OLDER than the stop
+NEXUS_TEST_NOW=9000 _service_health_check_tick 2>/dev/null
+assert_file_exists "an older supervisor does not withdraw the request" "$STOPSF"
+touch -d '@1000000000' "$STOPSF"; touch "$PIDFILE"               # launched after the stop
+NEXUS_TEST_NOW=9001 _service_health_check_tick 2>/dev/null
+assert_no_file "a newer live supervisor + green check withdraws it" "$STOPSF"
+assert_contains "the withdrawal is recorded" "$(cat "$SHDIR/myservice.events")" "stop-request-superseded"
+stop_supervisor
+
+echo
+echo "## svc.sh refusing an automated restart (rc 76) is not counted as an attempt (#1827)"
+reset_stop
+REFUSE_STUB="$WORK/svc-refuse.sh"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 76\n' "$SVC_CALLS" > "$REFUSE_STUB"
+chmod +x "$REFUSE_STUB"
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=9500 _service_health_check_tick 2>/dev/null
+SERVICE_HEALTH_SVC_BIN="$REFUSE_STUB" NEXUS_TEST_NOW=9540 _service_health_check_tick 2>/dev/null
+assert_eq      "the refused restart was attempted once" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+assert_no_file "no incident left counting toward the flap ceiling" "$SHDIR/myservice.state"
+assert_contains "recorded as a refusal, not a failure" "$(cat "$SHDIR/myservice.events")" "rc=76"
+rm -f "$STOPSF"
 
 # ===========================================================================
 # labsh COLD-BUILD awareness (your-org/nexus-code#326 follow-up). A

@@ -56,6 +56,7 @@ actual=$(
 # is caught even though the registration line does not change.
 read -r -d '' golden <<'GOLDEN'
 _schedule_task auth_hold 5 _v2_task_auth_hold --class cheap
+_schedule_task api_hold 10 _v2_task_api_hold --class cheap
 _schedule_task over_limit_wakes 5 _v2_task_over_limit_wakes --class cheap
 _schedule_task orphan_async_wakes 15 _v2_task_orphan_async_wakes --class cheap
 _schedule_task target_window 2 _v2_task_target_window_probe --class cheap
@@ -71,6 +72,7 @@ _schedule_task snapshot_local 30 _v2_task_snapshot_local --class medium --async
 _schedule_task idle_section 30 _v2_task_idle_section --class expensive --async
 _schedule_task over_limit_scan 60 _v2_task_over_limit_scan --class expensive --async
 _schedule_task orphan_async_scan 60 _v2_task_orphan_async_scan --class expensive --async
+_schedule_task api_hold_probe 30 _v2_task_api_hold_probe --class medium --async
 _schedule_task deliveries_poll 15 _v2_task_deliveries_poll --class medium --async
 _schedule_task github_poll 600 _v2_task_github_poll --class expensive --async
 _schedule_task full_state_snap 600 _v2_task_full_state_snap --class expensive --async
@@ -123,7 +125,14 @@ n_tasks=$(grep -c . <<<"$actual")
 # 27 since your-org/nexus-code#1528 (w240): `selection_snapshot` is the rolling
 # last-seen window-selection writer the respawn's rule-4 arm reads (10 s, cheap,
 # sync — one `list-windows -a` and one small atomic write per fire).
-[[ "$n_tasks" == 28 ]] && ok "28 tasks registered" || bad "task count" "got $n_tasks, want 28"
+# 30 since your-org/nexus-code#1845 (ncbundle29): the API-unreachable hold is
+# TWO tasks, split for the same reason as orphan_async's pair. `api_hold` is
+# the cheap sync STEP (a marker-dir read and one file; it must land before the
+# emit ladder consults `_api_hold_active`, like auth_hold). `api_hold_probe` is
+# medium --async because its curl probe can block on a resolver timeout for up
+# to ~15 s, which must never hold the synchronous slot; it is a no-op unless a
+# hold is open.
+[[ "$n_tasks" == 30 ]] && ok "30 tasks registered" || bad "task count" "got $n_tasks, want 30"
 
 # Every task must declare a cost class — the scheduler's whole priority model
 # reads it, and an unclassified task silently lands in the default bucket.

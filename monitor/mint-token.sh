@@ -389,8 +389,10 @@ if (( JWT_ONLY == 1 )); then
     exit 0
 fi
 
+# The JWT goes through a process-substitution header file, never argv: argv is
+# readable in /proc by every same-uid agent for the life of the request (#1840).
 resp=$(curl -sS -X POST \
-    -H "Authorization: Bearer $app_jwt" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$app_jwt") \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens")

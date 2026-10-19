@@ -1556,9 +1556,9 @@ assert_async_state "scheduled_wakeup_at<now → plain idle" \
 
 # (3) idle-orphan-async: external_waits non-empty, no resume signal.
 write_async_hb idle_prompt 5 0 0 - \
-    '[{"kind":"slurm","id":"52527284_4","desc":"BL"}]'
+    '[{"kind":"slurm","id":"12345678_4","desc":"BL"}]'
 assert_async_state "external_waits non-empty → idle-orphan-async" \
-    idle-orphan-async "orphan_kinds=slurm:52527284_4"
+    idle-orphan-async "orphan_kinds=slurm:12345678_4"
 
 # (3b) multiple external_waits surface as csv summary.
 write_async_hb idle_prompt 5 0 0 - \

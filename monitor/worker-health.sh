@@ -16,7 +16,7 @@
 # the FILE, not your text.
 #
 # Usage:
-#   worker-health.sh --health running --kind slurm --job-id 52527284 \
+#   worker-health.sh --health running --kind slurm --job-id 12345678 \
 #                    --runtime 7200 --note "salloc DE sweep, ~2h"
 #   worker-health.sh --health done   --note "job finished; children are leftover"
 #   worker-health.sh --health stuck  --note "sbatch --wait never returned"

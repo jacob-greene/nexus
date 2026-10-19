@@ -50,7 +50,12 @@
 #                   three it exits 12: `block-not-compat` (not a hold, retry)
 #                   when NO evidence field was given, a contract=incomplete
 #                   HOLD plus a defect when any was.
-#                   NEVER bumps either way.
+#                   NEVER bumps either way. On a clone BEHIND its integration
+#                   branch whose red scenario already changed upstream it is
+#                   STALE-CHECKOUT (your-org/nexus-code#1855): held, no
+#                   --issue needed, nothing filed, the OPERATOR notified once.
+#   stale-check     read-only: is this red a STALE-CHECKOUT? exit 20 = yes
+#                   (file NOTHING on the implementation repo), 0 = no.
 #   retry-now       schedule a re-evaluation on the next watcher tick
 #                   (--reason required; audit row `retry-requested`). The
 #                   supported replacement for hand-deleting last-fire-date.
@@ -4692,6 +4697,389 @@ cmd_compat_pr() {
     esac
 }
 
+# ---- STALE-CHECKOUT classification (your-org/nexus-code#1855) ---------------
+#
+# THE INCIDENT. Seven open "cc-update blocked" issues on the shared
+# implementation repo came from two other operators' installs, every one on
+# the same red scenario, `test-realmodel-auth-failure-hooks`, fixed weeks
+# earlier and present on both main and dev. Each bot's own body already said
+# its clone was 378-496 commits behind the operator's
+# monitor.integration_branch. The red belonged to the checkout, the fix was
+# one pull away, and the people who could act on it (the operators) were not
+# the people who were told (the shared repo's readers).
+#
+# THE RULE (operator decision, 2026-10-16). When a block's red scenario has
+# ALREADY CHANGED UPSTREAM and this clone is behind, the block is
+# STALE-CHECKOUT: nothing is opened or commented on the implementation repo,
+# and the OPERATOR is told on their own channel, once, in one sentence plus the
+# one pull command. Every other block keeps its behaviour.
+#
+# THE DECISION LIVES HERE, not in the prompt, so it is deterministic and
+# testable: `stale-check` answers it read-only BEFORE the evaluator files
+# anything, and `block` re-derives the same verdict, records it, and does the
+# operator notification itself.
+#
+# THE PREDICATE: for each failing scenario, did upstream change the scenario
+# file, or any file the scenario names by a literal path (the helpers it
+# sources and the scripts it drives), between the merge-base of HEAD and
+# upstream, and upstream? Every failing scenario must have changed; one
+# unchanged scenario is a red upstream has not touched, and the block is
+# filed as today. The comparison is `git diff --name-only` (names only — no
+# upstream file content is read, written or executed, your-org/nexus-code#1529).
+# The MERGE-BASE, not HEAD, is the "before" side: on a clone that is purely
+# behind they are the same commit, and on a clone carrying local commits it
+# keeps a LOCAL edit to the scenario from reading as an upstream fix.
+#
+# WHICH DIRECTION IT ERRS IN, AND WHY THAT DIRECTION.
+#   * TOWARD STALE (over-count): a changed file is not a fixed file. The
+#     scenario (or a helper it names) may have changed upstream and still be
+#     red there, and a shared helper such as `_test_helpers.sh` changes often,
+#     so on a clone hundreds of commits behind most reds will classify STALE.
+#     Accepted on purpose: the cost of a wrong STALE verdict is one operator
+#     pull, after which the next fire gates a CURRENT clone (not behind, so
+#     this classifier answers `not-stale`) and a genuine red is filed then. The
+#     cost of a wrong ISSUE verdict is noise on a repo every operator reads.
+#   * TOWARD ISSUE (under-count, today's behaviour): code under test that the
+#     scenario reaches without naming it by a literal path (a helper sourced by
+#     a helper, a path built at runtime) is not compared, so a fix that landed
+#     only there still files an issue. Likewise a remote-tracking ref that the
+#     bounded fetch could not refresh compares against an older upstream.
+#   * NEVER STALE when the classifier cannot look: no failing scenario named
+#     (a changelog pin-holder, a probe finding), a scenario that does not
+#     resolve to exactly one tracked file, no upstream commit, no merge-base,
+#     upstream not ahead, or a diff that errored. Each is a distinct
+#     `stale_reason=`, and each falls back to today's behaviour.
+
+# Results of the last _stale_checkout_classify call.
+STALE_VERDICT="not-stale"
+STALE_REASON=""
+STALE_UPSTREAM="none"
+STALE_UPSTREAM_SRC="none"
+STALE_SUITES=""
+STALE_CHANGED=""
+
+# _stale_failing_suites <evidence> <gate-log-or-empty> — the failing scenario
+# names, `.sh` stripped, sorted and unique, one per line: the `gate:<s>`
+# evidence plus every name on the gate log's `failed:` line. A probe or
+# changelog block names none, and so can never classify STALE.
+_stale_failing_suites() {
+    local evidence="${1:-}" log="${2:-}" s
+    {
+        if [[ "$evidence" == gate:?* ]]; then
+            s="${evidence#gate:}"; printf '%s\n' "${s%.sh}"
+        fi
+        if [[ -n "$log" && -f "$log" ]]; then
+            awk '/^ *failed: /{for(i=2;i<=NF;i++){n=$i; sub(/\.sh$/,"",n); print n}}' "$log"
+        fi
+    } | awk '/^[A-Za-z0-9._-]+$/' | sort -u
+}
+
+# _stale_suite_files <tree-listing-file> <suite-path> <suite-text-file> — the
+# suite path, then every TRACKED file its text names by a literal `.sh`/`.py`
+# path, tab-separated on one line. A `$REPO_ROOT/`-style prefix resolves from
+# the repository root; any other prefix (`$_self_dir/../x.sh`) or none
+# resolves from the suite's own directory first, then from the root. A name
+# that resolves to no tracked file is dropped (it cannot be compared). Depth
+# one: a helper's own references are not followed (the under-count named in
+# the header).
+_stale_suite_files() {
+    python3 -I - "$1" "$2" "$3" <<'PYEOF'
+import os, re, sys
+tree = set(l for l in open(sys.argv[1], errors='replace').read().split('\n') if l)
+suite = sys.argv[2]
+text = open(sys.argv[3], errors='replace').read()
+d = os.path.dirname(suite)
+ref = re.compile(r'(?:\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/)?((?:\.{1,2}/)*(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:sh|py))(?![A-Za-z0-9_])')
+root_vars = {'REPO_ROOT', 'NEXUS_ROOT', '_repo_root', 'repo_root'}
+out = [suite]
+for line in text.split('\n'):
+    if line.lstrip().startswith('#'):
+        continue
+    for m in ref.finditer(line):
+        var, rel = m.group(1), m.group(2)
+        bases = ['.'] if var in root_vars else [d, '.']
+        for b in bases:
+            c = os.path.normpath(os.path.join(b, rel))
+            if c.startswith('..') or c.startswith('/'):
+                continue
+            if c in tree:
+                if c not in out:
+                    out.append(c)
+                break
+print('\t'.join(out))
+PYEOF
+}
+
+# _stale_checkout_classify <root> <branch> <live-tip-or-empty> <suites> — sets
+# the STALE_* globals above. Call it only for a clone already measured
+# `behind`; it never decides that itself. Read-only, and no fetch here (the
+# caller's bounded fetch refreshes refs before the probe).
+_stale_checkout_classify() {
+    local root="$1" branch="$2" tip="${3:-}" suites="${4:-}"
+    STALE_VERDICT="not-stale"; STALE_REASON=""; STALE_UPSTREAM="none"
+    STALE_UPSTREAM_SRC="none"; STALE_SUITES=""; STALE_CHANGED=""
+    STALE_SUITES=$(printf '%s\n' "$suites" | awk 'NF' | paste -sd, -)
+    if [[ -z "$STALE_SUITES" ]]; then
+        STALE_REASON="no-failing-scenario"; return 0
+    fi
+
+    # Upstream: the live tip the drift probe saw, when its commit is here;
+    # else the remote-tracking ref. Neither → not stale.
+    local up=""
+    if [[ "$tip" =~ ^[0-9a-f]{40}$ ]] \
+       && git -C "$root" cat-file -e "${tip}^{commit}" 2>/dev/null; then
+        up="$tip"; STALE_UPSTREAM_SRC="live-tip"
+    else
+        up=$(git -C "$root" rev-parse --verify --quiet "refs/remotes/origin/${branch}^{commit}" 2>/dev/null) || up=""
+        STALE_UPSTREAM_SRC="tracking-ref"
+    fi
+    if [[ ! "$up" =~ ^[0-9a-f]{40}$ ]]; then
+        STALE_UPSTREAM_SRC="none"; STALE_REASON="no-upstream-ref"; return 0
+    fi
+    STALE_UPSTREAM="$up"
+    local base=""
+    base=$(git -C "$root" merge-base HEAD "$up" 2>/dev/null) || base=""
+    if [[ ! "$base" =~ ^[0-9a-f]{40}$ ]]; then
+        STALE_REASON="no-merge-base"; return 0
+    fi
+    if [[ "$base" == "$up" ]]; then
+        STALE_REASON="upstream-not-ahead"; return 0
+    fi
+
+    local scratch
+    if ! scratch=$(mktemp -d 2>/dev/null) || [[ -z "$scratch" ]]; then
+        STALE_REASON="mktemp-failed"; return 0
+    fi
+    if ! git -C "$root" ls-tree -r --name-only HEAD > "$scratch/tree" 2>/dev/null \
+       || [[ ! -s "$scratch/tree" ]]; then
+        rm -rf "$scratch"; STALE_REASON="tree-unreadable"; return 0
+    fi
+
+    local s p n changed_all="" out rc line
+    local -a files
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        # Exactly one tracked file with this basename, or the scenario is
+        # unresolvable and the block is filed as today.
+        n=$(awk -v b="$s.sh" '{k=$0; sub(/.*\//,"",k)} k==b{c++} END{print c+0}' "$scratch/tree")
+        if [[ "$n" != "1" ]]; then
+            rm -rf "$scratch"; STALE_REASON="scenario-unresolved:$s:matches=$n"; return 0
+        fi
+        p=$(awk -v b="$s.sh" '{k=$0; sub(/.*\//,"",k)} k==b{print; exit}' "$scratch/tree")
+        if ! git -C "$root" show "HEAD:${p}" > "$scratch/suite" 2>/dev/null; then
+            rm -rf "$scratch"; STALE_REASON="scenario-unreadable:$s"; return 0
+        fi
+        line=$(_stale_suite_files "$scratch/tree" "$p" "$scratch/suite"); rc=$?
+        if (( rc != 0 )) || [[ -z "$line" ]]; then
+            rm -rf "$scratch"; STALE_REASON="scenario-deps-unreadable:$s"; return 0
+        fi
+        IFS=$'\t' read -r -a files <<<"$line"
+        out=$(GIT_LITERAL_PATHSPECS=1 git -C "$root" diff --name-only "$base" "$up" -- "${files[@]}" 2>/dev/null); rc=$?
+        if (( rc != 0 )); then
+            rm -rf "$scratch"; STALE_REASON="diff-failed:$s"; return 0
+        fi
+        if [[ -z "$out" ]]; then
+            rm -rf "$scratch"; STALE_REASON="unchanged-upstream:$s"; return 0
+        fi
+        changed_all+="${changed_all:+$'\n'}$out"
+    done <<<"$suites"
+    rm -rf "$scratch"
+    STALE_CHANGED=$(printf '%s\n' "$changed_all" | awk 'NF && !seen[$0]++' | paste -sd, -)
+    STALE_VERDICT="stale-checkout"; STALE_REASON="changed-upstream"
+    return 0
+}
+
+# _stale_cfg <dotted.key> — one config value from the LIVE clone's loader, or
+# nothing. Empty means "not configured"; callers never guess a default.
+_stale_cfg() {
+    local loader="$NEXUS_ROOT/config/load.sh" v
+    [[ -x "$loader" ]] || return 0
+    v=$("$loader" "$1" 2>/dev/null) || v=""
+    printf '%s' "$v"
+}
+
+# _stale_deliver <channel> <target> <body-file> <message> — rc 0 iff the notice
+# reached the operator. CC_AUTO_OPERATOR_NOTIFY_CMD is the test seam: it
+# receives <channel> <target> <body-file> and replaces BOTH real transports,
+# so a test can never reach GitHub or a push channel.
+_stale_deliver() {
+    local chan="$1" target="$2" body="$3" msg="$4"
+    if [[ -n "${CC_AUTO_OPERATOR_NOTIFY_CMD:-}" ]]; then
+        "$CC_AUTO_OPERATOR_NOTIFY_CMD" "$chan" "$target" "$body" >/dev/null 2>&1
+        return $?
+    fi
+    case "$chan" in
+        issue)
+            [[ -x "$NEXUS_ROOT/monitor/ng" ]] || return 1
+            "$NEXUS_ROOT/monitor/ng" issue comment "${target##*#}" \
+                --repo "${target%#*}" --body-file "$body" >/dev/null 2>&1 ;;
+        notify)
+            [[ -x "$NEXUS_ROOT/monitor/notify.sh" ]] || return 1
+            "$NEXUS_ROOT/monitor/notify.sh" "cc-update: this clone is stale" "$msg" \
+                --require-delivery >/dev/null 2>&1 ;;
+        *)  return 1 ;;
+    esac
+}
+
+# _stale_operator_notify <candidate> <branch> <behind> <live-head> — tell the
+# OPERATOR, once per verdict. Never the implementation repo.
+#
+# CHANNEL: the configured tracking issue ONLY when it lives on the operator's
+# OWN nexus repo (github.repo, $MONITOR_REPO overriding) and that repo is
+# neither the surface repo nor the gate repo; otherwise monitor/notify.sh. A
+# failed issue comment falls back to notify.sh.
+#
+# DEDUPE KEY: live HEAD + integration branch + the failing-scenario set. NOT
+# the behind-count and NOT the upstream sha, both of which move with every
+# upstream merge (6-20 a day here) while the operator's situation does not.
+# The HEAD is what makes "caught up, then fell behind again" re-notify: any
+# pull moves it. A non-stale block clears the record (the verdict changed).
+# A notice that reached nobody is NOT recorded, so the next fire retries it.
+STALE_NOTICE=""
+_stale_operator_notify() {
+    local candidate="$1" branch="$2" behind="$3" live_head="$4"
+    local state="$AUTO_DIR/stale-checkout-notice"
+    local key="head=$live_head branch=$branch suites=$STALE_SUITES"
+    STALE_NOTICE=""
+    if [[ "$(_cc_update_field "$state" key 2>/dev/null)" == "$key" ]]; then
+        STALE_NOTICE="deduped"
+        note "STALE-CHECKOUT: the operator was already told about this verdict ($(_cc_update_field "$state" posted 2>/dev/null)); not re-notifying while the clone stays at $live_head"
+        return 0
+    fi
+
+    local margin="$behind commits"
+    [[ "$behind" =~ ^[0-9]+$ ]] || margin="an unmeasured number of commits"
+    local sentence msg pull_cmd
+    pull_cmd="git -C $NEXUS_ROOT pull --ff-only origin $branch"
+    sentence="cc-update $candidate was not applied: the local gate is red on ${STALE_SUITES//,/, }, which upstream has already changed, and this clone is $margin behind origin/$branch, so update it and the next daily fire re-gates"
+    msg="$sentence: $pull_cmd"
+
+    local chan="notify" target="-" raw ref trepo="" tissue="" own surface
+    raw="${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-}"
+    [[ -n "$raw" ]] || raw=$(_stale_cfg monitor.cc_auto_update.tracking_issue)
+    if [[ -n "$raw" ]] && ref=$(bash "$_self_dir/issue-ref.sh" "$raw" 2>/dev/null); then
+        trepo=$(printf '%s\n' "$ref" | sed -n 's/^REPO=//p')
+        tissue=$(printf '%s\n' "$ref" | sed -n 's/^ISSUE=//p')
+    fi
+    own="${MONITOR_REPO:-}"
+    [[ -n "$own" ]] || own=$(_stale_cfg github.repo)
+    surface="${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}"
+    if [[ "$trepo" =~ ^[^/[:space:]]+/[^/[:space:]]+$ && "$tissue" =~ ^[0-9]+$ ]] \
+       && [[ "${trepo,,}" == "${own,,}" ]] \
+       && [[ "${trepo,,}" != "${surface,,}" && "${trepo,,}" != "${GATE_REPO,,}" ]]; then
+        chan="issue"; target="$trepo#$tissue"
+    fi
+
+    local body
+    if ! body=$(mktemp 2>/dev/null) || [[ -z "$body" ]]; then
+        note "STALE-CHECKOUT: could not compose the operator notice (mktemp failed) — NOT recorded, retried on the next block"
+        notify "cc-auto-update: $msg"
+        STALE_NOTICE="failed"; return 0
+    fi
+    {
+        printf '%s:\n\n' "$sentence"
+        printf '    %s\n' "$pull_cmd"
+    } > "$body"
+
+    local how=""
+    if [[ "$chan" == "issue" ]]; then
+        if _stale_deliver issue "$target" "$body" "$msg"; then
+            how="issue $target"
+        else
+            note "STALE-CHECKOUT: the comment on $target did not land; falling back to notify.sh"
+        fi
+    fi
+    if [[ -z "$how" ]] && _stale_deliver notify "-" "$body" "$msg"; then
+        how="notify"
+    fi
+    rm -f "$body" 2>/dev/null || true
+    if [[ -z "$how" ]]; then
+        STALE_NOTICE="failed"
+        note "STALE-CHECKOUT: the operator notice reached NO channel — NOT recorded, so the next block retries it. Message: $msg"
+        notify "cc-auto-update: $msg"
+        return 0
+    fi
+    mkdir -p "$AUTO_DIR" 2>/dev/null || true
+    {
+        printf 'key=%s\n' "$key"
+        printf 'posted=%s\n' "$how"
+        printf 'candidate=%s\n' "$candidate"
+        printf 'date=%s\n' "$(date -Is 2>/dev/null || echo unknown)"
+    } > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null
+    STALE_NOTICE="sent:$how"
+    note "STALE-CHECKOUT: operator notified via $how"
+    return 0
+}
+
+# _stale_gate_log <candidate> — this run's gate log, by the SAME derivation and
+# freshness bound `block` uses (see step 2 there), or nothing.
+_stale_gate_log() {
+    local derived="$AUTO_DIR/gate-${1}.log" mt age
+    [[ -f "$derived" ]] || return 0
+    mt=$(stat -c %Y "$derived" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - mt ))
+    (( age <= GATE_EVIDENCE_MAX_AGE )) && printf '%s' "$derived"
+    return 0
+}
+
+# _stale_drift <branch> — the bounded refs-only fetch, then the shared drift
+# probe; prints the probe line. The fetch is the deployment gate's (see
+# `_deployment_gate`): it moves remote-tracking refs only, so the classifier
+# above compares against the upstream that exists now rather than whatever the
+# last pull left behind — a clone hundreds of commits behind has, by
+# definition, not been pulled.
+_stale_drift() {
+    local branch="$1"
+    [[ -d "$NEXUS_ROOT/.git" ]] && command -v git >/dev/null 2>&1 || return 0
+    timeout 10 git -C "$NEXUS_ROOT" fetch --quiet origin "$branch" >/dev/null 2>&1 || true
+    _clone_drift_probe "$NEXUS_ROOT" "$branch"
+}
+
+# ---- verb: stale-check (your-org/nexus-code#1855) ---------------------------
+# READ-ONLY (apart from the refs-only fetch): answers "is this block a stale
+# checkout?" BEFORE the evaluator opens or comments on anything. Records
+# nothing, notifies nobody — `block` does both.
+#
+#   stale-check --candidate X [--evidence gate:<scenario>] [--gate-evidence <log>]
+#
+# Exit codes — a distinct code for STALE so that EVERY other outcome, a crash
+# included, falls back to filing as today:
+#   20  STALE-CHECKOUT: file nothing on the implementation repo
+#   0   not stale: proceed exactly as before
+#   2   usage
+cmd_stale_check() {
+    local candidate="" evidence="" gate_evidence=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --candidate)     candidate="$2"; shift 2 ;;
+            --evidence)      evidence="$2"; shift 2 ;;
+            --gate-evidence) gate_evidence="$2"; shift 2 ;;
+            *) note "stale-check: unknown arg $1"; exit 2 ;;
+        esac
+    done
+    [[ -n "$candidate" ]] || { note "stale-check: --candidate required"; exit 2; }
+    [[ -n "$gate_evidence" ]] || gate_evidence=$(_stale_gate_log "$candidate")
+    local branch line drift behind
+    branch=$(_gate_integration_branch)
+    line=$(_stale_drift "$branch")
+    drift=$(_clone_drift_field "$line" verdict)
+    behind=$(_clone_drift_field "$line" commits)
+    if [[ "$drift" == "behind" ]]; then
+        _stale_checkout_classify "$NEXUS_ROOT" "$branch" "$(_clone_drift_field "$line" tip)" \
+            "$(_stale_failing_suites "$evidence" "$gate_evidence")"
+    else
+        STALE_VERDICT="not-stale"; STALE_REASON="drift-${drift:-unknown}"
+    fi
+    printf 'stale_checkout=%s stale_reason=%s suites=%s changed=%s upstream=%s upstream_src=%s drift=%s behind_integration=%s integration_branch=%s\n' \
+        "$STALE_VERDICT" "$STALE_REASON" "${STALE_SUITES:-none}" "${STALE_CHANGED:-none}" \
+        "$STALE_UPSTREAM" "$STALE_UPSTREAM_SRC" "${drift:-unknown}" "${behind:-unknown}" "$branch"
+    if [[ "$STALE_VERDICT" == "stale-checkout" ]]; then
+        note "STALE-CHECKOUT: $candidate's red (${STALE_SUITES//,/, }) has already changed upstream and this clone is ${behind:-an unmeasured number of} commit(s) behind origin/$branch. Open and comment on NOTHING on the implementation repo; record the block (it notifies the operator)."
+        exit 20
+    fi
+    exit 0
+}
+
 # ---- verb: block ----------------------------------------------------------
 
 # A BLOCK IS A CLAIM ABOUT (candidate x checkout), AND USED TO RECORD ONLY
@@ -4867,10 +5255,13 @@ cmd_block() {
     #    exactly how a spawn-time freshness banner read CLEAN seventy-six
     #    seconds before the fix that would have changed the verdict merged.
     #    `unknown` stays `unknown` and never becomes `up-to-date`.
-    local branch drift="unknown" behind="unknown"
+    local branch drift="unknown" behind="unknown" line=""
     branch=$(_gate_integration_branch)
     if [[ -d "$NEXUS_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
-        local line; line=$(_clone_drift_probe "$NEXUS_ROOT" "$branch")
+        # `_stale_drift` = the refs-only fetch, then the same probe; the
+        # fetch is what lets the STALE-CHECKOUT classifier below see the
+        # upstream that exists now (your-org/nexus-code#1855).
+        line=$(_stale_drift "$branch")
         drift=$(_clone_drift_field "$line" verdict)
         case "$drift" in
             up-to-date) behind=0 ;;
@@ -4893,6 +5284,34 @@ cmd_block() {
     elif [[ "$drift" != "up-to-date" ]]; then
         note "NOTE: could not determine whether this clone is behind origin/$branch — 'could not look' is NOT 'current'."
     fi
+    # 3b. STALE-CHECKOUT (your-org/nexus-code#1855; the predicate and its
+    #     error direction are in the header above `_stale_checkout_classify`).
+    #     Only a clone measured `behind` is classified; every other drift is
+    #     `not-stale` and files as today. Recorded on EVERY block row, so the
+    #     audit trail says which arm ran and why.
+    if [[ "$drift" == "behind" ]]; then
+        _stale_checkout_classify "$NEXUS_ROOT" "$branch" "$(_clone_drift_field "$line" tip)" \
+            "$(_stale_failing_suites "$evidence" "$gate_evidence")"
+    else
+        STALE_VERDICT="not-stale"; STALE_REASON="drift-$drift"
+    fi
+    subject="$subject stale_checkout=$STALE_VERDICT stale_reason=$STALE_REASON"
+    if [[ "$STALE_VERDICT" == "stale-checkout" ]]; then
+        # Still a HOLD (class=compat): the local gate is red, so nothing may
+        # apply on this tree, and a COMPAT hold is re-checked when the live
+        # HEAD moves — which is exactly the operator's pull. No `--issue` is
+        # required and NOTHING is filed: not the compat issue, not a
+        # `_gate_file_defect`, nothing on $GATE_REPO. The operator is told on
+        # their own channel instead, once per verdict.
+        note "STALE-CHECKOUT: $candidate's red (${STALE_SUITES//,/, }) has already changed upstream (${STALE_CHANGED:-?}) and this clone is $behind commit(s) behind origin/$branch. HELD on this tree, nothing filed on the implementation repo; the operator is asked to pull (the command is in the NOTE above)."
+        record_outcome "$candidate" "block" \
+            "class=compat contract=stale-checkout evidence=${evidence:-none} issue=${issue:-none} control=${control//$'\t'/ } upstream=$STALE_UPSTREAM upstream_src=$STALE_UPSTREAM_SRC changed=${STALE_CHANGED:-none} | $reason | $subject"
+        _stale_operator_notify "$candidate" "$branch" "$behind" "$live_head"
+        notify "cc-auto-update: $candidate held on a STALE CHECKOUT ($behind behind origin/$branch) — operator asked to pull; nothing filed upstream"
+        exit 0
+    fi
+    # Not stale: a later stale verdict at the same HEAD is news again.
+    rm -f "$AUTO_DIR/stale-checkout-notice" 2>/dev/null || true
     # 4. THE COMPAT CONTRACT (your-org/nexus-code#1657). Only positive,
     #    candidate-attributed evidence holds an update. "Residual
     #    uncertainty", a quiet changelog, a probe that could not run, a RED
@@ -5290,6 +5709,7 @@ case "$verb" in
     retire-watchdog)      cmd_retire_watchdog "$@" ;;
     compat-pr)           cmd_compat_pr "$@" ;;
     block)                cmd_block "$@" ;;
+    stale-check)          cmd_stale_check "$@" ;;
     record-outcome)       cmd_record_outcome "$@" ;;
     hold)                 cmd_hold "$@" ;;
     unhold)               cmd_unhold "$@" ;;

@@ -63,7 +63,11 @@ The orchestrator decides on every wake whether the dashboard needs a refresh. Tr
 
 For trivial deltas (single dirty/clean flip, no other change) the orchestrator skips the refresh — the dashboard isn't a log, and noise edits inflate the `<!-- NEXUS_DASHBOARD_END -->` revision history.
 
-The `--- dashboard ---` last-updated timestamp at the end of each watcher report is a gentle reminder, not a hard rule; if state hasn't moved since the timestamp the orchestrator declines to rewrite.
+The `--- dashboard ---` last-updated timestamp at the end of each watcher report (absent under `status_surface.kind: external`; see below) is a gentle reminder, not a hard rule; if state hasn't moved since the timestamp the orchestrator declines to rewrite.
+
+## Running your own status page instead
+
+The dashboard is the default status surface. If you run your own status page, set `status_surface.kind: external` in `config/nexus.yml` (optionally `url_file`, a file whose first line is the page URL, and `feed`, the landings file the page reads). Then the orchestrator stops maintaining the dashboard, the watcher report shows `--- status surface ---` (your page and feed) in place of the put timestamp, and `ng dashboard put` still works but notes that the dashboard is not the configured surface. The overview issue stays the routing channel. With the key absent, nothing changes. Any other `kind` is refused, never read as the default. Details and the full table: [`skills/nexus.dashboard/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.dashboard/SKILL.md) ("Two modes").
 
 ## The identity block (`ng nexus-identity`)
 

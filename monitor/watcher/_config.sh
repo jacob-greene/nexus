@@ -461,6 +461,41 @@ MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS="${MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS:-$("$_c
 # is only as good as the last cycle that actually SAW the dialog; a watcher
 # that stopped observing must not keep the channel shut on a memory.
 MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS="${MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.observation_staleness_seconds 600)}"
+# ---- API-unreachable hold (your-org/nexus-code#1845) ----------------------
+#
+# Bridged here from the start, for `#976`'s reason (see the login hold above):
+# these govern when the watcher HOLDS the operator's channel and when it pastes
+# into worker panes on its own. Every value is one WE CHOSE.
+MONITOR_API_HOLD_ENABLED="${MONITOR_API_HOLD_ENABLED:-$("$_cfg" monitor.watcher.api_hold.enabled true)}"
+# Chosen: a transport-class marker counts toward ENTRY for this long after its
+# turn failed. The harness retries a failed request for minutes before the turn
+# ends, so two sessions hit by one outage land well inside 10 min of each other.
+MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS="${MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS:-$("$_cfg" monitor.watcher.api_hold.signal_window_seconds 600)}"
+# Chosen: distinct sessions needed to enter (the orchestrator alone always
+# suffices). 2, so ONE worker's network blip keeps its existing owner — the
+# orchestrator's `interrupted` row — and the hold is reserved for a shared cause.
+MONITOR_API_HOLD_MIN_SESSIONS="${MONITOR_API_HOLD_MIN_SESSIONS:-$("$_cfg" monitor.watcher.api_hold.min_sessions 2)}"
+# Chosen: the async probe's minimum spacing while held, and each attempt's own
+# bound (curl --max-time; the outer timeout adds 5 s).
+MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS="${MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.api_hold.probe_interval_seconds 60)}"
+MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS="${MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS:-$("$_cfg" monitor.watcher.api_hold.probe_timeout_seconds 10)}"
+# Empty → ANTHROPIC_BASE_URL, else https://api.anthropic.com.
+MONITOR_API_HOLD_PROBE_URL="${MONITOR_API_HOLD_PROBE_URL:-$("$_cfg" monitor.watcher.api_hold.probe_url "")}"
+# Empty → the watcher's own NODE_OPTIONS. Set this to the resolver override the
+# harness runs with (e.g. `-r /path/force-dns.js`). The node probe tries both
+# `dns.lookup` and `dns.resolve*`, because a `dns.setServers` override reaches
+# only the second (skeptic ncbundle29-sk F2, F2b).
+MONITOR_API_HOLD_PROBE_NODE_OPTIONS="${MONITOR_API_HOLD_PROBE_NODE_OPTIONS:-$("$_cfg" monitor.watcher.api_hold.probe_node_options "")}"
+# Chosen: the ABSOLUTE ceiling, failing OPEN. 12 h: well past the measured
+# 4 h 46 m outage of 2026-10-15, short enough that a probe stuck on
+# "unreachable" while the agents work cannot mute the board for a day.
+MONITOR_API_HOLD_MAX_HOLD_SECONDS="${MONITOR_API_HOLD_MAX_HOLD_SECONDS:-$("$_cfg" monitor.watcher.api_hold.max_hold_seconds 43200)}"
+# Chosen: mirrors the login hold's observation staleness — a row the step has
+# not refreshed for this long releases the gates.
+MONITOR_API_HOLD_STALENESS_SECONDS="${MONITOR_API_HOLD_STALENESS_SECONDS:-$("$_cfg" monitor.watcher.api_hold.staleness_seconds 600)}"
+# Chosen: never two resume nudges to one window inside this, across holds, so a
+# flapping API cannot become a paste storm.
+MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS="${MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.api_hold.nudge_min_interval_seconds 900)}"
 # ---- operator alert (your-org/nexus-code#1548, #1533, #1534) ---------------
 # The text-carrying, turn-independent alert `_operator_alert.sh` raises when
 # the watcher alone knows the operator must act (a logged-out orchestrator, an
@@ -1050,6 +1085,12 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_AUTH_HOLD_ENABLED MONITOR_AUTH_HOLD_ESCAPE_AFTER_SECONDS \
        MONITOR_AUTH_HOLD_ACTIVE_GRACE_SECONDS MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS \
        MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS \
+       MONITOR_API_HOLD_ENABLED MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS \
+       MONITOR_API_HOLD_MIN_SESSIONS MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS \
+       MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS MONITOR_API_HOLD_PROBE_URL \
+       MONITOR_API_HOLD_PROBE_NODE_OPTIONS \
+       MONITOR_API_HOLD_MAX_HOLD_SECONDS MONITOR_API_HOLD_STALENESS_SECONDS \
+       MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS \
        MONITOR_OPERATOR_ALERT_PUSH_ENABLED MONITOR_OPERATOR_ALERT_GITHUB_ENABLED \
        MONITOR_OPERATOR_ALERT_REMINDER_SECONDS MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS \
        MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS \

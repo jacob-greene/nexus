@@ -9,7 +9,7 @@
 # `external_waits` whose jobs had already exited. Five instances shared one
 # mechanical property and one did not:
 #
-#   slurm:2219913        `sacct` retained `COMPLETED … 0:0`  → RECOVERABLE
+#   slurm:1234567        `sacct` retained `COMPLETED … 0:0`  → RECOVERABLE
 #   nohup:syn-4119b85d   the process is simply ABSENT        → NOT recoverable
 #
 # A bare `nohup cmd &` from the Bash tool structurally cannot retain a status:

@@ -474,8 +474,14 @@ replay_until_retain() {   # <window-to-retire>
                     '{window:$w, skeptic_mode:"", skeptic_depth:$dp, skeptic_role:true,
                       skeptic_target:$t, skeptic_orig:$t}' \
                     > "$d/${win//[^a-zA-Z0-9_-]/_}.json" 2>/dev/null || true
+                # THE RECORDED TIME for the verdict too (your-org/nexus-code#1849):
+                # supersession now asks whether this reviewer delivered BEFORE
+                # the next one was pinned, so a verdict stamped with the
+                # replay's own clock would land after every recorded open.
+                export OBL_NOW_OVERRIDE="$at"
                 _wrapup_skeptic_step 845 "$win" your-org/nexus-code "${depth:-1}" \
                     "" "" "" "check" "$tw" "${depth:-1}" 0 >/dev/null 2>&1 || true
+                unset OBL_NOW_OVERRIDE
                 ;;
             window-retain)
                 [[ "$win" == "$stop_win" ]] && return 0
@@ -629,17 +635,106 @@ assert_contains "9c …nor in the other direction (B)" "$OUT" "state=live"
 run_gate OUT RC skA; assert_eq "9c …and A still blocks" "$RC" "1"
 run_gate OUT RC skB; assert_eq "9c …and B still blocks" "$RC" "1"
 
-# --- 9d. supersession: STRICTLY later DOES supersede ----------------------
+# --- 9d. supersession: a HANDOVER — later, AFTER the earlier one delivered --
 # The potency control for 9c. Without it, `if false` passes 9c trivially —
 # the negative-control lesson from sk926's own retracted N1: a mutation that
 # does not mutate proves nothing, and neither does an assertion that a
-# disabled mechanism satisfies.
-obl open --debtor skB --creditor tgtT --round 2 --at 1700000001 >/dev/null
+# disabled mechanism satisfies. Since #1849 "strictly later" alone is not a
+# handover: skA files its verdict (at +50, the replay clock seam) and only
+# THEN is skB pinned (+100) — the sk900 -> sk911 shape.
+OBL_NOW_OVERRIDE=1700000050 obl note --debtor skA --verdict --text "round 1 verdict filed" >/dev/null
+obl open --debtor skB --creditor tgtT --round 2 --at 1700000100 >/dev/null
 OUT=$(obl state skA__tgtT__skeptic-verdict)
-assert_contains "9d a STRICTLY later reviewer supersedes the earlier one" \
+assert_contains "9d a reviewer pinned AFTER the earlier one delivered supersedes it" \
                 "$OUT" "state=void-superseded"
 run_gate OUT RC skA; assert_eq "9d …and the earlier one clears" "$RC" "0"
 run_gate OUT RC skB; assert_eq "9d …while the later one still blocks" "$RC" "1"
+
+# ── 9e–9j. #1849: a later edge is NOT a handover by itself ────────────────
+# THE INCIDENT SHAPE (2026-10-16): gate-sk reviewing PR 275 on `pipe`, then
+# alerts-sk pinned to the same target for PR 276, a minute later, while
+# gate-sk had delivered NOTHING. Pre-fix gate-sk read void-superseded and
+# was retirable mid-review. Both must stay live.
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\ngate-sk\nalerts-sk'
+obl open --debtor gate-sk   --creditor pipe --round 1 --at 1700000000 >/dev/null
+obl open --debtor alerts-sk --creditor pipe --round 1 --at 1700000060 >/dev/null
+OUT=$(obl state gate-sk__pipe__skeptic-verdict)
+assert_contains "9e #1849 INCIDENT: a CONCURRENT later reviewer does not void gate-sk" "$OUT" "state=live"
+assert_contains "9e …and the detail names the concurrent reviewer" "$OUT" "review CONCURRENTLY"
+run_gate OUT RC gate-sk;   assert_eq "9e …gate-sk still blocks its retirement" "$RC" "1"
+run_gate OUT RC alerts-sk; assert_eq "9e …and so does alerts-sk" "$RC" "1"
+LIVE=$(obl list --live --creditor pipe 2>/dev/null | grep -c 'skeptic-verdict')
+assert_eq "9e …two reviews outstanding, counted as two" "$LIVE" "2"
+
+# 9f. A verdict that lands AFTER the later pin is not a handover either:
+# gate-sk delivers at +120, alerts-sk was already pinned at +60.
+OBL_NOW_OVERRIDE=1700000120 obl note --debtor gate-sk --verdict --text "round 1 verdict filed" >/dev/null
+OUT=$(obl state gate-sk__pipe__skeptic-verdict)
+assert_contains "9f a verdict filed AFTER the later pin does not make it a handover" "$OUT" "state=live"
+
+# 9g. SAME subject on both edges: a handover even with no verdict on record
+# (a stuck reviewer replaced for the same PR).
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\nsk1\nsk2\nsk3'
+obl open --debtor sk1 --creditor pipe --at 1700000000 --subject 'proj-x#275' >/dev/null
+obl open --debtor sk2 --creditor pipe --at 1700000060 --subject 'proj-x#275' >/dev/null
+OUT=$(obl state sk1__pipe__skeptic-verdict)
+assert_contains "9g the SAME subject on both edges is a handover" "$OUT" "state=void-superseded"
+assert_contains "9g …and says why" "$OUT" "same subject 'proj-x#275'"
+
+# 9h. DIFFERENT subjects: concurrent, even when the earlier one HAS delivered
+# before the later pin — the subject outranks the verdict-time rule.
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\nsk1\nsk2'
+obl open --debtor sk1 --creditor pipe --at 1700000000 --subject 'proj-x#275' >/dev/null
+OBL_NOW_OVERRIDE=1700000030 obl note --debtor sk1 --verdict --text "round 1 verdict filed" >/dev/null
+obl open --debtor sk2 --creditor pipe --at 1700000060 --subject 'proj-x#276' >/dev/null
+OUT=$(obl state sk1__pipe__skeptic-verdict)
+assert_contains "9h DIFFERENT subjects never supersede, even after a verdict" "$OUT" "state=live"
+
+# 9i. A subject on ONE edge only cannot be compared: the verdict rule decides.
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\nsk1\nsk2'
+obl open --debtor sk1 --creditor pipe --at 1700000000 --subject 'proj-x#275' >/dev/null
+obl open --debtor sk2 --creditor pipe --at 1700000060 >/dev/null
+OUT=$(obl state sk1__pipe__skeptic-verdict)
+assert_contains "9i a subject on one edge only: no verdict, so still live" "$OUT" "state=live"
+
+# 9j. A REOPEN without a subject CLEARS the old one (a re-armed round
+# re-tasks the reviewer; the spawn stamp is stale, #963).
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\nsk1\nsk2'
+obl open --debtor sk1 --creditor pipe --at 1700000000 --subject 'proj-x#275' >/dev/null
+obl open --debtor sk1 --creditor pipe --at 1700000010 >/dev/null
+obl open --debtor sk2 --creditor pipe --at 1700000060 --subject 'proj-x#275' >/dev/null
+OUT=$(obl state sk1__pipe__skeptic-verdict)
+assert_contains "9j a reopen without --subject clears the stale subject (no match, no verdict: live)" "$OUT" "state=live"
+
+# 9k. A VERDICT IS ABOUT ONE TARGET (ncbundle31-sk F1). sk1 holds edges to
+# `pipe` and `other` — a depth-2 skeptic always holds two — and files its
+# verdict about `other` through ng's REAL verdict path. A concurrent sk2 is
+# then pinned to `pipe` with no subjects. sk1's `pipe` review is untouched by
+# that verdict and must stay LIVE. Pre-fix the stamp landed on every edge sk1
+# held, and the pipe edge read void-superseded: #1849 again. The positive half
+# (sk3 pinned to `other` after the verdict DOES supersede) proves the stamp
+# landed on the edge it is about, so dropping it altogether is caught too.
+reset_state
+export OBL_TMUX_WINDOWS=$'pipe\nother\nsk1\nsk2\nsk3'
+obl open --debtor sk1 --creditor pipe  --at 1700000000 >/dev/null
+obl open --debtor sk1 --creditor other --at 1700000000 >/dev/null
+mkdir -p "$STATE_DIR/windows"
+jq -n '{window:"sk1", skeptic_mode:"", skeptic_depth:1, skeptic_role:true,
+        skeptic_target:"other", skeptic_orig:"other"}' > "$STATE_DIR/windows/sk1.json"
+export OBL_NOW_OVERRIDE=1700000030
+_wrapup_skeptic_step 1849 sk1 your-org/nexus-code 1 "" "" "" "check" other 1 0 >/dev/null 2>&1 || true
+unset OBL_NOW_OVERRIDE
+obl open --debtor sk2 --creditor pipe  --at 1700000060 >/dev/null
+obl open --debtor sk3 --creditor other --at 1700000090 >/dev/null
+OUT=$(obl state sk1__pipe__skeptic-verdict)
+assert_contains "9k a verdict about OTHER does not let a concurrent pin to PIPE void sk1's pipe review" "$OUT" "state=live"
+OUT=$(obl state sk1__other__skeptic-verdict)
+assert_contains "9k …while the edge the verdict IS about is handed over to sk3" "$OUT" "state=void-superseded"
 
 # ── 10. D1: the gate's cost must not grow with the ledger ─────────────────
 # `retire-preflight` check 1d is SYNCHRONOUS and pre-kill: every retirement
@@ -700,8 +795,11 @@ mkdir -p "$STATE_DIR/skeptic/pending"; echo 1 > "$STATE_DIR/skeptic/pending/tgtR
 run_gate OUT RC skR
 assert_eq "11 CONTROL the reviewer blocks before the resolve" "$RC" "1"
 env -u NEXUS_WORKER_WINDOW NEXUS_STATE_DIR="$STATE_DIR" \
-    bash "$_test_dir/skeptic-channel.sh" resolve tgtR \
+    bash "$_test_dir/skeptic-channel.sh" resolve tgtR --reviewer skR \
     --reason "verdict landed on the PR thread; no further pass warranted" >/dev/null 2>&1
+# `--reviewer skR`: since your-org/nexus-code#1848 a resolve with a live edge
+# must NAME the review it settles; an unnamed one is refused (rc 9) and settles
+# nothing. Section 11's subject — the resolve ends THIS pairing — is unchanged.
 OUT=$(obl state skR__tgtR__skeptic-verdict)
 assert_contains "11 the resolve settles the reviewer's edge" "$OUT" "state=settled"
 assert_contains "11 …carrying the operator's reason verbatim" "$OUT" "no further pass warranted"
@@ -788,7 +886,7 @@ assert_eq "12 CONTROL …so the debtor still BLOCKS" "$RC" "1"
 # backslash continuation splits those two facts across two lines and the
 # guard reads as `count=none` — a suite under-crediting its own protection,
 # which is the declared limit that file records about itself.
-EXPECTED_ASSERTIONS=101
+EXPECTED_ASSERTIONS=114
 assert_eq "assertion-count guard: every assertion above actually ran" "$(( PASS + FAIL ))" "$EXPECTED_ASSERTIONS"
 
 th_summary_and_exit

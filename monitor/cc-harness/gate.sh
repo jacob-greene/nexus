@@ -777,6 +777,11 @@ gate_prod_scenarios=(
         # by then — `test-realmodel-apispoof.sh` and
         # `test-realmodel-long-exchange.sh` both existed, ungated, unnamed.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vimode.sh"
+        # `working-background` through the FOOTER channel (your-org/nexus-code#1866).
+        # Until this entry the gate never asserted that state, and 2.1.302 went
+        # GREEN while hiding the `← for agents` hint the footer parser leaned
+        # on, so a pane parked on a `Monitor` read `idle` (kill allowlist).
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-working-background.sh"
         # The STRUCTURAL select-dialog arm (your-org/nexus-code#896). A
         # full-screen dialog used to classify `empty` — "don't know yet" — so
         # nothing unstuck a worker that would never proceed; 2.1.232 made that

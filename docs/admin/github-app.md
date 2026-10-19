@@ -133,7 +133,7 @@ the rest ungranted keeps the bot's blast radius small.
 |---|---|---|---|
 | Repository → **Metadata** | Read | Implicit — every `gh api /repos/:r/...` resolves through it; `monitor/mint-token.sh`'s output is unusable without it | Required by every GitHub App. |
 | Repository → **Issues** | Read & Write | `monitor/ng process\|react\|reply\|close\|dashboard ...`; `monitor/watcher/_github.sh:snapshot_github` (GraphQL `search(type: ISSUE)` + comment-reactions fetch) | The dashboard is issue-body content; the eligibility filter reads comment bodies and reactions; every directive turn reacts 👀/🚀, posts replies, closes threads, or patches the overview body between the `<!-- NEXUS_DASHBOARD_START -->` markers. |
-| Repository → **Contents** | Read & Write | `monitor/upload-asset.sh`: `git clone` / `git fetch` / `git push` against `https://x-access-token:<TOKEN>@github.com/<asset-repo>.git` | Pushing to the asset repo's `main` branch under `assets/...` requires Contents write. Without it `git push origin main` returns 403. |
+| Repository → **Contents** | Read & Write | `monitor/upload-asset.sh`: `git clone` / `git fetch` / `git push` against `https://github.com/<asset-repo>.git` (the installation token reaches git through an inline credential helper, never the URL, #1840) | Pushing to the asset repo's `main` branch under `assets/...` requires Contents write. Without it `git push origin main` returns 403. |
 | Repository → **Pull requests** | Read & Write | `monitor/ng pr create\|edit\|merge\|view ...`; worker invocations of `GH_TOKEN=$(./monitor/mint-token.sh) gh pr ...` | Bot-authored PR operations 403 without this scope. Used by worker agents that open PRs on their feature branches. |
 | Organization → **Members** | Read | `gh pr edit` invoked as the bot against a PR in an org-owned head repo | `gh pr edit` validates the authenticated identity's edit rights by checking org membership before issuing the REST call. Without this scope the CLI errors out client-side. |
 
@@ -297,7 +297,7 @@ Then re-run the deliveries probe:
 ```bash
 JWT=$(./monitor/mint-token.sh --jwt-only)
 curl -sS \
-    -H "Authorization: Bearer $JWT" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$JWT") \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/hook/deliveries?per_page=3" \
   | jq '.[].event, .[].status_code'

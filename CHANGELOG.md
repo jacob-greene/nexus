@@ -2649,7 +2649,7 @@ ahead of any semantic change.
   `tmux list-windows`. Skeptic windows are not named that way: of 468
   `skeptic_role: true` spawn records on the reporting nexus, **198 (42%)**
   carry a name the pattern cannot match — `fig4sk`, `nexuscode-716sk`,
-  `debench-skeptic3`, `skeptic-B7`, `audit-skeptic` for target `ncode-audit`.
+  `bench-b-skeptic3`, `skeptic-B7`, `audit-skeptic` for target `ncode-audit`.
   Each was invisible to the field from the moment it was spawned.
   - `#771` reported the symptom exactly right — `fig4sk` was `busy`,
     re-pinned, working the delta, while the request said `no`; four duplicate

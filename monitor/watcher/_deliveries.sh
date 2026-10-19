@@ -73,7 +73,7 @@
 #       pr_review=<n> id=<cid> author=<login> path=<file>
 #       issue_new=<n> id=<n> author=<login>
 #   - Outside $REPO (the App is installed in the source repo, e.g.
-#     operator/labsh, and the user posted there):
+#     katosh/labsh, and the user posted there):
 #       mention=<owner>/<repo> kind=<issue|pr|pr_review|issue_new>
 #         n=<n> id=<id> author=<login> [path=<file>]
 #         (with body preview line)
@@ -272,7 +272,7 @@ snapshot_deliveries() {
         code=$(curl -sS -o "$body_file" -D "$hdr_file" \
             -w '%{http_code}' \
             --connect-timeout "$connect_to" --max-time "$max_time" \
-            -H "Authorization: Bearer $jwt" \
+            -H @<(printf 'Authorization: Bearer %s\n' "$jwt") \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "$url" 2>/dev/null) || {
@@ -431,7 +431,7 @@ _process_delivery() {
     code=$(curl -sS -o "$body_file" \
         -w '%{http_code}' \
         --connect-timeout "$connect_to" --max-time "$max_time" \
-        -H "Authorization: Bearer $jwt" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$jwt") \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/app/hook/deliveries/${id}" 2>/dev/null) || {

@@ -195,3 +195,123 @@ amg_scan() {
     done
     return 0
 }
+
+# ---- the workdir's OWN AGENTS.md: conventions, by trust tier ----------------
+# (your-org/nexus-code#1671, the operator-agreed proposal on that issue.) A
+# project that ships an AGENTS.md expects agents that WORK IN it to read it, so
+# the warning above is wrong for that one file. When the workdir IS a repository
+# root, or a linked worktree of one, and `<workdir>/AGENTS.md` exists, the spawn
+# prompt tells the worker to read it FIRST as the project's conventions. The
+# mechanism is an explicit read instruction, never harness auto-load, so the
+# precedence stays ours: the worker floor and the nexus contract win on any
+# conflict. A repo the worker only USES (an AGENTS.md above the workdir, or a
+# workdir below a repo's root) keeps the untrusted-DATA warning.
+#
+# The tier decides how much authority the file gets, after CLAUDE.md's
+# "WHETHER — by repo tier": INTERNAL is the lab org (`github.repo`'s owner) and
+# the operator's (`github.user_login`) PRIVATE repos; everything else is
+# EXTERNAL, and so is everything UNCERTAIN — no remote, an unparsable or
+# non-github.com remote, a placeholder or unreadable config, a visibility probe
+# that failed or timed out. External still reads the conventions, with the
+# stricter framing, so the fail direction costs only authority, never the read.
+#
+# API
+#   amg_workin_agents_md <workdir> <nexus_root>
+#     stdout: the path of the workdir repository's AGENTS.md, when the workdir
+#     is a repository root (repo-root.sh kind `root` or `linked-worktree`) and
+#     the file exists; nothing otherwise. rc 0 = decided; rc 2 = could not
+#     decide (repo-root.sh unreadable, or its verdict was `undetermined`).
+#   amg_repo_tier <repo_root> <nexus_root>
+#     stdout: `internal<TAB><owner/name><TAB><reason>` or
+#             `external<TAB><owner/name or -><TAB><reason>`. Always rc 0.
+#     Test seam: AMG_VISIBILITY_OVERRIDE=private|public|<anything> replaces the
+#     `gh api repos/O/R --jq .private` probe (bounded by AMG_GH_TIMEOUT
+#     seconds, default 10); any value but `private` reads as not-private.
+
+amg_workin_agents_md() {
+    local wd root="${2:-}" kind
+    wd=$(_amg_real "${1:-}") || return 2
+    [ -n "$wd" ] || return 2
+    root=$(_amg_real "$root") || root="${2:-}"
+    [ "$wd" = "$root" ] && return 0          # the nexus itself is not a clone
+    [ -f "$wd/AGENTS.md" ] || return 0
+    [ -r "$root/monitor/repo-root.sh" ] || return 2
+    kind=$(bash "$root/monitor/repo-root.sh" --kind "$wd" 2>/dev/null)
+    case "$kind" in
+        root|linked-worktree) printf '%s\n' "$wd/AGENTS.md" ;;
+        unreadable|git-unavailable|error|'') return 2 ;;
+        *) : ;;                                # subdir, none, …: a USE, not work-in
+    esac
+    return 0
+}
+
+# owner/name from a GitHub remote URL (https, ssh scp-form, ssh://), or nothing.
+# Only github.com: the tier rule is about GitHub ownership, and another host's
+# `labx/` is not the lab's.
+_amg_slug_from_url() {
+    printf '%s\n' "$1" | sed -nE \
+        -e 's#^https?://([^@/]+@)?github\.com/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)/?$#\2#Ip' \
+        -e 's#^ssh://([^@/]+@)?github\.com(:[0-9]+)?/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)/?$#\3#Ip' \
+        -e 's#^([^@/:]+@)?github\.com:([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)/?$#\2#Ip' \
+        | sed -E 's/\.git$//' | sed -n 1p
+}
+
+# A config value, or nothing when absent, unreadable, or still the
+# nexus.example.yml placeholder (load.sh falls through to the template when
+# config/nexus.yml is missing, and its values look real enough to match).
+_amg_cfg() {
+    local root="$1" key="$2" v ex
+    [ -x "$root/config/load.sh" ] || return 0
+    # NEXUS_ROOT pinned: load.sh prefers an inherited one over its own location.
+    v=$(NEXUS_ROOT="$root" "$root/config/load.sh" "$key" '' 2>/dev/null) || return 0
+    if [ -f "$root/config/nexus.example.yml" ]; then
+        ex=$(NEXUS_ROOT="$root" NEXUS_CONFIG="$root/config/nexus.example.yml" "$root/config/load.sh" "$key" '' 2>/dev/null) || ex=""
+        [ -n "$ex" ] && [ "$v" = "$ex" ] && return 0
+    fi
+    printf '%s\n' "$v"
+}
+
+amg_repo_tier() {
+    local repo="${1:-}" root="${2:-}" url slug owner lab op lc_owner vis
+    url=$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$repo" remote get-url origin 2>/dev/null) || url=""
+    if [ -z "$url" ]; then
+        printf 'external\t-\tno origin remote\n'; return 0
+    fi
+    slug=$(_amg_slug_from_url "$url")
+    if [ -z "$slug" ]; then
+        printf 'external\t-\torigin is not a parsable github.com URL\n'; return 0
+    fi
+    owner=${slug%%/*}
+    lab=$(_amg_cfg "$root" github.repo); lab=${lab%%/*}
+    op=$(_amg_cfg "$root" github.user_login)
+    case "$lab" in *[!A-Za-z0-9-]*) lab="" ;; esac
+    case "$op" in *[!A-Za-z0-9-]*) op="" ;; esac
+    if [ -z "$lab" ] && [ -z "$op" ]; then
+        printf 'external\t%s\tno lab org or operator resolvable from config\n' "$slug"; return 0
+    fi
+    # GitHub logins are case-insensitive.
+    lc_owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+    lab=$(printf '%s' "$lab" | tr '[:upper:]' '[:lower:]')
+    op=$(printf '%s' "$op" | tr '[:upper:]' '[:lower:]')
+    # A github.repo under the operator's OWN account names no lab org: that
+    # owner is then judged by the operator rule, which demands privacy.
+    if [ -n "$lab" ] && [ "$lab" != "$op" ] && [ "$lc_owner" = "$lab" ]; then
+        printf 'internal\t%s\tlab org %s\n' "$slug" "$owner"; return 0
+    fi
+    if [ -n "$op" ] && [ "$lc_owner" = "$op" ]; then
+        if [ -n "${AMG_VISIBILITY_OVERRIDE+x}" ]; then
+            vis="$AMG_VISIBILITY_OVERRIDE"
+        else
+            vis=$(timeout "${AMG_GH_TIMEOUT:-10}" gh api "repos/$slug" --jq .private 2>/dev/null) || vis=""
+            case "$vis" in true) vis=private ;; false) vis=public ;; *) vis=unknown ;; esac
+        fi
+        if [ "$vis" = private ]; then
+            printf 'internal\t%s\toperator-owned private repo\n' "$slug"
+        else
+            printf 'external\t%s\toperator-owned but not positively private (visibility %s)\n' "$slug" "$vis"
+        fi
+        return 0
+    fi
+    printf 'external\t%s\towner %s is neither the lab org nor the operator\n' "$slug" "$owner"
+    return 0
+}

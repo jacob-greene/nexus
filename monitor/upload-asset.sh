@@ -27,7 +27,10 @@
 #
 # Storage:
 #   - Asset repo is maintained as a local clone at `assets/` under
-#     the nexus root (gitignored).
+#     the nexus root (gitignored). A destination that is NOT the root's
+#     own asset repo ($NEXUS_CONFIG, --asset-repo, $NEXUS_ASSET_REPO)
+#     gets its own clone at `assets.<owner>__<name>/`, never the generic
+#     one (your-org/nexus-code#1694).
 #   - Concurrency model (lock-free staging + flock-elected batch
 #     manager): every upload first publishes a snapshot of its file +
 #     a request marker into `<assets-dir>.staging/` with an atomic
@@ -84,7 +87,8 @@
 #   7  REFUSED: the DESTINATION repository is wrong — either `--repo` named
 #      something other than the configured asset repo (that flag means the
 #      ASSET repo here and the ISSUE repo on every other `ng` verb), or the
-#      destination is the repository this nexus checkout itself came from.
+#      destination is the repository this nexus checkout itself came from,
+#      or the destination is not an `owner/name` (#1694: no clone to key).
 #      Like 4, a 7 is decided BEFORE anything is staged or any git verb runs
 #      (your-org/nexus-code#1173).
 #   4  REFUSED: the nexus primary root could not be established, or
@@ -272,7 +276,6 @@ REPO_PATH=""
 SHAPE="pin"
 MESSAGE=""
 REPLACE=0
-ASSETS_DIR="$_nexus_root/assets"
 
 # your-org/nexus-code#575. The full header block is a ~60-line design document.
 # Dumping it as the ERROR for a one-character flag typo reads as "something has
@@ -383,8 +386,46 @@ esac
 
 [[ -n "$MESSAGE" ]] || MESSAGE="Add asset $BASENAME via upload-asset.sh"
 
+# WHICH LOCAL CLONE — keyed on the repo it caches (your-org/nexus-code#1694).
+# The clone, its `.staging/` and its `.lock` are a cache of ONE asset repo. With
+# $NEXUS_CONFIG (or --asset-repo / $NEXUS_ASSET_REPO) naming a repo that is not
+# this root's own, the generic `<root>/assets` used to host that OTHER repo's
+# clone: the `remote set-url origin` below re-points whatever clone is there at
+# $REPO, and a request staged under the shared `.staging/` can be drained by a
+# concurrent manager pushing to the root's own repo. So:
+#   * REPO is the root's OWN asset repo -> `<root>/assets`, exactly as before
+#     (no migration for the common case);
+#   * anything else                     -> `<root>/assets.<owner>__<name>`.
+# "Own" is the root's config read WITHOUT $NEXUS_CONFIG — the same
+# `github.asset_repo`, fallback `github.repo`, that REPO_CONFIGURED reads when
+# no NEXUS_CONFIG is set. GitHub names are case-insensitive, so the comparison
+# and the key are lowercased: two spellings of one repo share one clone.
+_own_cfg() { env -u NEXUS_CONFIG NEXUS_ROOT="$_nexus_root" "$_nexus_root/config/load.sh" "$@"; }
+if [[ -n "${NEXUS_CONFIG:-}" ]]; then
+    REPO_OWN="$(_own_cfg github.asset_repo "$(_own_cfg github.repo "")" 2>/dev/null)" || REPO_OWN=""
+else
+    REPO_OWN="$REPO_CONFIGURED"
+fi
+_repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+if [[ "$_repo_lc" == "$(printf '%s' "$REPO_OWN" | tr '[:upper:]' '[:lower:]')" ]]; then
+    ASSETS_DIR="$_nexus_root/assets"
+elif [[ "$_repo_lc" =~ ^([a-z0-9_.-]+)/([a-z0-9_.-]+)$ \
+        && "${BASH_REMATCH[1]}" != . && "${BASH_REMATCH[1]}" != .. \
+        && "${BASH_REMATCH[2]}" != . && "${BASH_REMATCH[2]}" != .. ]]; then
+    ASSETS_DIR="$_nexus_root/assets.${BASH_REMATCH[1]}__${BASH_REMATCH[2]}"
+else
+    # Not `owner/name`: there is no clone path to key it on, and no GitHub repo
+    # it could name. Refused before anything is staged, like every other 7.
+    echo "upload-asset.sh: REFUSING — asset repo '$REPO' (from $REPO_SOURCE) is not an owner/name; cannot key its local clone (your-org/nexus-code#1694)." >&2
+    exit 7
+fi
+unset _repo_lc
+
 TOKEN="$("$_script_dir/mint-token.sh")" || { echo "mint-token.sh failed" >&2; exit 2; }
-ASSET_URL_AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+# The token never enters a URL: a credentialed URL sits in the argv of `git
+# clone`, `git remote set-url` and every `git-remote-https` that a fetch or push
+# spawns, and argv is readable in /proc by every same-uid agent (#1840). It
+# reaches git through _git_hardened's credential helper instead.
 ASSET_URL_NOAUTH="https://github.com/${REPO}.git"
 
 # Git author identity for the asset commit. No hardcoded operator fallback:
@@ -414,11 +455,15 @@ _LOCK_FD=9
 
 # _git_hardened — the ONLY way this script may invoke git.
 #
-#  1. `-c credential.helper=` (empty value RESETS the helper list). We embed a
-#     freshly-minted installation token in the remote URL, so a credential
-#     cache buys nothing — and costs everything: `git push` otherwise forks
-#     `git-credential-cache--daemon`, which is what leaked the lock. It would
-#     also cache an EXPIRED token and re-serve it. No helper, no daemon.
+#  1. `-c credential.helper=` (empty value RESETS the helper list), then ONE
+#     inline helper that answers `get` with the freshly-minted installation
+#     token from the environment. A credential cache buys nothing — and costs
+#     everything: `git push` otherwise forks `git-credential-cache--daemon`,
+#     which is what leaked the lock. It would also cache an EXPIRED token and
+#     re-serve it. The inline helper is a one-shot `sh -c`, not a daemon. The
+#     token rides in the environment (0400 in /proc, same uid only) and never
+#     in a URL or any argv (#1840); the helper's own argv names the variable,
+#     never its value.
 #
 #  2. `GIT_TERMINAL_PROMPT=0` — when the installation token expires mid-batch
 #     (~1 h TTL), git falls through to an interactive credential prompt. With
@@ -442,8 +487,11 @@ _LOCK_FD=9
 # (a pager, a filter, an askpass); guard 3 alone leaves an expired token
 # cached and re-served. Neither subsumes the other.
 _git_hardened() {
-    GIT_TERMINAL_PROMPT=0 \
-    git -c credential.helper= "$@" {_LOCK_FD}>&-
+    # Defined inside the function so a suite that lifts it verbatim
+    # (test-upload-asset-fd-leak.sh) gets the helper with it.
+    local helper='!f() { test "$1" = get || exit 0; printf "username=x-access-token\npassword=%s\n" "$NEXUS_ASSET_TOKEN"; }; f'
+    GIT_TERMINAL_PROMPT=0 NEXUS_ASSET_TOKEN="${TOKEN:-}" \
+    git -c credential.helper= -c "credential.helper=$helper" "$@" {_LOCK_FD}>&-
 }
 
 _git_assets() {
@@ -753,7 +801,7 @@ sync_tree() {
 # placeholder resolves to a repo that 404s rather than to `nexus-code`. The
 # actual mechanism is one line below this block:
 #
-#     _git_assets remote set-url origin "$ASSET_URL_AUTH"     # built from $REPO
+#     _git_assets remote set-url origin "$ASSET_URL_NOAUTH"   # built from $REPO
 #     _git_assets push --quiet origin main
 #
 # The asset tree can be perfectly self-rooted, correctly cloned, and pointed at
@@ -871,7 +919,6 @@ fi
 # holding this lock (your-org/nexus-code#468). Mint late, push soon after.
 if _fresh_token="$("$_script_dir/mint-token.sh")" && [[ -n "$_fresh_token" ]]; then
     TOKEN="$_fresh_token"
-    ASSET_URL_AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 else
     # Non-fatal: the startup token may still be valid. Fail at push, loudly.
     echo "upload-asset.sh: re-mint under lock failed; proceeding with the" \
@@ -894,7 +941,7 @@ if ! _asset_tree_is_self_rooted; then
         rmdir "$ASSETS_DIR" 2>/dev/null \
             || _assert_asset_tree_self_rooted "pre-bootstrap: path occupied"
     fi
-    _git_hardened clone "$ASSET_URL_AUTH" "$ASSETS_DIR" >&2 \
+    _git_hardened clone "$ASSET_URL_NOAUTH" "$ASSETS_DIR" >&2 \
         || { echo "asset-repo clone failed" >&2; exit 3; }
     # A clone that reported success but did not leave a self-rooted repository
     # would put us straight back in #1077 with the guard bypassed. Assert it.
@@ -909,7 +956,7 @@ fi
 # Authoritative check on EVERY run, bootstrap or not, immediately before the
 # first mutating git verb (`remote set-url`, then sync_tree's checkout/reset).
 _assert_asset_tree_self_rooted "before asset-repo mutation"
-_git_assets remote set-url origin "$ASSET_URL_AUTH" >/dev/null
+_git_assets remote set-url origin "$ASSET_URL_NOAUTH" >/dev/null
 sync_tree || { echo "asset-repo sync failed" >&2; exit 3; }
 
 # Snapshot the batch: every complete marker present now (ours is guaranteed
@@ -1071,8 +1118,9 @@ for reqid in "${!_refused[@]}"; do
     rm -f "$STAGING_DIR/$reqid.req" "$STAGING_DIR/$reqid.blob"
 done
 
-# Strip the credential from the remote url, then release the lock so the next
-# waiter can proceed immediately.
+# Leave the remote url credential-free (it already is since #1840; this also
+# scrubs a token a pre-#1840 run left in .git/config), then release the lock so
+# the next waiter can proceed immediately.
 _git_assets remote set-url origin "$ASSET_URL_NOAUTH" >/dev/null
 flock -u "$_LOCK_FD" 2>/dev/null || true
 
@@ -1092,4 +1140,11 @@ fi
 }
 url="$(< "$RESULT")"
 rm -f "$RESULT"
+# your-org/nexus-code#1856: github.com shows HTML as SOURCE, never rendered, so
+# an HTML asset alone does not reach a GitHub reader any better than a claude.ai
+# Artifact does. Say so on STDERR (stdout is the URL and callers parse it).
+case "$BASENAME" in
+    *.html|*.htm|*.HTML|*.HTM)
+        echo "upload-asset.sh: NOTE — GitHub does not render HTML; it shows the source. Upload an .md (or SVG/PNG images) beside it and link that for a GitHub reader (your-org/nexus-code#1856)." >&2 ;;
+esac
 printf '%s\n' "$url"

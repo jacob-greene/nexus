@@ -48,7 +48,7 @@ done
 
 # SYNTHETIC credential. Never a real token.
 SECRET='s3cr3tSYNTHETICNOTAREALTOKEN'
-CRED_URL="http://alice:${SECRET}@127.0.0.1:1/remote.git"
+CRED_URL="http://alice:${SECRET}@127.0.0.1:1/remote.git"   # argv-credential-ok: synthetic secret; this suite proves force-push-check REDACTS it
 SAFE_URL="http://127.0.0.1:1/remote.git"
 
 TMP=$(mktemp -d) || { echo "FATAL: mktemp failed" >&2; exit 1; }

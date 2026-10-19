@@ -348,4 +348,34 @@ b2_rc=0; _validate >/dev/null 2>&1 || b2_rc=$?
 assert_eq "same N qualifies against repo A" "$a_rc" "0"
 assert_eq "same N qualifies against repo B" "$b2_rc" "0"
 
+echo '=== E. #1839: status_surface is an enum — an unknown kind is refused ==='
+# Same fully-real fixture, so only the status_surface check can fire. A typo for
+# `external` read as the default would silently restore the dashboard nudges
+# the operator opted out of.
+_sscfg() {  # $1 = the status_surface block, verbatim (may be empty)
+    _mkcfg '""'
+    printf '%s\n' "$1" >> "$REFROOT/nexus.yml"
+}
+_sscfg ''
+ss_rc=0; _validate >/dev/null 2>&1 || ss_rc=$?
+assert_eq "status_surface absent => validates (the default)" "$ss_rc" "0"
+_sscfg $'status_surface:\n  kind: external\n  feed: landings.tsv'
+ss_rc=0; _validate >/dev/null 2>&1 || ss_rc=$?
+assert_eq "kind: external => validates" "$ss_rc" "0"
+_sscfg $'status_surface:\n  kind: overview-dashboard'
+ss_rc=0; _validate >/dev/null 2>&1 || ss_rc=$?
+assert_eq "kind: overview-dashboard => validates" "$ss_rc" "0"
+_sscfg $'status_surface:\n  kind: externl'
+ss_out=$(_validate); ss_rc=$?
+assert_eq "unknown kind => exit 4 (loud refusal, not the default)" "$ss_rc" "4"
+assert_contains "…and names the value" "$ss_out" "'externl'"
+_sscfg 'status_surface: external'
+ss_out=$(_validate); ss_rc=$?
+assert_eq "scalar status_surface => exit 4 (its .kind would read as the default)" "$ss_rc" "4"
+assert_contains "…and says it must be a mapping" "$ss_out" "must be a mapping"
+# --check-identity is the identity subset and does not look at it.
+ss_rc=0; NEXUS_EXAMPLE_PATH="$REFROOT/nexus.example.yml" NEXUS_CONFIG="$REFROOT/nexus.yml" \
+    bash "$_test_dir/../../config/load.sh" --check-identity >/dev/null 2>&1 || ss_rc=$?
+assert_eq "--check-identity ignores status_surface (identity subset)" "$ss_rc" "0"
+
 th_summary_and_exit

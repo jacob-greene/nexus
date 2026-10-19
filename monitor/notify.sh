@@ -207,13 +207,19 @@ try_pushover() {
         emergency) pri=1; sound="siren" ;;
     esac
 
-    local form=(-F "token=$app" -F "user=$user" -F "title=$TITLE"
+    # The app token and user key travel in a curl config read from a process
+    # substitution, never in argv, which every same-uid agent can read in /proc
+    # (#1840). Pushover keys are alphanumeric; anything else would need config
+    # quoting, so it is refused rather than escaped.
+    [[ "$app" =~ ^[A-Za-z0-9]+$ && "$user" =~ ^[A-Za-z0-9]+$ ]] || { log "pushover: key files are not alphanumeric"; return 2; }
+    local form=(-F "title=$TITLE"
                 -F "message=$MESSAGE" -F "priority=$pri" -F "sound=$sound")
     [[ -n "$CLICK_URL" ]] && form+=(-F "url=$CLICK_URL" -F "url_title=open in GitHub")
     [[ -n "$IMAGE"     ]] && form+=(-F "attachment=@$IMAGE;type=image/png")
 
     local http
     http=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+           -K <(printf 'form = "token=%s"\nform = "user=%s"\n' "$app" "$user") \
            "${form[@]}" https://api.pushover.net/1/messages.json 2>/dev/null || echo "000")
     if [[ "$http" =~ ^2 ]]; then
         log "pushover ok ($PRIORITY_LEVEL → priority=$pri)"

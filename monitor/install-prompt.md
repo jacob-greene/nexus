@@ -139,7 +139,7 @@ or whatever they have open) what the file says — don't fabricate.
 
 The asset+issue repo is the private repo where the bot writes
 issues, the dashboard, and uploaded assets. One per operator;
-separate from the shared `your-org/nexus-code` code repo.
+separate from the shared `<your-org>/nexus-code` code repo.
 
 1. Tell the operator what you're about to do and the exact
    `gh repo create` command you'll run, then run it:
@@ -182,8 +182,11 @@ precise field-by-field instructions and to capture the values
 they'll need for `config/nexus.yml`.
 
 `monitor/BOT_ADMIN_GUIDE.md` steps 1–7 and
-`docs/admin/github-app.md` steps 1–6 are the authoritative
-walkthroughs. Quote them; don't paraphrase loosely.
+`docs/admin/github-app.md` steps 1–7 are the authoritative
+walkthroughs for this phase. `github-app.md`'s step 7 is the
+install — that is Phase 2.8 below; in `BOT_ADMIN_GUIDE.md` the
+install is step 6 and the webhook secret is step 8 (Phase 2.3).
+Quote them; don't paraphrase loosely.
 
 ### 2.1 Open the App-creation page
 
@@ -305,9 +308,23 @@ capture:
    ```
 
    If the operator is working over SSH and the `.pem` is on their
-   laptop, walk them through `scp` (or `cat | ssh ...`). Don't
-   skip the `chmod 600` — `mint-token.sh` refuses world-readable
-   keys.
+   laptop, walk them through `scp` (or `cat | ssh ...`). Don't skip
+   the `chmod 600`: this key signs every token the bot ever mints, so
+   on a shared host it must not be readable by other users.
+   `mint-token.sh` REFUSES to sign (exit 4) when the key is
+   world-accessible **and** every ancestor directory grants
+   other-execute — i.e. when another local user can actually reach it
+   (<your-org>/nexus-code#1501). Read that boundary precisely, because
+   it is narrower than "the mode must be 600" and deliberately so: a
+   mode-644 key under a mode-700 `~/.claude` is INERT — traversal is
+   denied, so the file's own bits never come into play — and the gate
+   does not refuse it. Group access is reported, never refused; an
+   ancestor it cannot `stat` is `unknown`, and the mint proceeds.
+   So `chmod 600` is still the thing to do, and the gate is a
+   backstop against the reachable case rather than a mode checker.
+   `./monitor/mint-token.sh --check-key` prints the verdict without
+   minting (0 ok, 4 exposed, 5 anything it tolerates but you should
+   see).
 
 ### 2.8 Install the App on the asset+issue repo
 
@@ -315,7 +332,7 @@ capture:
    left-nav.
 2. Choose the account that owns the asset+issue repo from Phase 1.
 3. **Restrict the install to that single repo.** Do NOT install
-   it on `your-org/nexus-code`. The bot only ever writes to the
+   it on `<your-org>/nexus-code`. The bot only ever writes to the
    operator's own asset+issue repo.
 4. After install, GitHub redirects to a URL of the form
    `https://github.com/settings/installations/<n>` (or the org
@@ -382,11 +399,12 @@ is configured.
 
 ## Phase 4 — smoke tests
 
-Three independent checks. Run each as one tool call, in order,
+Four independent checks. Run each as one tool call, in order,
 and report results to the operator after each.
 
 ```bash
-# 1. Mint an installation token. Should print a JWT-shaped value.
+# 1. Mint an INSTALLATION token (a `ghs_...` value, NOT a JWT — the
+#    JWT is what `--jwt-only` prints, used by the 4b probe).
 ./monitor/mint-token.sh
 ```
 
@@ -400,17 +418,19 @@ the pem; recheck the App page.
 ./monitor/ng issue 1
 ```
 
-Expected: `#1 state=… title=…` or `ng: not found`. Either proves
-the token mints and the App can read the repo. A 404 with a
-different shape usually means `github.repo` is wrong.
+Expected: `#1 state=OPEN|CLOSED title=…`, or `ng: issue 1: fetch failed`
+on a repo with no issue #1 (the normal case on a fresh asset repo).
+Either proves the token mints and the App can read the repo. A
+failure naming a different repo means `github.repo` is wrong.
 
 ```bash
 # 3. Bot install scope check.
 ./monitor/ng preflight "$(./config/load.sh github.repo)"
 ```
 
-Expected: `bot installed yes`. A `no` means the App is created
-but not installed on the asset+issue repo — re-do Phase 2.8.
+Expected: `bot installed: yes (<ORG>/<REPO>) — repository_selection=…`.
+A `bot installed: NO` means the App is created but not installed on
+the asset+issue repo — re-do Phase 2.8.
 
 ```bash
 # 4. End-to-end asset upload.
@@ -444,7 +464,7 @@ real-time event source.
    ```bash
    JWT=$(./monitor/mint-token.sh --jwt-only)
    curl -sS \
-       -H "Authorization: Bearer $JWT" \
+       -H @<(printf 'Authorization: Bearer %s\n' "$JWT") \
        -H "Accept: application/vnd.github+json" \
        "https://api.github.com/app/hook/deliveries?per_page=3" \
      | jq '.[].event, .[].status_code'
@@ -484,7 +504,7 @@ issues without error.
 The monitor finds the dashboard issue **by label**, not by title
 or number, so `nexus:overview` is mandatory. The other three
 organise threads in the asset+issue repo and are the recommended
-defaults (the reference deployment `your-org/your-nexus` carries
+defaults (the reference deployment `<your-org>/<your-nexus>` carries
 all four). Colours and descriptions below match the reference.
 
 The `gh label` subcommand was only added in `gh` v2.x; the
@@ -592,15 +612,18 @@ dashboard. Common causes:
 - `ng issue create` errors resolving the repo: `github.repo` in
   `config/nexus.yml` is misspelled.
 
-## Phase 6 — Lab-specific addons (your-lab / your-institution only)
+## Phase 6 — optional HPC + reproducibility skills
 
-This phase is additive. On non-your-lab hosts every check below
-short-circuits and you advance to Phase 7 silently.
+This phase is additive and optional. It offers a general-purpose
+skill pack for teams running nexus on HPC. On hosts with no HPC
+signal every check below short-circuits and you advance to Phase 7
+silently.
 
 The bootstrap pre-launch context block carries three signals you
 need:
 
-- `HPC host (your-institution)` — yes/no, from `hpc-mount` + hostname.
+- `HPC host (<your-institution>)` — yes/no, from a shared-filesystem
+  + hostname probe.
 - `hpc-skills installed` — yes/no, from the link/dir under
   `~/.claude/skills/`.
 - `labsh installed` — yes/no, from the project-local clone or PATH.
@@ -617,30 +640,32 @@ nexus_detect_hpc_skills_installed
 nexus_detect_labsh_installed
 ```
 
-### 6.1 — `hpc-skills` (your-lab + your-institution HPC)
+### 6.1 — `hpc-skills` (general HPC + reproducibility/science)
 
-`your-org/hpc-skills` is the cluster-aware skill pack: Slurm
-submission patterns, storage tier semantics, Lmod loads, partition
-flags, scratch paths. It belongs on a lab HPC install and nowhere
-else.
+`hpc-skills` is an optional, operator-maintained pack of **general**
+HPC and reproducibility/science skills — Slurm submission patterns,
+environment/module management, container usage, parallelism,
+testing, and reproducibility guidance. It is transferable across
+clusters and carries no institution- or lab-specific conventions.
+Point `HPC_SKILLS_REMOTE` at your own skills repository (default
+`hpc-skills`) and keep that repository scoped to general skills;
+the installer links whatever sub-skills it finds, so a curated repo
+is what keeps the install general.
 
-Decision matrix (asset+issue repo owner × HPC signal):
+Decision matrix (HPC signal):
 
-| your-org/* repo | HPC host | Action |
-|---|---|---|
-| yes | yes | Offer `hpc-skills`, default-yes |
-| yes | no  | One-line note that it exists for HPC contexts; skip install |
-| no  | yes | Skip silently — operator is on the HPC but not running the lab's nexus |
-| no  | no  | Skip silently |
+| HPC host | Action |
+|---|---|
+| yes | Offer `hpc-skills`, default-yes |
+| no  | One-line note that it exists for HPC contexts; skip install |
 
 If `hpc-skills installed: yes`, say one short line ("`hpc-skills`
 already installed; nothing to do") and skip to 6.2.
 
-The offer when both signals fire:
+The offer when the HPC signal fires:
 
-> You're on the your-institution HPC and your asset repo is under
-> `your-org/`. Install `your-org/hpc-skills` (Slurm/Lmod/storage
-> skills)? [Y/n]
+> You're on an HPC host. Install `hpc-skills` (general Slurm /
+> modules / containers / reproducibility skills)? [Y/n]
 
 Default-yes; accept `Y`, `y`, or blank as yes. On yes:
 
@@ -651,35 +676,37 @@ Default-yes; accept `Y`, `y`, or blank as yes. On yes:
 The script is idempotent + fail-loud; it clones into
 `~/.claude/hpc-skills/` and creates one symlink per sub-skill at
 the top level of `~/.claude/skills/` (plus an umbrella symlink for
-browsing/sentinel purposes).
-On non-zero exit, surface the stderr verbatim and ask whether to
-retry, skip, or abort the bootstrap. Don't silently retry.
+browsing/sentinel purposes). It links whatever sub-skills your
+skills repository contains — keep that repository scoped to general
+skills. On non-zero exit, surface the stderr verbatim and ask
+whether to retry, skip, or abort the bootstrap. Don't silently
+retry.
 
 Smoke-check on success:
 
 ```bash
-# Sentinel umbrella + one known sub-skill must both be discoverable:
+# Sentinel umbrella + at least one resolvable per-sub-skill link:
 ls -ld ~/.claude/skills/hpc-skills
-test -f "$HOME/.claude/skills/yourlab.labsh"/SKILL.md && echo "labsh OK"
+count=$(find ~/.claude/skills -maxdepth 1 -type l -lname '*/hpc-skills/skills/*' 2>/dev/null | wc -l)
+[ "$count" -gt 0 ] && echo "sub-skills OK ($count linked)"
 ```
 
-Expected: umbrella listing without error AND `labsh OK` line. The
-second check catches the per-sub-skill regression — Claude Code's
-loader only walks one level deep, so the umbrella alone leaves the
-sub-skills invisible. Report "`hpc-skills` ready" only when both
-pass.
+Expected: umbrella listing without error AND a `sub-skills OK`
+line. The second check catches the per-sub-skill regression —
+Claude Code's loader only walks one level deep, so the umbrella
+alone leaves the sub-skills invisible. Report "`hpc-skills` ready"
+only when both pass.
 
-When the asset repo is `your-org/*` but HPC is `no`, say one line:
+When the HPC signal is `no`, say one line:
 
-> Skipping `hpc-skills` — it's HPC-only. If you later run nexus
-> on a your-institution node, install it then via
-> `./monitor/install-hpc-skills.sh`.
+> Skipping `hpc-skills` — it's HPC-only. If you later run nexus on
+> an HPC node, install it then via `./monitor/install-hpc-skills.sh`.
 
 ### 6.2 — `labsh` (orthogonal opt-in)
 
 `katosh/labsh` is a general-purpose project-local JupyterLab
-wrapper. It's not your-lab-specific and not HPC-specific, so the
-offer is decoupled from the previous decision.
+wrapper. It's not HPC-specific, so the offer is decoupled from the
+previous decision.
 
 If `labsh installed: yes`, say one line ("`labsh` already installed")
 and skip to Phase 7.
@@ -794,7 +821,7 @@ pem, App ID doesn't match, smee channel deleted, …):
 
 ## What you must NOT do
 
-- Do **not** install the GitHub App on `your-org/nexus-code`.
+- Do **not** install the GitHub App on `<your-org>/nexus-code`.
   The bot is per-operator; the code repo carries no
   per-operator state.
 - Do **not** write secrets to anything other than `chmod 600`
@@ -806,7 +833,7 @@ pem, App ID doesn't match, smee channel deleted, …):
 - Do **not** spawn workers or sub-agents from this session.
   This is install-only. The orchestrator (Phase 7's `./watcher`)
   is the right context for spawning.
-- Do **not** push to or open PRs against `your-org/nexus-code`
+- Do **not** push to or open PRs against `<your-org>/nexus-code`
   from this session. If you find a bug in the bootstrap itself,
   tell the operator and let them file the issue when they have
   a working nexus.

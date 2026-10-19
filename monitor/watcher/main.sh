@@ -347,6 +347,11 @@ source "$_script_dir/_respawn_prompts.sh"
 # shellcheck source=_hosting_migration.sh
 source "$_script_dir/_hosting_migration.sh"
 
+# Status-surface resolution (#1839): which surface the emit's dashboard
+# section points at. Functions only; no side effects on source.
+# shellcheck source=../_status-surface.sh
+source "$_monitor_dir/_status-surface.sh"
+
 NEXUS_ROOT="${NEXUS_ROOT:-$("$_cfg" nexus.root)}"
 
 # Publish our PID as the FIRST thing after resolving NEXUS_ROOT —
@@ -529,10 +534,18 @@ UNSTICK_DIR="${STATE_DIR}/unstick"
 UNSTICK_LOG="${STATE_DIR}/watcher-unstick.log"
 ACTION_LOG="${STATE_DIR}/action-log.jsonl"
 # Machine-input ledger (issue #201): watcher-side Enter-nudges into
-# worker panes stamp here so the idle-probe's operator-attribution
-# rule doesn't read them as operator input. Writers: _unstick.sh,
-# monitor/paste-followup.sh. Reader: _idle_probe.sh.
-MACHINE_INPUT_TSV="${STATE_DIR}/machine-input.tsv"
+# worker panes stamp it so the idle-probe's operator-attribution rule
+# doesn't read them as operator input. Writers: _unstick.sh (via
+# _lib.sh's _machine_input_stamp), monitor/paste-followup.sh,
+# monitor/send.sh. Reader: _idle_probe.sh. Its path is NOT pinned here:
+# every writer and reader resolves it PER CALL through
+# monitor/_ledger_path.sh, so `ng degraded enter|exit` (#1724) moves the
+# running watcher's ledger without a restart. Only the run dir's path
+# is cached, warmed once here (no TMPDIR is the watcher's normal state,
+# and deriving it then costs a subshell).
+# shellcheck source=../_ledger_path.sh
+source "$_script_dir/../_ledger_path.sh"
+nexus_degraded_pointer_warm
 RESPAWN_HISTORY="${STATE_DIR}/respawn-history.txt"
 RESPAWN_TRIPPED="${STATE_DIR}/respawn-guard-tripped"
 # Slow-grind counter + tripped stamp (issue #77). Counter persists
@@ -1985,6 +1998,7 @@ _cap_emit_sections() {
             exempt["--- idle workers ---"]                    = 1
             exempt["--- workspace snapshot ---"]              = 1
             exempt["--- dashboard ---"]                       = 1
+            exempt["--- status surface ---"]                  = 1
             ex = 1; n = 0; omit_n = 0   # preamble: always preserved
         }
         function flush_omit() {
@@ -2017,6 +2031,92 @@ compose_report() {
     # Thin wrapper: build the body, then run it through the per-section emit
     # guard so no single section can flood the orchestrator paste.
     _compose_report_body "$@" | _cap_emit_sections
+}
+
+# The `--- dashboard ---` section of every emit.
+#
+# Every emit already implies "state has shifted since", so the only
+# useful gate on the refresh prompt is age: suppress it when the last put
+# is recent (< 2h) so it doesn't become noise.
+#
+# your-org/nexus-code#1010 — THE LABEL, NOT THE THRESHOLD. This block used
+# to print `last updated: <ts>`, which reads as a fact about the DASHBOARD
+# and is a fact about a LOCAL FILE: `dashboard-updated.ts` is written by
+# `ng dashboard put` and nothing here reconciles it against the issue.
+# Both directions were measured on 2026-08-25 — a dashboard four minutes
+# old announced as `> 2h old` after an out-of-band PATCH (false STALE), and
+# a content-identical put clearing the warning (false FRESH; that half is
+# now refused in `cmd_dashboard_put`).
+#
+# WHAT IS AND IS NOT CHECKABLE, said precisely, because the loose version of
+# this claim overreaches (your-org/nexus-code#1116 review, §4):
+#
+#   NOT checkable — "the prose describes the board as it now stands", which
+#     is what a reader INFERS from the line. That is a correspondence
+#     between free-form text and a distributed, unbounded world state, and
+#     no oracle exists for it. A content hash certifies that the bytes are
+#     what someone wrote, never that what they wrote is still true.
+#
+#   CHECKABLE — "the forge body still matches what we last pushed"
+#     (`ng dashboard get | cmp - "$DASH_CACHE"`, one REST GET, and
+#     `DASH_CACHE` is already written on both put arms), and "somebody
+#     touched the issue recently" (its `updated_at`).
+#
+# So: the FALSE-FRESH half of #1010 is fixed in `cmd_dashboard_put` (a
+# content-identical put no longer buys freshness). The FALSE-STALE half —
+# a four-minute-old dashboard announced `> 2h old` after an out-of-band
+# PATCH — is a failure of the CHECKABLE property and is NOT fixed here; it
+# is relabelled. That is a deliberate scope choice, not an impossibility,
+# and it is recorded as such so nobody reads the unfixability of the third
+# property as covering the first.
+#
+# So the line stops claiming the property it cannot check and states the
+# one it can. A proxy honestly labelled as a proxy is worth more than a
+# stricter proxy still presented as the property — the failure here was
+# never that the proxy was loose, it was that it wore the property's name.
+#
+# your-org/nexus-code#1839 — WITH `status_surface.kind: external` the operator
+# runs their own status page and has asked not to be nudged toward the
+# overview dashboard, so the section becomes a pointer to that page and never
+# names a put. An absent key prints exactly what it printed before. An UNKNOWN
+# kind is not folded into either: it is announced in the emit, above the
+# default lines, so a typo cannot silently restore the nudges.
+_emit_dashboard_section() {
+    local ss_kind ss_rc ss_url_file ss_feed ss_url
+    ss_kind=$(status_surface_kind "$_cfg" 2>/dev/null); ss_rc=$?
+    if (( ss_rc == 0 )) && [[ "$ss_kind" == external ]]; then
+        ss_url_file=$(status_surface_key "$_cfg" url_file "$NEXUS_ROOT")
+        ss_feed=$(status_surface_key "$_cfg" feed "$NEXUS_ROOT")
+        echo '--- status surface ---'
+        if [[ -z "$ss_url_file" ]]; then
+            ss_url="(status_surface.url_file unset)"
+        elif ! IFS= read -r ss_url < "$ss_url_file" 2>/dev/null || [[ -z "$ss_url" ]]; then
+            ss_url="(unreadable: $ss_url_file)"
+        fi
+        echo "external page: $ss_url — operator-run (status_surface in config/nexus.yml); the overview dashboard is not maintained here."
+        [[ -n "$ss_feed" ]] && echo "landings feed: $ss_feed"
+        return 0
+    fi
+    echo '--- dashboard ---'
+    if (( ss_rc == 3 )); then
+        echo "CONFIG ERROR: status_surface.kind '$ss_kind' is not a known kind (overview-dashboard | external)."
+        echo ' Fix config/nexus.yml; until then this section shows the default lines below.'
+    fi
+    local dash_ts_file="${STATE_DIR}/dashboard-updated.ts" dash_ts dash_age_s
+    if [[ -f "$dash_ts_file" ]]; then
+        dash_ts=$(cat "$dash_ts_file")
+        echo "last put: $dash_ts (local stamp — when \`ng dashboard put\` last ran here)"
+        dash_age_s=$(( $(date +%s) - $(date -d "$dash_ts" +%s 2>/dev/null || echo 0) ))
+        if (( dash_age_s >= 7200 )); then
+            echo '(no put in > 2h. NOT a staleness check: nothing here reads the issue'
+            echo ' body, so the dashboard may be current, or stale, or edited elsewhere.'
+            echo ' To KNOW, read it: `monitor/ng dashboard get`.)'
+        fi
+    else
+        echo 'last put: unknown'
+        echo '(no dashboard-updated.ts — no put recorded on this host. Says nothing'
+        echo ' about the dashboard body; read it with `monitor/ng dashboard get`.)'
+    fi
 }
 
 _compose_report_body() {
@@ -2365,61 +2465,7 @@ _compose_report_body() {
         printf '%s\n' "$full_state_lines"
         echo '(full snapshot; transitions only between snapshots)'
     fi
-    # Every emit already implies "state has shifted since", so the only
-    # useful gate on the refresh prompt is age: suppress it when the last put
-    # is recent (< 2h) so it doesn't become noise.
-    #
-    # your-org/nexus-code#1010 — THE LABEL, NOT THE THRESHOLD. This block used
-    # to print `last updated: <ts>`, which reads as a fact about the DASHBOARD
-    # and is a fact about a LOCAL FILE: `dashboard-updated.ts` is written by
-    # `ng dashboard put` and nothing here reconciles it against the issue.
-    # Both directions were measured on 2026-08-25 — a dashboard four minutes
-    # old announced as `> 2h old` after an out-of-band PATCH (false STALE), and
-    # a content-identical put clearing the warning (false FRESH; that half is
-    # now refused in `cmd_dashboard_put`).
-    #
-    # WHAT IS AND IS NOT CHECKABLE, said precisely, because the loose version of
-    # this claim overreaches (your-org/nexus-code#1116 review, §4):
-    #
-    #   NOT checkable — "the prose describes the board as it now stands", which
-    #     is what a reader INFERS from the line. That is a correspondence
-    #     between free-form text and a distributed, unbounded world state, and
-    #     no oracle exists for it. A content hash certifies that the bytes are
-    #     what someone wrote, never that what they wrote is still true.
-    #
-    #   CHECKABLE — "the forge body still matches what we last pushed"
-    #     (`ng dashboard get | cmp - "$DASH_CACHE"`, one REST GET, and
-    #     `DASH_CACHE` is already written on both put arms), and "somebody
-    #     touched the issue recently" (its `updated_at`).
-    #
-    # So: the FALSE-FRESH half of #1010 is fixed in `cmd_dashboard_put` (a
-    # content-identical put no longer buys freshness). The FALSE-STALE half —
-    # a four-minute-old dashboard announced `> 2h old` after an out-of-band
-    # PATCH — is a failure of the CHECKABLE property and is NOT fixed here; it
-    # is relabelled. That is a deliberate scope choice, not an impossibility,
-    # and it is recorded as such so nobody reads the unfixability of the third
-    # property as covering the first.
-    #
-    # So the line stops claiming the property it cannot check and states the
-    # one it can. A proxy honestly labelled as a proxy is worth more than a
-    # stricter proxy still presented as the property — the failure here was
-    # never that the proxy was loose, it was that it wore the property's name.
-    echo '--- dashboard ---'
-    local dash_ts_file="${STATE_DIR}/dashboard-updated.ts" dash_ts dash_age_s
-    if [[ -f "$dash_ts_file" ]]; then
-        dash_ts=$(cat "$dash_ts_file")
-        echo "last put: $dash_ts (local stamp — when \`ng dashboard put\` last ran here)"
-        dash_age_s=$(( $(date +%s) - $(date -d "$dash_ts" +%s 2>/dev/null || echo 0) ))
-        if (( dash_age_s >= 7200 )); then
-            echo '(no put in > 2h. NOT a staleness check: nothing here reads the issue'
-            echo ' body, so the dashboard may be current, or stale, or edited elsewhere.'
-            echo ' To KNOW, read it: `monitor/ng dashboard get`.)'
-        fi
-    else
-        echo 'last put: unknown'
-        echo '(no dashboard-updated.ts — no put recorded on this host. Says nothing'
-        echo ' about the dashboard body; read it with `monitor/ng dashboard get`.)'
-    fi
+    _emit_dashboard_section
     # Trailer signature. Used by paste_to_target for content-level
     # verification: unique per emit (contains timestamp + shortid) and
     # lives near the bottom of the rendered message so it rarely
@@ -3421,6 +3467,15 @@ source "$_script_dir/_orphan_async.sh"
 # shellcheck source=_auth_hold.sh
 source "$_script_dir/_auth_hold.sh"
 
+# The API-UNREACHABLE hold (your-org/nexus-code#1845): the third whole-workspace
+# hold, beside over-limit and the login hold. Entered on transport-class
+# StopFailure markers (EAI_AGAIN and kin) from >= 2 sessions or the
+# orchestrator alone; left on a watcher-side probe of the API endpoint; on
+# exit the WATCHER pastes one resume nudge per crashed window, orchestrator
+# first, with no orchestrator turn. Functions only; no side effects on source.
+# shellcheck source=_api_hold.sh
+source "$_script_dir/_api_hold.sh"
+
 # The TEXT-CARRYING, turn-independent operator alert (your-org/nexus-code#1548,
 # #1533, #1534): durable record + `watcher ALERT:` bell + push + a bot-authored
 # GitHub issue, every leg fail-open. Sourced after _auth_hold.sh so the expiry
@@ -3624,6 +3679,9 @@ _service_health_route_blocked_via_watcher() {
     if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 && _auth_hold_expiry_standing; then
         printf 'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'; return 0
     fi
+    if declare -F _api_hold_active >/dev/null 2>&1 && _api_hold_active; then
+        printf 'api-unreachable\tthe Claude API is UNREACHABLE and emits are HELD (api-hold, your-org/nexus-code#1845)'; return 0
+    fi
     if [[ "${_V2_LAST_TARGET_RC:-0}" == "2" ]]; then
         printf 'target-absent\tthe orchestrator window is ABSENT (respawn pending)'; return 0
     fi
@@ -3646,6 +3704,22 @@ _orphan_async_paste_via_watcher() {
 _ORPHAN_ASYNC_LOG_FN=_orphan_async_log_to_watcher
 _ORPHAN_ASYNC_PASTE_FN=_orphan_async_paste_via_watcher
 export _ORPHAN_ASYNC_LOG_FN _ORPHAN_ASYNC_PASTE_FN
+
+# The API-unreachable hold's seams (your-org/nexus-code#1845). The resume goes
+# through `paste_with_retry`, the transport every emit uses, so the #745
+# dead-pane guard, the #1674 draft refusal and the #1591 confirmation all
+# apply; the module's own pre-paste gate (`queued=1`, `input=typed|?`, an
+# idle state, one nudge per window per hold) is the duplicate-delivery defence,
+# as in the orphan-async loop above. The bell is `_watcher_alert` (attention);
+# the text goes on `_operator_alert`'s legs.
+_api_hold_log_to_watcher() { log "$@"; }
+_api_hold_alert_to_watcher() { _watcher_alert "$@"; }
+_api_hold_paste_via_watcher() { paste_with_retry "$1" "$2"; }
+_API_HOLD_LOG_FN=_api_hold_log_to_watcher
+_API_HOLD_ALERT_FN=_api_hold_alert_to_watcher
+_API_HOLD_OPERATOR_ALERT_FN=_operator_alert
+_API_HOLD_PASTE_FN=_api_hold_paste_via_watcher
+export _API_HOLD_LOG_FN _API_HOLD_ALERT_FN _API_HOLD_OPERATOR_ALERT_FN _API_HOLD_PASTE_FN
 
 # ---- main loop -----------------------------------------------------------
 
@@ -4128,6 +4202,16 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
     elif _auth_hold_active; then
         log "startup-sweep paste HELD: operator is in a /login flow on ${TARGET} — a paste's trailing Enter would answer the dialog and select a login method (your-org/nexus-code#1518). archive=$(basename "$archive_path")"
         _auth_hold_record_held "$(basename "$archive_path")" "startup-sweep"
+    # API-UNREACHABLE HOLD (your-org/nexus-code#1845). A FOURTH arm, for the
+    # reasons the login arm above states: landing in this ladder is what keeps
+    # the body archived, the dedup anchor unmoved and request ids due. A paste
+    # into a session that cannot reach the API starts a turn that fails again
+    # and consumes the emit. AFTER the login arm: a dialog on the pane is the
+    # nearer hazard (its Enter answers the dialog), and either way nothing is
+    # pasted.
+    elif _api_hold_active; then
+        log "startup-sweep paste HELD: the Claude API is UNREACHABLE (api-hold, your-org/nexus-code#1845). archive=$(basename "$archive_path")"
+        _api_hold_record_held "$(basename "$archive_path")" "startup-sweep"
     elif paste_with_retry "$TARGET" "$emit_body"; then
         log "startup-sweep pasted to ${TARGET}"
         _emit_delivery_ok
@@ -4270,6 +4354,13 @@ _v2_task_over_limit_wakes()  { _over_limit_process_wakes "$TARGET"; }
 # read, and it MUST land before the emit ladder consults `_auth_hold_active` —
 # an async task could still be in flight when compose_emit asks.
 _v2_task_auth_hold()         { _auth_hold_step "$TARGET"; }
+# The API-unreachable hold (your-org/nexus-code#1845). The STEP is sync and
+# cheap (a marker-dir read and one file), and must land before the emit ladder
+# consults `_api_hold_active`, like the login hold above. The PROBE is async:
+# a resolver timeout must never stall the sync loop; the step reads its last
+# answer. The probe is a no-op unless a hold is open.
+_v2_task_api_hold()          { _api_hold_step "$TARGET"; }
+_v2_task_api_hold_probe()    { _api_hold_probe_step; }
 _v2_task_orphan_async_wakes() { _orphan_async_process_wakes "$TARGET"; }
 _v2_task_bell_windows() {
     list_bell_windows | _scheduler_stage_write_atomic bell_windows
@@ -5072,6 +5163,10 @@ _v2_task_comment_surface() {
     elif _auth_hold_active; then
         log "comment-surface paste HELD: operator is in a /login flow on ${TARGET} (your-org/nexus-code#1518). archive=$(basename "$archive_path")"
         _auth_hold_record_held "$(basename "$archive_path")" "comments"
+    # API-UNREACHABLE HOLD (your-org/nexus-code#1845) — see the startup-sweep arm.
+    elif _api_hold_active; then
+        log "comment-surface paste HELD: the Claude API is UNREACHABLE (api-hold, your-org/nexus-code#1845). archive=$(basename "$archive_path")"
+        _api_hold_record_held "$(basename "$archive_path")" "comments"
     elif paste_with_retry "$TARGET" "$emit_file"; then
         log "pasted to ${TARGET} (comment-surface)"
         _emit_delivery_ok
@@ -5146,8 +5241,8 @@ _v2_task_decision_surface() {
     # A HELD target cannot answer: write nothing, so the next fire after the
     # hold lifts pastes it. The compose body records the hold (and carries
     # the row) — repeating that here every 5 s would add only noise.
-    if _over_limit_orchestrator_paused || _auth_hold_active; then
-        log "decision-surface: paste held (target over-limit or in /login); the next fire retries"
+    if _over_limit_orchestrator_paused || _auth_hold_active || _api_hold_active; then
+        log "decision-surface: paste held (target over-limit, in /login, or the API unreachable); the next fire retries"
         return 0
     fi
     _ensure_watcher_tmp_dir
@@ -5378,7 +5473,7 @@ _v2_task_compose_emit() {
             # set describes the emitted cache, and mixing them would read as a
             # change on every poll of the hold.
             local _fs_cache="$FULL_STATE_CANONICAL_CACHE" _fs_rf_ref="$_fs_rf_then"
-            if [[ -f "$_fs_held_cache" ]] && { _over_limit_orchestrator_paused || _auth_hold_active; }; then
+            if [[ -f "$_fs_held_cache" ]] && { _over_limit_orchestrator_paused || _auth_hold_active || _api_hold_active; }; then
                 _fs_cache="$_fs_held_cache"; _fs_rf_ref="$_fs_rf_now"
             fi
             if [[ -f "$_fs_cache" ]]; then
@@ -5673,6 +5768,16 @@ _v2_task_compose_emit() {
                     printf '%s' "$full_state_canonical" > "${_fs_held_cache}.tmp" 2>/dev/null \
                         && mv "${_fs_held_cache}.tmp" "$_fs_held_cache" 2>/dev/null || true
                 fi
+            # API-UNREACHABLE HOLD (your-org/nexus-code#1845). The fourth arm, for
+            # the five reasons the login arm states; the held full-state cache is
+            # written the same way so an unchanged board waits out its floor.
+            elif _api_hold_active; then
+                log "emit paste HELD: the Claude API is UNREACHABLE (api-hold) — a paste would start a turn that fails again and consume the emit; the watcher resumes the crashed windows itself on recovery (your-org/nexus-code#1845). archive=$(basename "$archive_path") reason=${reason}"
+                _api_hold_record_held "$(basename "$archive_path")" "$reason"
+                if (( full_state_due == 1 )) && [[ -n "$full_state_canonical" ]]; then
+                    printf '%s' "$full_state_canonical" > "${_fs_held_cache}.tmp" 2>/dev/null \
+                        && mv "${_fs_held_cache}.tmp" "$_fs_held_cache" 2>/dev/null || true
+                fi
             elif paste_with_retry "$TARGET" "$emit_body"; then
                 log "pasted to ${TARGET}"
                 # A paste landed: the hold (if any) is over (#1770).
@@ -5821,6 +5926,7 @@ _v2_task_compose_emit() {
 # class is caught by the progress/cycle cutoffs (_watcher_wedged), not
 # by starving the liveness signal.
 _schedule_task auth_hold               5            _v2_task_auth_hold              --class cheap
+_schedule_task api_hold                10           _v2_task_api_hold               --class cheap
 _schedule_task over_limit_wakes        5            _v2_task_over_limit_wakes       --class cheap
 _schedule_task orphan_async_wakes      15           _v2_task_orphan_async_wakes     --class cheap
 _schedule_task target_window           2            _v2_task_target_window_probe    --class cheap
@@ -5840,6 +5946,7 @@ _schedule_task snapshot_local          30           _v2_task_snapshot_local     
 _schedule_task idle_section            30           _v2_task_idle_section           --class expensive --async
 _schedule_task over_limit_scan         60           _v2_task_over_limit_scan        --class expensive --async
 _schedule_task orphan_async_scan       60           _v2_task_orphan_async_scan      --class expensive --async
+_schedule_task api_hold_probe          30           _v2_task_api_hold_probe         --class medium    --async
 # Event-fetch split (issue #181). Webhook (App-JWT bucket) is the
 # primary 15 s source; GraphQL backstop runs at 600 s on the
 # installation bucket. Compose_emit reads both staging files.

@@ -192,7 +192,11 @@ whoami                                 # → <SSH-USER> (the in-sandbox login us
 > `enroll-invite`'s enroll session cannot run): mint a bare token with
 > `monitor/ng remote issue-token --principal <P> --ttl <S>`, have the client send
 > its public key out-of-band, and run
-> `monitor/ng remote enroll --pubkey <file> --token <ONE-TIME-TOKEN>` yourself.
+> `printf '%s\n' '<ONE-TIME-TOKEN>' | monitor/ng remote enroll --pubkey <file> --token-stdin`
+> yourself. Use `--token-stdin`, never `--token <T>`: argv is world-readable in
+> `/proc/<pid>/cmdline` for the life of the process, and `printf` is a builtin in
+> bash and zsh, so this form puts the token in no process's argv
+> (<your-org>/nexus-code#1846 skeptic N2).
 > Same token machinery; one extra human step, no enroll key.
 
 **State the access restriction up front (operator informed-choice).** Tell the

@@ -34,17 +34,31 @@
 #          [--at <epoch>]          stamp opened_at with a supplied time —
 #                                  for incident REPLAY and for BACKFILL of
 #                                  pairs already live when this shipped
+#          [--subject S]           WHAT the reviewer is pinned to (a PR, a
+#                                  report, a round). Two edges that both carry
+#                                  one supersede only for the SAME subject
+#                                  (your-org/nexus-code#1849)
 #   settle <id> --reason "<why>" [--by TEXT]
 #   settle (--debtor W | --creditor W) [--kind K] --reason "<why>" [--by TEXT]
 #          --debtor  discharges what W owes;  --creditor discharges every
-#          reviewer of W (what `ng skeptic resolve W` means)
-#   note   <id>|--debtor W --text "<what happened>"
+#          reviewer of W (what `ng skeptic resolve W --all-reviewers` means;
+#          `--reviewer R` passes --creditor W --debtor R, one edge — #1848)
+#   note   <id>|--debtor W --text "<what happened>" [--verdict]
+#                                  --verdict also stamps `verdict_at`: this
+#                                  reviewer DELIVERED a round, which is what
+#                                  tells a handover from a concurrent review
+#                                  when no subject is recorded (#1849).
 #                                  append a ROUND event to the audit trail.
 #                                  Records a delivered round WITHOUT ending
 #                                  the pairing — the #845 correction.
 #   state  <id>                    print the derived state + detail
 #   show   <id>                    the full record, audit trail included
-#   list   [--live|--all] [--debtor W] [--creditor W] [--kind K]
+#   list   [--live|--all] [--debtor W] [--creditor W] [--kind K] [--tsv]
+#   reviews <from> <to> [--kind K] [--since-edge ID]
+#                                  rc 0 = <from> reviews <to> through a chain of
+#                                  K edges (default skeptic-verdict), rc 1 = not;
+#                                  --since-edge: only links opened since edge ID
+#                                  first opened (#1865)
 #   gate   <window>                rc 0 = nothing this window owes blocks
 #                                  retiring it; rc 1 = it owes somebody
 #   pairs                          every LIVE edge (who waits on whom)
@@ -125,7 +139,7 @@ _log() {
 # ---------------------------------------------------------------------------
 
 cmd_open() {
-    local debtor="" creditor="" kind="skeptic-verdict" round="" by="" detail="" at=""
+    local debtor="" creditor="" kind="skeptic-verdict" round="" by="" detail="" at="" subject=""
     _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --debtor)   debtor="${2:-}";   shift 2 || die "--debtor needs a value" ;;
@@ -135,16 +149,17 @@ cmd_open() {
             --by)       by="${2:-}";       shift 2 || die "--by needs a value" ;;
             --detail)   detail="${2:-}";   shift 2 || die "--detail needs a value" ;;
             --at)       at="${2:-}";       shift 2 || die "--at needs an epoch" ;;
+            --subject)  subject="${2:-}";  shift 2 || die "--subject needs a value" ;;
             *) die "unknown flag: $1" ;;
         esac
     done
     [[ -n "$debtor" && -n "$creditor" ]] \
-        || die "usage: obligations.sh open --debtor <window> --creditor <window> [--kind K] [--round N] [--by T] [--detail T]"
+        || die "usage: obligations.sh open --debtor <window> --creditor <window> [--kind K] [--round N] [--by T] [--detail T] [--subject S]"
     [[ -n "$by" ]] || by="obligations.sh open"
     local id
     # obl_open has already printed its refusal on stderr (see its header on
     # why it cannot use $OBL_ERR); do not print a second, emptier one over it.
-    id=$(obl_open "$STATE_DIR" "$debtor" "$creditor" "$kind" "${round:-0}" "$by" "$detail" "$at") \
+    id=$(obl_open "$STATE_DIR" "$debtor" "$creditor" "$kind" "${round:-0}" "$by" "$detail" "$at" "$subject") \
         || exit 1
     _log --event obligation-open \
         --extra "id=$id" --extra "debtor=$debtor" --extra "creditor=$creditor" \
@@ -181,7 +196,8 @@ cmd_settle() {
     else
         # EITHER end of the edge selects. `--debtor W` discharges what W
         # owes; `--creditor W` discharges every reviewer of W, which is what
-        # an orchestrator `ng skeptic resolve W` means (#926 F5).
+        # an orchestrator `ng skeptic resolve W --all-reviewers` means (#926
+        # F5). Both together select ONE edge: `resolve W --reviewer R` (#1848).
         [[ -n "$debtor" || -n "$creditor" ]] \
             || die "usage: obligations.sh settle <id> --reason \"…\"  |  settle (--debtor W | --creditor W) [--kind K] --reason \"…\""
         local _id _d _c _k
@@ -272,12 +288,13 @@ _settle_channel_notice() {
 }
 
 cmd_note() {
-    local id="" debtor="" creditor="" text=""
+    local id="" debtor="" creditor="" text="" mark=""
     _argloop_prev_3=-1; while (( $# > 0 )); do (( $# != _argloop_prev_3 )) || _argloop_stuck "$1"; _argloop_prev_3=$#
         case "$1" in
             --debtor)   debtor="${2:-}";   shift 2 || die "--debtor needs a value" ;;
             --creditor) creditor="${2:-}"; shift 2 || die "--creditor needs a value" ;;
             --text)     text="${2:-}";     shift 2 || die "--text needs a value" ;;
+            --verdict)  mark=verdict;      shift ;;
             -*) die "unknown flag: $1" ;;
             *)  [[ -z "$id" ]] || die "unexpected extra positional: $1"
                 id="$1"; shift ;;
@@ -304,7 +321,7 @@ cmd_note() {
     fi
     local one
     for one in "${ids[@]}"; do
-        obl_note "$STATE_DIR" "$one" "$text" || die "$OBL_ERR"
+        obl_note "$STATE_DIR" "$one" "$text" "$mark" || die "$OBL_ERR"
         printf 'noted on %s\n' "$one"
     done
 }
@@ -333,11 +350,41 @@ cmd_show() {
     sed 's/^/  /' "$f"
 }
 
+# reviews <from> <to> [--kind K] [--since-edge ID] — rc 0 if <from> reviews
+# <to> through a chain of K edges (default skeptic-verdict), rc 1 if not. See
+# obl_reviews. --since-edge counts only links opened since edge ID was FIRST
+# opened, the bound obl_state applies when it judges that edge (#1865).
+cmd_reviews() {
+    local from="" to="" kind="skeptic-verdict" since="" sedge=""
+    # ORDER-INDEPENDENT, like every other verb here (test-ng-flag-order part B):
+    # flags may come before, between or after the two positionals.
+    _argloop_prev_10=-1; while (( $# > 0 )); do (( $# != _argloop_prev_10 )) || _argloop_stuck "$1"; _argloop_prev_10=$#
+        case "$1" in
+            --kind)       kind="${2:-}";  shift 2 || die "--kind needs a value";       [[ -n "$kind" ]]  || die "--kind needs a value" ;;
+            --since-edge) sedge="${2:-}"; shift 2 || die "--since-edge needs an edge id"; [[ -n "$sedge" ]] || die "--since-edge needs an edge id" ;;
+            --*) die "unknown flag: $1" ;;
+            *)
+                if   [[ -z "$from" ]]; then from="$1"
+                elif [[ -z "$to"   ]]; then to="$1"
+                else die "reviews takes two positionals; unexpected extra positional: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$from" && -n "$to" ]] || die "reviews needs <from> <to>"
+    if [[ -n "$sedge" ]]; then
+        [[ -r "$(obl_path "$STATE_DIR" "$sedge")" ]] || die "--since-edge: no such obligation: $sedge"
+        since=$(_obl_first_opened "$STATE_DIR" "$sedge")
+    fi
+    obl_reviews "$STATE_DIR" "$from" "$to" "$kind" "$since"
+}
+
 cmd_list() {
-    local want_live=0 want_all=0 debtor="" creditor="" kind=""
+    local want_live=0 want_all=0 want_tsv=0 debtor="" creditor="" kind=""
     _argloop_prev_4=-1; while (( $# > 0 )); do (( $# != _argloop_prev_4 )) || _argloop_stuck "$1"; _argloop_prev_4=$#
         case "$1" in
             --live)     want_live=1; shift ;;
+            --tsv)      want_tsv=1;  shift ;;
             --all)      want_all=1;  shift ;;
             --debtor)   debtor="${2:-}";   shift 2 || die "--debtor needs a value" ;;
             --creditor) creditor="${2:-}"; shift 2 || die "--creditor needs a value" ;;
@@ -346,8 +393,14 @@ cmd_list() {
         esac
     done
     (( want_all == 1 )) && want_live=0
-    local id st _d_ignored d c k n=0
-    printf '%-11s  %-18s  %-18s  %-16s  %s\n' STATE DEBTOR CREDITOR KIND ID
+    local id st _d_ignored d c k sub n=0
+    # --tsv: one row per edge, NO header and NO footer, fields
+    #   state <TAB> debtor <TAB> creditor <TAB> kind <TAB> id <TAB> subject
+    # for a MACHINE reader (spawn-worker.sh's live-reviewer check,
+    # your-org/nexus-code#1858). The subject is already tab-flattened at write
+    # time (_obl_flatten), so it cannot split a row; an empty subject is an
+    # empty last field, never a missing one.
+    (( want_tsv == 1 )) || printf '%-11s  %-18s  %-18s  %-16s  %s\n' STATE DEBTOR CREDITOR KIND ID
     while IFS= read -r id; do
         [[ -n "$id" ]] || continue
         d=$(obl_get "$STATE_DIR" "$id" debtor)
@@ -358,10 +411,15 @@ cmd_list() {
         [[ -n "$kind"     && "$k" != "$kind"     ]] && continue
         st=$(obl_state "$STATE_DIR" "$id" | cut -f1)
         (( want_live == 1 )) && [[ "$st" != "live" ]] && continue
-        printf '%-11s  %-18s  %-18s  %-16s  %s\n' "$st" "$d" "$c" "$k" "$id"
+        if (( want_tsv == 1 )); then
+            sub=$(obl_get "$STATE_DIR" "$id" subject)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$st" "$d" "$c" "$k" "$id" "$sub"
+        else
+            printf '%-11s  %-18s  %-18s  %-16s  %s\n' "$st" "$d" "$c" "$k" "$id"
+        fi
         n=$(( n + 1 ))
     done < <(obl_ids "$STATE_DIR")
-    printf '(%d row(s); ledger %s)\n' "$n" "$(obl_dir "$STATE_DIR")"
+    (( want_tsv == 1 )) || printf '(%d row(s); ledger %s)\n' "$n" "$(obl_dir "$STATE_DIR")"
 }
 
 # gate <window> — the predicate retire-preflight consumes.
@@ -450,6 +508,7 @@ main() {
         state)  cmd_state  "$@" ;;
         show)   cmd_show   "$@" ;;
         list)   cmd_list   "$@" ;;
+        reviews) cmd_reviews "$@" ;;
         gate)   cmd_gate   "$@" ;;
         pairs)  cmd_pairs  "$@" ;;
         preserve-closures) cmd_preserve_closures "$@" ;;

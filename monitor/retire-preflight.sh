@@ -51,7 +51,7 @@
 #      the freshness window, AND its stamped session-id is NOT the
 #      window's own spawn session-id. This is the exact gap the incident
 #      exposed. The session-id qualifier closes a second false positive
-#      (coembed-283-followup, 2026-07-17): a submit carrying the
+#      (proj-x-followup, 2026-07-17): a submit carrying the
 #      window's OWN session-id is the worker's pane self-activity
 #      (autosuggest / post-wrap typing / its own tool loop), never the
 #      operator — who drives a DIFFERENT session and never raw-types into
@@ -87,7 +87,10 @@
 #      it". Default-DENY over the edge state: `live` and `unknown` refuse;
 #      only `settled`, `void-pairing-closed` (the reviewer ran `ng skeptic
 #      close` on the creditor's channel), `void-superseded` (a later reviewer
-#      is pinned to the same creditor) and `void-creditor-absent` (the
+#      is pinned to the same creditor FOR THE SAME REVIEW — a matching
+#      `--skeptic-subject`, or pinned after this one filed a verdict; a
+#      concurrent review never releases, your-org/nexus-code#1849) and
+#      `void-creditor-absent` (the
 #      creditor window is positively not in tmux) release.
 #      A FILED VERDICT IS NOT A RELEASE — it discharges one ROUND, not the
 #      PAIRING. Keying the release on the verdict (the first version of this
@@ -1185,7 +1188,7 @@ _disp_append_only_release() {
 # ---- check 1c: an outstanding `disposition: second-pass` ------------------
 # your-org/nexus-code#813. This gate decided retirement from PANE STATE and
 # OPERATOR ENGAGEMENT and never read the report the target had just filed. On
-# 2026-08-08 it returned `safe=1` for `bench272F-skeptic`, whose frontmatter
+# 2026-08-08 it returned `safe=1` for `bench-a-skeptic`, whose frontmatter
 # said:
 #
 #     verdict: refuted
@@ -1577,14 +1580,15 @@ if [[ -r "$self_dir/_obligations.sh" ]]; then
                 printf '  verdict (evidence=%s). This is the TWO-LEDGER DESYNC, not an unmet\n' \
                     "$_obl_ev_class" >&2
                 printf '  requirement: the verdict was delivered and the obligation EDGE was never\n' >&2
-                printf '  settled. Discharge it with `ng skeptic resolve %q` — that records the\n' "$_obl_first_creditor" >&2
-                printf '  resolution AND settles the edge in ONE act. Do not ask for another verdict.\n' >&2
+                printf '  settled. Discharge it with `ng skeptic resolve %q --reviewer %q` — that records\n' "$_obl_first_creditor" "$win_name" >&2
+                printf '  the resolution AND settles THIS reviewer'"'"'s edge in ONE act (--reviewer is required\n' >&2
+                printf '  while an edge is live, your-org/nexus-code#1848). Do not ask for another verdict.\n' >&2
                 printf '%s\n' "$_obl_ev" | sed -n '2,$p' | sed 's/^/      /' >&2
                 _obl_ev_tag=" | the CREDITOR skeptic ledger ALREADY records a verdict (evidence=$_obl_ev_class) — TWO-LEDGER DESYNC, settle the edge rather than asking for another review (your-org/nexus-code#1156)"
                 ;;
             *) _obl_ev_tag="" ;;
         esac
-        emit 0 "$pane_state" "this window OWES $_obl_n outstanding obligation(s) — it still owes \`$_obl_first_creditor\` and retiring it strands that window (your-org/nexus-code#845); discharge with \`ng skeptic resolve $_obl_first_creditor\` (ONE act: it records the resolution and settles the edge), or for a non-skeptic obligation \`ng obligation settle --debtor <window> --reason …\`${_obl_ev_tag:-}"
+        emit 0 "$pane_state" "this window OWES $_obl_n outstanding obligation(s) — it still owes \`$_obl_first_creditor\` and retiring it strands that window (your-org/nexus-code#845); discharge with \`ng skeptic resolve $_obl_first_creditor --reviewer $win_name\` (ONE act: it records the resolution and settles THIS reviewer's edge; --reviewer is required while an edge is live, your-org/nexus-code#1848), or for a non-skeptic obligation \`ng obligation settle --debtor <window> --reason …\`${_obl_ev_tag:-}"
         exit 1
     fi
 else
@@ -1634,8 +1638,15 @@ if (( up_epoch > 0 )); then
     if (( have_probe )) && declare -F _openg_machine_input_epoch >/dev/null 2>&1; then
         machine_epoch=$(_openg_machine_input_epoch "$win_name" 2>/dev/null)
     else
-        mi="$STATE_DIR/machine-input.tsv"
-        if [[ -f "$mi" ]]; then
+        # The ledger's ONE resolver (your-org/nexus-code#1724): the relocated
+        # ledger while `ng degraded enter` is in force, which is where every
+        # writer stamps. An unusable pointer reads as no ledger (mi empty).
+        if { declare -F nexus_ledger_path >/dev/null 2>&1 || . "$self_dir/_ledger_path.sh"; } 2>/dev/null; then
+            mi=$(nexus_ledger_path "$STATE_DIR" 2>/dev/null) || mi=""
+        else
+            mi="$STATE_DIR/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+        fi
+        if [[ -n "$mi" && -f "$mi" ]]; then
             # Column 2 is MICROSECONDS since your-org/nexus-code#679 and
             # SECONDS in rows written before it; both live in this
             # append-only file forever. `machine_epoch` is compared
@@ -1667,7 +1678,7 @@ if (( up_epoch > 0 )); then
         [[ "$slack" =~ ^[0-9]+$ ]] || slack=120
     fi
 
-    # Self-attribution guard (coembed-283-followup false positive,
+    # Self-attribution guard (proj-x-followup false positive,
     # 2026-07-17). Even with NO covering machine-input stamp, a submit
     # stamped with the window's OWN spawn session-id is machine/self
     # input (autosuggest / post-wrap typing / the worker's own tool

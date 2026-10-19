@@ -11,6 +11,7 @@
 #             delivered or refused. This is where a note the orchestrator pane
 #             REFUSED (an operator draft in the box) can still be read.
 #   probe:    degraded-probe.sh over the registered surfaces, run now.
+# plus the relocation pointer `ng degraded enter` writes, when one is in force.
 # A watcher that last said `degraded` while the probe now says OK has not yet
 # run its next cycle; the line says so rather than picking one.
 #
@@ -61,6 +62,30 @@ if [[ -n "$sf" && -f "$sf" ]]; then
 else
     echo "  no status file for $STATE_DIR (the watcher has not been degraded since the run dir was last cleared)"
 fi
+
+# THE RELOCATION POINTER (`ng degraded enter|exit`, degraded-relocate.sh): read
+# through the same resolver the surfaces use, so this line and the writers
+# cannot disagree about whether a relocation is in force.
+echo "relocation:"
+# shellcheck source=_degraded-pointer.sh
+. "$_self_dir/_degraded-pointer.sh"
+if _ptr=$(nexus_degraded_pointer_path "$STATE_DIR") && [[ -f "$_ptr" ]]; then
+    _ent=$(awk -F= '$1 == "entered" { print substr($0, 9); exit }' "$_ptr")
+    _age=""; [[ "$_ent" =~ ^[0-9]+$ ]] && _age=" (entered $(( $(date +%s) - _ent ))s ago)"
+    echo "  IN FORCE: $_ptr$_age — leave with \`ng degraded exit\`"
+    grep -v '^#' "$_ptr" | sed 's/^/  /'
+else
+    echo "  none: every surface resolves to the tree"
+fi
+# Relocations a restart WIPED before they were exited, not yet acknowledged —
+# listed even while a newer relocation is in force (the #1724 residual).
+_lost=$(nexus_degraded_lost_records "$STATE_DIR" 2>/dev/null) || _lost=""
+while IFS= read -r _rec; do
+    [[ -n "$_rec" ]] || continue
+    _at=$(awk -F'\t' '{ for (i = 1; i <= NF; i++) if ($i ~ /^entered=/) { print substr($i, 9); exit } }' <<<"$_rec")
+    if [[ "$_at" =~ ^[0-9]+$ ]]; then _w=$(date -d "@$_at" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "epoch $_at"); else _w="at an unrecorded time"; fi
+    echo "  LOST (unacknowledged): relocation entered $_w — its staged writes never reached the tree; acknowledge with \`ng degraded exit --ack-loss\`"
+done <<<"$_lost"
 
 echo "probe:"
 NEXUS_ROOT="$root" NEXUS_STATE_DIR="$STATE_DIR" bash "$_self_dir/degraded-probe.sh" --timeout "$timeout_s" | sed 's/^/  /'

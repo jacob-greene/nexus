@@ -120,6 +120,7 @@ npastes() { find "$PASTES" -type f | wc -l | tr -d ' '; }
 HELD=1
 _over_limit_orchestrator_paused() { (( HELD == 0 )); }
 _auth_hold_active() { return 1; }
+_api_hold_active() { return 1; }   # your-org/nexus-code#1845: the fourth hold arm
 OK=0; BAD=0
 _emit_delivery_ok()   { OK=$(( OK + 1 )); }
 _emit_delivery_fail() { BAD=$(( BAD + 1 )); }

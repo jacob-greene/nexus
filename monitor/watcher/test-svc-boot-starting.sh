@@ -26,14 +26,18 @@
 #   B2  the same row once the grace has elapsed (SVC_STARTUP_GRACE_SECONDS=0)
 #       → DOWN: a supervisor that never brings its service up is still flagged
 #   B3  the same row once the stub is serving → UP (the warm-up completes on
-#       its own; no restart was needed)
+#       its own; no restart was needed). Sampled only after the stub is SEEN
+#       serving, and while it is held serving (#1822: it used to linger ~3 s
+#       and exit on its own, and a loaded `svc.sh status` sampled after that)
 #   N1  failing healthcheck with NO supervisor record → DOWN (STARTING requires
 #       a LIVE supervisor; an unmanaged dead service is not "starting")
 #   N2  failing healthcheck with a DEAD supervisor record → DOWN, `stale`
 #
-# The stub is SHORT-LIVED (~8 s) so this suite never leaves a setsid child
-# behind (proc-kill-authorized refuses setsid session leaders by design, so a
-# harness should not create long-lived ones). Synthetic names only.
+# The stub exits when the test drops `stop`, when its workdir disappears (the
+# EXIT trap removes it), or at a ~60 s ceiling, whichever is first, so this
+# suite never leaves a setsid child behind (proc-kill-authorized refuses setsid
+# session leaders by design, so a harness should not create long-lived ones).
+# Synthetic names only.
 #
 # Run: bash monitor/watcher/test-svc-boot-starting.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
@@ -46,19 +50,24 @@ SVC="$_dir/../svc.sh"
 RECOVER="$_dir/../bootstrap-recover.sh"
 
 W=$(mktemp -d)
-trap 'rm -rf "$W"' EXIT
+trap ': > "$W/slow/stop" 2>/dev/null; rm -rf "$W"' EXIT
 mkdir -p "$W/root/monitor/.state" "$W/tmx" "$W/slow" "$W/nosup" "$W/dead"
 
-# A slow starter under the TEST's control: it stays not-ready until the test
-# drops `go` (bounded at ~30 s so it can never outlive the suite by much), then
-# becomes healthy (`ready`), lingers ~3 s, and exits by itself. Must NOT exec
-# away: the supervisor probe matches the launch token against the live cmdline.
+# A slow starter under the TEST's control, in both directions: it stays
+# not-ready until the test drops `go`, then is healthy (`ready`) until the test
+# drops `stop`. No phase ends on a timer the host's speed decides (#1822: a
+# ~3 s serving window ran out inside a loaded `svc.sh status`, which then read
+# the dead supervisor as DOWN). Both waits share one ~60 s ceiling and end
+# early if the workdir is gone, so it can never outlive the suite by much.
+# Must NOT exec away: the supervisor probe matches the launch token against
+# the live cmdline.
 cat > "$W/slow/stub-supervised.sh" <<'S'
 #!/usr/bin/env bash
 rm -f ready
-for _ in $(seq 1 300); do [[ -f go ]] && break; sleep 0.1; done
+end=$(( SECONDS + 60 ))
+while [[ ! -f go && -e "$PWD" ]] && (( SECONDS < end )); do sleep 0.1; done
 : > ready
-for _ in 1 2 3 4 5 6; do sleep 0.5; done
+while [[ ! -f stop && -e "$PWD" ]] && (( SECONDS < end )); do sleep 0.1; done
 rm -f ready
 S
 chmod +x "$W/slow/stub-supervised.sh"
@@ -114,16 +123,22 @@ assert_eq       "B2 grace elapsed → DOWN (a never-healthy service is still fla
 assert_not_contains "B2 …and no STARTING detail"                  "$(row slowsvc)" "STARTING"
 
 echo '=== left alone, the warm-up completes ==='
+# Wait on the stub's OWN serving state (`ready`, which is its healthcheck), with
+# a ceiling, and say so when it never came: then B3 has not been tested, which
+# is not the same as B3 failing. The stub keeps serving until `stop`, so the
+# status below samples a serving service however long it takes to run.
 : > "$W/slow/go"
 for _ in $(seq 1 100); do [[ -f "$W/slow/ready" ]] && break; sleep 0.1; done
+assert_eq       "fixture precondition: the stub is serving before status samples it" "$([[ -f "$W/slow/ready" ]] && echo yes)" "yes"
 run_status
 assert_eq       "B3 the stub finished starting → UP, no restart needed" "$(word slowsvc)" "UP"
 
-# Let the short-lived stub finish before the trap removes its workdir.
+# Release the stub and let it exit before the trap removes its workdir.
+: > "$W/slow/stop"
 for _ in $(seq 1 120); do [[ -f "$W/slow/ready" ]] || break; sleep 0.1; done
 
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, count=exact).
-EXPECTED=12
+EXPECTED=13
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

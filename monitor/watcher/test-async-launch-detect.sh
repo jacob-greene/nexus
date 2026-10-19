@@ -88,20 +88,20 @@ echo "=== default pattern set: sbatch / srun --no-block / nohup ==="
 
 # (1) sbatch with id in stdout.
 reset_hb
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
+fire_hook "sbatch run.sh" "Submitted batch job 12345678"
 got=$(read_waits)
-if jq -e '. == [{kind:"slurm",id:"52527284",desc:"sbatch"}]' <<<"$got" >/dev/null; then
-    ok "sbatch run.sh → kind=slurm id=52527284"
+if jq -e '. == [{kind:"slurm",id:"12345678",desc:"sbatch"}]' <<<"$got" >/dev/null; then
+    ok "sbatch run.sh → kind=slurm id=12345678"
 else
     bad "sbatch basic" "got=$got"
 fi
 
 # (2) sbatch --array with array job id.
 reset_hb
-fire_hook "sbatch --array=1-10 --wrap='echo hi'" "Submitted batch job 52527285_1"
+fire_hook "sbatch --array=1-10 --wrap='echo hi'" "Submitted batch job 12345679_1"
 got=$(read_waits)
 id=$(jq -r '.[0].id' <<<"$got")
-if [[ "$id" == "52527285_1" ]]; then
+if [[ "$id" == "12345679_1" ]]; then
     ok "sbatch --array → array id captured"
 else
     bad "sbatch array" "got=$got"
@@ -109,8 +109,8 @@ fi
 
 # (3) Repeat same sbatch — idempotent on (kind, id).
 reset_hb
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
+fire_hook "sbatch run.sh" "Submitted batch job 12345678"
+fire_hook "sbatch run.sh" "Submitted batch job 12345678"
 got=$(read_waits)
 count=$(jq 'length' <<<"$got")
 if [[ "$count" == "1" ]]; then
@@ -702,6 +702,12 @@ _case "BOUNDARY: eval QUOTED is NOT caught"           quiet 'eval "srun --no-blo
 _gap 'direct pipe into the launcher: ... | srun'      'cat ids.txt | srun --no-block ./j.sh'
 _gap 'direct pipe into sbatch: ... | sbatch'          'cat list | sbatch job.sh'
 
+# Found while fixing your-org/nexus-code#1864: the dry-run fix counts these as
+# sbatch invocations, but no row matches the position, so on their own they arm
+# nothing. Neither is undecidable; neither is covered yet.
+_gap 'escaped command word: \sbatch job.sh'           '\sbatch job.sh'
+_gap 'the command builtin: command sbatch job.sh'     'command sbatch job.sh'
+
 # The consequence of that decline, asserted from the other side so the trade is
 # visible in one place: a markdown table row must stay QUIET.
 _case "markdown table row does not fire (why a bare pipe is declined)" quiet \
@@ -713,18 +719,14 @@ _case "markdown table row does not fire (why a bare pipe is declined)" quiet \
 #
 # residual — the old unanchored row fired on this too:
 _case "KNOWN FP: prose after a separator (residual, srun)"  fire 'echo a; srun --no-block is what the row matches'
-# INTRODUCED by the sbatch separator row added in this PR. The sbatch row
-# lacks srun's `[^&]*--no-block` constraint, so `; sbatch <anything>` is
-# enough. Kept because it buys `cd /tmp && sbatch job.sh`, a real launch
-# that was silently missed before.
-_case "KNOWN FP: prose after a separator (INTRODUCED, sbatch)" fire \
+# WERE KNOWN FPs, CLOSED BY your-org/nexus-code#1832: the hook now blanks
+# the body of every quoted string before any row is tried, so a separator
+# INSIDE a quote is no longer a separator. The sbatch separator row (which
+# lacks srun's `[^&]*--no-block` constraint) and the `||` position
+# (your-org/nexus-code#1269) introduced these two; both are prose in QUOTES.
+_case "FIXED (#1832): quoted prose after a separator (sbatch)" quiet \
     "git commit -m 'two rows now; sbatch after a separator is matched'"
-# INTRODUCED by the `||` position (your-org/nexus-code#1269) — the same shape as
-# the `;` residual above, on a different separator. It is the WHOLE measured
-# price of that position: on a 24-prose / 24-launch corpus the change went
-# 4/24 -> 5/24 prose FP and 10/24 -> 20/24 launches caught. Declared as `fire`
-# so a later silencing is noticed rather than assumed.
-_case "KNOWN FP: prose carrying a literal || (INTRODUCED)" fire \
+_case "FIXED (#1832): quoted prose carrying a literal ||" quiet \
     "echo 'either you sbatch it || srun --no-block it'"
 
 echo "=== #948 round 3: a separator class must not contain PROSE characters ==="
@@ -757,9 +759,10 @@ _case "if/then still fires"                         fire  'if true; then sbatch 
 _case "brace group WITH whitespace still fires"     fire  '{ sbatch job.sh; }'
 _case "subshell paren still fires"                  fire  '( sbatch job.sh )'
 
-# UNDECIDABLE — declared, not chased. Contains a literal `; then sbatch`,
-# textually identical to a real `if …; then sbatch …`.
-_case "UNDECIDABLE: '; then sbatch' in prose still fires" fire \
+# WAS UNDECIDABLE to a regex over raw text: a literal `; then sbatch`,
+# textually identical to a real `if …; then sbatch …`. It is inside QUOTES,
+# and since your-org/nexus-code#1832 quoted text is masked before matching.
+_case "FIXED (#1832): '; then sbatch' in quoted prose is quiet" quiet \
     'echo "if it is a batch job; then sbatch is the row that matches"'
 
 # WAS A KNOWN FALSE POSITIVE, CLOSED BY your-org/nexus-code#1312.
@@ -878,7 +881,7 @@ echo "=== ONE WAIT PER JOB, NOT ONE PER CALL (your-org/nexus-code#1071) ==="
 # unrecoverable case at exactly the shape (a dose grid) that is COMMON for this
 # kind of work.
 reset_hb
-_grid_out=$(for i in $(seq 2220890 2220904); do echo "Submitted batch job $i"; done)
+_grid_out=$(for i in $(seq 3000100 3000114); do echo "Submitted batch job $i"; done)
 fire_hook 'for i in $(seq 1 15); do sbatch j.sh; done' "$_grid_out"
 got=$(read_waits)
 n=$(jq 'length' <<<"$got")
@@ -887,7 +890,7 @@ if [[ "$n" == "15" ]]; then
 else
     bad "grid tokenisation" "got $n waits, expected 15 — got=$got"
 fi
-if jq -e 'map(.id) == ["2220890","2220891","2220892","2220893","2220894","2220895","2220896","2220897","2220898","2220899","2220900","2220901","2220902","2220903","2220904"]' <<<"$got" >/dev/null; then
+if jq -e 'map(.id) == ["3000100","3000101","3000102","3000103","3000104","3000105","3000106","3000107","3000108","3000109","3000110","3000111","3000112","3000113","3000114"]' <<<"$got" >/dev/null; then
     ok "…and every id is the REAL job id, in order"
 else
     bad "grid ids" "got=$(jq -c 'map(.id)' <<<"$got")"
@@ -913,11 +916,11 @@ fi
 # dangerous direction `#1071` names.
 reset_hb
 NEXUS_STATE_DIR="$WORK/.state" NEXUS_WORKER_WINDOW=testw \
-    bash "$_test_dir/../declare-no-wait.sh" slurm 2220891 >/dev/null 2>&1
+    bash "$_test_dir/../declare-no-wait.sh" slurm 3000101 >/dev/null 2>&1
 fire_hook 'for i in $(seq 1 15); do sbatch j.sh; done' "$_grid_out"
 got=$(read_waits)
 n=$(jq 'length' <<<"$got")
-if [[ "$n" == "14" ]] && jq -e 'map(.id) | index("2220891") | not' <<<"$got" >/dev/null; then
+if [[ "$n" == "14" ]] && jq -e 'map(.id) | index("3000101") | not' <<<"$got" >/dev/null; then
     ok "dismissing ONE grid job leaves the other 14 registered"
 else
     bad "per-id dismissal" "n=$n got=$(jq -c 'map(.id)' <<<"$got")"
@@ -946,9 +949,9 @@ echo "=== F2: `sbatch --parsable` prints a BARE id, and used to mint a syn- ==="
 # where the old code yielded a real (first) id and never a `syn-`. Two different
 # paths; neither subsumes the other.
 reset_hb
-fire_hook "sbatch --parsable job.sh" "2307577"
+fire_hook "sbatch --parsable job.sh" "2345678"
 got=$(read_waits)
-if jq -e '. == [{kind:"slurm",id:"2307577",desc:"sbatch --parsable"}]' <<<"$got" >/dev/null; then
+if jq -e '. == [{kind:"slurm",id:"2345678",desc:"sbatch --parsable"}]' <<<"$got" >/dev/null; then
     ok "sbatch --parsable → the REAL id, not a syn- token"
 else
     bad "parsable bare id" "got=$got"
@@ -966,8 +969,8 @@ fi
 
 # `--parsable` may append `;<cluster>`.
 reset_hb
-fire_hook "sbatch --parsable j.sh" "2307577;cluster"
-if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2307577" ]]; then
+fire_hook "sbatch --parsable j.sh" "2345678;cluster"
+if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2345678" ]]; then
     ok "the ;<cluster> suffix is stripped from a parsable id"
 else
     bad "parsable cluster suffix" "got=$(read_waits)"
@@ -992,7 +995,7 @@ else
     bad "#1629 phantom ids from line-numbered output" "got=$(jq -c 'map(.id)' <<<"$got")"
 fi
 reset_hb
-fire_hook "sbatch --parsable j.sh" "2307577 jobs queued"
+fire_hook "sbatch --parsable j.sh" "2345678 jobs queued"
 got=$(read_waits)
 if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$got" >/dev/null; then
     ok "#1629 a line that only BEGINS with digits is not a parsable id (syn- fallback)"
@@ -1000,8 +1003,8 @@ else
     bad "#1629 digits-then-words line read as an id" "got=$got"
 fi
 reset_hb
-fire_hook "sbatch --parsable j.sh" "2307577  "
-if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2307577" ]]; then
+fire_hook "sbatch --parsable j.sh" "2345678  "
+if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2345678" ]]; then
     ok "#1629 trailing whitespace after a parsable id is still accepted (control)"
 else
     bad "#1629 trailing whitespace" "got=$(read_waits)"
@@ -1036,7 +1039,7 @@ fi
 # which is the exact failure this issue exists to prevent. So a plain `sbatch`
 # must NOT gain the bare-id reading.
 reset_hb
-fire_hook "sbatch job.sh" "2307577"
+fire_hook "sbatch job.sh" "2345678"
 got=$(read_waits)
 if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$got" >/dev/null; then
     ok "a plain sbatch does NOT read bare numeric stdout as a job id"
@@ -1095,6 +1098,15 @@ else
     bad "prefix group drifted" "rows carrying it: $_pre_rows (expected 6); distinct spellings: $_pre_groups (expected 1)"
 fi
 
+# your-org/nexus-code#1868 left an UNQUOTED `$(cat <<EOF` whose closing `)`
+# carries the output into a shell on a LATER line as a gap. #1870 item 5 closed
+# it; the cases are in the #1870 section below. What is left of the family is a
+# DATAFLOW member: the value is captured by an assignment the mask allows, and
+# run later through the variable. Following a variable to its use is out of
+# reach for a per-command text scan.
+_gap "#1870 x=\$(cat <<EOF … EOF) && \$x: the captured value runs later, through the variable" \
+    "$(printf 'x=$(cat <<EOF\nsbatch job.sh\nEOF\n) && $x')"
+
 # GAP LEDGER (your-org/nexus-code#1269). The falsifiable half of `_gap`.
 #
 # Each `_gap` arm records the current answer without asserting it is correct;
@@ -1106,7 +1118,7 @@ fi
 #
 # It catches the other direction too: a covered launch falling back into a gap
 # reddens both its own `fire` assertion and this count.
-_EXPECTED_OPEN_GAPS=3
+_EXPECTED_OPEN_GAPS=6   # #1870: echo $(cat <<EOF …) | bash CLOSED, x=$(cat <<EOF …) && $x opened; +1: echo $(cat <<EOF …) | bash (#1868); +2: \sbatch and command sbatch (found with #1864)
 if (( _GAPS_OPEN == _EXPECTED_OPEN_GAPS )); then
     ok "gap ledger: exactly $_EXPECTED_OPEN_GAPS declared gaps still open"
 else
@@ -1117,6 +1129,141 @@ fi
 # COUNT GUARD. This suite had none; a case that stops running would otherwise
 # show up as a smaller green.
 # ── your-org/nexus-code#1439: the row records WHO launched it ────────────────
+echo "=== #1832 command position: quoted text is not a command; sbatch spoke first ==="
+# (A) A worker that ran no Slurm job got `slurm:syn-…` from a COMMIT MESSAGE:
+# per-line matching made line 3 of the quoted message a line start. Quoted
+# bodies and comments are masked before any row is tried, so none of these
+# may register a wait.
+_case "#1832 multi-line commit message naming sbatch is quiet" quiet \
+    "$(printf 'git commit -m "fix: rename\n\nsbatch job names in code are now stable"')"
+_case "#1832 echo of a quoted launch is quiet"            quiet 'echo "x && sbatch y.sh"'
+_case "#1832 ng send --message naming sbatch is quiet"    quiet \
+    "ng send w1 --message 'please run; sbatch j.sh later'"
+_case "#1832 quoted string with a newline-led sbatch is quiet" quiet \
+    "$(printf "printf '%%s\\\\n' 'a\nsbatch j.sh'")"
+_case "#1832 heredoc body naming sbatch is quiet"         quiet \
+    "$(printf "cat > notes.md <<'EOF'\nthen; sbatch j.sh\nEOF")"
+_case "#1832 a trailing comment naming sbatch is quiet"   quiet 'ls # then; sbatch j.sh'
+_case "#1832 parenthesised mention in quotes is quiet"    quiet "echo 'call it (sbatch) for short'"
+# …and every real launch position still fires, quotes ELSEWHERE notwithstanding.
+_case "#1832 sbatch x.sh fires"                           fire  'sbatch x.sh'
+_case "#1832 env A=1 sbatch fires"                        fire  'env A=1 sbatch x.sh'
+_case "#1832 timeout 5 sbatch fires"                      fire  'timeout 5 sbatch x.sh'
+_case "#1832 quoted ARGUMENTS of a real sbatch still fire" fire 'sbatch --job-name="w1 run" --wrap="a; b" x.sh'
+_case "#1832 a runner's quoted command is NOT masked"     fire  "ssh node01 'cd /data/proj-x && sbatch j.sh'"
+_case "#1832 a commit message BEFORE a real launch does not hide it" fire \
+    "$(printf 'git commit -m "msg"\nsbatch j.sh')"
+_case "#1832 an unterminated quote falls back to scanning everything" fire \
+    "$(printf 'echo "oops\nsbatch j.sh')"
+
+_ids_are() {   # <label> <cmd> <stdout> <expected ids as JSON array, or "syn">
+    local label="$1" cmd="$2" out="$3" want="$4" got
+    reset_hb
+    fire_hook "$cmd" "$out" >/dev/null 2>&1
+    got=$(jq -c 'map(.id)' <<<"$(read_waits)")
+    if [[ "$want" == syn ]]; then
+        if jq -e 'length == 1 and (.[0] | startswith("syn-"))' <<<"$got" >/dev/null; then ok "$label"; else bad "$label" "got=$got"; fi
+    elif jq -e --argjson w "$want" '. == $w' <<<"$got" >/dev/null; then
+        ok "$label"
+    else
+        bad "$label" "want=$want got=$got"
+    fi
+}
+_ids_are "#1832 cd d && sbatch --parsable j.sh reads the bare id" \
+    'cd d && sbatch --parsable j.sh' '1234567' '["1234567"]'
+_ids_are "#1832 jid=\$(sbatch --parsable …) stays a syn- wait (#1727 unchanged)" \
+    'jid=$(sbatch --parsable j.sh)' '' syn
+# Was a `syn-` pin; since #1859 the echoed variable is read back by position.
+_ids_are "#1832/#1859 jid=\"\$(sbatch --parsable …)\"; echo \"\$jid\" in double quotes reads the echoed id" \
+    'jid="$(sbatch --parsable j.sh)"; echo "$jid"' '1234567' '["1234567"]'
+# (B) sbatch --parsable FIRST, other commands after: stdout's first line is
+# sbatch's, so it is the id — this was a `syn-` wait (observed 3x).
+_ids_are "#1832 sbatch --parsable a.sh; echo done → the real id, not syn-" \
+    'sbatch --parsable a.sh; echo done' "$(printf '1234567\ndone')" '["1234567"]'
+_ids_are "#1832 a later grep -c is not a vouching echo: syn-, as on dev (declared cost)" \
+    'sbatch --parsable a.sh 2>&1; grep -c x f' "$(printf '1234567\n3')" syn
+_ids_are "#1832 echo hi; sbatch b.sh reads the Submitted line" \
+    'echo hi; sbatch b.sh' "$(printf 'hi\nSubmitted batch job 1234568')" '["1234568"]'
+# The guards on that rule, each a way the first line could be someone else's.
+_ids_are "#1832 guard: a FAILED sbatch (error in stdout) does not lend its slot to grep" \
+    'sbatch --parsable a.sh; grep -c x f' "$(printf 'sbatch: error: Batch job submission failed\n3')" syn
+reset_hb
+jq -nc --arg cmd 'sbatch --parsable a.sh; grep -c x f' \
+    '{hook_event_name:"PostToolUse",tool_name:"Bash",tool_input:{command:$cmd},tool_response:{stdout:"3",stderr:"sbatch: error: Batch job submission failed"}}' \
+  | env -u NEXUS_WORKER_WINDOW NEXUS_STATE_DIR="$WORK/.state" NEXUS_WORKER_WINDOW=testw \
+      NEXUS_ASYNC_PATTERNS="$PATTERNS_DEFAULT" bash "$HOOK" >/dev/null 2>&1
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$(read_waits)" >/dev/null; then
+    ok "#1832 guard: a FAILED sbatch (error in stderr) does not lend its slot to grep"
+else
+    bad "#1832 guard: stderr sbatch error" "got=$(read_waits)"
+fi
+_ids_are "#1832 guard: a printing command BEFORE sbatch keeps it distrusted" \
+    'grep -c x f; sbatch --parsable a.sh' "$(printf '1\n1234567')" syn
+_ids_are "#1832 guard: a backgrounded sbatch can be overtaken" \
+    'sbatch --parsable a.sh & echo 5' "$(printf '5\n1234567')" syn
+_ids_are "#1832 guard: a loop repeats, so one sbatch in the text is not one run" \
+    'for f in a b; do sbatch --parsable "$f"; echo x; done' "$(printf '1234567\nx')" syn
+_ids_are "#1832 control: | tee after sbatch keeps the first-line reading" \
+    'sbatch --parsable a.sh | tee id.txt; echo done' "$(printf '1234567\ndone')" '["1234567"]'
+_ids_are "#1832 guard: | tee then echo 5 is not vouched (echo of a digit)" \
+    'sbatch --parsable a.sh | tee id.txt; echo 5' "$(printf '1234567\n5')" syn
+
+# ncbundle27-sk F1: a sbatch that fails SILENTLY on stdout lends stdout's first
+# line to the next printer, and its failure text is open-ended. So the first
+# printer after sbatch must be an `echo <word>` whose line is never an integer.
+_ids_are "#1832 F1 repro: timeout kills sbatch, echo \$? prints 124 → never slurm:124" \
+    'timeout 60 sbatch --parsable j.sh; echo $?' '124' syn
+_ids_are "#1832 F1 repro: wc -l < ids.txt prints 42 → never slurm:42" \
+    'sbatch --parsable j.sh; wc -l < ids.txt' '42' syn
+_ids_are "#1832 F1 repro: the ORIGINAL #1727 core fixture (stdout just '1') → never slurm:1" \
+    'sbatch --parsable j.sh; grep -c x f' '1' syn
+_ids_are "#1832 F1 invariant: a SILENT failure before echo done reads no id" \
+    'sbatch --parsable a.sh; echo done' 'done' syn
+_ids_are "#1832 F1 guard (wrapper, isolated): timeout … sbatch; echo done is refused" \
+    'timeout 60 sbatch --parsable a.sh; echo done' "$(printf '1234567\ndone')" syn
+_ids_are "#1832 F1 guard: a QUOTED echo is masked, so not vouched (declared cost)" \
+    'sbatch --parsable a.sh; echo "done"' "$(printf '1234567\ndone')" syn
+_ids_are "#1832 F1 guard: source after sbatch can print anything" \
+    'sbatch --parsable a.sh; source env.sh; echo done' "$(printf '7\ndone')" syn
+_ids_are "#1832 F1 control: && echo submitted vouches" \
+    'sbatch --parsable a.sh && echo submitted' "$(printf '1234567\nsubmitted')" '["1234567"]'
+_ids_are "#1832 F1 control: cd between sbatch and the echo is quiet" \
+    'sbatch --parsable a.sh; cd d; echo done' "$(printf '1234567\ndone')" '["1234567"]'
+# ncbundle27-sk R1: `&&` (or `then`) SKIPS the echo exactly when sbatch fails,
+# so a conditional echo vouches only when nothing after it can print.
+_ids_are "#1832 R1 repro: sbatch && echo ok; grep -c x f (stdout '1') → never slurm:1" \
+    'sbatch --parsable j.sh && echo ok; grep -c x f' '1' syn
+_ids_are "#1832 R1 repro: sbatch && cd /d && echo ok; wc -l < f (stdout '7') → never slurm:7" \
+    'sbatch --parsable j.sh && cd /d && echo ok; wc -l < f' '7' syn
+_ids_are "#1832 R1 guard: an echo opened by else never runs after the then-branch sbatch" \
+    'if true; then sbatch --parsable j.sh; else echo ok; fi; grep -c x f' '1' syn
+_ids_are "#1832 R1 control: sbatch; echo ok inside one then-branch still vouches" \
+    'if true; then sbatch --parsable j.sh; echo ok; fi; grep -c x f' "$(printf '1234567\nok\n1')" '["1234567"]'
+_ids_are "#1832 R1 control: an UNCONDITIONAL ; echo vouches despite a later printer" \
+    'sbatch --parsable j.sh; echo ok; grep -c x f' "$(printf '1234567\nok\n1')" '["1234567"]'
+reset_hb
+jq -nc --arg cmd 'sbatch --parsable a.sh; echo done' \
+    '{hook_event_name:"PostToolUse",tool_name:"Bash",tool_input:{command:$cmd},tool_response:{stdout:"1234567\ndone",stderr:"warning: something"}}' \
+  | env -u NEXUS_WORKER_WINDOW NEXUS_STATE_DIR="$WORK/.state" NEXUS_WORKER_WINDOW=testw \
+      NEXUS_ASYNC_PATTERNS="$PATTERNS_DEFAULT" bash "$HOOK" >/dev/null 2>&1
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$(read_waits)" >/dev/null; then
+    ok "#1832 F1 guard (separated stderr, isolated): any stderr refuses the first-line rule"
+else
+    bad "#1832 F1 guard: separated stderr" "got=$(read_waits)"
+fi
+# The skeptic's stub repro as observed: the stub's error on stderr matches
+# neither `sbatch:` token, stdout is grep's count alone.
+reset_hb
+jq -nc --arg cmd 'sbatch --parsable j.sh; grep -c done log' \
+    '{hook_event_name:"PostToolUse",tool_name:"Bash",tool_input:{command:$cmd},tool_response:{stdout:"3",stderr:"error: chaperon is not responding"}}' \
+  | env -u NEXUS_WORKER_WINDOW NEXUS_STATE_DIR="$WORK/.state" NEXUS_WORKER_WINDOW=testw \
+      NEXUS_ASYNC_PATTERNS="$PATTERNS_DEFAULT" bash "$HOOK" >/dev/null 2>&1
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$(read_waits)" >/dev/null; then
+    ok "#1832 F1 repro: a stub's unrecognised stderr, then grep -c → never slurm:3"
+else
+    bad "#1832 F1 repro: stub stderr" "got=$(read_waits)"
+fi
+
 # An in-process subagent fires this hook under the PARENT's window, so the
 # wait lands on a heartbeat whose transcript cannot explain it. The payload's
 # transcript_path (a subagent's is its own file) and, where the harness sets
@@ -1148,7 +1295,350 @@ got=$(read_waits)
 assert_eq "#1439 CONTROL: no identity in the payload → no launcher field (not an empty string)" \
     "$(jq -r '.[0] | has("launcher")' <<<"$got")" "false"
 
-_EXPECTED_ASSERTIONS=127   # +3: #1439 launcher identity on the row; +3: #1629 phantom parsable ids; +2: #1727 id 0 / $(…)
+echo "=== #1854: a dry run arms nothing; an id sbatch wrote to a file is TRACKED ==="
+# Synthetic stand-ins for the four measured 2026-10-16 commands (sha1 of each
+# real command matched its syn- id); paths, ids and node names replaced.
+_ids() { read_waits | jq -r '[.[].id] | join(",")'; }
+_k1854() {   # <label> <want: id | syn | none> <cmd> <stdout>
+    reset_hb; fire_hook "$3" "$4" >/dev/null 2>&1
+    local got; got=$(_ids)
+    case "$2" in
+        none) assert_eq "$1" "$got" "" ;;
+        syn)  if [[ "$got" == syn-* && "$got" != *,* ]]; then ok "$1"; else bad "$1" "got=[$got] want a single syn- wait"; fi ;;
+        *)    assert_eq "$1" "$got" "$2" ;;
+    esac
+}
+# (a) DRY RUNS — no job exists, so no wait of any kind.
+_k1854 "#1854a sbatch --test-only arms NOTHING" none \
+    'sbatch --test-only --job-name=p --wrap="b.sh 9900"' 'sbatch: Job 1234567 to start at 2026-10-18T21:10:20 using 8 processors on nodes node01'
+_k1854 "#1854a the measured probe shape (test-only after && inside a longer call) arms NOTHING" none \
+    'EX=$(x/exclude_nodes.sh); rc=$?; echo "exclude rc=$rc: $EX"; [[ $rc == 0 && -n $EX ]] && sbatch --test-only --job-name=p --exclude="$EX" --wrap="'"'"'b.sh'"'"' 9900"; echo "test-only rc=$?"' \
+    $'exclude rc=0: node01\nsbatch: Job 1234567 to start at 2026-10-18T21:10:20\ntest-only rc=0'
+_k1854 "#1854a sbatch --help arms NOTHING" none 'sbatch --help' 'Usage: sbatch [OPTIONS(0)...] [ : [OPTIONS(N)...]] script(0) [args(0)...]'
+_k1854 "#1854a MUST-FIRE: --test-only AFTER the script is the job's own argument — a real submit" 1234567 \
+    'sbatch job.sh --test-only' 'Submitted batch job 1234567'
+_k1854 "#1854a MUST-FIRE: a dry sbatch beside a real one still tracks the real one" 1234568 \
+    'sbatch --test-only a.sh; sbatch b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+# (b) THE FILE-THEN-cat SHAPE: tracked, but only on a printed rc=0.
+_k1854 "#1854b EX=\$(…) && sbatch --parsable > F; echo rc; cat F → TRACKED slurm id" 1234567 \
+    'P=/data/proj-x/p; EX=$(x/exclude_nodes.sh) && sbatch --parsable --job-name=p --exclude="$EX" --wrap="'"'"'$W/b.sh'"'"' 9900 -- bash '"'"'$P/probe.sh'"'"'" > $P/JOBID.txt; echo "sbatch rc=$?"; cat $P/JOBID.txt' \
+    $'sbatch rc=0\n1234567'
+_k1854 "#1854b a long && chain with an echo BEFORE sbatch → TRACKED" 1234568 \
+    'C=/data/proj-x/c; [[ ! -e $C ]] && mkdir $C && cd /data/proj-x && [[ $(git rev-parse HEAD) == $S ]] && [[ -z $(git status --porcelain) ]] && EX=$(x/exclude_nodes.sh) && echo "re-asserted: clean; excludes=$EX" && sbatch --parsable --job-name=c --wrap="$PWD/b.sh 3300 $C/ok -- bash $PWD/j.sh $S" > $C/JOBID.txt; echo "rc=$?"; cat $C/JOBID.txt' \
+    $'re-asserted: clean; excludes=node01\nrc=0\n1234568'
+_k1854 "#1854b the hold-test shape (pipes inside \$(…), printf > file earlier) → TRACKED" 1234569 \
+    'H=/data/proj-x/h; mkdir "$H" && printf '"'"'PROBE-ONLY.\n'"'"' > $H/README && chmod 444 $H/README; EX=$(x/exclude_nodes.sh 2>/dev/null); [ -z "$EX" ] && EX=$(cd /data/proj-x && git show s:f.txt | command grep -vE '"'"'^(#|$)'"'"' | cut -f1 | paste -sd,); echo "exclude=$EX"; SBATCH_HOLD=1 sbatch --parsable --job-name=h --wrap="timeout 60 bash -c '"'"'hostname'"'"'" > $H/JOBID.txt; echo "sbatch rc=$?"; cat $H/JOBID.txt' \
+    $'exclude=node01\nsbatch rc=0\n1234569'
+_k1854 "#1854b NEGATIVE: rc=1 printed (sbatch skipped or failed; F holds an OLD id) → syn, never the stale id" syn \
+    'EX=$(x.sh) && sbatch --parsable --wrap=b > $P/JOBID.txt; echo "sbatch rc=$?"; cat $P/JOBID.txt' $'sbatch rc=1\n7654321'
+_k1854 "#1854b NEGATIVE: an || in the call (rc=0 no longer proves sbatch ran) → syn" syn \
+    'test -e x || sbatch --parsable --wrap=b > F; echo "rc=$?"; cat F' $'rc=0\n1234567'
+_k1854 "#1854b NEGATIVE: an if-branch around sbatch → syn" syn \
+    'if test -e x; then sbatch --parsable --wrap=b > F; fi; echo "rc=$?"; cat F' $'rc=0\n1234567'
+_k1854 "#1854b NEGATIVE: the echo expands another variable (it can print an integer line) → syn" syn \
+    'sbatch --parsable --wrap=b > F; echo "rc=$? $X"; cat F' $'rc=0 \n1234567'
+_k1854 "#1854b NEGATIVE: cat of a DIFFERENT file → syn" syn \
+    'sbatch --parsable --wrap=b > F; echo "rc=$?"; cat G' $'rc=0\n1234567'
+_k1854 "#1854b NEGATIVE: an APPEND (>>) keeps old ids → syn" syn \
+    'sbatch --parsable --wrap=b >> F; echo "rc=$?"; cat F' $'rc=0\n1234567'
+_k1854 "#1854b NEGATIVE: no rc echo between sbatch and cat → syn" syn \
+    'sbatch --parsable --wrap=b > F; cat F; echo "rc=$?"' $'1234567\nrc=0'
+_k1854 "#1854b PIN: an && chain with 'Submitted batch job' was already tracked, and stays so" 1234570 \
+    'git add f && sbatch job.sh' 'Submitted batch job 1234570'
+_k1854 "#1854b PIN: …and read back through > F; cat F" 1234571 \
+    'sbatch job.sh > F; cat F' 'Submitted batch job 1234571'
+
+echo "=== #1859: a substituted sbatch whose variable is echoed is TRACKED; a dry flag after an option VALUE arms nothing ==="
+# (a) jid=$(sbatch --parsable …) puts the id in the VARIABLE. Echoed as the
+# call's last and only printing command, the id is read back; every other shape
+# keeps the syn- wait (a loud miss, never a guessed id).
+_k1859() { _k1854 "$@"; }
+_k1859 "#1859a jid=\$(sbatch --parsable …); echo \"\$jid\" → TRACKED" 1234567 \
+    'jid=$(sbatch --parsable -p part-x job.sh); echo "$jid"' '1234567'
+_k1859 "#1859a no later echo → still a syn- wait (nothing on stdout to read)" syn \
+    'jid=$(sbatch --parsable -p part-x job.sh)' ''
+_k1859 "#1859a NEGATIVE: TWO substituted sbatches, one echoed → syn, never attributed" syn \
+    'a=$(sbatch --parsable a.sh); b=$(sbatch --parsable b.sh); echo "$a"' '1234567'
+_k1859 "#1859a cd && jid=\$(…) && printf '%s\\n' \"\${jid}\" → TRACKED" 1234568 \
+    'cd /data/proj-x && jid=$(sbatch --parsable --wrap="a; b" job.sh) && printf '"'"'%s\n'"'"' "${jid}"' '1234568'
+_k1859 "#1859a echo with literal text around the variable → TRACKED, text stripped by position" 1234569 \
+    'jid="$(sbatch --parsable job.sh)"; echo "submitted ${jid}."' 'submitted 1234569.'
+_k1859 "#1859a NEGATIVE: sbatch failed, the echo printed an empty line → syn" syn \
+    'jid=$(sbatch --parsable job.sh); echo "$jid"' ''
+_k1859 "#1859a NEGATIVE: another printing command (grep -c) before the echo → syn" syn \
+    'jid=$(sbatch --parsable job.sh); grep -c x f; echo "$jid"' $'3\n1234567'
+_k1859 "#1859a NEGATIVE: the echo is not the last command → syn" syn \
+    'jid=$(sbatch --parsable job.sh); echo "$jid"; echo done' $'1234567\ndone'
+_k1859 "#1859a NEGATIVE: the variable is reassigned before the echo → syn" syn \
+    'jid=$(sbatch --parsable job.sh); jid=7654321; echo "$jid"' '7654321'
+_k1859 "#1859a NEGATIVE: a default-expansion can assign it (\${jid:=…}) → syn" syn \
+    'jid=$(sbatch --parsable job.sh); : "${jid:=7654321}"; echo "$jid"' '7654321'
+# ncbundle32-sk R2: `+=` (and an array-element write) is a reassignment too.
+# `export` is on the quiet list, so before the fix these attributed the
+# APPENDED value: a wrong id where base armed `syn-`.
+_k1859 "#1859a NEGATIVE: export jid+=0 appends before the echo → syn, never 12345670" syn \
+    'jid=$(sbatch --parsable job.sh); export jid+=0; echo "$jid"' '12345670'
+_k1859 "#1859a NEGATIVE: && export jid+=9 && echo → syn, never 12345679" syn \
+    'jid=$(sbatch --parsable job.sh) && export jid+=9 && echo "$jid"' '12345679'
+_k1859 "#1859a NEGATIVE: an exported array-element write (export jid[0]=…) → syn" syn \
+    'jid=$(sbatch --parsable job.sh); export jid[0]=7654321; echo "$jid"' '7654321'
+_k1859 "#1859a CONTROL: a plain export (no assignment) stays TRACKED" 1234567 \
+    'jid=$(sbatch --parsable job.sh); export jid; echo "$jid"' '1234567'
+_k1859 "#1859a NEGATIVE: a wrapper inside the substitution (timeout) → syn" syn \
+    'jid=$(timeout 60 sbatch --parsable job.sh); echo "$jid"' '1234567'
+_k1859 "#1859a NEGATIVE: || join (the echo runs only on failure) → syn" syn \
+    'jid=$(sbatch --parsable job.sh) || echo "$jid"' '1234567'
+# (b) the script is the first word that is neither an option nor its VALUE.
+_k1859 "#1859b sbatch -p part-x --test-only job.sh arms NOTHING" none \
+    'sbatch -p part-x --test-only job.sh' 'sbatch: Job 1234567 to start at 2026-10-18T21:10:20'
+_k1859 "#1859b sbatch --partition part-x -J n --test-only job.sh arms NOTHING" none \
+    'sbatch --partition part-x -J n --test-only job.sh' 'sbatch: Job 1234567 to start at 2026-10-18T21:10:20'
+_k1859 "#1859b a short-option cluster ending in a value option (-Hp part-x) arms NOTHING" none \
+    'sbatch -Hp part-x --test-only job.sh' 'sbatch: Job 1234567 to start at 2026-10-18T21:10:20'
+_k1859 "#1859b MUST-FIRE: -p part-x job.sh --test-only — the flag is a job ARGUMENT" 1234570 \
+    'sbatch -p part-x job.sh --test-only' 'Submitted batch job 1234570'
+_k1859 "#1859b MUST-FIRE: an attached value (-ppart-x) is one word; job.sh then --test-only submits" 1234571 \
+    'sbatch -ppart-x job.sh --test-only' 'Submitted batch job 1234571'
+_k1859 "#1859b MUST-FIRE: -- ends the options, so a later --test-only is the script's" 1234572 \
+    'sbatch -p part-x -- --test-only' 'Submitted batch job 1234572'
+
+echo "=== #1864: dry-run detection is PER INVOCATION; a dry sbatch never hides a real one ==="
+# Every pair below has the real job b.sh and the dry probe a.sh in both orders,
+# joined by ; && and |, and then inside a substitution. The real job must keep a
+# wait: its id where the output carries one, else a single syn- wait, NEVER
+# nothing. Before the fix the substituted forms armed nothing: `_seg_word` read
+# `jid=$(sbatch …` as an assignment, so the real sbatch was not counted and the
+# call looked "all dry".
+_k1864() { _k1854 "$@"; }
+_k1864 "#1864 the issue's shape: dry ; jid=\$(sbatch --parsable) ; echo → a wait (was NOTHING)" syn \
+    'sbatch --test-only a.sh; jid=$(sbatch --parsable b.sh); echo "$jid"' $'sbatch: Job 1 to start at x\n1234567'
+_k1864 "#1864 reversed: jid=\$(sbatch --parsable) ; dry ; echo → a wait (was NOTHING)" syn \
+    'jid=$(sbatch --parsable b.sh); sbatch --test-only a.sh; echo "$jid"' $'1234567\nsbatch: Job 1 to start at x'
+_k1864 "#1864 dry ; jid=\$(sbatch --parsable), no echo → a syn- wait (was NOTHING)" syn \
+    'sbatch --test-only a.sh; jid=$(sbatch --parsable b.sh)' 'sbatch: Job 1 to start at x'
+_k1864 "#1864 real ; dry → the real id" 1234568 \
+    'sbatch b.sh; sbatch --test-only a.sh' $'Submitted batch job 1234568\nsbatch: Job 1 to start at x'
+_k1864 "#1864 dry && real → the real id" 1234568 \
+    'sbatch --test-only a.sh && sbatch b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+_k1864 "#1864 real && dry → the real id" 1234568 \
+    'sbatch b.sh && sbatch --test-only a.sh' $'Submitted batch job 1234568\nsbatch: Job 1 to start at x'
+_k1864 "#1864 dry | cat ; real → the real id" 1234568 \
+    'sbatch --test-only a.sh 2>&1 | cat; sbatch b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+_k1864 "#1864 real | cat ; dry | cat → the real id" 1234568 \
+    'sbatch b.sh | cat; sbatch --test-only a.sh 2>&1 | cat' $'Submitted batch job 1234568\nsbatch: Job 1 to start at x'
+_k1864 "#1864 \$(dry ; real) → the real id" 1234568 \
+    'x=$(sbatch --test-only a.sh; sbatch b.sh); echo "$x"' 'Submitted batch job 1234568'
+_k1864 "#1864 \$(dry && real), nothing printed → a syn- wait" syn \
+    'x=$(sbatch --test-only a.sh && sbatch b.sh)' ''
+_k1864 "#1864 \$(dry | cat) ; real → the real id" 1234568 \
+    'x=$(sbatch --test-only a.sh 2>&1 | cat); sbatch b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+_k1864 "#1864 dry ; a real sbatch by PATH → the real id (was NOTHING)" 1234568 \
+    'sbatch --test-only a.sh; /usr/bin/sbatch b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+# THREE REAL --parsable LINES IN ONE CALL (the orchestrator's question on the
+# bundle-33 submission, whose replay reproduced its live `syn-b481c16d3c06`).
+# Alone, each line arms its own id. Beside other printing commands (that call
+# had `sed`, `chmod` and `grep -H`), a bare integer could be anyone's, so the
+# #1727 rule distrusts every one: ONE syn- wait, never a guessed id. That is the
+# designed loud miss, not a dry-run defect; `ng longjob add slurm:<id>` per job
+# is the remedy the hook's notice names.
+_k1864 "#1864 three sbatch --parsable lines alone → three ids" 1234567,1234568,1234569 \
+    $'sbatch --parsable a.sh\nsbatch --parsable b.sh\nsbatch --parsable c.sh' $'1234567\n1234568\n1234569'
+_k1864 "#1864 three sbatch --parsable lines after a grep -H → ONE syn- wait (the #1727 distrust, by design)" syn \
+    $'grep -H "^ARM=" job-*.sh\nsbatch --parsable a.sh\nsbatch --parsable b.sh\nsbatch --parsable c.sh' $'job-a.sh:ARM=a\n1234567\n1234568\n1234569'
+_k1864 "#1864 three plain sbatch lines after a grep -c → three ids (Submitted lines need no trust)" 1234567,1234568,1234569 \
+    $'grep -c x f\nsbatch a.sh\nsbatch b.sh\nsbatch c.sh' $'3\nSubmitted batch job 1234567\nSubmitted batch job 1234568\nSubmitted batch job 1234569'
+# ncbundle33-sk F1: a redirection GLUED to the real sbatch word. Without `<>`
+# in the occurrence suffix class the real submit was not counted, so the dry
+# probe made the call read dry-only and NOTHING armed (base too).
+_k1864 "#1864 F1 dry ; sbatch<b.sh → the real id (was NOTHING)" 1234568 \
+    'sbatch --test-only a.sh; sbatch<b.sh' $'sbatch: Job 1 to start at x\nSubmitted batch job 1234568'
+_k1864 "#1864 F1 dry ; sbatch>o.txt b.sh → a syn- wait (was NOTHING)" syn \
+    'sbatch --test-only a.sh; sbatch>o.txt b.sh' 'sbatch: Job 1 to start at x'
+_k1864 "#1864 F1 control: a dry probe with its own redirections still arms NOTHING" none \
+    'sbatch --test-only a.sh >o.txt 2>&1' ''
+# The dry-only side stays dry-only: no wait of any kind.
+_k1864 "#1864 a dry sbatch inside \$(…) arms NOTHING (was a syn- wait)" none \
+    'x=$(sbatch --test-only a.sh 2>&1); echo "$x"' 'sbatch: Job 1234567 to start at x'
+_k1864 "#1864 two dry sbatches arm NOTHING" none \
+    'sbatch --test-only a.sh; sbatch -p part-x --test-only b.sh' ''
+_k1864 "#1864 a LOOKUP of sbatch (command -v) is not an invocation: dry probe arms NOTHING" none \
+    'command -v sbatch && sbatch --test-only a.sh' $'/usr/bin/sbatch\nsbatch: Job 1234567 to start at x'
+_k1864 "#1864 a LOOKUP of sbatch (which) is not an invocation: dry probe arms NOTHING" none \
+    'which sbatch; sbatch --test-only a.sh' $'/usr/bin/sbatch\nsbatch: Job 1234567 to start at x'
+# `\sbatch job.sh` and `command sbatch job.sh` arm nothing on their own: no row
+# matches those positions, dry probe or not. They are ledgered as row GAPS with
+# the other `_gap` arms, not here.
+
+echo "=== #1863: a pipe inside a COMPLETE \$(…) on a heredoc's line does not refuse the body mask ==="
+# The live shape (syn-6e8d5003da37, recovered from a transcript by sha1): a
+# test-case append whose body quotes an sbatch line. It submitted nothing. The
+# live `ls` carried a glob; it is dropped here, because a glob beside a bare-form
+# `ls` joins test-nullglob-bare-form-manifest's population, and the property
+# under test is the PIPE inside the substitution, which is kept.
+_hd1863=$(cat <<'CASE'
+f=$(ls -t "${TMPDIR}" | head -1); cat >> "$f" <<'EOF'
+_k1859 "x" 1234567 \
+    'jid=$(sbatch --parsable job.sh); echo "$jid"' '1234567'
+sbatch job.sh
+EOF
+CASE
+)
+_case "#1863 the recovered shape (\$(… | head) then cat >> <<'EOF', body names sbatch) is quiet" quiet "$_hd1863"
+_case "#1863 minimal repro: f=\$(ls x | head -1); cat >> \"\$f\" <<'EOF' … is quiet" quiet \
+    "$(printf 'f=$(ls x | head -1); cat >> "$f" <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF')"
+_case "#1863 the same with backticks is quiet" quiet \
+    "$(printf 'f=`ls x | head -1`; cat >> "$f" <<EOF\nsbatch job.sh\nEOF')"
+_case "#1863 the substitution AS the redirect target is quiet" quiet \
+    "$(printf 'cat >> "$(ls x | head -1)" <<EOF\nsbatch job.sh\nEOF')"
+_case "#1863 an && join, body naming srun --no-block, is quiet" quiet \
+    "$(printf 'f=$(ls x | head -1) && cat > "$f" <<EOF\nsrun --no-block ./j.sh\nEOF')"
+# The pipe guard itself is untouched: a pipe OUTSIDE every complete
+# substitution still refuses the mask, so an executed body still fires.
+_case "#1863 arm: \$(… | …) ; cat <<EOF | bash still fires" fire \
+    "$(printf 'f=$(ls x | head -1); cat <<EOF | bash\nsbatch job.sh\nEOF')"
+_case "#1863 arm: cat <<EOF \$(… | …) | bash still fires" fire \
+    "$(printf 'cat <<EOF $(ls x | head -1) | bash\nsbatch job.sh\nEOF')"
+_case "#1863 arm: a \$( holding the opener is NOT removed — x=\$(cat <<EOF | bash still fires" fire \
+    "$(printf 'x=$(cat <<EOF | bash\nsbatch job.sh\nEOF\n)')"
+# A COMPLETE substitution that HOLDS the opener: bash ends that heredoc at the
+# `)`, so the "body" lines run at TOP LEVEL. Removing the group would also
+# remove its pipe and mask lines a shell executes.
+_case "#1863 arm: a complete \$(… <<EOF | bash) holding the opener is NOT removed — still fires" fire \
+    "$(printf 'y=$(cat <<EOF | bash)\nsbatch job.sh\nEOF')"
+_case "#1863 arm: a pipe after an odd quote still refuses (quotes are not stripped)" fire \
+    "$(printf 'cat <<EOF "it'"'"'s" | bash '"'"'x'"'"'\nsbatch job.sh\nEOF')"
+_case "#1863 arm: \$(… | …) ; bash <<EOF still fires (bash is no data consumer)" fire \
+    "$(printf 'f=$(ls x | head -1); bash <<EOF\nsbatch job.sh\nEOF')"
+# ncbundle33-sk F2: a `$(` or backtick pair that is LITERAL text (behind an
+# odd single quote, or escaped) is not a substitution, so the pipe it straddles
+# must still refuse the mask.
+_case "#1863 F2 arm: a single-quoted '\$(' … ')' straddling the pipe still fires" fire \
+    "$(printf 'cat <<EOF '"'"'$('"'"' | bash '"'"')'"'"'\nsbatch job.sh\nEOF')"
+_case "#1863 F2 arm: a single-quoted backtick pair straddling the pipe still fires" fire \
+    "$(printf 'cat <<EOF '"'"'`'"'"' | bash '"'"'`'"'"'\nsbatch job.sh\nEOF')"
+_case "#1863 F2 arm: an escaped \\\$( … ) straddling the pipe still fires" fire \
+    "$(printf 'cat <<EOF \\$(x | bash)\nsbatch job.sh\nEOF')"
+# The mask covers the BODY only: a real launch after the delimiter still fires.
+_case "#1863 arm: a real sbatch AFTER the masked heredoc still fires" fire \
+    "$(printf 'f=$(ls x | head -1); cat > "$f" <<'"'"'EOF'"'"'\nbody\nEOF\nsbatch job.sh')"
+# Was a DECLARED RESIDUAL (a substitution holding a NESTED paren group is not
+# removed, so its pipe refused the mask). Closed by #1868 item 2: that pipe sits
+# LEFT of the opener, and only the text after the delimiter is read now.
+_case "#1863 residual closed by #1868: \$(… | (…)) BEFORE the opener no longer refuses the mask" quiet \
+    "$(printf 'f=$(ls x | (head -1)); cat > "$f" <<EOF\nsbatch job.sh\nEOF')"
+
+echo "=== #1868: heredoc-mask residuals — quote WALK, pipes AFTER the opener only, bare subshells ==="
+# Each MUST-FIX case below was run against the base hook (414bd080) and gave
+# the OPPOSITE answer; each NEGATIVE gave the same answer on both. The report
+# for this change carries that table.
+#
+# ITEM 1, the MISS direction. A `'` inside "…" is not a quote, but the parity
+# count read it as one: `"'"'$(' | bash ')'` looked unquoted, the literal group
+# was removed with the only pipe inside it, and a body bash runs was masked.
+_case "#1868 item 1 MUST-FIX: \"'\" then a single-quoted '\$(' straddling | bash fires" fire \
+    "$(printf 'cat <<EOF "'"'"'"'"'"'$('"'"' | bash '"'"')'"'"'\nsbatch job.sh\nEOF')"
+_case "#1868 item 1 MUST-FIX: \"'\" then a single-quoted backtick pair straddling | bash fires" fire \
+    "$(printf 'cat <<EOF "'"'"'"'"'"'`'"'"' | bash '"'"'`'"'"'\nsbatch job.sh\nEOF')"
+# The same count decided whether a `<<` is an opener at all. Here it is TEXT
+# (inside '…'), bash runs the next line as a command, and the parity read it
+# as an opener and masked that line until `EOF`.
+_case "#1868 item 1 MUST-FIX: a '<<EOF' that is text after \"'\" masks nothing (the next line runs)" fire \
+    "$(printf 'cat "'"'"'" '"'"'<<EOF'"'"'\nsbatch job.sh\nEOF')"
+_case "#1868 item 1 negative: a quoted apostrophe arg, no pipe, is still masked" quiet \
+    "$(printf 'cat <<EOF "it'"'"'s ok" > f\nsbatch job.sh\nEOF')"
+_case "#1868 item 1 negative: \"x\" then a real \$(… | …) after the opener is still removed" quiet \
+    "$(printf 'cat <<EOF "x" $(ls x | head -1) > f\nsbatch job.sh\nEOF')"
+# DECLARED RESIDUAL, false-positive side: the parity count is KEPT beside the
+# walk (removal stops when EITHER says single-quoted), so a "'" before a real
+# substitution still refuses the mask. Conservative by construction.
+_case "KNOWN FP (#1868): \"'\" then a real \$(… | …) after the opener still refuses the mask" fire \
+    "$(printf 'cat <<EOF "'"'"'" $(ls x | head -1) > f\nsbatch job.sh\nEOF')"
+# ITEM 2, the false-alarm direction: only a pipe AFTER the delimiter counts.
+_case "#1868 item 2 MUST-FIX: a pipe in an EARLIER pipeline does not refuse the mask" quiet \
+    "$(printf 'a | tail -1 && cat > f <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF')"
+_case "#1868 item 2 MUST-FIX: a pipe INTO the consumer (stdin replaced by the heredoc) does not refuse it" quiet \
+    "$(printf 'x | cat > f <<EOF\nsbatch job.sh\nEOF')"
+_case "#1868 item 2 arm: an earlier pipeline AND a later | bash still fires" fire \
+    "$(printf 'a | tail -1 && cat <<EOF | bash\nsbatch job.sh\nEOF')"
+_case "#1868 item 2 arm: a pipe after a redirect target still fires" fire \
+    "$(printf 'cat <<EOF > f | bash\nsbatch job.sh\nEOF')"
+_case "KNOWN FP (#1868): a pipe in a LATER pipeline on the opener line still refuses the mask" fire \
+    "$(printf 'cat > f <<EOF; x | y\nsbatch job.sh\nEOF')"
+# A BARE `( … )` subshell: its output leaves through a `)` on a later line.
+_case "#1868 MUST-FIX: ( cat <<EOF … EOF ) | bash fires (the body runs)" fire \
+    "$(printf '( cat <<EOF\nsbatch job.sh\nEOF\n) | bash')"
+_case "#1868 negative: body=\$(cat <<'EOF' … ) is still masked (\$( is not a bare subshell)" quiet \
+    "$(printf 'body=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n)')"
+
+echo "=== #1870 item 3: ANSI-C \$'…' quoting in the quote walk ==="
+# Inside `$'…'` a backslash escapes the next character, so `$'\''` is ONE
+# string. The walk read it as '…' closed early and a quote opened after it, so
+# it came out UNQUOTED where bash is inside '…', removed a LITERAL `$(' … ')`
+# pair with the only pipe in it, and masked a body bash runs (miss direction).
+_case "#1870 item 3 MUST-FIX: \$'\\'' then a single-quoted '\$(' straddling | bash fires" fire \
+    "$(printf '%s\nsbatch job.sh\nEOF' "cat <<EOF \$'\\'' '\$(' | bash ')'")"
+_case "#1870 item 3 MUST-FIX: \$'\\'' then a single-quoted backtick pair straddling | bash fires" fire \
+    "$(printf '%s\nsbatch job.sh\nEOF' "cat <<EOF \$'\\'' '\`' | bash '\`'")"
+# The other direction, a false alarm on base: an ANSI-C string with an EVEN
+# quote count before a REAL substitution. Base read the walk as inside '…' and
+# kept the substitution's pipe; the walk now closes the string where bash does.
+_case "#1870 item 3 MUST-FIX: \$'\\'\\'' then a real \$(… | …) after the opener is removed (masked)" quiet \
+    "$(printf '%s\nsbatch job.sh\nEOF' "cat <<EOF \$'\\'\\'' \$(ls x | head -1) > f")"
+# Only an ODD run of `$` opens ANSI-C: `$$'` is the PID, then an ordinary '…'.
+_case "#1870 item 3 arm: \$\$'\$(' | bash ')' — the PID then a plain quote — still fires" fire \
+    "$(printf '%s\nsbatch job.sh\nEOF' "cat <<EOF \$\$'\$(' | bash ')'")"
+_case "#1870 item 3 arm: an escaped \\\$'\$(' | bash ')' is a plain quote and still fires" fire \
+    "$(printf '%s\nsbatch job.sh\nEOF' "cat <<EOF \\\$'\$(' | bash ')'")"
+
+echo "=== #1870 item 5: a \$(cat <<EOF whose value may run ==="
+# The body of `$(cat <<EOF` becomes the substitution's VALUE, so what may run it
+# is the command AROUND the `$(`. It is masked only as an assignment's value or
+# as an argument of a named data consumer, and then only if the `)` that closes
+# it, on a later line, carries no pipe.
+_case "#1870 item 5 MUST-FIX: echo \$(cat <<EOF … EOF) | bash fires (was the #1868 gap)" fire \
+    "$(printf 'echo $(cat <<EOF\nsbatch job.sh\nEOF\n) | bash')"
+_case "#1870 item 5 MUST-FIX: \$(cat <<EOF … EOF) at COMMAND POSITION fires (the value is the command)" fire \
+    "$(printf '$(cat <<EOF\nsbatch job.sh\nEOF\n)')"
+_case "#1870 item 5 MUST-FIX: eval \$(cat <<EOF … EOF) fires" fire \
+    "$(printf 'eval $(cat <<EOF\nsbatch job.sh\nEOF\n)')"
+_case "#1870 item 5 MUST-FIX: a data consumer's \$(cat <<EOF, piped on the closing line, fires" fire \
+    "$(printf 'gh api x --jq $(cat <<EOF\nsbatch job.sh\nEOF\n) | bash')"
+_case "#1870 item 5 negative: export body=\$(cat <<'EOF' … ) is masked" quiet \
+    "$(printf 'export body=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n)')"
+_case "#1870 item 5 negative: gh … --body \$(cat <<'EOF' … ) > f, no pipe on the close, is masked" quiet \
+    "$(printf 'gh pr create --body $(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n) > /dev/null')"
+_case "#1870 item 5 negative: a pipe inside a complete \$(…) after the closing ) does not refuse it" quiet \
+    "$(printf 'x=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n) ; y=$(ls | head -1)')"
+# The conservative arms. Each errs toward the false positive, by design.
+_case "#1870 item 5 arm: a held body with no closing ) line is released and fires" fire \
+    "$(printf 'x=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF')"
+# A closing `)` line that ENDS IN A BACKSLASH continues onto the next line, so
+# a pipe there (`) \` / `  | bash`) is invisible to a decision that reads only
+# the `)` line (#1873 N1). Such a line is undecided and releases the body
+# verbatim; the cost is the false positive pinned after it.
+_case "#1873 N1 MUST-FIX: a backslash-continued closing ) line whose pipe is on the NEXT line fires" fire \
+    "$(printf 'gh api x --jq $(cat <<EOF\nsbatch job.sh\nEOF\n) \\\n  | bash')"
+_case "KNOWN FP (#1873 N1): a backslash-continued closing ) line with NO pipe after it still fires" fire \
+    "$(printf 'body=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n) \\\n  && echo done')"
+_case "#1873 N1 control: the same close WITHOUT the backslash, no pipe, is masked" quiet \
+    "$(printf 'body=$(cat <<'"'"'EOF'"'"'\nsbatch job.sh\nEOF\n) && echo done')"
+_case "KNOWN FP (#1870): a later opener on the same line releases the held \$(cat <<A body" fire \
+    "$(printf 'x=$(cat <<'"'"'A'"'"'; cat > f <<'"'"'B'"'"'\nsbatch job.sh\nA\nbody\nB\n)')"
+
+# THE VIEW IS BOUNDED at 8 per line (a view per opener costs removals x text
+# length; unbounded, a contrived 20 KB line took 4.3 s against base's 0.75 s).
+# Past the bound the raw text is the view, so a pipe inside a complete
+# substitution refuses the mask again: the 9th opener here fires, and the same
+# shape as the 1st opener is quiet. Pins the bound as a BEHAVIOUR, which a
+# timing assertion under load could not.
+_hd9=""; _hd9b=""
+for _i in 1 2 3 4 5 6 7 8; do _hd9+="cat > f$_i <<a$_i; "; _hd9b+=$'\nx\na'"$_i"; done
+_case "#1868 bound: the 9th data-consumer opener on a line reads the RAW text (\$(x | y) refuses)" fire \
+    "${_hd9}cat <<a9 \$(x | y) > f9${_hd9b}"$'\nsbatch job.sh\na9'
+_case "#1868 bound control: the same opener FIRST on its line is masked" quiet \
+    "$(printf 'cat <<a9 $(x | y) > f9\nsbatch job.sh\na9')"
+
+_EXPECTED_ASSERTIONS=282   # +3: #1873 N1 backslash-continued closing ) line (fire, known FP, control); +14: #1870 ANSI-C walk (5 cases) and $(cat <<EOF value (9 cases; the #1868 gap closed, the $x dataflow gap opened); +16: #1868 heredoc-mask residuals (15 cases, 1 gap); +40: #1864 per-invocation dry runs (+2 gaps), #1863 pipe inside a complete substitution; +4: ncbundle32-sk R2 (compound reassignment); +18: #1859 echoed substitution / option-value skip; +17: #1854 dry runs / file-then-cat attribution; +5: ncbundle27-sk R1 (conditional vouch); +12: ncbundle27-sk F1 (#1832 B invariant); +26: #1832 command position / spoke-first; +3: #1439 launcher identity on the row; +3: #1629 phantom parsable ids; +2: #1727 id 0 / $(…)
 _ran=$(( PASS + FAIL + 1 ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     ok "every declared assertion executed ($_EXPECTED_ASSERTIONS)"

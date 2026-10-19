@@ -48,7 +48,7 @@ proj-fig3 wrapped up (idle 0:35:12; wrap-up logged)
 last put: 2026-05-11T13:18:42-07:00 (local stamp — when `ng dashboard put` last ran here)
 ```
 
-In a `compose_report` emit the header, the `workspace:` prelude and the `--- dashboard ---` footer are always present; everything between is conditional. (The one exception is the `comment_surface` fast path, reason `comments`, which bypasses `compose_report` entirely and emits just the header, the CLAUDE.md cue, `--- eligible github comments ---` and the signature.) `compose_report` (in `monitor/watcher/main.sh`) emits the sections in this fixed order — the infra-health sections are pinned at the top, ahead of the routine local diff, so a watcher self-failure or service outage can't scroll out of view:
+In a `compose_report` emit the header, the `workspace:` prelude and a status footer are always present; everything between is conditional. Which footer depends on `status_surface.kind` in `config/nexus.yml` (`#1839`): absent or `overview-dashboard` → `--- dashboard ---` (the `last put:` stamp above); `external` → `--- status surface ---` in its place, a pointer to the operator-run page (`external page: <url from status_surface.url_file>`, plus `landings feed: <path>` when `status_surface.feed` is set) that never names a `put`; an unknown kind → `--- dashboard ---` opening with a `CONFIG ERROR: status_surface.kind '<kind>' is not a known kind …` line, then the default lines, so a typo is announced instead of silently restoring the nudges. (The one exception is the `comment_surface` fast path, reason `comments`, which bypasses `compose_report` entirely and emits just the header, the CLAUDE.md cue, `--- eligible github comments ---` and the signature.) `compose_report` (in `monitor/watcher/main.sh`) emits the sections in this fixed order — the infra-health sections are pinned at the top, ahead of the routine local diff, so a watcher self-failure or service outage can't scroll out of view:
 
 | Section | Trigger |
 |---|---|
@@ -68,7 +68,8 @@ In a `compose_report` emit the header, the `workspace:` prelude and the `--- das
 | `--- requests ---` | A claimed request in the watcher-mediated inbox (`monitor/.state/requests/*.claimed.md`). Each row's `handling:` line says how *that* request closes — `ng request reply <id>` or `ng request ack <id>`. |
 | `--- idle workers ---` | One or more workers transitioned across the idle threshold this cycle. |
 | `--- workspace snapshot ---` | Periodic full-state snapshot (every Nth emit), giving a cumulative view between the narrow transition emits. |
-| `--- dashboard ---` | Always present. Prints `last put:` — the **local** `ng dashboard put` stamp, not a read of the issue. Past 2 h it says so in those words and points at `ng dashboard get`; it deliberately does *not* claim the dashboard is stale, because nothing here reads the board (`#1010`). |
+| `--- dashboard ---` | Present in every emit unless `status_surface.kind: external` (`#1839`); an unknown kind still renders it, opening with a `CONFIG ERROR:` line. Prints `last put:` — the **local** `ng dashboard put` stamp, not a read of the issue. Past 2 h it says so in those words and points at `ng dashboard get`; it deliberately does *not* claim the dashboard is stale, because nothing here reads the board (`#1010`). |
+| `--- status surface ---` | `status_surface.kind: external` (`#1839`), in place of `--- dashboard ---`. Prints `external page: <url>` from `status_surface.url_file` (and `landings feed: <path>` when `status_surface.feed` is set); never asks for a `put`. |
 
 (A trailing `--- nexus-emit-sig … ---` signature line lets `paste_to_target` content-verify the emit; it's machinery, not operator-facing.)
 
@@ -162,6 +163,59 @@ The watcher carries a small auto-unstick library (`monitor/watcher/_unstick.sh`)
 - **Case W — blocked-question relay (worker windows).** A *worker* sitting on an `AskUserQuestion` overlay past a grace period (`monitor.watcher.worker_askuq_grace_seconds`, default 300 s — a human at the pane gets first right of reply) is never keyed by the watcher; instead the watcher synthesizes a decision record (`kind: "blocked_question"`) into the pending-decisions channel so the orchestrator can answer on the operator's behalf.
 
 The unstick library is opt-out via `MONITOR_AUTO_UNSTICK=false` (config: `monitor.watcher.auto_unstick`); default `true`. All unstick actions write append-only to `monitor/.state/watcher-unstick.log`. Every line carries `case=<A|B|C|D|W> action=<...>`; per-window actions add `window=<name> fp=<fingerprint>`, while Case B's *cascade* lines are workspace-scoped and carry neither — so key a parser on `case=`/`action=`, never on `window=` being present. Pre-action pane captures land beside it under `monitor/.state/unstick/<window>.<permission|askuq|worker-askuq|ratelimit>.<fp>.audit`.
+
+## API-unreachable hold
+
+When the Claude API cannot be reached (DNS `EAI_AGAIN`, connect refused or
+reset), every agent's turn ends with `API Error: Can't reach the API server`.
+The orchestrator crashes too, so it cannot paste the resume. On 2026-10-15
+nothing resumed for about 5 h (<your-org>/nexus-code#1845).
+`monitor/watcher/_api_hold.sh` treats this as a workspace hold, like
+over-limit and the login hold.
+
+- **Entry.** Transport-class `StopFailure` markers
+  (`monitor/.state/turn-failure/<window>.json`) from at least 2 sessions
+  within 10 min, or from the orchestrator alone. An Anthropic-side 5xx does
+  not count: it classifies `server`, not `transport`.
+- **While held.**
+  - Emits are archived and held.
+  - Orchestrator-liveness files no resubmit and no respawn.
+  - Crashed workers are not promoted to `idle-too-long`, and their
+    `interrupted` row says the watcher owns the resume.
+  - The operator alert `api-unreachable` is raised.
+- **Exit.** One of:
+  - an async probe gets any HTTP answer from `ANTHROPIC_BASE_URL` (default
+    `https://api.anthropic.com`). There are two probes, and either answering
+    counts. `curl` uses the system resolver. A `node` connect inherits
+    `NODE_OPTIONS`, or takes `monitor.watcher.api_hold.probe_node_options`,
+    and tries both `dns.lookup` and `dns.resolve*`. Both are needed because
+    `dns.lookup` (libc) ignores a `dns.setServers` override such as
+    `-r force-dns.js`, and only `dns.resolve*` honours it;
+  - a crashed session completes a turn;
+  - the orchestrator makes progress after the hold began
+    (`orchestrator-heartbeat`, touched by its `Stop` and `PostToolUse`
+    hooks). This can release early: a tool that started before the outage
+    may finish during it. The cost is one round of nudges, never a stranded
+    window.
+
+  Limit: an override set only in the agents' shells, and not in the
+  watcher's environment or the knob, is invisible to both probes. The hold
+  then ends by the board or at the 12 h ceiling.
+- **Resume.** The watcher itself pastes one nudge into each crashed window,
+  orchestrator first, with a summary. It skips a window that has a typed
+  draft, has `queued=1`, is not idle, or was already nudged for its CURRENT
+  crash. A window that crashes again after its resume (a flapping outage) is
+  owed a new nudge by the next hold.
+- **Afterwards.** The summary alert queued during the hold is handed to the
+  operator-alert legs.
+
+| Path | Holds |
+|---|---|
+| `monitor/.state/api-hold.log` | The ledger |
+| `monitor/.state/api-hold-nudged.tsv` | Per-window outcomes |
+| `monitor/.state/api-hold-alerts.tsv` | Queued alerts: `UNSENT`, then `handed-off`, never `sent` |
+
+Knobs live under `monitor.watcher.api_hold.*`; see `monitor/watcher/_config.sh`.
 
 ## GraphQL rate-limit handling
 

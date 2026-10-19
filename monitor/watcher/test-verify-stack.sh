@@ -67,7 +67,9 @@ svc_unhealthy() { rm -f "$WORK/svc-ok"; }
 
 run_verify() {  # extra args forwarded; short timeout so failures are fast
     # VS_EXTRA_PATH: a per-case stub dir put FIRST (Cases 11c/11d's `timeout`).
+    # VS_BASH_ENV: a per-case startup file for the verify-stack shell (Case 11b).
     PATH="${VS_EXTRA_PATH:+$VS_EXTRA_PATH:}$WORK/stub-bin:$PATH" \
+    BASH_ENV="${VS_BASH_ENV:-${BASH_ENV:-}}" \
     NEXUS_STATE_DIR="$WORK/state" \
     NEXUS_SERVICES_REGISTRY="$WORK/services.registry" \
     RECOVER_TARGET_WINDOW=orchestrator \
@@ -276,20 +278,52 @@ echo '=== Case 11b (#1743): a round CUT by the deadline keeps the last observed 
 # before the deadline reached every row after it and SKIPPED them, and the
 # summary printed "not checked" for rows round 1 had really seen (jlab BUILDING,
 # broken DOWN). Here a row placed BEFORE jlab answers at once in round 1 and
-# hangs in every later round (Case 8b's marker), so round 2 is always cut
-# mid-round with jlab still unvisited — independent of host speed.
+# hangs in every later round (Case 8b's marker), so round 2 is cut mid-round
+# with jlab still unvisited: the hang's cap is the time LEFT, so the real
+# `timeout` returns at the deadline on any host.
+#
+# Round 2 must also START, and that used to depend on host speed (#1822): the
+# deadline is fixed before round 1, and round 1 (a /proc-walking cold-build
+# probe among others) was measured taking the whole 4 s on one core shared with
+# 6 busy loops, so no round 2 ran and the summary was round 1's, fresh. No PATH
+# shim can fix that — a stub only ever ADDS time — so a startup file (BASH_ENV,
+# sourced by the verify-stack shell before the script) sets a DEBUG trap that,
+# at the first top-level command after round 1 ends (FIRST_ROUND=0), moves
+# DEADLINE to now + --timeout, once. Round 2 then gets the full budget however
+# long round 1 took, and is still cut by the real deadline arithmetic. If
+# verify-stack stops naming DEADLINE/TIMEOUT/FIRST_ROUND the shift does not
+# fire and the precondition below fails loudly. --no-orchestrator keeps round
+# 2's work before the hanging row in-process.
 leak_tag3="vsleak3-$$-$RANDOM"
-rm -f "$WORK/third-round"
-fresh_watcher; orch_present
+rm -f "$WORK/third-round" "$WORK/late-hung" "$WORK/deadline-shifted"
+cat > "$WORK/clock-seam.sh" <<SH
+# Test-only startup file for verify-stack.sh (Case 11b). Sourced by EVERY bash
+# that inherits BASH_ENV, in place of any inherited one (as on CI, which has
+# none); the trap is set only in the script shell, never in a \`bash -c\` probe.
+if [[ -z "\${BASH_EXECUTION_STRING:-}" ]]; then
+    _vs_shift_deadline() {
+        [[ -z "\${_vs_shifted:-}" && "\${FIRST_ROUND:-1}" == 0 && -n "\${DEADLINE:-}" && -n "\${TIMEOUT:-}" ]] || return 0
+        _vs_shifted=1; DEADLINE=\$(( SECONDS + TIMEOUT ))
+        : > "$WORK/deadline-shifted"
+    }
+    trap _vs_shift_deadline DEBUG
+fi
+SH
+fresh_watcher
 printf 'late\t%s\t%s\t%s\n' "$WORK" "$WORK/launch.sh" \
-    'if [ -e '"$WORK"'/third-round ]; then exec -a '"$leak_tag3"' sleep 600; else : > '"$WORK"'/third-round; false; fi' \
+    'if [ -e '"$WORK"'/third-round ]; then : > '"$WORK"'/late-hung; exec -a '"$leak_tag3"' sleep 600; else : > '"$WORK"'/third-round; false; fi' \
     > "$WORK/services.registry"
 printf 'jlab\t%s\t%s\tfalse\t%s/j.log\n' "$BWD" "$WORK/labsh-supervised.sh" "$WORK" >> "$WORK/services.registry"
-timed_verify --timeout 4 --poll 1 --check-timeout 60
-assert_eq "fixture precondition: a second round reached the hanging row" "$([[ -e "$WORK/third-round" ]] && echo yes)" "yes"
-assert_contains "fixture precondition: jlab was NOT re-checked in the cut round" "$T_OUT" "not re-checked"
+VS_BASH_ENV="$WORK/clock-seam.sh"
+timed_verify --timeout 4 --poll 1 --check-timeout 60 --no-orchestrator
+unset VS_BASH_ENV
+building_line=$(grep -F 'also BUILDING' <<<"$T_OUT")
+assert_eq "fixture precondition: round 2 started with a full budget (deadline seam fired)" "$([[ -e "$WORK/deadline-shifted" ]] && echo yes)" "yes"
+assert_eq "fixture precondition: a second round reached the hanging row" "$([[ -e "$WORK/late-hung" ]] && echo yes)" "yes"
+assert_contains "jlab was NOT re-checked in the cut round, and says so" "$building_line" "jlab (labsh cold build pid $BPID"
+assert_contains "…with its last observation kept, not discarded" "$building_line" "not re-checked — deadline reached; last observed"
 assert_eq "rc 1 (the late row is down)" "$T_RC" "1"
-assert_contains "names the late row" "$T_OUT" "late"
+assert_contains "names the late row as cut by the deadline in round 2" "$T_OUT" "late (healthcheck timed out after"
 assert_contains "still lists the build as BUILDING from its last observation" "$T_OUT" "BUILDING"
 assert_not_contains "never reports jlab as merely 'not checked'" "$T_OUT" "jlab (not checked"
 assert_not_contains "a cut round never certifies convergence" "$T_OUT" "stack converged"

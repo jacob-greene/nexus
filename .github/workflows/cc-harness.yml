@@ -34,6 +34,12 @@ on:
       # tree stamp's dirty_digest, so a change to it changes the gated-tree line
       # this workflow's gate run writes. PF001 named it.
       - 'monitor/_cc-hold-policy.sh'
+      # <your-org>/nexus-code#1724: the ledger writers and readers (send.sh, the
+      # watcher's _lib.sh/_idle_probe.sh) now SOURCE the ledger resolver, which
+      # sources the pointer reader beside it. PF001 named the first; the second
+      # is reached through a dirname-built path the lint cannot resolve.
+      - 'monitor/_ledger_path.sh'
+      - 'monitor/_degraded-pointer.sh'
       - 'monitor/watcher/test-integration/test-realmodel-*.sh'
       # <your-org>/nexus-code#568 D6. The realmodel scenarios SOURCE these two
       # modules, so a change to either changes what this workflow proves —

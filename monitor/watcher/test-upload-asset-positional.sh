@@ -185,6 +185,13 @@ run_upload "$WORK/third.md"
 assert_eq "exit 0" "$RC" "0"
 assert_contains "the file landed under assets/general/" \
     "$(remote_paths)" 'assets/general/third.md'
+assert_not_contains "an .md upload prints no HTML note (#1856 negative)" "$OUT" 'GitHub does not render HTML'
+
+echo '=== an .html upload still uploads, and NOTES that GitHub will not render it (#1856) ==='
+printf '<html><body>plan</body></html>\n' > "$WORK/plan.html"
+run_upload "$WORK/plan.html"
+assert_eq "exit 0" "$RC" "0"
+assert_contains "the NOTE says GitHub does not render HTML" "$OUT" 'GitHub does not render HTML'
 
 # ---------------------------------------------------------------------------
 # EXPECTED-COUNT GUARD (required by test-summary-honesty-manifest.sh at the
@@ -195,8 +202,9 @@ assert_contains "the file landed under assets/general/" \
 # +  3  the non-numeric second positional
 # +  5  positive control: --issue 846 uploads to the issue DIRECTORY
 # +  2  positive control: --repo-path still overrides placement
-# +  2  positive control: the lone positional still uploads
-EXPECTED=$(( 7 + 3 + 5 + 2 + 2 ))
+# +  3  positive control: the lone positional still uploads, with no HTML note
+# +  2  an .html upload uploads AND notes that GitHub will not render it (#1856)
+EXPECTED=$(( 7 + 3 + 5 + 2 + 3 + 2 ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

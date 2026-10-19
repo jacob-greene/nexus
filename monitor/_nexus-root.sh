@@ -95,8 +95,9 @@ nexus_primary_root() {
 #     config-less checkout outside work/, run with NEXUS_ROOT=<primary>: it
 #     acts for the primary, as it always did (#1651 skeptic item 2).
 #   * own tree HAS a config/nexus.yml that cannot be READ (config/load.sh
-#     fails on it: a YAML parse error, no python3/pyyaml, no loader) ->
-#     UNREADABLE, rc 2. A BROKEN config is not an ABSENT one: collapsing the
+#     fails on it: a YAML parse error, no python3/pyyaml, no loader; or it
+#     yields no top-level mapping — empty, comment-only, a torn write, #1694)
+#     -> UNREADABLE, rc 2. A BROKEN config is not an ABSENT one: collapsing the
 #     two let a tree with a malformed nexus.yml silently act for the nexus
 #     $NEXUS_ROOT names (your-org/nexus-code#1652 item 3).
 #   * both trees name the SAME identity (repo + asset repo) -> own root.
@@ -113,16 +114,27 @@ nexus_primary_root() {
 # YAML parse error (an uncaught traceback, rc 1), no python3/pyyaml (rc 3).
 # Callers must not fold rc 2 into rc 1 (CLAUDE.md "FALLBACK-COLLAPSE";
 # your-org/nexus-code#1652 item 3).
-# BOUNDARY, stated: "key not present" stays NO OPINION, as it was — a parsed
-# nexus.yml whose github.repo is misspelt or missing still defers to
-# NEXUS_ROOT. Refusing it too is a policy choice left open on #1652.
+# "Key not present" is load.sh's rc 2 for TWO different files, and they are
+# split here (your-org/nexus-code#1694): a nexus.yml that parses to a MAPPING
+# without github.repo stays NO OPINION (rc 1) — a partial config may defer on
+# purpose — while one that yields NO top-level mapping at all (empty,
+# whitespace-only, comments-only, or a bare scalar/list) is rc 2. That file is
+# what a torn or truncated write leaves; it cannot be a deliberate config, and
+# reading it as no opinion silently re-points identity at NEXUS_ROOT's nexus.
 nexus_tree_identity() {
-    local root="${1:-}" f="" repo="" ph="" asset="" lrc=0
+    local root="${1:-}" f="" repo="" ph="" asset="" lrc=0 urc=0
     f="$root/config/nexus.yml"
     [[ -n "$root" && -f "$f" ]] || return 1
     [[ -x "$root/config/load.sh" ]] || return 2
     repo=$(NEXUS_CONFIG="$f" NEXUS_ROOT="$root" "$root/config/load.sh" github.repo 2>/dev/null) || lrc=$?
-    (( lrc == 0 )) || { (( lrc == 2 )) && return 1; return 2; }
+    if (( lrc == 2 )); then
+        # Mapping without the key -> no opinion; no mapping, or could not
+        # tell (fail closed) -> unreadable.
+        nexus_yml_unmapped "$f" >/dev/null || urc=$?
+        (( urc == 1 )) && return 1
+        return 2
+    fi
+    (( lrc == 0 )) || return 2
     [[ -n "$repo" ]] || return 1
     if [[ -f "$root/config/nexus.example.yml" ]]; then
         ph=$(NEXUS_CONFIG="$root/config/nexus.example.yml" NEXUS_ROOT="$root" \
@@ -132,6 +144,45 @@ nexus_tree_identity() {
     asset=$(NEXUS_CONFIG="$f" NEXUS_ROOT="$root" "$root/config/load.sh" github.asset_repo "$repo" 2>/dev/null) \
         || asset="$repo"
     printf '%s %s' "$repo" "${asset:-$repo}"
+}
+
+# nexus_yml_unmapped <file> — does <file> yield NO top-level YAML mapping?
+# rc 0: no mapping; stdout says what it holds instead ("empty, whitespace-only
+# or comment-only", or "a top-level list/scalar, not a mapping").
+# rc 1: it is a mapping (possibly an empty `{}`).
+# rc 2: could not tell — no python3/pyyaml, unreadable, or a YAML parse error.
+# Uses the same parser as config/load.sh (yaml.safe_load), so "mapping" means
+# exactly what load.sh walks.
+nexus_yml_unmapped() {
+    local f="${1:-}"
+    [[ -n "$f" && -f "$f" && -r "$f" ]] || return 2
+    command -v python3 >/dev/null 2>&1 || return 2
+    python3 - "$f" 2>/dev/null <<'PY'
+import sys
+try:
+    import yaml
+    with open(sys.argv[1]) as fh:
+        d = yaml.safe_load(fh)
+except Exception:
+    sys.exit(2)
+if isinstance(d, dict):
+    sys.exit(1)
+if d is None:
+    print("empty, whitespace-only or comment-only", end="")
+else:
+    print("a top-level %s, not a mapping" % ("list" if isinstance(d, list) else "scalar"), end="")
+sys.exit(0)
+PY
+}
+
+# One-line description of an UNREADABLE (rc 2) tree config, for the messages.
+_nexus_unreadable_desc() {   # <root>
+    local f="$1/config/nexus.yml" what=""
+    if what=$(nexus_yml_unmapped "$f"); then
+        printf '%s is %s (no top-level mapping; probably a torn or truncated write)' "$f" "$what"
+    else
+        printf '%s has a config/nexus.yml that cannot be read (config/load.sh failed on it)' "$1"
+    fi
 }
 
 # nexus_config_root <own-candidate> — print the root whose config this tool
@@ -152,8 +203,8 @@ nexus_config_root() {
     if [[ -z "$env" || "$env" -ef "$own" ]]; then printf '%s' "$own"; return 0; fi
     own_id=$(nexus_tree_identity "$own") || irc=$?
     if (( irc == 2 )); then                   # own config BROKEN, not absent
-        printf '%s has a config/nexus.yml that cannot be read (config/load.sh failed on it), so this tool cannot tell whether it acts for that tree or for NEXUS_ROOT=%s' \
-            "$own" "$env"
+        printf '%s, so this tool cannot tell whether it acts for %s or for NEXUS_ROOT=%s' \
+            "$(_nexus_unreadable_desc "$own")" "$own" "$env"
         return 2
     elif (( irc != 0 )); then
         printf '%s' "$env"; return 0          # own tree has NO OPINION
@@ -165,7 +216,7 @@ nexus_config_root() {
         printf '%s' "$own"; return 0          # same identity: no conflict
     fi
     local env_disp="no config of its own"
-    (( erc == 2 )) && env_disp="a config/nexus.yml that cannot be read"
+    (( erc == 2 )) && env_disp=$(_nexus_unreadable_desc "$env")
     [[ -n "$env_id" ]] && env_disp="github.repo=${env_id% *} asset repo=${env_id#* }"
     printf 'NEXUS_ROOT names %s (%s), but this tool belongs to %s (github.repo=%s asset repo=%s)' \
         "$env" "$env_disp" "$own" "${own_id% *}" "${own_id#* }"

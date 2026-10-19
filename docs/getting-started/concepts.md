@@ -40,7 +40,7 @@ The GitHub App is installed here, not on the code repo. The monitor reads and wr
 
 ### Emit
 
-A single watcher report — one block of text pasted into the orchestrator's pane on one poll cycle. Archived at `monitor/.state/diffs/<ts>_<shortid>.md` for 7 days (`monitor.diff_retention_days`). Contains a state-change header, optionally a local diff (reports / tmux / git), optionally an `--- eligible github comments ---` block, optionally a `--- standing bells ---` block, and a `--- dashboard ---` last-updated reminder. See [Reference → Watcher protocol](../reference/watcher-protocol.md).
+A single watcher report — one block of text pasted into the orchestrator's pane on one poll cycle. Archived at `monitor/.state/diffs/<ts>_<shortid>.md` for 7 days (`monitor.diff_retention_days`). Contains a state-change header, optionally a local diff (reports / tmux / git), optionally an `--- eligible github comments ---` block, optionally a `--- standing bells ---` block, and a `--- dashboard ---` last-updated reminder (replaced by a `--- status surface ---` pointer when `status_surface.kind: external`). See [Reference → Watcher protocol](../reference/watcher-protocol.md).
 
 ### Eligible comment
 

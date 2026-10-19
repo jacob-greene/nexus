@@ -4,7 +4,7 @@
 # nothing else. Readers and writers (the watcher's _fs_guard.sh, `ng degraded
 # status`, the sandbox-notify wrapper) all resolve through it, so they agree.
 #
-# THE RULE (operator, 2026-10-10, #1724 comment c6105428034): degraded mode
+# THE RULE (operator, 2026-10-10, #1724): degraded mode
 # writes SMALL STATE only (a status file, paste locks, cooldown stamps, a
 # decision log), and only under the session-managed scratch tree, never a
 # hardcoded location: the nexus runs for many users, and nobody may assume

@@ -1269,7 +1269,9 @@ out-of-band:
    `principals_dir/enroll/`). The token is **handed to the operator out-of-band**
    (printed in the Claude Code session, or written to a `0600` op-only file). The
    operator presents `pubkey + token` to a one-shot enrollment step
-   (`ng remote enroll --pubkey <file> --token <tok>`, run in-sandbox); on a valid
+   (`printf '%s\n' '<tok>' | ng remote enroll --pubkey <file> --token-stdin`, run
+   in-sandbox — stdin, not `--token <tok>`, because argv is world-readable in
+   `/proc` and `printf` is a shell builtin; <your-org>/nexus-code#1846 N2); on a valid
    token the public key is appended to `authorized_keys` (with the forced command
    + hardened options + optional `from=` pin) and the **token is consumed**
    (deleted; a replay fails closed).
@@ -1331,7 +1333,8 @@ from the key type+blob only; the sandbox stays the boundary (this hardens the
 external enrollment path — a worst-case compromise yields a *confined channel
 login*, not escape); loopback stays the default, LAN-direct keeps `from_cidr` +
 the loud warning, and the token is the only enroll gate either way. The manual
-`ng remote enroll --pubkey F --token T` path remains a **fallback** for
+`ng remote enroll --pubkey F --token-stdin` path (token on stdin, never in argv)
+remains a **fallback** for
 environments where the bootstrap is unavailable (e.g. a live sshd that rejects
 the `AuthorizedKeysCommand` on path permissions — in which case the
 `AuthorizedKeysFile` still authorizes manually-enrolled keys, so the service
@@ -1373,7 +1376,9 @@ value, so the runbook itself is safe to post on GitHub.
 >    enrollment step the orchestrator runs in-sandbox:
 >    ```bash
 >    # orchestrator-side, in-sandbox (you provide the .pub contents + token):
->    ng remote enroll --pubkey ~/.ssh/nexus-remote.pub --token <TOKEN-FROM-STEP-2>
+>    # --token-stdin keeps the token out of argv (world-readable in /proc);
+>    # printf is a shell builtin, so it never reaches an execve.
+>    printf '%s\n' '<TOKEN-FROM-STEP-2>' | ng remote enroll --pubkey ~/.ssh/nexus-remote.pub --token-stdin
 >    ```
 >    On success your key is authorized (forced command, request-only) and the
 >    token is consumed.

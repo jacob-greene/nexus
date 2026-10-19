@@ -17,7 +17,7 @@ misbehaving); agent needs to propagate a nexus-internals fix to
 sibling fork repos.
 
 This skill is **nexus-self-only**. Project agents (kompot,
-perturb-bench, fig4-subtle-de, etc.) doing GitHub writes against
+proj-x, proj-y, etc.) doing GitHub writes against
 their own work should rely on `nexus.bot` instead — cross-fork
 discovery and propagation are nexus-bug-fix concerns, not general
 GitHub-write concerns.
@@ -539,6 +539,15 @@ guard at the same commit without either being careless; the discriminating
 variable was **the index**, not the ref. `--run` now prints such a green as
 `UNVERIFIED` and exits 4 rather than `PASS`/0. A red still exits 1 — adding the
 untracked files can only find more.
+
+`4` has a second cause, and it is printed as its own verdict: a guard that
+exits **77** (the automake SKIP convention — the codex integration suites
+without `RUN_INTEGRATION=1`) DECLINED TO RUN and asserted nothing
+(`<your-org>/nexus-code#1860`). It is neither `FAIL` (it used to be, so a clean
+run read `66 of 68 passed`) nor `PASS`; it prints `SKIP`, is counted in the
+reconciliation line's `skipped` column, and makes the run exit 4. Only 77 — a
+69 is still `FAIL`. Precedence is `5` > `1` > `4` > `0`: a SKIP never softens a
+red.
 
 **`0` is the code nothing warned you about** (`#1078`). It says only that SOME
 declaring guard read a file you changed. It never says the guard that matters

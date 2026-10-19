@@ -515,12 +515,134 @@ assert_eq       "#1652 Q: no asset tree under P"                "$([[ -e $R1651/
 assert_contains "#1652 Q: the refusal says the config cannot be read" "$stderr" "cannot be read"
 
 # =========================================================================
+# ==== your-org/nexus-code#1694 item 2: a nexus.yml with NO top-level MAPPING
+#
+# load.sh answers rc 2 ("key not present") both for a mapping without
+# github.repo and for a file that yields no mapping at all. The second is what a
+# torn or truncated write leaves, and at base it read as "no opinion": the
+# upload went to P's asset repo at rc 0, exactly like O. Now it is UNREADABLE
+# and refused by name; the mapping-without-the-key file (D) still defers, and O
+# above stays the no-config control.
+_mk_1694_root() {   # <dir> <file content, printf %b>
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$1"
+    cp "$_real_load" "$1/config/load.sh"
+    cp "$_monitor_dir/../config/nexus.example.yml" "$1/config/nexus.example.yml"
+    printf '%b' "$2" > "$1/config/nexus.yml"
+}
+R1694="$WORK/case-1694"
+_mk_1694_root "$R1694/E" ''
+_mk_1694_root "$R1694/W" '   \n\n  \n'   # spaces only: a TAB is a YAML parse error
+_mk_1694_root "$R1694/K" '# nexus.yml\n# github:\n#   repo: labx/issues\n'
+_mk_1694_root "$R1694/S" 'githu'
+_mk_1694_root "$R1694/D" 'notifications:\n  email:\n    enabled: false\n'
+
+# Each upload carries DISTINCT bytes: identical bytes at an existing
+# destination are a no-op that pins the old HEAD, so a shared payload would let
+# "the remote did not move" and "which tree committed" pass vacuously.
+_payload() { printf '# payload %s\n' "$1" > "$WORK/p1694-$1.md"; printf '%s' "$WORK/p1694-$1.md"; }
+for _k in E W K S; do
+    echo "=== R-$_k: a no-mapping own nexus.yml, NEXUS_ROOT=P — REFUSED, nothing pushed ==="
+    rm -rf "$R1651/P/assets"; _b=$(_bare_head)
+    NR_ROOT="$R1651/P" run_upload "$R1694/$_k" "$R1694/$_k/monitor/upload-asset.sh" "$(_payload "R$_k")" --issue 1694
+    assert_eq       "#1694 R-$_k: refuses (exit 4)"                 "$rc" "4"
+    assert_eq       "#1694 R-$_k: emits NO url"                     "$stdout" ""
+    assert_eq       "#1694 R-$_k: the asset remote did not move"    "$(_bare_head)" "$_b"
+    assert_eq       "#1694 R-$_k: no asset tree under P"            "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+    assert_contains "#1694 R-$_k: the refusal NAMES the file"       "$stderr" "$R1694/$_k/config/nexus.yml"
+    assert_contains "#1694 R-$_k: …says it has no mapping"          "$stderr" "no top-level mapping"
+    assert_contains "#1694 R-$_k: …and that it is probably torn"    "$stderr" "torn or truncated write"
+done
+
+echo '=== R-D: a MAPPING without github.repo, NEXUS_ROOT=P — still defers to P ==='
+NR_ROOT="$R1651/P" run_upload "$R1694/D" "$R1694/D/monitor/upload-asset.sh" "$(_payload RD)" --issue 1694
+assert_eq       "#1694 R-D: exit 0"                             "$rc" "0"
+assert_contains "#1694 R-D: the URL names P's asset repo"       "$stdout" "https://github.com/p-org/assets/"
+
+# The resolver itself, rc and message, against the same trees. The upload
+# cases above prove the refusal reaches a caller; these pin the rc vocabulary
+# every caller (ng, mint-token, notify) branches on.
+_ncr() {   # <own-root> <NEXUS_ROOT> -> "rc=<n> <stdout>"
+    local _o _r=0
+    _o=$(. "$R1651/P/monitor/_nexus-root.sh"; NEXUS_ROOT="$2" nexus_config_root "$1") || _r=$?
+    printf 'rc=%s %s' "$_r" "$_o"
+}
+echo '=== R-rc: nexus_config_root rc per shape ==='
+for _k in E W K S; do
+    _got=$(_ncr "$R1694/$_k" "$R1651/P")
+    assert_eq "#1694 R-rc: $_k (no mapping) is rc 2" "${_got%% *}" "rc=2"
+done
+assert_contains "#1694 R-rc: E is described as empty/comment-only" "$(_ncr "$R1694/E" "$R1651/P")" "empty, whitespace-only or comment-only"
+assert_contains "#1694 R-rc: S is described as a scalar"           "$(_ncr "$R1694/S" "$R1651/P")" "a top-level scalar, not a mapping"
+assert_eq       "#1694 R-rc: D (mapping, no key) defers: rc 0, P"  "$(_ncr "$R1694/D" "$R1651/P")" "rc=0 $R1651/P"
+assert_eq       "#1694 R-rc: a full config is its own root (control)" "$(_ncr "$R1651/F2" "$R1651/P")" "rc=0 $R1651/F2"
+assert_eq       "#1694 R-rc: malformed YAML is still rc 2"         "$(_ncr "$R1651/M" "$R1651/P" | cut -d' ' -f1)" "rc=2"
+assert_contains "#1694 R-rc: …and still says it cannot be read"    "$(_ncr "$R1651/M" "$R1651/P")" "cannot be read"
+# The NEXUS_ROOT side: a no-mapping env config is no identity, so a CONFLICT
+# (rc 3), and the message says why.
+assert_contains "#1694 R-rc: a no-mapping NEXUS_ROOT config is a conflict" "$(_ncr "$R1651/P" "$R1694/K")" "rc=3 "
+assert_contains "#1694 R-rc: …described as torn"                   "$(_ncr "$R1651/P" "$R1694/K")" "torn or truncated write"
+
+# =========================================================================
+# ==== your-org/nexus-code#1694 item 1: the local clone is KEYED ON THE REPO
+#
+# With NEXUS_CONFIG (or --asset-repo) naming a repo that is not the root's own,
+# the clone used to be the generic `<root>/assets`, re-pointed at that repo by
+# `remote set-url`. Own repo: `<root>/assets`, unchanged. Foreign:
+# `<root>/assets.<owner>__<name>`.
+_FOREIGN_CFG="$WORK/foreign-nexus.yml"
+printf 'github:\n  repo: labx/other-issues\n  asset_repo: labx/other-assets\n  bot_login: test-bot\n' > "$_FOREIGN_CFG"
+_OWN_CFG="$WORK/own-via-config.yml"
+printf 'github:\n  repo: p-org/issues\n  asset_repo: p-org/assets\n  bot_login: test-bot\n' > "$_OWN_CFG"
+run_upload_cfg() {   # <cfg> <args…> — upload from P with NEXUS_CONFIG=<cfg>
+    local _cfgf="$1"; shift
+    local _o _e; _o=$(mktemp); _e=$(mktemp)
+    ( cd "$R1651/P" && env -u NEXUS_ASSET_REPO NEXUS_CONFIG="$_cfgf" \
+        NEXUS_ROOT="$R1651/P" PATH="$STUB_DIR:$PATH" \
+        "$R1651/P/monitor/upload-asset.sh" "$@" ) >"$_o" 2>"$_e"
+    rc=$?
+    stdout=$(<"$_o"); stderr=$(<"$_e"); rm -f "$_o" "$_e"
+}
+
+echo '=== S-own: the root'"'"'s own repo — <root>/assets, exactly as before ==='
+rm -rf "$R1651/P/assets" "$R1651/P"/assets.*
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sown)" --issue 1694
+assert_eq       "#1694 S-own: exit 0"                           "$rc" "0"
+assert_eq       "#1694 S-own: clone at <root>/assets"           "$([[ -d $R1651/P/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq       "#1694 S-own: no keyed clone"                   "$(compgen -G "$R1651/P/assets.*__*" || echo none)" "none"
+
+echo '=== S-cfg-own: NEXUS_CONFIG naming the root'"'"'s OWN asset repo — <root>/assets ==='
+run_upload_cfg "$_OWN_CFG" "$(_payload Scfgown)" --issue 1694
+assert_eq       "#1694 S-cfg-own: exit 0"                       "$rc" "0"
+assert_eq       "#1694 S-cfg-own: still no keyed clone"         "$(compgen -G "$R1651/P/assets.*__*" || echo none)" "none"
+
+echo '=== S-foreign: NEXUS_CONFIG naming ANOTHER asset repo — assets.<owner>__<name> ==='
+_own_head=$("$REAL_GIT" -C "$R1651/P/assets" rev-parse HEAD 2>&1)
+run_upload_cfg "$_FOREIGN_CFG" "$(_payload Sforeign)" --issue 1694
+assert_eq       "#1694 S-foreign: exit 0"                       "$rc" "0"
+assert_contains "#1694 S-foreign: the URL names the foreign repo" "$stdout" "https://github.com/labx/other-assets/"
+assert_eq       "#1694 S-foreign: clone at assets.labx__other-assets" "$([[ -d $R1651/P/assets.labx__other-assets/.git ]] && echo yes || echo no)" "yes"
+# The git stub maps EVERY github.com URL to one local bare, so an origin URL
+# cannot tell the clones apart; WHICH TREE COMMITTED can. At base the foreign
+# upload committed in <root>/assets and moved its HEAD.
+assert_eq       "#1694 S-foreign: the keyed clone made the pushed commit" "$("$REAL_GIT" -C "$R1651/P/assets.labx__other-assets" rev-parse HEAD 2>&1)" "$(_bare_head)"
+assert_eq       "#1694 S-foreign: the generic clone did NOT move" "$("$REAL_GIT" -C "$R1651/P/assets" rev-parse HEAD 2>&1)" "$_own_head"
+assert_eq       "#1694 S-foreign: staging/lock keyed too"       "$([[ -e $R1651/P/assets.labx__other-assets.lock ]] && echo yes || echo no)" "yes"
+
+echo '=== S-flag: --asset-repo in another CASE shares the keyed clone; a non-owner/name is refused ==='
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sflag)" --issue 1694 --asset-repo LabX/Other-Assets
+assert_eq       "#1694 S-flag: exit 0"                          "$rc" "0"
+assert_eq       "#1694 S-flag: exactly one keyed clone (lowercased)" "$(compgen -G "$R1651/P/assets.*__*/.git" | wc -l | tr -d ' ')" "1"
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sbad)" --issue 1694 --asset-repo 'labx/../x'
+assert_eq       "#1694 S-flag: a non-owner/name repo is refused (exit 7)" "$rc" "7"
+
+# =========================================================================
 # ASSERTION-COUNT GUARD (count=exact). An EXACT comparison, not a floor: this
 # suite's whole value is a set of specific claims, and a claim that silently
 # stops executing is indistinguishable from one that passes. Six cases, in
 # order: 5 + 3 + 5 + 6 + 6 + 3 + 4 + 5, then #1173's I-M: 7 + 4 + 4 + 3 + 3,
-# then #1651's N-P: 7 + 4 + 2, then #1652's Q: 5.
-EXPECTED_ASSERTIONS=76
+# then #1651's N-P: 7 + 4 + 2, then #1652's Q: 5, then #1694's R: 4x7 + 2
+# + 12 and S: 3 + 2 + 6 + 3.
+EXPECTED_ASSERTIONS=132
 _ran=$(( ${PASS:-0} + ${FAIL:-0} ))
 if (( _ran != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \

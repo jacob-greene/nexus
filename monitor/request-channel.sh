@@ -131,6 +131,12 @@
 #              answered  an ordinary answer (REFUSED on spawn-skeptic: ambiguous)
 #            [--skeptic-resolved]  assert the gate is already discharged; skip
 #                        the resolve. Says so on stderr; never silent.
+#            [--settle-live-reviewer]  a decline is REFUSED while a live
+#                        skeptic still owes the origin a verdict (#1848); this
+#                        flag says the live review is abandoned on purpose and
+#                        settles it with the gate. For a duplicate request that
+#                        the live reviewer already covers, reply
+#                        `--status spawned --worker <that reviewer>` instead.
 #     fail   <id> --reason "<why>"                                # → .failed
 #
 # ── Exit codes ────────────────────────────────────────────────────────
@@ -992,7 +998,7 @@ _reply_payload_note() {
 cmd_reply() {
     local id=""
     local status="" worker="" wdir="" issue="" publish="" progress="" results="" amend=0
-    local skeptic_resolved=0
+    local skeptic_resolved=0 settle_live=0
     local -a body_args=()
     _argloop_prev_5=-1; while (( $# > 0 )); do (( $# != _argloop_prev_5 )) || _argloop_stuck "$1"; _argloop_prev_5=$#
         case "$1" in
@@ -1003,6 +1009,7 @@ cmd_reply() {
             --no-publish) publish="false"; shift ;;
             --amend)    amend=1;           shift ;;
             --skeptic-resolved) skeptic_resolved=1; shift ;;
+            --settle-live-reviewer) settle_live=1; shift ;;
             --progress) progress="${2:-}"; shift 2 || die "--progress needs a path" ;;
             --results)  results="${2:-}";  shift 2 || die "--results needs a path" ;;
             --file|--message) body_args+=("$1" "${2:-}"); shift 2 || die "$1 needs a value" ;;
@@ -1013,7 +1020,7 @@ cmd_reply() {
                 shift ;;
         esac
     done
-    [[ -n "$id" ]] || die "usage: reply <id> [--message t|--file f] [--status spawned|answered|declined|deferred] [--worker w] [--dir p] [--issue o/r#N] [--no-publish] [--amend] [--skeptic-resolved] [--progress p] [--results p]"
+    [[ -n "$id" ]] || die "usage: reply <id> [--message t|--file f] [--status spawned|answered|declined|deferred] [--worker w] [--dir p] [--issue o/r#N] [--no-publish] [--amend] [--skeptic-resolved] [--settle-live-reviewer] [--progress p] [--results p]"
     _validate_id "$id"
 
     # Pre-check for a precise voice on a STABLE state. The transition engine
@@ -1244,7 +1251,37 @@ cmd_reply() {
                         printf 'request-channel: cannot resolve %s'"'"'s skeptic gate — %s is missing or not executable. REFUSING the reply rather than recording a decline nothing will see.\n' "$req_origin" "$_sk_bin" >&2
                         exit 6
                     fi
-                    _sk_out=$("$_sk_bin" resolve "$req_origin" --reason "spawn-skeptic request $id DECLINED by the orchestrator: $_sk_reason" 2>&1); _sk_rc=$?
+                    # A DECLINE OF THE REQUEST IS NOT A VERDICT ON A LIVE REVIEW
+                    # (your-org/nexus-code#1848). Measured 2026-10-16 (ncbundle29):
+                    # the orchestrator declined a DUPLICATE spawn request because
+                    # the origin's skeptic was already live and re-armed — and this
+                    # resolve discharged that skeptic's edge, removed the marker and
+                    # released the origin's await while the verdict was still owed.
+                    # So by default the resolve REFUSES when any reviewer is live
+                    # (rc 9), and the abandoning form is a deliberate flag.
+                    local -a _sk_scope=(--refuse-live-reviewer)
+                    (( settle_live )) && _sk_scope=(--all-reviewers)
+                    _sk_out=$("$_sk_bin" resolve "$req_origin" "${_sk_scope[@]}" --reason "spawn-skeptic request $id DECLINED by the orchestrator: $_sk_reason" 2>&1); _sk_rc=$?
+                    if (( _sk_rc == 8 )); then
+                        # COULD NOT DETERMINE (your-org/nexus-code#1852 F2): the edge
+                        # ledger did not answer, so whether a reviewer is live is
+                        # unknown and resolve touched nothing. Name ONE remedy — the
+                        # same command again — never --skeptic-resolved (#1771).
+                        rm -f "$bodyfile"
+                        printf 'request-channel: REFUSING the decline — the obligation-edge ledger could not answer for %s, so it cannot be shown that no skeptic is still live (resolve rc 8).\n' "$req_origin" >&2
+                        printf '%s\n' "$_sk_out" | sed 's/^/  /' >&2
+                        printf '  Nothing was written; the request stays claimed. Re-run THIS SAME command once the ledger answers.\n' >&2
+                        exit 6
+                    fi
+                    if (( _sk_rc == 9 )); then
+                        rm -f "$bodyfile"
+                        printf 'request-channel: REFUSING the decline — a skeptic is still LIVE on %s and owes it a verdict, so declining would discharge that review before it lands (your-org/nexus-code#1848).\n' "$req_origin" >&2
+                        printf '%s\n' "$_sk_out" | sed 's/^/  /' >&2
+                        printf '  Nothing was written; the request stays claimed. Say which you mean:\n' >&2
+                        printf '    --status spawned --worker <that live reviewer>   this request is covered by the review already running; ITS verdict discharges the gate\n' >&2
+                        printf '    --status declined --settle-live-reviewer         the live review is ABANDONED on purpose; settle it with the gate (on the record)\n' >&2
+                        exit 6
+                    fi
                     if (( _sk_rc != 0 )); then
                         rm -f "$bodyfile"
                         printf 'request-channel: the skeptic gate for %s was NOT resolved (rc %s) — REFUSING to record the decline.\n' "$req_origin" "$_sk_rc" >&2

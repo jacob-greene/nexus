@@ -214,7 +214,8 @@ _sh_operator_alert_key() { printf 'service-health:%s' "$1"; }
 # _sh_operator_alert_step <name> <status> <policy> <first_iso> <note>
 #
 # The route function may print `<code>\t<reason>`; the CODE names which arm
-# blocked the route (`over-limit`, `auth-hold`, `auth-expired`, `target-absent`).
+# blocked the route (`over-limit`, `auth-hold`, `auth-expired`, `api-unreachable`,
+# `target-absent`).
 # A bare reason with no tab is code `unknown` (an older or injected function).
 _sh_operator_alert_step() {
     local name="$1" status="$2" policy="$3" first_iso="$4" note="$5" out code reason
@@ -239,6 +240,13 @@ _sh_operator_alert_step() {
             if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$auth_key"; then
                 severity=warning
                 rides=" (No separate bell or email: the route is blocked by the login, and the standing '${auth_key}' alert already pages for it.)"
+            fi ;;
+        # The same rule for the API-unreachable hold (your-org/nexus-code#1845):
+        # its own key pages for the outage, and the outage is the cause.
+        api-unreachable)
+            if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "${_API_HOLD_ALERT_KEY:-api-unreachable}"; then
+                severity=warning
+                rides=" (No separate bell or email: the route is blocked because the Claude API is unreachable, and the standing '${_API_HOLD_ALERT_KEY:-api-unreachable}' alert already pages for it.)"
             fi ;;
     esac
     "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$(_sh_operator_alert_key "$name")" "$severity" || return 0
@@ -547,6 +555,15 @@ _sh_service_healthy() {
 # derived from SERVICE_HEALTH_STATE_DIR so fixtures relocate both together.
 _sh_services_dir() { printf '%s/services' "${SERVICE_HEALTH_STATE_DIR%/service-health}"; }
 _sh_pidfile()      { printf '%s/%s.pid' "$(_sh_services_dir)" "$1"; }
+# Operator stop intent (your-org/nexus-code#1827): written by `svc.sh stop
+# <name>`, removed by an explicit `svc.sh start|restart <name>`. IDENTICAL path
+# to bootstrap-recover.sh's `_recover_stop_sentinel`; keep them in step. While
+# it stands, a DOWN service is "stopped by request", never an outage: no
+# incident, no grace, no restart, no emit.
+_sh_stop_sentinel() { printf '%s/%s.stop-requested' "$(_sh_services_dir)" "$1"; }
+# Sidecar so the stop is logged + recorded ONCE per stop, not once per tick.
+# A sidecar, not a `status` value: `status` SELECTS (#1050).
+_sh_stop_noted_file() { printf '%s/%s.stop-noted' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
 
 #
 # IDENTITY (your-org/nexus-code#606): mirrors the `ns=`/`start=` verification
@@ -1127,6 +1144,26 @@ _service_health_check_tick() {
         elif (( hrc == 0 )); then
             _sh_clear_finding "$name"
         fi
+        # Operator stop intent (your-org/nexus-code#1827). Consulted on the
+        # DOWN arm below; here only its lifecycle. A request is SUPERSEDED, not
+        # merely ignored, when the service is green under a supervisor
+        # launched AFTER the stop (jupyter-up.sh / remote-up.sh relaunch via
+        # recover_service without going through `svc.sh start`): left standing,
+        # it would silently veto the auto-restart of that NEW run's next crash.
+        # Positive evidence only — a live supervisor alone could be the one the
+        # stop is still killing.
+        local stop_sf stop_noted
+        stop_sf="$(_sh_stop_sentinel "$name")"
+        stop_noted="$(_sh_stop_noted_file "$name")"
+        if [[ ! -e "$stop_sf" ]]; then
+            rm -f "$stop_noted" 2>/dev/null || true
+        elif (( hrc == 0 )) && [[ "$sup_state" == alive:* ]] \
+             && [[ "$(_sh_pidfile "$name")" -nt "$stop_sf" ]]; then
+            rm -f "$stop_sf" "$stop_noted" 2>/dev/null || true
+            _sh_record_event "$name" stop-request-superseded \
+                "healthy under supervisor ${sup_state#alive:} launched after the stop request; request withdrawn, auto-restart re-armed"
+            _sh_log "service '$name' stop request SUPERSEDED: healthy under a supervisor launched after it (${sup_state}) — auto-restart re-armed"
+        fi
         if (( hrc == 0 )); then
             # --- healthy ---
             # Was an INCIDENT open when this tick found the service healthy?
@@ -1431,6 +1468,35 @@ _service_health_check_tick() {
         # `stale` beside a FAILING healthcheck is the ordinary dead-service
         # shape, already handled by the grace/restart/escalate machine below.
         rm -f "$incon_file" 2>/dev/null || true
+
+        # --- unhealthy, STOPPED BY REQUEST (your-org/nexus-code#1827) ---
+        # `svc.sh stop <name>` was run: the dead supervisor is the intended
+        # outcome, not an outage. Measured before this arm: a stop meant to
+        # hold an auto-deploy was auto-restarted at attempt 1/3 within ~3 min
+        # and deployed exactly what it was holding. No incident, no grace, no
+        # restart, no emit, and no new `status` token — `status` SELECTS
+        # (the emit loop, the incident arms, `ng service-incident`; #1050), so
+        # this state lives in the sentinel and a sidecar. Any incident open
+        # when the stop landed is closed: the operator has taken it over.
+        # Logged and recorded once per stop; the cockpit row reads STOPPED.
+        if [[ -e "$stop_sf" ]]; then
+            if [[ ! -e "$stop_noted" ]]; then
+                local stop_iso stop_by stop_closed=""
+                stop_iso=$(_sh_field "$stop_sf" iso 2>/dev/null || echo '?')
+                stop_by=$(_sh_field "$stop_sf" by 2>/dev/null || echo '?')
+                if [[ -n "$prev_status" && "$prev_status" != healthy && "$prev_status" != recovered \
+                      && "$prev_status" != reconciled ]]; then
+                    stop_closed="; closed the open '${prev_status}' incident record (since ${first_iso:-?})"
+                fi
+                _sh_record_event "$name" stopped-by-request \
+                    "DOWN because 'svc.sh stop' was run (since ${stop_iso} by ${stop_by}) — not an outage; no incident, no auto-restart until 'svc.sh start|restart ${name}'${stop_closed}"
+                _sh_log "service '$name' stopped by request since ${stop_iso} (by ${stop_by}) — not an outage; NOT restarting ('svc.sh start|restart $name' resumes)"
+                printf 'since_iso=%s\nnoted_at=%s\n' "$stop_iso" "$now" > "$stop_noted" 2>/dev/null || true
+            fi
+            rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" 2>/dev/null || true
+            _sh_operator_alert_clear "$name" "stopped by request"
+            continue
+        fi
         local fresh=0
         if [[ -z "$prev_status" || "$prev_status" == "healthy" || "$prev_status" == "recovered" \
               || "$prev_status" == "inconsistent" || "$prev_status" == "reconciled" ]]; then
@@ -1569,7 +1635,17 @@ _service_health_check_tick() {
                 _sh_log "service '$name' labsh build pid ${cb_pid:-?} RELEASED: ${cb_verdict#* } — forcing the restart through svc.sh's cold-build guard"
             fi
             _sh_restart_service "$name" "$cb_build" || rc=$?
-            if (( rc == 75 )); then
+            if (( rc == 76 )); then
+                # svc.sh REFUSED: a stop request landed between this tick's
+                # sentinel check and the call (#1827). Nothing was restarted
+                # and nothing is counted; the next tick's stopped-by-request
+                # arm owns the service from here.
+                _sh_record_event "$name" restart-refused "svc.sh refused (rc=76: stopped by request); not counted as an attempt"
+                _sh_log "service '$name' restart REFUSED by svc.sh: stopped by request — leaving it down"
+                rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" 2>/dev/null || true
+                _sh_operator_alert_clear "$name" "stopped by request"
+                continue
+            elif (( rc == 75 )); then
                 # svc.sh's cold-build guard REFUSED: a build it can see is in
                 # flight and protected. Nothing was restarted, so nothing is
                 # counted — a refusal is not an attempt that "did not hold"

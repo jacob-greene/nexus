@@ -131,10 +131,9 @@ command -v gawk >/dev/null 2>&1 || { th_skip "gawk absent" "this guard uses gawk
 # compared; the reason is prose, echoed back in the stale diagnostic. Delete a
 # row when its flag reaches the surface — leaving it is a FAILURE.
 KNOWN_DRIFT_ROWS=$(cat <<'ROWS'
-monitor/remote-enroll.sh --comment | SCOPE-HOLD. This script's help surface is a HEADER-COMMENT DUMP, not a usage string, and the flag is described in prose further down the file (out of the dumped block) — the #883 shape exactly. Documenting four remote-channel flags correctly needs that feature's owner; this PR does not otherwise touch remote-access. Recorded so it is a tracked obligation rather than an unknown.
+monitor/remote-enroll.sh --comment | SCOPE-HOLD. This script's help surface is a HEADER-COMMENT DUMP, not a usage string, and the flag is described in prose further down the file (out of the dumped block) — the #883 shape exactly. Documenting the remote-channel flags correctly needs that feature's owner (a fourth, --token-stdin, left this list when your-org/nexus-code#1846 skeptic N2 put it in the dumped header as the form to teach); this PR does not otherwise touch remote-access. Recorded so it is a tracked obligation rather than an unknown.
 monitor/remote-enroll.sh --explicit | SCOPE-HOLD, same as --comment: header-dump help surface, remote-access feature, not touched by this PR.
 monitor/remote-enroll.sh --no-shell-belt | SCOPE-HOLD, same as --comment. Note it IS described in prose at remote-enroll.sh:537 — below the dumped header block, so a caller reading the help never reaches it. That is #883's shape, not an absence of documentation.
-monitor/remote-enroll.sh --token-stdin | SCOPE-HOLD, same as --comment: header-dump help surface, remote-access feature, not touched by this PR.
 ROWS
 )
 # The comparison key: first two whitespace-separated fields only.
@@ -228,11 +227,14 @@ _drifts() {   # <ng-file> <drift-out> <checked-out> <skipped-out>
 # `degraded-status.sh` (your-org/nexus-code#1724, `ng degraded status`) and
 # `doctor.sh` (your-org/nexus-code#1722, `ng doctor`) are enrolled at birth on
 # the same footing: each prints its own usage, naming the one flag it parses.
+# `degraded-relocate.sh` (your-org/nexus-code#1724, `ng degraded enter|exit`)
+# is enrolled at birth on the same footing: its --help is its own header.
 _WALKED_FACADES='send.sh
 longjob-watch.sh
 codex-run.sh
 degraded-probe.sh
 degraded-status.sh
+degraded-relocate.sh
 doctor.sh'
 
 _delegated_scripts() {

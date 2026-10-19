@@ -5,6 +5,7 @@ labsh-uvx-shim/bash_env.sh	${LABSH_SHIM_BASH_ENV}
 longjob-watch.sh	$1
 shellenv/bash_env.sh	${NEXUS_PREV_BASH_ENV}
 watcher/_service_health.sh	$SERVICE_HEALTH_LABSH_EVIDENCE
+watcher/test-artifact-link-check.sh	$1
 watcher/test-assertion-accounting.sh	<(sed
 watcher/test-fixture-reap-ownership.sh	$1
 watcher/test-fixture-reap-ownership.sh	$1

@@ -689,7 +689,7 @@ bk_decision_row_actionable() {
 # skills/nexus.window-cleanup. `idle-state.tsv` was not on that list and
 # nothing else pruned it, so EVERY retirement of a wrapped worker left a
 # phantom row that kept the window in the `--- idle workers ---` emit
-# forever. `kompot-panelL` kept firing `wrapped up (idle 218s)` on every
+# forever. `proj-w-panelL` kept firing `wrapped up (idle 218s)` on every
 # poll tick for a window that no longer existed in tmux.
 #
 # The corrosive part is not the noise. `--- idle workers ---` is the
@@ -918,6 +918,35 @@ bk_retire_surface_path() {
 # bk_retire_surface_kind <template>
 bk_retire_surface_kind() { printf '%s' "${1%%:*}"; }
 
+# _bk_tsv_file <state-dir> <relpath> — the file a `tsv:` surface names. The
+# delivery ledger has its own resolver (monitor/_ledger_path.sh,
+# your-org/nexus-code#1724): while `ng degraded enter` is in force its rows
+# live in the relocated ledger, and a teardown checked against the tree's copy
+# would announce itself complete over rows it never looked at (#941's class).
+# Every other surface is state-dir-relative, unchanged.
+#
+# rc 2, prints NOTHING: a pointer is in force for this state dir but is
+# UNUSABLE. The answer is then unknown, and the tree's copy is NOT a stand-in
+# for it (#1830 skeptic): callers fail CLOSED — the refs check reports the
+# surface as still referenced, the prune leaves it alone. Resolver absent (a
+# suite's fake nexus): the tree path, as before.
+_bk_tsv_file() {
+    local sd="$1" rel="$2" p rc
+    if [[ "$rel" == machine-input.tsv ]]; then
+        if declare -F nexus_ledger_path >/dev/null 2>&1 \
+           || . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_ledger_path.sh" 2>/dev/null; then
+            p=$(nexus_ledger_path "$sd"); rc=$?
+            case "$rc" in
+                0) printf '%s' "$p"; return 0 ;;
+                *) printf 'bookkeeping: the degraded pointer for %s is unusable; %s is NOT read from the tree in its place (your-org/nexus-code#1724)\n' \
+                       "$sd" "$rel" >&2
+                   return 2 ;;
+            esac
+        fi
+    fi
+    printf '%s/%s' "$sd" "$rel"
+}
+
 # bk_state_refs_window <state-dir> <window>
 #
 # Print one line per manifest surface that STILL references <window>,
@@ -962,9 +991,13 @@ bk_state_refs_window() {
                     printf 'prefix\t%s\n' "${p#"$state_dir/"}"
                 done ;;
             tsv)
-                if [[ -f "$state_dir/$path" ]] \
+                if ! p=$(_bk_tsv_file "$state_dir" "$path"); then
+                    printf 'tsv\t%s\n' "$path"   # unknowable: fail closed, still referenced
+                    continue
+                fi
+                if [[ -f "$p" ]] \
                    && ( export _BK_W="$window"; awk -F'\t' 'BEGIN { w = ENVIRON["_BK_W"] } $1 == w { found = 1 } END { exit(found ? 0 : 1) }' \
-                        "$state_dir/$path" 2>/dev/null ); then
+                        "$p" 2>/dev/null ); then
                     printf 'tsv\t%s\n' "$path"
                 fi ;;
         esac
@@ -1021,8 +1054,9 @@ bk_prune_window_state() {
                     rm -rf "$p" 2>/dev/null || true
                 done ;;
             tsv)
-                [[ -f "$state_dir/$path" ]] || continue
-                tmp="$state_dir/$path.retire.$$"
+                p=$(_bk_tsv_file "$state_dir" "$path") || continue   # unusable pointer: prune nothing
+                [[ -f "$p" ]] || continue
+                tmp="$p.retire.$$"
                 # ENVIRON[], not `awk -v w=` (your-org/nexus-code#1419): `-v`
                 # ESCAPE-PROCESSES its value, so a window name with a backslash
                 # pruned a DIFFERENT window's row and left the target's — and the
@@ -1031,8 +1065,8 @@ bk_prune_window_state() {
                 # `export` in a subshell rather than an inline `VAR=… awk` prefix
                 # on the pipeline element: the inline form takes the element out
                 # of early-exit-readers.sh's view (#1415).
-                if ( export _BK_W="$window"; awk -F'\t' 'BEGIN { w = ENVIRON["_BK_W"] } $1 != w' "$state_dir/$path" > "$tmp" 2>/dev/null ); then
-                    mv -f "$tmp" "$state_dir/$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+                if ( export _BK_W="$window"; awk -F'\t' 'BEGIN { w = ENVIRON["_BK_W"] } $1 != w' "$p" > "$tmp" 2>/dev/null ); then
+                    mv -f "$tmp" "$p" 2>/dev/null || rm -f "$tmp" 2>/dev/null
                 else
                     rm -f "$tmp" 2>/dev/null || true
                 fi ;;

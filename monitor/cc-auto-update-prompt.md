@@ -465,8 +465,38 @@ standing directive, stricter than the GUIDE's interactive table):
 - **COMPAT** (the candidate breaks a version-sensitive surface and
   nexus-code needs a code change — e.g. a `_detect_*` drift — shown by a
   gate scenario or a probe that fails on the candidate and passes on the
-  installed version): HOLD, never bump. This is the ONLY hold. First check
-  for an existing open compat PR:
+  installed version): HOLD, never bump. This is the ONLY hold.
+
+  **STALE-CHECKOUT FIRST — before ANY issue, comment or compat-PR step**
+  (<your-org>/nexus-code#1855). When the evidence is a gate RED, ask the
+  script whether the red belongs to a stale checkout:
+
+      {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh stale-check \
+          --candidate {{CANDIDATE}} --evidence gate:<failing-scenario>
+
+  - **exit 20 — STALE-CHECKOUT**: this clone is behind its integration
+    branch and upstream has already changed the failing scenario (or a file
+    it names). The verdict is the SCRIPT's, not yours; obey it. Do NOT run
+    `compat-pr`, and open or comment on NOTHING on `{{SURFACE_REPO}}` —
+    not a cc-compat issue, not a "cc-update blocked" issue, not the tracking
+    issue when `{{TRACKING_REPO}}` is `{{SURFACE_REPO}}`. Record the hold
+    WITHOUT `--issue`:
+
+        {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh block --evidence gate:<failing-scenario> \
+            --candidate {{CANDIDATE}} \
+            --control '<installed version>: <the same check passed>' \
+            --reason "stale checkout: <failing-scenario> changed upstream"
+
+    `block` re-derives the same verdict, records the hold
+    (`contract=stale-checkout`, re-checked when the operator's pull moves
+    the HEAD) and notifies the OPERATOR itself, once per verdict, on their
+    own channel. Write the verdict in your report, finish with
+    `monitor/ng report-check <report-path>`, and post nothing else.
+  - **exit 0 — not stale** (or ANY other exit, a crash included): carry on
+    exactly as below. A red that upstream has not touched is a real finding
+    and is filed as before.
+
+  Otherwise, first check for an existing open compat PR:
 
       {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh compat-pr auto \
           --candidate {{CANDIDATE}} --findings <your-findings-file.md>
@@ -546,7 +576,11 @@ standing directive, stricter than the GUIDE's interactive table):
   (An **exit 9** here is live-tree drift, not a recorded block — restore
   the tree, then re-run; see step 4b.)
 
-  Then surface the specifics (which scenario failed / which changelog
+  A block that `stale-check` classified STALE-CHECKOUT (exit 20, above) is
+  surfaced by `block` itself to the operator and NOWHERE on
+  `{{SURFACE_REPO}}`; skip the rest of this step and the Surfacing section.
+  For every other block,
+  surface the specifics (which scenario failed / which changelog
   entry) in your report AND on `{{SURFACE_REPO}}` (never the asset repo):
   if `{{TRACKING_ISSUE}}` is configured, comment on it **on its own repo** —
   `monitor/ng issue comment {{TRACKING_ISSUE}} --repo {{TRACKING_REPO}} --body-file <file>`;
@@ -629,6 +663,9 @@ cleared, decisions taken, apply exit code) in your report.
 - **SAFE update applied** → stay SILENT: finish with
   `monitor/ng report-check <report-path>` and exit. Do NOT open or
   comment on any issue — a clean auto-update bothers no one.
+- **STALE-CHECKOUT block** (`stale-check` exit 20) → post NOTHING on any
+  issue: `block` already told the operator. Finish with
+  `monitor/ng report-check <report-path>` (<your-org>/nexus-code#1855).
 - **review/compat/block** → wrap up against the surface repo — unless
   the dedup check above said UNCHANGED (rc 12), in which case finish with
   `monitor/ng report-check <report-path>` and post nothing. Otherwise, if

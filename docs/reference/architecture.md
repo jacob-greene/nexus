@@ -225,7 +225,8 @@ cover the report schema.
    needed.
 4. The watcher composes a report — header, optional local diff,
    `--- eligible github comments ---` section, `--- standing bells
-   ---`, `--- idle workers ---`, `--- dashboard ---` footer, and a
+   ---`, `--- idle workers ---`, a `--- dashboard ---` footer (or
+   `--- status surface ---` under `status_surface.kind: external`), and a
    unique `--- nexus-emit-sig --- ` trailer — and pastes it into the
    orchestrator's tmux pane.
 5. The orchestrator wakes with the paste as an incoming message,

@@ -202,6 +202,49 @@ _fs_degraded_note_tick() {
 # (2026-09-28..10-10) ended in a sandbox restart, never an in-process heal,
 # and a restarted watcher starts with FS_DEGRADED=0 and a wiped run dir. So a
 # session resumed after a restart must read that as RESUME.
+# _fs_relocation_in_force -> the pointer path, rc 0, when `ng degraded enter`
+# (#1724) is still in force for $STATE_DIR; rc 1 otherwise (or no resolver).
+# A heal does NOT undo a relocation: the ledger and inbox stay in the run dir,
+# a tmpfs a sandbox restart wipes, until someone runs `ng degraded exit`, and
+# nothing else prompts that (skeptic on #1830). So the heal says it.
+_fs_relocation_in_force() {
+    declare -F nexus_degraded_pointer_path >/dev/null 2>&1 || return 1
+    local p
+    p=$(nexus_degraded_pointer_path "$STATE_DIR" 2>/dev/null) || return 1
+    [[ -n "$p" && -f "$p" ]] || return 1
+    printf '%s' "$p"
+}
+FS_RELOC_PTR=""
+
+# _fs_relocation_lost_check — ONCE per watcher process, on a writable cycle: a
+# loss marker with no pointer means `ng degraded enter` was never exited and a
+# sandbox restart wiped the run dir (skeptic F1 on #1830). A restarted watcher
+# starts with FS_DEGRADED=0 and never sees a heal, so the heal path cannot
+# report this; its first writable cycle can. Read through
+# nexus_degraded_lost_records (the one reader), which also returns the losses
+# a later `enter` appended to the lost record: those are reported even while
+# a NEW relocation is in force (the #1724 residual).
+FS_LOSS_CHECKED=0
+_fs_relocation_lost_check() {
+    (( FS_LOSS_CHECKED )) && return 0
+    FS_LOSS_CHECKED=1
+    declare -F nexus_degraded_lost_records >/dev/null 2>&1 || return 0
+    local recs n p first now=""
+    recs=$(nexus_degraded_lost_records "$STATE_DIR" 2>/dev/null) || return 0
+    n=$(grep -c . <<<"$recs")
+    (( n > 0 )) || return 0
+    p=$(nexus_degraded_pointer_path "$STATE_DIR" 2>/dev/null) || p=""
+    [[ -n "$p" && -f "$p" ]] && now=" A newer relocation is in force now: run monitor/ng degraded exit to bring it home first; the loss is listed again after."
+    if (( n == 1 )); then
+        first="a degraded relocation (ng degraded enter) was never exited, and the run dir that held it was wiped"
+    else
+        first="${n} degraded relocations (ng degraded enter) were never exited, and the run dirs that held them were wiped"
+    fi
+    log "fs-guard: LOST — ${n} degraded relocation(s) never exited, run dir gone (marker/lost record under ${CLAUDE_CONFIG_DIR:-?}/nexus-degraded); their staged ledger rows and requests did not reach the tree"
+    _fs_note_deliver "[nexus watcher] LOST: ${first}, almost certainly by a sandbox restart. Ledger rows and requests written while in force are gone. Run monitor/ng degraded exit for what and since when, then --ack-loss.${now}" \
+        || log "fs-guard: WARN the LOST note did not reach ${TARGET:-the orchestrator}"
+}
+
 _fs_broadcast_workers() {
     local kind="$1" secs="${2:-0}" text name _a _i
     [[ "${MONITOR_FS_DEGRADED_BROADCAST:-1}" == 0 ]] && return 0
@@ -211,6 +254,7 @@ _fs_broadcast_workers() {
         text="[nexus watcher] The project tree is READ-ONLY (cannot write ${STATE_DIR}). Writes, commits, pushes, ng send, ng longjob and test runs in the tree will fail until the sandbox is restarted from outside. STOP starting new work that writes there: record your resume point in your context, do not retry failing writes in a loop, and WAIT. Continue when EITHER a RESUME note arrives OR your session is resumed after a sandbox restart (the usual end of an outage: a restarted watcher cannot send RESUME). Reach the orchestrator with SendMessage. Details: monitor/ng degraded status"
     else
         text="[nexus watcher] RESUME: the project tree is writable again after ${secs}s read-only. Re-run any write that failed during the outage (reports, commits, ledger rows), check that files you staged elsewhere are copied back, then continue your task."
+        [[ -n "$FS_RELOC_PTR" ]] && text="$text A degraded relocation (ng degraded enter) is still in force, so the ledger and inbox are still written outside the tree; the orchestrator owes monitor/ng degraded exit."
     fi
     # A transition supersedes whatever the previous one left queued: a STOP
     # still owed when the tree heals is moot (they all get RESUME), and vice
@@ -426,17 +470,25 @@ _fs_guard_tick() {
             fi
             _fs_status_write mode=ok "state_dir=$STATE_DIR" "recovered=$now" \
                 "last_incident_seconds=$dur" "notes=$FS_NOTE_COUNT" || true
+            if FS_RELOC_PTR=$(_fs_relocation_in_force); then
+                log "fs-guard: healed with a degraded relocation still in force ($FS_RELOC_PTR) — \`ng degraded exit\` is owed"
+                _fs_note_deliver "[nexus watcher] The project tree is writable again, but a degraded RELOCATION is still in force (pointer $FS_RELOC_PTR). The delivery ledger and/or request inbox are still being written to the degraded run dir, a tmpfs that a sandbox restart wipes. Run monitor/ng degraded exit now to merge them home." \
+                    || log "fs-guard: WARN the relocation-owed note did not reach ${TARGET:-the orchestrator}"
+            else
+                FS_RELOC_PTR=""
+            fi
             if (( FS_BC_STOPPED )); then
                 _fs_broadcast_workers resume "$dur"; _bc_now=1
             else
                 log "fs-guard: read-only for ${FS_DEGRADED_CYCLES} cycle(s) only — no STOP was broadcast, so no RESUME is owed"
             fi
-            FS_BC_STOPPED=0
+            FS_BC_STOPPED=0; FS_RELOC_PTR=""
             FS_DEGRADED=0; FS_ESCALATED=0; FS_CHANNELS=''
             FS_DEGRADED_CYCLES=0; FS_ONSET=0
             FS_NOTE_NEXT=0; FS_NOTE_GAP=0; FS_NOTE_COUNT=0
         fi
         (( _bc_now )) || _fs_broadcast_drain
+        _fs_relocation_lost_check
         FS_LAST_OK=$now
         return 0
     fi

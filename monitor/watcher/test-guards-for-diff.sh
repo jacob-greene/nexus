@@ -1230,7 +1230,67 @@ if [[ "$discovered" == "$recorded" ]]; then
     # sentinel, because a public export excludes it and the declared-sentinel
     # check then failed every probe on the mirror. Selection rate not
     # re-measured for this change.
-    _TGFD_POP_EXPECTED=317
+    # +3 for bundle-1013b (your-org/nexus-code#1724 pieces A+B):
+    # test-degraded-enter-exit.sh declares, bringing its own suite path and two
+    # sentinels no other row named (_degraded-pointer.sh, degraded-relocate.sh).
+    # _ledger_path.sh is NOT in this suite's consumer-visible population
+    # (measured: absent from the head emit).
+    # MEASURED as a SET DIFFERENCE (`comm` of the sorted `--population` emits):
+    # the clean base worktree at origin/dev af49fcbc gives 317, equal to the pin
+    # committed there; the bundle-1013b head gives 320. THREE added, ZERO
+    # removed. Selection rate over the last 120 first-parent commits of
+    # af49fcbc (0 empty, counted with a draining `comm | wc -l`): 99/120 base,
+    # 99/120 head.
+    # +3 for bundle-1015a (your-org/nexus-code#1840):
+    # test-argv-credential-lint.sh declares, bringing its own suite path and two
+    # sentinels no other row named (user-pat.sh,
+    # skills/nexus.private-package-install/SKILL.md; upload-asset.sh was
+    # already named). MEASURED as a SET DIFFERENCE (`comm -3` of the sorted
+    # `--population` emits): the clean base worktree at origin/dev 3093b1d4
+    # gives 320, equal to the pin committed there; the bundle-1015a head gives
+    # 323. THREE added, ZERO removed. Selection rate not re-measured.
+    # +3 for bundle-1015b (your-org/nexus-code#1845): test-api-hold.sh declares,
+    # bringing its own suite path and two files no other row named
+    # (monitor/watcher/_api_hold.sh, monitor/hooks/_cause_classify.sh).
+    # MEASURED as a SET DIFFERENCE (`comm` of the sorted `--population` emits):
+    # the clean base worktree at origin/dev 52c91f09 gives 323, equal to the pin
+    # committed there; the bundle-1015b head gives 326. THREE added, ZERO
+    # removed. Selection rate over the last 120 first-parent commits of
+    # 52c91f09 (0 empty), files per commit from `git diff-tree -r -m
+    # --first-parent`, intersected with a draining `comm -12 | wc -l`: 98/120
+    # base, 98/120 head. That method differs from the earlier rows' (they quote
+    # 99-100/120), so compare base with head here, not with them.
+    # +1 for bundle-1016a (your-org/nexus-code#1848): test-skeptic-resolve-scoped.sh
+    # declares; its four declared files were already named by
+    # test-request-decline-ledger-timeout.sh, so only the suite path is new.
+    # MEASURED as a SET DIFFERENCE (`comm` of the sorted `--population` emits):
+    # the clean base worktree at origin/dev e15674d9 gives 326, equal to the pin
+    # committed there; the bundle-1016a head gives 327. ONE added, ZERO
+    # removed. Selection rate over the last 120 first-parent commits of
+    # e15674d9 (0 empty), with the bundle-1015b method (`git diff-tree -r -m
+    # --first-parent`, draining `comm -12 | wc -l`): 98/120 base, 98/120 head.
+    # +1 for bundle-1016b (your-org/nexus-code#1851): test-pane-state-mcp-helper.sh
+    # declares; its one declared file (monitor/pane-state.sh) was already named,
+    # so only the suite path is new. MEASURED as a SET DIFFERENCE against the
+    # clean base worktree at origin/dev 23a490ff (see the bundle report).
+    # +1 for bundle-1017b (your-org/nexus-code#1866): test-pane-state-footer-eol.sh
+    # declares; its one declared file (monitor/pane-state.sh) was already named,
+    # so only the suite path is new. MEASURED as a SET DIFFERENCE (`comm -3` of
+    # the sorted `--population` emits): the clean base worktree at origin/dev
+    # 414bd080 gives 328, equal to the pin committed there; the bundle-1017b
+    # head gives 329. ONE added, ZERO removed. Selection rate over the last 120
+    # first-parent commits of 414bd080 (0 empty), with the bundle-1015b method:
+    # 98/120 base, 98/120 head.
+    # +1 for bundle-1017c (your-org/nexus-code#1870): test-pane-state-footer-eol.sh
+    # names a second sentinel, the derived Monitor-only capture
+    # fixtures/working-background-monitor-shifttab-derived-657.ansi, which no
+    # other row named. MEASURED as a SET DIFFERENCE (`comm -3` of the sorted
+    # `--population` emits): a clean clone at origin/dev 2a5c2146 gives 329,
+    # equal to the pin committed there; the bundle-1017c head gives 330. ONE
+    # added, ZERO removed. Selection rate over the last 120 first-parent commits
+    # of 2a5c2146 (0 empty), with the bundle-1015b method: 98/120 base, 98/120
+    # head.
+    _TGFD_POP_EXPECTED=330
     _n_pop=$( gp_render "" 2>/dev/null | sort -u | "$REAL_GREP" -c . )
     _n_nosent=$(
         gp_population() { printf '%s\n' "$INDEX" "$PROTO" "$MANIFEST"
@@ -2045,6 +2105,56 @@ TOUT=$(cd "$REPO_ROOT" && timeout 90 bash "$INDEX" --changed-files "$_gfd_t/chan
 assert_rc      "an ample --timeout does NOT manufacture a truncation" "$TRC" 0
 assert_contains "…and the guard reports PASS"        "$TOUT" "PASS"
 assert_contains "…with a full reconciliation line"   "$TOUT" "reached 1 of 1"
+assert_contains "…counting no SKIP on a pass-only run" "$TOUT" "1 passed, 0 skipped, 0 failed"
+assert_not_contains "…and printing no SKIP verdict"  "$TOUT" "    SKIP "
+
+# ===========================================================================
+# SKIP (exit 77) IS ITS OWN VERDICT (your-org/nexus-code#1860). Read as
+# non-zero it was FAIL: the two codex integration suites exit 77 without
+# RUN_INTEGRATION, and a clean run at PR #1857 read `66 of 68 passed`. Read as
+# zero it would be a green from a guard that asserted nothing. Both directions
+# are pinned: a SKIP-only run is exit 4 (not 0, not 1), a SKIP beside a FAIL is
+# still 1, and a code that merely RESEMBLES a skip (69) stays FAIL.
+echo "=== SKIP: a guard that exits 77 is neither FAIL nor PASS (#1860) ==="
+_mk_guard skip 'exit 77'
+_mk_guard red  'exit 1'
+_mk_guard env69 'exit 69'
+
+printf '%s\n' "$_gfd_t/test-skip.sh" > "$_gfd_t/suites"
+TOUT=$(cd "$REPO_ROOT" && timeout 90 bash "$INDEX" --changed-files "$_gfd_t/changed" \
+        --suites-from "$_gfd_t/suites" --run 2>&1); TRC=$?
+assert_rc       "a SKIP-only run exits 4: not a clearance, and not a failure" "$TRC" 4
+assert_contains "…the guard is reported SKIP"          "$TOUT" "    SKIP $_gfd_t/test-skip.sh"
+assert_not_contains "…and never FAIL"                  "$TOUT" "    FAIL $_gfd_t/test-skip.sh"
+assert_not_contains "…and never PASS"                  "$TOUT" "    PASS $_gfd_t/test-skip.sh"
+assert_contains "…counted as skipped, not failed"      "$TOUT" "reached 1 of 1 selected guard(s) — 0 passed, 1 skipped, 0 failed"
+assert_contains "…and the exit is labelled as not a clearance" "$TOUT" "NOT A CLEARANCE (exit 4)"
+assert_contains "…naming the skipped guard"            "$TOUT" "SKIPPED: $_gfd_t/test-skip.sh"
+assert_not_contains "…without the #1054 untracked remedy, which does not apply" "$TOUT" "UNVERIFIED:"
+
+# The reconciliation sums: pass + skip + fail = reached = selected.
+printf '%s\n' "$_gfd_t/test-fast.sh" "$_gfd_t/test-skip.sh" > "$_gfd_t/suites"
+TOUT=$(cd "$REPO_ROOT" && timeout 90 bash "$INDEX" --changed-files "$_gfd_t/changed" \
+        --suites-from "$_gfd_t/suites" --run 2>&1); TRC=$?
+assert_rc       "a PASS beside a SKIP still exits 4" "$TRC" 4
+assert_contains "…and the line reconciles 1 + 1 + 0 = 2" "$TOUT" "reached 2 of 2 selected guard(s) — 1 passed, 1 skipped, 0 failed"
+
+# A FAIL dominates a SKIP.
+printf '%s\n' "$_gfd_t/test-skip.sh" "$_gfd_t/test-red.sh" > "$_gfd_t/suites"
+TOUT=$(cd "$REPO_ROOT" && timeout 90 bash "$INDEX" --changed-files "$_gfd_t/changed" \
+        --suites-from "$_gfd_t/suites" --run 2>&1); TRC=$?
+assert_rc       "a SKIP beside a FAIL exits 1 — a SKIP never softens a red" "$TRC" 1
+assert_contains "…the red guard is FAIL"               "$TOUT" "    FAIL $_gfd_t/test-red.sh"
+assert_contains "…the skipped guard is still SKIP"     "$TOUT" "    SKIP $_gfd_t/test-skip.sh"
+assert_contains "…and the line reconciles 0 + 1 + 1 = 2" "$TOUT" "reached 2 of 2 selected guard(s) — 0 passed, 1 skipped, 1 failed"
+
+# ONLY 77. run-tests.sh reads 69 as ENVSKIP, but this tool was asked for the
+# automake convention alone; a broader set would turn real reds into non-reds.
+printf '%s\n' "$_gfd_t/test-env69.sh" > "$_gfd_t/suites"
+TOUT=$(cd "$REPO_ROOT" && timeout 90 bash "$INDEX" --changed-files "$_gfd_t/changed" \
+        --suites-from "$_gfd_t/suites" --run 2>&1); TRC=$?
+assert_rc       "a guard exiting 69 is FAIL, exit 1 — only 77 is SKIP" "$TRC" 1
+assert_contains "…and printed FAIL"                    "$TOUT" "    FAIL $_gfd_t/test-env69.sh"
 
 # A valueless --timeout is EX_USAGE, matching #990's unification.
 (cd "$REPO_ROOT" && timeout 20 bash "$INDEX" --run --timeout >/dev/null 2>&1); TRC=$?

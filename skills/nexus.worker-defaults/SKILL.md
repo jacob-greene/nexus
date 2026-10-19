@@ -333,6 +333,12 @@ a hook or your task prompt points you there.
   watcher cannot send RESUME. `monitor/ng degraded status` says which mode you are in. Nothing
   inside the sandbox can repair it; never remount, bind or unshare around it.
   On RESUME, redo the writes that failed.
+- **A GitHub reader cannot open claude.ai Artifacts** (<your-org>/nexus-code`#1856`).
+  Anything you post on GitHub for the operator to read (a plan, a figure, a
+  schematic) goes up with `monitor/ng upload <file>` and you link THAT. md,
+  SVG and PNG render there; raw HTML does not, so ship an `.md` or images
+  beside it. An Artifact link is an optional extra, never the only copy;
+  `ng` and the `gh` shim warn on a body that breaks this.
 - **`sandbox-notify "<msg>"`** on blocker / ready / done. It delivers
   ATTENTION, not content: the real tool discards its argument and emits
   a bare BEL, so the operator learns that *something* happened, never
@@ -484,7 +490,17 @@ a hook or your task prompt points you there.
   `COMPLETED 0:0` for a job that produced nothing (measured on a real
   job). Put job I/O under the project tree, `/hpc/temp` or
   `/loc/scratch/$SLURM_JOB_ID`, and end the script with `exit $rc` of
-  the step that did the work.
+  the step that did the work. **`--time` is not a bound either**
+  (<your-org>/nexus-code#1841): `scontrol show config | grep -E
+  'OverTimeLimit|EnforcePartLimits'` read `2160 min` and `NO` here, so Slurm
+  runs a job up to 36 h past its `--time` (a 6 h build ran 13 h 52 m); other
+  clusters differ, so read yours. Wrap the real step in its own bound,
+  `timeout -k 60 <N> <cmd>; rc=$?`, write the rc to a file the watch can
+  read (`echo "$rc" > "$RCFILE"`, then `ng longjob add slurm:<id>
+  --payload-rc "$RCFILE"`, which merges into the launch hook's
+  `auto-slurm-<id>` watch rather than creating a second: a node with a DNS
+  fault held jobs RUNNING after their payload exited), and `exit "$rc"`. Classify that rc as a WRAPPER
+  status by the set 124/125/126/127/137/143, never by one value.
 - **On this cluster `--mem` is NOT enforced: size a job by its CORE share**
   (measured 2026-10-09). `scontrol show config` reports
   `SelectTypeParameters=CR_CORE` (memory is not a consumable resource) and

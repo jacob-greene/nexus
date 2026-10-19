@@ -117,7 +117,7 @@ sequential re-arm under a new report path is released as before (#1810 F1). `ng 
 a sibling round archives only the terminal sentinels and leaves the live
 `*.answered.md`. The target retires only when every round is closed: the last
 verdict releases the marker, or `ng skeptic resolve` releases them all on the
-record. A marker with no ledger is a legacy single round and behaves as before.
+record (naming the review with `--reviewer` while any edge is live, below). A marker with no ledger is a legacy single round and behaves as before.
 
 **Ask the ledger which kind of "missing" this is before you do anything.**
 
@@ -337,6 +337,25 @@ substantive, refuses when there is no marker, appends the reason to
 this verb exists to replace, and a guard that trains its own bypass is
 worse than no guard.
 
+**A resolve names the review it settles** (`<your-org>/nexus-code#1848`).
+- **No obligation edge is live:** `resolve <window>` behaves as above (a
+  marker clear or a disposition release).
+- **Any edge is live:** it is REFUSED (rc 9). The refusal prints the exact
+  command for each live reviewer:
+  `ng skeptic resolve <window> --reviewer <w> --reason "…"`.
+- **`--reviewer W`** settles ONLY W's edge. While other reviewers are still
+  live, the marker, the ledger, the await and any owed-delta record are left
+  for them, and `--delta-owed`, `--withdraw-delta` and `--disposition` are
+  refused.
+- **`--all-reviewers`** settles every live reviewer, deliberately and on the
+  record.
+
+Why the edge count was not the test: edges supersede by time. In the
+2026-10-16 incident the one live edge belonged to the OTHER reviewer, so the
+resolve credited a review its `--reason` was not about. If the review your
+`--reason` cites is not among the live reviewers the refusal lists, its edge
+is already gone: settle nothing.
+
 It is not a waive. `--skeptic-waive` says *no skeptic was required after
 all* and is recorded as a decision about the **requirement**; `resolve`
 says *the validation happened, here is where it landed* and is recorded as
@@ -368,6 +387,15 @@ With `enforce_auto_decision` off (advisory), an undecided wrap-up records
 Decline with `ng skeptic resolve <window> --reason "…" [--disposition]` (or
 `ng request reply <id> --status declined`, which calls it), **never** with
 `close`: a `DONE` planted on a decline is exactly what a later pass misreads.
+
+**A decline is REFUSED while a skeptic is still live** on the origin
+(`<your-org>/nexus-code#1848`; measured on ncbundle29). Declining a duplicate
+request discharged a review that was still running. The reply now passes
+`--refuse-live-reviewer`, and on its refusal you choose one of two forms:
+- `--status spawned --worker <live reviewer>`: the request is covered by the
+  review already running, and ITS verdict discharges the gate;
+- `--status declined --settle-live-reviewer`: the live review is abandoned on
+  purpose, and is settled with the gate.
 `resolve` now also writes a `RELEASED` sentinel stamped `kind: resolution`, so
 an `await` on that window — live, or re-entered after the marker was already
 gone — ends with **exit 14** and the orchestrator's reason instead of waiting
@@ -1032,7 +1060,7 @@ so nobody has to remember it:
 | `ng skeptic close <target>` | the protocol's **own** end-of-pairing signal — it already means "the skeptic closed the channel; stop looping and retire", and it releases the target's `await` with exit 10 |
 | a **later** reviewer pinned to the same target | supersession — the pairing was handed over, so the earlier reviewer is free |
 | the creditor window leaving tmux | a window that does not exist depends on nobody |
-| `ng skeptic resolve <target> --reason "…"` | an orchestrator adjudicating the target's gate as done — a statement about the pairing, so it discharges **every** reviewer of that window (`<your-org>/nexus-code#926` F5) |
+| `ng skeptic resolve <target> --reviewer <w> --reason "…"` | an orchestrator adjudicating ONE review as done. It settles only `<w>`'s edge, and is **required** while any edge is live (rc 9 otherwise, `<your-org>/nexus-code#1848`). `--all-reviewers` discharges **every** reviewer of that window deliberately (the old default, `<your-org>/nexus-code#926` F5) |
 | `ng obligation settle --debtor <w> --reason "…"` | the audited manual release (reason ≥ 20 chars, on the record). `--creditor <w>` discharges every reviewer of `w` instead |
 
 **A FILED VERDICT DOES NOT END THE PAIRING**, and this is the correction that
@@ -1168,8 +1196,15 @@ Four traps that repeatedly cost idle worker-hours:
   ./monitor/spawn-worker.sh -n <w>-skeptic -c <worker-workdir> \
     -p <skeptic-prompt-file> -r <the-report-the-skeptic-must-read> \
     --skeptic-role --skeptic-target <w> \
-    --skeptic-orig <w>
+    --skeptic-orig <w> \
+    --skeptic-subject <what-it-reviews>   # e.g. proj#275 — see below
   ```
+  **Pass `--skeptic-subject` whenever the target has more than one review in
+  flight** (`<your-org>/nexus-code#1849`). It is recorded on the reviewer's
+  obligation edge. Two edges that both carry one supersede only for the SAME
+  subject, so a second reviewer of a different PR can no longer void the
+  first one's edge mid-review. Without subjects, a later reviewer supersedes
+  only one that has already filed a verdict.
   Omit `--model` — the skeptic then inherits the `model` pin in
   `monitor/worker-settings.json`, so it tracks the operator's current
   default instead of a hardcoded id that goes stale on every release.

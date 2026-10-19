@@ -47,7 +47,7 @@ one.
 
 When the work is driven by a specific GitHub issue or PR, embed the
 number in the slug, e.g.
-`diff-dynamics_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
+`proj-x_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
 lets future workers retrieve the chain via
 `ls reports/*issue53* 2>/dev/null`.
 
@@ -346,6 +346,14 @@ url=$(./monitor/ng upload reports/<your-report>.md)
 on the asset repo's `main` branch and prints a SHA-pinned
 `blob/<sha>/...` URL that renders as a page on github.com.
 See the `nexus.bot` skill for the full upload-rule cheatsheet.
+
+**Material for a GitHub reader goes up as a nexus asset, never only as a
+claude.ai Artifact** (<your-org>/nexus-code#1856). The GitHub reader cannot open
+Artifact links. Upload plans, figures and schematics with `ng upload` and link
+the asset in the report and its `## Summary`; ship an `.md` or images beside
+any HTML, because raw HTML does not render on GitHub. `ng wrap-up` warns when
+its link comment names an Artifact with no asset beside it (the report's own
+asset link does not count, since it is not a copy of that deliverable).
 
 ## The skeptic decision at wrap-up
 

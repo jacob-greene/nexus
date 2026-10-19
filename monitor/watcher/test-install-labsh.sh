@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unit tests for monitor/install-labsh.sh — the bootstrap-side installer
-# for operator/labsh.
+# for katosh/labsh.
 #
 # Sandbox-correct path:
 #   target = $SANDBOX_PROJECT_DIR/work/labsh
@@ -54,7 +54,7 @@ if [[ "\${1-}" == "clone" ]]; then
     mkdir -p "\$target"
     echo "STUB-CLONE" > "\$target/README.md"
     "\$REAL_GIT" -C "\$target" init -q
-    "\$REAL_GIT" -C "\$target" remote add origin https://github.com/operator/labsh.git
+    "\$REAL_GIT" -C "\$target" remote add origin https://github.com/katosh/labsh.git
     exit 0
 fi
 exec "\$REAL_GIT" "\$@"
@@ -101,7 +101,7 @@ SBX1="$WORK/sandbox-1"; mkdir -p "$SBX1"
 run_install "$SBX1" "$STUBS"
 assert_eq "exit 0" "$LAST_RC" "0"
 assert_ok "clone landed (.git present)" test -d "$SBX1/work/labsh/.git"
-assert_contains "stdout mentions operator/labsh#3 caveat" "$LAST_STDOUT" "operator/labsh#3"
+assert_contains "stdout mentions katosh/labsh#3 caveat" "$LAST_STDOUT" "katosh/labsh#3"
 run_install "$SBX1" "$NOCLONE" --check
 assert_eq "--check passes on complete install" "$LAST_RC" "0"
 

@@ -91,7 +91,8 @@ assert_eq() { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "got [$2] want [$3]"; }
 _kids=""
 # ONLY recorded pids. A teardown that matched by name inside the suite about
 # the hazard of matching by name would be absurd (your-org/nexus-code#851).
-cleanup() { local k; for k in $_kids; do kill "$k" 2>/dev/null; done; }
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/procmatch-XXXXXX") || { echo "FATAL: mktemp failed" >&2; exit 1; }
+cleanup() { local k; for k in $_kids; do kill "$k" 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 [[ -r "$CLAUDE_MD" ]] || { echo "FATAL: CLAUDE.md not readable at $CLAUDE_MD" >&2; exit 1; }
@@ -174,13 +175,56 @@ else
         # Control C — BOTH POLARITIES of the bracketing claim, on a live plant.
         # Bracketing removes the OBSERVER's hit and leaves the foreign one, so
         # the bracketed count must be strictly smaller AND still non-zero.
-        _bracketed=$(ps -eo pid=,args= | grep -c "sibling_[${NONCE:0:1}]${NONCE:1}_decoy" || true)
-        if (( _bracketed < _naive )); then
-            ok "Control C: bracketing removes the observer's own hit ($_naive -> $_bracketed)"
+        #
+        # THE OBSERVER IS NOT GUARANTEED TO BE IN `ps`'s SNAPSHOT
+        # (your-org/nexus-code#1853). `ps | grep` starts both at once, and `ps`
+        # can read /proc before the grep has exec'd, so the grep's own argv is
+        # sometimes absent: measured once on a node, `naive=1 bracketed=1`, and
+        # Control C went red for a reason that is not the bullet's. So each
+        # attempt `tee`s the EXACT snapshot its grep consumed, and the suite
+        # LOOKS for the observer's line in it rather than inferring it from a
+        # count. An attempt that did not capture its observer measured nothing
+        # about self-matching and is retried; if none captures it, the control
+        # SKIPS, naming the measurement, and never reports a failure the
+        # mechanism under test did not produce. What is ASSERTED is unchanged:
+        # bracketed >= 1 on EVERY run, and bracketed < naive on a captured attempt.
+        _pat_n="sibling_${NONCE}_decoy"; _pat_b="sibling_[${NONCE:0:1}]${NONCE:1}_decoy"
+        _cc_seen=0 _cc_try=0 _cc_raced=0
+        while (( _cc_try < 8 )); do
+            _cc_try=$(( _cc_try + 1 ))
+            _naive_c=$(ps -eo pid=,args= | tee "$WORK/snap-n" | grep -c "$_pat_n" || true)
+            _bracketed=$(ps -eo pid=,args= | tee "$WORK/snap-b" | grep -c "$_pat_b" || true)
+            # The observer's own line: a process whose argv carries the pattern
+            # VERBATIM and is not the decoy. Keyed on the PATTERN, not on the
+            # word `grep`: a wrapped grep has a different argv[0], and a match
+            # on the literal would read as "raced" forever — a permanent SKIP,
+            # i.e. the control silently switched off. `index`, not a regex:
+            # the bracketed pattern IS a regex.
+            _on=$(awk -v p="$_pat_n" -v d="$_foreign" '$1 != d && index($0,p){n++} END{print n+0}' "$WORK/snap-n")
+            _ob=$(awk -v p="$_pat_b" -v d="$_foreign" '$1 != d && index($0,p){n++} END{print n+0}' "$WORK/snap-b")
+            if (( _on >= 1 && _ob >= 1 )); then _cc_seen=1; break; fi
+            _cc_raced=$(( _cc_raced + 1 ))
+        done
+        if (( _cc_seen == 1 )); then
+            # POTENCY: the naive count's extra hit IS the observer, so the
+            # comparison below measures the self-match and nothing else.
+            assert_eq "Control C potency: on a captured attempt the naive count is the decoy PLUS its own grep ($_cc_raced raced attempt(s) retried)" \
+                "$_naive_c" "$(( _bracketed + 1 ))"
+            if (( _bracketed < _naive_c )); then
+                ok "Control C: bracketing removes the observer's own hit ($_naive_c -> $_bracketed)"
+            else
+                bad "Control C: bracketing removes the observer's own hit" \
+                    "naive=$_naive_c bracketed=$_bracketed — the self-match half no longer reproduces"
+            fi
         else
-            bad "Control C: bracketing removes the observer's own hit" \
-                "naive=$_naive bracketed=$_bracketed — the self-match half no longer reproduces"
+            for _l in "Control C potency" "Control C: bracketing removes the observer's own hit"; do
+                th_skip "$_l" "COULD NOT OBSERVE: in $_cc_try attempts no ps snapshot contained the observer's own grep (it raced the grep's exec every time), so self-matching was not measured — not a failure of the bullet (your-org/nexus-code#1853)"
+            done
         fi
+        # OUTSIDE the capture gate (ncbundle31-sk F3): the foreign-session hit
+        # is the decoy's line, present in every snapshot whether or not the
+        # observer's grep raced, so the bullet's core claim is asserted on
+        # EVERY run, as it was before the race fix.
         if (( _bracketed >= 1 )); then
             ok "…and does NOT remove the foreign-session hit — the bullet's core claim"
         else
@@ -232,8 +276,8 @@ kill "$_mine" 2>/dev/null
 echo
 # COUNT GUARD. Two branches are conditional on a plant succeeding, so a case
 # that stops running would show as a smaller green rather than a red.
-_EXPECTED_ASSERTIONS=16
-_ran=$(( PASS + FAIL ))
+_EXPECTED_ASSERTIONS=17   # +1: #1853 Control C potency
+_ran=$(( PASS + FAIL + ${SKIP:-0} ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     ok "every declared assertion executed ($_EXPECTED_ASSERTIONS)"
 else

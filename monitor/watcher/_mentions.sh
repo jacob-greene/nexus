@@ -548,7 +548,7 @@ snapshot_bot_mentions() {
     local raw
     raw=$(curl -sS \
         --connect-timeout "$connect_to" --max-time "$max_time" \
-        -H "Authorization: Bearer $token" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$token") \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -X POST "https://api.github.com/graphql" \

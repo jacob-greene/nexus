@@ -154,10 +154,22 @@ _id=$(_mkreq e1) || th_abort "fixture: could not file+claim the edge-pending req
 assert_eq "declined + --skeptic-resolved on a live edge: refused (6)" \
     "$(_reply "${LIVE[@]}" -- "$_id" --status declined --skeptic-resolved --message "$MSG")" "6"
 assert_contains "…naming ONE remedy: drop --skeptic-resolved" "$(cat "$WORK/err")" "Drop --skeptic-resolved"
-assert_eq "FOLLOWING that remedy (no flag) is accepted: rc 0" \
-    "$(_reply "${LIVE[@]}" -- "$_id" --status declined --message "$MSG")" "0"
+# FOLLOWING that remedy (no flag) used to be accepted and SETTLED the live edge.
+# Since your-org/nexus-code#1848 that is refused — a decline of the REQUEST must
+# not discharge a review a live skeptic is still doing — and the refusal must
+# not reopen #1771's ping-pong: it names two NEW remedies, neither of which is
+# the flag the previous refusal told the caller to drop.
+assert_eq "following that remedy (no flag) on a LIVE reviewer: refused (6) since #1848" \
+    "$(_reply "${LIVE[@]}" -- "$_id" --status declined --message "$MSG")" "6"
 assert_not_contains "…and does NOT send the caller back to --skeptic-resolved (the ping-pong)" \
     "$(cat "$WORK/err")" "re-run with --skeptic-resolved"
+assert_contains "…it names the covered-by-the-live-review remedy" "$(cat "$WORK/err")" "--status spawned --worker <that live reviewer>"
+assert_contains "…and the deliberate abandoning remedy" "$(cat "$WORK/err")" "--settle-live-reviewer"
+assert_eq "…the request is left CLAIMED" "$(_state_of "$_id")" "claimed"
+assert_contains "…and the live edge is NOT settled" \
+    "$(env "${LIVE[@]}" "$OBLIG" state e1-sk__e1__skeptic-verdict 2>/dev/null)" "state=live"
+assert_eq "the ABANDONING remedy (--settle-live-reviewer) is accepted: rc 0" \
+    "$(_reply "${LIVE[@]}" -- "$_id" --status declined --settle-live-reviewer --message "$MSG")" "0"
 assert_eq "…the request is REPLIED" "$(_state_of "$_id")" "replied"
 assert_contains "…and the edge the decline declined is SETTLED" \
     "$(env "${LIVE[@]}" "$OBLIG" state e1-sk__e1__skeptic-verdict 2>/dev/null)" "state=settled"
@@ -179,7 +191,9 @@ assert_contains "…as nothing to resolve" "$(cat "$WORK/err")" "nothing to reso
     || th_abort "fixture: could not open the e3-sk -> e3 obligation edge"
 LIVE3=("OBL_TMUX_WINDOWS=$(printf 'e3\ne3-sk')")
 chmod 444 "$STATE/obligations/e3-sk__e3__skeptic-verdict.rec"
-_rc=0; env "${LIVE3[@]}" "$SC" resolve e3 --reason "the depth-1 verdict on e3 covers this change in full" >"$WORK/out" 2>"$WORK/err" || _rc=$?
+# `--reviewer e3-sk`: since your-org/nexus-code#1848 a resolve with a live edge
+# must name the review it settles, or it is refused before the settle runs.
+_rc=0; env "${LIVE3[@]}" "$SC" resolve e3 --reviewer e3-sk --reason "the depth-1 verdict on e3 covers this change in full" >"$WORK/out" 2>"$WORK/err" || _rc=$?
 assert_not_contains "settle FAILED: resolve does NOT claim the edges are settled" "$(cat "$WORK/out")" "are settled"
 assert_contains "…it says they are NOT settled and names the hand remedy" "$(cat "$WORK/out")" "NOT settled: the settle failed"
 assert_contains "…and the ledger agrees: the edge is still open" \
@@ -188,7 +202,7 @@ chmod 644 "$STATE/obligations/e3-sk__e3__skeptic-verdict.rec"
 
 # THE ASSERTION TOTAL IS EXACT: an assertion that silently stops running (a
 # section that aborted, a loop over an empty set) is a red, not a smaller green.
-EXPECTED=37
+EXPECTED=42
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: assertion census %d != EXPECTED %d — an assertion did not run, or one was added without updating EXPECTED\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

@@ -262,6 +262,24 @@ clears the resubmit marker, and the episode resets. Only `category=auth`
 gates; `transient`, `config` and `conversation` keep the ladder's existing
 remedies (an operator decision recorded on the bundle PR).
 
+## The API-unreachable gate (<your-org>/nexus-code#1845)
+
+Directly after the auth gate, `_api_hold_active` (`monitor/watcher/_api_hold.sh`)
+is asked whether the watcher holds an **API-unreachable hold**: transport-class
+`StopFailure` markers (`EAI_AGAIN`, `ENOTFOUND`, `ECONNRESET`, "Can't reach the
+API server", classified by `cause_classify_class` in
+`monitor/hooks/_cause_classify.sh`) from at least two sessions, or from the
+orchestrator alone. While it stands the verdict is
+`healthy reason=api-unreachable`: no resubmit and no respawn, because a
+resubmit starts a turn that fails again and a respawned session cannot reach
+the API either. The hold is released by a watcher-side probe of the API
+endpoint (any HTTP status from `curl` counts as reachable) or by a recorded
+session completing a turn; on release the **watcher** pastes one resume nudge
+into each crashed window, orchestrator first, so recovery needs no
+orchestrator turn. Bounded by `monitor.watcher.api_hold.max_hold_seconds`
+(43200 s), past which this gate fails open. Operator alert key:
+`api-unreachable`; ledger `monitor/.state/api-hold.log`.
+
 ## Verdict logging
 
 The liveness task polls every ~5 s. To avoid log spam,

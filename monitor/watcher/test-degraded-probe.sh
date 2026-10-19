@@ -14,8 +14,8 @@
 #   - it can never be aimed at the sandbox root: `/`, empty and relative paths
 #     are refused at rc 2 before anything is written.
 #   - an OK leaves nothing behind in the surface it probed.
-#   - `ng degraded` reaches the script for `probe` and REFUSES the subcommands
-#     that are not built, rather than ignoring them.
+#   - `ng degraded` reaches the script for `probe` and REFUSES an unknown
+#     subcommand, rather than ignoring it.
 
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_test_helpers.sh"
@@ -104,9 +104,11 @@ echo '=== ng degraded ==='
 out=$(NEXUS_STATE_DIR="$S2" "$NG" degraded probe --surface ok="$WORK/ok" 2>&1); rc=$?
 assert_eq       "ng degraded probe: rc 0"        "$rc" "0"
 assert_contains "ng degraded probe: reaches the script" "$out" "surface=ok verdict=OK"
-out=$("$NG" degraded enter 2>&1); rc=$?
-assert_eq       "ng degraded enter: REFUSED, not ignored (rc != 0)" "$(( rc != 0 ))" "1"
-assert_contains "ng degraded enter: says it is not implemented" "$out" "not implemented"
+# enter/exit are built now (test-degraded-enter-exit.sh, #1724 piece A); an
+# UNKNOWN sub-verb must still be refused rather than ignored.
+out=$("$NG" degraded bogus 2>&1); rc=$?
+assert_eq       "ng degraded <unknown>: REFUSED, not ignored (rc != 0)" "$(( rc != 0 ))" "1"
+assert_contains "ng degraded <unknown>: prints the usage" "$out" "usage: ng degraded probe"
 
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, count=exact): a
 # dropped or added assertion is a FAIL, never a quieter green.

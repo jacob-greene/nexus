@@ -1496,6 +1496,14 @@ fi
 #     still the shared `_arg_excerpt` ancestor, not a fifth copy. RECORDED, not
 #     fixed, like the rows above. The counts are this suite's own D2 output on
 #     the bundle tree; they were not counted by eye.
+#     `obligations.sh` 8 -> 10 at the bundle-1017a seam (your-org/nexus-code#1865):
+#     `reviews` gained `--since-edge` and an order-independent argument loop
+#     (part B of this suite reads the old parser, which silently ignored
+#     unknown words, as order-sensitive once it could refuse one). The loop
+#     brings TWO raw-token arg diagnostics, `unknown flag: $1` and `unexpected
+#     extra positional: $1`, in the shape of the eight arms already in that
+#     file. RECORDED, not fixed, for the shared-ancestor reason above. The
+#     count is this suite's own D2 output on the bundle tree.
 _D_MANIFEST='ci-head-attempts.sh 2
 degraded-status.sh 1
 doctor.sh 1
@@ -1503,7 +1511,7 @@ longjob-watch.sh 3
 guards-for-diff.sh 1
 lit.sh 3
 mint-token.sh 1
-obligations.sh 8
+obligations.sh 10
 paste-followup.sh 1
 remote-client-helper.sh 1
 remote-enroll.sh 6

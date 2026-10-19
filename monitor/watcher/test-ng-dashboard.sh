@@ -1008,6 +1008,125 @@ assert_contains "#1136 CONTROL: a genuinely empty body is still called that" \
     "$_d1136_empty" "has empty body"
 
 
+# ---- #1839: status_surface — the emit's dashboard section ----------------
+#
+# The REAL `_emit_dashboard_section` (plucked from main.sh) and the REAL
+# helpers (plucked from monitor/_status-surface.sh), read through the REAL
+# config/load.sh against a planted NEXUS_CONFIG. Plucked with awk + eval, so
+# the suite runs the production text rather than a copy of it.
+
+echo '=== #1839 status_surface: emit section, key absent / external / unknown ==='
+_ss_src=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+_ss_pluck() {  # <fn-name> <file>
+    awk -v fn="$1" '$0 ~ "^"fn"\\(\\) \\{" {c=1} c {print} c && /^\}/ {exit}' "$2"
+}
+_ss_fns=$(
+    _ss_pluck status_surface_kind  "$_ss_src/monitor/_status-surface.sh"
+    _ss_pluck status_surface_key   "$_ss_src/monitor/_status-surface.sh"
+    _ss_pluck _emit_dashboard_section "$_ss_src/monitor/watcher/main.sh"
+)
+# POSITIVE CONTROL: all three functions were found, so a later "line absent"
+# cannot be the absence of the code under test.
+assert_eq "#1839 POSITIVE CONTROL: three functions plucked" \
+    "$(printf '%s\n' "$_ss_fns" | grep -c '^[a-z_]*() {$')" "3"
+_ss_dir="$WORK/ss"; mkdir -p "$_ss_dir/state"
+_ss_emit() {  # <yml-file> -> the section on stdout
+    ( eval "$_ss_fns"
+      _cfg="$_ss_src/config/load.sh" NEXUS_ROOT="$_ss_dir" STATE_DIR="$_ss_dir/state" \
+      NEXUS_CONFIG="$1" _emit_dashboard_section )
+}
+printf 'nexus:\n  root: /data/proj-x\n' > "$_ss_dir/absent.yml"
+
+# KEY ABSENT — today's text, byte for byte, in each of the three stamp states.
+rm -f "$_ss_dir/state/dashboard-updated.ts"
+assert_eq "#1839 key absent, no stamp: today's lines exactly" "$(_ss_emit "$_ss_dir/absent.yml")" \
+"--- dashboard ---
+last put: unknown
+(no dashboard-updated.ts — no put recorded on this host. Says nothing
+ about the dashboard body; read it with \`monitor/ng dashboard get\`.)"
+printf '2026-01-01T00:00:00+00:00\n' > "$_ss_dir/state/dashboard-updated.ts"
+assert_eq "#1839 key absent, old stamp: today's lines exactly" "$(_ss_emit "$_ss_dir/absent.yml")" \
+"--- dashboard ---
+last put: 2026-01-01T00:00:00+00:00 (local stamp — when \`ng dashboard put\` last ran here)
+(no put in > 2h. NOT a staleness check: nothing here reads the issue
+ body, so the dashboard may be current, or stale, or edited elsewhere.
+ To KNOW, read it: \`monitor/ng dashboard get\`.)"
+_ss_now=$(date -Is); printf '%s\n' "$_ss_now" > "$_ss_dir/state/dashboard-updated.ts"
+assert_eq "#1839 key absent, fresh stamp: today's lines exactly" "$(_ss_emit "$_ss_dir/absent.yml")" \
+"--- dashboard ---
+last put: $_ss_now (local stamp — when \`ng dashboard put\` last ran here)"
+# The explicit default is the same as absence.
+printf 'nexus:\n  root: /data/proj-x\nstatus_surface:\n  kind: overview-dashboard\n' > "$_ss_dir/default.yml"
+assert_eq "#1839 kind: overview-dashboard == key absent" \
+    "$(_ss_emit "$_ss_dir/default.yml")" "$(_ss_emit "$_ss_dir/absent.yml")"
+
+# EXTERNAL — a pointer, and nothing that asks for a put. The stamp is left in
+# place (fresh), so the default arm WOULD have printed `ng dashboard put`.
+printf 'https://status.example/proj-x\n' > "$_ss_dir/endpoint"
+printf 'nexus:\n  root: /data/proj-x\nstatus_surface:\n  kind: external\n  url_file: endpoint\n  feed: landings.tsv\n' \
+    > "$_ss_dir/external.yml"
+_ss_out=$(_ss_emit "$_ss_dir/external.yml")
+assert_contains     "#1839 external: status-surface header"  "$_ss_out" "--- status surface ---"
+assert_contains     "#1839 external: the page URL from url_file (relative to the root)" \
+    "$_ss_out" "external page: https://status.example/proj-x"
+assert_contains     "#1839 external: the feed path, made absolute" "$_ss_out" "landings feed: $_ss_dir/landings.tsv"
+assert_not_contains "#1839 THE PROPERTY: external asks for no dashboard put" "$_ss_out" "dashboard put"
+assert_not_contains "#1839 external: no dashboard section at all" "$_ss_out" "--- dashboard ---"
+printf 'status_surface:\n  kind: external\n' > "$_ss_dir/external-bare.yml"
+_ss_out=$(_ss_emit "$_ss_dir/external-bare.yml")
+assert_contains     "#1839 external without url_file says so" "$_ss_out" "(status_surface.url_file unset)"
+assert_not_contains "#1839 external without feed prints no feed line" "$_ss_out" "landings feed:"
+printf 'status_surface:\n  kind: external\n  url_file: /nonexistent/endpoint\n' > "$_ss_dir/external-bad.yml"
+assert_contains     "#1839 external with an unreadable url_file says so" \
+    "$(_ss_emit "$_ss_dir/external-bad.yml")" "(unreadable: /nonexistent/endpoint)"
+
+# UNKNOWN — loud, and never silently read as either kind.
+printf 'status_surface:\n  kind: externl\n' > "$_ss_dir/unknown.yml"
+_ss_out=$(_ss_emit "$_ss_dir/unknown.yml")
+assert_contains     "#1839 unknown kind: CONFIG ERROR names the value" \
+    "$_ss_out" "CONFIG ERROR: status_surface.kind 'externl' is not a known kind"
+assert_contains     "#1839 unknown kind: the default lines still follow" "$_ss_out" "last put: $_ss_now"
+assert_eq           "#1839 unknown kind: exactly one section header" \
+    "$(printf '%s\n' "$_ss_out" | grep -c '^--- .* ---$')" "1"
+
+echo '=== #1839 status_surface: ng dashboard put ==='
+_ss_write_load() {  # <kind> — the fixture load.sh, answering status_surface.kind
+    cat > "$FAKE_NEXUS/config/load.sh" <<STUB
+#!/usr/bin/env bash
+case "\${1:-}" in
+    github.repo)                    printf 'default-org/default-repo' ;;
+    github.user_login)              printf 'test-user' ;;
+    github.overview_issue_number)   printf '' ;;
+    status_surface.kind)            printf '%s' '$1' ;;
+    *) [[ \$# -ge 2 ]] && { printf '%s' "\$2"; exit 0; }; exit 2 ;;
+esac
+STUB
+    chmod +x "$FAKE_NEXUS/config/load.sh"
+}
+printf 'SS LINE external\n' > "$WORK/ss-middle-ext.md"
+_ss_write_load external
+rm -rf "$WORK/state"
+run_ng out err rc dashboard put --body-file "$WORK/ss-middle-ext.md"
+assert_eq        "#1839 external: put still succeeds"            "$rc" "0"
+assert_contains  "#1839 external: put still PATCHes"             "$(<"$CAPTURE")" "-X PATCH"
+assert_contains  "#1839 external: put notes the configured surface" "$err" "status_surface.kind is external"
+printf 'SS LINE unknown\n' > "$WORK/ss-middle-unk.md"
+_ss_write_load externl
+rm -rf "$WORK/state"
+run_ng out err rc dashboard put --body-file "$WORK/ss-middle-unk.md"
+assert_eq        "#1839 unknown kind: put REFUSED"               "$rc" "1"
+assert_contains  "#1839 unknown kind: the refusal names the value" "$err" "'externl'"
+assert_not_contains "#1839 unknown kind: no PATCH was sent"      "$(<"$CAPTURE")" "-X PATCH"
+# CONTROL: the default kind prints no note.
+printf 'SS LINE default\n' > "$WORK/ss-middle-def.md"
+_ss_write_load overview-dashboard
+rm -rf "$WORK/state"
+run_ng out err rc dashboard put --body-file "$WORK/ss-middle-def.md"
+assert_eq        "#1839 CONTROL default kind: put succeeds"      "$rc" "0"
+assert_not_contains "#1839 CONTROL default kind: no status_surface note" "$err" "status_surface"
+write_pinned_overview ""
+
+
 # ---- summary ------------------------------------------------------------
 
 th_summary_and_exit

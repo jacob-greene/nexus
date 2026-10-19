@@ -51,6 +51,60 @@ bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# --- THE GATE RUNS ON A FROZEN SNAPSHOT, never the live tree -----------------
+# (your-org/nexus-code#1828.) Before any scenario, gate.sh runs FAIL-CLOSED
+# pre-flights over its own repo's whole `monitor/` tree, untracked and
+# gitignored files included: the tmux-socket lint, its exemption manifest, and
+# the executed-set recount. A file that VANISHES between that walk's `find` and
+# its read is a refusal by design (lint-no-tmux-server-kill.sh `scan`, skeptic
+# B2 on PR 1630), so the gate exits 1 with no GATE line and no scenario run.
+# Under `run-tests.sh --jobs 4` other processes share the checkout, and this
+# suite used to run its ~15 gate calls over that LIVE tree: CI job
+# 123456789012 failed the #1448 valid-preset control exactly so (`rc=1
+# seen=NO-SCENARIO-RAN out=`), and the plain re-run passed. Reproduced off-CI:
+# churning one tiny shell file under a clone's monitor/watcher during the call
+# gives the same three-field signature on the first try. Which concurrent
+# writer did it in CI is NOT established (its first-run output was not kept).
+#
+# So the gate under test is a copy, in a private git repo, of the TRACKED
+# `monitor/` files AS THEY ARE IN THE WORKING TREE (uncommitted edits to gate.sh
+# are what gets tested). Concurrent suites add and remove UNTRACKED files; the
+# snapshot reads only tracked ones, once, and nothing else writes to it. The
+# pre-flights still run for real, over a real-sized population.
+SNAP="$WORK/snap"
+_snap_err=""
+mkdir -p "$SNAP" || _snap_err="mkdir"
+if [[ -z "$_snap_err" ]]; then
+    ( cd "$_repo_root" && git ls-files -z -- monitor .gitignore \
+        | tar --null -T - --ignore-failed-read -cf - 2>/dev/null ) \
+        | tar -xf - -C "$SNAP" || _snap_err="copy"
+fi
+_snap_git() { git -C "$SNAP" -c user.email=fixture@example.invalid -c user.name=fixture "$@"; }
+if [[ -z "$_snap_err" ]]; then
+    { _snap_git init -q && _snap_git add -A -f && _snap_git commit -qm snapshot; } >/dev/null 2>&1 || _snap_err="git"
+fi
+# The snapshot must be its OWN repository root: a failed `init` would let git
+# walk up and answer about whatever encloses $WORK (CLAUDE.md, REPO-WALKUP).
+if [[ -z "$_snap_err" && "$(git -C "$SNAP" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$SNAP" && pwd -P)" ]]; then
+    _snap_err="not-a-repo-root"
+fi
+if [[ -n "$_snap_err" || ! -f "$SNAP/monitor/cc-harness/gate.sh" ]] \
+   || ! cmp -s "$GATE" "$SNAP/monitor/cc-harness/gate.sh"; then
+    # No silent fallback to the live tree: that is the flake this replaces.
+    echo "FAIL: could not build the frozen gate snapshot under $SNAP (${_snap_err:-gate.sh missing or differs from the working tree}) — refusing to run the gate on the live tree" >&2
+    exit 1
+fi
+GATE="$SNAP/monitor/cc-harness/gate.sh"
+
+# gate_diag <output> — the lines that say WHY a gate run went the way it did:
+# its own refusals (`gate.sh: …`), a lint's FAIL lines and SCAN FAILED, the
+# stamps, and the verdict. A failure message that kept only `GATE ` lines
+# printed `out=` for a pre-flight refusal, which is what made #1828
+# undiagnosable from its CI log.
+gate_diag() {
+    grep -E 'gate\.sh:|SCAN FAILED|^ *FAIL:|gated-tui:|gated-tree:|GATE ' <<<"$1" | sed -n '1,12p'   # drains: no early-exit reader (test-early-exit-reader-manifest)
+}
+
 # A real-enough "claude" binary: /bin/bash answers `--version` and is
 # executable, satisfying gate.sh's [[ -x ]] + version-echo pre-flight.
 CLAUDE_STUB=$(command -v bash)
@@ -308,7 +362,7 @@ echo "=== tree attribution: a verdict carries its subject (your-org/nexus-code#1
 #      satisfy a shape check while naming the wrong tree, which is the
 #      defect #1259 describes rather than a fix for it.
 out=$(run_gate "$S_PASS"); rc=$?
-want_head=$(git -C "$_repo_root" rev-parse HEAD 2>/dev/null)
+want_head=$(git -C "$SNAP" rev-parse HEAD 2>/dev/null)   # the tree the gate gated (the snapshot)
 got_head=$(sed -n 's/^=== gated-tree: head=\([0-9a-f]*\) .*$/\1/p' <<<"$out" | tail -n1)
 if [[ -n "$want_head" && "$got_head" == "$want_head" ]]; then
     ok "the gate stamps the ACTUAL head of the tree it gated ($got_head)"
@@ -318,7 +372,7 @@ fi
 # The blob of the artefact the scenarios assert THROUGH. On 2026-09-01 this
 # was the only field that distinguished the RED tree from the GREEN one
 # (08ed8ea7 vs 69b3d1ed), and it had to be reconstructed by hand.
-want_blob=$(git -C "$_repo_root" rev-parse HEAD:monitor/pane-state.sh 2>/dev/null)
+want_blob=$(git -C "$SNAP" rev-parse HEAD:monitor/pane-state.sh 2>/dev/null)
 got_blob=$(sed -n 's/^=== gated-tree: .* subject_blob=\([0-9a-f]*\) ===$/\1/p' <<<"$out" | tail -n1)
 if [[ -n "$want_blob" && "$got_blob" == "$want_blob" ]]; then
     ok "the stamp carries the gated blob of the classifier under test"
@@ -340,7 +394,7 @@ if (( rc == 3 )) && (( rc != 0 )) && (( rc != 1 )) \
    && grep -q 'GATE UNATTRIBUTABLE' <<<"$out"; then
     ok "tree unidentifiable → a THIRD outcome (exit 3), not green and not red"
 else
-    bad "third outcome on an unidentifiable tree" "rc=$rc out=$(grep -E 'gated-tree|GATE ' <<<"$out")"
+    bad "third outcome on an unidentifiable tree" "rc=$rc out=$(gate_diag "$out")"
 fi
 # ...and the scenario verdict is still PRINTED, just disowned. Suppressing it
 # would destroy information the operator needs; the fix is attribution, not
@@ -348,7 +402,7 @@ fi
 if grep -q 'GATE GREEN' <<<"$out" && grep -q 'NOT a property of the candidate' <<<"$out"; then
     ok "the underlying verdict is still printed, and explicitly DISOWNED"
 else
-    bad "verdict printed but disowned" "out=$(grep -E 'GATE ' <<<"$out")"
+    bad "verdict printed but disowned" "out=$(gate_diag "$out")"
 fi
 
 echo
@@ -676,12 +730,12 @@ out=$(run_gate_tui "$TH" "$TC"); rc=$?
 if grep -qF '=== gated-tui: mode=fullscreen source=config-dir ===' <<<"$out"; then
     ok "#1448 config-dir tui resolves and is STAMPED as source=config-dir"
 else
-    bad "#1448 config-dir stamp" "rc=$rc out=$(grep -F 'gated-tui' <<<"$out")"
+    bad "#1448 config-dir stamp" "rc=$rc out=$(gate_diag "$out")"
 fi
 if [[ "$(seen)" == "fullscreen" ]]; then
     ok "#1448 …and the scenario SAW CCH_TUI=fullscreen (stamp and environment agree)"
 else
-    bad "#1448 scenario env (config-dir)" "seen=$(seen)"
+    bad "#1448 scenario env (config-dir)" "seen=$(seen) out=$(gate_diag "$out")"
 fi
 
 # (2) FUNCTION: config-dir has NO tui key, HOME/.claude does -> source=home.
@@ -719,7 +773,7 @@ out=$(run_gate_tui "$TH" "$TC"); rc=$?
 if grep -qF '=== gated-tui: mode=binary-default source=unresolved reason=rejected-value ===' <<<"$out" && [[ "$(seen)" == "UNSET" ]]; then
     ok "#1448 a non-token tui value is REJECTED whole: stamped unresolved/rejected-value, scenario sees CCH_TUI unset"
 else
-    bad "#1448 hostile rejection" "rc=$rc seen=$(seen) out=$(grep -F 'gated-tui' <<<"$out")"
+    bad "#1448 hostile rejection" "rc=$rc seen=$(seen) out=$(gate_diag "$out")"
 fi
 if ! grep -qF "$SENTINEL" <<<"$out" && ! grep -qF 'PWNED' <<<"$out"; then
     ok "#1448 …and neither the sentinel nor the injected command text appears anywhere in the gate's output"
@@ -771,7 +825,7 @@ if (( rc == 2 )) && grep -qF 'gate.sh: REFUSED' <<<"$out" && ! grep -qF 'gated-t
    && [[ "$(seen)" == "NO-SCENARIO-RAN" ]]; then
     ok "#1448 an invalid preset is REFUSED at exit 2 with no stamp and no scenario run"
 else
-    bad "#1448 invalid preset must refuse" "rc=$rc seen=$(seen) out=$(grep -E 'REFUSED|gated-tui|GATE ' <<<"$out")"
+    bad "#1448 invalid preset must refuse" "rc=$rc seen=$(seen) out=$(gate_diag "$out")"
 fi
 # Mutation-shaped control for (8): the same call with a VALID preset runs the
 # scenario, renders a verdict, and the scenario sees the preset.
@@ -779,7 +833,7 @@ out=$(run_gate_tui "$TH" "$TC" "CCH_TUI=fullscreen"); rc=$?
 if (( rc == 0 )) && grep -qF 'GATE GREEN' <<<"$out" && [[ "$(seen)" == "fullscreen" ]]; then
     ok "#1448 …control: the identical call with a valid preset runs the scenario (rc 0, GATE GREEN, scenario sees it)"
 else
-    bad "#1448 valid-preset control" "rc=$rc seen=$(seen) out=$(grep -E 'GATE ' <<<"$out")"
+    bad "#1448 valid-preset control" "rc=$rc seen=$(seen) out=$(gate_diag "$out")"
 fi
 
 echo

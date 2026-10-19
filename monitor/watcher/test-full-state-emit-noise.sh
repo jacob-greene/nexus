@@ -89,26 +89,26 @@ echo '=== Class 1: stale-snapshot re-stat drops dead-window rows ==='
 # (pubfork-skills, pubfork-skills-skeptic) were kill-window'd ~00:34 but
 # the staged snapshot still lists them. The live set is the corrected
 # 5-window set from the 00:51 self-correcting emit.
-SNAP="  - palantir-genetrends idle 296311s (state=empty)
-  - prox-obsp idle 211768s (state=empty)
+SNAP="  - proj-x-trends idle 296311s (state=empty)
+  - proj-y idle 211768s (state=empty)
   - collab-simplify idle 32900s (state=empty)
   - pubfork-skills idle 320s (state=empty)
   - chat idle 14761s (state=empty)
   - pubfork-skills-skeptic parked-awaiting-skeptic (state=empty; skeptic reviewing — exempt from idle/close)
-  - palantir-genetrends-skeptic idle 298010s (state=empty)
+  - proj-x-trends-skeptic idle 298010s (state=empty)
 (full snapshot; transitions only between snapshots)"
-LIVE="palantir-genetrends
-prox-obsp
+LIVE="proj-x-trends
+proj-y
 collab-simplify
 chat
-palantir-genetrends-skeptic"
+proj-x-trends-skeptic"
 
 out=$(printf '%s' "$SNAP" | _full_state_restat_live_windows "$LIVE")
 assert_not_contains "killed pubfork-skills row dropped"          "$out" 'pubfork-skills idle'
 assert_not_contains "killed pubfork-skills-skeptic row dropped"  "$out" 'pubfork-skills-skeptic'
-assert_contains     "live palantir-genetrends row kept"          "$out" '  - palantir-genetrends idle'
+assert_contains     "live proj-x-trends row kept"          "$out" '  - proj-x-trends idle'
 assert_contains     "live chat row kept"                         "$out" '  - chat idle'
-assert_contains     "live palantir-genetrends-skeptic row kept"  "$out" '  - palantir-genetrends-skeptic idle'
+assert_contains     "live proj-x-trends-skeptic row kept"  "$out" '  - proj-x-trends-skeptic idle'
 assert_contains     "footer (non-row line) passes through"       "$out" '(full snapshot; transitions only between snapshots)'
 # Exactly the 5 live rows survive (+ footer).
 kept_rows=$(printf '%s\n' "$out" | grep -c '^  - ')
@@ -122,13 +122,13 @@ assert_eq "all 7 rows survive on empty live set" "$passthru_rows" 7
 unset MOCK_TMUX_WINDOWS
 
 echo '=== Class 1: all-live snapshot is unchanged ==='
-LIVE_ALL="palantir-genetrends
-prox-obsp
+LIVE_ALL="proj-x-trends
+proj-y
 collab-simplify
 pubfork-skills
 chat
 pubfork-skills-skeptic
-palantir-genetrends-skeptic"
+proj-x-trends-skeptic"
 out=$(printf '%s' "$SNAP" | _full_state_restat_live_windows "$LIVE_ALL")
 all_rows=$(printf '%s\n' "$out" | grep -c '^  - ')
 assert_eq "all 7 rows survive when all live" "$all_rows" 7

@@ -153,7 +153,75 @@ _ghs_opcfg() {
     fi
 }
 
+# Artifact-only body WARNING (your-org/nexus-code#1856). A GitHub body whose
+# only copy of a deliverable is a claude.ai Artifact link reaches a reader who
+# cannot open it. This collects the body text a write carries — `--body`/`-b`,
+# `--body-file`/`-F <file>` (pr/issue/release), and for `gh api` a `body=`
+# field (`-f`/`--raw-field`, `-F`/`--field`, `@file` read) or `--input <file>`
+# — and hands it to monitor/artifact-link-check.sh, which owns the rule.
+# WARNING ONLY: stderr, never the exit code, never the argv. A body arriving on
+# STDIN (`--body-file -`, `--input -`) is NOT read, because reading it would
+# consume what gh is about to send — that is the stated blind spot, and `ng`'s
+# verbs (which post via `--input -`) call the check themselves.
+_ghs_alc_scan() {
+    _ghs_alc_lib="${NEXUS_ROOT:-}/monitor/artifact-link-check.sh"
+    if [ ! -r "$_ghs_alc_lib" ] && [ -n "${_gw_dir:-}" ]; then
+        _ghs_alc_lib="$_gw_dir/../artifact-link-check.sh"
+    fi
+    [ -r "$_ghs_alc_lib" ] || return 0
+    _ghs_alc_api=0; _ghs_alc_txt=""; _ghs_alc_want=""; _ghs_alc_any=0
+    for _ghs_alc_a in "$@"; do
+        if [ -n "$_ghs_alc_want" ]; then
+            _ghs_alc_v="$_ghs_alc_a"
+            case "$_ghs_alc_want" in
+                text) ;;
+                file) [ "x$_ghs_alc_v" != "x-" ] && [ -r "$_ghs_alc_v" ] && _ghs_alc_v=$(cat -- "$_ghs_alc_v" 2>/dev/null) || _ghs_alc_v="" ;;
+                field)
+                    case "$_ghs_alc_v" in
+                        body=@-) _ghs_alc_v="" ;;
+                        body=@*) _ghs_alc_v="${_ghs_alc_v#body=@}"
+                                 [ -r "$_ghs_alc_v" ] && _ghs_alc_v=$(cat -- "$_ghs_alc_v" 2>/dev/null) || _ghs_alc_v="" ;;
+                        body=*)  _ghs_alc_v="${_ghs_alc_v#body=}" ;;
+                        *)       _ghs_alc_v="" ;;
+                    esac ;;
+                rawfield)
+                    case "$_ghs_alc_v" in body=*) _ghs_alc_v="${_ghs_alc_v#body=}" ;; *) _ghs_alc_v="" ;; esac ;;
+            esac
+            if [ -n "$_ghs_alc_v" ]; then
+                _ghs_alc_txt="$_ghs_alc_txt
+$_ghs_alc_v"; _ghs_alc_any=1
+            fi
+            _ghs_alc_want=""
+            continue
+        fi
+        case "$_ghs_alc_a" in
+            api) _ghs_alc_api=1 ;;
+            --body|-b) _ghs_alc_want=text ;;
+            --body=*) _ghs_alc_txt="$_ghs_alc_txt
+${_ghs_alc_a#--body=}"; _ghs_alc_any=1 ;;
+            --body-file) _ghs_alc_want=file ;;
+            --body-file=*) _ghs_alc_f="${_ghs_alc_a#--body-file=}"
+                           if [ "x$_ghs_alc_f" != "x-" ] && [ -r "$_ghs_alc_f" ]; then
+                               _ghs_alc_txt="$_ghs_alc_txt
+$(cat -- "$_ghs_alc_f" 2>/dev/null)"; _ghs_alc_any=1
+                           fi ;;
+            -F|--field) if [ "$_ghs_alc_api" = 1 ]; then _ghs_alc_want=field; else _ghs_alc_want=file; fi ;;
+            -f|--raw-field) [ "$_ghs_alc_api" = 1 ] && _ghs_alc_want=rawfield ;;
+            --input) [ "$_ghs_alc_api" = 1 ] && _ghs_alc_want=file ;;
+        esac
+    done
+    [ "$_ghs_alc_any" = 1 ] || return 0
+    printf '%s' "$_ghs_alc_txt" | bash "$_ghs_alc_lib" --where "this gh call's body" >/dev/null || :
+    return 0
+}
+
 gh() {
+    # (0a) your-org/nexus-code#1856 — warn (stderr only) on an Artifact-only
+    #      body. First, so the EXPLICIT-GH_TOKEN arm below, which is the form
+    #      every write is told to use, is covered too. Runs in a subshell so
+    #      none of its variables leak into the dispatch below.
+    ( _ghs_alc_scan "$@" )
+
     # (0) Watcher safety, defence-in-depth. The watcher runs bash and DOES
     #     pick up the PATH-front wrapper, but it spawns WATCHER_WINDOW=headless,
     #     so this branch passes its deterministic, self-tokened calls through

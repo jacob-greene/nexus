@@ -46,7 +46,7 @@ gp_handle "$@"
 
 # shellcheck source=monitor/watcher/_test_helpers.sh
 . "$_test_dir/_test_helpers.sh"
-EXPECTED_ASSERTIONS=51   # counted BEFORE the census assertion itself
+EXPECTED_ASSERTIONS=52   # counted BEFORE the census assertion itself
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/rtsig-$$-XXXXXX") || { echo "cannot mktemp" >&2; exit 2; }
 trap 'rm -rf "$WORK"' EXIT
@@ -169,6 +169,12 @@ NEXUS_KNOWN_LOCAL_RED="$D/klr.tsv" NEXUS_TEST_NPROC_GUARD=off NEXUS_TEST_STATE_D
     bash "$RUNNER" --jobs 1 --state "$D/ledger.tsv" --max-seconds 1 "$D"/test-sig*.sh > "$D/log1" 2>&1 < /dev/null
 rc=$?
 assert_eq       "§1d leg 1 budget-stops (rc 3) with the unexplained red recorded" "$rc" "3"
+# The leg's premise, asserted rather than assumed (#1826): the budget may stop
+# the run only AFTER its first test. SECONDS ticks at a wall-second boundary, so
+# a tick right after the runner sampled it once stopped this leg at 0.00s with
+# nothing run — rc 3 all the same, and "NOT EVALUATED" missing for want of a red.
+assert_eq       "§1d leg 1 ran its first test before any budget stop (ledger: test-sig0 FAIL)" \
+    "$(awk -F'\t' '$1 ~ /\/test-sig0\.sh$/ { print $2 }' "$D/ledger.tsv" 2>/dev/null)" "FAIL"
 assert_contains "§1d leg 1: NOT EVALUATED" "$(cat "$D/log1")" "LOCAL GATE: NOT EVALUATED"
 NEXUS_KNOWN_LOCAL_RED="$D/klr.tsv" NEXUS_TEST_NPROC_GUARD=off NEXUS_TEST_STATE_DIR="$D/state" \
     bash "$RUNNER" --jobs 1 --state "$D/ledger.tsv" --resume "$D"/test-sig*.sh > "$D/log2" 2>&1 < /dev/null

@@ -244,7 +244,7 @@ assert_contains "N7 no lister: skipped and logged" "$(cat "$LOG")" "worker broad
 chmod 0755 "$RO_STATE"
 
 echo '=== N8: the degraded run dir is DERIVED from the managed $TMPDIR, never a literal path (#1724) ==='
-# Operator, 2026-10-10 (#1724 c6105428034): small state only, under the
+# Operator, 2026-10-10 (#1724): small state only, under the
 # session-managed scratch tree; no hardcoded location. Run in subshells with
 # the suite's own NEXUS_DEGRADED_RUNDIR override removed.
 rd() { ( unset NEXUS_DEGRADED_RUNDIR; [ "$1" = - ] && unset TMPDIR || export TMPDIR="$1"; nexus_degraded_rundir; echo "|rc=$?" ); }
@@ -347,11 +347,56 @@ assert_eq "N11 heal mid-STOP: no STOP is pasted after the heal" "$(grep -c 'READ
 assert_eq "N11 …every worker gets RESUME" "$(grep -c '|\[nexus watcher\] RESUME' "$WORK/s.log")" "4"
 assert_contains "N11 …and the dropped STOPs are said out loud" "$(cat "$LOG")" "superseded by (resume) — 3 undelivered pane(s) dropped"
 
+echo '=== N12: a heal with `ng degraded enter` still in force owes `ng degraded exit` (#1830 skeptic) ==='
+# A heal does not undo a relocation: the ledger and inbox stay on the run dir's
+# tmpfs until someone runs `exit`, and a later restart drops them. The heal is
+# the one moment the watcher knows the tree is back, so it says so: to the
+# orchestrator directly, and in the workers' RESUME.
+# shellcheck source=../_ledger_path.sh
+. "$MON/_ledger_path.sh"
+_n12_cycle() {   # one onset + one heal through the real tick
+    chmod 0555 "$RO_STATE"; _reset; : > "$LOG"; : > "$WORK/bc.log"
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator MONITOR_FS_BROADCAST_ONSET_CYCLES=1 \
+        FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers \
+        NEXUS_DEGRADED_PROBE_WRITER="$WORK/erofs-writer" _fs_guard_tick >/dev/null
+    chmod 0755 "$RO_STATE"; : > "$WORK/bc.log"
+    [[ "${1:-}" == pointer ]] && printf 'state_dir=%s\n' "$(cd "$RO_STATE" && pwd -P)" > "$n12_ptr"
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+        FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers _fs_guard_tick >/dev/null
+}
+n12_ptr=$(nexus_degraded_pointer_path "$RO_STATE"); mkdir -p "${n12_ptr%/*}"; rm -f "$n12_ptr"
+_n12_cycle
+assert_not_contains "N12 control: a heal with NO pointer says nothing about degraded exit" "$(cat "$WORK/bc.log")" "degraded exit"
+_n12_cycle pointer
+assert_contains "N12 pointer in force: the orchestrator is told the exit is owed" "$(grep '^orchestrator|' "$WORK/bc.log")" "Run monitor/ng degraded exit now"
+assert_contains "N12 …and the workers' RESUME says so too" "$(grep '^w1|' "$WORK/bc.log")" "owes monitor/ng degraded exit"
+assert_contains "N12 …and the watcher log records it" "$(cat "$LOG")" "relocation still in force"
+rm -f "$n12_ptr"
+
+echo '=== N13: a watcher that starts after a restart reports an unexited relocation as LOST (#1830 skeptic F1) ==='
+# A restarted watcher begins with FS_DEGRADED=0, so it never sees a heal; the
+# loss marker (outside the wiped run dir) is what it can see, once.
+export CLAUDE_CONFIG_DIR="$WORK/ccd"
+n13_mk=$(nexus_degraded_marker_path "$RO_STATE"); mkdir -p "${n13_mk%/*}"
+chmod 0755 "$RO_STATE"; rm -f "$n12_ptr"
+_n13_tick() {
+    : > "$LOG"; : > "$WORK/bc.log"; FS_DEGRADED=0
+    STATE_DIR="$RO_STATE" NEXUS_ROOT="$WORK/nexus" TARGET=orchestrator \
+        FS_NOTE_PASTE_FN=bc_paste FS_WORKER_LIST_FN=bc_workers _fs_guard_tick >/dev/null
+}
+rm -f "$n13_mk"; FS_LOSS_CHECKED=0; _n13_tick
+assert_not_contains "N13 control: no marker → no LOST note" "$(cat "$WORK/bc.log")" "LOST"
+printf 'state_dir=%s\nentered=1700000000\n' "$RO_STATE" > "$n13_mk"; FS_LOSS_CHECKED=0; _n13_tick
+assert_contains "N13 marker, no pointer → the orchestrator is told LOST" "$(grep '^orchestrator|' "$WORK/bc.log")" "LOST: a degraded relocation"
+_n13_tick
+assert_not_contains "N13 …once per watcher process, not every cycle" "$(cat "$WORK/bc.log")" "LOST"
+rm -f "$n13_mk"
+
 # EXPECTED-COUNT GUARD (test-summary-honesty-manifest.sh, count=exact): a
 # dropped or added assertion is a FAIL, never a quieter green.
 #   N1 2 | N2 11 | N3 fixture 1 + 3 drafts x 3 + N3c 2 | N4 3 | N5 8 | N6 8 | N7 2 | N8 10 | N9 6 | N10 5 | N11 7. The root path
 #   exits at its th_skip before any assertion, so it never reaches this guard.
-EXPECTED=$(( 2 + 11 + 12 + 3 + 8 + 8 + 2 + 10 + 6 + 5 + 7 ))
+EXPECTED=$(( 2 + 11 + 12 + 3 + 8 + 8 + 2 + 10 + 6 + 5 + 7 + 4 + 3 ))
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

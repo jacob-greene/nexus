@@ -226,6 +226,7 @@ monitor/watcher/test-known-local-red.sh::ledger=yes::count=none
 monitor/watcher/test-lab-context.sh::ledger=no::count=none
 monitor/watcher/test-labsh-phantom-adopt.sh::ledger=yes::count=none
 monitor/watcher/test-labsh-reap-stale-builds.sh::ledger=no::count=none
+monitor/watcher/test-labsh-replace-adopt.sh::ledger=yes::count=none
 monitor/watcher/test-launcher-empty-target.sh::ledger=no::count=none
 monitor/watcher/test-launcher-headless.sh::ledger=no::count=none
 monitor/watcher/test-launcher-pidfile.sh::ledger=no::count=none
@@ -449,5 +450,6 @@ monitor/watcher/test-worker-floor-content.sh::ledger=no::count=none
 # raises it to count=exact.
 monitor/watcher/test-integration/test-realmodel-longjob-wake.sh::ledger=no::count=none
 monitor/watcher/test-longjob-plugin-arming.sh::ledger=no::count=none
+monitor/watcher/test-longjob-watch-ledger.sh::ledger=no::count=none
 monitor/watcher/test-longjob-watch.sh::ledger=no::count=none
 monitor/watcher/test-pane-state-longjob-discount.sh::ledger=no::count=none

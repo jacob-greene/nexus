@@ -184,7 +184,7 @@ prevents thrashing if the respawn itself keeps dying.
 ```bash
 JWT=$(./monitor/mint-token.sh --jwt-only)
 curl -sS \
-    -H "Authorization: Bearer $JWT" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$JWT") \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/hook/deliveries?per_page=5" \
   | jq '.[] | {event, status_code, delivered_at}'

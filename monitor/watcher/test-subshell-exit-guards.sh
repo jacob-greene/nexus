@@ -301,9 +301,9 @@ if [[ -r "$MANIFEST" ]]; then
     printf '%s\n' "$_live" | grep -a . | cut -f1-3 | LC_ALL=C sort > "$_live_keys"
     grep -av '^#' "$MANIFEST" | grep -a . | cut -f1-3 | LC_ALL=C sort > "$_man_keys"
     assert_empty "no site in the tree is missing from the manifest" \
-        "$(comm -23 "$_live_keys" "$_man_keys")"
+        "$(LC_ALL=C comm -23 "$_live_keys" "$_man_keys")"
     assert_empty "no manifest row names a site that is no longer in the tree" \
-        "$(comm -13 "$_live_keys" "$_man_keys")"
+        "$(LC_ALL=C comm -13 "$_live_keys" "$_man_keys")"
     _unrev=$(grep -av '^#' "$MANIFEST" | grep -a . | cut -f6 | grep -c '^unreviewed$')
     echo "    (manifest: $(grep -ac . "$_man_keys") rows, $_unrev unreviewed)"
 fi

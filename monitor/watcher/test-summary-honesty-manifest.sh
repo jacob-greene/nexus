@@ -464,6 +464,11 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # red was to RAISE the suite to the protected form rather than to record it as
 # unprotected, and a suite that asserts other readers' honesty has no business
 # being the weaker kind.
+# TWO ENTRANTS at your-org/nexus-code#1866, both born protected (ledger=yes via
+# `th_summary_and_exit`, count=exact via EXPECTED_ASSERTIONS):
+# `test-pane-state-footer-eol.sh` and the real-binary scenario
+# `test-integration/test-realmodel-working-background.sh`, raised to the form
+# rather than recorded `count=none` beside the older realmodel scenarios.
 # ONE ENTRANT at your-org/nexus-code#1657: `test-cc-hold-policy.sh` enters
 # fully protected at birth (ledger=yes via `th_summary_and_exit`, count=exact
 # via EXPECTED) — raised to the form rather than recorded as unprotected.
@@ -903,7 +908,9 @@ monitor/watcher/test-agent-delivery-latency-envelope.sh
 monitor/watcher/test-agent-delivery.sh
 monitor/watcher/test-agents-md-guard.sh
 monitor/watcher/test-agent-tmpdir.sh
+monitor/watcher/test-api-hold.sh
 monitor/watcher/test-argloop-progress-guard.sh
+monitor/watcher/test-artifact-link-check.sh
 monitor/watcher/test-assert-bot-author-generic-optin.sh
 monitor/watcher/test-assertion-ledger.sh
 monitor/watcher/test-async-launch-detect.sh
@@ -916,6 +923,7 @@ monitor/watcher/test-backtick-label-lint.sh
 monitor/watcher/test-band-verdict.sh
 monitor/watcher/test-bootstrap-recover-followup.sh
 monitor/watcher/test-cc-auto-update-default-docs.sh
+monitor/watcher/test-cc-auto-update-stale-checkout.sh
 monitor/watcher/test-cc-harness-gate-population.sh
 monitor/watcher/test-cc-harness-socket-isolation.sh
 monitor/watcher/test-cc-harness-teardown-remnant.sh
@@ -994,6 +1002,8 @@ monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh
 monitor/watcher/test-issue-ref.sh
 monitor/watcher/test-knob-default-agrees.sh
 monitor/watcher/test-labsh-pin.sh
+monitor/watcher/test-longjob-slurm-overtime.sh
+monitor/watcher/test-argv-credential-lint.sh
 monitor/watcher/test-mail-path-lint.sh
 monitor/watcher/test-merge-ref-base.sh
 monitor/watcher/test-mutation-gate-bounds.sh
@@ -1018,6 +1028,7 @@ monitor/watcher/test-over-limit-stale-stamp.sh
 monitor/watcher/test-pane-state-asyncrun-liveness.sh
 monitor/watcher/test-pane-state-claude-identity.sh
 monitor/watcher/test-pane-state-codex.sh
+monitor/watcher/test-pane-state-mcp-helper.sh
 monitor/watcher/test-pane-state-resolver-precondition.sh
 monitor/watcher/test-pane-state-restart-quiescence.sh
 monitor/watcher/test-pane-state-wrapped-idle.sh
@@ -1073,7 +1084,9 @@ monitor/watcher/test-session-name-from-window.sh
 monitor/watcher/test-skeptic-answer-body-fidelity.sh
 monitor/watcher/test-skeptic-arm-recording.sh
 monitor/watcher/test-skeptic-evidence-class-agreement.sh
+monitor/watcher/test-skeptic-resolve-scoped.sh
 monitor/watcher/test-skeptic-round-identity.sh
+monitor/watcher/test-skeptic-second-reviewer.sh
 monitor/watcher/test-skeptic-self-spawn.sh
 monitor/watcher/test-skeptic-spawn-origin-key.sh
 monitor/watcher/test-skeptic-verdict-evidence.sh
@@ -1129,7 +1142,10 @@ monitor/watcher/test-tmux-fixture-conf-lint.sh
 monitor/watcher/test-rv-load-classify.sh
 monitor/watcher/test-bootstrap-recover-ro-nudge.sh
 monitor/watcher/test-skeptic-parallel-rounds.sh
-monitor/watcher/test-host-pin-lint.sh'
+monitor/watcher/test-host-pin-lint.sh
+monitor/watcher/test-degraded-enter-exit.sh
+monitor/watcher/test-pane-state-footer-eol.sh
+monitor/watcher/test-integration/test-realmodel-working-background.sh'
 
 _corpus_verdict() {   # <scanned> <indep> <pinned> -> rc 0 sound, rc 1 + reason
     local scanned="$1" indep="$2" pinned="$3"

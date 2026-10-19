@@ -61,21 +61,38 @@ bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 echo "--- 1. the rewrite is behaviour-preserving except on the defect ---"
 
 # old_form/new_form take a stub body and a target; both call `tmux`.
+#
+# THE `same` CASES COMPARE AGAINST THE OLD FORM'S *SEMANTICS*, NOT ITS RACE
+# (your-org/nexus-code#1861). The raw old pipe is the defect: whenever the
+# target is NOT the last line ("window present", "name with spaces", "name with
+# a dot"), `grep -q` can exit while the stub is still writing, and the raw old
+# form then reads 141. Comparing that against the new form made this suite
+# FLAKY BY CONSTRUCTION — it failed whenever it reproduced the very race it
+# exists to document. So `same` uses `old_sem`: the identical pipeline with the
+# reader DRAINING after its verdict, which keeps every semantic the rewrite
+# must preserve (exact match, `pipefail` carrying a failed tmux) and removes
+# only the race. The raw form is still captured and is what `fixed` asserts on,
+# where the race is forced deterministic.
 compare() {
     local label="$1" stub="$2" target="$3" expect="$4"
-    local old new
+    local old old_sem new
     (
         eval "$stub"
         tmux() { _stub "$@"; }
         tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target"
         printf 'old=%s\n' "$?"
+        tmux list-windows -F '#{window_name}' 2>/dev/null \
+            | { grep -qxF "$target"; _r=$?; cat >/dev/null; exit "$_r"; }
+        printf 'old_sem=%s\n' "$?"
         grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"
         printf 'new=%s\n' "$?"
     ) > "$TMPOUT" 2>/dev/null
     old=$(sed -n 's/^old=//p' "$TMPOUT")
+    old_sem=$(sed -n 's/^old_sem=//p' "$TMPOUT")
     new=$(sed -n 's/^new=//p' "$TMPOUT")
     case "$expect" in
         same)
+            old="$old_sem"
             if [[ "$old" == "$new" ]]; then
                 ok "$label: both forms agree (rc=$new)"
             else
@@ -107,6 +124,13 @@ compare "single window"        '_stub(){ printf "only\n"; }'                only
 compare "name with spaces"     '_stub(){ printf "my win\nother\n"; }'       "my win"  same
 compare "name with a dot"      '_stub(){ printf "a.b\nc\n"; }'              a.b       same
 compare "substring is not -x"  '_stub(){ printf "alphabet\n"; }'            alpha     same
+# #1861 PIN: the flake made deterministic. The writer stalls AFTER the match
+# line, so the raw old pipe reads 141 on every run (measured 20/20) while the
+# draining semantic oracle and the new form read 0 (0/20 each). If `same` ever
+# compares against the raw pipe again, this case fails every time instead of
+# under load only.
+compare "present, writer stalls after the match" \
+        '_stub(){ printf "alpha\nbeta\n"; sleep 0.05; printf "gamma\n"; }' beta same
 # The decisive case, forced deterministic: match on line 1 of a list larger
 # than the pipe buffer, so grep exits while the producer is still writing.
 compare "match early, long list" \

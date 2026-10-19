@@ -63,6 +63,14 @@ the policy and exactly which path fired:
   flap ceiling. **The actionable failure case — run the full
   protocol below.**
 
+A service someone stopped with `monitor/svc.sh stop <svc>` produces **no
+emit at all** (<your-org>/nexus-code#1827): the stop writes a
+`.state/services/<svc>.stop-requested` sentinel, the watcher records one
+`stopped-by-request` event instead of an incident and never auto-restarts it,
+and `svc.sh status` shows `STOPPED`. An incident open when the stop landed is
+closed. If a stopped service should be running, `svc.sh start <svc>` is the
+whole remedy; do not treat its silence as an outage.
+
 The emit cites the per-service incident state file
 (`monitor/.state/service-health/<svc>.state`) and event history
 (`<svc>.events`) — the machine record the issue generator reads.

@@ -211,28 +211,58 @@ ALLOC_BASE=39000
 # sockets share a port while neither listens, so a bound-not-listening fixture
 # does NOT reproduce the conflict; this suite's own assertion caught that draft.
 # An ordinary outbound connection (no SO_REUSEADDR) pinned to the port does.
+#
+# THE HOLDER WALKS THE ALLOCATOR'S OWN CANDIDATE SEQUENCE (your-org/nexus-code#1828).
+# It used to pin ONE fixed port, base + pid%900 — inside the ephemeral range, so
+# under `--jobs 4` another suite's socket (or any outbound connection) could
+# already hold it, the pin raised EADDRINUSE, and the case FAILED without
+# measuring the allocator. Now it takes the FIRST candidate it can pin, in the
+# order pick_free_port tries them, and reports the ones it skipped. Case (c)
+# EXCLUDES exactly those, so the held port is still the allocator's FIRST
+# candidate — the same potency as the fixed pin, now without the race.
 python3 -c '
 import socket, sys, time
 base = int(sys.argv[1]); pid = int(sys.argv[2])
-p = base + (pid % 900)          # the FIRST port pick_free_port will try (i=0)
 srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(5)
-cli = socket.socket()           # deliberately NO SO_REUSEADDR
-cli.bind(("127.0.0.1", p))      # pin our chosen port as the SOURCE port
-cli.connect(srv.getsockname())  # …and make it ESTABLISHED
-conn, _ = srv.accept()
-open(sys.argv[3], "w").write(str(p))
-time.sleep(300)
-' "$ALLOC_BASE" "$$" "$WORK/held.port" &
-SSHD_PIDS+=( "$!" )
-for _i in $(seq 1 50); do [[ -s "$WORK/held.port" ]] && break; sleep 0.2; done
+skipped = []; errs = []
+for i in range(200):
+    p = base + ((pid + i * 7) % 900)    # the pick_free_port sequence, i = 0, 1, …
+    cli = socket.socket()               # deliberately NO SO_REUSEADDR
+    try:
+        cli.bind(("127.0.0.1", p))      # pin it as the SOURCE port
+    except OSError as e:
+        cli.close(); skipped.append(str(p)); errs.append("%d:%s" % (p, e.strerror))
+        continue
+    cli.connect(srv.getsockname())      # …and make it ESTABLISHED
+    conn, _ = srv.accept()
+    open(sys.argv[4], "w").write(",".join(skipped))
+    open(sys.argv[3], "w").write(str(p))
+    time.sleep(300)
+    sys.exit(0)
+sys.stderr.write("no candidate could be pinned: " + " ".join(errs[:10]) + "\n")
+sys.exit(1)
+' "$ALLOC_BASE" "$$" "$WORK/held.port" "$WORK/held.skipped" 2>"$WORK/held.err" &
+_holder=$!
+SSHD_PIDS+=( "$_holder" )
+# Wait on the holder's READINESS (its port file) or its EXIT, not a clock: a
+# python startup slowed by `--jobs 4` is not a failure, and an exit is final.
+# The 300-poll cap is only a hang guard.
+for _i in $(seq 1 300); do
+    [[ -s "$WORK/held.port" ]] && break
+    kill -0 "$_holder" 2>/dev/null || break
+    sleep 0.2
+done
 HELD_PORT=$(cat "$WORK/held.port" 2>/dev/null)
+HELD_SKIPPED=$(cat "$WORK/held.skipped" 2>/dev/null)
 
 if [[ ! "$HELD_PORT" =~ ^[0-9]+$ ]]; then
     # Do not let this degrade into a vacuous pass: if the fixture could not be
     # held, the assertions below would compare nothing and report success.
-    printf '  FAIL: could not hold a bound-not-listening port for the allocator test\n' >&2
+    printf '  FAIL: could not hold a bound-not-listening port for the allocator test (%s)\n' \
+        "$(tr '\n' ' ' < "$WORK/held.err" 2>/dev/null)" >&2
     FAIL=$((FAIL+1))
 else
+    [[ -n "$HELD_SKIPPED" ]] && echo "  note: the holder skipped already-held candidate(s) $HELD_SKIPPED; case (c) excludes them"
     # (a) THE BLIND SPOT, demonstrated — the old probe's evidence says "free".
     if ( exec 3<>"/dev/tcp/127.0.0.1/$HELD_PORT" ) 2>/dev/null; then
         conn_verdict=occupied
@@ -256,7 +286,10 @@ finally:
 
     # (c) THE FIX: the allocator must not hand it out. Before this, it did —
     #     deterministically, on every retry, which is why retrying was a placebo.
+    _PORT_EXCLUDE_SAVE="$_PORT_EXCLUDE"
+    _PORT_EXCLUDE="${_PORT_EXCLUDE:+$_PORT_EXCLUDE,}$HELD_SKIPPED"
     alloc_got=$(pick_free_port "$ALLOC_BASE")
+    _PORT_EXCLUDE="$_PORT_EXCLUDE_SAVE"
     assert_eq "pick_free_port allocates a port at all" \
         "$([[ "$alloc_got" =~ ^[0-9]+$ ]] && echo yes || echo "no ($alloc_got)")" "yes"
     assert_eq "…and NEVER the port only bind() could see" \

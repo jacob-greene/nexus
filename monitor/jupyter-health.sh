@@ -74,7 +74,7 @@ token=$(cat .jupyter/token 2>/dev/null)
 #
 # Not exec'd any more: a non-zero curl must still get to explain itself.
 curl -fsSk -o /dev/null --max-time "${LABSH_HEALTH_TIMEOUT:-3}" \
-    -H "Authorization: token $token" \
+    -H @<(printf 'Authorization: token %s\n' "$token") \
     "$scheme://127.0.0.1:$port/api/status" && exit 0
 
 rc=$?

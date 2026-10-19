@@ -718,7 +718,7 @@ guards and reports each verdict.
 | `1` | `--run`: a selected guard **FAILED** |
 | `2` | **REFUSED** — a guard's population probe errored, or the diff could not be computed. Fail-closed on purpose |
 | `3` | **no** registered guard reads your diff. A measured answer, not a green light |
-| `4` | `--run`: every selected guard came back green, but at least one green is **UNVERIFIED** — a population guard enumerates `git ls-files`, so it cannot see an **untracked** file in your diff (`#1054`). `git add` and re-run |
+| `4` | `--run`: no selected guard failed, but at least one did not verify anything: a green that is **UNVERIFIED** — a population guard enumerates `git ls-files`, so it cannot see an **untracked** file in your diff (`#1054`; `git add` and re-run) — or a guard that printed **SKIP** because it exited 77 and asserted nothing (`#1860`). A FAIL still exits 1 |
 | `5` | `--run`: the `--timeout` deadline expired with selected guards left **without a verdict** |
 
 Read the tool's own per-run **blind-spot count**, not the exit code:
@@ -1354,7 +1354,9 @@ from "could not look":
 | `skeptic-disposition <window> [--reports-dir D]` | the window's `disposition:` as read from its reports, emitted `key=value` (`state= source= report= report_mtime= blocking= reports= detail=`) | `0` read · `2` could not determine (`state=unknown`) |
 
 Per orphan the remedy is `ng skeptic-evidence <window>`, then
-`ng skeptic resolve <task> --reason "<why>"`.
+`ng skeptic resolve <task> --reason "<why>"`. While a reviewer's obligation
+edge is live, add `--reviewer <w>` (or `--all-reviewers`), or the resolve is
+refused with rc 9 (`<your-org>/nexus-code#1848`).
 
 > **Known divergence at `a3177ef6`.** `ng skeptic-arm --help` and
 > `ng skeptic-obligations --help` die `unknown flag` — neither

@@ -390,7 +390,7 @@ assert_contains "safe=0"            "$OUT" "safe=0"
 assert_contains "reason cites fresh submit" "$OUT" "fresh operator submit"
 
 # ── 12. GO: self-activity submit — session-id == own spawn session-id ─────
-#     The coembed-283-followup false positive (2026-07-17). A fresh
+#     The proj-x-followup false positive (2026-07-17). A fresh
 #     user-prompt with NO covering machine input used to read as a fresh
 #     operator submit → safe=0, pinning a wrapped window open. But when
 #     the submit carries the window's OWN spawn session-id it is provably
@@ -443,7 +443,7 @@ assert_contains "self+machine -> safe=1"     "$OUT" "safe=1"
 # ══ your-org/nexus-code#813: the target's own `disposition:` ══════════════
 #
 # The gate decided retirement from pane state and operator engagement and
-# never read the report the target had just filed. `bench272F-skeptic` said
+# never read the report the target had just filed. `bench-a-skeptic` said
 # `verdict: refuted` / `disposition: second-pass`, was retired on a `safe=1`
 # preflight, and stranded TWO windows: its target burned ~75 minutes on five
 # `await` exit-4 cycles waiting for a reviewer that no longer existed, and

@@ -296,8 +296,8 @@ cmd_refresh() {
     sp=$!
     for (( i = 0; i < ${LABSH_PIN_SMOKE_TIMEOUT:-900}; i += 2 )); do
         kill -0 "$sp" 2>/dev/null || break
-        if curl -fsS -o /dev/null --max-time 5 -H "Authorization: token $tok" "http://127.0.0.1:$port/api/status" \
-           && curl -fsS -o /dev/null --max-time 10 -H "Authorization: token $tok" "http://127.0.0.1:$port/lab"; then
+        if curl -fsS -o /dev/null --max-time 5 -H @<(printf 'Authorization: token %s\n' "$tok") "http://127.0.0.1:$port/api/status" \
+           && curl -fsS -o /dev/null --max-time 10 -H @<(printf 'Authorization: token %s\n' "$tok") "http://127.0.0.1:$port/lab"; then
             ok=1; break
         fi
         sleep 2

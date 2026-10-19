@@ -3561,13 +3561,21 @@ if (( jobs > 1 )); then
     fi
 else
     _budget_t0=$SECONDS
+    _budget_ran=0
     for t in "${tests[@]:-}"; do
         [[ -n "$t" ]] || continue
         # A signal to the runner is handled HERE, at the test boundary bash
         # deferred it to (#1474). Not `budget_stopped`: that is a resumable,
         # intended stop (exit 3); this is an environment event (exit 4).
         [[ -z "$_rt_runner_signal" ]] || break
-        if (( max_seconds > 0 )) && (( SECONDS - _budget_t0 >= max_seconds )); then
+        # NEVER BEFORE THE FIRST TEST (your-org/nexus-code#1826). SECONDS is
+        # whole wall-clock seconds, so it ticks at a second BOUNDARY, not one
+        # second after `_budget_t0` was read: a tick landing between that read
+        # and this check made `--max-seconds 1` stop a run that had dispatched
+        # NOTHING (CI: "0 PASS … 3 not yet run … this invocation: 0.00s", rc 3).
+        # An invocation that runs no test makes no progress, and "repeat the
+        # same command until exit != 3" needs progress.
+        if (( max_seconds > 0 && _budget_ran > 0 )) && (( SECONDS - _budget_t0 >= max_seconds )); then
             budget_stopped=1
             break
         fi
@@ -3582,6 +3590,7 @@ else
             _rt_exit 97
         fi
         run_one "$t" "$_out"
+        _budget_ran=1
     done
 fi
 

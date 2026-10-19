@@ -146,22 +146,22 @@ assert_not_contains "unknown kind is NOT reported running"  "${v%%|*}" "running"
 
 echo '=== resolver: Slurm state mapping ==='
 _orphan_async_sacct() { printf '%s' "${MOCK_SACCT:-}"; }
-MOCK_SACCT="RUNNING|0:0";        assert_eq "RUNNING → running"   "$(_orphan_async_resolve slurm 2219913 w1)" "running|RUNNING"
-MOCK_SACCT="PENDING|0:0";        assert_eq "PENDING → running"   "$(_orphan_async_resolve slurm 2219913 w1)" "running|PENDING"
-MOCK_SACCT="COMPLETED|0:0";      assert_eq "COMPLETED → terminal" "$(_orphan_async_resolve slurm 2219913 w1)" "terminal|COMPLETED 0:0"
+MOCK_SACCT="RUNNING|0:0";        assert_eq "RUNNING → running"   "$(_orphan_async_resolve slurm 1234567 w1)" "running|RUNNING"
+MOCK_SACCT="PENDING|0:0";        assert_eq "PENDING → running"   "$(_orphan_async_resolve slurm 1234567 w1)" "running|PENDING"
+MOCK_SACCT="COMPLETED|0:0";      assert_eq "COMPLETED → terminal" "$(_orphan_async_resolve slurm 1234567 w1)" "terminal|COMPLETED 0:0"
 MOCK_SACCT="OUT_OF_MEMORY|0:125"
-v=$(_orphan_async_resolve slurm 2219913 w1)
+v=$(_orphan_async_resolve slurm 1234567 w1)
 assert_eq "OUT_OF_MEMORY → terminal (Slurm RETAINED the status)" "${v%%|*}" "terminal"
 assert_contains "…and the state is carried verbatim" "$v" "OUT_OF_MEMORY 0:125"
 MOCK_SACCT="CANCELLED by 1234|0:15"
 assert_eq "a state with a trailing reason still classifies" \
-    "$(_orphan_async_resolve slurm 2219913 w1)" "terminal|CANCELLED by 1234 0:15"
+    "$(_orphan_async_resolve slurm 1234567 w1)" "terminal|CANCELLED by 1234 0:15"
 MOCK_SACCT=""
-v=$(_orphan_async_resolve slurm 2219913 w1)
+v=$(_orphan_async_resolve slurm 1234567 w1)
 assert_eq "empty sacct → unresolvable, NOT completed" "${v%%|*}" "unresolvable"
 MOCK_SACCT="WEIRD_NEW_STATE|0:0"
 assert_eq "unrecognised Slurm state → unresolvable" \
-    "$(_orphan_async_resolve slurm 2219913 w1 | cut -d'|' -f1)" "unresolvable"
+    "$(_orphan_async_resolve slurm 1234567 w1 | cut -d'|' -f1)" "unresolvable"
 v=$(_orphan_async_resolve slurm "not-a-jobid" w1)
 assert_eq "non-numeric slurm id → unresolvable" "${v%%|*}" "unresolvable"
 
@@ -429,7 +429,7 @@ if [[ -r "$_fix" && -r "$_qfix" ]] && command -v jq >/dev/null 2>&1; then
     _now=$(date +%s)
     _hb="$WORK/real-hb.json"
     jq -nc --argjson n "$_now" '{window:"test",state:"idle_prompt",last_activity:($n-5),
-        external_waits:[{kind:"slurm",id:"2219913",desc:"a"},{kind:"nohup",id:"syn-abc",desc:"b"}],
+        external_waits:[{kind:"slurm",id:"1234567",desc:"a"},{kind:"nohup",id:"syn-abc",desc:"b"}],
         dismissed_waits:[]}' > "$_hb"
     _real=$("$_repo_root/monitor/pane-state.sh" --fixture "$_fix" \
                 --window 9 --name test --active 0 --heartbeat-file "$_hb" --now "$_now" 2>&1)
@@ -438,7 +438,7 @@ if [[ -r "$_fix" && -r "$_qfix" ]] && command -v jq >/dev/null 2>&1; then
     assert_contains "control: the real pane-state DOES emit idle-orphan-async here" \
         "$_real" "state=idle-orphan-async"
     assert_eq "…and the parser reads its state"        "$(_orphan_async_field "$_real" state)" "idle-orphan-async"
-    assert_eq "…and its orphan_kinds, verbatim"        "$(_orphan_async_field "$_real" orphan_kinds)" "slurm:2219913,nohup:syn-abc"
+    assert_eq "…and its orphan_kinds, verbatim"        "$(_orphan_async_field "$_real" orphan_kinds)" "slurm:1234567,nohup:syn-abc"
     assert_eq "…and reads NO queued on a pane with none" "$(_orphan_async_field "$_real" queued)" ""
     _realq=$("$_repo_root/monitor/pane-state.sh" --fixture "$_qfix" \
                  --window 9 --name test --active 1 --now "$_now" 2>&1)

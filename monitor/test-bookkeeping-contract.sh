@@ -370,26 +370,26 @@ seed_surfaces() {
     # An unrelated window, to prove the prune is scoped.
     printf 'other-window\twrapped\n' >> "$ST/idle-state.tsv"
 }
-rm -rf "$ST"; seed_surfaces kompot-panelL
+rm -rf "$ST"; seed_surfaces proj-w-panelL
 
 # The manifest must be non-empty — an empty array would make every
 # assertion below vacuously true.
 (( ${#BK_RETIRE_SURFACES[@]} >= 15 ))
 assert_rc "#602 the surface manifest is populated (not vacuous)" $? 0
 
-refs=$(bk_state_refs_window "$ST" kompot-panelL)
+refs=$(bk_state_refs_window "$ST" proj-w-panelL)
 assert_contains "#602 idle-state.tsv IS a tracked surface (the missed one)" \
     "$refs" "idle-state.tsv"
 n_before=$(printf '%s\n' "$refs" | grep -c .)
 (( n_before >= 15 ))
 assert_rc "#602 a freshly-seeded window is detected on every seeded surface" $? 0
 
-bk_prune_window_state "$ST" kompot-panelL
-leftover=$(bk_state_refs_window "$ST" kompot-panelL)
+bk_prune_window_state "$ST" proj-w-panelL
+leftover=$(bk_state_refs_window "$ST" proj-w-panelL)
 assert_empty "#602 after teardown NO surface references the retired window" "$leftover"
 # The reported symptom, named explicitly.
 assert_not_contains "#602 idle-state.tsv no longer holds the retired row" \
-    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "proj-w-panelL"
 # Scope: the prune must not have eaten the neighbours.
 assert_contains "#602 CONTROL: an unrelated window's row SURVIVES the prune" \
     "$(cat "$ST/idle-state.tsv")" "other-window"
@@ -401,7 +401,7 @@ assert_contains "#602 CONTROL: an unrelated window's row SURVIVES the prune" \
 # no server, so `list-windows` fails and the resolver correctly reports rc 3
 # "could not look" (your-org/nexus-code#699), which retire-window refuses by
 # design — it must never prune the state of a window it did not OBSERVE. The
-# flag asserts what is true in this fixture (kompot-panelL exists nowhere) and
+# flag asserts what is true in this fixture (proj-w-panelL exists nowhere) and
 # does not weaken the assertions below: with a live server the resolver
 # returns rc 1 and the flag is never consulted.
 #
@@ -426,9 +426,9 @@ assert_contains "#602 CONTROL: an unrelated window's row SURVIVES the prune" \
 #   (1) does an UNRELEASED obligation refuse the teardown?   [#977]
 #   (2) once RELEASED, is the prune still complete?          [#602]
 # — and (2) keeps every property #602 was asserting.
-rm -rf "$ST"; seed_surfaces kompot-panelL
+rm -rf "$ST"; seed_surfaces proj-w-panelL
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason test --assume-absent 2>&1); rw_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelL --reason test --assume-absent 2>&1); rw_rc=$?
 assert_rc "#977 retire-window REFUSES an absent window that still owes a verdict" "$rw_rc" 1
 assert_contains "#977 …and the refusal comes from the preflight, not a new copy of the check" \
     "$rw_out" "preflight refused"
@@ -439,9 +439,9 @@ assert_contains "#977 …and the pane state it was evaluated under" \
 # THE PROPERTY. A refusal that still pruned would satisfy every string
 # assertion above and be the bug.
 assert_file_exists "#977 the obligation SURVIVES the refused teardown" \
-    "$ST/skeptic/pending/kompot-panelL"
+    "$ST/skeptic/pending/proj-w-panelL"
 assert_contains "#977 …and so does every other surface (nothing was pruned)" \
-    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "proj-w-panelL"
 
 # The RELEASE. A gate with no release is a brick and a brick trains the `rm`
 # bypass — which destroys the obligation outside any gate, i.e. #977 made
@@ -453,21 +453,21 @@ assert_contains "#977 …and so does every other surface (nothing was pruned)" \
 # and refuses from a worker context, and this suite may itself run inside a
 # spawned worker (run_hermetic does not clear that variable).
 rel_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    env -u NEXUS_WORKER_WINDOW bash "$REPO_ROOT/monitor/ng" skeptic resolve kompot-panelL \
+    env -u NEXUS_WORKER_WINDOW bash "$REPO_ROOT/monitor/ng" skeptic resolve proj-w-panelL \
         --reason "verdict landed in the secondary clone state dir; see the linked report" 2>&1); rel_rc=$?
 assert_rc "#977 the sanctioned release works on a window absent from tmux" "$rel_rc" 0
 assert_contains "#977 …and leaves a rationale record" "$rel_out" "rationale appended"
 
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason test --assume-absent 2>&1); rw_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelL --reason test --assume-absent 2>&1); rw_rc=$?
 assert_rc "#602 ng retire-window exits 0 on a clean teardown" "$rw_rc" 0
 # your-org/nexus-code#1434 / #1270 residual A: the skeptic CHANNEL is archived,
 # not destroyed — the live path is clear (so every live-path reader sees what
 # it saw after the rm) and the record survives under skeptic/.archive/.
 assert_eq "#1434 the retired channel is GONE from its live path" \
-    "$([[ -d "$ST/skeptic/kompot-panelL" ]] && echo present || echo absent)" "absent"
+    "$([[ -d "$ST/skeptic/proj-w-panelL" ]] && echo present || echo absent)" "absent"
 assert_eq "#1434 …and ARCHIVED under skeptic/.archive/<key>.retired-<ts>/ (a DONE tombstone survives)" \
-    "$(find "$ST/skeptic/.archive" -maxdepth 1 -name 'kompot-panelL.retired-*' 2>/dev/null | grep -c .)" "1"
+    "$(find "$ST/skeptic/.archive" -maxdepth 1 -name 'proj-w-panelL.retired-*' 2>/dev/null | grep -c .)" "1"
 # The FALLBACK is never silent (skeptic w220sk on the W2-20 bundle): with the
 # archive made impossible (a FILE where the .archive dir must go), the channel is
 # still cleared from its live path AND a WARNING names what was destroyed.
@@ -500,12 +500,12 @@ assert_contains "#1101 …and puts the unmanifested COUNT on stdout as a present
 # verb announced a clean teardown over evidence it had chosen to keep. Now it
 # reports it and declines to rule, which is the whole design.
 assert_contains "#1101/G1 the deliberately-RETAINED skeptic ledger family is REPORTED, not silently kept" \
-    "$rw_out" "skeptic/pending/.kompot-panelL"
+    "$rw_out" "skeptic/pending/.proj-w-panelL"
 assert_contains "#1101/G1 …and the verb refuses to decide whether it belongs in the manifest" \
     "$rw_out" "does not decide which"
 assert_not_contains "#1101 …leaving orphan-async-state.tsv clean" \
-    "$(cat "$ST/orphan-async-state.tsv" 2>/dev/null)" "kompot-panelL"
-if [[ -e "$ST/orphan-async-woken/kompot-panelL" ]]; then
+    "$(cat "$ST/orphan-async-state.tsv" 2>/dev/null)" "proj-w-panelL"
+if [[ -e "$ST/orphan-async-woken/proj-w-panelL" ]]; then
     assert_eq "#1101 …and the post-wake cooldown sidecar pruned" "present" "absent"
 else
     assert_eq "#1101 …and the post-wake cooldown sidecar pruned" "absent" "absent"
@@ -516,22 +516,22 @@ fi
 # BOTH, because a scan that reports EVERYTHING passes the positive control and
 # is useless, and one that reports nothing passes no control at all. The
 # discriminating variable is whether the manifest names the surface.
-mkdir -p "$ST/async-run/kompot-panelL"
-echo x > "$ST/async-run/kompot-panelL/status"
+mkdir -p "$ST/async-run/proj-w-panelL"
+echo x > "$ST/async-run/proj-w-panelL/status"
 unman=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
     . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
-    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+    bk_state_refs_unmanifested "'"$ST"'" proj-w-panelL')
 assert_contains "#1101 the independent scan SEES a surface the manifest omits" \
-    "$unman" "async-run/kompot-panelL"
+    "$unman" "async-run/proj-w-panelL"
 # The NEGATIVE control, and the one that matters: a surface the manifest DOES
 # name must never be reported here, or every retirement drowns in noise and the
 # signal is discarded by the first reader.
-echo x > "$ST/heartbeat/kompot-panelL.json"
+echo x > "$ST/heartbeat/proj-w-panelL.json"
 unman2=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
     . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
-    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+    bk_state_refs_unmanifested "'"$ST"'" proj-w-panelL')
 assert_not_contains "#1101 …and does NOT report a MANIFESTED surface" \
-    "$unman2" "heartbeat/kompot-panelL.json"
+    "$unman2" "heartbeat/proj-w-panelL.json"
 
 # ---- the KEY SHAPE: a token boundary, not a prefix (skeptic G1) ----------
 #
@@ -541,21 +541,21 @@ assert_not_contains "#1101 …and does NOT report a MANIFESTED surface" \
 # AND to the scan. The second is the instructive one: it sits directly beside
 # `file:skeptic/pending/{s}`, which IS manifested.
 mkdir -p "$ST/obligations" "$ST/skeptic/pending"
-echo x > "$ST/obligations/kompot-panelL-sk__kompot-panelL__skeptic-verdict.rec"
-echo x > "$ST/skeptic/pending/.kompot-panelL.ledger"
+echo x > "$ST/obligations/proj-w-panelL-sk__proj-w-panelL__skeptic-verdict.rec"
+echo x > "$ST/skeptic/pending/.proj-w-panelL.ledger"
 # THE FALSE-POSITIVE CONTROL, and it is the direction a report must not have:
 # a SIBLING window's file must not be reported when asking about this one. `-`
 # is deliberately not a delimiter, because window names contain it.
-echo x > "$ST/skeptic/pending/.kompot-panelL-sk.ledger"
+echo x > "$ST/skeptic/pending/.proj-w-panelL-sk.ledger"
 unman3=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
     . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
-    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+    bk_state_refs_unmanifested "'"$ST"'" proj-w-panelL')
 assert_contains "#1101/G1 the scan sees the window MID-basename (obligations/…__w__….rec)" \
-    "$unman3" "__kompot-panelL__skeptic-verdict.rec"
+    "$unman3" "__proj-w-panelL__skeptic-verdict.rec"
 assert_contains "#1101/G1 …and behind a LEADING DOT, beside a manifested sibling" \
-    "$unman3" "skeptic/pending/.kompot-panelL.ledger"
+    "$unman3" "skeptic/pending/.proj-w-panelL.ledger"
 assert_not_contains "#1101/G1 CONTROL a SIBLING window's file is NOT reported" \
-    "$unman3" ".kompot-panelL-sk.ledger"
+    "$unman3" ".proj-w-panelL-sk.ledger"
 
 # ---- --strict turns an unmanifested reference into a failure -------------
 #
@@ -563,18 +563,18 @@ assert_not_contains "#1101/G1 CONTROL a SIBLING window's file is NOT reported" \
 # unmanifested reference is not a failed prune — so the flag is the only way a
 # caller can make it one, and an untested flag is a promise nobody checked.
 st_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason t --assume-absent 2>&1); st_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelL --reason t --assume-absent 2>&1); st_rc=$?
 assert_rc "#1101/G4 default: unmanifested references do NOT fail the verb" "$st_rc" 0
 assert_contains "#1101/G4 …and the COUNT is on stdout as a present value" \
     "$st_out" "unmanifested="
 st2_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason t --assume-absent --strict 2>&1); st2_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelL --reason t --assume-absent --strict 2>&1); st2_rc=$?
 assert_rc "#1101/G4 --strict: the same state now FAILS" "$st2_rc" 1
 assert_contains "#1101/G4 …and says --strict is why" "$st2_out" "--strict given"
 
-rm -rf "$ST/async-run" "$ST/heartbeat/kompot-panelL.json" "$ST/obligations" "$ST/skeptic/pending"
+rm -rf "$ST/async-run" "$ST/heartbeat/proj-w-panelL.json" "$ST/obligations" "$ST/skeptic/pending"
 assert_not_contains "#602 …leaving idle-state.tsv clean" \
-    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "proj-w-panelL"
 # #977's recording half, which lands regardless of the refusing half: the
 # channel directory is still destroyed by this (now legitimate) teardown, and
 # before this change that destruction left no artefact at all — so the
@@ -592,51 +592,51 @@ assert_contains "#977 …and warning on stderr, not only in the log" \
 # the dotfiles beside it), and a claim about a manifest is exactly the kind
 # that a later manifest edit silently falsifies. Without this, #977's whole
 # accounting argument rests on a sentence.
-rm -rf "$ST"; seed_surfaces kompot-panelD
+rm -rf "$ST"; seed_surfaces proj-w-panelD
 mkdir -p "$ST/skeptic/pending"
 { printf 'armed\t%s\t2026-08-26T00:00:00\t977\t/r/d.md\n'          "$(printf 'a%.0s' {1..64})"
   printf 'discharged\t%s\t2026-08-26T01:00:00\tcredible\t977\tsk-d\tattributed\n' "$(printf 'a%.0s' {1..64})"
-} > "$ST/skeptic/pending/.kompot-panelD.ledger"
-rm -f "$ST/skeptic/pending/kompot-panelD"   # released; only the ledger remains
+} > "$ST/skeptic/pending/.proj-w-panelD.ledger"
+rm -f "$ST/skeptic/pending/proj-w-panelD"   # released; only the ledger remains
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelD --reason test --assume-absent 2>&1); rw_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelD --reason test --assume-absent 2>&1); rw_rc=$?
 assert_rc "#977 a released window retires" "$rw_rc" 0
-assert_no_file "#977 …the channel dir IS destroyed" "$ST/skeptic/kompot-panelD"
+assert_no_file "#977 …the channel dir IS destroyed" "$ST/skeptic/proj-w-panelD"
 assert_file_exists "#977 …but the OBLIGATION LEDGER survives the prune" \
-    "$ST/skeptic/pending/.kompot-panelD.ledger"
+    "$ST/skeptic/pending/.proj-w-panelD.ledger"
 assert_contains "#977 …with both its arm and its discharge intact" \
-    "$(cat "$ST/skeptic/pending/.kompot-panelD.ledger" 2>/dev/null)" "discharged"
+    "$(cat "$ST/skeptic/pending/.proj-w-panelD.ledger" 2>/dev/null)" "discharged"
 assert_contains "#977 …and the destruction event carries the subject it destroyed" \
     "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"subject-armed-sha":"aaaaaaaa'
 
 # NEGATIVE CONTROL — a teardown with NOTHING to destroy must not emit the
 # event. Without this, an unconditional emit would pass every assertion above
 # and bury the ~1-in-N retirement that matters in the N that do not.
-rm -rf "$ST"; seed_surfaces kompot-panelQ
-rm -f "$ST/skeptic/pending/kompot-panelQ"; rm -rf "$ST/skeptic/kompot-panelQ"
+rm -rf "$ST"; seed_surfaces proj-w-panelQ
+rm -f "$ST/skeptic/pending/proj-w-panelQ"; rm -rf "$ST/skeptic/proj-w-panelQ"
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelQ --reason test --assume-absent 2>&1); rw_rc=$?
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelQ --reason test --assume-absent 2>&1); rw_rc=$?
 assert_rc "#977 CONTROL: a window owing nothing retires cleanly" "$rw_rc" 0
 assert_not_contains "#977 CONTROL: …and emits NO destruction event" \
     "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"event":"skeptic-obligation-destroyed"'
 
 # --dry-run must report without mutating. A "dry run" that prunes is the
 # same class of lie as a verb reporting work it did not do.
-rm -rf "$ST"; seed_surfaces kompot-panelL
+rm -rf "$ST"; seed_surfaces proj-w-panelL
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
-    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --dry-run 2>&1)
+    bash "$REPO_ROOT/monitor/ng" retire-window proj-w-panelL --dry-run 2>&1)
 assert_contains "#602 --dry-run NAMES idle-state.tsv" "$rw_out" "idle-state.tsv"
 assert_contains "#602 CONTROL: --dry-run did NOT prune" \
-    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "proj-w-panelL"
 
 # NEGATIVE CONTROL — the completeness check must FAIL when a surface is
 # deliberately left dirty, and must NAME that surface. A check that
 # reports "clean" unconditionally would pass every assertion above; this
 # is the one that distinguishes them.
-rm -rf "$ST"; seed_surfaces kompot-panelL
-bk_prune_window_state "$ST" kompot-panelL
-printf 'kompot-panelL\twrapped\n' >> "$ST/idle-state.tsv"
-leftover=$(bk_state_refs_window "$ST" kompot-panelL)
+rm -rf "$ST"; seed_surfaces proj-w-panelL
+bk_prune_window_state "$ST" proj-w-panelL
+printf 'proj-w-panelL\twrapped\n' >> "$ST/idle-state.tsv"
+leftover=$(bk_state_refs_window "$ST" proj-w-panelL)
 assert_contains "#602 NEGATIVE CONTROL: a dirty surface is DETECTED" \
     "$leftover" "idle-state.tsv"
 assert_contains "#602 …and reported with its kind, so it is actionable" \

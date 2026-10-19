@@ -199,7 +199,7 @@ _reports_roll_emit_section() { :; }; _supervisor_arm_emit_section() { :; }
 compose_report() { printf 'reason=%s\n' "$1"; }
 archive_emit() { printf '%s/archive.md' "$W"; }
 _compose_emit_should_suppress() { return 1; }   # the hash-ring gate is not under test
-_over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1; }
+_over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1; }; _api_hold_active() { return 1; }
 paste_with_retry() { printf '%s %s\n' "$FAKE_NOW" "$(head -n1 "$2")" >> "$PASTES"; return 0; }
 _emit_delivery_ok() { :; }; _compose_emit_record_emit() { :; }; requests_commit_emitted() { :; }
 _respawn_loop_reset() { :; }; _respawn_consec_reset() { :; }

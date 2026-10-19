@@ -230,6 +230,22 @@ else
     STATE_DIR="$NEXUS_PRIMARY/monitor/.state"
 fi
 
+# ---- the ledger: by its ONE resolver (#1724) -------------------------------
+# `<state>/machine-input.tsv`, unless `ng degraded enter` relocated it out of a
+# read-only tree. The watcher reads through the same resolver, so a send
+# stamped at a relocated ledger is still seen by the delivery guard. An
+# unusable relocation pointer is a refusal, never a stamp into the tree.
+# A copy of this file with no resolver beside it (the suites' mutants) stamps
+# the tree path: no pointer can name a fixture's state dir.
+if [[ -r "$_sd/_ledger_path.sh" ]]; then
+    # shellcheck source=monitor/_ledger_path.sh
+    . "$_sd/_ledger_path.sh" || die "cannot source $_sd/_ledger_path.sh"
+    LEDGER=$(nexus_ledger_path "$STATE_DIR") \
+        || die "the delivery ledger's degraded-mode relocation pointer is unusable (see above; \`ng degraded status\`) — refusing to stamp the tree's ledger, which the guard is not reading (your-org/nexus-code#1724)"
+else
+    LEDGER="$STATE_DIR/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+fi
+
 WINDOW=""; MSG_FILE=""; MSG_TEXT=""; NONCE=""; ONLY_TRANSPORT=""
 STAMP_ONLY=0; CHECK=0; DRY=0; ADMIN=0; TIMEOUT=""
 NONCE_GIVEN=0; LAST=0; LIST=0; COVERAGE=0
@@ -336,7 +352,7 @@ GUARD_KEY="paste-followup"
 _stamp_ledger() {
     local epoch="$1" transport="$2" admin_col=""
     (( ADMIN )) && admin_col="admin"
-    mkdir -p "$STATE_DIR" 2>/dev/null
+    mkdir -p "${LEDGER%/*}" 2>/dev/null
     # STAMP BEFORE SEND, AND DIE IF IT FAILS (#665 / SKILL §3). The asymmetry
     # is the reason: stamp→send fails LOUD (a stamped epoch whose submission
     # never confirms is exactly what paste-unconfirmed catches — a recoverable
@@ -344,8 +360,8 @@ _stamp_ledger() {
     # watcher may sample. Order any two-part operation so the failure mode is
     # the observable one.
     printf '%s\t%s\t%s\t%s\n' "$WINDOW" "$epoch" "$GUARD_KEY" "$admin_col" \
-        >> "$STATE_DIR/machine-input.tsv" \
-        || die "cannot stamp $STATE_DIR/machine-input.tsv — refusing to send unstamped (the watcher would misattribute the input to the operator)"
+        >> "$LEDGER" \
+        || die "cannot stamp $LEDGER — refusing to send unstamped (the watcher would misattribute the input to the operator)"
     local dir="$STATE_DIR/paste-verdicts" tmp
     mkdir -p "$dir" 2>/dev/null || return 0
     tmp="$dir/.$WINDOW.$epoch.$$"
@@ -426,7 +442,7 @@ fi
 # its gap before; an auditor counting rows for a window read 8 deliveries
 # against 7 rows and nearly published "the correction never propagated".
 if (( COVERAGE )); then
-    printf 'window=%s harness=%s ledger=%s/machine-input.tsv\n' "$WINDOW" "$HARNESS" "$STATE_DIR"
+    printf 'window=%s harness=%s ledger=%s\n' "$WINDOW" "$HARNESS" "$LEDGER"
     _gap=""
     for t in "${TRANSPORTS[@]}"; do
         IFS=$'\t' read -r n inv rcp stm <<<"$t"
@@ -726,24 +742,27 @@ trap '[[ -n "$TMP_PAYLOAD" ]] && rm -f "$TMP_PAYLOAD"' EXIT
 # probe the ledger with a FRESH create (never a held fd, see _fs_probe.sh)
 # and, if it fails, say what failed, that NOTHING was sent, and exit 4: an
 # ESTABLISHED non-delivery, which is exactly what licenses a fallback (SKILL §4).
+# The probe is of the LEDGER'S directory, which is the state dir unless
+# `ng degraded enter` relocated the ledger (#1724, piece A): after an enter the
+# relocated ledger is writable and the send proceeds.
 _ledger_unwritable() {   # -> 0 and the reason on stdout when the ledger cannot take a row
-    local t err
-    mkdir -p "$STATE_DIR" 2>/dev/null
-    t="$STATE_DIR/.ngsend-probe.$$.${RANDOM}"
+    local t err ld="${LEDGER%/*}"
+    mkdir -p "$ld" 2>/dev/null
+    t="$ld/.ngsend-probe.$$.${RANDOM}"
     if err=$( { : > "$t"; } 2>&1 ); then
         rm -f "$t" 2>/dev/null
-        if [[ -e "$STATE_DIR/machine-input.tsv" && ! -w "$STATE_DIR/machine-input.tsv" ]]; then
-            printf '%s' "$STATE_DIR/machine-input.tsv: not writable"; return 0
+        if [[ -e "$LEDGER" && ! -w "$LEDGER" ]]; then
+            printf '%s' "$LEDGER: not writable"; return 0
         fi
         return 1
     fi
-    printf '%s: %s' "$STATE_DIR" "${err##*: }"
+    printf '%s: %s' "$ld" "${err##*: }"
     return 0
 }
 if _why=$(_ledger_unwritable); then
     say "DEGRADED — the delivery ledger cannot be written (${_why}). See: monitor/ng degraded status (your-org/nexus-code#1724)."
     say "NOTHING WAS SENT to $WINDOW. This is an ESTABLISHED non-delivery, so a fallback cannot double-deliver."
-    say "FALLBACK: deliver it with SendMessage to '$WINDOW' (address it by the name ListAgents prints). Do not retry ng send until 'ng degraded status' exits 0."
+    say "FALLBACK: deliver it with SendMessage to '$WINDOW' (address it by the name ListAgents prints). Do not retry ng send until 'ng degraded status' exits 0, or until the orchestrator has run 'ng degraded enter', which relocates the ledger out of the tree."
     exit $RC_NOT_DELIVERED
 fi
 

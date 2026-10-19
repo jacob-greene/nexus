@@ -11,7 +11,7 @@
 #
 # The dispatcher itself lives one directory up so it can be TESTED without a
 # plugin — against a HERMETIC state dir (a private NEXUS_STATE_DIR), as
-# monitor/watcher/test-longjob-watch.sh does.
+# monitor/watcher/test-longjob-watch.sh and test-longjob-watch-ledger.sh do.
 #
 # NEVER RUN `dispatch` BY HAND INSIDE A LIVE SESSION (bundle-2609sk3 F1,
 # your-org/nexus-code#1541, #1544). The session ledger has ONE writer. That

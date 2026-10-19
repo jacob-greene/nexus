@@ -625,6 +625,20 @@ _recover_window_exists() {
 # Path of a service's headless-supervisor pidfile.
 _recover_pidfile() { printf '%s/services/%s.pid' "$STATE_DIR" "$1"; }
 
+# Operator stop intent (your-org/nexus-code#1827). `svc.sh stop <name>` writes
+# this sentinel (`at=`/`iso=`/`by=` key=value lines) and only an explicit
+# `svc.sh start|restart <name>` removes it. Every AUTOMATIC start path —
+# the recovery sweep below, the watcher's service-health auto-restart, a
+# watcher/version-restart `svc.sh restart` — must leave a service carrying it
+# DOWN: before it existed, health recovery restarted a deliberately stopped
+# service within minutes and the stop held nothing. The name deliberately
+# does not end in `.pid`, so the `services/*.pid` sweeps never see it.
+# A SECOND, IDENTICAL definition lives at monitor/watcher/_service_health.sh
+# (`_sh_stop_sentinel`), replicated for the same don't-source reason as
+# `_sh_service_healthy`; keep them in step.
+_recover_stop_sentinel() { printf '%s/services/%s.stop-requested' "$STATE_DIR" "$1"; }
+_recover_stop_requested() { [[ -e "$(_recover_stop_sentinel "$1")" ]]; }
+
 # Resolve a service's headless-supervisor record into one of three words:
 #
 #   alive:<pid>  the pidfile names a live PID whose cmdline still mentions
@@ -1196,7 +1210,19 @@ _recover_capture_followup_inputs() {
     (( FOLLOWUP_MI_CAPTURED == 1 )) && return 0
     FOLLOWUP_MI_CAPTURED=1
     FOLLOWUP_MI_ROWS=""
-    local mi="$STATE_DIR/machine-input.tsv" rows
+    local mi rows
+    # The ledger's ONE resolver (your-org/nexus-code#1724): while `ng degraded
+    # enter` is in force every writer stamps the RELOCATED ledger, so reading
+    # the tree's copy would call every follow-up made since onset UNKNOWN. An
+    # unusable pointer is `unreadable`, never `absent`: absent asserts there
+    # were no follow-ups.
+    if ! { declare -F nexus_ledger_path >/dev/null 2>&1 || . "$_script_dir/_ledger_path.sh"; } 2>/dev/null; then
+        mi="$STATE_DIR/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+    elif ! mi=$(nexus_ledger_path "$STATE_DIR"); then
+        FOLLOWUP_MI_STATE=unreadable
+        log "workers: WARNING the machine-input ledger's location could not be resolved (degraded-mode pointer unusable, see \`ng degraded status\`) — every wrapped window will be treated as follow-up-UNKNOWN and RESUMED"
+        return 0
+    fi
     if [[ ! -e "$mi" ]]; then
         FOLLOWUP_MI_STATE=absent
         return 0
@@ -2346,6 +2372,13 @@ _recover_main() {
             while IFS=$'\t' read -r name workdir launch health logfile; do
                 [[ -n "$name" ]] || continue
                 n_total=$(( n_total + 1 ))
+                # An operator `svc.sh stop` is not an outage to recover
+                # (your-org/nexus-code#1827): leave it down and say why.
+                if _recover_stop_requested "$name"; then
+                    log "service '$name': stopped by request (since $(sed -n 's/^iso=//p;T;q' "$(_recover_stop_sentinel "$name")" 2>/dev/null)) — NOT relaunching; 'svc.sh start $name' resumes it"
+                    n_skipped=$(( n_skipped + 1 ))
+                    continue
+                fi
                 outcome=$(recover_service "$name" "$workdir" "$launch" "$health" "$logfile")
                 case "$outcome" in
                     healthy)    n_healthy=$(( n_healthy + 1 )) ;;

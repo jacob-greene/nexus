@@ -125,6 +125,9 @@ eval "$(_pluck_fn _bounded_failure_log "$_test_dir/main.sh")"
 # by _compose_report_body; plucked from production too, for the same reason.
 eval "$(_pluck_fn _render_budget_seconds "$_test_dir/main.sh")"
 eval "$(_pluck_fn _prelude_cache_path "$_test_dir/main.sh")"
+# The dashboard section moved into its own function (#1839); without it every
+# compose below printed `command not found` and dropped the section.
+eval "$(_pluck_fn _emit_dashboard_section "$_test_dir/main.sh")"
 eval "$(_pluck_fn _compose_report_body "$_test_dir/main.sh")"
 
 render_idle_prelude() { sleep 5; }   # never writes → deterministic EMPTY

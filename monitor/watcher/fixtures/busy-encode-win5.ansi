@@ -33,7 +33,7 @@
      [38;5;167m[48;5;52m  7 -[38;5;231mtr4 profile smoothing — the same smoothing scale as ENCODE profile-                                                                                                           [39m[49m
      [38;5;167m[48;5;52m  8 -[38;5;231msmoothed RT bigwigs used elsewhere in the analysis.                                                                                                                           [39m[49m
      [38;5;77m[48;5;22m  4 +[38;5;231mReplaces script [38;5;141m16[38;5;186m's TSS ± 5 kb window with each gene'[38;5;231ms exact body                                                                                                            [39m[49m
-     [38;5;77m[48;5;22m  5 +[38;5;231mcoordinates [start, end] [38;5;197mfrom[38;5;231m data/genesets/all_coding.parquet,                                                                                                               [39m[49m
+     [38;5;77m[48;5;22m  5 +[38;5;231mcoordinates [start, end] [38;5;197mfrom[38;5;231m data/featsets/all_coding.parquet,                                                                                                               [39m[49m
      [38;5;77m[48;5;22m  6 +[38;5;231maddressing the window-overlap critique on                                                                                                                                     [39m[49m
      [38;5;77m[48;5;22m  7 +[38;5;231myour-org/user1-nexus[38;5;242m#38 comment 4400000003.[38;5;231m                                                                                                                                   [39m[49m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m8[0m[39m[49m [38;5;231m [39m

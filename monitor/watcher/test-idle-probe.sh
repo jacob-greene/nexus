@@ -148,6 +148,7 @@ bginfra_key="MOCK_BG_INFRA_${win//[^a-zA-Z0-9_]/_}"
 bgcmd_key="MOCK_BG_CMD_${win//[^a-zA-Z0-9_]/_}"
 bgwedged_key="MOCK_BG_WEDGED_${win//[^a-zA-Z0-9_]/_}"
 bgmembers_key="MOCK_BG_MEMBERS_${win//[^a-zA-Z0-9_]/_}"
+bgljkept_key="MOCK_BG_LJKEPT_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
 orphan_kinds="${!orphan_key:-}"
@@ -160,6 +161,7 @@ bg_infra="${!bginfra_key:-}"
 bg_cmd="${!bgcmd_key:-}"
 bg_wedged="${!bgwedged_key:-}"
 bg_members="${!bgmembers_key:-}"
+bg_ljkept="${!bgljkept_key:-}"
 extras=""
 [[ -n "$reset_at" ]]      && extras+=" reset_at=$reset_at"
 [[ -n "$orphan_kinds" ]]  && extras+=" orphan_kinds=$orphan_kinds"
@@ -172,6 +174,7 @@ extras=""
 [[ -n "$bg_cmd" ]]        && extras+=" bg_cmd=$bg_cmd"
 [[ -n "$bg_wedged" ]]     && extras+=" bg_cpu_bp=2 bg_wedged=$bg_wedged"
 [[ -n "$bg_members" ]]    && extras+=" bg_members=$bg_members"
+[[ -n "$bg_ljkept" ]]     && extras+=" bg_longjob_kept=$bg_ljkept"
 printf 'state=%s%s\n' "$state" "$extras"
 exit 0
 STUB
@@ -715,12 +718,12 @@ LOG="$STATE_DIR/action-log.jsonl"
 export MOCK_TMUX_WINDOWS="$(printf 'orphw|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_orphw=idle-orphan-async
-export MOCK_ORPHAN_KINDS_orphw="slurm:52527284_4,ci:abc/runs/9"
+export MOCK_ORPHAN_KINDS_orphw="slurm:12345678_4,ci:abc/runs/9"
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains "orphan-async → row emitted" "$out" \
     $'orphw\tidle-orphan-async'
 assert_contains "orphan-async row carries orphan_kinds csv as detail" "$out" \
-    "slurm:52527284_4,ci:abc/runs/9"
+    "slurm:12345678_4,ci:abc/runs/9"
 
 # window-retain MUST NOT suppress idle-orphan-async.
 rm -f "$STATE_DIR/idle-state.tsv"
@@ -904,7 +907,7 @@ seed_engagement_log_matching_activity
 seed_frozen_child bgc4 120 500
 mkdir -p "$STATE_DIR/worker-health"
 cat > "$STATE_DIR/worker-health/bgc4.json" <<EOF
-{"window":"bgc4","job_kind":"slurm","job_id":"52527284","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
+{"window":"bgc4","job_kind":"slurm","job_id":"12345678","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
 EOF
 export MOCK_PANE_STATE_bgc4=working-background
 export MOCK_BG_SHELLS_bgc4=1 MOCK_BG_RELIABLE_bgc4=1 MOCK_BG_CPU_bgc4=500
@@ -1315,6 +1318,30 @@ unset MOCK_PANE_STATE_bgs4 MOCK_BG_SHELLS_bgs4 MOCK_BG_RELIABLE_bgs4 \
 rm -rf "$STATE_DIR/bg-members"
 : > "$LOG"
 
+# (b14) your-org/nexus-code#1851: the idle-awaiting-job row NAMES its child.
+#       #1851 was filed against the longjob dispatcher because this row
+#       printed a bare count; the counted child was an MCP helper shell.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state; : > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs5|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs5=working-background
+export MOCK_BG_SHELLS_bgs5=1 MOCK_BG_RELIABLE_bgs5=1 MOCK_BG_CPU_bgs5=0
+export MOCK_BG_INFRA_bgs5=0 MOCK_BG_CMD_bgs5='sh:sh_-c_mcp-server-x' MOCK_BG_WEDGED_bgs5=1
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1851): the idle-awaiting-job row names its child" "$out" \
+    "idle-awaiting-job (state=working-background; 1 live background child(ren) [child: sh:sh_-c_mcp-server-x]"
+assert_not_contains "snapshot (#1851) CONTROL: no kept dispatcher → no dead-wake note" "$out" "longjob DISPATCHER"
+# (b15) a counted root holding the dispatcher means its ledger is NOT armed:
+#       a stale or dead dispatcher is a LOST WAKE, and the row says so.
+export MOCK_BG_LJKEPT_bgs5=1 MOCK_BG_CMD_bgs5='bash:bash_longjob-watch.sh_dispatch'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1851): a kept (stale/dead) dispatcher is named as a DOWN wake" "$out" \
+    "hold the longjob DISPATCHER and its ledger is NOT armed"
+assert_contains "snapshot (#1851): …and still flags WEDGED? (a stale dispatcher is not exempt)" "$out" "WEDGED?"
+unset MOCK_PANE_STATE_bgs5 MOCK_BG_SHELLS_bgs5 MOCK_BG_RELIABLE_bgs5 MOCK_BG_CPU_bgs5 \
+      MOCK_BG_INFRA_bgs5 MOCK_BG_CMD_bgs5 MOCK_BG_WEDGED_bgs5 MOCK_BG_LJKEPT_bgs5
+: > "$LOG"
+
 # ---- inverted priority: the exemption is BOUNDED (#455 follow-up) ---------
 #
 # "We'd rather misclassify and consider retiring a worker rather than having
@@ -1334,7 +1361,7 @@ seed_engagement_log_matching_activity
 seed_frozen_child bgcap1 4000 500        # frozen 4000s > ceiling 3600
 mkdir -p "$STATE_DIR/worker-health"
 cat > "$STATE_DIR/worker-health/bgcap1.json" <<EOF
-{"window":"bgcap1","job_kind":"slurm","job_id":"52527999","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
+{"window":"bgcap1","job_kind":"slurm","job_id":"12345999","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
 EOF
 export MOCK_PANE_STATE_bgcap1=working-background
 export MOCK_BG_SHELLS_bgcap1=1 MOCK_BG_RELIABLE_bgcap1=1 MOCK_BG_CPU_bgcap1=500
@@ -1572,14 +1599,14 @@ out=$(PATH="$STUB_DIR:$PATH" bash -c "
     NEXUS_ROOT='$NEXUS_ROOT'
     source '$PROBE'
     list_really_idle_workers() {
-        printf 'orphw\tidle-orphan-async\t120\tslurm:52527284_4\n'
+        printf 'orphw\tidle-orphan-async\t120\tslurm:12345678_4\n'
     }
     render_idle_section
 " 2>/dev/null)
 assert_contains  "orphan-async advisory line"           "$out" \
                  "orphw idle-orphan-async"
 assert_contains  "advisory quotes the offending job"    "$out" \
-                 "slurm:52527284_4"
+                 "slurm:12345678_4"
 assert_contains  "advisory points at the contract"      "$out" \
                  "worker-defaults"
 
@@ -1623,9 +1650,9 @@ assert_contains     "unresolved branch: keeps the do-not-clear rule" "$out" "mus
 assert_not_contains "unresolved branch: does NOT offer the verb"     "$out" "declare-no-wait"
 
 # The legacy 4th-column shape (no class prefix) must degrade to the SAFE arm.
-out=$(render_orphan_row 'slurm:52527284_4')
+out=$(render_orphan_row 'slurm:12345678_4')
 assert_contains     "legacy detail degrades to the do-not-clear text" "$out" "must not be cleared"
-assert_contains     "legacy detail still quotes the job"              "$out" "slurm:52527284_4"
+assert_contains     "legacy detail still quotes the job"              "$out" "slurm:12345678_4"
 
 echo '=== _idle_orphan_wait_class resolves fail-CLOSED ==='
 #
@@ -1662,7 +1689,7 @@ assert_eq "two terminal tokens → terminal" \
 assert_eq "one token WITHOUT a status file → unresolved" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-cccccccccccc')")" unresolved
 assert_eq "a non-asyncrun kind → untracked" \
-    "$(wc_class "$(wc_probe wcw 'slurm:52527284_4')")" untracked
+    "$(wc_class "$(wc_probe wcw 'slurm:12345678_4')")" untracked
 # RE-BASELINED, NOT DECIDED (your-org/nexus-code#1311). `git log -G` shows this
 # was written `→ unresolved` at cbf61b0a and flipped to `→ untracked` 4.5h later
 # at 002f1138, the commit that CREATED the untracked class, in a block edit whose
@@ -1867,18 +1894,18 @@ assert_not_contains "#1311 ALL-untracked: does not claim a terminal status exist
 _a83="$STATE_DIR/async-run/$_wc_enc/ar-await000001"
 mkdir -p "$_a83"
 # A REAL await-shaped process: a stub whose cmdline IS
-# `bash <path>/skeptic-channel.sh await dolicompsk`, because since the #1183
+# `bash <path>/skeptic-channel.sh await projcsk`, because since the #1183
 # reopen the classifier ALSO asks the channel's own record — `.await-owner`
 # must name a live pid whose cmdline is this await (read off /proc by the same
 # property parser) and `.await-heartbeat` must be fresh. A bare `sleep` would
 # fail that check, correctly.
 printf '#!/usr/bin/env bash\nsleep 120\n' > "$WORK/monitor/skeptic-channel.sh"
 chmod +x "$WORK/monitor/skeptic-channel.sh"
-bash "$WORK/monitor/skeptic-channel.sh" await dolicompsk &
+bash "$WORK/monitor/skeptic-channel.sh" await projcsk &
 _a83pid=$!
 _a83st=$(awk '{n=split($0,a,") "); split(a[n],f," "); print f[20]}' "/proc/$_a83pid/stat" 2>/dev/null)
-_a83chan_enc=$(bash -c "source '$NEXUS_ROOT/monitor/_bookkeeping.sh' 2>/dev/null; wk_encode dolicompsk" 2>/dev/null)
-[[ -n "$_a83chan_enc" ]] || _a83chan_enc=dolicompsk
+_a83chan_enc=$(bash -c "source '$NEXUS_ROOT/monitor/_bookkeeping.sh' 2>/dev/null; wk_encode projcsk" 2>/dev/null)
+[[ -n "$_a83chan_enc" ]] || _a83chan_enc=projcsk
 _a83chan="$STATE_DIR/skeptic/$_a83chan_enc"
 mkdir -p "$_a83chan"
 _a83_arm() {   # the channel's own record: owner pid + fresh heartbeat
@@ -1888,42 +1915,42 @@ _a83_arm() {   # the channel's own record: owner pid + fresh heartbeat
 _a83_arm
 printf '%s\n' "$_a83pid" > "$_a83/pid"
 printf '%s\n' "$_a83st"  > "$_a83/pidstart"
-printf './monitor/skeptic-channel.sh\0await\0dolicompsk\0' > "$_a83/argv"
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
 assert_eq "#1183 a live SKEPTIC AWAIT -> skeptic-await, not running" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
 # THE REOPEN (2026-09-03): argv[0] had to BE the script, which missed the form
 # the skill PRESCRIBES. Measured on the primary: 7 of 27 live awaits missed —
 # six `bash <path>/skeptic-channel.sh await …`, one `bash -c '<;-list>'` — and
 # every one was told to install a second listener.
-printf 'bash\0/shared/x/monitor/skeptic-channel.sh\0await\0dolicompsk\0--timeout\021600\0' > "$_a83/argv"
+printf 'bash\0/shared/x/monitor/skeptic-channel.sh\0await\0projcsk\0--timeout\021600\0' > "$_a83/argv"
 assert_eq "#1183 REOPEN: \`bash <path>/skeptic-channel.sh await …\` -> skeptic-await" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
-printf 'bash\0monitor/skeptic-channel.sh\0await\0dolicompsk\0' > "$_a83/argv"
+printf 'bash\0monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
 assert_eq "#1183 REOPEN: \`bash monitor/skeptic-channel.sh await …\` (relative) -> skeptic-await" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
-printf 'bash\0-c\0monitor/skeptic-channel.sh await dolicompsk; rc=$?; echo "await rc=$rc"; exit $rc\0' > "$_a83/argv"
+printf 'bash\0-c\0monitor/skeptic-channel.sh await projcsk; rc=$?; echo "await rc=$rc"; exit $rc\0' > "$_a83/argv"
 assert_eq "#1183 REOPEN: the SKILL-prescribed \`bash -c '<list>'\` form -> skeptic-await" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
-printf 'bash\0-c\0cd /x && timeout 550 monitor/skeptic-channel.sh await dolicompsk --timeout 600\0' > "$_a83/argv"
+printf 'bash\0-c\0cd /x && timeout 550 monitor/skeptic-channel.sh await projcsk --timeout 600\0' > "$_a83/argv"
 assert_eq "#1183 REOPEN: an await behind \`cd … &&\` and a \`timeout\` wrapper -> skeptic-await" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
 # >>> NEGATIVE CONTROL (the issue's own): a `bash -c` that merely MENTIONS the
 # script must NOT be classified skeptic-await — that over-match is exactly what
 # a substring predicate (`_await_pid_is_ours`-style) would commit, and it would
 # suppress the poller advice for real work.
-printf 'bash\0-c\0echo "skeptic-channel.sh await dolicompsk is armed"; sleep 5\0' > "$_a83/argv"
+printf 'bash\0-c\0echo "skeptic-channel.sh await projcsk is armed"; sleep 5\0' > "$_a83/argv"
 assert_eq "#1183 NEG CONTROL: a \`bash -c\` that only MENTIONS \`skeptic-channel.sh await\` -> running" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
 printf 'bash\0-c\0grep -c "skeptic-channel.sh await" notes.md\0' > "$_a83/argv"
 assert_eq "#1183 NEG CONTROL: a grep FOR the phrase -> running" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
-printf 'bash\0-c\0monitor/skeptic-channel.sh status dolicompsk\0' > "$_a83/argv"
+printf 'bash\0-c\0monitor/skeptic-channel.sh status projcsk\0' > "$_a83/argv"
 assert_eq "#1183 NEG CONTROL: the script with a verb other than await -> running" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
 # >>> STALENESS, FAIL CLOSED (the issue's ask, previously prose only): the
 # channel record decides. Owner dead, heartbeat past the hang threshold, or
 # either file missing -> a STALE await is an orphan and keeps `running`.
-printf './monitor/skeptic-channel.sh\0await\0dolicompsk\0' > "$_a83/argv"
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
 printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$_a83chan/.await-heartbeat"
 assert_eq "#1183 STALE: heartbeat past the hang threshold -> running (fail closed)" \
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
@@ -1950,7 +1977,7 @@ assert_eq "#1183 …without the argv record, the same live token is plain runnin
     "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
 # `== n_run`, not `> 0`: an await ALONGSIDE a live compute job still needs the
 # poller advice, so the mixed window must NOT take the skeptic-await arm.
-printf './monitor/skeptic-channel.sh\0await\0dolicompsk\0' > "$_a83/argv"
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
 _a83b="$STATE_DIR/async-run/$_wc_enc/ar-await000002"
 mkdir -p "$_a83b"
 printf '%s\n' "$_a83pid" > "$_a83b/pid"

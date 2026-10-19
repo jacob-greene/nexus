@@ -21,7 +21,7 @@
 #
 #   kinds present : asyncrun 121, slurm 63, nohup 35,
 #                   slurm-srun-async 16, service 1
-#   id shapes     : kind `slurm` carries BOTH `2219913` and
+#   id shapes     : kind `slurm` carries BOTH `1234567` and
 #                   `syn-02ce6257b730`; kind `service` carries
 #                   `myviewer-8766`
 #

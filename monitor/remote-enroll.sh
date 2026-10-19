@@ -26,7 +26,9 @@
 #   issue-token --principal P [--ttl S]
 #                               mint a one-time token (printed to stdout,
 #                               OUT-OF-BAND ONLY); record it hashed+TTL'd
-#   enroll --pubkey F --token T [--principal P]
+#   enroll --pubkey F (--token-stdin | --token T) [--principal P]
+#                               prefer --token-stdin: --token T puts the secret
+#                               in world-readable argv (your-org/nexus-code#1846)
 #                               consume T → append the forced-command
 #                               authorized_keys line for its principal
 #   enroll-invite --principal P [--ttl S]

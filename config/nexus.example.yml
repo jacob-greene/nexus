@@ -154,6 +154,27 @@ lit:
   # Point this at a path inside your asset repo to version the library.
   # library_path: ~/path/to/refs.jsonl
 
+status_surface:
+  # Where the operator reads "the state of everything" (<your-org>/nexus-code#1839).
+  #   overview-dashboard  the default, and what an ABSENT block means: the
+  #                       overview issue's dashboard, kept current with
+  #                       `ng dashboard put` (skills/nexus.dashboard/SKILL.md).
+  #   external            you run your own status page. The watcher emit stops
+  #                       reporting dashboard puts and points at your page;
+  #                       the orchestrator stops maintaining the dashboard.
+  #                       `ng dashboard put` still works, with a note.
+  # Any other value is REFUSED (`config/load.sh --validate`, and so watcher
+  # start), never read as the default.
+  kind: overview-dashboard
+  # external only, both optional; relative paths resolve against nexus.root.
+  # url_file: a file whose first line is the page's URL (a service's
+  #   `.deploy/endpoint`, skills/nexus.services/SKILL.md) — never a
+  #   hardcoded host.
+  # url_file: work/status-page/.deploy/endpoint
+  # feed: the append-only landings file your page reads; the emit names it so
+  #   the orchestrator knows where landings go.
+  # feed: work/status-page/landings.tsv
+
 notifications:
   # Phone push: Pushover is preferred, ntfy is the fallback. Both are
   # optional; with neither configured, monitor/notify.sh silently

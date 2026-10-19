@@ -912,10 +912,27 @@ mg_eligible() {   # <file> [ifmode=0|1|2]   1 = the if-* modes, 2 = subst
 # A case is a line `  PASS: <label>` — what `_test_helpers.sh` prints for every
 # assertion, and what most hand-rolled suites print too. A suite that prints no
 # such line has NO cases this tool can name; that is said, never papered over.
+#
+# TWO OTHER VOCABULARIES ARE IN USE AND ARE READ TOO (#1823). Measured at
+# af49fcbc: 24 tracked suites print `ok:   <label>` (test-bootstrap-recover,
+# test-svc, test-entry, …) or the padded column `  ok   <label>` (the lint and
+# step-contract suites), with `FAIL: <label>` or `  FAIL <label>` on the other
+# side. Reading only `PASS:` gave those suites "0 case label(s)" and a REFUSED
+# gate. The `ok` forms are anchored hard — a colon, or at least TWO spaces — so
+# prose that merely starts with "ok " is not a case. `not ok` is read as a FAIL
+# for TAP-shaped suites. Each sed arm ends in `t`, so a label is taken by the
+# FIRST arm that matches and never twice.
+MG_PASS_SED='s/^[[:space:]]*PASS: //p;t
+s/^[[:space:]]*ok:[[:space:]]+//p;t
+s/^[[:space:]]*ok[[:space:]]{2,}//p'
+MG_FAIL_SED='s/^[[:space:]]*FAIL: //p;t
+s/^[[:space:]]*not ok:?[[:space:]]+//p;t
+s/^[[:space:]]*FAIL[[:space:]]+//p'
+MG_FAIL_ERE='^[[:space:]]*(FAIL:? |not ok:?[[:space:]])'
 mg_labels() {   # <captured stdout> -> SORTED PASS labels, duplicates KEPT
     # A multiset on purpose: `comm` pairs duplicate lines, so a label printed
     # twice at baseline and once in the mutant still shows up as one loss.
-    sed -n 's/^[[:space:]]*PASS: //p' "$1" | LC_ALL=C sort
+    sed -E -n "$MG_PASS_SED" "$1" | LC_ALL=C sort
 }
 # mg_flipset <base.out> <mut.out> <mut.err>
 #   -> $WORKDIR/flipped    labels, one per line (what --predict and --record read)
@@ -957,10 +974,13 @@ mg_flipset() {
     LC_ALL=C sort -u "$WORKDIR/base.labels.all" > "$WORKDIR/base.labels"
     LC_ALL=C comm -23 "$WORKDIR/base.labels.all" "$WORKDIR/mut.labels.all" > "$WORKDIR/notpassed"
     LC_ALL=C comm -13 "$WORKDIR/base.labels.all" "$WORKDIR/mut.labels.all" > "$WORKDIR/newlabels"
-    cat "$2" "$3" | sed -n 's/^[[:space:]]*FAIL: //p' > "$WORKDIR/mut.fails"
+    cat "$2" "$3" | sed -E -n "$MG_FAIL_SED" > "$WORKDIR/mut.fails"
     : > "$WORKDIR/flipped.ev"; : > "$WORKDIR/vanished"; : > "$WORKDIR/relabelled"; : > "$WORKDIR/unmatched"
-    awk -v F_EV="$WORKDIR/flipped.ev" -v F_VAN="$WORKDIR/vanished" \
-        -v F_REL="$WORKDIR/relabelled" -v F_UNM="$WORKDIR/unmatched" '
+    # Paths through ENVIRON, not `awk -v`, which would rewrite a backslash in a
+    # caller-named --workdir (#1873).
+    F_EV="$WORKDIR/flipped.ev" F_VAN="$WORKDIR/vanished" \
+    F_REL="$WORKDIR/relabelled" F_UNM="$WORKDIR/unmatched" awk '
+        BEGIN { F_EV = ENVIRON["F_EV"]; F_VAN = ENVIRON["F_VAN"]; F_REL = ENVIRON["F_REL"]; F_UNM = ENVIRON["F_UNM"] }
         function cpl(a, b,   i, n) {
             n = (length(a) < length(b)) ? length(a) : length(b)
             for (i = 1; i <= n; i++) if (substr(a, i, 1) != substr(b, i, 1)) break
@@ -1253,16 +1273,20 @@ if [ -n "$PROVENANCE" ]; then
     mg_labels "$WORKDIR/prov.out" | LC_ALL=C sort -u > "$WORKDIR/prov.labels"
     n_cases=$(grep -c . "$WORKDIR/prov.labels")
     if [ "$n_cases" -eq 0 ]; then
-        printf 'mutation-gate.sh: REFUSED — the suite printed no `PASS: <label>` line, so it has no case this tool can name.\n' >&2
+        printf 'mutation-gate.sh: REFUSED — the suite printed no `PASS: <label>` (nor `ok: <label>`) line, so it has no case this tool can name.\n' >&2
         exit 3
     fi
     cur_suite_blob=$(mg_blob "$SUITE_ABS")
     n_guarded=0; n_stale=0; n_never=0
     while IFS= read -r label; do
         # The newest killing row for (suite, case). Tab-separated; `case` is
-        # column 10. Matched by EQUALITY on both keys, never by pattern.
-        row=$(awk -F'\t' -v s="$SUITE_REL" -v c="$label" \
-              '$0 !~ /^#/ && $2 == "killed-by-assertion" && $3 == s && $10 == c { r = $0 } END { if (r != "") print r }' "$PROVENANCE")
+        # column 10. Matched by EQUALITY on both keys, never by pattern, and
+        # passed through ENVIRON, never `awk -v`: `-v` processes escape
+        # sequences, so a label holding a backslash (`$'\''`) never equalled
+        # its own row and read NEVER-KILLED (#1873). The `""` forces a STRING
+        # comparison, so two numeric-looking labels cannot compare as numbers.
+        row=$(MG_PROV_S="$SUITE_REL" MG_PROV_C="$label" awk -F'\t' \
+              '$0 !~ /^#/ && $2 == "killed-by-assertion" && $3 == (ENVIRON["MG_PROV_S"] "") && $10 == (ENVIRON["MG_PROV_C"] "") { r = $0 } END { if (r != "") print r }' "$PROVENANCE")
         if [ -z "$row" ]; then
             printf 'NEVER-KILLED   %s\n' "$label"; n_never=$((n_never+1)); continue
         fi
@@ -1438,9 +1462,11 @@ if [ -n "$SUBJECT_ABS" ]; then
         # check below is `-s`. A builtin, so it costs no fork in a hot subject.
         wline=$(printf 'echo x >> %q' "$WORKDIR/witness")
         if [ "$(head -c 2 "$T0/$SUBJ_REL")" = '#!' ]; then
-            awk -v w="$wline" 'NR==1{print; print w; next} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
+            # ENVIRON, not `awk -v`: `%q` escapes a special character in the
+            # path with a backslash, and `-v` would strip it (#1873).
+            MG_WLINE="$wline" awk 'NR==1{print; print ENVIRON["MG_WLINE"]; next} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
         else
-            awk -v w="$wline" 'NR==1{print w} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
+            MG_WLINE="$wline" awk 'NR==1{print ENVIRON["MG_WLINE"]} {print}' "$T0/$SUBJ_REL" > "$WORKDIR/subj.inst"
         fi
         if [ "$(( $(wc -l < "$T0/$SUBJ_REL") + 1 ))" -ne "$(wc -l < "$WORKDIR/subj.inst")" ]; then
             printf 'mutation-gate.sh: REFUSED — planting the load witness did not add exactly one line.\n' >&2; exit 3
@@ -1771,7 +1797,7 @@ fi
 # first match, so no `| head -1` (that would be an early-exit reader whose
 # pipeline status nothing consumes — a construct this repo lints for).
 witness=""
-named=$(grep -m1 -h -E '^[[:space:]]*FAIL: ' "$WORKDIR/mutant.out" "$WORKDIR/mutant.err" 2>/dev/null)
+named=$(grep -m1 -h -E "$MG_FAIL_ERE" "$WORKDIR/mutant.out" "$WORKDIR/mutant.err" 2>/dev/null)
 # Discard the count guard when it wears the canonical spelling. This is a
 # predicate keyed on a STRING, so it is INCOMPLETE by construction: a suite is
 # free to spell its count guard as an ordinary `assert_eq "assertion TOTAL
@@ -1783,7 +1809,7 @@ if grep -qiE 'ASSERTION COUNT MISMATCH|assertion (count|total)' <<<"$named"; the
     named=""
 fi
 if [ -n "$named" ]; then
-    witness="a named assertion changed verdict: ${named#*FAIL: }"
+    witness="a named assertion changed verdict: $(sed -E -n "$MG_FAIL_SED" <<<"$named")"
 elif [ "$base_assert" != '?' ] && [ "$mut_assert" != '?' ] && [ "$base_assert" != "$mut_assert" ]; then
     witness="COUNT GUARD ONLY — the declared total moved ($base_assert -> $mut_assert), and no"
     witness="$witness

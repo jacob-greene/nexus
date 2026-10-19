@@ -653,8 +653,13 @@ _c=$(_na_ctx)
 [[ "$_c" == "longjob NOT ARMED"*"ng longjob add slurm:<id>"*"ARMED"* ]] && ok "#1727 …and the hook prints a PostToolUse additionalContext: longjob NOT ARMED + the arming command" || bad "#1727 no NOT ARMED notice: '$H_OUT'"
 
 ledger "sid-$SID" "$(date +%s)" 0
-_h1727 'J=$(sbatch --parsable j.sh); echo $J' '123457'
-[[ ! -e "$W1727/auto-slurm-123457.json" && "$(_na_ctx)" == *"inside \$(…)"* ]] && ok "#1727 a bare number inside a \$(…) submission is not trusted even when it looks real — NOT ARMED names why (declared cost)" || bad "#1727 subst distrust: $(ls "$W1727" 2>&1) out=$H_OUT"
+_h1727 'J=$(sbatch --parsable j.sh); grep -c x f; echo $J' $'3\n123457'
+[[ ! -e "$W1727/auto-slurm-123457.json" && "$(_na_ctx)" == *"inside \$(…)"* ]] && ok "#1727 a bare number inside a \$(…) submission is not trusted when another command could have printed it — NOT ARMED names why (declared cost)" || bad "#1727 subst distrust: $(ls "$W1727" 2>&1) out=$H_OUT"
+# …but echoed as the call's last and only printing command, the variable's
+# value IS sbatch's id, and it is armed (your-org/nexus-code#1859 a).
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'J=$(sbatch --parsable j.sh); echo $J' '123458'
+[[ -f "$W1727/auto-slurm-123458.json" && -z "$H_OUT" ]] && ok "#1859 \`J=\$(sbatch --parsable j.sh); echo \$J\` → auto-slurm-123458 armed, no notice" || bad "#1859 echoed substitution not armed: $(ls "$W1727" 2>&1) out=$H_OUT"
 
 ledger "sid-$SID" "$(date +%s)" 0
 _h1727 'sbatch --parsable j.sh' '0'
@@ -681,12 +686,21 @@ _h1727 'sbatch j.sh' 'Submitted batch job 123459'
 # shape: a NON-substituted `sbatch --parsable` beside `grep -c` lines whose bare
 # `1`s were read as the job id (slurm:1).
 ledger "sid-$SID" "$(date +%s)" 0
+# #1832 reads sbatch's first line only when a literal `echo <word>` vouches for
+# the slot after it (ncbundle27-sk F1); a grep -c cannot, so this is dev's case.
 _h1727 'sbatch --parsable j.sh; grep -c a f; grep -c b f' $'123470\n1\n1'
 [[ ! -e "$W1727/auto-slurm-1.json" && ! -e "$W1727/auto-slurm-123470.json" ]] && ok "#1727 core: sbatch --parsable beside two grep -c lines arms NOTHING (no slurm:1)" || bad "#1727 core: armed from a count: $(ls "$W1727" 2>&1)"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'grep -c a f; sbatch --parsable j.sh; grep -c b f' $'1\n123474\n1'
+[[ ! -e "$W1727/auto-slurm-1.json" && ! -e "$W1727/auto-slurm-123474.json" ]] && ok "#1727 core: a grep -c BEFORE sbatch --parsable arms NOTHING (no slurm:1)" || bad "#1727 core: armed from a count: $(ls "$W1727" 2>&1)"
 [[ "$(_na_ctx)" == *"other commands beside sbatch --parsable"* ]] && ok "#1727 core: …and NOT ARMED names why (other commands may have printed the number)" || bad "#1727 core: notice: '$H_OUT'"
 ledger "sid-$SID" "$(date +%s)" 0
 _h1727 'sbatch --parsable j.sh; grep -c x f' '1'
 [[ ! -e "$W1727/auto-slurm-1.json" ]] && ok "#1727 core: a FAILED sbatch beside one grep -c (stdout just '1') arms nothing" || bad "#1727 core: slurm:1 armed from a lone count"
+ledger "sid-$SID" "$(date +%s)" 0
+# The same failure with its diagnostic merged into stdout (this harness).
+_h1727 'sbatch --parsable j.sh; grep -c x f' $'sbatch: error: Batch job submission failed: Invalid account\n1'
+[[ ! -e "$W1727/auto-slurm-1.json" ]] && ok "#1727 core: a FAILED sbatch beside one grep -c (sbatch: error + '1') arms nothing" || bad "#1727 core: slurm:1 armed from a lone count"
 ledger "sid-$SID" "$(date +%s)" 0
 _h1727 'cd /x && sbatch --parsable j.sh | tee sub.log' '123471'
 [[ -f "$W1727/auto-slurm-123471.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: cd && sbatch --parsable | tee still arms its id silently" || bad "#1727 core control tee: $(ls "$W1727" 2>&1) out=$H_OUT"

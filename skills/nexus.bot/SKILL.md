@@ -301,6 +301,19 @@ Override the default destination with `--repo-path foo/bar.png` for
 fine control. The push always lands under `assets/`; the loader
 prepends if you omit it.
 
+**A claude.ai Artifact is never the GitHub copy** (<your-org>/nexus-code#1856).
+The operator reading a thread on GitHub cannot open `claude.ai/artifact/…` or
+`claude.ai/code/artifact/…` links, so a deliverable posted only as an Artifact
+link is missing for its reader, and nothing errors. Anything meant for a GitHub
+reader goes up with `ng upload` and the asset link goes in the body. md, SVG
+and PNG render on github.com; raw HTML does NOT, so ship an `.md` (or images)
+beside any HTML. An Artifact link may sit beside the asset as an optional
+extra. `ng reply`/`comment`/`issue create`/`issue comment`/`pr create`/`pr
+edit`/`comment-edit`/`wrap-up` and the `gh` shim print a WARNING (stderr only,
+never a refusal) for a body carrying an Artifact link and no `…/assets/…`
+link; `monitor/artifact-link-check.sh <file>` runs the same check before you
+post (rc 3 = flagged). A body arriving on stdin to raw `gh` is not inspected.
+
 What **not** to use: `raw.githubusercontent.com/...` (wrong-domain
 cookies on private repos), `data:` URIs in `<img>` (sanitiser strips
 them), signed Contents-API `?token=` URLs (5-min TTL), release

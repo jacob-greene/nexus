@@ -2061,20 +2061,28 @@ _supervisor_arm_emit_section() {
 # A comment asserting a proxy for the property it names, in the file the
 # next three issues will edit. Found by the #687 skeptic (F4).
 #
-# Path precedence: MACHINE_INPUT_TSV global (set by main.sh) →
-# ACTION_LOG-sibling fallback → STATE_DIR-sibling fallback (matching
-# _idle_probe.sh's `_machine_input_path`). Silent no-op when none is
-# available (standalone harnesses that don't care). Never flips the
-# caller's exit code — a failed stamp must not abort a recovery paste.
+# Path precedence: an explicit MACHINE_INPUT_TSV override → the ledger
+# resolver (monitor/_ledger_path.sh, your-org/nexus-code#1724) for the
+# ACTION_LOG's dir → for STATE_DIR (matching _idle_probe.sh's
+# `_machine_input_path`). Resolved PER CALL: main.sh no longer pins
+# MACHINE_INPUT_TSV at startup, because a path fixed when the watcher started
+# would keep stamping the tree after `ng degraded enter` relocated the ledger
+# the guard reads. Silent no-op when none is available (standalone harnesses
+# that don't care), or when the relocation pointer is unusable. Never flips
+# the caller's exit code — a failed stamp must not abort a recovery paste.
 _machine_input_stamp() {
     local window="$1" src="${2:-machine}"
     [[ -n "$window" ]] || return 0
     local path="${MACHINE_INPUT_TSV:-}"
-    if [[ -z "$path" && -n "${ACTION_LOG:-}" ]]; then
-        path="$(dirname "$ACTION_LOG")/machine-input.tsv"
-    fi
-    if [[ -z "$path" && -n "${STATE_DIR:-}" ]]; then
-        path="${STATE_DIR}/machine-input.tsv"
+    if [[ -z "$path" ]] && { [[ -n "${ACTION_LOG:-}" ]] || [[ -n "${STATE_DIR:-}" ]]; }; then
+        local sd="${STATE_DIR:-}"
+        [[ -n "${ACTION_LOG:-}" ]] && sd=$(dirname "$ACTION_LOG")
+        if declare -F nexus_ledger_path >/dev/null 2>&1 \
+           || source "${BASH_SOURCE[0]%/*}/../_ledger_path.sh" 2>/dev/null; then
+            path=$(nexus_ledger_path "$sd" 2>/dev/null) || return 0
+        else
+            path="$sd/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+        fi
     fi
     [[ -n "$path" ]] || return 0
     mkdir -p "$(dirname "$path")" 2>/dev/null || return 0

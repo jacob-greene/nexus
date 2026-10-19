@@ -375,7 +375,7 @@ _probe_ratelimit_reset() {
     fi
     local resp_headers
     resp_headers=$(curl -sS -m 15 -D - -o /dev/null \
-        -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+        -H @<(printf 'x-api-key: %s\n' "$ANTHROPIC_API_KEY") \
         -H "anthropic-version: 2023-06-01" \
         -H "content-type: application/json" \
         --data "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\".\"}],\"max_tokens\":1}" \

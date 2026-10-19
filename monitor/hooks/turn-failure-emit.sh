@@ -31,6 +31,7 @@
 #      "recovery": <paste|respawn|operator>,
 #      "last_msg": <first 200 chars of last_assistant_message>,
 #      "session_id": <claude session id>,
+#      "prompt_id": <the failed turn's prompt id, or "">,
 #      "window": <tmux window name>,
 #      "hook_event_name": "StopFailure"}
 #
@@ -104,6 +105,11 @@ fi
 error_token=$(jq -r '.error // empty' <<<"$payload" 2>/dev/null) || error_token=""
 last_msg=$(jq -r '.last_assistant_message // empty' <<<"$payload" 2>/dev/null) || last_msg=""
 session_id=$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null) || session_id=""
+# The id of the prompt whose turn failed (your-org/nexus-code#1845): the
+# API-unreachable hold records it with the crashed window, so a resume can be
+# matched to the exact turn it replaces. Present on real payloads since at
+# least 2.1.29x; absent → empty, and nothing keys on it.
+prompt_id=$(jq -r '.prompt_id // empty' <<<"$payload" 2>/dev/null) || prompt_id=""
 
 # Classify. rate_limit → category=rate_limit, recovery=none: that's
 # over-limit-emit.sh's territory, so we write NOTHING and exit (no
@@ -130,6 +136,7 @@ if jq -nc \
     --arg     recovery    "$recovery" \
     --arg     last_msg    "$last_msg_trunc" \
     --arg     session_id  "$session_id" \
+    --arg     prompt_id   "$prompt_id" \
     --arg     window      "$window" \
     '{
         ts:              $ts,
@@ -138,6 +145,7 @@ if jq -nc \
         recovery:        $recovery,
         last_msg:        $last_msg,
         session_id:      $session_id,
+        prompt_id:       $prompt_id,
         window:          $window,
         hook_event_name: "StopFailure"
      }' > "$tmp" 2>/dev/null; then

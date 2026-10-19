@@ -46,12 +46,21 @@
 #      the considered list is printed in full, because "0 selected" and "the
 #      index did not run" are indistinguishable to anyone reading a summary,
 #      and that conflation is this repo's dominant defect class.
-#   4  --run: every selected guard that ran came back green, but at least one
-#      of those greens is UNVERIFIED — the guard's population does not contain
-#      an UNTRACKED file in your diff, so its pass is a claim about a tree that
-#      does not contain that file (your-org/nexus-code#1054). Distinct from 0
-#      precisely so a caller cannot read it as a clearance. `git add` the named
-#      files and re-run to convert it into a real verdict.
+#   4  --run: no selected guard FAILED, but at least one of them did not
+#      VERIFY anything, so the run is not a clearance. Two causes, each NAMED
+#      in the output with its own remedy:
+#        UNVERIFIED — the guard passed, but its population does not contain an
+#          UNTRACKED file in your diff, so its pass is a claim about a tree that
+#          does not contain that file (your-org/nexus-code#1054). `git add` the
+#          named files and re-run to convert it into a real verdict.
+#        SKIP — the guard exited 77 (the automake convention: it DECLINED TO
+#          RUN, e.g. an integration suite without RUN_INTEGRATION=1) and so
+#          asserted nothing (your-org/nexus-code#1860). Only 77; any other
+#          non-zero is still FAIL. Supply what it needs, or run it where it is
+#          supplied.
+#      Distinct from 0 precisely so a caller cannot read it as a clearance.
+#      PRECEDENCE: 5 outranks 1, 1 outranks 4, 4 outranks 0 — a SKIP never
+#      softens a FAIL, and a FAIL never hides that the sweep was truncated.
 #   5  --run: the --timeout deadline expired with selected guards left WITHOUT A
 #      VERDICT — never started, or started and cut off mid-run. They are named.
 #      A guard that did not finish is not a guard that passed, and
@@ -697,7 +706,9 @@ if (( do_run )); then
     _n_sel=${#sel_names[@]}
     _reached=0
     _passed=0
+    _skipped=0
     _failed=0
+    skipped=()
     unreached=()
     # THE DEADLINE (your-org/nexus-code#965). `--run` had no bound at all, so a
     # slow corpus under CPU contention simply outlived whatever was invoking it
@@ -785,6 +796,23 @@ if (( do_run )); then
             _reached=$(( _reached - 1 ))
             continue
         fi
+        # A GUARD THAT DECLINED TO RUN DID NOT FAIL — AND DID NOT PASS
+        # (your-org/nexus-code#1860). Exit 77 is the automake SKIP convention
+        # run-tests.sh already tallies as SKIP. Read as non-zero it was FAIL, so
+        # the two codex integration suites (77 without RUN_INTEGRATION) made a
+        # clean run read `66 of 68 passed` at PR #1857. Read as zero it would be
+        # the opposite lie: a green from a guard that asserted nothing. So it
+        # is its own verdict, its own count, and exit 4 (see the header).
+        # ONLY 77: widening this to "any code we think means skip" would turn a
+        # guard's real red into a non-red.
+        if (( _grc == 77 )); then
+            printf '    SKIP %s\n' "$s"
+            printf '        it exited 77: it DECLINED TO RUN and asserted nothing. Not a\n'
+            printf '        failure and not a pass — supply what it needs and re-run it.\n'
+            skipped+=("$s")
+            _skipped=$(( _skipped + 1 ))
+            continue
+        fi
         if (( _grc == 0 )); then
             # #1054: a PASS from a guard whose population omits an untracked
             # changed file is NOT a pass — it is a green about a tree that does
@@ -823,8 +851,9 @@ if (( do_run )); then
     # the second is the first. Printed on EVERY --run, green or red, because a
     # completion claim that only appears sometimes is not one a reader can rely
     # on the absence of.
-    printf '\n=== --run: reached %d of %d selected guard(s) — %d passed, %d failed ===\n' \
-        "$_reached" "$_n_sel" "$_passed" "$_failed"
+    # passed + skipped + failed = reached, and reached + NO VERDICT = selected.
+    printf '\n=== --run: reached %d of %d selected guard(s) — %d passed, %d skipped, %d failed ===\n' \
+        "$_reached" "$_n_sel" "$_passed" "$_skipped" "$_failed"
     if (( ${#unreached[@]} > 0 )); then
         printf '::error::--run TIMED OUT after %ss — %d selected guard(s) RETURNED NO VERDICT.\n' \
             "$run_timeout" "${#unreached[@]}"
@@ -838,14 +867,22 @@ if (( do_run )); then
         printf '    named guards directly.\n'
         exit 5
     fi
-    if (( rc == 0 )) && (( unverified )); then
+    if (( rc == 0 )) && (( unverified || _skipped )); then
         printf '\n=== NOT A CLEARANCE (exit 4) ===\n'
-        printf 'Every selected guard came back green, but at least one green is\n'
-        printf 'UNVERIFIED: the guard cannot see an untracked file in your diff, so it\n'
-        printf 'answered about a tree that does not contain it. Measured on this very\n'
-        printf 'tool (your-org/nexus-code#1054): the same planted reader scored\n'
-        printf '21 passed / 0 failed untracked and 20 passed / 1 failed once `git add`ed.\n'
-        printf '`git add` the files named above and re-run.\n'
+        printf 'No selected guard failed, but not every one of them verified anything.\n'
+        if (( unverified )); then
+            printf 'UNVERIFIED: at least one green comes from a guard that cannot see an\n'
+            printf 'untracked file in your diff, so it answered about a tree that does not\n'
+            printf 'contain it. Measured on this very tool (your-org/nexus-code#1054): the\n'
+            printf 'same planted reader scored 21 passed / 0 failed untracked and 20 passed /\n'
+            printf '1 failed once `git add`ed. `git add` the files named above and re-run.\n'
+        fi
+        if (( _skipped )); then
+            printf 'SKIP: %d guard(s) exited 77 and asserted nothing (your-org/nexus-code#1860):\n' \
+                "$_skipped"
+            printf '%s\n' "${skipped[@]}" | sed 's/^/    SKIPPED: /'
+            printf 'Their silence is not a pass. Run them where their precondition holds.\n'
+        fi
         exit 4
     fi
     exit "$rc"

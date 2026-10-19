@@ -154,7 +154,7 @@
 # heartbeat's `external_waits` array. Caller renders it verbatim in
 # the operator-facing `--- idle workers ---` block so the contract
 # violation surfaces with the offending job id (e.g.
-# `orphan_kinds=slurm:52527284_4,ci:your-org/runs/26304173692`).
+# `orphan_kinds=slurm:12345678_4,ci:your-org/runs/26304173692`).
 # Capped at 80 chars; longer lists are truncated with `…`.
 #
 # `content_hash` is appended whenever the pane was actually captured
@@ -694,7 +694,8 @@ _strip_ansi() {
     # emit OSC 8 hyperlinks — `ESC ] 8 ; ; <url> ESC \ <anchor> ESC ] 8 ; ;
     # ESC \` — e.g. a clickable PR badge. A CSI-only strip leaves those raw
     # bytes inline, immediately adjacent to the footer tokens
-    # _footer_handle_counts anchors on (` · N shell[s] · `, ` · N monitor ·`).
+    # _footer_handle_counts anchors on (` · N shell[s] · `, ` · N monitor ·`,
+    # or the same count ending a footer row, #1866).
     # The URL payload can itself carry digits and separators, so surviving
     # OSC bytes can both HIDE a real handle count (by breaking the ` · `
     # boundary the regex needs) and FAKE one (by contributing digits).
@@ -3251,14 +3252,50 @@ _pane_background_shells() {
     # The 4th field (#590) attributes every node inside a background-shell
     # subtree back to the ROOT that owns it, so a protocol command found on a
     # DESCENDANT (not just in the root shell's own argv) classifies that root.
-    local queue="${pane_pid}:0:0:0" depth
+    #
+    # HOST HELPERS ARE NOT TASK SHELLS (your-org/nexus-code#1851). The 5th
+    # field is where a node sits relative to claude's DIRECT children:
+    #   0  anything else
+    #   c  a direct child of claude
+    #   m  below a NON-shell direct child of claude that stays in CLAUDE'S OWN
+    #      SESSION — an MCP server (`npm exec <pkg>` → `sh -c <bin>` → node)
+    # A shell at `m` is that server's own helper. It used to count as a
+    # background-shell ROOT, static and at 0 CPU for the server's whole life,
+    # so the full-state emit flagged `space-plan` WEDGED? on every snapshot for
+    # 30 h (measured 2026-10-16: `bg_cmd=sh:sh_-c_notion-mcp-server`, with the
+    # longjob dispatcher ALREADY excluded, `bg_longjob=1`). It is skipped
+    # WHOLE, like the dispatcher root: not counted, not a member, no cpu.
+    #
+    # WHY SESSION, NOT NAME. Claude Code launches every Bash tool shell and
+    # every Monitor/plugin-monitor shell DETACHED: each is its own session
+    # leader (measured: tool shells 5865 and 13319, the dispatcher wrapper
+    # 7165, each sid == pid). MCP servers are spawned in claude's session
+    # (npm 35047 and its `sh` 9217: sid 4328 == claude's). A config-name match
+    # cannot see this server at all: `pane-state.sh --mcp-shell-risk` answered
+    # `none` on that same pane, because the server is not in any file it reads.
+    #
+    # WHAT CAN NEVER BE SKIPPED, because the skip is a KILL-DIRECTION change (a
+    # skipped shell cannot hold `working-background`):
+    #   * a shell that is a DIRECT child of claude, whatever its session — a
+    #     tool shell, and a genuinely blocked one keeps its WEDGED? flag;
+    #   * a shell under a direct child that LEFT claude's session (a wrapper
+    #     that setsid'd) — that is a launched job, not a helper;
+    #   * anything at all when this walk has NOT seen claude detach a shell
+    #     (`detached_seen`): on a harness that ran tool shells in claude's
+    #     session, "same session" would no longer tell a helper from a task, so
+    #     the skip turns itself off and the old count stands. The dispatcher
+    #     root counts as evidence even though it is excluded, so every armed
+    #     nexus session carries the evidence.
+    local claude_sid="" detached_seen=0
+    local queue="${pane_pid}:0:0:0:0" depth
     for depth in 0 1 2 3 4 5 6 7 8 9; do
         [[ -n "$queue" ]] || break
-        local next="" entry pid below pinbg bgroot
+        local next="" entry pid below pinbg bgroot hf
         for entry in $queue; do
-            IFS=: read -r pid below pinbg bgroot <<<"$entry"
+            IFS=: read -r pid below pinbg bgroot hf <<<"$entry"
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             [[ "$bgroot" =~ ^[0-9]+$ ]] || bgroot=0
+            [[ "$hf" == c || "$hf" == m ]] || hf=0
             # Parse /proc/<pid>/stat: `pid (comm) state ppid ... utime stime`.
             # comm may contain spaces/parens — split on the LAST ') '.
             # Read via `read <` (NOT `$(< file)` — that command-substitution
@@ -3277,11 +3314,15 @@ _pane_background_shells() {
             local -a f=($after)
             # after[] is 0-indexed from `state`: utime=idx11, stime=idx12,
             # starttime (stat field 22) = idx19.
-            local utime="${f[11]:-}" stime="${f[12]:-}" starttime="${f[19]:-}"
+            local utime="${f[11]:-}" stime="${f[12]:-}" starttime="${f[19]:-}" nsid="${f[3]:-}"
+            # The dispatcher root is a SHELL by construction (`_pane_longjob_root`
+            # walks to one), so a detached one is evidence before it is skipped.
+            local _detached=0
+            [[ "$hf" == c && "$nsid" == "$pid" && -n "$claude_sid" && "$nsid" != "$claude_sid" ]] && _detached=1
             if [[ -n "$excl" && "$pid:${starttime:-?}" == "$excl" ]]; then
+                (( _detached )) && detached_seen=1
                 continue    # the dispatcher's root: neither it nor anything below it is visited
             fi
-            members="${members}${pid}:${starttime:-?} "
             local is_shell=0 is_claude=0 in_bg=0
             # Shared predicate — see _pane_comm_is_shell. Kept in one place so
             # the MCP-config probe cannot certify a `command` this walk would
@@ -3290,7 +3331,13 @@ _pane_background_shells() {
             case "$comm" in
                 claude|claude.exe|claude-code) is_claude=1 ;;
             esac
-            (( is_claude == 1 )) && claude_found=1
+            (( is_claude == 1 )) && { claude_found=1; claude_sid="$nsid"; }
+            (( _detached && is_shell )) && detached_seen=1   # claude DETACHES its shells here
+            # #1851: a host helper's shell is skipped WHOLE (header above).
+            if [[ "$hf" == m ]] && (( is_shell == 1 && pinbg == 0 && detached_seen == 1 )); then
+                continue
+            fi
+            members="${members}${pid}:${starttime:-?} "
             # A background-shell subtree ROOT: a shell directly under claude
             # whose parent was NOT already inside a bg-shell subtree (so a
             # nested subshell of the same job doesn't double-count).
@@ -3398,11 +3445,18 @@ _pane_background_shells() {
             # Descend. Children are "below claude" once this node is (or
             # is) claude; they inherit this node's bg-shell membership.
             local child_below=$(( below == 1 || is_claude == 1 ? 1 : 0 ))
+            local child_hf=0
+            if (( is_claude == 1 )); then
+                child_hf=c
+            elif [[ "$hf" == m ]] || { [[ "$hf" == c ]] && (( is_shell == 0 )) \
+                    && [[ -n "$claude_sid" && "$nsid" == "$claude_sid" ]]; }; then
+                child_hf=m
+            fi
             local kid kids
             kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')
             for kid in $kids; do
                 [[ "$kid" =~ ^[0-9]+$ ]] || continue
-                next+=" ${kid}:${child_below}:${in_bg}:${bgroot}"
+                next+=" ${kid}:${child_below}:${in_bg}:${bgroot}:${child_hf}"
             done
         done
         queue=$(printf '%s' "$next" | tr -s ' ')
@@ -3985,6 +4039,78 @@ _classify_from_heartbeat() {
 # forms (kept for back-compat + the #183 synthetic fixtures). The
 # middle-dot / comma boundaries anchor on the status-line separators,
 # which never appear around unrelated transcript prose.
+#
+# THE RIGHT-HAND BOUNDARY MAY BE THE END OF THE ROW (your-org/nexus-code#1866).
+# Up to 2.1.301 the `← for agents` hint always followed the tasks pill, so a
+# trailing ` · ` was always there. 2.1.302 hides that hint 10 s after a session
+# opens, and the footer then ENDS at the last count — `· 1 shell` /
+# `· 2 monitors` / `· 1 shell, 1 monitor` with nothing after them — whenever
+# no later item is drawn (a configured `statusLine`, or vim INSERT, both
+# suppress `↓ to manage`; production has both). Neither double-bounded regex
+# matches that row, so a pane parked on a `Monitor` read `idle`, which is on
+# the kill allowlist: the footer is a Monitor's ONLY channel (#1374).
+#
+# The fix is a SECOND pass, never a rewrite of the first. Pass 1 is the
+# double-bounded form above, unchanged and evaluated first, so every input it
+# matched before it still matches with the same count (the 2.1.301 layout is
+# byte-for-byte the old behaviour). Pass 2 runs only when pass 1 found nothing,
+# and accepts end-of-row as the right boundary — but ONLY on FOOTER ROWS: the
+# rows after the last input-box rule (`────────`), or the bottom row when the
+# capture has no rule. End-of-row is the boundary a transcript line has too
+# (`…, 2 monitors` closing a sentence), and a false monitor count is never
+# aged out, so the looser boundary is confined to where the status line lives.
+# The left boundary in pass 2 is `·` or `,` for both kinds, which also counts a
+# shell that follows another pill item (`· 1 subagent, 1 shell`).
+#
+# PASS 2's RIGHT BOUNDARY IS WIDER THAN END-OF-ROW (your-org/nexus-code#1870
+# item 1). Two more things can follow the count on a footer row, and neither is
+# a `·` or `,`:
+#   * `(` — a real v2.1.220 capture renders `· 1 shell, 1 monitor (shift+tab
+#     to cycle) · ← for agents` (fixtures/working-background-bare-chevron-657
+#     .ansi). Pass 1 took the shell there and missed the monitor, so the
+#     Monitor-only form `· 1 monitor (shift+tab to cycle)` read `0 0`: idle.
+#   * a COLUMN GAP of two or more spaces before more text — the footer's
+#     right-aligned area (`· 1 monitor      12% until auto-compact`). The gap
+#     is the boundary, not the text after it, so a single space (`· 1 shell
+#     command`) is still not a count. This layout is read from the renderer
+#     (`% until auto-compact` is drawn beside the footer), not from a capture.
+# Both are confined to footer rows, like end-of-row, for the same reason.
+#
+# A NARROW PANE DROPS THE PILL'S NOUN (your-org/nexus-code#1876). The renderer
+# fits the footer to one row by dropping whole words from the end, so at 45
+# columns the 2.1.302 row ends `bypass permissions on · 2` and at 35 `bypass
+# · 2` — a count with no `shell`/`monitor` after it (measured on the real
+# binary, fixtures/working-background-narrow{45,35}-realmodel-302.ansi). No
+# noun means no kind, and both passes above read `0 0`: idle, on the kill
+# allowlist. Pass 3 takes such a BARE count, at the END of a FOOTER row, as a
+# MONITOR count, because the monitor channel is the one that holds the pane
+# (a Monitor is never aged out) while a shell reading is overridden by the
+# process tree whenever that tree is reliable. The error it can make is a
+# truncated shell pill read as a monitor: the pane is kept, never killed.
+#
+# Below ~30 columns the pill is gone entirely and only the spinner row is
+# left, wrapped onto its own row as `  · 2 shells still running`
+# (fixtures/idle-narrow30-realmodel-302.ansi). That is NOT read as a shell
+# count: the same phrase is pinned as not-a-handle by
+# fixtures/idle-nopill-eol-derived-302.ansi. A Monitor there is still read,
+# through the `N monitors still running` arm above, and live shells are read
+# from the process tree (#455), which overrides the footer whenever it is
+# reliable; the residual is a narrow pane on the UNRELIABLE path.
+_FOOTER_RULE='────────'
+
+# The rows pass 2 may read: after the LAST rule row, or the last row if none.
+_footer_rows() {
+    local bottom="$1" row out="" seen_rule=0 last=""
+    while IFS= read -r row; do
+        if [[ "$row" == *"$_FOOTER_RULE"* ]]; then
+            seen_rule=1; out=""; continue
+        fi
+        last="$row"
+        (( seen_rule )) && out+="$row"$'\n'
+    done <<<"$bottom"
+    if (( seen_rule )); then printf '%s' "$out"; else printf '%s\n' "$last"; fi
+}
+
 _footer_handle_counts() {
     local plain="$1"
     local bottom mon=0 bg=0
@@ -4000,6 +4126,36 @@ _footer_handle_counts() {
         bg="${BASH_REMATCH[1]}"
     elif [[ "$bottom" =~ ·[[:space:]]+([0-9]+)[[:space:]]+background[[:space:]]+(bash|process|bashes|processes)[[:space:]]+· ]]; then
         bg="${BASH_REMATCH[1]}"
+    fi
+    # Pass 2 (#1866, #1870): end-of-row, `(` or a column gap as the right
+    # boundary, footer rows only. See above.
+    if (( mon == 0 || bg == 0 )); then
+        local row found_mon=0 found_bg=0
+        # The right boundary: `·`, `,` or end of row (#1866), then `(` and a
+        # column gap (#1870). One arm per line, so each can be removed alone;
+        # the `(` sits in its own variable so its arm's line holds no paren.
+        local lp='[(]'
+        local rhs='[[:space:]]*([·,]|$)'
+        rhs+="|[[:space:]]*${lp}"
+        rhs+='|[[:space:]][[:space:]]+'
+        rhs="(${rhs})"
+        local re_mon="[·,][[:space:]]+([0-9]+)[[:space:]]+monitor[s]?${rhs}"
+        local re_bg="[·,][[:space:]]+([0-9]+)[[:space:]]+shell[s]?${rhs}"
+        # Pass 3 (#1876): a bare count ending a footer row, noun truncated.
+        local re_bare='[·,][[:space:]]+([0-9]+)[[:space:]]*$'
+        local bare=0
+        while IFS= read -r row; do
+            if (( mon == 0 && found_mon == 0 )) && [[ "$row" =~ $re_mon ]]; then
+                mon="${BASH_REMATCH[1]}"; found_mon=1
+            fi
+            if (( bg == 0 && found_bg == 0 )) && [[ "$row" =~ $re_bg ]]; then
+                bg="${BASH_REMATCH[1]}"; found_bg=1
+            fi
+            if (( bare == 0 )) && [[ "$row" =~ $re_bare ]]; then
+                bare="${BASH_REMATCH[1]}"
+            fi
+        done < <(_footer_rows "$bottom")
+        (( mon == 0 && bare > 0 )) && mon="$bare"
     fi
     printf '%d %d' "$mon" "$bg"
 }

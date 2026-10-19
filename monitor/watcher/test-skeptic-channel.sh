@@ -1715,7 +1715,11 @@ assert_file "#984 …with a rationale record on disk" \
 # is the #813/#618/#802 polarity applied to an operator verb.
 BLIND="$WORK/blind-monitor"
 mkdir -p "$BLIND" "$WORK/blind-state/skeptic/pending"
-for _d in skeptic-channel.sh _bookkeeping.sh _channel_lib.sh _fm_lib.sh _window_key.sh _proc_argv.sh; do
+# obligations.sh + _obligations.sh are copied ON PURPOSE (your-org/nexus-code#1852
+# F2): since resolve fails CLOSED (rc 8) on an edge ledger that cannot answer, a
+# blind tree without them would stop there and never reach the DISPOSITION probe
+# this case is about. `ng` stays absent, so that probe still cannot run.
+for _d in skeptic-channel.sh _bookkeeping.sh _channel_lib.sh _fm_lib.sh _window_key.sh _proc_argv.sh obligations.sh _obligations.sh; do
     [[ -f "$_repo_root/monitor/$_d" ]] && cp "$_repo_root/monitor/$_d" "$BLIND/$_d"
 done
 chmod +x "$BLIND/skeptic-channel.sh"

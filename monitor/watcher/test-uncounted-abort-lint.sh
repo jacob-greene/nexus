@@ -533,10 +533,16 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # the clear EXITED and left it (a defect) vs had NOT EXITED by the ceiling (not
 # a verdict), each a counter bump. Measured on the bundle-1005a tree (got 73 / 55
 # before this re-pin). `neither` is still 0.
-assert_eq "manifest: 16 realmodel files are enumerated"  "$_nfiles"          "16"
-assert_eq "manifest: 73 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "73"
-assert_eq "manifest: 18 are disposed by \`exit\`, NOT by a counter" \
-    "$(echo "$_c" | cut -d' ' -f2)" "18"
+# 16 -> 17 files, 73 -> 75 announcements, 18 -> 20 by-exit, 55 by-count unchanged:
+# your-org/nexus-code#1866 adds test-realmodel-working-background.sh. Its two
+# announcements are preconditions disposed by `exit 1`: the production footer
+# parser could not be read out of pane-state.sh, and the worker window never
+# appeared. Found by `ng guards-for-diff --run` on bundle-1017b (got 17/75/20).
+# `neither` is still 0.
+assert_eq "manifest: 17 realmodel files are enumerated"  "$_nfiles"          "17"
+assert_eq "manifest: 75 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "75"
+assert_eq "manifest: 20 are disposed by \`exit\`, NOT by a counter" \
+    "$(echo "$_c" | cut -d' ' -f2)" "20"
 assert_eq "manifest: 55 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "55"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \

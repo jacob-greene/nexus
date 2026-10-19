@@ -188,6 +188,7 @@ _ps_fixtures_required=(
     auth-expired-terminal-quoted-above-realmodel-284 auth-expired-retrying-realmodel-284
     idle-auth-quoted-prose-realmodel-284 idle-auth-quoted-code-block-realmodel-284
     idle-auth-quoted-user-msg-realmodel-284 busy-auth-quoted-spinner-todo-synthetic
+    auth-expired-revoked-derived-302
 )
 for _f in "${_ps_fixtures_required[@]}"; do
     [[ -r "$FIX/$_f.ansi" ]] || env_fail "fixture missing or unreadable: $FIX/$_f.ansi"
@@ -270,6 +271,20 @@ assert_eq "A/auth-expired-retrying-realmodel-268 state (mid-retry IS a turn in f
     "$(state_of auth-expired-retrying-realmodel-268)" busy
 assert_eq "A/auth-expired-terminal-realmodel-268 state" \
     "$(state_of auth-expired-terminal-realmodel-268)" idle
+
+# THE REVOKED RENDER (2.1.287+, your-org/nexus-code#1844 item 3). A revoked
+# claude.ai login renders `OAuth token revoked · Please run /login` — the 2.1.302
+# binary builds it through the SAME `Os({error:"authentication_failed", …})`
+# call, from the same string table, as `Login expired · Please run /login`.
+# DERIVED, not observed: the 268 terminal capture with only its message text
+# replaced by that string (no real revoked login is drivable under the mock).
+# It carries no `Login expired` and no `token has expired`, so `Please run
+# /login` is the only disjunct that can fire: this pins that disjunct for the
+# revoked render. Not a fix — the detector already matched it.
+assert_eq "A/auth-expired-revoked-derived-302 auth (revoked login, #1844)" \
+    "$(auth_of auth-expired-revoked-derived-302)" expired
+assert_eq "A/auth-expired-revoked-derived-302 state" \
+    "$(state_of auth-expired-revoked-derived-302)" idle
 
 # NEGATIVE CONTROLS. Without these the detector could match everything and
 # every assertion above would still pass.
@@ -1341,8 +1356,9 @@ rm -f "$STATE_DIR/turn-failure/orchestrator.json"
 # invisible in a pass/fail tally — and three of this suite's parts are inside
 # loops or conditionals, which is exactly where a case goes missing.
 #
-# A  16  4 login-frame (2 fixtures x state/auth/overlay = 6) + 4 expired
-#        (2 x state/auth) + 4 negative-control auth + 2 overlay-unchanged
+# A  18  4 login-frame (2 fixtures x state/auth/overlay = 6) + 4 expired
+#        (2 x state/auth) + 2 revoked (state/auth, #1844) + 4 negative-control
+#        auth + 2 overlay-unchanged
 # B   2  reworded-login state + the auth-honesty report
 # C0  5  index keying x2, liveness keying, degraded-path key, degraded hold
 # C  10  engage/log/alert/once, quoted-frame, release/log, unreadable x2
@@ -1379,7 +1395,7 @@ rm -f "$STATE_DIR/turn-failure/orchestrator.json"
 # A2 20  #1659: 10 non-vacuity preconditions (3 fixtures x 3 strings + the
 #        spinner todo), 4 quoted fixtures carry no auth=, 2 quoted states,
 #        2 real-2.1.284 true positives x auth/state
-EXPECTED=184
+EXPECTED=186
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

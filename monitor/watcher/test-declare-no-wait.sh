@@ -43,7 +43,7 @@ run_wait()    { NEXUS_STATE_DIR="$STATE" NEXUS_WORKER_WINDOW=w1390 bash "$DECLAR
 plant_good() {
     rm -rf "$STATE"; mkdir -p "$STATE/heartbeat"
     jq -nc '{window:"w1390", last_activity:1,
-             external_waits:[{kind:"slurm",id:"2219913"},
+             external_waits:[{kind:"slurm",id:"1234567"},
                              {kind:"nohup",id:"syn-3b2c13e3930e"},
                              {kind:"asyncrun",id:"ar-cc40075aa77b"}],
              dismissed_waits:[]}' > "$HB"
@@ -61,7 +61,7 @@ plant_good
 run_no_wait nohup syn-3b2c13e3930e >/dev/null 2>&1; rc=$?
 assert_rc "well-formed heartbeat: dismiss is rc 0 (a real wait WAS lifted)" "$rc" "0"
 assert_eq "…exactly the named wait is gone, the other two remain" \
-    "$(waits)" '[{"kind":"slurm","id":"2219913"},{"kind":"asyncrun","id":"ar-cc40075aa77b"}]'
+    "$(waits)" '[{"kind":"slurm","id":"1234567"},{"kind":"asyncrun","id":"ar-cc40075aa77b"}]'
 
 # ---------------------------------------------------------------------------
 echo "=== a TRUNCATED heartbeat is REFUSED (rc 5), named, and left byte-identical ==="
@@ -117,8 +117,26 @@ assert_rc "declare-wait.sh over the same truncated heartbeat: rc 0 (fallback int
 assert_eq "…and the reseeded file now parses and holds the new wait" \
     "$(waits)" '[{"kind":"slurm","id":"777","desc":"control wait"}]'
 
+# ---------------------------------------------------------------------------
+echo "=== --outstanding lists what is OUTSTANDING, not what was dismissed (#1854 c) ==="
+plant_good
+run_no_wait nohup syn-3b2c13e3930e >/dev/null 2>&1   # one dismissed, two outstanding
+out=$(run_no_wait --outstanding 2>/dev/null); rc=$?
+assert_rc "--outstanding with two waits outstanding: rc 0" "$rc" "0"
+assert_contains "…names the slurm wait" "$out" "slurm 1234567"
+assert_contains "…names the asyncrun wait" "$out" "asyncrun ar-cc40075aa77b"
+assert_not_contains "…and NOT the dismissed one (that is what --list shows)" "$out" "syn-3b2c13e3930e"
+assert_contains "…with the command that dismisses each" "$out" "dismiss: monitor/ng declare-no-wait slurm 1234567"
+assert_contains "CONTROL: --list still shows the DISMISSAL" "$(run_no_wait --list 2>/dev/null)" "syn-3b2c13e3930e"
+run_no_wait slurm 1234567 >/dev/null 2>&1; run_no_wait asyncrun ar-cc40075aa77b >/dev/null 2>&1
+out=$(run_no_wait --outstanding 2>&1 >/dev/null); rc=$?
+assert_rc "--outstanding with none left: rc 3, a measured empty" "$rc" "3"
+plant_truncated
+run_no_wait --outstanding >/dev/null 2>&1; rc=$?
+assert_rc "--outstanding over a truncated heartbeat: rc 5, never a confident 'none'" "$rc" "5"
+
 # ---- assertion-count guard ------------------------------------------------
-EXPECTED_ASSERTIONS=19
+EXPECTED_ASSERTIONS=27   # +8: #1854 c --outstanding
 _ran=$(( ${PASS:-0} + ${FAIL:-0} ))
 if (( _ran == EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$EXPECTED_ASSERTIONS"; _th_pass

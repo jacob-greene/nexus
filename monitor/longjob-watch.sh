@@ -190,6 +190,13 @@
 #                        hook already declared the wait; skip the sync probe)
 #                        [--for-lead NAME]   (an in-process SUB-AGENT's add: the
 #                        wake goes to the LEAD, never to you — see below)
+#                        [--payload-rc FILE]   (slurm: an ABSOLUTE path the job
+#                        script writes its real step's rc to; once it holds
+#                        0..255 that rc decides, even while Slurm says RUNNING
+#                        — see longjob-probes.d/slurm.sh, #1841. When a live
+#                        watch on the same job already exists — the launch
+#                        hook's auto-slurm-<id> — the rc file is ATTACHED to
+#                        it and no second watch is created, #1846 N4)
 #   longjob-watch.sh run [--desc TEXT] [--id ID] [--notify …] [--for-lead NAME] -- <cmd…>
 #                        launch a LOCAL command via async-run.sh (rc retained)
 #                        AND watch its token — the one-liner for a long local job
@@ -716,6 +723,40 @@ _file_fail_arm() {
     printf '%s' "$v"
 }
 
+# _slurm_live_watch <jobid> → the id of a live (un-retired) slurm watch on that
+# job in this session's spool, empty when none. Agent-made watches are
+# preferred over the hook's `auto-*` ones when both exist, in name order, so
+# the answer is deterministic (#1846 N4).
+_slurm_live_watch() {
+    local f ids
+    [[ -d "$SPOOL/watches" ]] || return 0
+    local -a specs=()
+    for f in "$SPOOL"/watches/*.json; do [[ -f "$f" ]] && specs+=("$f"); done
+    (( ${#specs[@]} )) || return 0
+    ids=$(jq -r --arg t "$1" 'select(.kind == "slurm" and .target == $t and (.retired != true)) | .id' "${specs[@]}" 2>/dev/null) || ids=""
+    # One awk over a herestring, reading ALL input: no early-exit reader, so no
+    # EPIPE for `pipefail` to turn into a status (the early-exit-reader manifest).
+    awk 'NF { if ($0 ~ /^auto-/) { if (a == "") a = $0 } else if (m == "") m = $0 }
+         END { if (m != "") print m; else if (a != "") print a }' <<<"$ids"
+}
+# _attach_payload_rc <id> <rc-file> <handoff> — set .payload_rc (and .handoff
+# when the watch has none) on a live watch, then READ IT BACK. There is no
+# flock (the spool is on NFS; see the #1623 restore in _poll_once), so a
+# dispatcher pass that read the spec just before this write can rename its own
+# copy over ours a few ms later; the read-back catches that and the write is
+# retried. rc 1 when it did not stick — the caller refuses rather than claim it.
+_attach_payload_rc() {
+    local f j k
+    f=$(_spec_path "$1")
+    for k in 1 2 3 4 5; do
+        j=$(jq --arg p "$2" --arg h "$3" '.payload_rc = $p | (if ((.handoff // "") == "") and $h != "" then .handoff = $h else . end)' "$f" 2>/dev/null) || return 1
+        _spec_write "$f" "$j" 2>/dev/null || return 1
+        sleep 0.2
+        [[ "$(_spec_get "$f" .payload_rc)" == "$2" ]] && return 0
+    done
+    return 1
+}
+
 # ---- verbs --------------------------------------------------------------------
 cmd_add() {
     # The key is checked now; the spool is CREATED just before the write, so a
@@ -723,7 +764,7 @@ cmd_add() {
     [[ -n "$SPOOL" ]] || _require_spool
     local subject="" desc="" id="" interval="$DEFAULT_INTERVAL" ttl="$TTL_SECONDS" notify=terminal persistent=0
     local max_events="$WATCH_MAX_EVENTS" unknown_max="$UNKNOWN_MAX" when="" pattern="" no_declare=0 no_first_probe=0
-    local fail_pattern="" fail_set=0 handoff=""
+    local fail_pattern="" fail_set=0 handoff="" payload_rc=""
     _argloop_prev_1=-1; while (( $# )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --desc) desc="${2:-}"; shift 2 ;;
@@ -740,6 +781,7 @@ cmd_add() {
             --pattern) pattern="${2:-}"; shift 2 ;;
             --fail-pattern) fail_pattern="${2:-}"; fail_set=1; shift 2 ;;
             --for-lead) handoff="${2:-}"; [[ -n "$handoff" ]] || die "add: --for-lead needs the sub-agent's SendMessage name"; shift 2 ;;
+            --payload-rc) payload_rc="${2:-}"; [[ -n "$payload_rc" ]] || die "add: --payload-rc needs a file path"; shift 2 ;;
             -h|--help) _usage; exit 0 ;;
             --*) die "add: unknown option $1" ;;
             *) [[ -z "$subject" ]] || die "add: one subject only (got '$subject' and '$1')"; subject="$1"; shift ;;
@@ -763,6 +805,14 @@ cmd_add() {
     # Kind-specific normalisation at ADD time, where the information exists.
     local size0=0 lines0=0
     (( fail_set )) && [[ "$kind" != file ]] && die "add: --fail-pattern applies only to file: --when match"
+    if [[ -n "$payload_rc" ]]; then
+        [[ "$kind" == slurm ]] || die "add: --payload-rc applies only to slurm: subjects"
+        # The dispatcher runs elsewhere, so a relative path names nothing; and
+        # a file already there is a previous run's rc, which would end this
+        # watch on its first probe (#1841).
+        [[ "$payload_rc" == /* ]] || die "add: --payload-rc must be an absolute path, got '$payload_rc'"
+        [[ -e "$payload_rc" ]] && die "add: --payload-rc file $payload_rc already exists — a stale rc would end this watch at once. If THIS job wrote it, it is done: read it. Otherwise remove it and add again"
+    fi
     case "$kind" in
         pid)
             if [[ "$target" != *:* ]]; then
@@ -804,14 +854,53 @@ cmd_add() {
                 *) die "add: slurm target must be a positive Slurm job id (e.g. 123456, 123456_3), got '$target' — job id 0 does not exist, and 'sacct -j 0' answers about OTHER jobs; read the real id from sbatch's output" ;;
             esac ;;
     esac
+    # ONE WATCH PER SLURM JOB WHEN A PAYLOAD RC IS INVOLVED (your-org/nexus-code
+    # #1846 skeptic N4). The launch hook auto-watches a parsed `sbatch` as
+    # `auto-slurm-<id>` BEFORE the agent's `add slurm:<id> --payload-rc F` can
+    # run, so that add used to create a SECOND watch on the same job: two wakes,
+    # and only one of them read the payload rc — the other still reported
+    # Slurm's COMPLETED over a failed payload, the #1841 defect. So the add
+    # MERGES: the rc file is attached to the live watch already there, which
+    # keeps its id, its declared wait (the hook declared it; the dispatcher
+    # removes it when THAT watch retires) and the hook's retry contract
+    # (`watch auto-slurm-<id> already exists`), none of which a retire-and-
+    # replace would keep without re-deriving them here. The reverse order — a
+    # payload watch exists, then a payload-LESS add (the hook) — adds nothing.
+    # A payload-less add over a payload-less watch is unchanged (not this fix).
+    if [[ "$kind" == slurm ]]; then
+        local _dup="" _dup_prc="" _dup_ho=""
+        _dup=$(_slurm_live_watch "$target")
+        if [[ -n "$_dup" ]]; then
+            _dup_prc=$(_spec_get "$(_spec_path "$_dup")" .payload_rc)
+            _dup_ho=$(_spec_get "$(_spec_path "$_dup")" .handoff)
+        fi
+        if [[ -n "$_dup" && -n "$payload_rc" ]]; then
+            [[ -z "$_dup_prc" || "$_dup_prc" == "$payload_rc" ]] \
+                || die "add: slurm:$target is already watched by $_dup carrying a DIFFERENT --payload-rc ($_dup_prc); one job has one payload rc. Remove that watch first if $payload_rc is the right file: monitor/ng longjob rm $_dup"
+            if [[ -z "$_dup_prc" ]]; then
+                _attach_payload_rc "$_dup" "$payload_rc" "$handoff" \
+                    || die "add: could not attach --payload-rc to $_dup (spec unwritable or rewritten under us) — NOTHING changed; retry the add"
+            fi
+            [[ -z "$_dup_ho" && -n "$handoff" ]] && _dup_ho="$handoff"
+            printf 'merged: slurm:%s was already watched by %s — that watch now carries --payload-rc %s (no second watch created; its other settings are kept)\n' "$target" "$_dup" "$payload_rc"
+            _add_dispatcher_verdict "$_dup" "$_dup_ho"
+            return $?
+        fi
+        if [[ -n "$_dup" && -z "$payload_rc" && -n "$_dup_prc" ]]; then
+            printf 'merged: slurm:%s is already watched by %s, which carries --payload-rc %s (no second watch created)\n' "$target" "$_dup" "$_dup_prc"
+            _add_dispatcher_verdict "$_dup" "${_dup_ho:-$handoff}"
+            return $?
+        fi
+    fi
     local now; now=$(_now)
     local spec
     spec=$(jq -n --arg id "$id" --arg kind "$kind" --arg target "$target" --arg desc "$desc" \
                  --arg now "$now" --arg interval "$interval" --arg ttl "$ttl" --arg notify "$notify" \
                  --arg persistent "$persistent" --arg max "$max_events" --arg umax "$unknown_max" \
                  --arg when "$when" --arg pattern "$pattern" --arg size0 "$size0" --arg key "$SESSION_KEY" \
-                 --arg fail "$fail_pattern" --arg lines0 "$lines0" --arg handoff "$handoff" \
+                 --arg fail "$fail_pattern" --arg lines0 "$lines0" --arg handoff "$handoff" --arg prc "$payload_rc" \
            '{id:$id, kind:$kind, target:$target, desc:$desc, session_key:$key, handoff:$handoff,
+             payload_rc:$prc,
              added_at:($now|tonumber), interval:($interval|tonumber), ttl:($ttl|tonumber),
              notify:$notify, persistent:($persistent=="1"), max_events:($max|tonumber),
              unknown_max:($umax|tonumber), when:$when, pattern:$pattern, size0:($size0|tonumber),
@@ -867,6 +956,14 @@ cmd_add() {
             "$pattern" "$target" "$_pl" "$id"
     fi
     [[ "$kind" == pid ]] && printf 'note: a pid: subject cannot report an EXIT STATUS (the parent reaps it); for a status, launch via monitor/async-run.sh and watch asyncrun:<token>\n'
+    _add_dispatcher_verdict "$id" "$handoff"
+}
+
+# _add_dispatcher_verdict <id> <handoff> — add's LAST lines and its rc: whether
+# anything in this session will deliver <id>'s wake (0 armed, 3 not). Shared by
+# a fresh add and a merge (#1846 N4), so a merged add keeps the same contract.
+_add_dispatcher_verdict() {
+    local id="$1" handoff="$2"
     local v; v=$(_ledger_verdict)
     case "${v%%|*}" in
         armed)
@@ -1341,6 +1438,17 @@ _poll_once() {
                         # on #1635: latched → UP was silent).
                         if [[ "$new_state" != "$prev" ]] && { [[ "$notify" == transitions ]] || { [[ "$persistent" == "true" && ( "$prev" == failed || "$prev" == done ) ]]; }; }; then
                             line=$(_compose_line "${new_state^^}" "$id" "$kind:$target" "transition $prev → $new_state" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
+                        fi
+                        # PAST ITS --time (#1841): Slurm's OverTimeLimit lets a
+                        # job run on past its limit, so say so ONCE per watch,
+                        # whatever --notify is. The flag is a COLUMN written
+                        # after `pre` is read, so a failed write restores it
+                        # unset and a later pass warns again. The literal is
+                        # LJ_SLURM_OVERTIME_MARK in longjob-probes.d/slurm.sh.
+                        if [[ "$kind" == slurm && "$new_state" == running && "$detail" == *'PAST ITS --time'* \
+                              && "$(printf '%s' "$spec" | jq -r '.overtime_warned // false')" != true ]]; then
+                            local _oj; _oj=$(jq '.overtime_warned=true' "$f" 2>/dev/null) && _spec_write "$f" "$_oj"
+                            line=$(_compose_line RUNNING "$id" "$kind:$target" "${line:+transition $prev → $new_state; }OVERTIME (warned once): past its --time and still running; not terminal, still watched" "$detail" "$(printf '%s' "$spec" | jq -r '.desc // empty')" "$handoff")
                         fi ;;
                 esac
             fi

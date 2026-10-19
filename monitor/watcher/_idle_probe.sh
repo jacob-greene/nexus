@@ -1342,10 +1342,28 @@ _openg_input_slack_seconds() {
 
 # Ledger of watcher-side machine inputs into worker panes (unstick
 # Enter-nudges and the like): append-only rows `<window>\t<epoch>\t<src>`,
-# written by _unstick.sh via the MACHINE_INPUT_TSV global and by
-# monitor/paste-followup.sh. Compacted by the per-cycle pruner.
+# written by _unstick.sh via _lib.sh's _machine_input_stamp, by
+# monitor/paste-followup.sh and by monitor/send.sh. Compacted by the
+# per-cycle pruner.
+#
+# THE PATH comes from the ledger's ONE resolver, monitor/_ledger_path.sh
+# (your-org/nexus-code#1724): `<state>/machine-input.tsv`, or the relocated
+# ledger while `ng degraded enter` is in force. Resolved PER CALL, so the
+# running watcher follows enter/exit on its next cycle. An UNUSABLE pointer
+# falls back to the tree's path here (warned on stderr, which is the watcher
+# log): the writers refuse in that state, so no new row lands anywhere and the
+# tree copy is the freshest record there is.
 _machine_input_path() {
-    printf '%s/machine-input.tsv' "${STATE_DIR:-$(_ip_nostate_dir)}"
+    local sd="${STATE_DIR:-$(_ip_nostate_dir)}" p
+    if ! declare -F nexus_ledger_path >/dev/null 2>&1 \
+       && ! source "${BASH_SOURCE[0]%/*}/../_ledger_path.sh" 2>/dev/null; then
+        printf '%s/machine-input.tsv' "$sd"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+        return 0
+    fi
+    if p=$(nexus_ledger_path "$sd"); then
+        printf '%s' "$p"; return 0
+    fi
+    nexus_ledger_tree_path "$sd"
 }
 
 # Per-window "last user-prompt submitted" stamp, written by
@@ -1425,7 +1443,7 @@ _openg_window_own_session() {
 # operator. The operator drives a DIFFERENT Claude Code session and
 # never types into a spawned worker's pane, so a submit carrying the
 # worker's own session-id is autosuggest / post-wrap typing / the
-# worker's own tool loop (the coembed-283-followup false positive,
+# worker's own tool loop (the proj-x-followup false positive,
 # 2026-07-17). Requires BOTH ids present AND equal — any doubt (a
 # missing stamp session-id, an unknown own session-id) returns FALSE,
 # so the pre-existing attribution stays in force and a genuine operator
@@ -2633,7 +2651,7 @@ _openg_observe() {
             since=0; last=0; reminded=0; src="machine"
             prompt_seen="$prompt_epoch"; changed=1
         elif _openg_prompt_is_self "$window"; then
-            # SELF-attributed (your-org/your-nexus, coembed-283-followup
+            # SELF-attributed (your-org/your-nexus, proj-x-followup
             # 2026-07-17). No covering machine-input stamp, yet the submit
             # carries the window's OWN spawn session-id — so it is the
             # worker's own pane self-activity (autosuggest, post-wrap
@@ -3157,7 +3175,7 @@ _idle_skeptic_join_detail() {
     printf '; skeptic=%s idle %ds' "$sw" "$age"
     local thr; thr=$(_idle_skeptic_deadlock_seconds)
     if (( age > thr )) && ! _idle_window_retained_within_ttl "$sw" "$now"; then
-        printf ' — DEADLOCK SHAPE (#845): the target is parked on this skeptic and the skeptic has been idle longer than %ds; neither side can release the other. Push the delta to the skeptic (skeptic-channel.sh notify-delta / nudge) or resolve the requirement (ng skeptic resolve); if the hold is deliberate, declare it (ng log-action monitor --event window-retain --extra window=%s --extra reason=…) and this flag goes silent' "$thr" "$sw"
+        printf ' — DEADLOCK SHAPE (#845): the target is parked on this skeptic and the skeptic has been idle longer than %ds; neither side can release the other. Push the delta to the skeptic (skeptic-channel.sh notify-delta / nudge) or resolve the requirement (ng skeptic resolve <this target> --reviewer %s; --reviewer is required while that edge is live, your-org/nexus-code#1848); if the hold is deliberate, declare it (ng log-action monitor --event window-retain --extra window=%s --extra reason=…) and this flag goes silent' "$thr" "$sw" "$sw"
     fi
     return 0
 }
@@ -4889,7 +4907,14 @@ list_really_idle_workers() {
             tf_recovery=$(_idle_turn_failure_field "$name" recovery)
             cls=interrupted
             detail="${tf_category:-unknown}:${tf_recovery:-paste}"
-            if (( age >= close_threshold )); then
+            # NOT a close candidate while the API-unreachable hold owes it a
+            # resume (your-org/nexus-code#1845): a 5 h outage ages every crashed
+            # worker past close_threshold, and closing one loses the very work
+            # the hold is keeping. Degrades to the old promotion when
+            # `_api_hold.sh` is not loaded.
+            if (( age >= close_threshold )) \
+                && ! { declare -F _api_hold_window_awaiting_nudge >/dev/null 2>&1 \
+                       && _api_hold_window_awaiting_nudge "$name"; }; then
                 cls=idle-too-long
             fi
             printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
@@ -5579,8 +5604,10 @@ render_full_state_snapshot() {
             # a real compute job. pane-state now measures it (`bg_wedged=1`,
             # with the CPU share in basis points); this renderer NAMES it so
             # the operator sees a stall instead of healthy-with-a-job.
-            local snap_bg_wedged snap_bg_cpu_bp snap_wedge_note="" snap_bg_members snap_turnover
+            local snap_bg_wedged snap_bg_cpu_bp snap_wedge_note="" snap_bg_members snap_turnover snap_lj_kept
             snap_bg_wedged=$(_idle_pane_line_field "$pane_line" bg_wedged)
+            snap_lj_kept=$(_idle_pane_line_field "$pane_line" bg_longjob_kept)
+            [[ "$snap_lj_kept" =~ ^[0-9]+$ ]] || snap_lj_kept=0
             snap_bg_cpu_bp=$(_idle_pane_line_field "$pane_line" bg_cpu_bp)
             snap_bg_members=$(_idle_pane_line_field "$pane_line" bg_members)
             # your-org/nexus-code#1460: lifetime CPU cannot tell a wedge from a
@@ -5604,6 +5631,16 @@ render_full_state_snapshot() {
                         snap_wedge_note=" — WEDGED? child at ${snap_bg_cpu_bp:-?} bp CPU (0.01%=1) over its whole episode (membership not measured): read its wchan, fd/0 and cmdline in /proc; an existence query piped into head, or a wait on a token the producer never writes, looks exactly like this (your-org/nexus-code#1446, #1447)" ;;
                 esac
             fi
+            # your-org/nexus-code#1851: a counted root that holds the session's
+            # longjob DISPATCHER is one the identity exclusion did NOT remove —
+            # pane-state removes it only while `ledger-verdict` says `armed`. So
+            # this is a dispatcher that stopped polling, or died, or is not the
+            # ledger's: the session's >30-min wake is DOWN. Said as that, and
+            # not left to read as a wedged waiter someone should "stop" — the
+            # instruction the WEDGED? row invited on #1851.
+            if (( snap_lj_kept >= 1 )); then
+                snap_wedge_note+=" — ${snap_lj_kept} counted child(ren) hold the longjob DISPATCHER and its ledger is NOT armed (stale last_poll, dead, or not this session's): this session's >30-min wake is DOWN — check \`monitor/ng longjob status\` in that window and respawn the session rather than stopping the child (your-org/nexus-code#1851)"
+            fi
             if (( snap_bg_reliable == 1 )) && (( snap_bg_shells >= 1 )); then
                 if _bg_window_is_wrapped "$name"; then
                     if (( snap_bg_task <= 0 )) && (( snap_bg_infra >= 1 )); then
@@ -5619,8 +5656,12 @@ render_full_state_snapshot() {
                     printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up%s — inconsistency; clarify or close)%s\n' \
                         "$name" "$snap_bg_task" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}" "$snap_wedge_note"
                 else
-                    printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren) — long-timeout backoff)%s\n' \
-                        "$name" "$snap_bg_shells" "$snap_wedge_note"
+                    # The CHILD is named (your-org/nexus-code#1851): without it a
+                    # WEDGED? row cannot be checked, and #1851 was filed against
+                    # the wrong process — the dispatcher, when the counted child
+                    # was an MCP server's helper shell.
+                    printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren)%s — long-timeout backoff)%s\n' \
+                        "$name" "$snap_bg_shells" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}" "$snap_wedge_note"
                 fi
                 continue
             fi
@@ -5878,7 +5919,20 @@ render_idle_section() {
     transitions=$(list_idle_transitions)
     [[ -n "$transitions" ]] || return 0
     # Per-window rows (non-retained classes only).
-    printf '%s\n' "$transitions" | awk -F'\t' '
+    # The API-unreachable hold's per-window notes (your-org/nexus-code#1845):
+    # `<window>\t<note>` lines, appended to that window's `interrupted` row so
+    # the orchestrator does not paste a resume the watcher owns. Passed through
+    # the ENVIRONMENT, not `-v`, because `-v` interprets backslash escapes.
+    local _api_notes=""
+    declare -F _api_hold_render_notes >/dev/null 2>&1 && _api_notes=$(_api_hold_render_notes 2>/dev/null)
+    printf '%s\n' "$transitions" | _API_NOTES="$_api_notes" awk -F'\t' '
+        BEGIN {
+            nn = split(ENVIRON["_API_NOTES"], nl, "\n")
+            for (i = 1; i <= nn; i++) {
+                t = index(nl[i], "\t")
+                if (t > 1) apinote[substr(nl[i], 1, t - 1)] = substr(nl[i], t + 1)
+            }
+        }
         function fmt_age(s,    h, m) {
             if (s >= 3600) {
                 h = int(s / 3600); m = int((s % 3600) / 60)
@@ -6213,7 +6267,9 @@ render_idle_section() {
             # verbatim resend); operator needs a human (auth/model).
             split(($4 == "" ? "unknown:paste" : $4), tf, ":")
             cat = tf[1]; rec = tf[2]
-            if (rec == "respawn")
+            if ($1 in apinote)
+                printf "  - %s interrupted %s — turn crashed (%s); %s\n", $1, fmt_age($3), cat, apinote[$1]
+            else if (rec == "respawn")
                 printf "  - %s interrupted %s — turn crashed (%s); a resume would re-fail, RESPAWN via `claude --continue` or fresh spawn\n", $1, fmt_age($3), cat
             else if (rec == "operator")
                 printf "  - %s interrupted %s — turn crashed (%s); needs operator (credentials/model access), not a paste\n", $1, fmt_age($3), cat

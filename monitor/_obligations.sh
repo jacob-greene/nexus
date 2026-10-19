@@ -144,10 +144,14 @@ _OBL_KNOWN_KINDS=(skeptic-verdict)
 #                         from a previous round must not release a pairing
 #                         re-armed since.
 #   void-superseded       a LATER edge pins a DIFFERENT reviewer to the same
-#                         creditor. The pairing was handed over, so the
+#                         creditor AND it is a HANDOVER of the same review,
+#                         not a concurrent review of something else. The
 #                         earlier reviewer is free — without this, every
 #                         skeptic a target ever had accumulates as
 #                         un-retirable (`sk900` in the recorded timeline).
+#                         See `_obl_supersedes` for what counts as a
+#                         handover (your-org/nexus-code#1849): a later edge
+#                         alone is NOT one.
 #   void-creditor-absent  the creditor window is positively not in tmux. A
 #                         window that does not exist depends on nobody.
 #
@@ -272,6 +276,16 @@ obl_path() { printf '%s/obligations/%s.rec' "${1-}" "${2-}"; }
 # mid-sentence still reads as a complete one.
 _obl_flatten() { printf '%s' "${1-}" | tr '\n\t' '  '; }
 
+# _obl_now — the epoch this file stamps a VERDICT with. OBL_NOW_OVERRIDE is the
+# REPLAY seam, the same role `obl_open`'s <at-epoch> plays for an open: since
+# your-org/nexus-code#1849 supersession compares a verdict's time with two
+# opens, so a replay that stamped verdicts with the replay's own clock would
+# place every recorded verdict AFTER every recorded open and answer a
+# different question. Anything not epoch-shaped is ignored.
+_obl_now() {
+    if [[ "${OBL_NOW_OVERRIDE:-}" =~ ^[0-9]{9,11}$ ]]; then printf '%s' "$OBL_NOW_OVERRIDE"; else date +%s; fi
+}
+
 # obl_get <state-dir> <id> <key>
 # Print the LAST value for <key>, or nothing. rc 1 if the record is missing
 # or unreadable — distinct from "present with an empty value".
@@ -326,7 +340,14 @@ _obl_done_identity() {
 
 _obl_open_err() { OBL_ERR="${1-}"; printf 'obligations: %s\n' "${1-}" >&2; }
 
-# obl_open <state-dir> <debtor> <creditor> <kind> <round> <opened-by> <detail> [<at-epoch>]
+# obl_open <state-dir> <debtor> <creditor> <kind> <round> <opened-by> <detail> [<at-epoch>] [<subject>]
+#
+# <subject> is WHAT this reviewer is pinned to — a PR, a report, a round —
+# free text, compared literally (your-org/nexus-code#1849). It is written on
+# EVERY open, empty when not given, so a reopen without one CLEARS a previous
+# subject: a re-armed round re-tasks the reviewer, and the spawn-time stamp is
+# then stale (the #963 lesson). An empty subject means "not recorded", never
+# "the same as any other".
 #
 # Opens the edge, or REOPENS it for a new round. Reopening appends a fresh
 # `opened_at` and an EMPTY `settled_at`, which is what makes the last-wins
@@ -341,7 +362,7 @@ _obl_open_err() { OBL_ERR="${1-}"; printf 'obligations: %s\n' "${1-}" >&2; }
 # message. $OBL_ERR is still set, for a same-process caller.
 obl_open() {
     local sd="${1-}" debtor="${2-}" creditor="${3-}" kind="${4-}"
-    local round="${5-}" by="${6-}" detail="${7-}" at="${8-}"
+    local round="${5-}" by="${6-}" detail="${7-}" at="${8-}" subject="${9-}"
     if [[ -z "$sd" || -z "$debtor" || -z "$creditor" || -z "$kind" ]]; then
         _obl_open_err "obl_open requires <state-dir> <debtor> <creditor> <kind>"
         return 1
@@ -382,6 +403,7 @@ obl_open() {
         printf 'opened_by\t%s\n'  "$(_obl_flatten "$by")"
         printf 'detail\t%s\n'     "$(_obl_flatten "$detail")"
         printf 'done_baseline\t%s\n' "$(_obl_done_identity "$sd" "$creditor")"
+        printf 'subject\t%s\n'    "$(_obl_flatten "$subject")"
         printf 'settled_at\t\n'
         printf 'settled_by\t\n'
         printf 'settled_reason\t\n'
@@ -477,7 +499,11 @@ obl_preserve_pairing_closures() {
 #
 # Every scalar of a record in ONE awk pass, ONE VALUE PER LINE, fixed order:
 #   debtor creditor kind round opened_at settled_at settled_by settled_reason
-#   detail done_baseline
+#   detail done_baseline subject verdict_at
+#
+# APPEND new fields at the END: callers read a PREFIX of these lines, so a
+# field inserted mid-list would shift every later read (#1849 added the last
+# two).
 #
 # LINES, not a TSV row, and that is not a style choice. `IFS=$'\t' read -r a b
 # c …` COLLAPSES runs of tabs, because TAB is IFS *whitespace* — so a record
@@ -521,10 +547,13 @@ _obl_scalars() {
         $1 == "settled_reason" { settled_reason = $2 }
         $1 == "detail"         { detail = $2 }
         $1 == "done_baseline"  { done_baseline = $2 }
+        $1 == "subject"        { subject = $2 }
+        $1 == "verdict_at"     { verdict_at = $2 }
         END {
-            printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
+            printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
                 debtor, creditor, kind, round, opened_at,
-                settled_at, settled_by, settled_reason, detail, done_baseline
+                settled_at, settled_by, settled_reason, detail, done_baseline,
+                subject, verdict_at
         }' "$f" 2>/dev/null
 }
 
@@ -551,20 +580,119 @@ _obl_ids_matching() {
     done < <(find "$dir" -maxdepth 1 -type f -name "$glob" 2>/dev/null | sort)
 }
 
-# obl_note <state-dir> <id> <text>
+# _obl_first_opened <state-dir> <id>
+#
+# The EARLIEST `opened_at` in the record: when this debtor first took this
+# review on. The record is append-only and a re-armed round appends a new block,
+# so last-wins `opened_at` is the CURRENT round's start, not this. Prints
+# nothing when the record has no numeric `opened_at`.
+_obl_first_opened() {
+    local f; f=$(obl_path "${1-}" "${2-}")
+    [[ -r "$f" ]] || return 0
+    awk -F'\t' '$1 == "opened_at" && $2 ~ /^[0-9]+$/ { if (m == "" || $2 + 0 < m + 0) m = $2 }
+                 END { if (m != "") print m }' "$f" 2>/dev/null
+}
+
+# obl_reviews <state-dir> <from> <to> <kind> [since]
+#
+# rc 0 → <from> REVIEWS <to>, directly or through a chain: a path of one or
+# more <kind> edges from -> x -> … -> to exists in the ledger, in ANY state
+# (a settled link is still a link). rc 1 → no such path within the bound.
+# Used to tell a CHAIN LINK from a REPLACEMENT (ncbundle32-sk R1): sk3, spawned
+# on sk2 with chain root w, reviews sk2 and, through sk2->sk1, sk1 as well, so
+# its chain-root edge on w must not supersede sk1's or sk2's.
+#
+# [since] — an epoch (your-org/nexus-code#1865). With it, a hop counts only if
+# its edge's CURRENT `opened_at` (last wins) is at or after <since>. obl_state
+# passes the FIRST `opened_at` of the edge it is judging (`_obl_first_opened`),
+# so a chain link must have been opened after that reviewer first took the
+# review on. Window names are reused: the real ledger holds `cifixsk->cifix`
+# from one task and `cifixsk->cifix2` from a later one, and without the bound an
+# edge left by the earlier task read as a chain link and kept a reviewer live
+# through a genuine handover. WHY THE LOWER BOUND AND NOT AN UPPER ONE ("opened
+# at or before the later root edge"): a re-armed round APPENDS a fresh
+# `opened_at`, so a genuine link re-opened after its chain-root edge would fail
+# an upper bound and the reviewer would be voided, the dangerous direction. The
+# lower bound uses the judged edge's FIRST open for the same reason: a re-armed
+# root keeps the links it already had. A hop with no numeric `opened_at` counts.
+# RESIDUAL, live direction: a stale edge whose CURRENT open is later than the
+# judged edge's first open (the name was reused AFTER the review began) still
+# counts, and keeps the reviewer live. And when the SAME (debtor, creditor) pair
+# is reused, the judged record's first `opened_at` is the EARLIER task's, which
+# loosens the bound back toward the old any-time reading (also live). KEPT on
+# purpose (#1868 item 3): bounding by the first open since the last settlement
+# would close it, but for a pair settled and RE-ARMED inside one review that
+# bound drops a genuine link and voids a reviewer still owed. The two shapes
+# are NOT recorded identically (#1870 item 2): every open block carries its own
+# `round`, `subject` and `detail`. But `round` is no discriminator in
+# production. Measured on the live ledger (447 records, 2026-10-17): 21 of 22
+# re-opens after a settlement carry a round no higher than the open before
+# them, including a genuine in-review re-arm (`ng wrap-up (require re-arm)`
+# re-opens at round 1). A "round did not increase => reused" test would void
+# that reviewer. Pinned both ways, with the settlement tightening built as
+# mutant M7, in test-skeptic-second-reviewer.sh D10/D11.
+#
+# ERROR DIRECTION, stated. Bounded at 8 hops (recursion is capped well below
+# that), so a longer chain reads "not a reviewer" and its root edge falls back
+# to rule 2, i.e. today's behaviour. Each hop confirms debtor AND creditor from
+# the RECORD, never from the filename, because obl_safe is lossy (`a.b` and
+# `a_b` share a filename) and a `__` inside a window name would let a prefix
+# glob match a different window. A loop in the ledger terminates on the
+# visited set.
+obl_reviews() {
+    local sd="${1-}" from="${2-}" to="${3-}" kind="${4-}" since="${5-}"
+    [[ -n "$from" && -n "$to" && -n "$kind" ]] || return 1
+    [[ "$since" =~ ^[0-9]+$ ]] || since=""
+    local frontier="$from" next hop=0 x id d c o visited=$'\n'"$from"$'\n'
+    while [[ -n "$frontier" ]] && (( hop < 8 )); do
+        hop=$(( hop + 1 )); next=""
+        while IFS= read -r x; do
+            [[ -n "$x" ]] || continue
+            while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                d=$(obl_get "$sd" "$id" debtor); [[ "$d" == "$x" ]] || continue
+                [[ "$(obl_get "$sd" "$id" kind)" == "$kind" ]] || continue
+                c=$(obl_get "$sd" "$id" creditor); [[ -n "$c" ]] || continue
+                if [[ -n "$since" ]]; then
+                    o=$(obl_get "$sd" "$id" opened_at)
+                    [[ "$o" =~ ^[0-9]+$ ]] && (( o < since )) && continue
+                fi
+                [[ "$c" == "$to" ]] && return 0
+                [[ "$visited" == *$'\n'"$c"$'\n'* ]] && continue
+                visited+="$c"$'\n'; next+="$c"$'\n'
+            done < <(_obl_ids_matching "$sd" "$(obl_safe "$x")__*__$(obl_safe "$kind").rec")
+        done <<< "$frontier"
+        frontier="$next"
+    done
+    return 1
+}
+
+# obl_note <state-dir> <id> <text> [verdict]
+#
+# With a 4th argument `verdict`, also appends `verdict_at<TAB><epoch>`: a
+# scalar, last wins, read by `_obl_supersedes` as "this reviewer delivered a
+# round at <epoch>". A SEPARATE KEY rather than a pattern over the `event`
+# text, because a field that SELECTS is not a label (#1050): prose in `event`
+# can be reworded by anyone, and a supersession rule matching it would change
+# behaviour on a wording edit.
 #
 # Append a ROUND EVENT to the edge's audit trail. Deliberately writes a
 # non-scalar key (`event`), so it accumulates and can never be mistaken for
 # a settlement by the last-wins scalar read — the whole point being that a
 # delivered round is recorded WITHOUT releasing the pairing.
 obl_note() {
-    local sd="${1-}" id="${2-}" text="${3-}" f now
+    local sd="${1-}" id="${2-}" text="${3-}" mark="${4-}" f now
     [[ -n "$sd" && -n "$id" ]] || { OBL_ERR="obl_note requires <state-dir> <id>"; return 1; }
     f=$(obl_path "$sd" "$id")
     [[ -f "$f" ]] || { OBL_ERR="no such obligation: $id"; return 1; }
-    now=$(date +%s)
-    printf 'event\t%s %s\n' "$now" "$(_obl_flatten "$text")" >> "$f" 2>/dev/null \
-        || { OBL_ERR="cannot append to $f"; return 1; }
+    now=$(_obl_now)
+    if [[ "$mark" == verdict ]]; then
+        printf 'event\t%s %s\nverdict_at\t%s\n' "$now" "$(_obl_flatten "$text")" "$now" >> "$f" 2>/dev/null \
+            || { OBL_ERR="cannot append to $f"; return 1; }
+    else
+        printf 'event\t%s %s\n' "$now" "$(_obl_flatten "$text")" >> "$f" 2>/dev/null \
+            || { OBL_ERR="cannot append to $f"; return 1; }
+    fi
     return 0
 }
 
@@ -617,6 +745,83 @@ _obl_verdict() {
     printf '%s\t%s' "${1-}" "$(printf '%s' "${2-}" | tr '\n\t' '  ')"
 }
 
+# _obl_supersedes <opened_at> <subject> <verdict_at> <later-opened_at> <later-subject>
+#
+# rc 0 → the LATER edge is a HANDOVER of this one's review, so this one is
+# void-superseded; rc 1 → it is a CONCURRENT review and frees nothing. Sets
+# $_OBL_SUPERSEDE_WHY either way (a global: called in-process, never in `$( )`).
+# The caller has already established: same creditor, different debtor, and the
+# later edge STRICTLY later.
+#
+# THE DEFECT (your-org/nexus-code#1849). This used to be "strictly later ⇒
+# superseded", keyed on the creditor and the second, with nothing about WHAT
+# was under review. Measured 2026-10-16: `gate-sk` was reviewing proj-x #275 when
+# `alerts-sk` was pinned to the same target for #276. gate-sk's edge read
+# `void-superseded` mid-review, so it was retirable, the live set was
+# {alerts-sk}, and a resolve written for gate-sk's verdict settled alerts-sk's
+# edge (#1848). A worker with N concurrent reviews had N−1 voided.
+#
+# THE RULE — what separates the two shapes, and only what is on the record:
+#
+#   1. BOTH edges carry a subject (`--skeptic-subject` at spawn): the SAME
+#      subject is a handover, a DIFFERENT one is concurrent. Literal compare.
+#   2. Otherwise the subject cannot be compared, so the rule asks the one fact
+#      that tells a handover from a concurrent review without it: had THIS
+#      reviewer DELIVERED a verdict since its edge was last opened, BEFORE the
+#      later reviewer was pinned? `sk900` filed at 07:16 and `sk911` was
+#      spawned at 08:58 — a reviewer that delivered and was then REPLACED.
+#      `gate-sk` had delivered nothing when `alerts-sk` arrived — a reviewer
+#      still mid-review. Both inequalities are STRICT, so a same-second
+#      verdict counts for nothing: the doubtful arm keeps the edge LIVE.
+#
+# WHY NOT THE ARM LEDGER'S SUBJECT. The obvious default — stamp each edge with
+# the target's latest armed sha at spawn — was measured against the incident's
+# own ledger and does not separate it: `proj-y-pipe` armed twice, both
+# times for one report path, and every one of its reviewers from accshard-sk
+# to bound-sk2 was spawned against the SAME last arm. Every edge would carry
+# one subject and every later one would supersede, exactly as before.
+#
+# ERROR DIRECTION, stated — rule 2 errs BOTH ways (ncbundle31-sk F2).
+#   LIVE: a reviewer abandoned mid-review and replaced, with no subjects
+#   recorded, stays a debtor until `ng skeptic close`, a resolve naming it, or
+#   `ng obligation settle`. A refused retirement, recoverable by an audited verb.
+#   VOID: a RETAINED reviewer that delivered round N (say REVISE) and is waiting
+#   for the delta is, by `ng`'s own account, the designated reviewer for round
+#   N+1. If a DIFFERENT review of the same target is then pinned with no
+#   subjects, this edge reads `void-superseded` and the retained reviewer is
+#   retirable while it is still owed. Nothing on a subject-less record
+#   separates that from the sk900 -> sk911 handover, so the rule cannot; the
+#   remedy is a subject on both edges (`spawn-worker.sh --skeptic-subject`),
+#   under which rule 1 decides and this case stays LIVE. Since
+#   your-org/nexus-code#1858 `spawn-worker.sh --skeptic-role` REFUSES (exit 29)
+#   to open a second live edge on a target without that flag. That narrows the
+#   shape to: an edge opened outside the launcher; a subject on the NEW edge
+#   only (allowed with a warning: that is the handover case); and, before
+#   ncbundle32-sk R1, the launcher's OWN depth-2 chain-root edge (sk2->w,
+#   which never carries a subject). The chain-root case is now closed twice:
+#   obl_state skips a later edge whose debtor holds a review edge on this
+#   debtor (a chain link, not a replacement), and spawn-worker.sh refuses a
+#   depth-2 spawn while ANOTHER reviewer (not the chain's own target) holds a
+#   live edge on the root, where no subject can help. The VOID error is
+#   strictly narrower than the pre-#1849 rule, which voided it AND every
+#   concurrent review with no verdict at all.
+_OBL_SUPERSEDE_WHY=""
+_obl_supersedes() {
+    local at="${1-}" sub="${2-}" vat="${3-}" lat="${4-}" lsub="${5-}"
+    if [[ -n "$sub" && -n "$lsub" ]]; then
+        if [[ "$sub" == "$lsub" ]]; then
+            _OBL_SUPERSEDE_WHY="both edges name the same subject '$sub'"; return 0
+        fi
+        _OBL_SUPERSEDE_WHY="subject '$lsub' is not this edge's '$sub'"; return 1
+    fi
+    if [[ "$vat" =~ ^[0-9]+$ && "$at" =~ ^[0-9]+$ && "$lat" =~ ^[0-9]+$ ]] \
+        && (( vat > at && vat < lat )); then
+        _OBL_SUPERSEDE_WHY="this reviewer filed a verdict at $vat, after its edge opened at $at and before the later one at $lat"; return 0
+    fi
+    _OBL_SUPERSEDE_WHY="no subject on both edges, and no verdict from this reviewer between its open ($at) and the later pin ($lat): still mid-review"
+    return 1
+}
+
 # obl_state <state-dir> <id>
 #
 # Print ONE line: `<state><TAB><detail>`, where <state> is exactly one of
@@ -641,11 +846,11 @@ obl_state() {
 
     # ONE read for the whole record (your-org/nexus-code#926 D1).
     local debtor creditor kind round settled_at settled_by settled_reason
-    local detail_txt opened_at baseline
+    local detail_txt opened_at baseline subject verdict_at
     {   read -r debtor;     read -r creditor;       read -r kind
         read -r round;      read -r opened_at;      read -r settled_at
         read -r settled_by; read -r settled_reason;  read -r detail_txt
-        read -r baseline
+        read -r baseline;   read -r subject;        read -r verdict_at
     } < <(_obl_scalars "$sd" "$id")
 
     if [[ -n "$settled_at" ]]; then
@@ -659,18 +864,23 @@ obl_state() {
 
     # --- release 1: the pairing was HANDED OVER to a later reviewer -------
     # `sk900` held `papercuts` before `sk911` did. Once a later edge pins a
-    # DIFFERENT reviewer to the same creditor, the earlier reviewer has
-    # stopped being the one that target depends on, and holding it open
-    # would accumulate every skeptic a target ever had as un-retirable.
+    # DIFFERENT reviewer to the same creditor FOR THE SAME REVIEW, the earlier
+    # reviewer has stopped being the one that target depends on, and holding
+    # it open would accumulate every skeptic a target ever had as
+    # un-retirable. A later edge is NECESSARY and NOT SUFFICIENT
+    # (your-org/nexus-code#1849): `_obl_supersedes` decides.
     #
     # Scoped by FILENAME to the edges that name this creditor, not by a scan
     # of the whole ledger (#926 D1): the supersession loop used to be the
     # dominant cost and it re-read every record three times.
-    local other od odebtor ocreditor _o1 _o2 _o3 _o4 _o5 _o6 _o7
+    local other od odebtor ocreditor osubject _o1 _o2 _o3 _o4 _o5 _o6 _o7 _o8 _o9 _concurrent=""
+    local _first_open
     while IFS= read -r other; do
         [[ -n "$other" && "$other" != "$id" ]] || continue
         {   read -r odebtor; read -r ocreditor; read -r _o1
-            read -r _o2;     read -r od
+            read -r _o2;     read -r od;        read -r _o3
+            read -r _o4;     read -r _o5;       read -r _o6
+            read -r _o7;     read -r osubject
         } < <(_obl_scalars "$sd" "$other")
         [[ "$ocreditor" == "$creditor" ]] || continue
         [[ -n "$odebtor" && "$odebtor" != "$debtor" ]] || continue
@@ -679,11 +889,30 @@ obl_state() {
         # supersede each other in either direction — the conservative arm,
         # since "which of these two is the current reviewer" is exactly what
         # a tie fails to answer, and the wrong answer retires a live one.
-        if (( od > opened_at )); then
-            _obl_verdict void-superseded "a later reviewer ('$odebtor') is pinned to '$creditor' (edge $other opened at $od, after this one at $opened_at) — the pairing was handed over"
+        (( od > opened_at )) || continue
+        # A CHAIN LINK IS NOT A HANDOVER (ncbundle32-sk R1). A depth-2 skeptic
+        # spawned with `--skeptic-target sk1 --skeptic-orig w` opens TWO edges:
+        # sk2->sk1 and a subject-less chain-root edge sk2->w. Without this arm
+        # rule 2 read the chain-root edge as sk1's replacement and voided
+        # sk1->w the moment sk1 had delivered — the F2 shape, made by the
+        # launcher itself. The test is STRUCTURAL: the later debtor reviews
+        # THIS debtor through a chain of review edges (obl_reviews: transitive,
+        # so depth 3's root edge spares sk1 as well as sk2; no label field).
+        # Any state counts: a settled sk2->sk1 is still a chain.
+        # Only links opened since this debtor first took the review on count
+        # (#1865): a reused window name leaves stale edges in the ledger.
+        [[ -n "${_first_open+x}" ]] || _first_open=$(_obl_first_opened "$sd" "$id")
+        if obl_reviews "$sd" "$odebtor" "$debtor" "$kind" "${_first_open:-$opened_at}"; then
+            _concurrent="${_concurrent:+$_concurrent, }$odebtor (a chain link: it reviews '$debtor' through '$kind' edges, so it does not replace it)"
+            continue
+        fi
+        if _obl_supersedes "$opened_at" "$subject" "$verdict_at" "$od" "$osubject"; then
+            _obl_verdict void-superseded "a later reviewer ('$odebtor') is pinned to '$creditor' (edge $other opened at $od, after this one at $opened_at) and it is a handover: $_OBL_SUPERSEDE_WHY"
             return 0
         fi
+        _concurrent="${_concurrent:+$_concurrent, }$odebtor ($_OBL_SUPERSEDE_WHY)"
     done < <(_obl_ids_matching "$sd" "*__$(obl_safe "$creditor")__*.rec")
+    [[ -n "$_concurrent" ]] && _prefix="later reviewer(s) of '$creditor' review CONCURRENTLY and do not free this one: $_concurrent; "
 
     # --- release 2: the reviewer CLOSED the pairing -----------------------
     # `skeptic-channel.sh close <target>` drops a DONE sentinel, and the

@@ -14,13 +14,18 @@
 #
 # PRECEDENCE
 #   1. NEXUS_REQUESTS_DIR (env) — explicit, always wins.
-#   2. config key `monitor.requests.dir` — honoured ONLY for the state dir the
+#   2. the degraded-mode relocation pointer (your-org/nexus-code#1724): while
+#      `ng degraded enter` has relocated the inbox for THIS state dir, the
+#      relocated dir under the degraded run dir. Read per call through the one
+#      pointer reader, monitor/_degraded-pointer.sh; an unusable pointer is
+#      REFUSED (rc 2), never silently replaced by the tree's inbox.
+#   3. config key `monitor.requests.dir` — honoured ONLY for the state dir the
 #      config describes (`<nexus.root>/monitor/.state`). A test fixture or a
 #      secondary clone that points NEXUS_STATE_DIR somewhere else therefore
 #      keeps its own `<state>/requests` and can never be redirected into the
 #      operator's LIVE inbox by their config (the your-org/nexus-code#833
 #      class: a fixture must never read or write live state).
-#   3. `<state_dir>/requests` — the default, unchanged.
+#   4. `<state_dir>/requests` — the default, unchanged.
 # A configured value must be absolute (`~/` is expanded); anything else is
 # REFUSED (rc 2, stderr), never silently replaced by the default.
 #
@@ -32,7 +37,7 @@
 #
 # Usage (sourced):
 #   nexus_requests_dir <state_dir>          -> prints the inbox path; rc 2 refused
-#   nexus_requests_dir_source <state_dir>   -> env | config | default
+#   nexus_requests_dir_source <state_dir>   -> env | degraded | config | default
 #   nexus_requests_dir_check <dir> <source> -> rc 3 + stderr when a READER would
 #       otherwise see a silent zero: a configured (env/config) dir that does not
 #       exist, or a symlink that does not resolve to a directory (the hand-made
@@ -42,6 +47,10 @@
 [[ -n "${_NEXUS_REQUESTS_DIR_LIB:-}" ]] && return 0
 _NEXUS_REQUESTS_DIR_LIB=1
 _nrd_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if ! declare -F nexus_degraded_relocated >/dev/null 2>&1; then
+    # shellcheck source=monitor/_degraded-pointer.sh
+    . "$_nrd_self_dir/_degraded-pointer.sh"
+fi
 
 _nrd_cfg() {   # <dotted.key> -> value or empty
     local load="${NEXUS_ROOT:+$NEXUS_ROOT/config/load.sh}"
@@ -61,6 +70,10 @@ _nrd_resolve() {
     local sd="${1:?state_dir required}" v root src
     if [[ -n "${NEXUS_REQUESTS_DIR:-}" ]]; then
         v="$NEXUS_REQUESTS_DIR"; src=env
+    elif v=$(nexus_degraded_relocated "$sd" requests); then
+        src=degraded
+    elif (( $? == 2 )); then
+        return 2
     else
         v=$(_nrd_cfg monitor.requests.dir)
         src=config
@@ -97,6 +110,10 @@ nexus_requests_dir_check() {
     local dir="${1:?dir required}" src="${2:-default}"
     if [[ -L "$dir" && ! -d "$dir" ]]; then
         printf 'request inbox: %s is a symlink that does not resolve to a directory — refusing to report an empty inbox (your-org/nexus-code#1723)\n' "$dir" >&2
+        return 3
+    fi
+    if [[ "$src" == degraded && ! -d "$dir" ]]; then
+        printf 'request inbox: the RELOCATED inbox %s (from the degraded-mode pointer, `ng degraded status`) does not exist — refusing to report an empty inbox (your-org/nexus-code#1724)\n' "$dir" >&2
         return 3
     fi
     if [[ "$src" != default && ! -d "$dir" ]]; then

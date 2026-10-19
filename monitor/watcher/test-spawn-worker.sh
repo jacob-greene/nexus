@@ -1402,15 +1402,15 @@ assert_contains  "#814 F2 …and names the WRITE side of the family too" \
 # A window named like a skeptic but spawned bare writes no linkage record, so
 # its target reads "NO live skeptic" and is walked toward retirement while the
 # review is in progress. Warning only, on stderr; the prompt is still composed.
-_o1153=$("$SCRIPT" -n dolimeth-sk -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+_o1153=$("$SCRIPT" -n projm-sk -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
 assert_contains "#1153 a '-sk' window without --skeptic-role gets a WARNING naming the flag" \
                 "$_o1153" "WITHOUT --skeptic-role"
-_o1153=$("$SCRIPT" -n dolimethsk2 -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+_o1153=$("$SCRIPT" -n projmsk2 -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
 assert_contains "#1153 …and so does the hyphen-less 'sk2' spelling this board actually uses" \
                 "$_o1153" "WITHOUT --skeptic-role"
-_o1153=$("$SCRIPT" -n dolimeth -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+_o1153=$("$SCRIPT" -n projm -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
 assert_eq "#1153 CONTROL: a plain window name is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
-_o1153=$("$SCRIPT" -n dolimeth-sk -c "$WORKDIR" -p "$PROMPT_FILE" --skeptic-role --skeptic-target dolimeth --print-prompt 2>&1 >/dev/null)
+_o1153=$("$SCRIPT" -n projm-sk -c "$WORKDIR" -p "$PROMPT_FILE" --skeptic-role --skeptic-target projm --print-prompt 2>&1 >/dev/null)
 assert_eq "#1153 CONTROL: the same name WITH --skeptic-role is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
 
 # ---- your-org/nexus-code#1601: the stale spawn-tempfile BACKSTOP ------------

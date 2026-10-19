@@ -1027,13 +1027,17 @@ _version_check_tick() {
                         # recovery, and its default `operator` made a
                         # source-drift restart read as "RESTORED by operator
                         # intervention" when no operator acted.
+                        # SVC_RESTART_MODE=replace: the service is being
+                        # REPLACED onto new code, not stopped, so a labsh
+                        # supervisor may hand its healthy server to its
+                        # successor instead of bouncing it (#1693).
                         if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
-                            SVC_RESTART_ACTOR=version-restart \
+                            SVC_RESTART_ACTOR=version-restart SVC_RESTART_MODE=replace \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 {INSTANCE_LOCK_FD}>&- || svc_rc=$?
                         else
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
-                            SVC_RESTART_ACTOR=version-restart \
+                            SVC_RESTART_ACTOR=version-restart SVC_RESTART_MODE=replace \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 || svc_rc=$?
                         fi
                         if (( svc_rc == 0 )); then

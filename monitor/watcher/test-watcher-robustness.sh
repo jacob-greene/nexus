@@ -579,7 +579,7 @@ _reports_roll_emit_section() { :; }; _supervisor_arm_emit_section() { :; }
 compose_report() { printf 'reason=%s\n%s\n' "$1" "$6"; }
 archive_emit() { printf '%s/archive.md' "$G2"; }
 _compose_emit_should_suppress() { return 1; }     # NEVER suppress — see above
-_over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1; }
+_over_limit_orchestrator_paused() { return 1; }; _auth_hold_active() { return 1; }; _api_hold_active() { return 1; }
 paste_with_retry() { printf '%s\n' "$(head -n1 "$2")" >> "$PASTES"; return 0; }
 _emit_delivery_ok() { :; }; _compose_emit_record_emit() { :; }; requests_commit_emitted() { :; }
 _respawn_loop_reset() { :; }; _respawn_consec_reset() { :; }
@@ -654,7 +654,7 @@ unset -f log _ensure_watcher_tmp_dir _progress_bump _cycle_bump bump_heartbeat _
     _emit_volatile_strip _full_state_effective_floor _classify_diff _oneshot_reset _oneshot_defer _oneshot_commit \
     _cc_update_emit_section _version_emit_section _service_health_emit_section _reports_roll_emit_section \
     _supervisor_arm_emit_section compose_report archive_emit _compose_emit_should_suppress \
-    _over_limit_orchestrator_paused _auth_hold_active paste_with_retry _emit_delivery_ok \
+    _over_limit_orchestrator_paused _auth_hold_active _api_hold_active paste_with_retry _emit_delivery_ok \
     _compose_emit_record_emit requests_commit_emitted _respawn_loop_reset _respawn_consec_reset \
     _g2_quiet_board _g2_next_fire _g2_cycle plant_g2_marker
 unset NEXUS_NOTIFY_QUIET ORCH_LAST_PASTE_FILE

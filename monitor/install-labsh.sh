@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# monitor/install-labsh.sh — clone operator/labsh into the operator's
+# monitor/install-labsh.sh — clone katosh/labsh into the operator's
 # sandbox project tree under work/labsh/.
 #
 # Sandbox-correct path:
@@ -22,7 +22,7 @@
 # $HOME — labsh outside the sandbox would surprise the operator), and surfaces
 # git clone errors verbatim.
 #
-# Caveat: operator/labsh#3 documents a sandbox-interaction issue with
+# Caveat: katosh/labsh#3 documents a sandbox-interaction issue with
 # `labsh-attach`. The bootstrap surfaces this on success so the operator knows
 # to read the upstream issue before relying on the attach flow.
 #
@@ -39,8 +39,8 @@ die()  { printf 'install-labsh: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'install-labsh: WARNING: %s\n' "$*" >&2; }
 stamp(){ date +%Y%m%d-%H%M%S 2>/dev/null || echo ts; }
 
-REMOTE_URL="${LABSH_REMOTE:-https://github.com/operator/labsh.git}"
-REMOTE_ID="operator/labsh"
+REMOTE_URL="${LABSH_REMOTE:-https://github.com/katosh/labsh.git}"
+REMOTE_ID="katosh/labsh"
 
 CHECK_ONLY=0
 while (( $# > 0 )); do
@@ -74,7 +74,7 @@ install_acquire_lock labsh || die "could not acquire install lock"
 
 if repo_healthy; then
     echo "labsh: already cloned at $target"
-    echo "labsh: review operator/labsh#3 before running 'labsh-attach'."
+    echo "labsh: review katosh/labsh#3 before running 'labsh-attach'."
     exit 0
 fi
 
@@ -105,4 +105,4 @@ fi
 
 verify || die "install finished but verification FAILED — see above."
 echo "labsh: cloned at $target"
-echo "labsh: review operator/labsh#3 before running 'labsh-attach'."
+echo "labsh: review katosh/labsh#3 before running 'labsh-attach'."

@@ -239,7 +239,7 @@ base_url_of() {  # scheme://127.0.0.1:port from the service env file
     scheme=$(sed -n 's/^SCHEME=//p' "$d/.jupyter/labsh-service.env" 2>/dev/null | head -1)
     printf '%s://127.0.0.1:%s' "${scheme:-http}" "$port"
 }
-auth_curl() { curl -fsSk --max-time 5 -H "Authorization: token $(cat "$1/.jupyter/token")" "${@:2}"; }
+auth_curl() { curl -fsSk --max-time 5 -H @<(printf 'Authorization: token %s\n' "$(cat "$1/.jupyter/token")") "${@:2}"; }
 free_port() { python3 -c '
 import socket
 s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'; }

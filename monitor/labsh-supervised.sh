@@ -39,7 +39,9 @@
 #
 # On SIGTERM/SIGINT (svc.sh stop sends TERM to the whole process
 # group): run `labsh stop` so kernels and the server shut down
-# gracefully, then exit 0.
+# gracefully, then exit 0. The one exception is a supervisor being
+# REPLACED by the version-aware restart, which may leave a healthy
+# server it owns for its successor to adopt (see `on_term`, #1693).
 #
 # Env knobs (production leaves unset):
 #   LABSH_SVC_INTERVAL  seconds between health probes      (default 15)
@@ -442,9 +444,148 @@ _reap_periodic_group() {
     kill -TERM -- "-$t" 2>/dev/null || true
     rm -f "$PERIODIC_PGID_FILE"
 }
+# ── replacement hand-off (your-org/nexus-code#1693) ────────────────────────
+# A supervisor that is being REPLACED (its launch script drifted, so the
+# version-aware restart runs `svc.sh restart` with SVC_RESTART_MODE=replace)
+# used to take a healthy lab down with it: kernels and sessions lost, ~5 min
+# warm or ~30 min cold. Now it may leave the server running for its successor,
+# whose bring-up probe finds it healthy and adopts it without a `labsh start`.
+#
+# STOP IS THE DEFAULT; THE HAND-OFF NEEDS FOUR POSITIVE FACTS, each of which
+# fails closed to today's `labsh stop`:
+#   1. a one-shot REPLACE MARK naming THIS supervisor's pid, written by svc.sh
+#      just before it TERMs us (and never by `svc.sh stop`), younger than
+#      LABSH_SVC_REPLACE_MAX_AGE seconds (default 60);
+#   2. the server is HEALTHY (the same jupyter-health.sh every probe uses);
+#   3. OWNERSHIP: the server answering on our persisted PORT is the one the
+#      OWNER record names — the record this service writes after a start of
+#      its own (`_record_server_owner`), carried across hand-offs. A server
+#      this service did not start (hand-started, or started before this
+#      feature existed) has no such record, and is stopped;
+#   4. no server-env pin refresh is in flight: svc.sh signals only this pid on
+#      a replace, so a refresh's process tree would outlive us.
+# The successor then checks the fifth condition, the middle path: if the
+# server was launched with a different configuration than the successor would
+# use, it restarts it after all (see `_adopt_running_server`).
+REPLACE_MARK=".jupyter/labsh-supervisor.replace"
+HANDOFF_ACK=".jupyter/labsh-supervisor.handoff"
+OWNER_FILE=".jupyter/labsh-server.owner"
+REPLACE_MAX_AGE="${LABSH_SVC_REPLACE_MAX_AGE:-60}"
+[[ "$REPLACE_MAX_AGE" =~ ^[0-9]+$ ]] || REPLACE_MAX_AGE=60
+
+# First PORT= of the env file, with no `head` reader (#622).
+_env_port() { sed -n '/^PORT=/{s///p;q;}' "$ENV_FILE" 2>/dev/null; }
+# _kv_field <file> <key> — first `key=value` line's value.
+_kv_field() { sed -n "/^$2=/{s///p;q;}" "$1" 2>/dev/null; }
+
+# The pid of the runtime record whose port is <port>. Prints nothing (rc 1)
+# when no record carries that port.
+_record_pid_for_port() {
+    local port="$1" rt jf
+    rt=$(runtime_dir); [[ -d "$rt" ]] || return 1
+    for jf in "$rt"/jpserver-*.json; do
+        [[ -e "$jf" ]] || continue
+        [[ "$(record_field "$jf" port)" == "$port" ]] || continue
+        record_field "$jf" pid
+        return 0
+    done
+    return 1
+}
+
+# What shapes how the SERVER is launched, as this supervisor would launch it:
+# LABSH_WITH, the replayed opts, the uvx pin shim, and labsh itself. NOT the
+# pin file — a pin refresh is designed never to touch the running server.
+_launch_fingerprint() {
+    local f lb
+    read_opts
+    lb=$(labsh_lib_target 2>/dev/null) || lb=''
+    [[ -n "$lb" ]] || lb=$(command -v labsh 2>/dev/null)
+    {
+        printf 'LABSH_WITH=%s\n' "$LABSH_WITH"
+        printf 'opt=%s\n' ${OPTS[@]+"${OPTS[@]}"}
+        for f in "$PIN_SHIM_DIR/uvx" "$PIN_SHIM_DIR/bash_env.sh" "$lb"; do
+            printf '%s ' "${f##*/}"
+            cksum < "$f" 2>/dev/null || echo absent
+        done
+    } | cksum | awk '{print $1 "-" $2}'
+}
+
+# Written after a start THIS service made became healthy. Any failure to name
+# the server removes the record, so a stale one can never vouch for a new
+# server.
+_record_server_owner() {
+    local port spid
+    port=$(_env_port)
+    if [[ "$port" =~ ^[0-9]+$ ]] && spid=$(_record_pid_for_port "$port") \
+        && [[ "$spid" =~ ^[0-9]+$ ]] && kill -0 "$spid" 2>/dev/null; then
+        printf 'server_pid=%s\nport=%s\nfp=%s\nsupervisor=%s\nrecorded=%s\n' \
+            "$spid" "$port" "$(_launch_fingerprint)" "$$" "$(date -Is)" \
+            > "$OWNER_FILE.tmp.$$" && mv -f "$OWNER_FILE.tmp.$$" "$OWNER_FILE" && return 0
+    fi
+    rm -f "$OWNER_FILE" "$OWNER_FILE.tmp.$$"
+    return 1
+}
+
+# rc 0 (and the server pid on stdout) iff the server on our persisted PORT is
+# the one the owner record names, and it is alive.
+_server_owned() {
+    local opid oport port rpid
+    opid=$(_kv_field "$OWNER_FILE" server_pid)
+    oport=$(_kv_field "$OWNER_FILE" port)
+    port=$(_env_port)
+    [[ "$opid" =~ ^[0-9]+$ && "$oport" =~ ^[0-9]+$ && "$port" == "$oport" ]] || return 1
+    rpid=$(_record_pid_for_port "$port") || return 1
+    [[ "$rpid" == "$opid" ]] && kill -0 "$opid" 2>/dev/null || return 1
+    printf '%s\n' "$opid"
+}
+
+# rc 0 iff all four facts above hold; sets HANDOFF_SERVER. Every refusal says
+# why, because "it stopped the lab" must be explainable from the log alone.
+HANDOFF_SERVER=''
+_replacement_handoff_ok() {
+    local mpid mat now spid
+    [[ -e "$REPLACE_MARK" ]] || return 1
+    mpid=$(_kv_field "$REPLACE_MARK" pid)
+    mat=$(_kv_field "$REPLACE_MARK" at)
+    if [[ "$mpid" != "$$" ]]; then
+        log "a replace mark is present but names pid ${mpid:-?}, not this supervisor ($$) — not ours; stopping the server"
+        return 1
+    fi
+    rm -f "$REPLACE_MARK"          # one-shot: consumed whatever follows
+    now=$(date +%s)
+    if ! [[ "$mat" =~ ^[0-9]+$ ]] || (( now < mat || now - mat > REPLACE_MAX_AGE )); then
+        log "the replace mark is stale or undated (at=${mat:-?}, max age ${REPLACE_MAX_AGE}s) — stopping the server"
+        return 1
+    fi
+    if _refresh_in_flight; then
+        log "being replaced, but a server-env pin refresh (pid $REFRESH_PID) is in flight and would outlive this supervisor — stopping the server"
+        return 1
+    fi
+    if ! "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
+        log "being replaced, but the server is NOT healthy — stopping it, as on any stop"
+        return 1
+    fi
+    if ! spid=$(_server_owned); then
+        log "being replaced, but the server on port $(_env_port) is not the one $OWNER_FILE names (not started by this service, or the record is stale) — stopping it"
+        return 1
+    fi
+    HANDOFF_SERVER="$spid"
+    return 0
+}
+
 on_term() {
-    log "signal received — stopping labsh server, exiting"
     _reap_periodic_group
+    if _replacement_handoff_ok; then
+        local j
+        # svc.sh signalled this pid only: our own jobs (the probe-loop sleep,
+        # a finished hook's subshell) go with us. The server is not one.
+        for j in $(jobs -p); do kill "$j" 2>/dev/null; done
+        printf 'pid=%s\nserver=%s\nat=%s\n' "$$" "$HANDOFF_SERVER" "$(date +%s)" \
+            > "$HANDOFF_ACK.tmp.$$" && mv -f "$HANDOFF_ACK.tmp.$$" "$HANDOFF_ACK"
+        log "being REPLACED — leaving the healthy server (pid $HANDOFF_SERVER) running for the successor supervisor to adopt (your-org/nexus-code#1693); exiting"
+        exit 0
+    fi
+    log "signal received — stopping labsh server, exiting"
     labsh stop >/dev/null 2>&1 || true
     exit 0
 }
@@ -661,7 +802,7 @@ record_is_serving() {
         scheme=http
     fi
     curl -fsSk -o /dev/null --max-time "${LABSH_HEALTH_TIMEOUT:-3}" \
-        -H "Authorization: token $token" \
+        -H @<(printf 'Authorization: token %s\n' "$token") \
         "$scheme://127.0.0.1:$port/api/status"
 }
 
@@ -822,6 +963,9 @@ _start_cycle() {
             hrc=0; "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1 || hrc=$?
             if (( hrc == 0 )); then
                 REJECT_BAILS=0
+                # Only a server THIS start launched gets an owner record; an
+                # adopted one (rc 1) keeps whatever record it already had.
+                (( rc == 0 )) && { _record_server_owner || log "could not name the server just started on port $(_env_port) — no owner record, so a later replacement stops it (#1693)"; }
                 return 0
             fi
             # 22 = answered and REJECTED our token — which a WARMING server may
@@ -1073,10 +1217,39 @@ log "supervisor up: project=$PROJECT_DIR interval=${INTERVAL}s threshold=$MAX_FA
 # directory. Nothing starts one today; it is the price of reaping by file.
 _reap_periodic_group "an orphaned periodic hook left by a previous supervisor"
 
+# _adopt_running_server — the bring-up probe found a healthy server. Adopt it,
+# UNLESS it is one this service started (owner record) under a different launch
+# configuration: then the change that replaced the previous supervisor cannot
+# take effect without a restart, and that is the restart that is really needed
+# (#1693's middle path). A server with no owner record is adopted as before —
+# its configuration is unknown, and adopting a hand-started lab is the
+# long-standing contract.
+_adopt_running_server() {
+    local spid ofp nfp
+    if ! spid=$(_server_owned); then
+        log "a healthy server is already running — adopted"
+        return 0
+    fi
+    ofp=$(_kv_field "$OWNER_FILE" fp)
+    nfp=$(_launch_fingerprint)
+    if [[ -n "$ofp" && "$ofp" == "$nfp" ]]; then
+        log "a healthy server (pid $spid) is already running with this supervisor's launch configuration — adopted, not restarted (#1693)"
+        return 0
+    fi
+    log "the running server (pid $spid) was launched with a DIFFERENT configuration (LABSH_WITH, opts, uvx shim or labsh changed: ${ofp:-?} -> $nfp) — restarting it so the change takes effect (#1693)"
+    labsh stop >/dev/null 2>&1 || true
+    sleep 1
+    start_server || true
+}
+
 # Immediate bring-up: don't make first activation wait out a failure
 # streak. Adopt-or-start covers both cold boot and an already-live
 # server whose env file is missing/stale.
-"$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1 || start_server
+if "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
+    _adopt_running_server
+else
+    start_server
+fi
 run_periodic
 
 fails=0

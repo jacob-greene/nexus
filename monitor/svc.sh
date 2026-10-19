@@ -42,11 +42,16 @@
 #                            machinery — `up` does not (and must not)
 #                            spawn the orchestrator directly.
 #   svc.sh start <name>      start one service iff not running (same
-#                            idempotent decision path as recovery)
+#                            idempotent decision path as recovery);
+#                            clears a stop request
 #   svc.sh stop <name>       stop a service: TERM its supervisor's
-#                            process group, escalate to KILL after 5 s
-#   svc.sh restart <name>    stop + start (`restart watcher` uses
-#                            launcher.sh --replace)
+#                            process group, escalate to KILL after 5 s.
+#                            Records a stop request (.state/services/
+#                            <name>.stop-requested) that the watcher's
+#                            auto-restart and recovery honour: the row
+#                            reads STOPPED, not DOWN, until start/restart
+#   svc.sh restart <name>    stop + start, clears a stop request
+#                            (`restart watcher` uses launcher.sh --replace)
 #   svc.sh --force <verb> <name>
 #                            override the cold-build guard. stop/restart of a
 #                            labsh service REFUSE while a uvx cold build is in
@@ -1256,6 +1261,13 @@ render_status() {
                 ;;
             *)      supc="$C_DIM" ;;
         esac
+        # DOWN because someone ran `svc.sh stop` is not an outage
+        # (your-org/nexus-code#1827): say so, in a colour that is not an alarm.
+        local _sdesc
+        if [[ "$up" == DOWN ]] && _sdesc=$(_svc_stop_request_desc "$name"); then
+            up='STOPPED'; upc="$C_DIM"
+            detail="stopped by request ${_sdesc} — not an outage; auto-restart suspended until 'svc.sh start $name'"
+        fi
         # A labsh JupyterLab service that is SERVING shows its reachable,
         # tokened URL; everything else falls back to the healthcheck-
         # derived endpoint. Keyed on the raw healthcheck, not the possibly
@@ -1270,6 +1282,8 @@ render_status() {
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
         R_TXT[$i]="$ROW"
         line_cost "$ROW"; R_COST[$i]=$COST
+        # STOPPED stays pinned too: a service held down on purpose is
+        # something to keep in view, and the pager labels hidden rows "UP".
         if [[ "$up" != UP || "$sup" == stale || "$sup" == orphan ]]; then
             R_ATT[$i]=1
         else
@@ -1587,6 +1601,14 @@ cmd_start() {
         orchestrator|"$TARGET_WINDOW") _orchestrator_redirect ;;
     esac
     svc_require "$name"
+    # An explicit start withdraws a stop request (your-org/nexus-code#1827);
+    # an automated caller never does.
+    local _sdesc
+    if _svc_actor_is_automated && _sdesc=$(_svc_stop_request_desc "$name"); then
+        echo "[svc] $name: REFUSING an automated start (actor ${SVC_RESTART_ACTOR}) — stopped by request $_sdesc" >&2
+        return "$SVC_STOP_REQUESTED_RC"
+    fi
+    _svc_clear_stop_sentinel "$name"
     local outcome
     outcome=$(recover_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}" "${SVC_LOG[$REG_I]}")
@@ -1772,9 +1794,38 @@ _seed_labsh_pin() {
     return 0
 }
 
+# REPLACE, DON'T BOUNCE (your-org/nexus-code#1693). When the version-aware
+# restart replaces a labsh supervisor (`SVC_RESTART_MODE=replace`, inside
+# `restart` only — never `stop`), the old supervisor may leave a healthy server
+# it owns running for its successor. That needs two things from here:
+#   * a one-shot MARK naming the supervisor pid, so `on_term` can tell
+#     "replaced" from "stopped";
+#   * a TERM to the supervisor ALONE. labsh backgrounds the server without job
+#     control, so a server the supervisor started sits in ITS process group,
+#     and the group TERM of a plain stop would kill the server whatever
+#     `on_term` decided (measured on the live service: jupyter-lab's pgid is
+#     the supervisor's).
+# The supervisor answers with an ACK naming its pid when it handed off. No ACK
+# (it stopped the server, or it is code from before this change) means the
+# rest of its group is TERMed as a plain stop would, so the worst case of a
+# replace is exactly today's bounce.
+_labsh_replace_wanted() {
+    local workdir="$1" launch="$2"
+    (( ${_SVC_RESTART_REPLACE:-0} && ${_SVC_STOP_IN_RESTART:-0} )) || return 1
+    [[ "$launch" == *labsh-supervised.sh* && -d "$workdir/.jupyter" ]]
+}
+_labsh_write_replace_mark() {
+    local f="$1/.jupyter/labsh-supervisor.replace" pid="$2"
+    rm -f "$1/.jupyter/labsh-supervisor.handoff"
+    printf 'pid=%s\nat=%s\n' "$pid" "$(date +%s)" > "$f.tmp.$$" 2>/dev/null \
+        && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+}
+_SVC_HANDED_OFF=0
+
 _stop_service() {
     local name="$1" workdir="$2" launch="$3" health="$4"
-    local pf pid i
+    local pf pid i replace=0 ack
+    _SVC_HANDED_OFF=0
     pf=$(_recover_pidfile "$name")
     if ! _recover_service_running "$name" "$launch"; then
         # ORPHAN CHECK BEFORE ANY REMOVAL (your-org/nexus-code#606). The old
@@ -1803,8 +1854,15 @@ _stop_service() {
     fi
     read -r pid < "$pf" 2>/dev/null
     _seed_labsh_pin "$name" "$workdir" "$launch" "$health"
-    echo "[svc] $name: stopping supervisor pid $pid (TERM to its process group)" >&2
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    if _labsh_replace_wanted "$workdir" "$launch" && [[ "$pid" =~ ^[0-9]+$ ]] \
+        && _labsh_write_replace_mark "$workdir" "$pid"; then
+        replace=1
+        echo "[svc] $name: REPLACING supervisor pid $pid (TERM to the supervisor only; it hands a healthy server it owns to its successor, else stops it)" >&2
+        kill -TERM "$pid" 2>/dev/null
+    else
+        echo "[svc] $name: stopping supervisor pid $pid (TERM to its process group)" >&2
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    fi
     for i in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
@@ -1813,8 +1871,32 @@ _stop_service() {
         echo "[svc] $name: still alive after 5s — KILL" >&2
         kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
         sleep 0.2
+    elif (( replace )); then
+        ack=$(sed -n '/^pid=/{s///p;q;}' "$workdir/.jupyter/labsh-supervisor.handoff" 2>/dev/null)
+        if [[ "$ack" == "$pid" ]]; then
+            _SVC_HANDED_OFF=1
+        else
+            # It did not hand off: finish the stop a plain `stop` would have made.
+            kill -TERM -- "-$pid" 2>/dev/null || true
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 -- "-$pid" 2>/dev/null || break
+                sleep 0.5
+            done
+            kill -0 -- "-$pid" 2>/dev/null && { kill -KILL -- "-$pid" 2>/dev/null || true; }
+        fi
+    fi
+    if (( replace )); then
+        rm -f "$workdir/.jupyter/labsh-supervisor.replace" "$workdir/.jupyter/labsh-supervisor.handoff"
     fi
     rm -f "$pf"
+    if (( _SVC_HANDED_OFF )); then
+        if _recover_service_healthy "$workdir" "$health"; then
+            echo "[svc] $name: supervisor replaced — the healthy server was left running for its successor to adopt (#1693)" >&2
+            return 0
+        fi
+        _SVC_HANDED_OFF=0
+        echo "[svc] $name: the supervisor handed off, but the server is no longer healthy — a fresh supervisor will start one" >&2
+    fi
     if _recover_service_healthy "$workdir" "$health"; then
         echo "[svc] $name: WARNING — healthcheck still passes after stop; a daemonized child likely escaped the process group" >&2
         return 1
@@ -2059,6 +2141,57 @@ EOF
     return "$SVC_COLDBUILD_REFUSED_RC"
 }
 
+# --- operator stop intent (your-org/nexus-code#1827) -----------------------
+# `stop <name>` records WHY the service is down, so the automatic start paths
+# (watcher service-health auto-restart, the recovery sweep behind `up` and
+# boot, a watcher/version-restart `restart`) leave it down instead of reading
+# a dead supervisor as an outage. Measured before this: a deliberate stop to
+# hold an auto-deploy was auto-restarted ~3 min later and deployed exactly the
+# content it was holding. The path is bootstrap-recover.sh's
+# `_recover_stop_sentinel`; only an explicit `start`/`restart <name>` clears it.
+# Exit code for a refused automated restart of a service stopped by request.
+# Distinct from the cold-build refusal (75) so a caller can tell the two apart.
+SVC_STOP_REQUESTED_RC=76
+
+_svc_write_stop_sentinel() {
+    local name="$1" f; f=$(_recover_stop_sentinel "$name")
+    if mkdir -p "${f%/*}" 2>/dev/null \
+       && { printf 'at=%s\n'  "$(date +%s 2>/dev/null || echo 0)"
+            printf 'iso=%s\n' "$(date -Is 2>/dev/null || date)"
+            printf 'by=%s\n'  "${NEXUS_WORKER_WINDOW:-${USER:-unknown}}"
+          } > "$f" 2>/dev/null; then
+        echo "[svc] $name: recorded the stop request ($f) — watcher auto-restart and recovery will leave it DOWN until 'svc.sh start|restart $name'" >&2
+        return 0
+    fi
+    echo "[svc] $name: WARNING — could not record the stop request at $f; the watcher's service-health auto-restart WILL bring it back" >&2
+    return 1
+}
+
+# Prints "since <iso> by <who>" and returns 0 iff a stop request stands.
+_svc_stop_request_desc() {
+    local f; f=$(_recover_stop_sentinel "$1")
+    [[ -e "$f" ]] || return 1
+    local iso by
+    iso=$(sed -n 's/^iso=//p;T;q' "$f" 2>/dev/null)
+    by=$(sed -n 's/^by=//p;T;q' "$f" 2>/dev/null)
+    printf 'since %s by %s' "${iso:-?}" "${by:-?}"
+}
+
+_svc_clear_stop_sentinel() {
+    local name="$1" desc
+    desc=$(_svc_stop_request_desc "$name") || return 0
+    if rm -f "$(_recover_stop_sentinel "$name")" 2>/dev/null; then
+        echo "[svc] $name: cleared the stop request ($desc)" >&2
+    else
+        echo "[svc] $name: WARNING — could not clear the stop request ($desc); automatic restarts stay suspended" >&2
+    fi
+}
+
+# An automated caller (the watcher, version-restart) names itself in
+# SVC_RESTART_ACTOR; an operator/orchestrator leaves it unset. Only an
+# explicit caller may override a stop request.
+_svc_actor_is_automated() { [[ "${SVC_RESTART_ACTOR:-operator}" != operator ]]; }
+
 cmd_stop() {
     local name="$1"
     case "$name" in
@@ -2068,6 +2201,10 @@ cmd_stop() {
     svc_require "$name"
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" || return
+    # Record intent BEFORE the kill, so a health tick racing the stop sees a
+    # requested stop rather than a fresh outage. Not when `restart` calls us:
+    # its `start` follows immediately and the service is meant to come back.
+    (( ${_SVC_STOP_IN_RESTART:-0} )) || _svc_write_stop_sentinel "${SVC_NAME[$REG_I]}"
     _stop_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}"
 }
@@ -2094,6 +2231,14 @@ _record_restart_marker() {
 
 cmd_restart() {
     local name="$1"
+    # SVC_RESTART_MODE=replace (the version-aware restart sets it) asks a
+    # labsh supervisor to hand its healthy server over rather than stop it
+    # (#1693; see _labsh_replace_wanted). Read once and UNSET, so it cannot
+    # leak through the relaunch into the supervisor — and from there into
+    # every shell of the lab's terminals.
+    local _SVC_RESTART_REPLACE=0
+    [[ "${SVC_RESTART_MODE:-}" == replace ]] && _SVC_RESTART_REPLACE=1
+    unset SVC_RESTART_MODE
     case "$name" in
         # THE canonical, idempotent watcher restart — see _restart_watcher.
         watcher) _restart_watcher; return ;;
@@ -2104,8 +2249,19 @@ cmd_restart() {
     # already-stopped service is benign and must not block the start — but it
     # would also swallow a guard refusal, so the guard cannot live only there.
     svc_require "$name"
+    # A stop request outranks an AUTOMATED restart (your-org/nexus-code#1827).
+    # The watcher checks the sentinel before calling us; this is the backstop
+    # for the race where `stop` lands between its check and this call.
+    local _sdesc
+    if _svc_actor_is_automated && _sdesc=$(_svc_stop_request_desc "$name"); then
+        echo "[svc] $name: REFUSING an automated restart (actor ${SVC_RESTART_ACTOR}) — stopped by request $_sdesc; 'svc.sh start $name' resumes it" >&2
+        return "$SVC_STOP_REQUESTED_RC"
+    fi
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" || return
+    # An explicit restart is the operator saying "run it": the stop request
+    # is withdrawn. After the guard, so a refused restart keeps it.
+    _svc_clear_stop_sentinel "$name"
     _record_restart_marker "$name"
     # ORPHAN PATH FIRST (your-org/nexus-code#606). The plain stop→start
     # sequence cannot reconcile an orphan: `stop` has no live supervisor to
@@ -2120,7 +2276,18 @@ cmd_restart() {
             "$_RECOVER_SUP_STATE" "$_RECOVER_STALE_REASON"
         return
     fi
-    cmd_stop "$name" || true
+    _SVC_STOP_IN_RESTART=1 cmd_stop "$name" || true
+    # A replaced supervisor left its healthy server running (#1693). `start`
+    # would see a green healthcheck with no supervisor and launch nothing, so
+    # the successor is launched here; its bring-up probe adopts the server.
+    if (( _SVC_HANDED_OFF )); then
+        if _recover_launch_service "$_n" "$_w" "$_l" "$_g"; then
+            echo "[svc] $name: relaunched — the new supervisor adopts the running server" >&2
+            return 0
+        fi
+        echo "[svc] $name: FAILED to launch the successor supervisor — the server is SERVING UNSUPERVISED; see $_g" >&2
+        return 1
+    fi
     cmd_start "$name"
 }
 

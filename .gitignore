@@ -26,6 +26,8 @@ nexus/
 /assets/
 /assets.lock
 /assets.staging/
+# A non-own asset repo's clone + its .lock/.staging (your-org/nexus-code#1694).
+/assets.*__*
 /monitor/status-assets/
 /.wiki-checkout/
 

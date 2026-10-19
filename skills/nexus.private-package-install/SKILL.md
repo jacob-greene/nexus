@@ -64,14 +64,17 @@ GITHUB_TOKEN="$(gh auth token)" uv run --with \
   my_script.py
 ```
 
-The env-var form assumes `gh auth setup-git` has been run for the user (standard nexus setup), so the git-credential helper routes `GITHUB_TOKEN` to `github.com` clones. Where that's not guaranteed — e.g. a CI runner that doesn't carry `gh` config — embed the token in the URL directly:
+The env-var form assumes `gh auth setup-git` has been run for the user (standard nexus setup), so the git-credential helper routes `GITHUB_TOKEN` to `github.com` clones. Where that's not guaranteed — e.g. a CI runner that doesn't carry `gh` config — hand git the token through `GIT_ASKPASS`:
 
 ```bash
-uv pip install \
-  "git+https://x-access-token:$(gh auth token)@github.com/<your-org>/<repo>@<sha>"
+ap=$(mktemp "${TMPDIR:?}/askpass.XXXXXX") && chmod 700 "$ap"
+printf '#!/bin/sh\nexec gh auth token\n' > "$ap"
+GIT_ASKPASS="$ap" GIT_TERMINAL_PROMPT=0 uv pip install \
+  "git+https://x-access-token@github.com/<your-org>/<repo>@<sha>"
+rm -f "$ap"
 ```
 
-Same pattern `<your-org>.sandbox-gotchas` rule 3 uses for one-shot bot-token pushes; it bypasses the credential helper entirely.
+**Never embed the token in the URL** (`https://x-access-token:$(gh auth token)@…`). That URL sits in the argv of `uv`, `git` and every `git-remote-https` it spawns, and argv is readable in `/proc` by every same-uid agent for the whole install (<your-org>/nexus-code#1840); a PAT outlives any session. The askpass form puts only the username in the URL; git asks the script for the password over a pipe.
 
 ## Python — plain `pip install git+...` (fallback only)
 

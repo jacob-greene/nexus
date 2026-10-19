@@ -19,12 +19,23 @@
 #   declare-no-wait.sh --un-dismiss <kind> <id>
 #                                             remove from dismissed_waits
 #                                             (auto-detect can re-add).
-#   declare-no-wait.sh --list                 print current dismissals.
+#   declare-no-wait.sh --list                 print current DISMISSALS (JSON).
+#   declare-no-wait.sh --outstanding          print the OUTSTANDING waits — the
+#                                             ones the watcher flags as
+#                                             `idle-orphan-async` — one per line
+#                                             as `<kind> <id>  <desc>`, plus the
+#                                             command that dismisses each. Exit
+#                                             3 when there are none.
+#                                             (your-org/nexus-code#1854: `--list`
+#                                             shows the OTHER ledger, so a worker
+#                                             told to dismiss a wait had to read
+#                                             its heartbeat JSON by hand to find
+#                                             the id.)
 #
 # Use case: you submitted a long-running slurm job whose result
 # you'll check tomorrow morning by hand; the watcher would
 # otherwise emit `idle-orphan-async` against you. Run
-# `declare-no-wait.sh slurm 52527284_4` after the sbatch and the
+# `declare-no-wait.sh slurm 12345678_4` after the sbatch and the
 # watcher will treat the worker as plain `idle` (subject to the
 # usual wrap-up rules).
 #
@@ -59,6 +70,8 @@
 #      manufactured-success direction — the operator believes the wait
 #      is gone, the next watcher emit still names it, and the natural
 #      next move is something blunter.
+#   3  `--outstanding` only: there are no outstanding waits (a measured
+#      answer — the heartbeat was read).
 #   5  REFUSED — the heartbeat file EXISTS but does not parse (or is
 #      empty / unreadable). NOTHING was written (your-org/nexus-code#1390).
 #      This verb LIFTS a hold; seeding a fresh skeleton over a file it
@@ -83,7 +96,8 @@ usage() {
     cat >&2 <<'EOF'
 usage: declare-no-wait.sh <kind> <id>
        declare-no-wait.sh --un-dismiss <kind> <id>
-       declare-no-wait.sh --list
+       declare-no-wait.sh --list          (dismissals already on record, JSON)
+       declare-no-wait.sh --outstanding   (waits still OUTSTANDING: what to dismiss)
 
   Mark an async launch as deliberately fire-and-forget. See
   `skills/nexus.worker-defaults/SKILL.md`, `## Worker floor`, "Own
@@ -227,6 +241,25 @@ case "${1:-}" in
         _dnw_refuse_unparseable
         existing=$(read_existing)
         printf '%s' "$existing" | jq -c '.dismissed_waits // []'
+        ;;
+
+    --outstanding)
+        # READ-ONLY, and FAIL-CLOSED on an unreadable heartbeat like every other
+        # path here: "no outstanding waits" from a file this verb could not
+        # parse would be a confident zero (rc 5, not rc 3).
+        _dnw_refuse_unparseable
+        existing=$(read_existing)
+        rows=$(printf '%s' "$existing" | jq -r \
+            '(.external_waits // [])[] | "\(.kind)\t\(.id)\t\(.desc // "")"' 2>/dev/null) || {
+            echo "declare-no-wait.sh: could not read external_waits from $hb_file" >&2; exit 5; }
+        if [[ -z "$rows" ]]; then
+            printf 'declare-no-wait.sh: no OUTSTANDING waits for window %s (%s)\n' "$window" "$hb_file" >&2
+            exit 3
+        fi
+        while IFS=$'\t' read -r k i d; do
+            printf '%s %s  %s\n' "$k" "$i" "$d"
+            printf '    dismiss: monitor/ng declare-no-wait %q %q\n' "$k" "$i"
+        done <<< "$rows"
         ;;
 
     --un-dismiss)

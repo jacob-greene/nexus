@@ -94,7 +94,10 @@ chmod +x "$NEXUS/monitor/mint-token.sh"
 
 # nexus.yml content is irrelevant — load.sh is stubbed. The file just
 # needs to exist for the strict config-resolve check to pass.
-echo '# placeholder' > "$NEXUS/config/nexus.yml"
+# A MAPPING, not a comment: a comment-only nexus.yml is refused as a torn
+# write since your-org/nexus-code#1694, and this fixture only needs a config
+# that parses and defers.
+echo 'placeholder: true' > "$NEXUS/config/nexus.yml"
 
 # Stub config/load.sh. Each key's value is driven by a TEST_* env var;
 # unsetting (or empty) makes the stub exit 2, mirroring real load.sh's

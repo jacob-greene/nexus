@@ -290,7 +290,7 @@ fi
 # allowlist (nohup|slurm|asyncrun) and a per-kind id grammar; both are
 # measurably wrong against this nexus's own heartbeats — kind
 # `slurm-srun-async` and kind `service` are live, kind `slurm` carries
-# BOTH `2219913` and `syn-02ce6257b730`, and `declare-wait`'s own
+# BOTH `1234567` and `syn-02ce6257b730`, and `declare-wait`'s own
 # docstring documents a `ci` example with slashes. This case is the
 # reason the floor is a character class.
 reset_hb
@@ -300,8 +300,8 @@ while IFS='|' read -r k i; do
     rc=$?
     [[ $rc -eq 0 ]] || { bad "shape acceptance" "kind=$k id=$i rc=$rc (want 0)"; _accept_fail=1; }
 done <<'CASES'
-slurm|2219913
-slurm|52527284_4
+slurm|1234567
+slurm|12345678_4
 slurm|syn-02ce6257b730
 asyncrun|ar-e156942f7283
 nohup|syn-0919b1641f12

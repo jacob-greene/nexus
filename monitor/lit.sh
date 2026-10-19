@@ -401,10 +401,12 @@ _s2_search() {
     local args=(-sS --max-time 40 -G "$url"
         --data-urlencode "query=$q"
         --data-urlencode "limit=$limit"
-        --data-urlencode "fields=$fields"
-        -H "x-api-key: $key")
+        --data-urlencode "fields=$fields")
     [[ -n "$year" ]] && args+=(--data-urlencode "year=${year/:/-}")
-    local resp; resp=$(curl "${args[@]}" 2>/dev/null) || { note "S2: request failed"; return 1; }
+    # The key goes through a process-substitution header file, never argv:
+    # argv is readable in /proc by every same-uid agent (#1840). It is
+    # created on the curl line itself so the fd is open while curl runs.
+    local resp; resp=$(curl "${args[@]}" -H @<(printf 'x-api-key: %s\n' "$key") 2>/dev/null) || { note "S2: request failed"; return 1; }
     if ! printf '%s' "$resp" | jq -e 'has("data")' >/dev/null 2>&1; then
         # A zero-hit S2 search answers `{"total": 0, "offset": 0}` — with NO
         # `data` key at all (measured live, 2026-07-29). That is a SUCCESSFUL
@@ -451,7 +453,7 @@ _asta_search() {
     resp=$(curl -sS --max-time 60 -X POST "$ASTA_API" \
         -H 'Content-Type: application/json' \
         -H 'Accept: application/json, text/event-stream' \
-        -H "x-api-key: $key" \
+        -H @<(printf 'x-api-key: %s\n' "$key") \
         -d "$body" 2>/dev/null) || { note "ASTA: request failed"; return 1; }
     # SSE: take the JSON payload of the last `data:` event.
     local data
@@ -1089,7 +1091,7 @@ _fetch_s2_ref() {
     local fields="title,year,venue,authors,externalIds,abstract,paperId"
     local resp
     resp=$(curl -sS --max-time 40 -G "$S2_API/paper/$lookup" \
-        --data-urlencode "fields=$fields" -H "x-api-key: $s2key" 2>/dev/null) \
+        --data-urlencode "fields=$fields" -H @<(printf 'x-api-key: %s\n' "$s2key") 2>/dev/null) \
         || die "S2 lookup failed"
     if ! printf '%s' "$resp" | jq -e '.paperId' >/dev/null 2>&1; then
         die "S2: $(printf '%s' "$resp" | jq -r '.error // .message // "not found"' 2>/dev/null)"

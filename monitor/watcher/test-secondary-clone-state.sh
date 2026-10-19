@@ -82,6 +82,11 @@ make_nexus() {
     cp "$MON/guard-block.sh.in" "$root/monitor/guard-block.sh.in"
     cp "$NG_REAL"               "$root/monitor/ng"
     cp "$SKCH_REAL"             "$root/monitor/skeptic-channel.sh"
+    # The edge ledger every real tree ships (your-org/nexus-code#1852 F2): resolve
+    # now fails CLOSED (rc 8) when it cannot read the edges, and a fixture tree
+    # without the ledger tool is a read that cannot answer.
+    cp "$MON/obligations.sh"    "$root/monitor/obligations.sh"
+    cp "$MON/_obligations.sh"   "$root/monitor/_obligations.sh"
     cp "$MON/_claude-bin.sh"    "$root/monitor/_claude-bin.sh"
     cp "$MON/_tmux-window.sh"   "$root/monitor/_tmux-window.sh"
     cp "$MON/_fm_lib.sh"        "$root/monitor/_fm_lib.sh"

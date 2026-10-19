@@ -481,8 +481,9 @@ for f in skills/nexus.cc-update/GUIDE.md monitor/cc-auto-update-prompt.md monito
 done
 assert_eq "_version_restart.sh's clone-drift advisory (variable branch, 1 site)" \
     "$(grep -oE "$ALLOWED_ADVISORY_RE" "$_repo_root/monitor/watcher/_version_restart.sh" | wc -l | tr -d ' ')" "1"
-assert_eq "apply.sh's deployment-gate and block advisories (variable branch, 3 sites)" \
-    "$(grep -oE "$ALLOWED_ADVISORY_RE" "$_repo_root/monitor/cc-auto-update-apply.sh" | wc -l | tr -d ' ')" "3"
+# 4th site: the STALE-CHECKOUT operator notice's `pull_cmd` (your-org/nexus-code#1855).
+assert_eq "apply.sh's deployment-gate, block and stale-checkout advisories (variable branch, 4 sites)" \
+    "$(grep -oE "$ALLOWED_ADVISORY_RE" "$_repo_root/monitor/cc-auto-update-apply.sh" | wc -l | tr -d ' ')" "4"
 # GUIDE sites: the evaluator-comments rule, Step 4's block wording, the Step 5
 # "never conflicts" note, the Notes entry on how a fire binds.
 assert_eq "the GUIDE's deploy advisories (placeholder branch, 4 sites)" \

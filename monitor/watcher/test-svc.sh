@@ -63,6 +63,10 @@
 # 16b. a healthcheck that does not finish within SVC_STATUS_HEALTH_TIMEOUT
 #      renders UNKNOWN with the bound named, and status returns; a check's
 #      own rc 124 inside the bound stays DOWN (your-org/nexus-code#1601).
+#  18. stop request (your-org/nexus-code#1827) — `stop` writes
+#      .state/services/<name>.stop-requested; status reads STOPPED; an
+#      automated restart (SVC_RESTART_ACTOR=watcher) is refused rc 76 and
+#      the `up` sweep skips it; an explicit start/restart clears it.
 #
 # Run: bash monitor/watcher/test-svc.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -1271,6 +1275,73 @@ grep -qE 'SERVING UNSUPERVISED|REFUSING' "$ROOT/err" \
     && pass "stop-orphan: a down service's stale record IS removed" \
     || fail "stop-orphan: stale record kept for a down service"
 unset NEXUS_ROOT
+cleanup_case
+
+# --- Case 18: stop records operator intent (your-org/nexus-code#1827) -----------
+# `stop` used to leave no trace of WHY a service was down, so the watcher's
+# service-health auto-restart read the dead supervisor as an outage and brought
+# the service back within minutes. The sentinel is the record; every automatic
+# start path honours it and only an explicit start/restart withdraws it.
+echo '=== case 18: stop writes a stop request; automation honours it; start/restart clear it ==='
+build_case stopreq
+mkdir -p "$ROOT/wd-s"
+make_fake_wrapper "$ROOT/wd-s" wrapper.sh "$ROOT/wd-s/marker"
+hc="kill -0 \$(awk '{print \$2}' marker 2>/dev/null)"
+reg_line5 svc-s "$ROOT/wd-s" './wrapper.sh' "$hc" "$ROOT/wd-s/s.log" > "$REG"
+SENT="$ROOT/monitor/.state/services/svc-s.stop-requested"
+pf=$(svc_pidfile svc-s)
+sup_live() { local p; [[ -f "$pf" ]] && read -r p < "$pf" && [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null; }
+
+run_svc start svc-s; sleep 1
+sup_live && pass "stopreq: PRECONDITION service running" || fail "stopreq: start failed: $(cat "$ROOT/err")"
+NEXUS_WORKER_WINDOW=w1 run_svc stop svc-s
+[[ $RC == 0 ]] && pass "stopreq: stop rc 0" || fail "stopreq: stop rc=$RC err=$(cat "$ROOT/err")"
+[[ -f "$SENT" ]] && pass "stopreq: stop wrote the sentinel beside the pidfile" \
+    || fail "stopreq: no sentinel at $SENT"
+grep -q '^at=[0-9]' "$SENT" 2>/dev/null && grep -q '^iso=.' "$SENT" && grep -qx 'by=w1' "$SENT" \
+    && pass "stopreq: sentinel records at/iso/by" || fail "stopreq: sentinel body: $(cat "$SENT" 2>/dev/null)"
+
+run_svc status
+grep -E '^ *[0-9]+ +svc-s +STOPPED' "$ROOT/out" >/dev/null \
+    && pass "stopreq: status row reads STOPPED, not DOWN" \
+    || fail "stopreq: status row: $(grep svc-s "$ROOT/out")"
+grep -q 'stopped by request since ' "$ROOT/out" \
+    && pass "stopreq: status says 'stopped by request since <ts>'" \
+    || fail "stopreq: no stopped-by-request detail: $(grep svc-s "$ROOT/out")"
+
+SVC_RESTART_ACTOR=watcher run_svc restart svc-s; sleep 0.5
+[[ $RC == 76 ]] && pass "stopreq: an automated restart is REFUSED (rc 76)" \
+    || fail "stopreq: watcher restart rc=$RC err=$(cat "$ROOT/err")"
+sup_live && fail "stopreq: the refused restart relaunched the service" \
+    || pass "stopreq: the service stays down"
+[[ -f "$SENT" ]] && pass "stopreq: the refusal leaves the request standing" \
+    || fail "stopreq: an automated restart cleared the request"
+
+run_svc up --no-workers; sleep 0.5
+sup_live && fail "stopreq: the recovery sweep relaunched a stopped service" \
+    || pass "stopreq: the recovery sweep (up) leaves it down"
+grep -q "svc-s': stopped by request" "$ROOT/err" \
+    && pass "stopreq: the sweep says why it skipped" \
+    || fail "stopreq: sweep silent: $(grep svc-s "$ROOT/err")"
+
+run_svc start svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: an explicit start clears the request" \
+    || fail "stopreq: start left the sentinel"
+sup_live && pass "stopreq: …and the service runs again" || fail "stopreq: start did not relaunch: $(cat "$ROOT/err")"
+
+run_svc stop svc-s
+[[ -f "$SENT" ]] || fail "stopreq: PRECONDITION second stop wrote no sentinel"
+run_svc restart svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: an explicit restart clears the request" \
+    || fail "stopreq: restart left the sentinel"
+sup_live && pass "stopreq: …and the service runs again" || fail "stopreq: restart did not relaunch: $(cat "$ROOT/err")"
+
+run_svc restart svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: a restart of a running service leaves no request behind" \
+    || fail "stopreq: restart's internal stop wrote a sentinel"
+SVC_RESTART_ACTOR=watcher run_svc restart svc-s; sleep 1
+[[ $RC == 0 ]] && sup_live && pass "stopreq: CONTROL — an automated restart with no request proceeds" \
+    || fail "stopreq: automated restart without a request: rc=$RC err=$(cat "$ROOT/err")"
 cleanup_case
 
 # --- summary ---------------------------------------------------------------------

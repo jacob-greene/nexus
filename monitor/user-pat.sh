@@ -119,8 +119,11 @@ fi
 
 api_probe() {
     local path="$1"
+    # The PAT goes through a process-substitution header file, never argv: argv
+    # is readable in /proc by every same-uid agent, and a PAT outlives any
+    # session (#1840).
     curl -sS -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer ${PAT}" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$PAT") \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/${path}"

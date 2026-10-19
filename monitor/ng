@@ -647,7 +647,7 @@ _usage_for() {
         cmd_report_check)   echo "usage: ng report-check <path> [--allow-todo] [--skeptic-gate-settling]" ;;
         cmd_report_grep)    echo "usage: ng report-grep [grep-opts] <pattern> [path...]   # ignore-file-blind corpus search; exit 3 (not a silent zero) if the tree is invisible to the search (#618)" ;;
         cmd_doctor)         echo "usage: ng doctor [--quiet]   # read-only setup check: cc install vs expected, gh floor, config placeholders + mode, transcript root; one PASS/WARN/FAIL/UNKNOWN row each; exit 1 on any FAIL (#1722)" ;;
-        cmd_degraded)       echo "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S]   # probe: per-surface writability OK/EROFS/ENOSPC/EACCES/HANG/MISSING/ERROR; status: the watcher's degraded status file + a probe; exit 0 all OK, 1 not OK or watcher degraded, 2 usage/refused path, 3 could not probe (#1724)" ;;
+        cmd_degraded)       echo "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S] | enter [--force] [--timeout S] [--max-kb K] | exit [--force] [--timeout S] [--probes N] [--interval S] [--ack-loss]   # probe: per-surface writability OK/EROFS/ENOSPC/EACCES/HANG/MISSING/ERROR; status: the watcher's degraded status file + a probe + the relocation pointer; exit 0 all OK, 1 not OK or watcher degraded, 2 usage/refused path, 3 could not probe. enter: relocate the delivery ledger + request inbox into the degraded run dir (pointer outside the tree); exit: N consecutive OK probes, then a no-clobber merge home with an itemised conflict list; 0 done, 1 refused (nothing changed), 3 no run dir, 4 exited with items STILL STAGED, 5 LOST: a restart wiped an unexited relocation (--ack-loss clears) (#1724)" ;;
         cmd_codex)          echo "usage: ng codex [run] --cd <git-root> (--prompt-file F | --prompt-stdin) [--out DIR] [--model M] [--sandbox MODE] [--timeout S] [--allow-dirty] [--no-git] [--resume ID] [--ephemeral] [--config K=V] [--also-watch DIR] [--output-schema F] [--background] [--dry-run]   # supervised Codex co-worker; exit 0 completed, 3 turn-failed, 4 timeout, 5 unavailable, 6 workdir, 7 indeterminate (#1640)" ;;
         cmd_longjob)        echo "usage: ng longjob add <kind>:<target> [--desc T] [--interval S] [--notify terminal|transitions] [--persistent] [--for-lead NAME] | run [--for-lead NAME] -- <cmd…> | list | show <id> | rm <id> | status | events [N] | await <id> [--timeout S] | probe <kind>:<target>   # kinds: slurm asyncrun pid file cmd (#1535)" ;;
         cmd_fetch_asset)    echo "usage: ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]" ;;
@@ -986,6 +986,19 @@ _body_receipt() {   # <body> <body-file-or-empty>
     return 0
 }
 
+# your-org/nexus-code#1856: a GitHub body whose only copy of a deliverable is a
+# claude.ai Artifact link reaches a reader who cannot open it. Warn on stderr,
+# never change the exit code; the rule and its error direction live in
+# monitor/artifact-link-check.sh. Called at every ng verb that publishes a
+# human-written body, BEFORE the post, outside any stderr capture (wrap-up's
+# _post_body calls redirect stderr into a failure buffer).
+_alc_warn() {   # <body> <where>
+    [[ -r "$_script_dir/artifact-link-check.sh" ]] || return 0
+    # shellcheck source=monitor/artifact-link-check.sh
+    source "$_script_dir/artifact-link-check.sh" || return 0
+    alc_warn "$1" "$2"
+}
+
 # Post {body: "..."} to <endpoint> ($1) with content from $2; print html_url.
 # Lets `gh api`'s stderr (HTTP status, error message body) leak through
 # so a 4xx surfaces concretely instead of a bare "POST … failed".
@@ -1298,6 +1311,7 @@ cmd_reply() {
     target=$(_resolve_repo write "$repo_arg") || exit $?
     local _body; _body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
     _body_receipt "$_body" "$body_file"
+    _alc_warn "$_body" "ng reply #$issue"
     _post_body "/repos/$target/issues/$issue/comments" "$_body"
 }
 
@@ -1353,6 +1367,7 @@ cmd_comment_edit() {
     target=$(_resolve_repo write "$repo_arg") || exit $?
     body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
     [[ -n "$body" ]] || die "empty body"
+    _alc_warn "$body" "ng comment-edit $cid"
     if (( force == 1 )); then
         {
             printf 'ng comment-edit: --force — writing WITHOUT a concurrency precondition\n'
@@ -3170,7 +3185,7 @@ _skeptic_provenance() {
 # decision — and because a worker's only way to record anything is to file
 # a report and wrap up, a worker told "write your findings and wrap up"
 # after a resolve RE-BLOCKED ITSELF BY COMPLYING, and could not record that
-# fact without doing it again. Observed 2026-08-08 on `bench272F`: marker
+# fact without doing it again. Observed 2026-08-08 on `bench-a`: marker
 # resolved at ~01:2x, back at 01:48 as a side effect of a `--no-comment`
 # wrap-up whose only purpose was to persist a report.
 #
@@ -3367,7 +3382,7 @@ _skeptic_resolution_state() {
     # cause it has not established, and a window resolved ONCE could never arm a
     # require-gate again for the rest of that NAME's life — `require` silently
     # degrading to advisory. Window names are recycled here (`orchestrator`,
-    # `bench272F`, `spawnpath`), so the state outlives the window it described.
+    # `bench-a`, `spawnpath`), so the state outlives the window it described.
     #
     # The fix is the one this batch already applies in retire-preflight check
     # 1c: release evidence must POST-DATE the thing it releases. A resolution is
@@ -5716,8 +5731,15 @@ _wrapup_skeptic_step() {
         # The verdict is still WRITTEN to the edge, because an operator
         # reading `ng obligation show` should see the rounds that have been
         # delivered — it just does not release anything.
+        # SCOPED TO THE REVIEWED EDGE (#1849, ncbundle31-sk F1). `verdict_at`
+        # decides supersession, so a stamp is no longer a label: without
+        # `--creditor` it landed on EVERY edge this reviewer holds — a depth-2
+        # skeptic holds the target edge and the chain-root edge — and a verdict
+        # about one target let a later pin to the OTHER void a live review.
+        local -a _vn_cred=()
+        [[ -n "$target" ]] && _vn_cred=(--creditor "$target")
         if [[ -n "$source_window" && -x "$_script_dir/obligations.sh" ]]; then
-            ( "$_script_dir/obligations.sh" note --debtor "$source_window" \
+            ( "$_script_dir/obligations.sh" note --debtor "$source_window" ${_vn_cred[@]+"${_vn_cred[@]}"} --verdict \
                 --text "round $depth verdict '$verdict' filed for $reviewed (issue ${issue:-none}) — round discharged, pairing NOT ended" \
                 ) >/dev/null 2>&1 || true
         fi
@@ -8891,7 +8913,7 @@ _ng_provenance() {
 # Skeptic windows are not named that way. Measured against this nexus's
 # own provenance store: of 468 records carrying `skeptic_role: true`,
 # 198 — 42% — have a window name the pattern cannot match (`fig4sk`,
-# `nexuscode-716sk`, `debench-skeptic3`, `skeptic-B7`, `audit-skeptic`
+# `nexuscode-716sk`, `bench-b-skeptic3`, `skeptic-B7`, `audit-skeptic`
 # for target `ncode-audit`). Every one of them was invisible to this
 # field from the moment it was spawned.
 #
@@ -10393,6 +10415,9 @@ _wrapup_dry_run_print() {
             printf '%s\n' "$body" | sed 's/^/  | /'
         fi
     fi
+    # your-org/nexus-code#1856: the same Artifact-only warning the live path
+    # gives, so a preview cannot pass silently over what the post will warn on.
+    [[ -n "$body" ]] && _alc_warn "${body//"$url"/}" "ng wrap-up's link comment on #$iss"
     if (( cm == 1 )); then
         printf '\n[--reply-to %s channel body]' "$rt"
         if [[ -n "$af" ]]; then
@@ -11000,6 +11025,13 @@ EOF
         # comment a reader will actually see, never only on wrap-up's stderr.
         if [[ -n "${_WU_FANOUT_LINE:-}" && "$comment_st" != degenerate-teaser ]]; then
             body="${body}"$'\n\n'"${_WU_FANOUT_LINE}"
+        fi
+        # your-org/nexus-code#1856: the link comment always carries the REPORT's
+        # asset URL, so the check runs on the body WITHOUT it — an Artifact named
+        # in the Summary or a --comment-body-file is still the only copy of
+        # THAT deliverable unless some other asset link is beside it.
+        if [[ "$comment_st" != degenerate-teaser && -n "${body:-}" ]]; then
+            _alc_warn "${body//"$asset_url"/}" "ng wrap-up's link comment on #$issue"
         fi
         # your-org/nexus-code#1114: everything below PUBLISHES. A degenerate
         # teaser must not reach any of it — not the fresh POST, not the
@@ -11671,7 +11703,7 @@ EOF
 # retirement gate that the marker on disk says is owed. The two records are
 # written by different steps at different times (the author sets the field
 # before wrap-up prompts the skeptic decision) and nothing compared them; the
-# contradiction on `jcdeck` surfaced only because the spawn-skeptic request
+# contradiction on `deckw1` surfaced only because the spawn-skeptic request
 # happens to print both values side by side, and the skeptic the orchestrator
 # spawned anyway found a scientific error one presentation from being stated
 # as fact. Failing CLOSED costs the author one edit; failing open costs a
@@ -11807,7 +11839,7 @@ _disposition_gate_conflict() {
 #
 # `wrap-up` had a report-check pre-flight and no async-wait pre-flight, so an
 # agent could complete its work, wrap up cleanly and leave waits dangling —
-# three windows in one hour (`dolicomp`, `devmain2sk`, `olimit2sk`), and the
+# three windows in one hour (`projc`, `devmain2sk`, `olimit2sk`), and the
 # first thing to notice was the watcher, one emit later, landing "RESUME is
 # the default, a wait you have not confirmed dead must not be cleared" on an
 # agent that had already declared itself done.
@@ -12069,7 +12101,7 @@ cmd_fetch_asset() {
 
     local s1_status
     s1_status=$(curl -sS -o /dev/null -D "$h1" -w '%{http_code}' \
-        -H "Authorization: Bearer $user_pat" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$user_pat") \
         -H "Accept: application/octet-stream" \
         "$url") || { echo "ng fetch-asset: stage 1 curl failed (network?)" >&2; exit 3; }
 
@@ -12231,6 +12263,7 @@ cmd_issue_create() {
     local body target
     body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
     [[ -n "$body" ]] || die "ng issue create: empty body"
+    _alc_warn "$body" "ng issue create"
     target=$(_resolve_repo write "$repo_arg") || exit $?
     # Build the POST payload with jq so label escaping stays honest.
     # An empty array goes to jq as zero args (not `[""]`) — which
@@ -12272,6 +12305,7 @@ cmd_issue_comment() {
     target=$(_resolve_repo write "$repo_arg") || exit $?
     local _body; _body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
     _body_receipt "$_body" "$body_file"
+    _alc_warn "$_body" "ng issue comment #$n"
     _post_body "/repos/$target/issues/$n/comments" "$_body"
 }
 
@@ -12325,6 +12359,7 @@ cmd_pr_create() {
     local body target
     body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
     [[ -n "$body" ]] || die "ng pr create: empty body"
+    _alc_warn "$body" "ng pr create"
     target=$(_resolve_repo write "$repo_arg") || exit $?
     # When PRing into a non-nexus repo, run the bot-install preflight
     # so a missing install fails with a clear remediation instead of
@@ -12379,6 +12414,7 @@ cmd_pr_edit() {
         local body
         body=$(_read_body "$body_file") || exit $?   # #1136: a die in $( ) cannot abort us
         [[ -n "$body" ]] || die "ng pr edit: empty body"
+        _alc_warn "$body" "ng pr edit"
         payload=$(jq -c --arg b "$body" '. + {body:$b}' <<<"$payload")
     fi
     local url
@@ -13692,6 +13728,20 @@ cmd_dashboard_put() {
     _argloop_prev_24=-1; while (( $# > 0 )); do (( $# != _argloop_prev_24 )) || _argloop_stuck "$1"; _argloop_prev_24=$#
         case "$1" in --body-file) _need_val --body-file "$#" "${2:-}"; body_file="$2"; shift 2 ;; *) die "unknown flag: $(_arg_excerpt "$1")" ;; esac
     done
+    # your-org/nexus-code#1839 — the operator may have chosen an external
+    # status page. The put still works (they may call it on purpose), but says
+    # the dashboard is not the configured surface; an unknown kind is refused
+    # rather than read as the default.
+    if [[ -r "$_script_dir/_status-surface.sh" ]]; then
+        # shellcheck source=monitor/_status-surface.sh
+        source "$_script_dir/_status-surface.sh"
+        local ss_kind ss_rc
+        ss_kind=$(status_surface_kind _ng_cfg); ss_rc=$?
+        (( ss_rc == 3 )) && die "dashboard put: fix status_surface.kind in config/nexus.yml first (see above)."
+        [[ "$ss_kind" == external ]] && printf 'ng dashboard put: note — status_surface.kind is external in config/nexus.yml; the overview dashboard is not the configured status surface.\n' >&2
+    else
+        printf 'ng dashboard put: WARNING — %s is missing, so status_surface in config/nexus.yml was not consulted.\n' "$_script_dir/_status-surface.sh" >&2
+    fi
     local tmp_new tmp_full tmp_merged tmp_live
     tmp_new=$(mktemp); tmp_full=$(mktemp); tmp_merged=$(mktemp); tmp_live=$(mktemp)
     # Double-quoted trap expands paths at trap-set time, so cleanup
@@ -15048,7 +15098,8 @@ cmd_request() {
 # secrets travel out-of-band only (stdout / 0600 op-only file).
 #     ng remote gen-host-key                       (print host fingerprint)
 #     ng remote issue-token --principal P [--ttl S](mint a one-time token)
-#     ng remote enroll --pubkey F --token T        (consume token → authorize a key)
+#     ng remote enroll --pubkey F --token-stdin    (consume token → authorize a key;
+#                                                   token on stdin, --token T leaks it to argv)
 #     ng remote enroll-invite --principal P [--ttl S]  (ROOTLESS self-enroll:
 #                                                   mint token + per-window enroll
 #                                                   key; client pipes <token>\n<pub>)
@@ -15720,20 +15771,23 @@ cmd_doctor()           { _facade doctor.sh           "$@"; }
 # any agent, during a read-only/full-disk incident: is the tree writable, per
 # surface, and HOW is it failing (EROFS/ENOSPC/EACCES/HANG/MISSING) (#1724).
 # `status` (#1724 remainder) reads the watcher's degraded status file (kept
-# OUTSIDE the tree) and re-probes. enter/exit (relocation) are not built yet,
-# and saying so beats a verb that silently ignores its subcommand.
+# OUTSIDE the tree) and re-probes. `enter`/`exit` relocate the delivery ledger
+# and the request inbox into the degraded run dir and merge them back, through
+# a pointer the surfaces' resolvers read per call (degraded-relocate.sh).
 # One named handler per sub-verb, called straight from its arm: the
 # test-ng-flag-order sweep finds sub-verbs as `name) <handler>` arms, and an arm
 # that opened with `shift;` was invisible to it (B-DOC).
 _degraded_probe()  { _facade degraded-probe.sh  "$@"; }
 _degraded_status() { _facade degraded-status.sh "$@"; }
+_degraded_enter()  { _facade degraded-relocate.sh enter "$@"; }
+_degraded_exit()   { _facade degraded-relocate.sh exit "$@"; }
 cmd_degraded() {
     case "${1:-}" in
         probe)  _degraded_probe "${@:2}" ;;
         status) _degraded_status "${@:2}" ;;
-        enter|exit)
-            die "degraded $1: not implemented — only \`ng degraded probe\` and \`status\` exist (your-org/nexus-code#1724)" ;;
-        *)  die "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S]   # exit 0 all OK, 1 not OK / watcher degraded, 2 usage/refused path, 3 could not probe (#1724)" ;;
+        enter)  _degraded_enter "${@:2}" ;;
+        exit)   _degraded_exit "${@:2}" ;;
+        *)  die "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S] | enter [--force] [--timeout S] [--max-kb K] | exit [--force] [--timeout S] [--probes N] [--interval S] [--ack-loss]   # probe/status: exit 0 all OK, 1 not OK / watcher degraded, 2 usage/refused path, 3 could not probe; enter/exit: 0 done, 1 refused (nothing changed), 3 no run dir, 4 exited with items STILL STAGED, 5 LOST: a restart wiped an unexited relocation (--ack-loss clears) (#1724)" ;;
     esac
 }
 # maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
@@ -15812,6 +15866,9 @@ Task lifecycle & reports:
                                  transcripts, PASS|WARN|FAIL|UNKNOWN (#1722)
   degraded status                the watcher's degraded-mode status (kept outside
                                  the tree: its notes, errno, delivery) + a probe
+  degraded enter|exit            relocate the delivery ledger + request inbox out
+                                 of a read-only tree (pointer in the TMPDIR run
+                                 dir), and merge them home after sustained health
   reports-roll [--dry-run]       archive pre-buffer reports into reports/YYYY-MM/
   log-action <agent> --event …   append an action-log event
   fetch-asset <url>              fetch a user-attachments asset locally

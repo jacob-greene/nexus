@@ -63,6 +63,9 @@ cp "$_real_dir/../watcher-supervise-tick.sh" "$MON/watcher-supervise-tick.sh"
 cp "$_real_dir/../revive-watcher.sh"         "$MON/revive-watcher.sh"
 # launcher.sh sources ../_log-mode.sh (nexus-code#509).
 cp "$_real_dir/../_log-mode.sh"              "$MON/_log-mode.sh"
+# watcher-supervise-tick.sh sources ../_nexus-root.sh; without it the tick
+# printed `No such file` and fell back to `cd ..` (found by the #1879 triage).
+cp "$_real_dir/../_nexus-root.sh"            "$MON/_nexus-root.sh"
 chmod +x "$WD/launcher.sh" "$MON/watcher-supervise-tick.sh" "$MON/revive-watcher.sh"
 
 # Stub main.sh — faithful single-instance contract: refuse if a live
@@ -186,8 +189,9 @@ assert_contains "arm reminder names the revive script"                   "$armou
 assert_contains "arm reminder points at the service-recovery skill"      "$armout" "skills/nexus.service-recovery"
 
 echo '=== A2: a supervise tick ARMS the supervisor → the reminder self-clears ==='
-NEXUS_STATE_DIR="$STATE" MONITOR_INTERVAL=60 "$MON/watcher-supervise-tick.sh"; trc=$?
+NEXUS_STATE_DIR="$STATE" MONITOR_INTERVAL=60 "$MON/watcher-supervise-tick.sh" 2>"$WORK/tick-a2.err"; trc=$?
 assert_eq "tick exits 0 while watcher alive" "$trc" "0"
+assert_empty "an ALIVE tick writes nothing to stderr (its sourced helpers resolve)" "$(cat "$WORK/tick-a2.err")"
 assert_file_exists "tick touched (armed) the supervisor heartbeat" "$STATE/watcher-supervisor-heartbeat"
 armout2=$(
   source "$WD/_lib.sh"
@@ -198,8 +202,9 @@ assert_empty "fresh supervisor heartbeat (armed) suppresses the reminder" "$armo
 echo "############ DIRECTION B — supervisor armed, watcher DOWN → revive → exactly one ############"
 echo '=== B1: alive watcher → tick reports ALIVE (exit 0) + touches heartbeat ==='
 rm -f "$STATE/watcher-supervisor-heartbeat"
-NEXUS_STATE_DIR="$STATE" MONITOR_INTERVAL=60 "$MON/watcher-supervise-tick.sh"; trc=$?
+NEXUS_STATE_DIR="$STATE" MONITOR_INTERVAL=60 "$MON/watcher-supervise-tick.sh" 2>"$WORK/tick-b1.err"; trc=$?
 assert_eq "tick exit 0 (watcher alive)" "$trc" "0"
+assert_empty "B1 ALIVE tick: stderr is clean" "$(cat "$WORK/tick-b1.err")"
 assert_file_exists "tick touched the supervisor heartbeat" "$STATE/watcher-supervisor-heartbeat"
 
 echo '=== B2: KILL the watcher → tick reports DOWN (exit non-zero) + self-descriptive recovery ==='
@@ -216,6 +221,7 @@ assert_contains "down message names the reason (DEAD/stale)"           "$downmsg
 assert_contains "down message gives the exact revive command"          "$downmsg" "monitor/revive-watcher.sh"
 assert_contains "down message gives the exact re-arm Monitor command"  "$downmsg" 'Monitor({command: "until !'
 assert_contains "down message points at the service-recovery skill"    "$downmsg" "skills/nexus.service-recovery"
+assert_not_contains "DOWN tick: no missing-file noise beside the message" "$downmsg" "No such file"
 
 echo '=== B3: revive → EXACTLY ONE live watcher (single-root); tick reads ALIVE again ==='
 : > "$WORK/svc-calls.log"

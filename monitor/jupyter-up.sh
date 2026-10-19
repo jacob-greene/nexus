@@ -409,7 +409,7 @@ migrate_legacy_root() {
 # --- health wait -------------------------------------------------------------
 
 # Wait for the service to become healthy, tolerating a slow first
-# converge. First run on hpc-mount can build the labsh venvs slower than
+# converge. First run on /shared can build the labsh venvs slower than
 # UP_TIMEOUT; the supervisor keeps retrying and the server comes up
 # moments later. Failing the whole (idempotent) activation on that
 # timeout makes the exit code contradict the eventual healthy state
@@ -477,7 +477,7 @@ cmd_up() {
     # for why the in-function guard cannot carry this on its own.
     _registry_must_be_readable
     command -v labsh >/dev/null 2>&1 \
-        || die "labsh not on PATH — install via 'brew install operator/tools/labsh' or monitor/install-labsh.sh"
+        || die "labsh not on PATH — install via 'brew install katosh/tools/labsh' or monitor/install-labsh.sh"
     command -v uv >/dev/null 2>&1 \
         || die "uv not on PATH — labsh needs it (curl -LsSf https://astral.sh/uv/install.sh | sh)"
 

@@ -591,6 +591,15 @@ expected_jq=(
     # read failure — UNKNOWN is a distinct third value, asserted both ways in
     # test-verify-worker-started.sh.
     monitor/verify-worker-started.sh
+    # your-org/nexus-code#1845. A DECISION: the API-unreachable hold reads the
+    # typed StopFailure markers with jq. Without jq `_api_hold_scan_markers`
+    # reports nothing, so the hold never ENTERS and the board keeps its
+    # pre-#1845 behaviour (per-window `interrupted`, the orchestrator pastes).
+    # Announced once per run in the watcher log ("the API-unreachable sensor
+    # is OFF for this run"), never silent, and it fails toward NOT holding, the
+    # safe direction for a gate whose costly act is muting the board. Behaviour
+    # still DEGRADES, so it belongs here rather than in FALLBACK.
+    monitor/watcher/_api_hold.sh
     # #719. `return 1` with no message — the update check reports "unreachable"
     # and fails safe, so a jq-less host stops seeing CC updates without saying
     # so.

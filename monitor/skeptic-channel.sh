@@ -111,6 +111,7 @@
 #                                             skeptic → ensure all acked
 #   close   <task-id>                         skeptic → drop DONE sentinel
 #   resolve <task-id> --reason "<why>" [--disposition] [--delta-owed "<what>" | --withdraw-delta]
+#           [--reviewer <window> | --all-reviewers] [--refuse-live-reviewer]
 #                                             ORCHESTRATOR-ONLY: clear a
 #                                             skeptic-pending marker that a
 #                                             returned verdict failed to clear,
@@ -655,7 +656,7 @@ _await_heartbeat() {
 # your-org/nexus-code#615. `await` is bounded by --timeout, but a worker
 # re-enters it on every turn (the worker floor instructs exactly that),
 # and nothing reaped the PREVIOUS still-blocked waiter. Observed on
-# `kompot-spikeguard`: FIVE concurrent `skeptic-channel.sh await` on one
+# `proj-z-guard`: FIVE concurrent `skeptic-channel.sh await` on one
 # channel, arriving ~1/min, none exited, all `S`. Unbounded in principle
 # — one per worker turn, ~60/hour — and the stacked shells are counted
 # by `bg_shells`, so a leak volume was being read as worker liveness
@@ -864,7 +865,17 @@ _await_release_singleton() {
 _stamp_machine_input() {
     local window="$1" src="$2"
     [[ -n "$window" && -n "$src" ]] || return 0
-    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    # The ledger's path from its ONE resolver (your-org/nexus-code#1724): the
+    # relocated ledger while `ng degraded enter` is in force. Best-effort like
+    # the rest of this writer: an unusable pointer skips the stamp rather than
+    # writing a tree copy nothing reads.
+    local _mi_path
+    if { declare -F nexus_ledger_path >/dev/null 2>&1 || . "$_script_dir/_ledger_path.sh"; } 2>/dev/null; then
+        _mi_path=$(nexus_ledger_path "$STATE_DIR" 2>/dev/null) || return 0
+    else
+        _mi_path="$STATE_DIR/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+    fi
+    mkdir -p "${_mi_path%/*}" 2>/dev/null || return 0
     # Column 2 is MICROSECONDS since your-org/nexus-code#679, matching
     # paste-followup.sh and _lib.sh's _machine_input_stamp. This writer's
     # rows feed retire-preflight's `$1 == w` lookup, which takes a MAX
@@ -876,7 +887,7 @@ _stamp_machine_input() {
     _mi_epoch=$(date +%s%6N 2>/dev/null)
     [[ "$_mi_epoch" =~ ^[0-9]{16,}$ ]] || _mi_epoch=$(( $(date +%s) * 1000000 ))
     printf '%s\t%s\t%s\n' "$window" "$_mi_epoch" "$src" \
-        >> "$STATE_DIR/machine-input.tsv" 2>/dev/null || true
+        >> "$_mi_path" 2>/dev/null || true
 }
 
 cmd_init() {
@@ -1249,8 +1260,8 @@ cmd_await() {
         # optional act, so a skeptic that delivers a verdict and goes
         # idle without closing left the worker blocked forever.
         #
-        # Observed: `kompot-sg3-skeptic` delivered its verdict at
-        # 20:50:53 and went idle; `kompot-spikeguard` was still stacking
+        # Observed: `proj-z-sk3` delivered its verdict at
+        # 20:50:53 and went idle; `proj-z-guard` was still stacking
         # awaits at 23:32 on a channel holding nothing but a
         # `.await-heartbeat` it was refreshing itself. The heartbeat
         # proved THE WAITER was alive and was then read as evidence THE
@@ -1662,7 +1673,7 @@ cmd_close() {
         printf 'skeptic-channel: close %s — the channel is LEFT OPEN (exit 16): %s (your-org/your-nexus#414).\n' "$task" "$_cl_keep_why" >&2
         printf '  No DONE was written, no round was released and the pending marker is untouched.\n' >&2
         printf '  Each open round ends with its own verdict (ng wrap-up … --skeptic-role --skeptic-subject <report>);\n' >&2
-        printf '  `ng skeptic-obligations %s` lists them, `ng skeptic resolve %s --reason …` releases them on the record.\n' "$task" "$task" >&2
+        printf '  `ng skeptic-obligations %s` lists them, `ng skeptic resolve %s --reviewer <w> --reason …` releases one on the record (--all-reviewers for every live one, #1848).\n' "$task" "$task" >&2
         "$_script_dir/ng" log-action monitor --event skeptic-close-kept-open \
             --extra "task=$task" --extra "by=${NEXUS_WORKER_WINDOW:-orchestrator}" \
             --extra "reason=$_cl_keep_why" >/dev/null 2>&1 || true
@@ -1793,6 +1804,7 @@ _res_evidence_note() {
 cmd_resolve() {
     local task=""
     local reason="" disposition=0 delta_owed="" _delta_flag=0 withdraw_delta=0 _res_rat_failed=0
+    local reviewer="" all_reviewers=0 refuse_live=0
     local _a; for _a in "$@"; do [[ "$_a" == "--delta-owed" ]] && _delta_flag=1; done
     _argloop_prev_6=-1; while (( $# > 0 )); do (( $# != _argloop_prev_6 )) || _argloop_stuck "$1"; _argloop_prev_6=$#
         case "$1" in
@@ -1809,6 +1821,11 @@ cmd_resolve() {
             # THE PROMISE. See `_delta_owed_file` below.
             --delta-owed) delta_owed="${2:-}"; shift 2 || die "--delta-owed needs text: WHAT the delta review must cover" ;;
             --withdraw-delta) withdraw_delta=1; shift ;;
+            # WHICH REVIEW THIS SETTLES (your-org/nexus-code#1848). See the
+            # scoping block below the edge read.
+            --reviewer) reviewer="${2:-}"; shift 2 || die "--reviewer needs the reviewing window's name"; [[ -n "$reviewer" ]] || die "--reviewer needs the reviewing window's name" ;;
+            --all-reviewers) all_reviewers=1; shift ;;
+            --refuse-live-reviewer) refuse_live=1; shift ;;
             --*) die "unknown flag: $(_arg_excerpt "$1")" ;;
             *)  if [[ -z "$task" ]]; then task="$1"
                 else _die_positional "resolve" "$1" "--reason"; fi
@@ -1878,10 +1895,108 @@ EOF
     # to decide, because writing a resolution nobody needed suppresses a later
     # re-arm (#815), and `release` already owns the could-not-determine reply
     # (rc 8). The edge is settled below with every other reviewer of $task.
-    local _res_edges="" _res_live_edges=0
-    if _res_edges=$(_creditor_edges_pending "$task" "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}") \
-       && [[ -n "$_res_edges" ]]; then
-        _res_live_edges=1
+    local _res_edges="" _res_live_edges=0 _res_edge_rc=0
+    _res_edges=$(_creditor_edges_pending "$task" "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}") || _res_edge_rc=$?
+    # AN EDGE READ THAT DID NOT ANSWER IS NOT "NO LIVE EDGES" (skeptic
+    # ncbundle30-sk F2, your-org/nexus-code#1852). Read as empty, it stood down
+    # both #1848 refusals and the full path below settled `--creditor <task>` —
+    # every live edge, the incident's own act — and removed the marker and wrote
+    # RELEASED. Measured: a live edge, `--refuse-live-reviewer` (what a decline
+    # passes) and SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT=0.01 gave rc 0, the edge
+    # settled. So it fails CLOSED here, rc 8 (could not determine, the same code
+    # `release` uses), before anything is written. `--all-reviewers` is the one
+    # exception: it already means "settle every live review", known or not.
+    if (( _res_edge_rc != 0 && all_reviewers == 0 )); then
+        printf 'skeptic-channel: REFUSING to resolve %s — the obligation-edge ledger did not answer (rc %s%s), so whether a reviewer is still live CANNOT BE DETERMINED (your-org/nexus-code#1852 F2).\n' \
+            "$task" "$_res_edge_rc" "$( case "$_res_edge_rc" in 124|137|143) printf ', a timeout after %ss' "${SKEPTIC_RESOLVE_DISPOSITION_TIMEOUT:-60}" ;; esac )" >&2
+        printf '  Nothing was written and no edge was touched. Re-run once the ledger answers; to settle\n' >&2
+        printf '  every live review regardless, say so: ng skeptic resolve %q --all-reviewers --reason %q\n' "$task" "$reason" >&2
+        return 8
+    fi
+    [[ -n "$_res_edges" ]] && _res_live_edges=1
+    # ── A RESOLVE SETTLES THE REVIEW IT NAMES, NOT EVERY REVIEW OF ITS TARGET
+    #    (your-org/nexus-code#1848) ───────────────────────────────────────────
+    #
+    # This verb is keyed on the TARGET window, and it used to settle EVERY live
+    # edge naming that window as creditor. Measured 2026-10-16: one worker had
+    # concurrent skeptics on different PRs, and resolving after ONE of them
+    # landed (`gate-sk` on proj-x #275) credited `alerts-sk`'s #276 edge before
+    # alerts-sk had a verdict. That is #963 one level up.
+    #
+    # AND IT TOOK ONLY ONE LIVE EDGE. Edges supersede by TIME
+    # (`_obligations.sh`, release 1, the sk900->sk911 handover): alerts-sk's
+    # later edge had already voided gate-sk's, so the live set was {alerts-sk}
+    # (the OTHER reviewer) and "refuse when two are live" would not have fired.
+    # The defect is not the count; it is that the caller never said WHICH
+    # review it was settling. So, before ANY write:
+    #
+    #   · no live edge             → unchanged (marker / disposition resolves);
+    #   · any live edge, no flag   → REFUSED (rc 9), printing the exact command
+    #                                per live reviewer. The #961 ambiguous-N-arms
+    #                                shape: a choice the caller did not make is
+    #                                not made for them;
+    #   · --reviewer W             → settles ONLY W's edge. While other live
+    #                                edges remain, the marker, the ledger, the
+    #                                await and the delta record are LEFT ALONE:
+    #                                they belong to the target's still-pending
+    #                                reviews, and the last reviewer's own
+    #                                verdict (or a later resolve) clears them;
+    #   · --all-reviewers          → the old behaviour, on purpose and on the
+    #                                record;
+    #   · --refuse-live-reviewer   → REFUSED (rc 9) if ANY reviewer is live.
+    #                                Passed by `ng request reply --status
+    #                                declined`: declining a REQUEST must not
+    #                                discharge a review someone is still doing
+    #                                (ncbundle29, 2026-10-16).
+    #
+    # Fails toward REFUSING: an edge read that did not answer has already
+    # returned rc 8 above (unless --all-reviewers), so an empty `_res_edges`
+    # here is a POSITIVE "no live edge".
+    local _res_n_live=0 _res_partial=0 _res_others=""
+    (( _res_live_edges )) && _res_n_live=$(grep -c . <<<"$_res_edges")
+    local _res_live_list; _res_live_list=$(cut -f1 <<<"$_res_edges" | paste -sd, -)
+    if [[ -n "$reviewer" ]] && (( all_reviewers )); then
+        die "resolve: --reviewer and --all-reviewers contradict each other"
+    fi
+    if (( refuse_live && _res_n_live > 0 )); then
+        printf 'skeptic-channel: REFUSING to resolve %s — %d reviewer(s) still owe it a verdict on a LIVE edge: %s\n' \
+            "$task" "$_res_n_live" "$_res_live_list" >&2
+        printf '  Resolving would discharge that review before it lands (your-org/nexus-code#1848). Nothing was written.\n' >&2
+        return 9
+    fi
+    if [[ -n "$reviewer" ]]; then
+        # Capture, then test a herestring: piping cut into a quiet grep under pipefail can
+        # read 141 (SIGPIPE on cut when grep -q exits at its first match) and
+        # REFUSE a reviewer who IS live (test-sigpipe-assertion-lint).
+        local _res_debtors; _res_debtors=$(cut -f1 <<<"$_res_edges")
+        if ! grep -qxF -- "$reviewer" <<<"$_res_debtors"; then
+            printf 'skeptic-channel: REFUSING — %s has no LIVE edge to %s. Live reviewers of %s: %s\n' \
+                "$reviewer" "$task" "$task" "${_res_live_list:-none}" >&2
+            printf '  Nothing was written.\n' >&2
+            return 9
+        fi
+        _res_others=$(grep -vxF -- "$reviewer" <<<"$_res_debtors" | paste -sd, -)
+        if [[ -n "$_res_others" ]]; then
+            _res_partial=1
+            (( _delta_flag || withdraw_delta || disposition )) \
+                && die "resolve: --reviewer settles ONE review while others ($_res_others) are still live; --delta-owed, --withdraw-delta and --disposition are statements about the WHOLE gate — resolve the remaining reviews first"
+        fi
+    elif (( _res_n_live >= 1 && all_reviewers == 0 )); then
+        printf 'skeptic-channel: REFUSING — %s has %d LIVE reviewer(s) on obligation edges: %s\n' \
+            "$task" "$_res_n_live" "$_res_live_list" >&2
+        printf '  A resolve keyed on the target would settle them whichever review your --reason is\n' >&2
+        printf '  about (your-org/nexus-code#1848). Name the review this resolution settles:\n' >&2
+        local _rl_w
+        while IFS= read -r _rl_w; do
+            [[ -n "$_rl_w" ]] || continue
+            printf '      ng skeptic resolve %q --reviewer %q --reason %q\n' "$task" "$_rl_w" "$reason" >&2
+        done < <(cut -f1 <<<"$_res_edges")
+        printf '  If the review your --reason cites is NOT in that list, its edge is already gone\n' >&2
+        printf '  (superseded or settled): settle nothing here, and check `ng skeptic-evidence %s`.\n' "$task" >&2
+        printf '  Or, deliberately and on the record, every live review:\n' >&2
+        printf '      ng skeptic resolve %q --all-reviewers --reason %q\n' "$task" "$reason" >&2
+        printf '  Nothing was written.\n' >&2
+        return 9
     fi
     # THE READER THAT REFUSES THE WRAP-UP MUST BE THE READER THIS VERB CONSULTS
     # (orchestrator, 2026-09-18, merge4 addendum). `ng report-check` settles a
@@ -1985,7 +2100,17 @@ EOF
     # line the sibling PR fixes in this same batch.
     local had_marker=0
     [[ -e "$marker" ]] && had_marker=1
+    # A PARTIAL resolution must not write `.cleared-rationale` (skeptic
+    # ncbundle30-sk F1, your-org/nexus-code#1852). That file IS a whole-gate
+    # record: `_skeptic_resolution_state` reads it as "resolved" (so the next
+    # wrap-up prints REQUIRE GATE ALREADY RESOLVED and does NOT re-arm, #815 —
+    # a fix for the settled reviewer's CHECK would get no delta review), and
+    # retire-preflight check 1c is released by any rationale newer than the
+    # report. Its audit goes to `.reviewer-resolutions` instead, which no
+    # resolution reader consults. The rationale is written only when the
+    # resolution settles the LAST live edge (the full path).
     local rationale="$PENDING_DIR/.$(_safe "$task").cleared-rationale"
+    (( _res_partial )) && rationale="$PENDING_DIR/.$(_safe "$task").reviewer-resolutions"
     {
         printf '# skeptic-pending marker resolved via `skeptic-channel resolve` (your-org/nexus-code#577)\n'
         printf 'task-id  : %s\n' "$task"
@@ -1997,8 +2122,13 @@ EOF
             printf 'marker   : none (disposition-only release)\n'
         fi
         (( disposition )) && printf 'scope    : also releases retire-preflight check 1c (disposition: second-pass)\n'
-        (( _res_live_edges )) && printf 'scope    : settles the live obligation edge(s) naming %s as creditor (#1771): %s\n' \
-            "$task" "$(cut -f1 <<<"$_res_edges" | paste -sd, -)"
+        if (( _res_partial )); then
+            printf 'scope    : settles ONLY %s'"'"'s live edge to %s (#1848); still LIVE and untouched: %s — marker, ledger and await are left for them\n' \
+                "$reviewer" "$task" "$_res_others"
+        elif (( _res_live_edges )); then
+            printf 'scope    : settles the live obligation edge(s) naming %s as creditor (#1771): %s\n' \
+                "$task" "$(cut -f1 <<<"$_res_edges" | paste -sd, -)"
+        fi
         # skprotosk G1: a resolution that SETTLES A COMPLETED ROUND (no marker,
         # nothing outstanding, a verdict already delivered) declines nothing, so
         # it must not feed the #815 "ALREADY RESOLVED — NOT RE-ARMING" arm: a
@@ -2024,6 +2154,31 @@ EOF
             printf '%s\t%s\t%s\n' "$(_now_iso)" "$_cv_sha" "$_cv_rp" \
                 >> "$PENDING_DIR/.$(_safe "$task").disposition-cover" 2>/dev/null || true
         fi
+    fi
+    # A PARTIAL resolution (#1848) stops here, after the rationale: it settles
+    # the ONE named edge and none of the whole-gate records below — the ledger
+    # `resolved` row closes the WHOLE outstanding set, RELEASED ends the
+    # target's await, and the marker is the gate the remaining reviews still
+    # hold. Writing any of them would be the defect this verb now refuses.
+    if (( _res_partial )); then
+        local _rp_rc=0 _rp_err=""
+        _rp_err=$( "$_script_dir/obligations.sh" settle --creditor "$task" --debtor "$reviewer" \
+            --by "skeptic-channel.sh resolve" \
+            --reason "orchestrator resolved $reviewer's review of $task on the record: $reason" \
+            2>&1 >/dev/null ) || _rp_rc=$?
+        "$_script_dir/ng" log-action monitor --event skeptic-resolve \
+            --extra "task=$task" --extra "scope=reviewer" --extra "reviewer=$reviewer" \
+            --extra "left-live=$_res_others" --extra "reason=$reason" >/dev/null 2>&1 || true
+        if (( _rp_rc != 0 )); then
+            printf 'resolve: %s'"'"'s edge to %s was NOT settled (rc %s: %s). Settle it by hand: monitor/obligations.sh settle --creditor %s --debtor %s --reason "<why>"\n' \
+                "$reviewer" "$task" "$_rp_rc" "${_rp_err%%$'\n'*}" "$task" "$reviewer"
+            return 1
+        fi
+        printf 'resolved %s'"'"'s review of %s ONLY: its edge is settled; still LIVE and untouched: %s\n' "$reviewer" "$task" "$_res_others"
+        printf 'the marker, the ledger and any await on %s are left for those reviews: their verdicts (or a later resolve) clear them\n' "$task"
+        if (( ${_res_rat_failed:-0} )); then printf 'audit NOT appended (write failed): %s\n' "$rationale"
+        else printf 'audit appended (NOT the gate'"'"'s resolution record, which stays unwritten while reviews remain): %s\n' "$rationale"; fi
+        return 0
     fi
     # AND RECORD IT WHERE THE KILL PATH LOOKS (your-org/nexus-code#961).
     #
@@ -2124,7 +2279,9 @@ EOF
     # when the settle had failed (skeptic nit on PR #1781).
     local _res_settle_rc=0 _res_settle_err=""
     if [[ -x "$_script_dir/obligations.sh" ]]; then
-        _res_settle_err=$( "$_script_dir/obligations.sh" settle --creditor "$task" \
+        local -a _res_sel=(--creditor "$task")
+        [[ -n "$reviewer" ]] && _res_sel+=(--debtor "$reviewer")
+        _res_settle_err=$( "$_script_dir/obligations.sh" settle "${_res_sel[@]}" \
             --by "skeptic-channel.sh resolve" \
             --reason "orchestrator resolved $task's skeptic gate on the record: $reason" \
             2>&1 >/dev/null ) || _res_settle_rc=$?
@@ -2329,7 +2486,8 @@ cmd_release() {
         (( ${#doubt[@]} )) && printf '  - (also could not answer) %s\n' "${doubt[@]}" >&2
         printf '  `release` ends a WAIT on an already-discharged gate; it never discharges one. If the\n' >&2
         printf '  orchestrator is DECLINING the review, that is `ng skeptic resolve %s --reason "…"`\n' "$task" >&2
-        printf '  (audited, and it releases the await itself). Nothing was written.\n' >&2
+        printf '  (audited, and it releases the await itself). While a reviewer'"'"'s edge is live it must\n' >&2
+        printf '  name it: `--reviewer <w>` (or `--all-reviewers`), your-org/nexus-code#1848. Nothing was written.\n' >&2
         return 7
     fi
     if (( ${#doubt[@]} )); then

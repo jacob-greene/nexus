@@ -111,3 +111,45 @@ cause_classify_error() {
     printf 'unknown\tpaste'
     return 0
 }
+
+# cause_classify_class <error_token> <last_assistant_message>
+#   → prints `transport` | `server` | `other`, exit 0.
+#
+# The ERROR CLASS, a second axis beside `category` (your-org/nexus-code#1845).
+# `category` cannot carry it: the harness reports a DNS failure and an
+# Anthropic 500 with the SAME token, `server_error` — measured on all 35
+# EAI_AGAIN StopFailure payloads of 2026-10-15 — so both classify
+# `transient:paste` above, and `category` is a field other modules SELECT on
+# (#1050), so re-labelling one of them would change every reader. This is a
+# separate function, read only by `monitor/watcher/_api_hold.sh`.
+#
+#   transport  the request never reached the API: resolution, connect, reset.
+#              Matched on the MESSAGE (the token cannot tell it apart) by the
+#              Node/libc error names and the harness's own copy, `Can't reach
+#              the API server — check your internet or DNS (EAI_AGAIN)`; plus
+#              the `connection_error` token, should a release emit it.
+#   server     the API answered with a failure (5xx, overloaded).
+#   other      everything else, including an empty input.
+#
+# Ordered transport FIRST: a message that names both (a 503 page served by a
+# proxy that then reset) is a transport failure from where the nexus stands.
+cause_classify_class() {
+    local errl msgl
+    errl=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    msgl=$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')
+    case "$errl" in
+        connection_error|api_connection_error) printf 'transport'; return 0 ;;
+    esac
+    case "$msgl" in
+        *eai_again*|*enotfound*|*econnrefused*|*econnreset*|*etimedout*|*ehostunreach*|*enetunreach*|*"reach the api server"*|*"connection error"*)
+            printf 'transport'; return 0 ;;
+    esac
+    case "$errl" in
+        server_error|overloaded_error|overloaded|api_error) printf 'server'; return 0 ;;
+    esac
+    case "$msgl" in
+        *"api error: 5"*|*overloaded*|*"internal server error"*) printf 'server'; return 0 ;;
+    esac
+    printf 'other'
+    return 0
+}

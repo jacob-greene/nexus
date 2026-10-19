@@ -103,6 +103,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 # your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
 cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
+# your-org/nexus-code#1856: the Artifact-only-body warning's rule lives here.
+cp "$(dirname "$NG_REAL")/artifact-link-check.sh" "$FAKE_NEXUS/monitor/artifact-link-check.sh"
 # …and source it HERE too: this suite computes a marker key itself
 # (your-org/nexus-code#941), and a test that hard-codes the key it is checking
 # re-creates the coupling the injective key exists to remove.
@@ -968,6 +970,34 @@ assert_contains  "custom prose preserved"              "$body" \
                  "Custom prose that does not reference"
 assert_contains  "footer appended with asset URL"      "$body" \
                  "Full report: https://github.com/asset-org"
+
+# ---- Test 12b/12c: an Artifact-only body WARNS, never blocks (#1856) ----
+#
+# The link comment always carries the REPORT's asset URL, so the check runs on
+# the body WITHOUT it: a Summary or --comment-body-file whose only copy of a
+# deliverable is a claude.ai Artifact must still warn (12b), and the same body
+# with a nexus asset beside the Artifact must not (12c). Both still post.
+
+echo '=== 12b: --comment-body-file naming only a claude.ai Artifact → WARNING, still posted ==='
+ART_BODY="$WORK/artifact-only-body.md"
+printf '%s\n' 'The research plan is ready for review: https://claude.ai/code/artifact/0123abcd-plan' > "$ART_BODY"
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" \
+    --comment-body-file "$ART_BODY" --repo override-org/override-repo
+assert_eq        "12b exit 0: a warning never blocks the hand-off"  "$rc" "0"
+assert_contains  "12b stderr carries the #1856 WARNING"          "$stderr" "your-org/nexus-code#1856"
+assert_contains  "12b the WARNING names ng upload"                "$stderr" "monitor/ng upload"
+body=$(jq -r '.body // ""' < "$BODY_CAPTURE" 2>/dev/null)
+assert_contains  "12b the comment was still POSTED"               "$body" "claude.ai/code/artifact/0123abcd-plan"
+
+echo '=== 12c: the same body WITH a nexus asset beside the Artifact → no WARNING ==='
+printf '%s\n' 'The research plan: https://github.com/asset-org/assets/blob/abc123/assets/42/plan.md' \
+               '(an interactive copy: https://claude.ai/code/artifact/0123abcd-plan)' > "$ART_BODY"
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" \
+    --comment-body-file "$ART_BODY" --repo override-org/override-repo
+assert_eq           "12c exit 0"                                  "$rc" "0"
+assert_not_contains "12c no #1856 WARNING when an asset sits beside it" "$stderr" "your-org/nexus-code#1856"
 
 # ---- Test 13: --no-comment skips step 2 entirely ------------------------
 
@@ -1954,7 +1984,7 @@ unset MOCK_TMUX MOCK_TMUX_WINDOW
 #
 # This WORKER topology — a `require` decision beside a stated
 # `no-further-pass` — used to proceed and file `recommendation: DISPUTED`.
-# That is the exact shape `jcdeck` produced, and the contradiction was
+# That is the exact shape `deckw1` produced, and the contradiction was
 # caught only by the request-body diagnostic in an adjacent subsystem while
 # `retire-preflight` read the permissive field as its first gate. The worker
 # path now REFUSES it at wrap-up, before anything is armed or filed. The
@@ -2280,6 +2310,12 @@ assert_contains "the contradiction text rides the body"    "$body" \
 # that actually matters.
 cp "$_test_dir/../skeptic-channel.sh" "$FAKE_NEXUS/monitor/skeptic-channel.sh"
 chmod +x "$FAKE_NEXUS/monitor/skeptic-channel.sh"
+# The edge ledger every real tree ships (your-org/nexus-code#1852 F2): resolve
+# now fails CLOSED (rc 8) when it cannot read the obligation edges, so a fake
+# monitor dir without the ledger tool is a read that cannot answer.
+cp "$_test_dir/../obligations.sh" "$FAKE_NEXUS/monitor/obligations.sh"
+cp "$_test_dir/../_obligations.sh" "$FAKE_NEXUS/monitor/_obligations.sh"
+chmod +x "$FAKE_NEXUS/monitor/obligations.sh"
 SK_PENDING="$STATE_DIR/skeptic/pending"
 
 echo '=== #815: CONTROL — a first-pass require ARMS the marker ==='

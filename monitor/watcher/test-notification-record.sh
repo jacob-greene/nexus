@@ -37,13 +37,24 @@ STRUCT="$STATE/worker-notifications.jsonl"
 
 EVENT='{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash","session_id":"abc123"}'
 
+# THE PAYLOAD ARRIVES BY REDIRECT FROM A FILE, NEVER BY `printf … | hook`
+# (your-org/nexus-code#1861). The hook exits before reading stdin on several
+# fail-open paths (NEXUS_ROOT unset, an uncreatable state dir), and under this
+# suite's `pipefail` a writer that loses that race takes SIGPIPE: the pipeline
+# returns 141 and the "still exits 0" assertions read a red that belongs to
+# printf, not to the hook. A file redirect has no writer to kill, so the status
+# read below is the HOOK's exit status and nothing else — the assertion is not
+# weakened, it is made to measure what it names. The bytes are identical
+# (`printf '%s'` into the file, no trailing newline, as before).
+EVENT_FILE="$WORK/event.json";   printf '%s' "$EVENT" > "$EVENT_FILE"
+NOTJSON_FILE="$WORK/notjson";    printf 'not json at all' > "$NOTJSON_FILE"
+
 run_hook() {  # run_hook <window-env-assignments...>
     # Clear the ambient window vars first: this suite may itself run inside a
     # nexus worker, whose NEXUS_WORKER_WINDOW would otherwise leak in and make
     # the orchestrator call-site case indistinguishable from the worker one.
-    printf '%s' "$EVENT" \
-        | env -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW \
-              NEXUS_ROOT="$ROOT" "$@" "$HOOK"
+    env -u NEXUS_WORKER_WINDOW -u NEXUS_ORCHESTRATOR_WINDOW \
+        NEXUS_ROOT="$ROOT" "$@" "$HOOK" < "$EVENT_FILE"
 }
 
 echo '=== worker call site: both journals written, one event each ==='
@@ -95,18 +106,31 @@ rotated=$(find "$STATE" -maxdepth 1 -name 'worker-notifications.jsonl.*' | wc -l
 echo '=== FAILS OPEN: never propagate a bookkeeping failure into the gate ==='
 # Unwritable state tree — the 2026-07-09 shape.
 RO="$WORK/ro"; mkdir -p "$RO/monitor/.state"; chmod 500 "$RO/monitor/.state"
-rc=0; printf '%s' "$EVENT" | env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$RO" NEXUS_WORKER_WINDOW=w7 "$HOOK" >/dev/null 2>&1 || rc=$?
+rc=0; env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$RO" NEXUS_WORKER_WINDOW=w7 "$HOOK" < "$EVENT_FILE" >/dev/null 2>&1 || rc=$?
 chmod 700 "$RO/monitor/.state"
 [[ "$rc" == 0 ]] && ok "unwritable state dir → still exits 0" || bad "read-only tree" "rc=$rc"
 
-rc=0; printf '%s' "$EVENT" | env -u NEXUS_ROOT -u NEXUS_WORKER_WINDOW "$HOOK" >/dev/null 2>&1 || rc=$?
+rc=0; env -u NEXUS_ROOT -u NEXUS_WORKER_WINDOW "$HOOK" < "$EVENT_FILE" >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "NEXUS_ROOT unset → still exits 0" || bad "no NEXUS_ROOT" "rc=$rc"
 
-rc=0; printf 'not json at all' | env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$ROOT" NEXUS_WORKER_WINDOW=w7 "$HOOK" >/dev/null 2>&1 || rc=$?
+rc=0; env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$ROOT" NEXUS_WORKER_WINDOW=w7 "$HOOK" < "$NOTJSON_FILE" >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "malformed payload → still exits 0" || bad "malformed payload" "rc=$rc"
 
-rc=0; printf '' | env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$ROOT" NEXUS_WORKER_WINDOW=w7 "$HOOK" >/dev/null 2>&1 || rc=$?
+rc=0; env -u NEXUS_ORCHESTRATOR_WINDOW NEXUS_ROOT="$ROOT" NEXUS_WORKER_WINDOW=w7 "$HOOK" < /dev/null >/dev/null 2>&1 || rc=$?
 [[ "$rc" == 0 ]] && ok "empty payload → still exits 0" || bad "empty payload" "rc=$rc"
+
+# POTENCY of the redirect form (#1861): it must still REPORT a non-zero hook.
+# A stand-in that exits 3 WITHOUT reading stdin (the race's exact shape) read
+# through the same construct must give 3 — neither 0 (masked) nor 141 (the
+# writer's signal), on every one of 50 attempts.
+STANDIN="$WORK/exits-3-unread.sh"; printf '#!/bin/sh\nexit 3\n' > "$STANDIN"; chmod +x "$STANDIN"
+_pot_bad=0
+for _i in $(seq 1 50); do
+    rc=0; env -u NEXUS_ROOT "$STANDIN" < "$EVENT_FILE" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 3 ]] || _pot_bad=$(( _pot_bad + 1 ))
+done
+[[ "$_pot_bad" == 0 ]] && ok "redirect form reports an unread non-zero exit exactly (50/50)" \
+    || bad "redirect potency" "$_pot_bad of 50 attempts did not read rc 3"
 
 echo '=== the settings files reference the hook, not an inline pipeline ==='
 for f in monitor/worker-settings.json monitor/orchestrator-settings.json; do

@@ -163,6 +163,33 @@ auto-trim: what to drop is editorial judgement, and a publish verb that
 quietly publishes something other than what it was handed is the same defect
 wearing better clothes.
 
+## Two modes — `status_surface.kind` (<your-org>/nexus-code#1839)
+
+The dashboard is the DEFAULT status surface, not the only one. An operator
+may run their own status page and opt out in `config/nexus.yml`:
+
+```yaml
+status_surface:
+  kind: external                        # default: overview-dashboard
+  url_file: work/status-page/.deploy/endpoint   # optional; first line = URL
+  feed: work/status-page/landings.tsv   # optional; the page's landings file
+```
+
+| | `overview-dashboard` (default; also an ABSENT key) | `external` |
+|---|---|---|
+| orchestrator | maintains the dashboard as above | does NOT maintain it; skip the render step |
+| watcher emit | `--- dashboard ---` with the last put stamp | `--- status surface ---`: the page URL and the feed path, no put asked for |
+| `ng dashboard put` | as above | still works, prints a one-line note |
+| identity block, routing | unchanged | unchanged — `#1` stays the routing surface |
+
+Any other kind is refused by `config/load.sh --validate` (so the watcher will
+not start), by `ng dashboard put`, and is flagged as a `CONFIG ERROR` in the
+emit — never read as the default, since that would restore the nudges the
+operator opted out of. Read the effective value with
+`config/load.sh status_surface.kind overview-dashboard`. Appending to the feed
+is the operator's page's format, so the nexus names the file and does not
+write it.
+
 ## Consistency with the rest of the nexus
 
 - The identity block is **metadata, not content** — it does not

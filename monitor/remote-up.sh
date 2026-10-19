@@ -706,7 +706,10 @@ EOF
 
   Enroll a client (secret token delivered OUT-OF-BAND, never on GitHub):
     monitor/ng remote issue-token --principal <name>     # prints token to THIS session only
-    monitor/ng remote enroll --principal <name> --pubkey <client.pub> --token <TOKEN>
+    printf '%s\n' '<TOKEN>' | monitor/ng remote enroll --principal <name> --pubkey <client.pub> --token-stdin
+    # --token-stdin, never --token: argv is world-readable in /proc for the life
+    # of the process (your-org/nexus-code#1846 skeptic N2). printf is a builtin
+    # in bash and zsh, so the token reaches no process's argv.
 
   Manage:
     monitor/svc.sh status | logs $SERVICE_NAME | restart $SERVICE_NAME

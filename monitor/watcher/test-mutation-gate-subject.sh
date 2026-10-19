@@ -53,7 +53,7 @@ gp_handle "$@"
 
 # shellcheck source=monitor/watcher/_test_helpers.sh
 . "$_test_dir/_test_helpers.sh"
-EXPECTED_ASSERTIONS=127   # counted BEFORE the census assertion itself
+EXPECTED_ASSERTIONS=136   # counted BEFORE the census assertion itself
 
 [[ -x "$GATE" ]] || { echo "missing/non-executable $GATE" >&2; exit 1; }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/mgsubj-$$-XXXXXX") || { echo "cannot mktemp" >&2; exit 2; }
@@ -186,6 +186,25 @@ escapes 1000; rc=$?
 if [ "$rc" = 1 ]; then printf '  PASS: T1: past grace holds\n'; else printf '  FAIL: T1: past grace holds — got %s want 1\n' "$rc" >&2; fi
 printf '=== summary: %d passed, %d failed ===\n' "$(( rc == 1 ))" "$(( rc != 1 ))"
 [ "$rc" = 1 ]
+EOF
+# A suite in the `ok:` vocabulary (#1823): 24 tracked suites print `ok:   <label>`
+# (test-bootstrap-recover, test-svc, …) or the padded `  ok   <label>` column,
+# with `FAIL: ` / `  FAIL ` on the other side and no `PASS:` line at all. One
+# case of each spelling, plus a prose line that must NOT be read as a case.
+cat > "$FX/t/test-okvocab.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$_d/../lib/hold.sh"
+F=0
+echo "ok so the fixture starts"
+escapes 60
+if [ "$?" = 1 ]; then echo "ok:   OK1 a fresh hold does not escape"; else echo "FAIL: OK1 a fresh hold does not escape" >&2; F=$((F+1)); fi
+escapes 1000
+if [ "$?" = 1 ]; then echo "ok:   OK2 past grace, under the threshold does not escape"; else echo "FAIL: OK2 past grace, under the threshold does not escape" >&2; F=$((F+1)); fi
+escapes 3599
+if [ "$?" = 1 ]; then printf '  ok   %s\n' "OK3 one second under the threshold"; else printf '  FAIL %s\n' "OK3 one second under the threshold"; F=$((F+1)); fi
+[ "$F" -eq 0 ]
 EOF
 printf 'not shell at all\n' > "$FX/lib/notes.txt"
 cp "$FX/lib/hold.sh" "$WORK/elsewhere/hold.sh"
@@ -479,6 +498,22 @@ bash "$SUITE" > "$WORK/cap.out" 2>/dev/null
 run s9c --provenance "$WORK/ledger.tsv" --suite "$SUITE" --labels-from "$WORK/cap.out"
 assert_contains "§9 --labels-from gives the same tally without a run" "$(out s9c)" "9 case(s) — 3 GUARDED, 0 GUARDED-STALE, 6 NEVER-KILLED"
 assert_not_contains "§9 …and really did not run the suite" "$(out s9c)" "=== running"
+# A LABEL HOLDING A BACKSLASH matches its own row (#1873). `--provenance` once
+# read the case key through `awk -v`, which processes escape sequences, so
+# `$'\''` became `$''` and the three #1870 item-3 MUST-FIX cases read
+# NEVER-KILLED with kill rows on file. The row is a REAL recorded kill row
+# (current blobs) with only its case column rewritten, and the capture is the
+# real one plus that case's PASS line — so the only variable is the label.
+BS_LABEL='#1873 a label with $'"'"'\'"'"''"'"' and \n and \\ and a trailing \'
+cp "$WORK/ledger.tsv" "$WORK/ledger-bs.tsv"
+IFS=$'\t' read -r -a _f < <(awk -F'\t' '$2=="killed-by-assertion" { print; exit }' "$WORK/ledger.tsv")
+_f[9]="$BS_LABEL"
+( IFS=$'\t'; printf '%s\n' "${_f[*]}" ) >> "$WORK/ledger-bs.tsv"
+{ cat "$WORK/cap.out"; printf 'PASS: %s\n' "$BS_LABEL"; } > "$WORK/cap-bs.out"
+run s9e --provenance "$WORK/ledger-bs.tsv" --suite "$SUITE" --labels-from "$WORK/cap-bs.out"
+assert_contains "§9 #1873 a backslash-carrying label reads GUARDED from its own row" "$(out s9e)" "GUARDED        $BS_LABEL   ["
+assert_not_contains "§9 #1873 …and NOT NEVER-KILLED" "$(out s9e)" "NEVER-KILLED   $BS_LABEL"
+assert_contains "§9 #1873 …so the tally gains one GUARDED, nothing else moves" "$(out s9e)" "10 case(s) — 4 GUARDED, 0 GUARDED-STALE, 6 NEVER-KILLED"
 
 # ── §9d  THE TRACKED LEDGER ─────────────────────────────────────────────────
 # monitor/watcher/mutation-provenance.tsv is written only by `--record`. A
@@ -532,6 +567,22 @@ assert_eq "§11 G13: the root check no longer globs the whole verdict line" \
 assert_eq "§11 G13: …it asks repo-root.sh for the kind and compares for equality" \
     "$(grep -o -F '[ "$rr_kind" = linked-worktree ] && rr_ok=1' "$GATE" | wc -l | tr -d ' ')" "1"
 git -C "$FX" worktree remove --force "$WT" > /dev/null 2>&1 || true
+
+# ── §12  THE `ok:` VOCABULARY is read (your-org/nexus-code#1823) ────────────
+# Before #1823 the case parser read only `PASS: <label>`, so this suite printed
+# "0 case label(s)" and every --predict was REFUSED. The colon form, the padded
+# column form, and both FAIL spellings are driven; "ok so …" is prose.
+echo '=== §12 a suite that labels its cases ok: / "  ok   " is gated ==='
+printf '%s\n' '+OK2 past grace' '+OK3 one second under' '-OK1 a fresh hold' > "$WORK/p12"
+run s12 --suite "$FX/t/test-okvocab.sh" --subject "$SUBJ" --line "$L_THRESH" --predict "$WORK/p12"
+assert_eq       "§12 rc 0: the ok:-labelled prediction is CONFIRMED, not refused" "$RC" "0"
+assert_contains "§12 the colon form is a case that flipped" "$(out s12)" "FLIPPED: OK2 past grace, under the threshold does not escape"
+assert_contains "§12 the padded-column form is a case that flipped" "$(out s12)" "FLIPPED: OK3 one second under the threshold"
+assert_not_contains "§12 prose starting 'ok ' is not a case" "$(out s12)" "fixture starts"
+printf '%s\n' '+so the fixture starts' > "$WORK/p12b"
+run s12b --suite "$FX/t/test-okvocab.sh" --subject "$SUBJ" --line "$L_THRESH" --predict "$WORK/p12b"
+assert_eq       "§12 control: a prediction naming the PROSE line is refused as naming no case (rc 3)" "$RC" "3"
+assert_contains "§12 …and the baseline count is the three ok cases" "$(out s12b)" "printed 3 case label(s)"
 
 # ASSERTION CENSUS — the exact-count guard (your-org/nexus-code#807).
 _total=$(( ${PASS:-0} + ${FAIL:-0} + ${SKIP:-0} ))

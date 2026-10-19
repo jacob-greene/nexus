@@ -817,14 +817,19 @@ ng obligation pairs                  # every live dependency on the board
 ng obligation settle --debtor "$WIN" --reason "<where it landed, or why it is no longer owed>"
 ```
 
-`ng skeptic resolve <target>` also ends it — adjudicating a target's gate as
-done is a statement about the pairing, so it discharges every reviewer of that
-window (`<your-org>/nexus-code#926` F5).
+`ng skeptic resolve <target> --reviewer <w>` also ends it. It settles that ONE
+reviewer's edge, and naming the reviewer is required while any edge is live
+(`<your-org>/nexus-code#1848`). `--all-reviewers` discharges every reviewer of
+the window on purpose, which is the pre-#1848 default
+(`<your-org>/nexus-code#926` F5).
 
 **The normal ending is `ng skeptic close <target>`** — the step the skeptic
 protocol has always specified for the final reviewer, which also releases the
-target's `await` loop (exit 10). Supersession by a later reviewer and the
-creditor leaving tmux release automatically. Reach for `settle` only when the
+target's `await` loop (exit 10). Supersession by a later reviewer of the SAME
+review and the creditor leaving tmux release automatically. A later reviewer
+is a handover only when both edges carry the same `--skeptic-subject`, or when
+it was pinned after this reviewer filed a verdict. A CONCURRENT review of
+something else releases nothing (`<your-org>/nexus-code#1849`). Reach for `settle` only when the
 pairing ended some other way — and note that the
 symmetric case (a target owed a verdict) is check 1b's, not this one's.
 
@@ -1267,7 +1272,9 @@ not available and the fresh-spawn path is the only option —
 
 The dashboard's running-agents table updates on the next
 `monitor/ng dashboard put`, folded into the next wake
-naturally — no separate dashboard step needed.
+naturally — no separate dashboard step needed (and none at all when
+`status_surface.kind` is `external` in `config/nexus.yml`:
+`skills/nexus.dashboard/SKILL.md` "Two modes").
 
 ## Cadence
 

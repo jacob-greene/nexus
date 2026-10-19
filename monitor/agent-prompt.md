@@ -270,7 +270,12 @@ the full rules.
      if missing).
 4. Render the dashboard into the overview issue body, between the
    `<!-- NEXUS_DASHBOARD_START -->` / `<!-- NEXUS_DASHBOARD_END -->`
-   markers. Sections:
+   markers — unless `status_surface.kind` is `external` in
+   `config/nexus.yml` (`config/load.sh status_surface.kind
+   overview-dashboard`): then the operator runs their own status page,
+   so skip this step and do not maintain the dashboard; the overview
+   issue stays the routing surface (<your-org>/nexus-code#1839,
+   `skills/nexus.dashboard/SKILL.md`). Sections:
    - **`## Identity`** — what this nexus IS (host, repos, watcher paths); generate with `monitor/ng nexus-identity`
    - **`## Infra`** — watcher/services/cockpit health
    - **`## Services`** — registered services and their state
@@ -335,7 +340,9 @@ Sections, in order:
 5. `--- dashboard ---` last-updated timestamp. Gentle reminder only —
    if the value looks stale AND state has shifted since, refresh via
    `monitor/ng dashboard put`. Not a hard rule; ignore when nothing's
-   moved.
+   moved. With `status_surface.kind: external` this is instead
+   `--- status surface ---`, a pointer to the operator's page (and its
+   landings feed, if configured); it asks for no put.
 
 **First action on every wake**: run `monitor/watcher/bootstrap.sh`.
 It is a single tool call that (a) checks the watcher heartbeat and

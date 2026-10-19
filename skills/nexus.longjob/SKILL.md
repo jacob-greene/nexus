@@ -48,11 +48,44 @@ you deliberately fire-and-forget: `monitor/declare-no-wait.sh slurm <id>`
 first, and no watch is added. Manual form, for a job id you got some other
 way: `monitor/ng longjob add slurm:<jobid> --desc "…"`.
 
+**Slurm state is not the whole truth** (<your-org>/nexus-code#1841). Two gaps,
+both measured here:
+
+- **`--time` is not a bound.** `scontrol show config | grep OverTimeLimit` read
+  `2160 min`: Slurm runs a job up to 36 h past its `--time`. A RUNNING watched
+  job whose elapsed time exceeds its limit prints ONE line per watch,
+  `RUNNING <id> | … | OVERTIME (warned once): past its --time …`, and stays
+  watched (it is not terminal). An `UNLIMITED` or unreadable limit never warns.
+  The bound that holds is the job script's own `timeout -k 60 <N> <cmd>`.
+- **RUNNING after the payload ended.** A node with a DNS fault held jobs
+  RUNNING/COMPLETING after their payload exited. Have the script write the
+  real step's rc to a file and pass it at add time:
+
+  ```bash
+  # last lines of the job script
+  timeout -k 60 21000 ./build.sh; rc=$?
+  echo "$rc" > /abs/path/build.rc
+  exit "$rc"
+  ```
+  `monitor/ng longjob add slurm:<jobid> --payload-rc /abs/path/build.rc`.
+  When the launch hook already auto-watched that sbatch (`auto-slurm-<jobid>`),
+  the add ATTACHES the rc file to that watch and prints `merged: … that watch
+  now carries --payload-rc …` instead of creating a second one, so the job
+  wakes you once; a different rc file for the same job is refused
+  (<your-org>/nexus-code#1846).
+  Once the file holds an integer 0..255 the watch ends DONE (rc 0) or FAILED
+  with `payload rc=N: RUNNING after payload end … scancel <id>` while Slurm
+  still says RUNNING, and a nonzero rc beside Slurm's `COMPLETED` reads FAILED.
+  The path must be absolute and must NOT exist at add time (a stale rc would
+  end the watch at once). Content that is not 0..255 is REFUSED, never read as
+  a number: `unknown` while Slurm says the job is live, so the bounded retry
+  rides out a torn write and then emits UNKNOWN naming the content.
+
 **Anything else — `add <kind>:<target>`:**
 
 | kind | target | terminal when |
 |---|---|---|
-| `slurm:` | job id | sacct reports any terminal state; UNKNOWN if never in accounting |
+| `slurm:` | job id `[--payload-rc FILE]` | sacct reports any terminal state, or FILE holds the payload's rc; UNKNOWN if never in accounting |
 | `asyncrun:` | async-run token | the runner wrote its status (`done` rc 0, `failed` otherwise, `failed\|died` if the pid vanished with no status) |
 | `pid:` | pid (start-time pinned at add) | the process is gone — **exit status NOT retained**; use `asyncrun:` when the rc matters |
 | `file:` | path, `--when exists\|grew\|match --pattern ERE [--fail-pattern ERE\|none]` | the predicate holds; for `match`, FAILED on a failure-arm line written after the add and before any success line (a default arm applies; `add` prints it) |
@@ -204,7 +237,7 @@ DEAD incarnation's dispatcher (reparented to init, still polling) holding the
 ledger and refused to arm. The orphan then retired terminal watches into a
 pipe nobody read (measured on `lsc2`: 7 × `done write-failed`, including a
 2335 s suite), and the window could not be retired either (next paragraph).
-Three rules now close that, each pinned by `test-longjob-watch.sh` (`#1623a`–`e`):
+Three rules now close that, each pinned by `test-longjob-watch-ledger.sh` (`#1623a`–`e`):
 
 - **A dispatcher exits when its claude is gone.** At arm it records its OWNER,
   the nearest `claude` above it, as `owner_pid` + `owner_start` (/proc start
@@ -374,5 +407,6 @@ own fire.
 - `monitor/longjob-plugin/` — the plugin manifest + `dispatch.sh`
 - `monitor/_longjob-plugin.sh` — the fail-open launcher helper
 - `config/nexus.example.yml` `monitor.longjob.*` — kill switch, caps, cadence
-- suites: `test-longjob-watch.sh`, `test-longjob-plugin-arming.sh`,
+- suites: `test-longjob-watch.sh`, `test-longjob-watch-ledger.sh` (one suite
+  until `#1877` split it, sharing `_longjob-watch-rig.sh`), `test-longjob-plugin-arming.sh`,
   `test-pane-state-longjob-discount.sh`

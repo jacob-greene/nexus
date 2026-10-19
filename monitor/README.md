@@ -528,6 +528,18 @@ Three pieces:
      escalates to the orchestrator and lets it decide. For services where a
      blind restart is unsafe or wants human judgment.
 
+   **A requested stop is not an outage** (<your-org>/nexus-code#1827).
+   `svc.sh stop <name>` writes `.state/services/<name>.stop-requested`
+   (`at`/`iso`/`by`); while it stands a DOWN service opens no incident, is
+   never restarted and never emitted (one `stopped-by-request` event, and an
+   incident already open is closed), the `bootstrap-recover.sh` sweep behind
+   `up`/boot skips it, and an automated `svc.sh restart`
+   (`SVC_RESTART_ACTOR` set, i.e. watcher or version-restart) is refused with
+   rc 76. An explicit `svc.sh start|restart <name>` clears it; so does a
+   supervisor launched after the stop and observed healthy
+   (`stop-request-superseded`). No `status` token was added: the state lives in
+   the sentinel and a `<name>.stop-noted` sidecar.
+
    It **never degrades or falsifies** the service to make a check pass — the
    only ever action is an honest restart. Per-service incident state —
    first-unhealthy → restored timestamps, the policy in effect, whether it
@@ -1619,6 +1631,9 @@ unique to `ng`.
      (<your-org>/nexus-code#886). One literal (`IDENTITY_HEADING` in
      `monitor/ng`) feeds the generator, the pointer prose and the
      validator's accepted set, so a rename moves all three.
+     An operator running their own status page sets
+     `status_surface.kind: external` in `config/nexus.yml`, and the
+     dashboard is then not maintained (<your-org>/nexus-code#1839).
      See `skills/nexus.dashboard/SKILL.md`.
 
          <!-- NEXUS_DASHBOARD_START -->
@@ -1669,7 +1684,11 @@ mobile browser).
 `ng upload` is a thin shim over `monitor/upload-asset.sh` (same flags,
 same output). The uploader maintains a local clone of the asset repo
 at `<nexus_root>/assets/` (gitignored), copies the file into
-`assets/<repo-path>`, commits as the bot, and pushes to `main`.
+`assets/<repo-path>`, commits as the bot, and pushes to `main`. When the
+destination is not the root's own asset repo (`NEXUS_CONFIG`,
+`--asset-repo`, `NEXUS_ASSET_REPO`), the clone is
+`<nexus_root>/assets.<owner>__<name>/` instead, so one tree never hosts
+another repo's clone under the generic name (<your-org>/nexus-code#1694).
 
 | Source path | Flag | Asset destination | Printed URL |
 |-------------|------|-------------------|-------------|
@@ -2457,7 +2476,9 @@ presence + turn-end heartbeat age, supervised by the watcher), then
 every registered service with live `UP`/`DOWN` (its healthcheck), or
 `STARTING` when the healthcheck fails but a LIVE supervisor started less
 than `SVC_STARTUP_GRACE_SECONDS` (default 300) ago (a just-relaunched
-service warming up after a restart is not down: do not restart it), a
+service warming up after a restart is not down: do not restart it), or
+`STOPPED` when it is down because `svc.sh stop` was run (detail: "stopped by
+request since <ts>"), a
 `SUPERVISOR` column reading the headless pidfile (`pid:N` alive /
 `stale` / `-`), and a final untruncated `DETAIL` column: for an UP
 labsh JupyterLab service its URL, else the healthcheck-derived or
@@ -2508,7 +2529,9 @@ monitor/svc.sh up --no-services  # nexus core only: watcher (+ its
 monitor/svc.sh up --no-workers   # watcher + services; skip only the
                                  #   worker respawn
 monitor/svc.sh start  <name>     # start iff not running ('watcher' ok)
-monitor/svc.sh stop   <name>     # TERM the supervisor's process group
+monitor/svc.sh stop   <name>     # TERM the supervisor's process group;
+                                 #   records a stop request: no auto-restart,
+                                 #   row reads STOPPED until start/restart
 monitor/svc.sh restart <name>    # restart watcher == launcher.sh --replace
 monitor/svc.sh logs   <name>     # tail -F the service's log(s)
 ```
@@ -2680,6 +2703,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `_cc-version.sh`             | Shared resolver for the EFFECTIVE Claude Code version (floor-plus-local-pin, #226). `effective = local-pin (monitor/.state/cc-version-local) else package.json floor`. Read by `install-claude-local.sh` (install + verify) and the watcher gate baseline (`_v2_task_cc_version_check`). Atomic local-pin write. | yes |
 | `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. | yes |
 | `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `load-buffer` (the payload is a FILE, never an argv element: tmux 2.6's command-list rule ate a trailing `;` from `set-buffer -- "$MSG"`, `<your-org>/nexus-code#1590`) → bracketed `paste-buffer` → `Enter` sequence through the shared confirmed-delivery primitive `monitor/_paste-deliver.sh` (`#1591`), which confirms the submit against the target's transcript and presses `Enter` again only on positive evidence that the text is still in the input box, never into an overlay, appends a `paste-followup` action-log audit event, and persists its own confirmation verdict to `.state/paste-verdicts/<window>.<epoch>` so the watcher's `paste-unconfirmed` detector reads what the sender established rather than re-deriving it from a possibly-rotated session-id (issue #665). Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
+| `degraded-relocate.sh`       | `ng degraded enter\|exit` (<your-org>/nexus-code#1724): during a read-only incident, relocates the delivery ledger and the request inbox into the degraded run dir (`_degraded-rundir.sh`, derived from the managed `$TMPDIR`; never a hardcoded fallback) and records a pointer file THERE, outside the possibly-read-only tree. `exit` requires `--probes` consecutive OK probes (default 3, `--interval` 20 s), then merges home with no clobber: ledger rows the tree lacks are appended in epoch order; inbox files merge three-way against the checksums taken at `enter`, and a file both sides changed is an itemised CONFLICT that refuses the exit (`--force` merges the rest and lists it STILL STAGED). Every reader and writer resolves through ONE pointer reader, `_degraded-pointer.sh`, per call: the ledger via `_ledger_path.sh` (send.sh, paste-followup.sh, skeptic-channel.sh, the watcher's stamp/guard/prune, retire-preflight.sh, bootstrap-recover.sh, the retirement bookkeeping), the inbox via `_requests_dir.sh`. So a running watcher follows `enter`/`exit` on its next cycle without a restart, and with no pointer every path is byte-identical to before. `ng degraded status` shows the pointer. **A sandbox restart wipes the run dir** (a tmpfs, by the 2026-10-10 small-state constraint), so anything written while relocated survives only if `exit` runs before the restart; the watcher's heal names `exit` as owed while a pointer is in force. `enter` also leaves a few-line LOSS MARKER in `$CLAUDE_CONFIG_DIR` (the harness's own persistent state dir; only when set, no fallback): after a restart that wiped the run dir, `exit` reports LOST at rc 5 (what, since when) instead of "nothing to do", and repeats until `exit --ack-loss`; the next watcher start reports it to the orchestrator once. A second `enter` before that ack is not refused and does not erase the earlier loss: it appends it to `<marker>.lost` (append-only), every loss stays listed by `status`, `exit` and the watcher, and one `--ack-loss` clears them all. | yes |
 | `_paste-deliver.sh`          | THE confirmed-delivery primitive (`<your-org>/nexus-code#1591`, `#1590`), sourced by `paste-followup.sh` and by the watcher's emit, unstick and respawn pastes, and holder of the tree's ONLY executable `tmux paste-buffer` (`watcher/paste-buffer-sites.manifest`). `pd_normalise_file` removes the invisible characters Claude Code >= 2.1.277 would hold a prompt for — conservatively: it under-strips and never over-strips relative to 2.1.278's own context-sensitive rule — `pd_paste_file` does the VI-safe bracketed paste from a FILE behind the `#745` dead-pane guard, and `pd_submit` presses `Enter`, looks for a TUI-submission or enqueue record in the target's transcript after a pre-paste byte offset, and presses `Enter` again only while the pane positively reads `state=user-typing input=typed`, never into `blocked`. Result in `PD_OUTCOME` / `PD_ENTER_RETRIES`; rc 0 delivered, 3 unconfirmed, 4 NOT submitted, 5 dead pane, 6 liveness unknown. Tests: `watcher/test-paste-deliver.sh` (hermetic, real tmux + a fake REPL that reproduces the hold) and `watcher/test-integration/test-realmodel-paste-held.sh` (the real binary, gated). | yes |
 | `mint-token.sh`              | Mints / caches the bot's installation token | yes |
 | `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the bot, not the user's gh OAuth identity, must own both the credentials and the commit author — `gh auth setup-git` configures a credential helper ONLY (it never writes `user.name`/`user.email`) and delegates to the user's OAuth token. NOT because `~/.gitconfig` is read-only: it is writable (`-rw-rw-rw-`, measured 2026-09-01 inside agent-sandbox), and that false premise is <your-org>/nexus-code#1244 — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |

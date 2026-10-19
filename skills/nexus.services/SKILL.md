@@ -116,6 +116,17 @@ The rules:
   only.** Registered services run as their own session leaders, which is
   exactly why `monitor/proc-kill-authorized` refuses them. That refusal is
   correct: never `pkill`, never signal by name.
+- **`svc.sh stop <name>` is a durable stop** (<your-org>/nexus-code#1827). It
+  writes `monitor/.state/services/<name>.stop-requested` (`at`/`iso`/`by`), and
+  every automatic start path honours it: the watcher's service-health
+  auto-restart opens no incident and never restarts, the `up`/boot recovery
+  sweep skips the row, and an automated `svc.sh restart` (watcher,
+  version-restart) is refused with rc 76. The cockpit row reads `STOPPED`,
+  "stopped by request since <ts>". Only an explicit `svc.sh start|restart
+  <name>` withdraws it — or a supervisor launched after the stop that is
+  observed healthy (e.g. `jupyter-up.sh`), which the watcher records as
+  `stop-request-superseded`. Use it to hold a service down, e.g. to pause an
+  auto-deploy companion.
 - `auto-restart` is right when a blind restart is safe. Use `emit-only` for
   anything with side effects on relaunch, any network listener exposed
   beyond the host, and any reporter whose failure means "look at this".

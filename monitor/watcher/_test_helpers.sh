@@ -1911,7 +1911,9 @@ setup_fake_nexus() {
     # `_nexus-root.sh` joins the list for the same reason (your-org/nexus-code#1077):
     # `ng` refuses to start without the primary-root resolver, because a silent
     # un-pinning of reports and assets from the primary is worse than a refusal.
-    for _th_lib in _bookkeeping.sh _merge_ref_base.sh _nexus-root.sh; do
+    # `_status-surface.sh` (your-org/nexus-code#1839): `dashboard put` reads
+    # status_surface through it and WARNS when it is absent.
+    for _th_lib in _bookkeeping.sh _merge_ref_base.sh _nexus-root.sh _status-surface.sh; do
         [[ -f "$_th_dir/../$_th_lib" ]] && cp "$_th_dir/../$_th_lib" "$FAKE_NEXUS/monitor/$_th_lib"
     done
 

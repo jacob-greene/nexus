@@ -996,9 +996,20 @@ PASTE_EPOCH=$(( PASTE_EPOCH_KEY / 1000000 ))
 # working untouched.
 _ADMIN_COL=""
 (( ADMINISTRATIVE )) && _ADMIN_COL="admin"
+# THE LEDGER'S PATH comes from its ONE resolver (your-org/nexus-code#1724):
+# `<state>/machine-input.tsv`, or the relocated ledger while `ng degraded
+# enter` is in force. The watcher's guard reads through the same resolver.
+# An unusable relocation pointer is a refusal, never a stamp into the tree.
+if { declare -F nexus_ledger_path >/dev/null 2>&1 || . "$_script_dir/_ledger_path.sh"; } 2>/dev/null; then
+    _PF_LEDGER=$(nexus_ledger_path "$STATE_DIR") \
+        || die "the delivery ledger's degraded-mode relocation pointer is unusable (see above; \`ng degraded status\`) — refusing to paste unstamped (your-org/nexus-code#1724)"
+else
+    _PF_LEDGER="$STATE_DIR/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+fi
+mkdir -p "${_PF_LEDGER%/*}" 2>/dev/null
 printf '%s\t%s\t%s\t%s\n' "$WINDOW" "$PASTE_EPOCH_KEY" "$SRC_TOKEN" "$_ADMIN_COL" \
-    >> "$STATE_DIR/machine-input.tsv" \
-    || die "cannot stamp $STATE_DIR/machine-input.tsv — refusing to paste unstamped (the watcher would misattribute the input to the operator)"
+    >> "$_PF_LEDGER" \
+    || die "cannot stamp $_PF_LEDGER — refusing to paste unstamped (the watcher would misattribute the input to the operator)"
 
 # 1b. The content marker, keyed by the SAME epoch as the stamp above and
 #     written BEFORE a single byte goes out (your-org/nexus-code#665).

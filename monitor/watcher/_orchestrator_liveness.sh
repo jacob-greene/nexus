@@ -501,6 +501,21 @@ _orchestrator_liveness_decide() {
         return 1
     fi
 
+    # API-UNREACHABLE GATE (your-org/nexus-code#1845). The same reasoning as the
+    # auth gate above, one cause over: while the API cannot be reached, a paste
+    # with no answer is not a lost paste and a silent orchestrator is not a dead
+    # one — a resubmit starts a turn that fails again, and a respawned session
+    # cannot reach the API either. Placed AFTER the auth gate (a logout is the
+    # nearer cause and has its own alert) and BEFORE the mtime predicate, for the
+    # auth gate's own reason: every failed turn writes an error record, which is
+    # a newer mtime. Degrades to "not blocked" when `_api_hold.sh` is absent.
+    # Bounded by that module's ceiling, past which `_api_hold_active` fails open.
+    if declare -F _api_hold_active >/dev/null 2>&1 && _api_hold_active; then
+        printf 'healthy reason=api-unreachable age=%ds (the Claude API is unreachable: no resubmit, no respawn — neither can reach it; the watcher resumes the orchestrator itself on recovery; operator-alert key=api-unreachable; your-org/nexus-code#1845)' \
+            "$age"
+        return 1
+    fi
+
     # Past the stale-paste ceiling. The paste is too old to be
     # evidence of wedging — a quiet workspace with no eligible
     # pastes for hours is not the same as a wedged orchestrator.

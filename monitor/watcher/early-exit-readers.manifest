@@ -28,6 +28,7 @@ monitor/test-interpreter-parity.sh	head	test	1
 monitor/tmpfs-guard.sh	head	prod	2
 monitor/toolchain-bash.sh	head	prod	1
 monitor/verify-worker-started.sh	head	prod	1
+monitor/watcher/_api_hold.sh	awk-exit	prod	2
 monitor/watcher/_clone_drift.sh	awk-exit	prod	1
 monitor/watcher/_clone_drift.sh	head	prod	1
 monitor/watcher/_deliveries.sh	head	prod	2
@@ -80,7 +81,7 @@ monitor/watcher/test-integration/test-same-name-recycle.sh	head	test	1
 monitor/watcher/test-integration/test-wrapup-retain-close.sh	head	test	1
 monitor/watcher/test-jupyter-service.sh	head	test	1
 monitor/watcher/test-log-no-dup.sh	head	test	1
-monitor/watcher/test-longjob-watch.sh	head	test	2
+monitor/watcher/test-longjob-watch-ledger.sh	head	test	2
 monitor/watcher/test-nexus-root-sensitivity.sh	head	test	2
 monitor/watcher/test-ng-close.sh	head	test	1
 monitor/watcher/test-over-limit.sh	head	test	1

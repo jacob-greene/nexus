@@ -48,7 +48,7 @@
 #
 # The six field instances split three ways, and the split is the design input:
 #
-#   real Slurm id (`slurm:2219913`)  `sacct` retained `COMPLETED … 0:0`
+#   real Slurm id (`slurm:1234567`)  `sacct` retained `COMPLETED … 0:0`
 #                                    → the worker can TRUST its outputs
 #   `asyncrun:ar-…`                  `monitor/async-run.sh` retained the rc,
 #                                    and distinguishes `died` (killed before

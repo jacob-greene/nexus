@@ -321,7 +321,8 @@ infrastructure health the operator must not miss.
 | `--- requests ---` | a claimed request in the watcher-mediated inbox | Sourced from `monitor/.state/requests/*.claimed.md` (`_requests.sh`), re-emitted with cooldown / cap / origin fairness. Each row carries its own `handling:` line saying how THAT request closes — `ng request reply <id>` or `ng request ack <id>`; a `reply:required` request refuses a bare ack. |
 | `--- idle workers ---` | non-empty idle-transition list | Per-cycle; emitted on transitions only. |
 | `--- workspace snapshot ---` | periodic full-state cadence | Cumulative view between transition emits. |
-| `--- dashboard ---` | always | Footer. Prints `last put: <ts> (local stamp — when \`ng dashboard put\` last ran here)` from `monitor/.state/dashboard-updated.ts`. **It is deliberately NOT a staleness check** (`#1010`): nothing here reads the issue body, so past 2 h it says so in those words and points at `ng dashboard get` rather than nudging a `put`. |
+| `--- dashboard ---` | always, UNLESS `status_surface.kind: external` (`#1839`) | Footer when `status_surface.kind` is absent or `overview-dashboard`. An UNKNOWN kind still renders this section, but opening with `CONFIG ERROR: status_surface.kind '<kind>' is not a known kind (overview-dashboard \| external).` and a fix-the-config line before the default lines, so a typo is announced rather than folded into either kind. Otherwise: Prints `last put: <ts> (local stamp — when \`ng dashboard put\` last ran here)` from `monitor/.state/dashboard-updated.ts`. **It is deliberately NOT a staleness check** (`#1010`): nothing here reads the issue body, so past 2 h it says so in those words and points at `ng dashboard get` rather than nudging a `put`. |
+| `--- status surface ---` | `status_surface.kind: external` in `config/nexus.yml` | Footer in place of `--- dashboard ---` (`#1839`, `_emit_dashboard_section`): the operator runs their own status page, so it prints `external page: <first line of status_surface.url_file> — operator-run …; the overview dashboard is not maintained here.` (`(status_surface.url_file unset)` / `(unreadable: <path>)` when it cannot), plus `landings feed: <path>` when `status_surface.feed` is set. Never names a `put`. Exactly one of the two footers appears in every `compose_report` emit. |
 
 The **idle-workers** section names a state about other tmux windows
 and deserves its own classifier vocabulary.
@@ -893,7 +894,7 @@ issue=42 id=4567890 author=user_login
 (silenced after emit; agents will re-ring on the next event)
 
 --- idle workers ---                    # only when non-empty
-  - storage-bench wrapped up (idle 1h12m; wrap-up logged)
+  - bench-c wrapped up (idle 1h12m; wrap-up logged)
   - report-init-fixup idle 8m WITHOUT wrap-up — consider follow-up paste
 (emitted on transitions only; see skills/nexus.window-cleanup)
 
