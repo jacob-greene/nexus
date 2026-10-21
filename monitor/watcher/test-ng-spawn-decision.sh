@@ -223,6 +223,26 @@ rc=$?
 assert_eq "stale-only → exit 1" "$rc" "1"
 assert_contains "stale-only → wrap_up=missing" "$out" "wrap_up=missing"
 
+echo '=== wrap-up-check: numeric INDEX → usage error, exit 2 (#101) ==='
+# The log is keyed by window NAME. An index used to print a false
+# `wrap_up=missing` verdict for a window that did wrap up. It must now
+# refuse with exit 2 and print no verdict.
+cat > "$LOG" <<EOF
+{"ts":"$WRAP_TS","agent":"monitor","event":"wrap-up","window":"myworker","report":"$REPORT_NAME","upload":"ok","comment":"ok","rocket":"ok"}
+EOF
+out=$(run_ng wrap-up-check 5 2>&1)
+rc=$?
+assert_eq "index → exit 2" "$rc" "2"
+assert_contains "index → names the NAME requirement" "$out" "takes a window NAME, got index '5'"
+assert_contains "index → points at tmux list-windows" "$out" "tmux list-windows"
+if [[ "$out" == *"wrap_up="* ]]; then
+    printf '  FAIL: index → no verdict printed\n'; FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: index → no verdict printed\n'; PASS=$(( PASS + 1 ))
+fi
+out=$(run_ng wrap-up-check myworker 2>&1)
+assert_contains "name still works → wrap_up=present" "$out" "wrap_up=present"
+
 # --- summary ---------------------------------------------------------------
 
 echo

@@ -4985,10 +4985,19 @@ cmd_spawn_decision() {
 # Exit codes:
 #   0  status=ok — safe to close
 #   1  status=incomplete — at least one obligation missing
+#   2  usage error — e.g. a numeric window INDEX instead of a name
 cmd_wrap_up_check() {
     _help_check "$@"
     local window="${1:-}"
     [[ -n "$window" ]] || die "usage: ng wrap-up-check <window>"
+    # The action log is keyed by window NAME. A bare index never matches,
+    # so it used to print `wrap_up=missing` for a window that did wrap up.
+    # Refuse it as a usage error (exit 2, distinct from status=incomplete).
+    # Do not resolve it through tmux: indices are reused within minutes.
+    if [[ "$window" =~ ^[0-9]+$ ]]; then
+        echo "ng: wrap-up-check takes a window NAME, got index '$window' (resolve with tmux list-windows)" >&2
+        exit 2
+    fi
     local log_file="$STATE_DIR/action-log.jsonl"
     local wrap_up_st="missing" report_check_st="missing" rocket_st="skipped"
     local entry_report=""
