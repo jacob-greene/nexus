@@ -206,6 +206,25 @@ Do you want to proceed?
 EOF
 }
 
+# Dangerous-rm permission fixture (issue #228). Claude Code shows this
+# prompt even in bypass mode, and denies it by itself after 2 minutes.
+# It carries the Case A shape, so Case A must skip it explicitly.
+dangerous_rm_pane() {
+    cat <<'EOF'
+● Bash(rm -f "$OUT"/*.csv)
+
+ Bash command
+
+   rm -f "$OUT"/*.csv
+
+ Dangerous rm operation on possibly-empty variable path: "$OUT"/*.csv
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+EOF
+}
+
 # Rate-limit-prompt fixture (case B).
 ratelimit_pane() {
     cat <<'EOF'
@@ -1198,6 +1217,26 @@ else
     printf '  FAIL: both shapes fingerprint as %s\n' "$FP_NUM" >&2
     FAIL=$((FAIL+1))
 fi
+teardown_test
+
+# ---- Case A: dangerous-rm prompt is never approved (#228) --------------
+
+echo '=== Case A: dangerous-rm prompt is skipped, not approved (#228) ==='
+setup_test
+dangerous_rm_pane > "$PANES_DIR/rm-win"
+quiet_pane        > "$PANES_DIR/watcher"
+WINDOWS_LIST=$'rm-win\nwatcher'
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+actions_content=$(<"$ACTIONS")
+assert_contains "dangerous-rm logs skip-dangerous-rm" "$log_content" "window=rm-win case=A action=skip-dangerous-rm"
+assert_not_contains "dangerous-rm never logs sent-Enter" "$log_content" "action=sent-Enter"
+send_count=$(grep -cE '^send-keys win=rm-win' <<<"$actions_content" || true)
+assert_eq "dangerous-rm window received no send-keys" "$send_count" "0"
+assert_eq "dispatcher returns empty case key for dangerous-rm" "$(_handle_unstick_window rm-win)" ""
+[[ -e "$UNSTICK_DIR/rm-win.permission.tries" ]] \
+    && { echo "  FAIL: dangerous-rm wrote a Case A tries file" >&2; FAIL=$((FAIL+1)); } \
+    || { echo "  PASS: dangerous-rm wrote no Case A tries file"; PASS=$((PASS+1)); }
 teardown_test
 
 # ---- Summary -----------------------------------------------------------
