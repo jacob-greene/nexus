@@ -386,6 +386,36 @@ run_ng out err rc dashboard validate --body-file "$WORK/scaffold-minus-one.md"
 assert_eq        "exit 1 unchanged"                  "$rc" "1"
 assert_eq        "stdout is exactly the verdict"     "$out" "dashboard validate: FAIL (1 missing, 0 duplicated, 0 over budget)"
 
+# ---- Test 17b: empty stdin / terminal stdin (#216, #200) ---------------
+
+echo '=== ng dashboard validate, no flag, empty stdin → names the source (#216) ==='
+_err_tmp=$(mktemp)
+PATH="$STUB_DIR:$PATH" STATE_DIR="$WORK/state" NEXUS_STATE_DIR="$WORK/state" \
+    "$NG" dashboard validate </dev/null >/dev/null 2>"$_err_tmp"
+rc=$?; err=$(<"$_err_tmp")
+assert_eq        "exit 1 on empty stdin"             "$rc" "1"
+assert_contains  "says no flag and stdin was empty"  "$err" "empty dashboard body (no --body-file given; stdin was empty)"
+: > "$WORK/empty-validate.md"
+run_ng out err rc dashboard validate --body-file "$WORK/empty-validate.md"
+assert_eq        "exit 1 on empty body file"         "$rc" "1"
+assert_not_contains "file case does not blame stdin" "$err" "stdin was empty"
+run_ng out err rc dashboard validate --help
+assert_contains  "usage names stdin as the default"  "$out$err" "[--body-file <path> | body on stdin]"
+
+if command -v script >/dev/null 2>&1; then
+    echo '=== ng dashboard validate, no flag, stdin is a TTY → refuses, no hang (#200) ==='
+    # `script` gives the child a pseudo-terminal on stdin. The `sleep`
+    # keeps script's own stdin open, so a `cat` on the pty would block
+    # until the timeout (exit 124) rather than see EOF.
+    tty_out=$(sleep 8 | PATH="$STUB_DIR:$PATH" NEXUS_STATE_DIR="$WORK/state" \
+        script -qec "timeout 5 '$NG' dashboard validate; echo inner_rc=\$?" /dev/null 2>&1)
+    assert_not_contains "no timeout (exit 124)"       "$tty_out" "inner_rc=124"
+    assert_contains  "exit 1 on terminal stdin"       "$tty_out" "inner_rc=1"
+    assert_contains  "names the terminal-stdin cause" "$tty_out" "stdin is a terminal"
+else
+    echo '  SKIP: `script` not installed; TTY-stdin case not exercised'
+fi
+
 # ---- Test 18: scaffold output passes validate (schema self-consistency) -
 
 echo '=== ng dashboard scaffold | validate → exit 0 (schema is self-consistent) ==='
