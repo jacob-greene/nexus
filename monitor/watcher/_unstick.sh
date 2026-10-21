@@ -844,9 +844,13 @@ _handle_unstick_window() {
     fi
     # Never approve Claude Code's `Dangerous rm operation` prompt (#228).
     # It carries the Case A shape, but Claude Code shows it on purpose
-    # even in bypass mode, and since 2.1.281 it denies itself after 2
-    # minutes, so it cannot stall a worker. Leave it to that auto-deny:
-    # log, send no keys, write no Case A state, print no case key.
+    # even in bypass mode. Leave it to Claude Code: log, send no keys,
+    # write no Case A state, print no case key.
+    # VERSION DEPENDENCY: the prompt denies itself after 2 minutes only
+    # from Claude Code 2.1.281. On 2.1.280 or older it never times out,
+    # so the worker stalls until a human answers the prompt. A stall is
+    # safer than the old auto-approve. A dedicated signal for this stall
+    # is a follow-up; today only this unstick-log line records it.
     if grep -qF 'Dangerous rm operation' <<<"$pane" \
        && grep -qE 'Do you want to proceed\?' <<<"$pane"; then
         unstick_log "window=$window case=A action=skip-dangerous-rm"

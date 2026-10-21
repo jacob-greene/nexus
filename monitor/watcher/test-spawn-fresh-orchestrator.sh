@@ -229,8 +229,11 @@ launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || tr
 # must list every row so a fresh orchestrator sees the dropped
 # operator comments. Columns: id, emits, ts, announced.
 DROPPED_TSV="$STATE_DIR/resurface-dropped.tsv"
-printf '%s\t%s\t%s\t%s\n' 7000000001 4 1760000000 1 >  "$DROPPED_TSV"
-printf '%s\t%s\t%s\t%s\n' 7000000002 4 1760000600 0 >> "$DROPPED_TSV"
+# A third row is 8 days old: it must be left out, and counted.
+DROP_NOW=$(date +%s)
+printf '%s\t%s\t%s\t%s\n' 7000000001 4 $(( DROP_NOW - 3600 )) 1 >  "$DROPPED_TSV"
+printf '%s\t%s\t%s\t%s\n' 7000000002 4 $(( DROP_NOW - 600 )) 0 >> "$DROPPED_TSV"
+printf '%s\t%s\t%s\t%s\n' 7000000003 4 $(( DROP_NOW - 8 * 86400 )) 1 >> "$DROPPED_TSV"
 
 # Default-mode (continue) run.
 NEXUS_ROOT="$FAKE_NEXUS" \
@@ -298,10 +301,12 @@ if [[ -f "$REPORT" ]]; then
                     "$body" "## Suggested first checks"
     assert_contains "report tags mode as resume"  "$body" "- Mode: resume"
     assert_contains "report has resurface-dropped section (#230)" \
-                    "$body" "## Unprocessed operator comments (resurface-dropped)"
+                    "$body" "## Resurface-dropped operator comments (may be processed since)"
     assert_contains "report lists 1st dropped comment id (#230)" "$body" "comment id=7000000001"
     assert_contains "report lists 2nd dropped comment id (#230)" "$body" "comment id=7000000002"
     assert_contains "report shows the drop's emit count (#230)" "$body" "dropped after 4 emits"
+    assert_not_contains "report omits a drop older than 7 days (#230)" "$body" "comment id=7000000003"
+    assert_contains "report counts the omitted old drop (#230)" "$body" "(1 older than 7 days not listed"
 else
     fail "situation-report file missing at $REPORT"
 fi
@@ -393,7 +398,7 @@ assert_contains "pin-missing report tags mode as fresh" \
                 "$body" "- Mode: fresh"
 # Bash substring test, not assert_contains: grep -F treats a
 # multi-line needle as several patterns, and the blank line matches.
-if [[ "$body" == *$'## Unprocessed operator comments (resurface-dropped)\n\nnone\n'* ]]; then
+if [[ "$body" == *$'## Resurface-dropped operator comments (may be processed since)\n\nnone\n'* ]]; then
     pass "absent TSV: resurface-dropped section says none (#230)"
 else
     fail "absent TSV: resurface-dropped section does not say none (#230)"
@@ -452,7 +457,7 @@ assert_contains "fresh-mode report tags mode as fresh" \
                 "$body" "- Mode: fresh"
 # Bash substring test, not assert_contains: grep -F treats a
 # multi-line needle as several patterns, and the blank line matches.
-if [[ "$body" == *$'## Unprocessed operator comments (resurface-dropped)\n\nnone\n'* ]]; then
+if [[ "$body" == *$'## Resurface-dropped operator comments (may be processed since)\n\nnone\n'* ]]; then
     pass "empty TSV: resurface-dropped section says none (#230)"
 else
     fail "empty TSV: resurface-dropped section does not say none (#230)"
