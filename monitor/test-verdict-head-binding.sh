@@ -631,6 +631,11 @@ assert_contains "T5.1e the printed block states the validated head" "$out" "vali
 # Negative control on the same assertion: the pre-change event shape had no
 # head field at all, so confirm the grep is capable of failing.
 assert_not_contains "T5.1f control — no bogus head leaks in" "$ev" '"head":"0000000"'
+# T5.1g with a head but no --skeptic-pr nothing is published, so the verb
+# must SAY the verdict is host-local and gates nothing (jacob-greene/nexus#198).
+assert_contains "T5.1g no --skeptic-pr warns the verdict is host-local" "$out" \
+    "no --skeptic-pr: verdict recorded host-local only"
+assert_contains "T5.1h and that it will not gate a merge" "$out" "will NOT gate ng pr merge"
 
 # T5.2 a malformed --skeptic-head is refused rather than recorded.
 : > "$ALOG"
@@ -661,6 +666,7 @@ assert_contains "T5.4d the event names the pull request" "$ev" '"pr":"175"'
 assert_contains "T5.4e a body PATCH was sent to publish the trailer" \
     "$(cat "$CALLS")" "PATCH"
 assert_contains "T5.4f and the operator is told it was published" "$out" "trailer published"
+assert_not_contains "T5.4g a published verdict does NOT get the host-local warning" "$out" "host-local only"
 
 # =========================================================================
 printf '\n--- results ---\n'

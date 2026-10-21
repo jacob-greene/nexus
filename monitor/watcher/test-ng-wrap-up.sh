@@ -1415,6 +1415,83 @@ assert_contains "stderr names the legal values"      "$stderr" \
                 "--shape must be pin|latest"
 assert_eq       "no upload attempted"                "$(wc -c < "$UPLOAD_CAPTURE")" "0"
 
+# ---- jacob-greene/nexus#94: a non-numeric skeptic count fails loud ------
+echo '=== --skeptic-findings / --skeptic-depth non-numeric → exit 2, no upload ==='
+for _flag in --skeptic-findings --skeptic-depth; do
+    reset_mocks
+    run_ng stdout stderr rc wrap-up 42 "$REPORT" \
+           --repo override-org/override-repo $_flag three
+    assert_eq       "$_flag three → exit 2"          "$rc" "2"
+    assert_contains "$_flag three → names the flag and value" "$stderr" \
+                    "ng wrap-up: $_flag must be a non-negative integer, got 'three'"
+    assert_eq       "$_flag three → no upload attempted" "$(wc -c < "$UPLOAD_CAPTURE")" "0"
+done
+
+# ---- jacob-greene/nexus#134: the upload-failure text names the shape -----
+echo '=== upload fails → stderr names an ng upload fallback WITH the shape ==='
+reset_mocks
+export MOCK_UPLOAD_FAIL=1
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_eq       "upload failure exits 1"             "$rc" "1"
+assert_contains "fallback names --shape latest (wrap-up default)" "$stderr" \
+                "fallback: ng upload $REPORT --issue 42 --shape latest"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo --shape pin
+assert_contains "fallback follows an explicit --shape pin" "$stderr" \
+                "fallback: ng upload $REPORT --issue 42 --shape pin"
+unset MOCK_UPLOAD_FAIL
+
+# ---- jacob-greene/nexus#136: usage lists every --skeptic-* flag ----------
+echo '=== --help lists every --skeptic-* flag the parser accepts ==='
+run_ng stdout stderr rc wrap-up --help
+for _f in decision rationale waive contradicted new-round role target \
+          verdict depth findings orig head pr; do
+    assert_contains "--help lists --skeptic-$_f" "$stdout$stderr" "--skeptic-$_f"
+done
+run_ng stdout stderr rc wrap-up
+assert_contains "missing-args usage lists --skeptic-contradicted" "$stderr" \
+                "--skeptic-contradicted"
+
+# ---- jacob-greene/nexus#138: a body file on a re-wrap posts fresh --------
+echo '=== re-wrap with --comment-body-file → the body is POSTed, not discarded ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_eq       "first wrap-up exits 0"              "$rc" "0"
+REWRAP_BODY="$WORK/rewrap-body.md"
+printf 'Correction pass two: the headline now reads 0.41. {{REPORT_URL}}\n' > "$REWRAP_BODY"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo \
+       --comment-body-file "$REWRAP_BODY"
+assert_eq       "re-wrap with a body file exits 0"   "$rc" "0"
+assert_not_contains "re-wrap with a body file is not a silent UPDATED" "$stdout" \
+                    "posted comment: UPDATED"
+gh_calls=$(<"$GH_CAPTURE")
+assert_contains "the caller's body is POSTed as a new comment" "$gh_calls" \
+                "/repos/override-org/override-repo/issues/42/comments"
+assert_contains "the posted comment carries the caller's prose" "$(comment_store_body)" \
+                "Correction pass two: the headline now reads 0.41."
+# Control: a body-less re-run still re-points (post-once is intact).
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_contains "a body-less re-run still re-points" "$stdout" \
+                "posted comment: UPDATED"
+
+# ---- jacob-greene/nexus#140: the teaser is the first PARAGRAPH ----------
+echo '=== link-comment teaser = first paragraph of ## Summary, capped at 200 ==='
+summ() { ( unset NEXUS_ROOT; source "$NG_REAL" >/dev/null 2>&1; _wrapup_report_summary "$1" ); }
+SUMF="$WORK/summary-fixture.md"
+printf '# T\n\n## Summary\n\nYes. The claim holds on 3 arms.\nOne caveat on the null.\n\nSecond paragraph.\n\n## Next\nx\n' > "$SUMF"
+assert_eq "verdict-first Summary keeps the whole first paragraph" "$(summ "$SUMF")" \
+          "Yes. The claim holds on 3 arms. One caveat on the null."
+printf '# T\n\n## Summary\n\n**Status:** done\n\nFirst real paragraph.\n\n## Next\n' > "$SUMF"
+assert_eq "a metadata-only lead paragraph is skipped" "$(summ "$SUMF")" "First real paragraph."
+_long=$(printf 'Sentence number %02d is here. ' $(seq 1 12))
+printf '# T\n\n## Summary\n\n%s\n\n## Next\n' "$_long" > "$SUMF"
+_got=$(summ "$SUMF")
+assert_eq "over the cap → ends on the last whole sentence" "${_got: -8}" "is here."
+(( ${#_got} <= 200 )) && assert_eq "over the cap → within 200 chars" ok ok \
+    || assert_eq "over the cap → within 200 chars" "${#_got}" "<=200"
+printf '# T\n\n## Summary\n\n%s\n\n## Next\n' "$(printf 'word%.0s ' $(seq 1 60))" > "$SUMF"
+_got=$(summ "$SUMF")
+assert_eq "no sentence end inside the cap → '...'" "${_got: -3}" "..."
+
 # ---- summary ------------------------------------------------------------
 
 echo
