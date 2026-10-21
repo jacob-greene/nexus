@@ -131,8 +131,8 @@ echo '=== ng reply (no --repo, cwd origin != $REPO) → ERRORS with structured m
 run_ng stdout stderr rc "$CWD_REPO" \
     reply 9 --body-file "$WORK/body.txt"
 assert_eq        "exit 1 on cwd-mismatch write"          "$rc" "1"
-assert_contains  "stderr names the config target"        "$stderr" \
-                 "writes to default-org/default-repo"
+assert_contains  "stderr offers config value"            "$stderr" \
+                 "--repo default-org/default-repo (configured repo)"
 assert_contains  "stderr names the cwd repo"             "$stderr" \
                  "cwd is cwd-org/cwd-repo"
 assert_contains  "stderr names --repo as the override"   "$stderr" \
@@ -170,7 +170,7 @@ assert_contains  "POST endpoint embeds --repo target"    "$gh_args" \
 assert_not_contains "cwd origin suppressed by --repo"    "$gh_args" \
                     "cwd-org/cwd-repo"
 assert_not_contains "no structured error when --repo wins" "$stderr" \
-                    "writes to default-org/default-repo"
+                    "missing --repo"
 
 # ---- Test 5: unknown flag → exit 1 --------------------------------------
 
@@ -186,7 +186,7 @@ assert_contains  "stderr names the unknown flag"         "$stderr" \
 # Issue #108: a worker in a `nexus-code` worktree running
 # `ng issue create` WITHOUT --repo previously cwd-derived to
 # `nexus-code` and silently misrouted. Now it MUST error with the
-# structured "writes to <config>; cwd is <cwd>; pass --repo
+# structured "missing --repo: cwd is <cwd> ...; pass --repo
 # explicitly" message — preventing accidental issue creation on
 # the wrong repo (load-bearing for the soon-to-be-public
 # nexus-code repo).
@@ -204,8 +204,8 @@ TEST_DEFAULT_REPO="your-org/your-nexus" \
 run_ng stdout stderr rc "$NEXUS_CODE_CWD" \
     issue create --title "test issue" --body-file "$WORK/issue-body.md"
 assert_eq        "exit 1 on misroute-block"              "$rc" "1"
-assert_contains  "stderr names config target as dest"    "$stderr" \
-                 "writes to your-org/your-nexus"
+assert_contains  "stderr offers config value"            "$stderr" \
+                 "--repo your-org/your-nexus (configured repo)"
 assert_contains  "stderr names cwd repo"                 "$stderr" \
                  "cwd is your-org/nexus-code"
 assert_contains  "stderr names --repo override"          "$stderr" \
@@ -240,7 +240,7 @@ run_ng stdout stderr rc "$CWD_REPO" \
 # the assertion is that the cwd-derive path didn't trigger the
 # structured-write-error.
 assert_not_contains "read verb does NOT trigger write-block error" "$stderr" \
-                    "writes to default-org/default-repo"
+                    "missing --repo"
 gh_args=$(<"$CAPTURE_FILE")
 assert_contains "read verb hits cwd-origin repo"        "$gh_args" \
                 "/repos/cwd-org/cwd-repo/issues/12"

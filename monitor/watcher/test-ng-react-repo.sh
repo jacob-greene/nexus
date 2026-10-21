@@ -204,8 +204,14 @@ echo '=== ng react (no --repo, cwd != $REPO) → structured error ==='
 run_ng stdout stderr rc "$CWD_REPO" \
     react 4242 eyes
 assert_eq        "exit 1 on cwd-mismatch write"          "$rc" "1"
-assert_contains  "stderr names config target"            "$stderr" \
-                 "writes to default-org/default-repo"
+assert_contains  "stderr leads with the missing flag"    "$stderr" \
+                 "ng: missing --repo:"
+assert_contains  "stderr offers config value"            "$stderr" \
+                 "--repo default-org/default-repo (configured repo)"
+assert_contains  "stderr offers cwd value"               "$stderr" \
+                 "--repo cwd-org/cwd-repo (cwd origin)"
+assert_not_contains "stderr drops the unrelated #108 cite" "$stderr" \
+                    "#108"
 assert_contains  "stderr names cwd repo"                 "$stderr" \
                  "cwd is cwd-org/cwd-repo"
 assert_contains  "stderr names --repo override"          "$stderr" \

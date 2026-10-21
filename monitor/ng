@@ -541,7 +541,9 @@ _resolve_repo() {
             ;;
         write)
             if [[ -n "$cwd_repo" && -n "${REPO:-}" && "$cwd_repo" != "$REPO" ]]; then
-                die "this verb writes to $REPO; cwd is $cwd_repo; pass --repo explicitly to override (write verbs no longer cwd-derive silently — issue #108)"
+                # Lead with the missing flag and offer both candidate
+                # values, so the fix is copy-pasteable (#181).
+                die "missing --repo: cwd is $cwd_repo but the configured repo is $REPO, so the target is ambiguous; pass --repo explicitly: --repo $REPO (configured repo) or --repo $cwd_repo (cwd origin)"
             fi
             [[ -n "${REPO:-}" ]] || die "no --repo, no \$REPO, and cwd has no github origin"
             printf '%s' "$REPO"
