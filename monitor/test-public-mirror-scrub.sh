@@ -15,6 +15,7 @@
 #      verify it is gone (exit 3 otherwise); leak-gate must independently fail
 #      if any excluded path is present in a tree bound for publication.
 #   4. leak-gate is load-bearing — it must PASS a clean tree and FAIL a leak.
+#   5. leak-gate fails loud — a mapping with no `deny` lines exits 2, never 0.
 #
 # Hermetic: builds a throwaway git repo with a SYNTHETIC dictionary (fake
 # source tokens like `secretorg`, never a real internal identifier — this test
@@ -157,6 +158,14 @@ else
     no "leak-gate did not flag a present excluded dictionary (rc=$dg_rc): $dg_out"
 fi
 ( cd "$REPO" && git rm -q pm/mapping.tsv >/dev/null 2>&1; rm -f pm/mapping.tsv )
+
+# 5b. fail-loud contract: a mapping with NO `deny` lines must be REFUSED with
+#     exit exactly 2 — never reported as a clean tree (exit 0), and kept
+#     distinguishable from a found leak (exit 1).
+printf 'map\tsecretorg\tyour-org\t<your-org>\nkeep\tyour-org\n' > "$WORK/nodeny.tsv"
+ed_out=$( cd "$REPO" && bash pm/leak-gate.sh "$WORK/nodeny.tsv" . 2>&1 ); ed_rc=$?
+[[ $ed_rc -eq 2 ]] && ok "leak-gate refuses an empty denylist with exit 2" \
+                   || no "leak-gate on an empty denylist exited $ed_rc (expected 2): $ed_out"
 
 # 6. build.sh survivor assertion: if a drop is impossible, refuse (exit 3).
 #    Simulate by making the exclude path a non-removable read-only dir entry is
