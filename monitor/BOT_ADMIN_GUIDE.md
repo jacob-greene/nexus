@@ -306,7 +306,9 @@ steps 1–12 against the new fork's org and repo.
 Cross-fork bug-fix pings (a fix landing in one fork that siblings
 should pull) need a way to enumerate the live forks. The convention is
 the GitHub topic `nexus-fork`: tag your fork once and every nexus
-agent can list siblings via `gh search repos topic:nexus-fork`.
+agent can list siblings via the REST search endpoint
+(`gh api 'search/repositories?q=topic:nexus-fork+org:<ORG>'`).
+`gh search` does not exist in `gh` 1.13.0, so do not use it.
 
 After forking the nexus pattern (creating a `<USER_LOGIN>-nexus`
 repo), tag it:
@@ -327,7 +329,7 @@ run via `GH_TOKEN=$(./monitor/mint-token.sh) gh repo edit ...`
 Verify the fork now appears alongside its siblings:
 
 ```bash
-gh search repos topic:nexus-fork org:<ORG> --json fullName,description
+gh api 'search/repositories?q=topic:nexus-fork+org:<ORG>' --jq '.items[] | {full_name, description}'
 ```
 
 ## When something is off

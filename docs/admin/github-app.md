@@ -443,7 +443,7 @@ tag.)
 Verify siblings show up:
 
 ```bash
-gh search repos topic:nexus-fork --json fullName,description
+gh api 'search/repositories?q=topic:nexus-fork+org:<your-org>' --jq '.items[] | {full_name, description}'
 ```
 
 ## What the bot can read and write

@@ -262,10 +262,11 @@ skill), enumerate live forks via the `nexus-fork` GitHub topic that
 each fork maintainer tags their repo with:
 
 ```bash
-gh search repos topic:nexus-fork org:<your-org> --json fullName,description
+gh api 'search/repositories?q=topic:nexus-fork+org:<your-org>' --jq '.items[] | {full_name, description}'
 ```
 
-This uses **bare `gh`** under the caller's user PAT, not the bot
+This uses the REST search endpoint, because `gh search` does not
+exist in `gh` 1.13.0. Run it under the caller's user PAT, not the bot
 token: bot installation tokens are scoped per-fork and don't see
 sibling forks they aren't installed on. Topic search is read-only
 metadata and works for any logged-in user.

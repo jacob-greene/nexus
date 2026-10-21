@@ -66,6 +66,26 @@ assert_ctx "python | tail fires block-buffer reminder" "python -u"
 run '{"tool_name":"Bash","tool_input":{"command":"ml Python | tail"}}'
 assert_ctx "ml | tail fires eval-loss reminder" "forks a subshell"
 
+echo '=== git checkout <ref> -- <path> fires the staging reminder (#197) ==='
+# Fresh window, and the silent cases run FIRST. If the positive fired
+# first, per-(window,tag) dedup would silence the negatives for the
+# wrong reason and the assertions could not fail.
+export NEXUS_WORKER_WINDOW="footgun-checkout"
+run '{"tool_name":"Bash","tool_input":{"command":"git checkout -b x"}}'
+assert_silent "git checkout -b x is silent"
+run '{"tool_name":"Bash","tool_input":{"command":"git checkout main"}}'
+assert_silent "git checkout main is silent"
+run '{"tool_name":"Bash","tool_input":{"command":"git checkout main && ls -- x"}}'
+assert_silent "a -- in a later command does not fire"
+run '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}'
+assert_silent "echo hello is silent"
+run '{"tool_name":"Bash","tool_input":{"command":"git checkout abc -- foo.sh"}}'
+assert_ctx "git checkout <ref> -- <path> fires staging reminder" "git restore --staged"
+export NEXUS_WORKER_WINDOW="footgun-checkout-C"
+run '{"tool_name":"Bash","tool_input":{"command":"git -C /tmp/t checkout abc -- foo.sh"}}'
+assert_ctx "git -C <clone> checkout <ref> -- <path> fires too" "STAGES the file"
+export NEXUS_WORKER_WINDOW="footgun-test"
+
 echo '=== dedup: same (window, tag) fires at most once ==='
 run '{"tool_name":"Bash","tool_input":{"command":"pgrep -f other-marker"}}'
 assert_silent "second pkill-family call is silent (already seen)"

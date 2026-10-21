@@ -84,10 +84,15 @@ Two paths, picked on isolation needs:
   work/nexus-code-<task>/`. Separate `.git`, separate working tree,
   separate index. Use this when the task touches data the running
   nexus reads, or when you want a guaranteed-clean remote checkout.
-- **Worktree** — `git worktree add ../nexus-code-<task>
-  -b <handle>/<task>`. Lighter; the `.git` dir is shared with the
-  primary clone but the working tree and branch are separate.
-  Default choice for code-only edits that don't touch shared state.
+- **Worktree** — fetch first, then name the base ref. Use the
+  repository's default branch, for example `origin/main`:
+  `git fetch origin` and `git worktree add ../nexus-code-<task>
+  -b <handle>/<task> origin/main`. Lighter; the `.git` dir is shared
+  with the primary clone but the working tree and branch are
+  separate. Default choice for code-only edits that stay local.
+  Without a base ref, the branch starts at the primary clone's
+  HEAD. That HEAD can run ahead of the public remote. For a public
+  pull-request target, use a fresh clone instead.
 
 A worktree directory under `work/` is gitignored from the primary
 clone, so you can park them next to project checkouts without
