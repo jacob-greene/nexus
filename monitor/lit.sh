@@ -62,10 +62,31 @@ note() { printf 'lit: %s\n' "$*" >&2; }
 command -v jq  >/dev/null 2>&1 || die "jq not found (required)"
 command -v curl >/dev/null 2>&1 || die "curl not found (required)"
 
+# --- config reads -----------------------------------------------------------
+# load.sh exits 2 when a key is absent (fine: unset) but 1 or 3 when the
+# config cannot be read at all (no file, parse error, PyYAML missing).
+# Merging those hid every lit.* setting silently (#226). Probe once in the
+# parent shell so the note prints once per run, even though most reads
+# happen inside $(...) subshells.
+_CFG_RC=0
+"$_cfg" nexus.root >/dev/null 2>&1 || _CFG_RC=$?
+case "$_CFG_RC" in
+    1|3) note "cannot read config (load.sh exit $_CFG_RC); lit.* settings ignored" ;;
+esac
+
+# $1 = dotted key -> prints the value, or nothing when absent/unreadable.
+_cfg_get() {
+    case "$_CFG_RC" in 1|3) return 0 ;; esac
+    local v rc=0
+    v=$("$_cfg" "$1" 2>/dev/null) || rc=$?
+    [[ $rc -eq 0 ]] && printf '%s' "$v"
+    return 0
+}
+
 # --- nexus root -------------------------------------------------------------
 _nexus_root() {
     if [[ -n "${NEXUS_ROOT:-}" ]]; then printf '%s' "$NEXUS_ROOT"; return; fi
-    local r; r=$("$_cfg" nexus.root 2>/dev/null) || r=""
+    local r; r=$(_cfg_get nexus.root)
     if [[ -n "$r" ]]; then printf '%s' "${r/#\~/$HOME}"; return; fi
     # script lives at <root>/monitor/lit.sh
     printf '%s' "$(cd "$_script_dir/.." && pwd)"
@@ -82,7 +103,7 @@ _lit_key() {
         *) return 1 ;;
     esac
     val="${!envv:-}"; [[ -n "$val" ]] && { printf '%s' "$val"; return; }
-    val=$("$_cfg" "$cfgk" 2>/dev/null) || val=""
+    val=$(_cfg_get "$cfgk")
     [[ -n "$val" ]] && { printf '%s' "$val"; return; }
     local bipcfg="$ROOT/.config/bip/config.yml"
     if [[ -f "$bipcfg" ]]; then
@@ -100,7 +121,7 @@ _lit_key_origin() {
         asta) envv=ASTA_API_KEY; cfgk=lit.asta_api_key; bipk=asta_api_key ;;
     esac
     [[ -n "${!envv:-}" ]] && { printf 'env:%s' "$envv"; return; }
-    local v; v=$("$_cfg" "$cfgk" 2>/dev/null) || v=""
+    local v; v=$(_cfg_get "$cfgk")
     [[ -n "$v" ]] && { printf 'config:%s' "$cfgk"; return; }
     local bipcfg="$ROOT/.config/bip/config.yml"
     if [[ -f "$bipcfg" ]] && grep -qE "^[[:space:]]*${bipk}:[[:space:]]*\S" "$bipcfg"; then
@@ -113,24 +134,24 @@ _lit_key_origin() {
 # Optional API key: env NCBI_API_KEY, then lit.ncbi_api_key. Never logged.
 _ncbi_key() {
     local v="${NCBI_API_KEY:-}"; [[ -n "$v" ]] && { printf '%s' "$v"; return; }
-    v=$("$_cfg" lit.ncbi_api_key 2>/dev/null) || v=""
+    v=$(_cfg_get lit.ncbi_api_key)
     printf '%s' "$v"
 }
 _ncbi_key_origin() {
     [[ -n "${NCBI_API_KEY:-}" ]] && { printf 'env:NCBI_API_KEY'; return; }
-    local v; v=$("$_cfg" lit.ncbi_api_key 2>/dev/null) || v=""
+    local v; v=$(_cfg_get lit.ncbi_api_key)
     [[ -n "$v" ]] && { printf 'config:lit.ncbi_api_key'; return; }
     printf 'none'
 }
 # `email=` / `tool=` identify the caller to NCBI. Configured, never hard-coded.
 _ncbi_email() {
     local v="${NCBI_EMAIL:-}"; [[ -n "$v" ]] && { printf '%s' "$v"; return; }
-    v=$("$_cfg" lit.ncbi_email 2>/dev/null) || v=""
+    v=$(_cfg_get lit.ncbi_email)
     printf '%s' "$v"
 }
 _ncbi_tool() {
     local v="${NCBI_TOOL:-}"; [[ -n "$v" ]] && { printf '%s' "$v"; return; }
-    v=$("$_cfg" lit.ncbi_tool 2>/dev/null) || v=""
+    v=$(_cfg_get lit.ncbi_tool)
     printf '%s' "${v:-nexus-lit}"
 }
 
@@ -223,7 +244,7 @@ _pubmed_summaries() {
 
 # --- library ----------------------------------------------------------------
 _lit_library() {
-    local p; p=$("$_cfg" lit.library_path 2>/dev/null) || p=""
+    local p; p=$(_cfg_get lit.library_path)
     if [[ -n "$p" ]]; then printf '%s' "${p/#\~/$HOME}"; return; fi
     printf '%s/.bipartite/refs.jsonl' "$ROOT"
 }
