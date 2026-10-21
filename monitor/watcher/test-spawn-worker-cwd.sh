@@ -155,6 +155,10 @@ out=$( cd "$WORK" && PATH="$STUB_BIN:$PATH" CLAUDE_BIN="$STUB_BIN/claude" \
            -n "$WINDOW_NAME" -c "$WORKDIR" -p "$PROMPT_FILE" 2>&1 )
 rc=$?
 assert_eq "spawn exits 0" "$rc" "0"
+# Issue #81: the spawned: line names the resolved skeptic mode and depth,
+# even for the default (auto/0), so a missed --skeptic is visible at once.
+spawned_line=$(grep '^spawned:' <<<"$out")
+assert_contains "spawned: line reports default skeptic-mode" "$spawned_line" " skeptic-mode=auto skeptic-depth=0"
 
 [[ -f "$LAUNCHER_CAPTURE" ]] || {
     printf '  FAIL: tmux stub did not capture launcher path\n' >&2
@@ -316,9 +320,11 @@ out=$( cd "$WORK" && \
     MONITOR_RETAIN_USE_LOOP_WRAPPER=1 PATH="$STUB_BIN:$PATH" \
     CLAUDE_BIN="$STUB_BIN/claude" \
     "$FAKE_NEXUS/monitor/spawn-worker.sh" \
-        -n "$LOOP_WINDOW" -c "$WORKDIR" -p "$PROMPT_FILE" 2>&1 )
+        -n "$LOOP_WINDOW" -c "$WORKDIR" -p "$PROMPT_FILE" --skeptic require 2>&1 )
 rc=$?
 assert_eq "loop-wrapped spawn exits 0" "$rc" "0"
+spawned_line=$(grep '^spawned:' <<<"$out")
+assert_contains "spawned: line reports an explicit --skeptic require" "$spawned_line" " skeptic-mode=require skeptic-depth=0"
 
 LOOP_LAUNCHER=$(<"$LAUNCHER_CAPTURE_LOOP")
 loop_launcher_body=$(cat "$LOOP_LAUNCHER")

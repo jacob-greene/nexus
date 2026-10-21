@@ -1615,4 +1615,4 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
     fi
 fi
 
-echo "spawned: window=$WINDOW_NAME workdir=$WORKDIR prompt=$PROMPT_FILE kind=$SPAWN_KIND floor=injected${PRIOR_REPORT_RESOLVED:+ prior-report=$PRIOR_REPORT_RESOLVED} settings=$SETTINGS_FILE${WORKER_SESSION_ID:+ session-id=$WORKER_SESSION_ID}$([ "$USE_LOOP_WRAPPER" -eq 1 ] && echo ' loop=on')" >&2
+echo "spawned: window=$WINDOW_NAME workdir=$WORKDIR prompt=$PROMPT_FILE kind=$SPAWN_KIND floor=injected skeptic-mode=$SKEPTIC_MODE skeptic-depth=$SKEPTIC_DEPTH${PRIOR_REPORT_RESOLVED:+ prior-report=$PRIOR_REPORT_RESOLVED} settings=$SETTINGS_FILE${WORKER_SESSION_ID:+ session-id=$WORKER_SESSION_ID}$([ "$USE_LOOP_WRAPPER" -eq 1 ] && echo ' loop=on')" >&2
