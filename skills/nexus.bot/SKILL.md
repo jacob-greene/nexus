@@ -407,6 +407,19 @@ REST shape unless you genuinely need a deeply nested traversal or a
 search query (full-text/`is:issue`/`mentions:`) that REST can't
 express.
 
+**`gh api --paginate` writes one JSON array per page.** The output is
+not one JSON document. Plain `jq length` prints one count per page.
+A caller that keeps only the first line undercounts silently.
+
+| Goal | Form |
+|---|---|
+| Merge all pages into one array | `gh api --paginate <path> \| jq -s 'add'` |
+| Count items across all pages | `gh api --paginate <path> \| jq -s 'map(length)\|add'` |
+| Count without `jq -s` | `gh api --paginate <path> --jq '.[].id' \| wc -l` |
+
+Verified on a 230-issue read at `per_page=30`. Plain `jq length` gave
+eight lines (30 ... 20). All three forms above gave 230.
+
 **On `gh` 1.13.0 many `gh issue` and `gh pr` verbs are BROKEN — use
 REST.** The sandbox base image ships that version. Its lookup for an
 issue or a pull request still asks for Projects (classic), which
