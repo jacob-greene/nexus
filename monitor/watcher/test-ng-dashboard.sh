@@ -375,6 +375,16 @@ assert_eq        "exit 1 on incomplete body"         "$rc" "1"
 # Multi-word section names must print intact (no word-splitting).
 assert_contains  "names '## Awaiting operator'"      "$err" "## Awaiting operator"
 assert_contains  "names '## Recent landings'"        "$err" "## Recent landings"
+# The verdict must reach stdout on failure too (#132), with the counts.
+assert_contains  "FAIL verdict on stdout"            "$out" "dashboard validate: FAIL (4 missing, 0 duplicated, 0 over budget)"
+assert_not_contains "no FAIL verdict on stderr"      "$err" "dashboard validate: FAIL"
+
+echo '=== scaffold minus one section → FAIL verdict on stdout, exit 1 (#132) ==='
+run_ng out err rc dashboard scaffold
+printf '%s\n' "$out" | grep -v '^## Services$' > "$WORK/scaffold-minus-one.md"
+run_ng out err rc dashboard validate --body-file "$WORK/scaffold-minus-one.md"
+assert_eq        "exit 1 unchanged"                  "$rc" "1"
+assert_eq        "stdout is exactly the verdict"     "$out" "dashboard validate: FAIL (1 missing, 0 duplicated, 0 over budget)"
 
 # ---- Test 18: scaffold output passes validate (schema self-consistency) -
 
@@ -450,6 +460,7 @@ assert_contains  "advice: archive before pruning"    "$err" "ng upload"
 assert_contains  "advice: where to retune"           "$err" "DASH_MAX_"
 # Schema is intact, so the missing-section path must NOT fire.
 assert_not_contains "no false missing-section report" "$err" "missing required section"
+assert_contains  "FAIL verdict counts the breach"    "$out" "dashboard validate: FAIL (0 missing, 0 duplicated, 1 over budget)"
 
 echo '=== ng dashboard validate (one huge entry) → exit 1, entry-bytes rule ==='
 run_ng out err rc dashboard validate --body-file "$big_entry_dash"

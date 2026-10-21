@@ -4394,6 +4394,16 @@ cmd_dashboard_validate() {
         total=$(wc -c < "$tmp"); total=${total//[[:space:]]/}
         printf 'dashboard validate: OK (all %d required sections present; %s bytes, within budget %s)\n' \
             "${#DASH_REQUIRED_SECTIONS[@]}" "$total" "$DASH_MAX_BYTES"
+    else
+        # Verdict on stdout on EVERY path (#132): a caller that keeps only
+        # stdout used to see nothing on a failure. Printed last, after the
+        # stderr detail and advice, so it is also the final line in a pane.
+        local n_missing=0 n_dupes=0 n_over=0
+        [[ -n "$missing" ]]  && n_missing=$(grep -c '' <<<"$missing")
+        [[ -n "$dupes" ]]    && n_dupes=$(grep -c '' <<<"$dupes")
+        [[ -n "$oversize" ]] && n_over=$(grep -c '' <<<"$oversize")
+        printf 'dashboard validate: FAIL (%d missing, %d duplicated, %d over budget)\n' \
+            "$n_missing" "$n_dupes" "$n_over"
     fi
     return "$rc"
 }
