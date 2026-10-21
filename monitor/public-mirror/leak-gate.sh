@@ -6,6 +6,16 @@
 #   leak-gate.sh <mapping.tsv> [<repo-dir>]
 #
 # Exit 0 = clean. Exit 1 = leak (offending lines printed).
+# Exit 2 = empty denylist (no `deny` lines): refuse rather than report clean.
+#
+# SCOPE: this gate scans ONLY the content of files in the tree at the one
+# checked-out reference. It does NOT scan:
+#   - commit author/committer names and emails (identity surface);
+#   - commit messages (message surface);
+#   - issue and pull-request titles, bodies, or comments (API surface);
+#   - other branch heads or refs/pull/* refs the remote also serves.
+# A PASS says nothing about those surfaces. Detection is not remediation
+# there either: an edited comment or a rewritten commit can stay served.
 set -uo pipefail
 export LC_ALL=C
 MAP="${1:?usage: leak-gate.sh <mapping.tsv> [repo-dir]}"
@@ -45,5 +55,5 @@ if [ -n "$hits" ]; then
     printf '%s\n' "$hits"
     exit 1
 fi
-echo "LEAK GATE: PASS — zero denied tokens (keep-list applied)"
+echo "LEAK GATE: PASS — zero denied tokens in tracked file content (keep-list applied; commit identity/messages and issue/PR text NOT scanned)"
 exit 0
