@@ -375,6 +375,46 @@ assert_eq        "exit 1 on incomplete body"         "$rc" "1"
 # Multi-word section names must print intact (no word-splitting).
 assert_contains  "names '## Awaiting operator'"      "$err" "## Awaiting operator"
 assert_contains  "names '## Recent landings'"        "$err" "## Recent landings"
+# The verdict must reach stdout on failure too (#132), with the counts.
+assert_contains  "FAIL verdict on stdout"            "$out" "dashboard validate: FAIL (4 missing, 0 duplicated, 0 over budget)"
+assert_not_contains "no FAIL verdict on stderr"      "$err" "dashboard validate: FAIL"
+
+echo '=== scaffold minus one section → FAIL verdict on stdout, exit 1 (#132) ==='
+run_ng out err rc dashboard scaffold
+printf '%s\n' "$out" | grep -v '^## Services$' > "$WORK/scaffold-minus-one.md"
+run_ng out err rc dashboard validate --body-file "$WORK/scaffold-minus-one.md"
+assert_eq        "exit 1 unchanged"                  "$rc" "1"
+assert_eq        "stdout is exactly the verdict"     "$out" "dashboard validate: FAIL (1 missing, 0 duplicated, 0 over budget)"
+
+# ---- Test 17b: empty stdin / terminal stdin (#216, #200) ---------------
+
+echo '=== ng dashboard validate, no flag, empty stdin → names the source (#216) ==='
+_err_tmp=$(mktemp)
+PATH="$STUB_DIR:$PATH" STATE_DIR="$WORK/state" NEXUS_STATE_DIR="$WORK/state" \
+    "$NG" dashboard validate </dev/null >/dev/null 2>"$_err_tmp"
+rc=$?; err=$(<"$_err_tmp")
+assert_eq        "exit 1 on empty stdin"             "$rc" "1"
+assert_contains  "says no flag and stdin was empty"  "$err" "empty dashboard body (no --body-file given; stdin was empty)"
+: > "$WORK/empty-validate.md"
+run_ng out err rc dashboard validate --body-file "$WORK/empty-validate.md"
+assert_eq        "exit 1 on empty body file"         "$rc" "1"
+assert_not_contains "file case does not blame stdin" "$err" "stdin was empty"
+run_ng out err rc dashboard validate --help
+assert_contains  "usage names stdin as the default"  "$out$err" "[--body-file <path> | body on stdin]"
+
+if command -v script >/dev/null 2>&1; then
+    echo '=== ng dashboard validate, no flag, stdin is a TTY → refuses, no hang (#200) ==='
+    # `script` gives the child a pseudo-terminal on stdin. The `sleep`
+    # keeps script's own stdin open, so a `cat` on the pty would block
+    # until the timeout (exit 124) rather than see EOF.
+    tty_out=$(sleep 8 | PATH="$STUB_DIR:$PATH" NEXUS_STATE_DIR="$WORK/state" \
+        script -qec "timeout 5 '$NG' dashboard validate; echo inner_rc=\$?" /dev/null 2>&1)
+    assert_not_contains "no timeout (exit 124)"       "$tty_out" "inner_rc=124"
+    assert_contains  "exit 1 on terminal stdin"       "$tty_out" "inner_rc=1"
+    assert_contains  "names the terminal-stdin cause" "$tty_out" "stdin is a terminal"
+else
+    echo '  SKIP: `script` not installed; TTY-stdin case not exercised'
+fi
 
 # ---- Test 18: scaffold output passes validate (schema self-consistency) -
 
@@ -450,6 +490,7 @@ assert_contains  "advice: archive before pruning"    "$err" "ng upload"
 assert_contains  "advice: where to retune"           "$err" "DASH_MAX_"
 # Schema is intact, so the missing-section path must NOT fire.
 assert_not_contains "no false missing-section report" "$err" "missing required section"
+assert_contains  "FAIL verdict counts the breach"    "$out" "dashboard validate: FAIL (0 missing, 0 duplicated, 1 over budget)"
 
 echo '=== ng dashboard validate (one huge entry) → exit 1, entry-bytes rule ==='
 run_ng out err rc dashboard validate --body-file "$big_entry_dash"
@@ -519,6 +560,41 @@ small_table_dash="$WORK/small-table-dash.md"
 } > "$small_table_dash"
 run_ng out err rc dashboard validate --body-file "$small_table_dash"
 assert_eq        "a live-windows-sized table passes" "$rc" "0"
+
+# ---- Test 20b2: prose after a table is NOT charged to the last row (#120) --
+#
+# A markdown table row cannot span lines, so a table-row entry ends at the
+# first non-table line. Before the fix, a blank line plus a 2400-byte
+# paragraph after a one-row table was charged to that row (~2413 bytes),
+# tripping the entry-bytes rule on a 13-byte row. A multi-line BULLET must
+# still be charged its continuation lines — that is the runaway shape.
+
+prose_2400=$(head -c 2400 /dev/zero | tr '\0' 'p')
+
+echo '=== table row + blank + 2400 B prose → no entry-bytes breach (#120) ==='
+table_prose_dash="$WORK/table-prose-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf '| a | b |\n|---|---|\n| row1 | x |\n\n%s\n' "$prose_2400"
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$table_prose_dash"
+run_ng out err rc dashboard validate --body-file "$table_prose_dash"
+assert_eq        "trailing prose is not a table entry" "$rc" "0"
+assert_not_contains "no entry-bytes false positive"    "$err" "single entry of"
+stat_line=$(LC_ALL=C bash -c '. <(sed -n "/^_dashboard_stats_tsv() {/,/^}/p" "$1"); _dashboard_stats_tsv "$2"' _ "$NG" "$table_prose_dash" | awk -F'\t' '$1 == "## In-flight"')
+assert_eq        "largest entry is the header+separator, not the prose" \
+                 "$(cut -f5 <<<"$stat_line")" "20"
+
+echo '=== multi-line bullet + 2400 B continuation → still breaches (#120) ==='
+bullet_prose_dash="$WORK/bullet-prose-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf -- '- window w01 · topic · busy\n  %s\n' "$prose_2400"
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$bullet_prose_dash"
+run_ng out err rc dashboard validate --body-file "$bullet_prose_dash"
+assert_eq        "bullet continuation still charged" "$rc" "1"
+assert_contains  "names single-entry byte breach"    "$err" "## In-flight has a single entry of"
 
 # ---- Test 20c: entry budget must not fire on legitimate content --------
 #

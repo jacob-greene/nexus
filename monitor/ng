@@ -401,7 +401,7 @@ _usage_for() {
         cmd_dashboard_get)  echo "usage: ng dashboard get [--stat]   # --stat = size breakdown only, never the body" ;;
         cmd_dashboard_put)  echo "usage: ng dashboard put [--body-file <path>]" ;;
         cmd_dashboard_scaffold) echo "usage: ng dashboard scaffold" ;;
-        cmd_dashboard_validate) echo "usage: ng dashboard validate [--body-file <path>]" ;;
+        cmd_dashboard_validate) echo "usage: ng dashboard validate [--body-file <path> | body on stdin]" ;;
         cmd_log_action)     echo "usage: ng log-action <agent> --event <name> [--note <t>] [--extra k=v]..." ;;
         cmd_service_incident) echo "usage: ng service-incident <svc> [--state-dir <path>]" ;;
         cmd_suppress_emit)  echo "usage: ng suppress-emit <comment-id> [--repo <owner/name>] [--reason <short>]" ;;
@@ -547,7 +547,9 @@ _resolve_repo() {
             ;;
         write)
             if [[ -n "$cwd_repo" && -n "${REPO:-}" && "$cwd_repo" != "$REPO" ]]; then
-                die "this verb writes to $REPO; cwd is $cwd_repo; pass --repo explicitly to override (write verbs no longer cwd-derive silently — issue #108)"
+                # Lead with the missing flag and offer both candidate
+                # values, so the fix is copy-pasteable (#181).
+                die "missing --repo: cwd is $cwd_repo but the configured repo is $REPO, so the target is ambiguous; pass --repo explicitly: --repo $REPO (configured repo) or --repo $cwd_repo (cwd origin)"
             fi
             [[ -n "${REPO:-}" ]] || die "no --repo, no \$REPO, and cwd has no github origin"
             printf '%s' "$REPO"
@@ -575,11 +577,15 @@ _preflight_repo() {
 }
 
 # Read body from --body-file path (in $1) or stdin (if $1 empty).
+# Refuses a terminal stdin: a bare `cat` there blocks until EOF, so a
+# verb called without its body flag used to hang instead of erroring
+# (#200). A pipe or redirect still works as before.
 _read_body() {
     if [[ -n "$1" ]]; then
         [[ -f "$1" ]] || die "body file not found: $1"
         cat -- "$1"
     else
+        [[ -t 0 ]] && die "no --body-file given and stdin is a terminal; pass --body-file <path> or pipe the body"
         cat
     fi
 }
@@ -4239,10 +4245,13 @@ _dashboard_duplicate_sections() {
 # section that ran away. The header row counts as an entry, so a table's
 # count reads one high — immaterial against a budget of two dozen.
 #
-# An entry runs until the next entry or the next `## ` heading, so a
-# multi-line bullet is charged its full weight — that is the shape the
-# runaway growth actually took (prose blocks hanging off one bullet), and
-# charging only the marker line would have missed it. This is a heuristic
+# A list-item entry runs until the next entry or the next `## ` heading,
+# so a multi-line bullet is charged its full weight — that is the shape
+# the runaway growth actually took (prose blocks hanging off one bullet),
+# and charging only the marker line would have missed it. A table-row
+# entry is different: a markdown table row cannot span lines, so it ends
+# at the first non-table line. Otherwise prose after a table (a blank
+# line, then a paragraph) was charged to the last row (#120). This is a heuristic
 # feeding a warning, not a markdown parser: indentation and lazy list
 # continuation are not modelled.
 #
@@ -4260,7 +4269,7 @@ _dashboard_stats_tsv() {
             if (name != "")
                 printf "%s\t%d\t%d\t%d\t%d\n", name, bytes, lines, entries, maxentry
         }
-        BEGIN { name = ""; bytes = 0; lines = 0; entries = 0; maxentry = 0; cur = 0 }
+        BEGIN { name = ""; bytes = 0; lines = 0; entries = 0; maxentry = 0; cur = 0; in_table = 0 }
         {
             n = length($0) + 1
             if ($0 ~ /^## /) {
@@ -4271,15 +4280,19 @@ _dashboard_stats_tsv() {
             if (name == "") name = "(preamble)"
             bytes += n; lines++
             is_entry = ($0 ~ /^[-*+][ \t]/ || $0 ~ /^[0-9]+[.)][ \t]/)
-            if ($0 ~ /^[ \t]*\|/) {
+            is_table = ($0 ~ /^[ \t]*\|/)
+            if (is_table) {
                 # Table row — but a `|---|:--:|` separator is formatting,
                 # not a row, so it neither starts nor extends an entry.
                 if ($0 !~ /^[ \t]*\|[ \t:|-]*$/) is_entry = 1
             }
             if (is_entry) {
-                close_entry(); entries++; cur = n
+                close_entry(); entries++; cur = n; in_table = is_table
             } else if (cur > 0) {
-                cur += n
+                # A table row ends at the first non-table line; only a
+                # list item keeps charging its continuation lines.
+                if (in_table && !is_table) close_entry()
+                else cur += n
             }
         }
         END { close_entry(); flush_section() }
@@ -4378,7 +4391,7 @@ _dashboard_stat_render() {
     printf '  body NOT printed (the point of --stat); full text cached at %s\n' "$DASH_CACHE"
 }
 
-# `ng dashboard validate [--body-file <path>]` — check a candidate
+# `ng dashboard validate [--body-file <path> | body on stdin]` — check a candidate
 # dashboard body (file or stdin) against DASH_REQUIRED_SECTIONS and the
 # DASH_MAX_* size budget. Exit 0 = every required heading present AND
 # within budget; exit 1 = drift on either axis (detail on stderr). This
@@ -4394,7 +4407,12 @@ cmd_dashboard_validate() {
     local tmp; tmp=$(mktemp)
     trap "rm -f '$tmp'" RETURN
     _read_body "$body_file" > "$tmp"
-    [[ -s "$tmp" ]] || die "empty dashboard body"
+    if [[ ! -s "$tmp" ]]; then
+        # Say WHERE the empty body came from (#216): with no flag the
+        # source was stdin, which the bare message did not reveal.
+        [[ -n "$body_file" ]] || die "empty dashboard body (no --body-file given; stdin was empty)"
+        die "empty dashboard body"
+    fi
     local missing dupes oversize total rc=0
     missing=$(_dashboard_missing_sections "$tmp")
     dupes=$(_dashboard_duplicate_sections "$tmp")
@@ -4429,6 +4447,16 @@ cmd_dashboard_validate() {
         total=$(wc -c < "$tmp"); total=${total//[[:space:]]/}
         printf 'dashboard validate: OK (all %d required sections present; %s bytes, within budget %s)\n' \
             "${#DASH_REQUIRED_SECTIONS[@]}" "$total" "$DASH_MAX_BYTES"
+    else
+        # Verdict on stdout on EVERY path (#132): a caller that keeps only
+        # stdout used to see nothing on a failure. Printed last, after the
+        # stderr detail and advice, so it is also the final line in a pane.
+        local n_missing=0 n_dupes=0 n_over=0
+        [[ -n "$missing" ]]  && n_missing=$(grep -c '' <<<"$missing")
+        [[ -n "$dupes" ]]    && n_dupes=$(grep -c '' <<<"$dupes")
+        [[ -n "$oversize" ]] && n_over=$(grep -c '' <<<"$oversize")
+        printf 'dashboard validate: FAIL (%d missing, %d duplicated, %d over budget)\n' \
+            "$n_missing" "$n_dupes" "$n_over"
     fi
     return "$rc"
 }
@@ -5027,10 +5055,19 @@ cmd_spawn_decision() {
 # Exit codes:
 #   0  status=ok — safe to close
 #   1  status=incomplete — at least one obligation missing
+#   2  usage error — e.g. a numeric window INDEX instead of a name
 cmd_wrap_up_check() {
     _help_check "$@"
     local window="${1:-}"
     [[ -n "$window" ]] || die "usage: ng wrap-up-check <window>"
+    # The action log is keyed by window NAME. A bare index never matches,
+    # so it used to print `wrap_up=missing` for a window that did wrap up.
+    # Refuse it as a usage error (exit 2, distinct from status=incomplete).
+    # Do not resolve it through tmux: indices are reused within minutes.
+    if [[ "$window" =~ ^[0-9]+$ ]]; then
+        echo "ng: wrap-up-check takes a window NAME, got index '$window' (resolve with tmux list-windows)" >&2
+        exit 2
+    fi
     local log_file="$STATE_DIR/action-log.jsonl"
     local wrap_up_st="missing" report_check_st="missing" rocket_st="skipped"
     local entry_report=""
