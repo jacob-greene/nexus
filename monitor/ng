@@ -63,6 +63,7 @@
 #                                [--shape pin|latest]   # default latest
 #                                [--skeptic-decision require|deny --skeptic-rationale "<why>"]
 #                                [--skeptic-waive "<reason>"]
+#                                [--skeptic-contradicted "<what/why>"]
 #                                [--skeptic-new-round]
 #                                [--skeptic-role --skeptic-target <window>
 #                                 --skeptic-verdict credible|check|suspect|refuted
@@ -88,6 +89,11 @@
 #                # skeptic's own wrap-up (logs its --skeptic-verdict and
 #                # applies bounded recursion). --skeptic-waive is the
 #                # operator override of a required skeptic.
+#                # --skeptic-contradicted: pass it when you OVERRODE a
+#                # prior skeptic's finding; it flags the spawn-skeptic
+#                # request deliberate so the orchestrator arbitrates.
+#                # --skeptic-new-round opens a new round on a window
+#                # whose previous round already returned a verdict.
 #                # --skeptic-head <sha> binds the verdict to the commit it
 #                # covers; --skeptic-pr <n> publishes that binding as the
 #                # `Skeptic-Verdict:` trailer `ng pr merge` gates on
@@ -374,7 +380,7 @@ _usage_for() {
         cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>] [--meta]" ;;
         cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
         cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
-        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain] [--shape pin|latest]" ;;
+        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain] [--shape pin|latest] [--skeptic-decision require|deny --skeptic-rationale <why>] [--skeptic-waive <reason>] [--skeptic-contradicted <what/why>] [--skeptic-new-round] [--skeptic-role --skeptic-target <window> --skeptic-verdict credible|check|suspect|refuted --skeptic-depth N --skeptic-findings N --skeptic-orig <window> --skeptic-head <sha> --skeptic-pr <n>]" ;;
         cmd_report_init)    echo "usage: ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>]" ;;
         cmd_report_check)   echo "usage: ng report-check <path> [--allow-todo]" ;;
         cmd_fetch_asset)    echo "usage: ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]" ;;
@@ -1409,12 +1415,15 @@ _wrapup_report_title() {
     awk '/^# / { sub(/^# +/, ""); sub(/[[:space:]]+$/, ""); print; exit }' "$1"
 }
 
-# Pull a one-sentence summary from a report:
+# Pull a short teaser from a report:
 #   1. body of `## Summary` (case-insensitive) if present
 #   2. else body of the section under the H1, before the next H2
-# Flatten to a single line, drop **Key:** metadata lines, take the first
-# sentence (text up to ". "), cap at 200 chars. Empty stdout means
-# nothing parseable.
+# Drop **Key:** metadata lines, take the first PARAGRAPH (up to the first
+# blank line), flatten it to one line, cap at 200 chars. The first
+# sentence alone was too short: a verdict-first Summary posted just
+# "Yes." (jacob-greene/nexus#140). Over the cap, cut at the last sentence
+# end inside it, else at the cap with "...". Empty stdout means nothing
+# parseable.
 _wrapup_report_summary() {
     local report="$1"
     local text
@@ -1431,20 +1440,25 @@ _wrapup_report_summary() {
             found_h1           { print }
         ' "$report")
     fi
-    # Flatten, strip `**Key:** value` metadata lines, collapse whitespace.
+    # Strip `**Key:** value` metadata lines, keep the first non-blank
+    # paragraph, flatten it, collapse whitespace.
     text=$(printf '%s\n' "$text" \
         | grep -v '^\*\*[A-Za-z][A-Za-z ]*:\*\*' \
+        | awk '/^[[:space:]]*$/ { if (seen) exit; next } { seen=1; print }' \
         | tr '\n' ' ' \
         | sed -e 's/[[:space:]][[:space:]]*/ /g' \
               -e 's/^[[:space:]]*//' \
               -e 's/[[:space:]]*$//')
     [[ -n "$text" ]] || return 0
     local prefix="${text:0:200}"
-    # If the first sentence ends within the cap, cut there.
-    if [[ "$prefix" == *". "* ]]; then
-        prefix="${prefix%%. *}."
-    elif (( ${#text} > 200 )); then
-        prefix="${prefix}..."
+    if (( ${#text} > 200 )); then
+        # Over the cap: end on the LAST sentence that fits, else "...".
+        if [[ "${text:0:201}" == *". "* ]]; then
+            prefix="${text:0:201}"
+            prefix="${prefix%. *}."
+        else
+            prefix="${prefix}..."
+        fi
     fi
     printf '%s' "$prefix"
 }
@@ -1849,6 +1863,14 @@ _wrapup_skeptic_step() {
                 echo "ng wrap-up: failed to publish the Skeptic-Verdict trailer on pull request $f_pr" >&2
                 echo "  record it by hand:  ng pr verdict set $f_pr --verdict $verdict --head $head_sha" >&2
             fi
+        elif [[ -n "$head_sha" ]]; then
+            # Say so when nothing is published (jacob-greene/nexus#198).
+            echo "ng wrap-up: no --skeptic-pr: verdict recorded host-local only; no Skeptic-Verdict trailer published; it will NOT gate ng pr merge" >&2
+            # A worktree HEAD is the caller's checkout, not the pull request's
+            # head, so print a placeholder rather than a sha that fails the gate.
+            local hint_head="${head_sha:0:7}"
+            [[ "$head_src" == "worktree" ]] && hint_head="<pr-head-sha>"
+            echo "  if the work is on a pull request:  ng pr verdict set <n> --verdict $verdict --head $hint_head" >&2
         fi
 
         # A returned verdict SATISFIES the first-pass require-gate, so clear
@@ -2488,7 +2510,7 @@ cmd_wrap_up() {
     _help_check "$@"
     local issue="${1:-}" report_path="${2:-}"
     [[ -n "$issue" && -n "$report_path" ]] \
-        || die "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--shape pin|latest]"
+        || die "$(_usage_for cmd_wrap_up)"
     shift 2 || true
     local trigger_comment="" repo_arg="" trigger_repo_arg="" body_file="" no_comment=0 allow_stub=0
     local retain_reason="" no_retain=0
@@ -2555,6 +2577,18 @@ cmd_wrap_up() {
         pin|latest) ;;
         *) die "wrap-up: --shape must be pin|latest, got: $shape" ;;
     esac
+    # A non-numeric count must fail loud here (jacob-greene/nexus#94).
+    # Further down, _wrapup_skeptic_step coerces it to 0 in silence, and
+    # findings=0 TERMINATES the skeptic chain. Unset stays allowed.
+    local _sk_numflag _sk_numval
+    for _sk_numflag in findings depth; do
+        if [[ "$_sk_numflag" == findings ]]; then _sk_numval="$sk_findings"
+        else _sk_numval="$sk_depth"; fi
+        if [[ -n "$_sk_numval" && ! "$_sk_numval" =~ ^[0-9]+$ ]]; then
+            echo "ng wrap-up: --skeptic-$_sk_numflag must be a non-negative integer, got '$_sk_numval'" >&2
+            exit 2
+        fi
+    done
     [[ -f "$report_path" ]] || die "wrap-up: report not found: $report_path"
     # --no-comment and --comment-body-file are mutually exclusive: one
     # asks to skip step 2 entirely, the other supplies a custom body
@@ -2664,6 +2698,10 @@ cmd_wrap_up() {
     else
         upload_st=failed
         failure_detail+="  upload: upload-asset.sh failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
+        # Name the shape for a manual fallback (jacob-greene/nexus#134).
+        # `ng upload` defaults to `pin`; wrap-up to `latest`. A bare
+        # `ng upload` here would publish a link that strands on correction.
+        failure_detail+="  fallback: ng upload $report_path --issue $issue --shape $shape"$'\n'
     fi
 
     # Step 2: post the comment. Three modes:
@@ -2709,8 +2747,12 @@ cmd_wrap_up() {
         # asset link(s) at the new blob via the CAS edit path; when the
         # comment is gone or no longer references this report, post the
         # canonical link comment fresh (a duplicate beats a stale link).
-        local prior_comment_url
-        prior_comment_url=$(_wrapup_prior_comment_url "$issue" "$basename" "$target")
+        # A caller-supplied body (--comment-body-file) is a NEW statement,
+        # not a retry: post it fresh. Re-pointing would discard it
+        # (jacob-greene/nexus#138). Only a body-less re-run re-points.
+        local prior_comment_url=""
+        [[ -z "$body_file" ]] \
+            && prior_comment_url=$(_wrapup_prior_comment_url "$issue" "$basename" "$target")
         if [[ -n "$prior_comment_url" ]]; then
             local repoint_rc=0
             comment_url=$(_wrapup_repoint_link_comment \

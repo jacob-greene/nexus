@@ -631,6 +631,27 @@ assert_contains "T5.1e the printed block states the validated head" "$out" "vali
 # Negative control on the same assertion: the pre-change event shape had no
 # head field at all, so confirm the grep is capable of failing.
 assert_not_contains "T5.1f control — no bogus head leaks in" "$ev" '"head":"0000000"'
+# T5.1g with a head but no --skeptic-pr nothing is published, so the verb
+# must SAY the verdict is host-local and gates nothing (jacob-greene/nexus#198).
+assert_contains "T5.1g no --skeptic-pr warns the verdict is host-local" "$out" \
+    "no --skeptic-pr: verdict recorded host-local only"
+assert_contains "T5.1h and that it will not gate a merge" "$out" "will NOT gate ng pr merge"
+assert_contains "T5.1i an explicit --skeptic-head is echoed in the hint" "$out" \
+    "--head ${VALIDATED_FULL:0:7}"
+
+# T5.1j a head taken from the caller's worktree is not the pull request's
+# head, so the hint prints a placeholder instead of that sha.
+WT="$TMP/wt-hint"; mkdir -p "$WT"
+git -C "$WT" init -q
+git -C "$WT" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+WT_HEAD=$(git -C "$WT" rev-parse HEAD)
+: > "$ALOG"
+out=$( cd "$WT" && _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
+        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "" "" 2>&1 ); rc=$?
+ev=$(grep '"event":"skeptic-verdict"' "$ALOG" | tail -1)
+assert_contains "T5.1j the head came from the worktree" "$ev" '"head-source":"worktree"'
+assert_contains "T5.1k the hint prints a placeholder head" "$out" "--head <pr-head-sha>"
+assert_not_contains "T5.1l and not the worktree sha" "$out" "--head ${WT_HEAD:0:7}"
 
 # T5.2 a malformed --skeptic-head is refused rather than recorded.
 : > "$ALOG"
@@ -661,6 +682,7 @@ assert_contains "T5.4d the event names the pull request" "$ev" '"pr":"175"'
 assert_contains "T5.4e a body PATCH was sent to publish the trailer" \
     "$(cat "$CALLS")" "PATCH"
 assert_contains "T5.4f and the operator is told it was published" "$out" "trailer published"
+assert_not_contains "T5.4g a published verdict does NOT get the host-local warning" "$out" "host-local only"
 
 # =========================================================================
 printf '\n--- results ---\n'
