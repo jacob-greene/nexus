@@ -262,6 +262,11 @@ once. Pull the relevant ones into worker prompts when delegating.
 - **`git checkout <ref> -- <path>` overwrites the working tree
   without warning** — destructive on a dirty tree. For read-only
   peeks at content at another ref, use `git show <ref>:<path>`.
+  It also **stages** the file. The staged entry survives a later
+  `git checkout -b`. The next `git commit` writes it, even when
+  `git add` named a different path. After a revert test, unstage
+  with `git restore --staged <path>`. Check `git status` before
+  you commit.
 - **`git checkout <branch>` on the main clone silently breaks
   the running watcher** if the branch has changed
   `monitor/watcher/_*.sh` helper signatures. Functions in
