@@ -276,10 +276,12 @@ _resolve_reqfile() {
 }
 
 # Next zero-padded request number for a channel dir (max existing + 1).
+# Counts archived rounds too (`reset` moves requests into
+# .stale-archive-<ts>/), so a number never names two requests in one channel.
 _next_req_num() {
     local dir="$1" max=0 n base
     local f
-    for f in "$dir"/req-*.md; do
+    for f in "$dir"/req-*.md "$dir"/.stale-archive-*/req-*.md; do
         [[ -e "$f" ]] || continue
         base=$(basename -- "$f")
         n=${base#req-}; n=${n%%-*}
