@@ -558,6 +558,36 @@ ERR=$(bash "$PREFLIGHT" utf8-win --pane-state autosuggest-only --input-text "$UT
         --state-dir "$STATE_DIR" --now "$NOW" 2>&1 >/dev/null)
 assert_contains "utf8 -> decodes intact on stderr" "$ERR" "why exp(-d/σ) instead of the Gaussian?"
 
+echo "## 21. the detector beside the script wins over \$NEXUS_ROOT's (#125)"
+#     A worker testing a pane-state.sh change from a secondary clone has
+#     NEXUS_ROOT pointing at the primary clone. The gate must classify with
+#     the detector in its OWN directory, not the primary's. Fully hermetic:
+#     a stub tmux that never delegates to a real server, and two stub
+#     detectors that disagree (secondary says blocked, primary says idle).
+reset_state
+SEC="$WORK/secondary/monitor"; PRI="$WORK/primary"
+mkdir -p "$SEC/watcher" "$PRI/monitor"
+cp "$PREFLIGHT" "$SEC/retire-preflight.sh"
+cp "$_test_dir"/watcher/_*.sh "$SEC/watcher/" 2>/dev/null || true
+printf '#!/usr/bin/env bash\necho "state=blocked active=1 window=1 name=victim"\n' > "$SEC/pane-state.sh"
+printf '#!/usr/bin/env bash\necho "state=idle active=1 window=1 name=victim"\n' > "$PRI/monitor/pane-state.sh"
+chmod +x "$SEC/pane-state.sh" "$PRI/monitor/pane-state.sh"
+DET_STUB="$WORK/det-bin"; mkdir -p "$DET_STUB"
+cat > "$DET_STUB/tmux" <<'STUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == "display-message" ]] && { echo victim; exit 0; }
+exit 0
+STUB
+chmod +x "$DET_STUB/tmux"
+OUT=$(PATH="$DET_STUB:$PATH" NEXUS_ROOT="$PRI" bash "$SEC/retire-preflight.sh" harness:1 \
+        --state-dir "$STATE_DIR" --now "$NOW" 2>/dev/null); RC=$?
+assert_contains "NEXUS_ROOT set -> own-dir detector used (pane=blocked)" "$OUT" "pane=blocked"
+assert_eq "NEXUS_ROOT set -> own-dir verdict vetoes the kill (rc 1)" "$RC" "1"
+rm -f "$SEC/pane-state.sh"
+OUT=$(PATH="$DET_STUB:$PATH" NEXUS_ROOT="$PRI" bash "$SEC/retire-preflight.sh" harness:1 \
+        --state-dir "$STATE_DIR" --now "$NOW" 2>/dev/null)
+assert_contains "no own-dir detector -> falls back to NEXUS_ROOT's (pane=idle)" "$OUT" "pane=idle"
+
 # ---- summary -------------------------------------------------------------
 echo
 printf 'retire-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"

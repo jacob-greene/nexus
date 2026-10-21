@@ -307,11 +307,15 @@ emit() {
 # doubt and also vetoes.
 pane_state="${pane_state_override:-}"
 if [[ -z "$pane_state" ]]; then
+    # The detector beside this script wins. NEXUS_ROOT points at the
+    # primary clone in every worker session, so preferring it made a gate
+    # run from a secondary clone classify with a detector other than the
+    # one under test (#125). NEXUS_ROOT is only the fallback.
     pane_script=""
-    if [[ -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/monitor/pane-state.sh" ]]; then
-        pane_script="$NEXUS_ROOT/monitor/pane-state.sh"
-    elif [[ -x "$self_dir/pane-state.sh" ]]; then
+    if [[ -x "$self_dir/pane-state.sh" ]]; then
         pane_script="$self_dir/pane-state.sh"
+    elif [[ -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/monitor/pane-state.sh" ]]; then
+        pane_script="$NEXUS_ROOT/monitor/pane-state.sh"
     fi
     if [[ -n "$pane_script" && -n "$pane_target" ]]; then
         pane_line=$("$pane_script" "$pane_target" 2>/dev/null) || pane_line=""
