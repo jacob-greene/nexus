@@ -1086,6 +1086,20 @@ assert_eq "no lifecycle history -> rc 1" \
     "$(_skeptic_last_round_event no-such-window-anywhere >/dev/null 2>&1; echo $?)" "1"
 
 # ============================================================
+echo '=== issue 131: `<sub> --help` prints usage, never binds --help as a task id ==='
+# ============================================================
+# `close --help` used to run a real close on a task named `--help`:
+# mkdir the channel and publish a DONE sentinel, exit 0.
+for _sub in close init ask answer reset status await; do
+    _hout=$(timeout 5 "$CHAN" "$_sub" --help </dev/null 2>&1); _hrc=$?
+    assert_eq "$_sub --help exits 0" "$_hrc" "0"
+    assert_contains "$_sub --help prints usage" "$_hout" "skeptic-channel.sh"
+done
+assert_nofile "close --help wrote no --help channel" "$NEXUS_STATE_DIR/skeptic/--help"
+"$CHAN" bogus-sub --help >/dev/null 2>&1
+assert_eq "unknown subcommand with --help still fails" "$?" "1"
+
+# ============================================================
 echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
