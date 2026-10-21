@@ -402,10 +402,10 @@ installation's GraphQL bucket (5,000 pts/hr, shared across
 orchestrator + watcher + every active worker) regularly exhausts on
 busy days; the REST core bucket sits ~99% unused. `gh api /repos/...`
 is REST; `gh api graphql ...` and `gh pr view --json` /
-`gh issue view --json` / `gh search` are GraphQL. Reach for the
-REST shape unless you genuinely need a deeply nested traversal or a
-search query (full-text/`is:issue`/`mentions:`) that REST can't
-express.
+`gh issue view --json` are GraphQL. (`gh search` does not exist in
+`gh` 1.13.0; use the REST `search/*` endpoints via `gh api`.) Reach for
+the REST shape unless you genuinely need a deeply nested traversal
+that REST can't express.
 
 **`gh api --paginate` writes one JSON array per page.** The output is
 not one JSON document. Plain `jq length` prints one count per page.
@@ -559,9 +559,10 @@ foot-gun in the workspace report corpus.
 - `nexus.report` — the report convention; the `## Infrastructure
   Issues` section is the right place to flag bot-install gaps,
   missing `ng` verbs, and any other tooling friction.
-- `nexus.self-fix` — cross-fork ping discovery (`gh search repos
-  topic:nexus-fork`) and the cross-fork PR body convention. Loads
-  only for nexus-internals work, not general project agents.
+- `nexus.self-fix` — cross-fork ping discovery (`gh api
+  'search/repositories?q=topic:nexus-fork+org:<org>'`) and the
+  cross-fork PR body convention. Loads only for nexus-internals
+  work, not general project agents.
   (Post-cutover the canonical implementation is single-tenant
   `<your-org>/nexus-code`; the topic-discovery path is legacy from
   the pre-split era when each operator forked the code repo.)
