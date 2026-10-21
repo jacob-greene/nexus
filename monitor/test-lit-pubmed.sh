@@ -296,6 +296,22 @@ jq -e '.pubmed.api_key and .pubmed.origin=="env:NCBI_API_KEY" and .pubmed.rate_l
 expect "status with NCBI_API_KEY: origin env, 10/s" $?
 ! grep -q 'k3y-SECRET' <<<"$OUT$ERR"; expect "status never prints the key" $?
 
+echo "-- config unreadable is loud, key-absent is quiet (#226) --"
+# A python3 that cannot import PyYAML: -S drops site-packages, so
+# config/load.sh exits 3. lit.sh must say so once, not pass silently.
+mkdir -p "$TMP/noyaml"
+printf '#!/usr/bin/env bash\nexec %q -S "$@"\n' "$(command -v python3)" >"$TMP/noyaml/python3"
+chmod +x "$TMP/noyaml/python3"
+printf 'lit:\n  ncbi_email: "ops@example.org"\n' >"$TMP/mail3.yml"
+: >"$CURL_LOG"
+OUT=$(NEXUS_CONFIG="$TMP/mail3.yml" PATH="$TMP/bin:$TMP/noyaml:$PATH" bash "$LIT" status 2>"$TMP/err"); RC=$?
+ERR=$(cat "$TMP/err")
+n=$(grep -c 'cannot read config (load.sh exit 3); lit.\* settings ignored' <<<"$ERR")
+[ "$n" -eq 1 ]; expect "PyYAML missing -> one stderr note (count=$n)" $? "$ERR"
+expect "PyYAML missing -> status still exits 0 (env vars still work)" "$RC" "rc=$RC"
+run status
+! grep -q 'cannot read config' <<<"$ERR"; expect "readable config with absent keys -> no note" $? "$ERR"
+
 echo "-- live E-utilities (LIT_LIVE=0 to skip) --"
 if [ "${LIT_LIVE:-1}" = 0 ]; then
   echo "  skip live check (LIT_LIVE=0)"

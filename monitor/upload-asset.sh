@@ -129,6 +129,17 @@ case "$REPO_PATH" in
     *)        REPO_PATH="assets/$REPO_PATH" ;;
 esac
 
+# REPO_PATH names a FILE. A trailing slash, or a path that is an existing
+# directory in the assets checkout, would make the drain's `cp` drop the
+# internal staging blob (req.XXXXXXXXXX.blob) into that directory and commit
+# it at exit 0 (#211). Refuse up front and name the path the caller meant.
+_rp_dir="${REPO_PATH%/}"
+if [[ "$REPO_PATH" == */ || -d "$ASSETS_DIR/$REPO_PATH" ]]; then
+    echo "upload-asset.sh: --repo-path $REPO_PATH names a directory, not a file." \
+         "Did you mean --repo-path $_rp_dir/$BASENAME ?" >&2
+    exit 1
+fi
+
 [[ -n "$MESSAGE" ]] || MESSAGE="Add asset $BASENAME via upload-asset.sh"
 
 TOKEN="$("$_script_dir/mint-token.sh")" || { echo "mint-token.sh failed" >&2; exit 2; }
@@ -413,6 +424,17 @@ while :; do
         [[ -n "$rp" ]] || { echo "upload-asset.sh: marker $marker missing repo_path; skipping" >&2; continue; }
         blob="${marker%.req}.blob"
         dest="$ASSETS_DIR/$rp"
+        # Backstop for #211: the up-front check ran against a checkout that
+        # may predate this sync. Never copy the staging blob INTO a directory.
+        # Drop the request and leave an .err result for its stager to report.
+        if [[ -d "$dest" ]]; then
+            echo "upload-asset.sh: $rp is a directory in the asset repo;" \
+                 "skipping request $reqid (pass a file path)" >&2
+            printf 'repo-path %s is a directory in the asset repo; pass %s/<file>\n' \
+                "$rp" "$rp" > "${marker%.req}.err"
+            rm -f "$marker" "$blob"
+            continue
+        fi
         mkdir -p "$(dirname "$dest")"
         # Basename-collision warning (your-org/your-nexus#236 B8): a distinct
         # source with the same basename overwrites at HEAD. Per-request commits
@@ -514,6 +536,11 @@ flock -u "$_LOCK_FD" 2>/dev/null || true
 # --- 4. COLLECT this request's own result ----------------------------------
 # Guaranteed present now: either we drained our own marker above, or a prior
 # manager drained it before we acquired the lock and wrote our result then.
+if [[ -f "$REQ_BASE.err" ]]; then
+    echo "upload-asset.sh: $(< "$REQ_BASE.err")" >&2
+    rm -f "$REQ_BASE.err"
+    exit 1
+fi
 [[ -f "$RESULT" ]] || {
     echo "upload-asset.sh: internal error — no result for $REQID after drain" >&2
     exit 3
