@@ -864,10 +864,13 @@ WID=$(monitor/_tmux-window.sh id "$WIN") \
 WORKDIR=$(tmux display -p -t "$WID" '#{pane_current_path}' 2>/dev/null || true)
 
 # 2. Locate the worker's most recent session jsonl. Claude Code
-#    writes to ~/.claude/projects/<workdir-slug>/<uuid>.jsonl;
-#    the slug is the workdir path with '/' -> '-' (verify by ls).
-SLUG=$(printf '%s' "$WORKDIR" | sed 's|/|-|g')
-JSONL=$(ls -t "$HOME/.claude/projects/$SLUG/"*.jsonl 2>/dev/null | head -1)
+#    writes to <config-dir>/projects/<workdir-slug>/<uuid>.jsonl.
+#    The slug replaces EVERY non-alphanumeric character with '-',
+#    not only '/'. An '_', '.' or ' ' in the path also becomes '-'.
+#    This mirrors _resume_slug in monitor/spawn-worker.sh; keep the
+#    two in step. Verify the directory with ls.
+SLUG=$(printf '%s' "$WORKDIR" | sed 's|[^a-zA-Z0-9]|-|g')
+JSONL=$(ls -t "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$SLUG/"*.jsonl 2>/dev/null | head -1)
 SESSION_ID=$(basename -s .jsonl "$JSONL" 2>/dev/null || true)
 
 # 3. (Optional) post a brief closing message into the worker's
