@@ -247,6 +247,26 @@ _compose_situation_report() {
     printf -- '- Nexus root: %s\n' "$NEXUS_ROOT"
     printf '\n'
 
+    # Issue #230 (B3): operator comments the resurface cap dropped are
+    # never re-emitted. List every row so a fresh orchestrator sees
+    # them. File name and columns (id, emits, ts, announced) come from
+    # `_resurface_cap.sh::_resurface_record_dropped`.
+    printf '## Unprocessed operator comments (resurface-dropped)\n\n'
+    local dropped_tsv="$STATE_DIR/resurface-dropped.tsv"
+    local dropped_n=0 d_id d_emits d_ts _d_rest d_when
+    if [[ -s "$dropped_tsv" ]]; then
+        while IFS=$'\t' read -r d_id d_emits d_ts _d_rest; do
+            [[ -n "$d_id" ]] || continue
+            d_when=""
+            [[ "$d_ts" =~ ^[0-9]+$ ]] && d_when=$(date -Is -d "@$d_ts" 2>/dev/null || true)
+            printf -- '- comment id=%s — dropped after %s emits at %s\n' \
+                "$d_id" "${d_emits:-?}" "${d_when:-${d_ts:-unknown time}}"
+            dropped_n=$(( dropped_n + 1 ))
+        done < "$dropped_tsv"
+    fi
+    (( dropped_n == 0 )) && printf 'none\n'
+    printf '\n'
+
     printf '## Current tmux windows\n\n'
     printf '```\n'
     tmux list-windows -F '#I #W' 2>/dev/null || printf '(tmux list-windows failed)\n'
