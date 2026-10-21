@@ -983,6 +983,17 @@ cmd_fail() {
 
 main() {
     local sub="${1:-}"; shift || true
+    # `<sub> --help` must print usage, never bind `--help` as an id
+    # (it used to: `close --help` wrote a DONE sentinel, `await --help`
+    # blocked forever). Only $1 is checked; unknown subs still die below.
+    case "${1:-}" in
+        -h|--help)
+            case "$sub" in
+                file|await|fetch|show|reqfile|dir|list|reply|ack|fail)
+                    awk '/^$/{exit} NR>1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                    exit 0 ;;
+            esac ;;
+    esac
     case "$sub" in
         file)     cmd_file    "$@" ;;
         await)    cmd_await   "$@" ;;

@@ -276,10 +276,12 @@ _resolve_reqfile() {
 }
 
 # Next zero-padded request number for a channel dir (max existing + 1).
+# Counts archived rounds too (`reset` moves requests into
+# .stale-archive-<ts>/), so a number never names two requests in one channel.
 _next_req_num() {
     local dir="$1" max=0 n base
     local f
-    for f in "$dir"/req-*.md; do
+    for f in "$dir"/req-*.md "$dir"/.stale-archive-*/req-*.md; do
         [[ -e "$f" ]] || continue
         base=$(basename -- "$f")
         n=${base#req-}; n=${n%%-*}
@@ -903,6 +905,17 @@ Re-enter the await loop with \`monitor/skeptic-channel.sh await ${task}\` — it
 
 main() {
     local sub="${1:-}"; shift || true
+    # `<sub> --help` must print usage, never bind `--help` as an id
+    # (it used to: `close --help` wrote a DONE sentinel, `await --help`
+    # blocked forever). Only $1 is checked; unknown subs still die below.
+    case "${1:-}" in
+        -h|--help)
+            case "$sub" in
+                init|dir|reqfile|ask|poll|status|list|await|answer|await-answer|reconcile|close|reset|nudge)
+                    awk '/^$/{exit} NR>1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                    exit 0 ;;
+            esac ;;
+    esac
     case "$sub" in
         init)         cmd_init         "$@" ;;
         dir)          cmd_dir          "$@" ;;

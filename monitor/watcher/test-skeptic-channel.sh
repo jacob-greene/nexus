@@ -1086,6 +1086,37 @@ assert_eq "no lifecycle history -> rc 1" \
     "$(_skeptic_last_round_event no-such-window-anywhere >/dev/null 2>&1; echo $?)" "1"
 
 # ============================================================
+echo '=== issue 131: `<sub> --help` prints usage, never binds --help as a task id ==='
+# ============================================================
+# `close --help` used to run a real close on a task named `--help`:
+# mkdir the channel and publish a DONE sentinel, exit 0.
+for _sub in close init ask answer reset status await; do
+    _hout=$(timeout 5 "$CHAN" "$_sub" --help </dev/null 2>&1); _hrc=$?
+    assert_eq "$_sub --help exits 0" "$_hrc" "0"
+    assert_contains "$_sub --help prints usage" "$_hout" "skeptic-channel.sh"
+done
+assert_nofile "close --help wrote no --help channel" "$NEXUS_STATE_DIR/skeptic/--help"
+"$CHAN" bogus-sub --help >/dev/null 2>&1
+assert_eq "unknown subcommand with --help still fails" "$?" "1"
+
+# ============================================================
+echo '=== issue 177: request numbers stay monotonic across a reset archive ==='
+# ============================================================
+RTASK=renumber-probe
+"$CHAN" init "$RTASK" >/dev/null
+"$CHAN" ask "$RTASK" first-q --message "round 1 question" >/dev/null
+"$CHAN" answer "$RTASK" 1 --message "round 1 answer" >/dev/null
+"$CHAN" close "$RTASK" >/dev/null
+"$CHAN" reset "$RTASK" >/dev/null
+_rdir="$NEXUS_STATE_DIR/skeptic/$RTASK"
+_arch=$(ls -d "$_rdir"/.stale-archive-*/req-001-first-q.answered.md 2>/dev/null | head -1)
+assert_file "reset archived the round-1 request" "$_arch"
+_rp=$("$CHAN" ask "$RTASK" second-q --message "round 2 question")
+assert_contains "ask after reset allocates req-002, not req-001" "$_rp" "req-002-second-q.open.md"
+assert_eq "req-001 names exactly one request in the channel" \
+    "$(find "$_rdir" -name 'req-001-*' | wc -l | tr -d ' ')" "1"
+
+# ============================================================
 echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
