@@ -520,6 +520,41 @@ small_table_dash="$WORK/small-table-dash.md"
 run_ng out err rc dashboard validate --body-file "$small_table_dash"
 assert_eq        "a live-windows-sized table passes" "$rc" "0"
 
+# ---- Test 20b2: prose after a table is NOT charged to the last row (#120) --
+#
+# A markdown table row cannot span lines, so a table-row entry ends at the
+# first non-table line. Before the fix, a blank line plus a 2400-byte
+# paragraph after a one-row table was charged to that row (~2413 bytes),
+# tripping the entry-bytes rule on a 13-byte row. A multi-line BULLET must
+# still be charged its continuation lines — that is the runaway shape.
+
+prose_2400=$(head -c 2400 /dev/zero | tr '\0' 'p')
+
+echo '=== table row + blank + 2400 B prose → no entry-bytes breach (#120) ==='
+table_prose_dash="$WORK/table-prose-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf '| a | b |\n|---|---|\n| row1 | x |\n\n%s\n' "$prose_2400"
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$table_prose_dash"
+run_ng out err rc dashboard validate --body-file "$table_prose_dash"
+assert_eq        "trailing prose is not a table entry" "$rc" "0"
+assert_not_contains "no entry-bytes false positive"    "$err" "single entry of"
+stat_line=$(LC_ALL=C bash -c '. <(sed -n "/^_dashboard_stats_tsv() {/,/^}/p" "$1"); _dashboard_stats_tsv "$2"' _ "$NG" "$table_prose_dash" | awk -F'\t' '$1 == "## In-flight"')
+assert_eq        "largest entry is the header+separator, not the prose" \
+                 "$(cut -f5 <<<"$stat_line")" "20"
+
+echo '=== multi-line bullet + 2400 B continuation → still breaches (#120) ==='
+bullet_prose_dash="$WORK/bullet-prose-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf -- '- window w01 · topic · busy\n  %s\n' "$prose_2400"
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$bullet_prose_dash"
+run_ng out err rc dashboard validate --body-file "$bullet_prose_dash"
+assert_eq        "bullet continuation still charged" "$rc" "1"
+assert_contains  "names single-entry byte breach"    "$err" "## In-flight has a single entry of"
+
 # ---- Test 20c: entry budget must not fire on legitimate content --------
 #
 # Calibration regression guard, BOTH directions. DASH_MAX_ENTRY_BYTES was

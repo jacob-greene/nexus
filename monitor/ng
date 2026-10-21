@@ -4197,10 +4197,13 @@ _dashboard_duplicate_sections() {
 # section that ran away. The header row counts as an entry, so a table's
 # count reads one high — immaterial against a budget of two dozen.
 #
-# An entry runs until the next entry or the next `## ` heading, so a
-# multi-line bullet is charged its full weight — that is the shape the
-# runaway growth actually took (prose blocks hanging off one bullet), and
-# charging only the marker line would have missed it. This is a heuristic
+# A list-item entry runs until the next entry or the next `## ` heading,
+# so a multi-line bullet is charged its full weight — that is the shape
+# the runaway growth actually took (prose blocks hanging off one bullet),
+# and charging only the marker line would have missed it. A table-row
+# entry is different: a markdown table row cannot span lines, so it ends
+# at the first non-table line. Otherwise prose after a table (a blank
+# line, then a paragraph) was charged to the last row (#120). This is a heuristic
 # feeding a warning, not a markdown parser: indentation and lazy list
 # continuation are not modelled.
 #
@@ -4218,7 +4221,7 @@ _dashboard_stats_tsv() {
             if (name != "")
                 printf "%s\t%d\t%d\t%d\t%d\n", name, bytes, lines, entries, maxentry
         }
-        BEGIN { name = ""; bytes = 0; lines = 0; entries = 0; maxentry = 0; cur = 0 }
+        BEGIN { name = ""; bytes = 0; lines = 0; entries = 0; maxentry = 0; cur = 0; in_table = 0 }
         {
             n = length($0) + 1
             if ($0 ~ /^## /) {
@@ -4229,15 +4232,19 @@ _dashboard_stats_tsv() {
             if (name == "") name = "(preamble)"
             bytes += n; lines++
             is_entry = ($0 ~ /^[-*+][ \t]/ || $0 ~ /^[0-9]+[.)][ \t]/)
-            if ($0 ~ /^[ \t]*\|/) {
+            is_table = ($0 ~ /^[ \t]*\|/)
+            if (is_table) {
                 # Table row — but a `|---|:--:|` separator is formatting,
                 # not a row, so it neither starts nor extends an entry.
                 if ($0 !~ /^[ \t]*\|[ \t:|-]*$/) is_entry = 1
             }
             if (is_entry) {
-                close_entry(); entries++; cur = n
+                close_entry(); entries++; cur = n; in_table = is_table
             } else if (cur > 0) {
-                cur += n
+                # A table row ends at the first non-table line; only a
+                # list item keeps charging its continuation lines.
+                if (in_table && !is_table) close_entry()
+                else cur += n
             }
         }
         END { close_entry(); flush_section() }
