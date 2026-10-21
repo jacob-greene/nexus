@@ -350,6 +350,12 @@ write, a multi-day run. A cosmetic change gets a glance. But when
 scientific output is in play, *absence of a probe is not absence of the
 failure.*
 
+**A disclosed figure is still an untested claim.** A worker may volunteer
+a figure in its own report. Candour is not evidence. Derive the figure
+independently, or record it in the verdict as underived. Reproducing the
+worker's own table is not derivation. It proves only that the table is
+internally consistent.
+
 ---
 
 ## The worker↔skeptic communication channel
