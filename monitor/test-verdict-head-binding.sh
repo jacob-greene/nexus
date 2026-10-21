@@ -636,6 +636,22 @@ assert_not_contains "T5.1f control — no bogus head leaks in" "$ev" '"head":"00
 assert_contains "T5.1g no --skeptic-pr warns the verdict is host-local" "$out" \
     "no --skeptic-pr: verdict recorded host-local only"
 assert_contains "T5.1h and that it will not gate a merge" "$out" "will NOT gate ng pr merge"
+assert_contains "T5.1i an explicit --skeptic-head is echoed in the hint" "$out" \
+    "--head ${VALIDATED_FULL:0:7}"
+
+# T5.1j a head taken from the caller's worktree is not the pull request's
+# head, so the hint prints a placeholder instead of that sha.
+WT="$TMP/wt-hint"; mkdir -p "$WT"
+git -C "$WT" init -q
+git -C "$WT" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+WT_HEAD=$(git -C "$WT" rev-parse HEAD)
+: > "$ALOG"
+out=$( cd "$WT" && _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
+        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "" "" 2>&1 ); rc=$?
+ev=$(grep '"event":"skeptic-verdict"' "$ALOG" | tail -1)
+assert_contains "T5.1j the head came from the worktree" "$ev" '"head-source":"worktree"'
+assert_contains "T5.1k the hint prints a placeholder head" "$out" "--head <pr-head-sha>"
+assert_not_contains "T5.1l and not the worktree sha" "$out" "--head ${WT_HEAD:0:7}"
 
 # T5.2 a malformed --skeptic-head is refused rather than recorded.
 : > "$ALOG"

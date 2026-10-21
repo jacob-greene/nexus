@@ -1866,7 +1866,11 @@ _wrapup_skeptic_step() {
         elif [[ -n "$head_sha" ]]; then
             # Say so when nothing is published (jacob-greene/nexus#198).
             echo "ng wrap-up: no --skeptic-pr: verdict recorded host-local only; no Skeptic-Verdict trailer published; it will NOT gate ng pr merge" >&2
-            echo "  if the work is on a pull request:  ng pr verdict set <n> --verdict $verdict --head ${head_sha:0:7}" >&2
+            # A worktree HEAD is the caller's checkout, not the pull request's
+            # head, so print a placeholder rather than a sha that fails the gate.
+            local hint_head="${head_sha:0:7}"
+            [[ "$head_src" == "worktree" ]] && hint_head="<pr-head-sha>"
+            echo "  if the work is on a pull request:  ng pr verdict set <n> --verdict $verdict --head $hint_head" >&2
         fi
 
         # A returned verdict SATISFIES the first-pass require-gate, so clear
