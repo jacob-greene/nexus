@@ -247,6 +247,36 @@ _compose_situation_report() {
     printf -- '- Nexus root: %s\n' "$NEXUS_ROOT"
     printf '\n'
 
+    # Issue #230 (B3): operator comments the resurface cap dropped are
+    # never re-emitted. List the recent rows so a fresh orchestrator sees
+    # them. File name and columns (id, emits, ts, announced) come from
+    # `_resurface_cap.sh::_resurface_record_dropped`. The file is never
+    # pruned, and a row says nothing about whether the comment was
+    # handled later, so only rows from the last 7 days are listed and
+    # the heading does not call them unprocessed.
+    printf '## Resurface-dropped operator comments (may be processed since)\n\n'
+    local dropped_tsv="$STATE_DIR/resurface-dropped.tsv"
+    local dropped_n=0 dropped_old=0 d_id d_emits d_ts _d_rest d_when
+    local dropped_cutoff=$(( $(date +%s) - 7 * 86400 ))
+    if [[ -s "$dropped_tsv" ]]; then
+        while IFS=$'\t' read -r d_id d_emits d_ts _d_rest; do
+            [[ -n "$d_id" ]] || continue
+            if [[ "$d_ts" =~ ^[0-9]+$ ]] && (( d_ts < dropped_cutoff )); then
+                dropped_old=$(( dropped_old + 1 ))
+                continue
+            fi
+            d_when=""
+            [[ "$d_ts" =~ ^[0-9]+$ ]] && d_when=$(date -Is -d "@$d_ts" 2>/dev/null || true)
+            printf -- '- comment id=%s — dropped after %s emits at %s\n' \
+                "$d_id" "${d_emits:-?}" "${d_when:-${d_ts:-unknown time}}"
+            dropped_n=$(( dropped_n + 1 ))
+        done < "$dropped_tsv"
+    fi
+    (( dropped_n == 0 )) && printf 'none\n'
+    (( dropped_old > 0 )) && printf '(%s older than 7 days not listed; see %s)\n' \
+        "$dropped_old" "$dropped_tsv"
+    printf '\n'
+
     printf '## Current tmux windows\n\n'
     printf '```\n'
     tmux list-windows -F '#I #W' 2>/dev/null || printf '(tmux list-windows failed)\n'

@@ -225,6 +225,16 @@ EOF
 # the one this run produced.
 launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
 
+# Issue #230 (B3): seed two resurface-cap drops. The situation report
+# must list every row so a fresh orchestrator sees the dropped
+# operator comments. Columns: id, emits, ts, announced.
+DROPPED_TSV="$STATE_DIR/resurface-dropped.tsv"
+# A third row is 8 days old: it must be left out, and counted.
+DROP_NOW=$(date +%s)
+printf '%s\t%s\t%s\t%s\n' 7000000001 4 $(( DROP_NOW - 3600 )) 1 >  "$DROPPED_TSV"
+printf '%s\t%s\t%s\t%s\n' 7000000002 4 $(( DROP_NOW - 600 )) 0 >> "$DROPPED_TSV"
+printf '%s\t%s\t%s\t%s\n' 7000000003 4 $(( DROP_NOW - 8 * 86400 )) 1 >> "$DROPPED_TSV"
+
 # Default-mode (continue) run.
 NEXUS_ROOT="$FAKE_NEXUS" \
 STATE_DIR="$STATE_DIR" \
@@ -290,6 +300,13 @@ if [[ -f "$REPORT" ]]; then
     assert_contains "report has resume-mode Suggested first checks" \
                     "$body" "## Suggested first checks"
     assert_contains "report tags mode as resume"  "$body" "- Mode: resume"
+    assert_contains "report has resurface-dropped section (#230)" \
+                    "$body" "## Resurface-dropped operator comments (may be processed since)"
+    assert_contains "report lists 1st dropped comment id (#230)" "$body" "comment id=7000000001"
+    assert_contains "report lists 2nd dropped comment id (#230)" "$body" "comment id=7000000002"
+    assert_contains "report shows the drop's emit count (#230)" "$body" "dropped after 4 emits"
+    assert_not_contains "report omits a drop older than 7 days (#230)" "$body" "comment id=7000000003"
+    assert_contains "report counts the omitted old drop (#230)" "$body" "(1 older than 7 days not listed"
 else
     fail "situation-report file missing at $REPORT"
 fi
@@ -343,6 +360,8 @@ echo '=== pin missing: helper degrades to a COLD spawn, never --continue (issue 
 rm -f "$REPORT" "$COOLDOWN"
 # Remove the pin for the duration of this test, then restore it.
 mv "$PIN_FILE" "$WORK/pin-backup"
+# Issue #230: no resurface-dropped.tsv at all -> the section says none.
+rm -f "$DROPPED_TSV"
 
 launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
 NEXUS_ROOT="$FAKE_NEXUS" \
@@ -377,6 +396,14 @@ assert_contains "pin-missing report has First actions section" \
                 "$body" "## First actions"
 assert_contains "pin-missing report tags mode as fresh" \
                 "$body" "- Mode: fresh"
+# Bash substring test, not assert_contains: grep -F treats a
+# multi-line needle as several patterns, and the blank line matches.
+if [[ "$body" == *$'## Resurface-dropped operator comments (may be processed since)\n\nnone\n'* ]]; then
+    pass "absent TSV: resurface-dropped section says none (#230)"
+else
+    fail "absent TSV: resurface-dropped section does not say none (#230)"
+fi
+assert_not_contains "absent TSV: no comment rows listed (#230)" "$body" "comment id="
 
 # Restore the pin so the remaining tests see the deterministic default.
 mv "$WORK/pin-backup" "$PIN_FILE"
@@ -387,6 +414,8 @@ echo '=== --fresh flag: launcher omits --continue, report uses fresh-mode wordin
 : > "$TMUX_LOG"
 : > "$PANE_STATE_LOG"
 rm -f "$REPORT" "$COOLDOWN"
+# Issue #230: an EMPTY resurface-dropped.tsv also yields "none".
+: > "$DROPPED_TSV"
 
 launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
 NEXUS_ROOT="$FAKE_NEXUS" \
@@ -426,6 +455,15 @@ assert_contains "fresh-mode report has First actions section" \
                 "$body" "## First actions"
 assert_contains "fresh-mode report tags mode as fresh" \
                 "$body" "- Mode: fresh"
+# Bash substring test, not assert_contains: grep -F treats a
+# multi-line needle as several patterns, and the blank line matches.
+if [[ "$body" == *$'## Resurface-dropped operator comments (may be processed since)\n\nnone\n'* ]]; then
+    pass "empty TSV: resurface-dropped section says none (#230)"
+else
+    fail "empty TSV: resurface-dropped section does not say none (#230)"
+fi
+assert_not_contains "empty TSV: no comment rows listed (#230)" "$body" "comment id="
+rm -f "$DROPPED_TSV"
 # Issue #203: the --fresh boot wrote a valid-UUID pin at spawn.
 if [[ -f "$PIN_FILE" ]]; then
     pinned_after_fresh=$(<"$PIN_FILE"); pinned_after_fresh="${pinned_after_fresh//[[:space:]]/}"
