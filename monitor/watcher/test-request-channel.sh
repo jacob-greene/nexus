@@ -644,6 +644,18 @@ assert_eq "21: fetch status on .replying still reports claimed" "$lst1" "claimed
 lst2=$("$RC" fetch "$li2" status --principal remote-mia)
 assert_eq "21: fetch status on .failing still reports claimed"  "$lst2" "claimed"
 
+# --- issue 122: `<sub> --help` prints usage, never binds --help as an id ---
+# `await --help` used to wait forever for a reply to request id `--help`.
+timeout 5 "$RC" await --help </dev/null >"$WORK/h122.out" 2>&1
+assert_rc "122: await --help exits 0 (not 124)" "$?" "0"
+assert_contains "122: await --help prints usage" "$(cat "$WORK/h122.out")" "request-channel.sh"
+for _sub in reply show reqfile ack fail fetch list file; do
+    timeout 5 "$RC" "$_sub" --help </dev/null >/dev/null 2>&1
+    assert_rc "122: $_sub --help exits 0" "$?" "0"
+done
+timeout 5 "$RC" bogus-sub --help >/dev/null 2>&1
+assert_rc "122: unknown subcommand with --help still fails" "$?" "1"
+
 echo
 if (( FAIL == 0 )); then echo "ALL TESTS PASSED ($PASS)"; exit 0
 else echo "SOME TESTS FAILED ($FAIL failed, $PASS passed)" >&2; exit 1; fi
