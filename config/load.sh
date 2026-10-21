@@ -69,7 +69,7 @@ except ImportError:
     sys.exit(3)
 
 path, key, default = os.environ['NEXUS_CFG_PATH'], os.environ['KEY'], os.environ['DEFAULT']
-with open(path) as f:
+with open(path, encoding="utf-8") as f:
     cfg = yaml.safe_load(f) or {}
 
 def _stringify(v):
@@ -137,7 +137,7 @@ if key in ('--check-identity', '--validate'):
     example = {}
     expath = os.environ.get('NEXUS_EXAMPLE_PATH', '')
     if expath and os.path.isfile(expath):
-        with open(expath) as f:
+        with open(expath, encoding="utf-8") as f:
             example = yaml.safe_load(f) or {}
 
     def _dig(d, dotted):

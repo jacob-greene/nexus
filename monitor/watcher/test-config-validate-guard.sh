@@ -278,4 +278,23 @@ incident_count=$(find "$CROOT/reports" -name '*watcher-incident.md' 2>/dev/null 
 assert_eq "bootstrap.sh writes NO watcher-incident report" "$incident_count" "0"
 assert_eq "bootstrap.sh calls NO launcher" "$(cat "$WORK/launcher.calls")" ""
 
+echo '=== E. config/load.sh reads UTF-8 under LC_ALL=C (#150) ==='
+
+# The example template carries non-ASCII punctuation. Before the fix,
+# open() used the locale encoding, so LC_ALL=C raised UnicodeDecodeError
+# and every key read failed (exit 1). Both reads are covered: the main
+# config read (key lookup) and the example read (--check-identity).
+if LC_ALL=C /bin/grep -q -P '[^\x00-\x7F]' "$EXAMPLE"; then
+    rc=0; out=$(LC_ALL=C NEXUS_CONFIG="$EXAMPLE" "$LOAD" github.bot_app_id 2>/dev/null) || rc=$?
+    assert_eq "LC_ALL=C key read of non-ASCII config → exit 0" "$rc" "0"
+    assert_eq "LC_ALL=C key read returns the value" "$out" "$ph_app"
+    e1=$WORK/e1; mkdir -p "$e1/config"; cp "$EXAMPLE" "$e1/config/nexus.example.yml"
+    write_real_identity "$e1/config/nexus.yml" "$e1"
+    rc=0; env -u MONITOR_REPO -u MONITOR_USER_LOGIN -u NEXUS_CONFIG LC_ALL=C NEXUS_ROOT="$e1" \
+        "$LOAD" --check-identity >/dev/null 2>&1 || rc=$?
+    assert_eq "LC_ALL=C --check-identity (example read) → exit 0" "$rc" "0"
+else
+    assert_eq "example template holds non-ASCII bytes (fixture premise)" "ascii-only" "non-ascii"
+fi
+
 th_summary_and_exit
