@@ -28,17 +28,17 @@ Direct routing (`@<window>:`) skips the spawn and feeds a follow-up to an existi
 The orchestrator auto-routes any comment whose first non-empty line matches `@<window-name>:<instruction>`. The instruction is pasted into the named tmux window via `monitor/paste-followup.sh` (see [Follow-up messages](#follow-up-messages)), and a confirmation comment is posted on the issue.
 
 ```text
-@kompot-fig3: please skip the slow preprocessing step and use the cached parquet
+@proj-fig3: please skip the slow preprocessing step and use the cached parquet
 ```
 
-If `kompot-fig3` exists, the line after the colon is pasted into its pane, the bot reacts 🚀, and a "routed `@kompot-fig3` directive" comment appears on the thread.
+If `proj-fig3` exists, the line after the colon is pasted into its pane, the bot reacts 🚀, and a "routed `@proj-fig3` directive" comment appears on the thread.
 
 ### The bang convention for destructive instructions
 
 The orchestrator declines to auto-forward instructions that look destructive — anything containing `delete`, `drop`, `force push`, `reset`, or `clean`. Instead it replies asking you to re-send with a bang:
 
 ```text
-@kompot-fig3!: please delete the failed sbatch run output
+@proj-fig3!: please delete the failed sbatch run output
 ```
 
 `@<window>!:` means "yes, I read the warning, do it anyway". This is the one place where you can post a confirmation from your phone without typing the full instruction twice — copy the bot's quoted reply, add the `!`, post.
@@ -93,7 +93,7 @@ Two ways a follow-up reaches a running worker, one per audience:
 
 ## Window naming
 
-Short, descriptive, kebab-case window names tied to the task or project: `repro-skills`, `data-mgmt`, `kompot-fig3`, `bench-eligibility`. The dashboard's *Active Agents* table surfaces the name; the watcher's `tmux list-windows` snapshot uses it; the [window-cleanup policy](#closing-windows) keys on it.
+Short, descriptive, kebab-case window names tied to the task or project: `repro-skills`, `data-mgmt`, `proj-fig3`, `bench-eligibility`. The dashboard's *Active Agents* table surfaces the name; the watcher's `tmux list-windows` snapshot uses it; the [window-cleanup policy](#closing-windows) keys on it.
 
 Check `tmux list-windows` or the dashboard before spawning to avoid collisions. The launcher refuses to create a window whose name already exists.
 

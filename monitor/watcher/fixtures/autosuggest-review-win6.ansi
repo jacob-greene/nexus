@@ -3,14 +3,14 @@
      [2m… +7 lines (ctrl+o to expand)[0m[39m[49m
 
 [38;5;114m●[39m [1mBash[0m[39m[49m(git log --oneline -5)
-[38;5;246m  ⎿  [39mc24b7cd README: embed v5 organigram + user-interaction section (#91)
-     8214136 docs: redistribute instruction context (orchestrator curates per-spawn) (#88)
-     b24d362 watcher: add CLAUDE.md cue under every emit header (#90)
-[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT/work/<your-nexus>-watcher-startup
-      git push -u origin <operator>/watcher-as-startup 2>&1)
+[38;5;246m  ⎿  [39me4f5a6b README: embed v5 organigram + user-interaction section (#45)
+     c7d8e9f docs: redistribute instruction context (orchestrator curates per-spawn) (#43)
+     f0e1d2c watcher: add CLAUDE.md cue under every emit header (#44)
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd /data/lab-share/users/user1/nexus/work/user1-nexus-watcher-startup
+      git push -u origin devuser/watcher-as-startup 2>&1)
 [38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mremote:
-     remote: Create a pull request for '<operator>/watcher-as-startup' on GitHub by visiting:
-     remote:      https://github.com/<your-org>/<your-nexus>/pull/new/<operator>/watcher-as-startup
+     remote: Create a pull request for 'devuser/watcher-as-startup' on GitHub by visiting:
+     remote:      https://github.com/your-org/user1-nexus/pull/new/devuser/watcher-as-startup
      [2m…[0m[39m[49m [2m+4[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
 
 [38;5;114m●[39m [1mWrite[0m[39m[49m(/tmp/watcher-startup-pr-body.md)
@@ -27,15 +27,15 @@
      [2m[38;5;231m 9[0m[39m[49m [38;5;231m```[39m
      [38;5;246m…[39m [38;5;246m+56[39m [38;5;246mlines[39m [38;5;246m(ctrl+o[39m [38;5;246mto[39m [38;5;246mexpand)[39m
 
-[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT/work/<your-nexus>-watcher-startup
-      ./monitor/ng pr create --head <operator>/watcher-as-startup --base main \…)
-[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/<your-org>/<your-nexus>/pull/93
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd /data/lab-share/users/user1/nexus/work/user1-nexus-watcher-startup
+      ./monitor/ng pr create --head devuser/watcher-as-startup --base main \…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/your-org/user1-nexus/pull/47
 
-[38;5;231m●[39m PR #93 is open. Now back-commenting on the tracking issue.
+[38;5;231m●[39m PR #47 is open. Now back-commenting on the tracking issue.
 
 [38;5;114m●[39m [1mWrite[0m[39m[49m(/tmp/watcher-startup-back-comment.md)
 [38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mWrote [1m19[0m[39m[49m lines to [1m../../../../../../../../tmp/watcher-startup-back-comment.md[0m[39m[49m
-     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m2[0m[39m[49m [38;5;231mImplementation[39m [38;5;231mPR[39m [38;5;231mis[39m [38;5;231mup:[39m [38;5;231m<your-org>/<your-nexus>#93.[39m
+     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m2[0m[39m[49m [38;5;231mImplementation[39m [38;5;231mPR[39m [38;5;231mis[39m [38;5;231mup:[39m [38;5;231myour-org/user1-nexus#47.[39m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m3[0m[39m[49m [38;5;231m###[39m [38;5;231mTested[39m [38;5;231mpaths[39m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m4[0m[39m[49m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m5[0m[39m[49m [38;5;231m-[39m [38;5;231m[x][39m [38;5;231m**Cold[39m [38;5;231mstart**[39m [38;5;231m—[39m [38;5;231m`entry.sh`[39m [38;5;231mself-checks[39m [38;5;231mpass,[39m [38;5;231mclaude[39m [38;5;231mwindow[39m [38;5;231mgets[39m [38;5;231mcreated[39m [38;5;231mwith[39m [38;5;231mthe[39m [38;5;231mbootstrap[39m [38;5;231mprompt[39m [38;5;231mbaked[39m [38;5;231min,[39m [38;5;231mcurrent[39m [38;5;231mwindow[39m [38;5;231mrenamed[39m [38;5;231mto[39m [38;5;231m`watcher`,[39m [38;5;231mmain.sh[39m [38;5;231mexeced[39m [38;5;231m(unit[39m [38;5;231mte[39m
@@ -47,11 +47,11 @@
      [2m[38;5;231m 10[0m[39m[49m [38;5;231m-[39m [38;5;231m[x][39m [38;5;231m**Self-checks**[39m [38;5;231m—[39m [38;5;231mmissing[39m [38;5;231m`TMUX`[39m [38;5;231mand[39m [38;5;231mmissing[39m [38;5;231m`SANDBOX_ACTIVE`[39m [38;5;231meach[39m [38;5;231mrefuse[39m [38;5;231mwith[39m [38;5;231mrc=2[39m [38;5;231m+[39m [38;5;231ma[39m [38;5;231mfix[39m [38;5;231mhint[39m [38;5;231m(unit[39m [38;5;231mtests).[39m
      [38;5;246m…[39m [38;5;246m+17[39m [38;5;246mlines[39m [38;5;246m(ctrl+o[39m [38;5;246mto[39m [38;5;246mexpand)[39m
 
-[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT/work/<your-nexus>-watcher-startup
-      ./monitor/ng issue comment 92 --body-file /tmp/watcher-startup-back-comment.md 2>&1)
-[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/<your-org>/<your-nexus>/issues/92#issuecomment-4402128856
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd /data/lab-share/users/user1/nexus/work/user1-nexus-watcher-startup
+      ./monitor/ng issue comment 46 --body-file /tmp/watcher-startup-back-comment.md 2>&1)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/your-org/user1-nexus/issues/46#issuecomment-4400000002
 
-[38;5;114m●[39m [1mBash[0m[39m[49m(sandbox-notify "watcher-startup PR #93 is up; comment posted on #92")
+[38;5;114m●[39m [1mBash[0m[39m[49m(sandbox-notify "watcher-startup PR #47 is up; comment posted on #46")
 [38;5;246m [39m [38;5;246m⎿[39m [38;5;246m (No[39m [38;5;246moutput)[39m
 
 [38;5;231m●[39m Now writing the final report (replacing the earlier idle-status one).
@@ -68,19 +68,19 @@
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m5[0m[39m[49m [38;5;231m**Started:**[39m [38;5;231m2026-05-07T16:25Z[39m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m6[0m[39m[49m [38;5;231m**Finished:**[39m [38;5;231m2026-05-07T17:21Z[39m
      [2m[38;5;231m [0m[39m[49m [2m[38;5;231m7[0m[39m[49m [38;5;231m**Status:**[39m [38;5;231mcompleted[39m
-     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m8[0m[39m[49m [38;5;231m**Tracking:**[39m [38;5;231m[[38;5;186m<your-org>/<your-nexus>#92[38;5;231m](https://github.com/<your-org>/<your-nexus>/issues/92)[39m
-     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m9[0m[39m[49m [38;5;231m**PR:**[39m [38;5;231m[[38;5;186m<your-org>/<your-nexus>#93[38;5;231m](https://github.com/<your-org>/<your-nexus>/pull/93)[39m
-     [2m[38;5;231m 10[0m[39m[49m [38;5;231m**Branch:**[39m [38;5;231m`<operator>/watcher-as-startup`[39m [38;5;231m(1[39m [38;5;231mcommit[39m [38;5;231mon[39m [38;5;231mtop[39m [38;5;231mof[39m [38;5;231m`main`)[39m
+     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m8[0m[39m[49m [38;5;231m**Tracking:**[39m [38;5;231m[[38;5;186myour-org/user1-nexus#46[38;5;231m](https://github.com/your-org/user1-nexus/issues/46)[39m
+     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m9[0m[39m[49m [38;5;231m**PR:**[39m [38;5;231m[[38;5;186myour-org/user1-nexus#47[38;5;231m](https://github.com/your-org/user1-nexus/pull/47)[39m
+     [2m[38;5;231m 10[0m[39m[49m [38;5;231m**Branch:**[39m [38;5;231m`devuser/watcher-as-startup`[39m [38;5;231m(1[39m [38;5;231mcommit[39m [38;5;231mon[39m [38;5;231mtop[39m [38;5;231mof[39m [38;5;231m`main`)[39m
      [38;5;246m…[39m [38;5;246m+64[39m [38;5;246mlines[39m [38;5;246m(ctrl+o[39m [38;5;246mto[39m [38;5;246mexpand)[39m
 
-[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT/work/<your-nexus>-watcher-startup
-      ./monitor/ng pr view 93 2>&1)
-[38;5;246m  ⎿  [39m#93 state=OPEN author=<your-org>-bot[bot] <operator>/watcher-as-startup->main title=watcher: invert boot order so the watcher is the entry point (#92)
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd /data/lab-share/users/user1/nexus/work/user1-nexus-watcher-startup
+      ./monitor/ng pr view 47 2>&1)
+[38;5;246m  ⎿  [39m#47 state=OPEN author=your-org-user1-bot[bot] devuser/watcher-as-startup->main title=watcher: invert boot order so the watcher is the entry point (#46)
 
 [38;5;231m●[39m Done.
 
-  - [1mTracking issue:[0m[39m[49m https://github.com/<your-org>/<your-nexus>/issues/92 — design write-up, decisions, post-implementation back-comment with tested-paths checklist + three refinements.
-  - [1mPR:[0m[39m[49m https://github.com/<your-org>/<your-nexus>/pull/93 — single commit, bot identity, references #92. Open, awaiting your review; not merged.
+  - [1mTracking issue:[0m[39m[49m https://github.com/your-org/user1-nexus/issues/46 — design write-up, decisions, post-implementation back-comment with tested-paths checklist + three refinements.
+  - [1mPR:[0m[39m[49m https://github.com/your-org/user1-nexus/pull/47 — single commit, bot identity, references #46. Open, awaiting your review; not merged.
   - [1mWhat landed:[0m[39m[49m [38;5;153m./watcher[39m symlink → [38;5;153mmonitor/watcher/entry.sh[39m (self-checks, idempotent re-invocation, [38;5;153m--continue[39m opt-in); crash-loop guard wired through [38;5;153m_lib.sh[39m and [38;5;153mmain.sh[39m's missing-target
   branch; both spawn paths use [38;5;153mtmux new-window <cmd>[39m so claude's exit actually collapses the window; README + monitor/README + [38;5;153mconfig/nexus.example.yml[39m updated; three new tests (15 unit cases
    pass, integration test PASS in ~15-30 s).
@@ -97,5 +97,5 @@
 [39m❯ [7mr[0;2m[39m[49meview the PR diff myself[0m[39m[49m
 [38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 [39m  [38;5;246m◉[39m [38;5;246mOpus[39m [38;5;246m4.7[39m [38;5;246m(1M[39m [38;5;246mcontext)[39m [38;5;246m│[39m [38;5;246m██▌░░░░░░▓[39m [38;5;246m254K/1.0M[39m [38;5;246m│[39m [38;5;246m⚡100%[39m [38;5;246m│[39m [38;5;246m$15.62[39m [38;5;246m+1387/-135[39m                                  [38;5;211m✗[39m [38;5;211mAuto-update[39m [38;5;211mfailed[39m [38;5;211m·[39m [38;5;211mTry[39m [1m[38;5;211mclaude[0m[39m[49m [1m[38;5;211mdoctor[0m[38;5;211m[49m or[39m [1m[38;5;211mnpm[0m[39m[49m [1m[38;5;211mi[0m[39m[49m [1m[38;5;211m-g[0m[39m[49m [1m[38;5;211m@anthropic-ai/claude-code[0m[39m[49m
-  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m [38;5;246m·[39m [38;5;246mPR[39m [38;5;220m#93[39m
+  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m [38;5;246m·[39m [38;5;246mPR[39m [38;5;220m#47[39m
 

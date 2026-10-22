@@ -38,7 +38,7 @@ issue=42 id=4422219722 author=<your-login>
   body: please open the PR when tests pass
 
 --- idle workers ---
-kompot-fig3 wrapped up (idle 0:35:12; wrap-up logged)
+proj-fig3 wrapped up (idle 0:35:12; wrap-up logged)
 
 --- dashboard ---
 last updated 2026-05-11T13:18:42Z (24m ago)

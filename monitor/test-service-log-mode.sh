@@ -167,7 +167,7 @@ fi
 # ── 9. END-TO-END: the real fleet-wide launcher, bootstrap-recover.sh ─────
 # _recover_launch_service is THE create-by-redirect site for every
 # registry service (remote-ssh.log, labsh-service.log, serve.log,
-# deploy.log, annzarro.log …). bootstrap-recover.sh is source-safe: it
+# deploy.log, myviewer.log …). bootstrap-recover.sh is source-safe: it
 # runs _recover_main only when executed directly.
 echo "## 9. end-to-end: bootstrap-recover.sh::_recover_launch_service"
 if [[ "${LOG_MODE_HELPER:-real}" == "noop" ]]; then

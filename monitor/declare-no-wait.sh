@@ -24,7 +24,7 @@
 # Use case: you submitted a long-running slurm job whose result
 # you'll check tomorrow morning by hand; the watcher would
 # otherwise emit `idle-orphan-async` against you. Run
-# `declare-no-wait.sh slurm 52527284_4` after the sbatch and the
+# `declare-no-wait.sh slurm 12345284_4` after the sbatch and the
 # watcher will treat the worker as plain `idle` (subject to the
 # usual wrap-up rules).
 #

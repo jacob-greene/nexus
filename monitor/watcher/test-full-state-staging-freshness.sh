@@ -192,7 +192,7 @@ orchestrator|0|2
 proj-d|0|3'
 OTHER_WORKER='services|0|1
 orchestrator|0|2
-kompot-bench|0|4'
+proj-e|0|4'
 
 STALE_BODY='  - proj-d (active, state=busy)'
 
@@ -245,7 +245,7 @@ assert_contains "re-render reason names the threshold it crossed" \
 # Stale staging + a DIFFERENT live worker: the served body must be the LIVE
 # one, not merely "not the stale one".
 out=$(compose_cycle "$OTHER_WORKER" 320 "$STALE_BODY" 2>/dev/null)
-assert_contains "stale body replaced by the live worker" "$out" "kompot-bench"
+assert_contains "stale body replaced by the live worker" "$out" "proj-e"
 assert_not_contains "stale worker gone from the replacement" "$out" "proj-d"
 
 # ===========================================================================
@@ -509,7 +509,7 @@ assert_contains "timeout logs the empty-render fallback" \
 # (An earlier revision used a plain sleep and self-SKIPped on a fast host —
 # and that skip is precisely where the empty-PARTIAL defect below hid.)
 TWO_WORKERS="$ONE_WORKER
-kompot-bench|0|5"
+proj-e|0|5"
 out=$(compose_cycle "$TWO_WORKERS" 320 "$STALE_BODY" 2 30 hang-after-first 2>"$WORK/err.8")
 assert_contains "partial (non-empty) timed-out render is labelled PARTIAL" \
     "$out" "PARTIAL"

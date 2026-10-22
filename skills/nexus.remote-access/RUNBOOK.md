@@ -30,7 +30,7 @@ pin). Choose along a breadth ladder:
 
 - **Broad subnet — recommended set-once default.** Pin your campus/LAN block once
   and any client on it can reach the auth stage; no per-client lookup. E.g.
-  `140.107.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
+  `198.51.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
   network).
 - **`/32` — max security.** Pin the single client host so only that machine can
   even reach the auth stage.
@@ -45,7 +45,7 @@ the endpoint directly (e.g. it sits behind a campus bastion reached by
 `ProxyJump`) does the connect line need a `-J <jump-host>` hop. In that case the
 source IP the host sees is the BASTION's, not the client's laptop — pin the
 bastion's address (e.g. a `<BASTION-IP>/32`; a concrete value such as
-`140.107.116.184/32` is an EXAMPLE for one specific network, never a
+`198.51.100.84/32` is an EXAMPLE for one specific network, never a
 recommendation). Config + connect (broad-subnet default shown, direct connect —
 no jump host):
 

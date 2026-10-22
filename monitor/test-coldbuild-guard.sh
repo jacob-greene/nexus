@@ -126,7 +126,7 @@ _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
 check "--force / SVC_FORCE=1 overrides the guard" "$?" "0"
 
 SVC_FORCE=0
-_coldbuild_guard dolimap-serve "$wd" ./serve-supervised.sh >/dev/null 2>&1
+_coldbuild_guard mysite-serve "$wd" ./serve-supervised.sh >/dev/null 2>&1
 check "a non-labsh service is never guarded" "$?" "0"
 
 echo "=== BOUNDS: the guard must never refuse a WEDGED build (your-org/your-nexus#273 round 2) ==="

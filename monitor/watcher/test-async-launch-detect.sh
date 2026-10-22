@@ -55,20 +55,20 @@ echo "=== default pattern set: sbatch / srun --no-block / nohup ==="
 
 # (1) sbatch with id in stdout.
 reset_hb
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
+fire_hook "sbatch run.sh" "Submitted batch job 12345284"
 got=$(read_waits)
-if jq -e '. == [{kind:"slurm",id:"52527284",desc:"sbatch"}]' <<<"$got" >/dev/null; then
-    ok "sbatch run.sh → kind=slurm id=52527284"
+if jq -e '. == [{kind:"slurm",id:"12345284",desc:"sbatch"}]' <<<"$got" >/dev/null; then
+    ok "sbatch run.sh → kind=slurm id=12345284"
 else
     bad "sbatch basic" "got=$got"
 fi
 
 # (2) sbatch --array with array job id.
 reset_hb
-fire_hook "sbatch --array=1-10 --wrap='echo hi'" "Submitted batch job 52527285_1"
+fire_hook "sbatch --array=1-10 --wrap='echo hi'" "Submitted batch job 12345285_1"
 got=$(read_waits)
 id=$(jq -r '.[0].id' <<<"$got")
-if [[ "$id" == "52527285_1" ]]; then
+if [[ "$id" == "12345285_1" ]]; then
     ok "sbatch --array → array id captured"
 else
     bad "sbatch array" "got=$got"
@@ -76,8 +76,8 @@ fi
 
 # (3) Repeat same sbatch — idempotent on (kind, id).
 reset_hb
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
-fire_hook "sbatch run.sh" "Submitted batch job 52527284"
+fire_hook "sbatch run.sh" "Submitted batch job 12345284"
+fire_hook "sbatch run.sh" "Submitted batch job 12345284"
 got=$(read_waits)
 count=$(jq 'length' <<<"$got")
 if [[ "$count" == "1" ]]; then
@@ -140,11 +140,11 @@ fi
 # (9) srun --no-block with id in stdout.
 reset_hb
 fire_hook "srun --no-block --partition=campus-new -n 1 ./script.sh" \
-          "Submitted job 52527299"
+          "Submitted job 12345299"
 got=$(read_waits)
 kind=$(jq -r '.[0].kind' <<<"$got")
 id=$(jq -r '.[0].id' <<<"$got")
-if [[ "$kind" == "slurm-srun-async" ]] && [[ "$id" == "52527299" ]]; then
+if [[ "$kind" == "slurm-srun-async" ]] && [[ "$id" == "12345299" ]]; then
     ok "srun --no-block → kind=slurm-srun-async id captured"
 else
     bad "srun --no-block" "got=$got"
@@ -154,7 +154,7 @@ fi
 #      add a wait for synchronous srun calls.
 reset_hb
 fire_hook "srun --partition=campus-new -n 1 ./script.sh" \
-          "Submitted job 52527311"
+          "Submitted job 12345311"
 got=$(read_waits)
 if [[ "$got" == "[]" ]]; then
     ok "srun without --no-block → no match"

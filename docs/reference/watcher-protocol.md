@@ -772,15 +772,15 @@ issue=42 id=4567890 author=user_login
 (silenced after emit; agents will re-ring on the next event)
 
 --- idle workers ---                    # only when non-empty
-  - storage-bench wrapped up (idle 1h12m; wrap-up logged)
+  - bench-c wrapped up (idle 1h12m; wrap-up logged)
   - report-init-fixup idle 8m WITHOUT wrap-up — consider follow-up paste
 (emitted on transitions only; see skills/nexus.window-cleanup)
 
 --- service health ---                  # only when a registry service is unhealthy
-service 'dolimap-serve' DOWN and NOT auto-recovering (FLAPPING): unhealthy since 2026-05-11T13:30:00-07:00; 3 restart attempt(s) did not hold.
+service 'mysite-serve' DOWN and NOT auto-recovering (FLAPPING): unhealthy since 2026-05-11T13:30:00-07:00; 3 restart attempt(s) did not hold.
   failing healthcheck: curl -fsS -o /dev/null --max-time 3 http://localhost:8765/
   ACTION (skills/nexus.service-recovery): restore first, then dispatch a root-cause worker + open an operator incident issue.
-    incident issue: monitor/ng service-incident dolimap-serve
+    incident issue: monitor/ng service-incident mysite-serve
 
 --- dashboard ---
 last updated: 2026-05-11T11:10:00-07:00

@@ -209,7 +209,7 @@ stripped, capped at 40 chars) from the canonical Claude Code
 `orphan_kinds` appears only when `state=idle-orphan-async`; it
 carries a comma-separated, dedup'd `kind:id,…` list from the
 heartbeat's `external_waits` array (e.g.
-`orphan_kinds=slurm:52527284_4,ci:<your-org>/runs/26304173692`),
+`orphan_kinds=slurm:12345284_4,ci:<your-org>/runs/26304173692`),
 capped at 80 chars with a trailing `…` on overflow, so the
 contract violation surfaces with the offending job id.
 

@@ -324,7 +324,7 @@ alive when any of the following holds:
   referenced in its last report. Re-engagement cost is
   high. Retain unless idle ≥ 24 h.
 - **Open-ended scope.** Long-running research threads the
-  user routinely re-engages (`kompot-fig*`,
+  user routinely re-engages (`proj-fig*`,
   `proj-alpha-series`, `proj-density`-style worker windows
   whose tracking issue is still open). Close only on
   explicit user directive, not on idle alone.

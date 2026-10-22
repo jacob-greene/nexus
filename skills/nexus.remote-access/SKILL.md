@@ -159,7 +159,7 @@ monitor:
     allow_attach: false            # opt-in read-only attach (channel-only)
     from_cidr: ""                  # REQUIRED for a routable (non-loopback) bind — EMPTY is
                                    # FAIL-CLOSED (won't start). Recommended set-once default: your
-                                   # campus/LAN subnet, e.g. 140.107.0.0/16 (EXAMPLE — use your
+                                   # campus/LAN subnet, e.g. 198.51.0.0/16 (EXAMPLE — use your
                                    # own network). Tighten to <CLIENT-IP>/32 for max security, or
                                    # 0.0.0.0/0 to allow ANY source (opt-in; RUNBOOK.md "Network exposure").
                                    # A malformed CIDR is refused. Optional (defence-in-depth) with

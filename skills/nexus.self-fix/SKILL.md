@@ -13,7 +13,7 @@ misbehaving); agent needs to propagate a nexus-internals fix to
 sibling fork repos.
 
 This skill is **nexus-self-only**. Project agents (kompot,
-perturb-bench, fig4-subtle-de, etc.) doing GitHub writes against
+proj-x, proj-y, etc.) doing GitHub writes against
 their own work should rely on `nexus.bot` instead — cross-fork
 discovery and propagation are nexus-bug-fix concerns, not general
 GitHub-write concerns.

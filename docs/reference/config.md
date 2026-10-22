@@ -140,7 +140,7 @@ environment-modules (e.g. <your-institution> <cluster>: `module load nodejs`).
 is absent: it sources the module init, `module load`s this name (then
 falls back to discovering the highest `>=18` versioned module if the
 site has no default), and re-checks. Leave as the default `nodejs`
-for FH <cluster> and most EasyBuild sites; override only if your site's
+for <your-institution> <cluster> and most EasyBuild sites; override only if your site's
 node module is named differently. No effect on hosts where `node` is
 already on `PATH`. Env var `NEXUS_NODE_MODULE` wins over this key.
 
