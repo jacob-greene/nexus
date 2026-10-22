@@ -32,7 +32,7 @@ nexus:
   # absent: it sources the module init, `module load`s this name (then
   # falls back to discovering the highest >=18 versioned module if the
   # site has no default), and re-checks. Leave as the default `nodejs`
-  # for FH <cluster> and most EasyBuild sites; override only if your site's
+  # for <your-institution> <cluster> and most EasyBuild sites; override only if your site's
   # node module is named differently. Env var NEXUS_NODE_MODULE wins
   # over this key. Has no effect on hosts where node is already on PATH.
   # See <your-org>/<other-nexus>#41.
@@ -1690,16 +1690,16 @@ monitor:
     #   # your campus/LAN, no per-connection edit. Use YOUR network's block;
     #   # the value below is an EXAMPLE (<your-institution> campus), not a universal
     #   # default — substitute your own CIDR.
-    #   from_cidr: "140.107.0.0/16"
+    #   from_cidr: "198.51.0.0/16"
     #
     #   # single client — MAX security: only this one host may reach the
     #   # pre-auth stage. Swap in the client's IP.
     #   # from_cidr: "10.0.0.5/32"
     #
-    #   # snail2 / bastion-proxy users: if you reach this host by ProxyJump
+    #   # bastion-proxy users: if you reach this host by ProxyJump
     #   # through a bastion, the SOURCE IP the host sees is the BASTION's, not
-    #   # your laptop's — pin the bastion. Example (FH sn2 hop):
-    #   # from_cidr: "140.107.116.184/32"
+    #   # your laptop's — pin the bastion. Example (an institutional bastion hop):
+    #   # from_cidr: "198.51.100.84/32"
     #
     #   # ANY source — conscious opt-in: exposes the SSH PRE-AUTH surface to the
     #   # whole reachable network. Auth stays pubkey-only + forced-command +

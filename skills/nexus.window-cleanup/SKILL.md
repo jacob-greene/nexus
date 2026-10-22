@@ -144,7 +144,7 @@ Suppression conditions (all must hold):
   `tmux #{window_activity}` alone** — autosuggest re-renders,
   cursor blinks, spinner glyphs, and status-bar token-counter
   ticks all bump `window_activity` without representing real
-  engagement (issue #111: `echo-density` retain consumed
+  engagement (issue #111: `proj-density` retain consumed
   inside 30 min while pane-state reliably reported idle /
   autosuggest-only).
 
@@ -291,8 +291,8 @@ filename: `<project>_<date>_<time>_<slug>.md`. Match by either:
 
 - **Project slot** — `reports/<window-name>_*.md` (worker
   whose `work/<project>` matches the window name, e.g.
-  `echo-density`, `agent-sandbox-doc`,
-  `repltime-histones`).
+  `proj-density`, `agent-sandbox-doc`,
+  `proj-alpha-series`).
 - **Slug slot** — `reports/<project>_*<window-name>*.md`
   (workspace-level worker that uses `nexus` as project; the
   window name appears inside the slug, e.g.
@@ -324,8 +324,8 @@ alive when any of the following holds:
   referenced in its last report. Re-engagement cost is
   high. Retain unless idle ≥ 24 h.
 - **Open-ended scope.** Long-running research threads the
-  user routinely re-engages (`kompot-fig*`,
-  `repltime-histones`, `echo-density`-style worker windows
+  user routinely re-engages (`proj-fig*`,
+  `proj-alpha-series`, `proj-density`-style worker windows
   whose tracking issue is still open). Close only on
   explicit user directive, not on idle alone.
 - **Cross-issue spillover.** The worker's tracking issue is

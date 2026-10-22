@@ -281,7 +281,7 @@ assert_not_contains "no retained row while interactive" "$out" $'chatback\tretai
 unset MOCK_PANE_STATE_chatback
 
 # ---- (2b) post-wrap SELF-activity (own session-id) → NOT operator ---------
-# The coembed-283-followup false positive (2026-07-17). A UserPromptSubmit
+# The proj-x-followup false positive (2026-07-17). A UserPromptSubmit
 # with NO covering machine stamp used to fall straight into the OPERATOR
 # branch. But when it carries the window's OWN spawn session-id it is the
 # worker's pane self-activity (autosuggest / post-wrap typing / its own

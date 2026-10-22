@@ -189,12 +189,12 @@ RESERVED_ONLY='services|0|1
 orchestrator|0|2'
 ONE_WORKER='services|0|1
 orchestrator|0|2
-nuc-arm-scatter|0|3'
+proj-d|0|3'
 OTHER_WORKER='services|0|1
 orchestrator|0|2
-kompot-bench|0|4'
+proj-e|0|4'
 
-STALE_BODY='  - nuc-arm-scatter (active, state=busy)'
+STALE_BODY='  - proj-d (active, state=busy)'
 
 # ===========================================================================
 echo '=== _full_state_stage_age_seconds (unit) ==='
@@ -230,7 +230,7 @@ out=$(compose_cycle "$RESERVED_ONLY" 320 "$STALE_BODY" 2>"$WORK/err.1")
 counts=$(printf '%s\n' "$out" | grep '^workspace:')
 assert_contains "counts line reports zero workers (ground truth)" "$counts" "0 busy"
 assert_not_contains "stale window is NOT served in the snapshot body" \
-    "$out" "nuc-arm-scatter"
+    "$out" "proj-d"
 # Zero live workers ⇒ render_full_state_snapshot yields nothing ⇒ the section
 # is correctly absent. Agreeing with `0 busy` is the whole point.
 assert_not_contains "snapshot section absent when there are no workers" \
@@ -245,8 +245,8 @@ assert_contains "re-render reason names the threshold it crossed" \
 # Stale staging + a DIFFERENT live worker: the served body must be the LIVE
 # one, not merely "not the stale one".
 out=$(compose_cycle "$OTHER_WORKER" 320 "$STALE_BODY" 2>/dev/null)
-assert_contains "stale body replaced by the live worker" "$out" "kompot-bench"
-assert_not_contains "stale worker gone from the replacement" "$out" "nuc-arm-scatter"
+assert_contains "stale body replaced by the live worker" "$out" "proj-e"
+assert_not_contains "stale worker gone from the replacement" "$out" "proj-d"
 
 # ===========================================================================
 echo '=== heartbeat guard: FRESH staging is served as-is, no inline render ==='
@@ -260,7 +260,7 @@ echo '=== heartbeat guard: FRESH staging is served as-is, no inline render ==='
 # `_compose_report_body` renders the `workspace:` prelude inline on every
 # emit (by design — that is the always-fresh half), so the cycle pays a
 # pane-probe pass either way.
-SENTINEL='  - nuc-arm-scatter (active, state=busy) [staged-sentinel]'
+SENTINEL='  - proj-d (active, state=busy) [staged-sentinel]'
 out=$(compose_cycle "$ONE_WORKER" 10 "$SENTINEL" 2>"$WORK/err.2")
 assert_contains "fresh staged body served byte-for-byte" "$out" "[staged-sentinel]"
 assert_not_contains "no inline re-render on the fresh path" \
@@ -270,7 +270,7 @@ assert_not_contains "no inline re-render on the fresh path" \
 out=$(compose_cycle "$ONE_WORKER" 320 "$SENTINEL" 2>/dev/null)
 assert_not_contains "stale staged bytes are discarded, not served" \
     "$out" "[staged-sentinel]"
-assert_contains "replaced by a live render of the same window" "$out" "nuc-arm-scatter"
+assert_contains "replaced by a live render of the same window" "$out" "proj-d"
 
 # Boundary. The end-to-end checks carry a few seconds of slack on purpose:
 # compose_cycle backdates with `touch -d` and the child then re-reads the
@@ -317,7 +317,7 @@ echo '=== row-count consistency (threshold-INDEPENDENT) ==='
 for age in 100 290; do
     out=$(compose_cycle "$RESERVED_ONLY" "$age" "$STALE_BODY" 2>"$WORK/err.rc.$age")
     assert_not_contains "#14 at ${age}s (under the gate): killed window not served" \
-        "$out" "nuc-arm-scatter"
+        "$out" "proj-d"
     assert_contains "#14 at ${age}s: caught by the row count, not the age gate" \
         "$(cat "$WORK/err.rc.$age")" "snapshot lists 1 window(s), 0 live"
 done
@@ -374,7 +374,7 @@ assert_not_contains "empty body does not trip the row-count branch" \
 
 # Matching counts are left alone even for row classes the harness rarely sees
 # (the skeptic found this shape in the live staging file).
-PARKED_BODY='  - nuc-arm-scatter parked-awaiting-skeptic (state=empty; skeptic reviewing — exempt from idle/close)'
+PARKED_BODY='  - proj-d parked-awaiting-skeptic (state=empty; skeptic reviewing — exempt from idle/close)'
 out=$(compose_cycle "$ONE_WORKER" 10 "$PARKED_BODY" 2>"$WORK/err.parked")
 assert_contains "parked-awaiting-skeptic row counts as a row (1==1, served)" \
     "$out" "parked-awaiting-skeptic"
@@ -393,7 +393,7 @@ mkdir -p "$STATE_DIR/skeptic/pending"
 printf '1' > "$STATE_DIR/skeptic/pending/ghost-w"
 touch -d "@$(( $(date +%s) - 1900800 ))" "$STATE_DIR/skeptic/pending/ghost-w"
 DEAD_ROW='  - ghost-w dead-window-skeptic-pending (marker 1900800s old; skeptic required 1900800s ago; window GONE)'
-WORKER_ROW='  - nuc-arm-scatter (active, state=busy)'
+WORKER_ROW='  - proj-d (active, state=busy)'
 
 # 2 rows, 1 live window + 1 dead-window marker ⇒ consistent ⇒ served as-is.
 out=$(compose_cycle "$ONE_WORKER" 10 "$DEAD_ROW"$'\n'"$WORKER_ROW" 2>"$WORK/err.dw1")
@@ -437,33 +437,33 @@ echo '=== the cancelling case: a marker-holding window that CLOSED (#202) ==='
 # is a REGRESSION of the #14 guarantee, not merely a gap. The name-aware test
 # (`dead rows in body == dead markers on disk`) is what closes it.
 mkdir -p "$STATE_DIR/skeptic/pending"
-printf '1' > "$STATE_DIR/skeptic/pending/nuc-arm-scatter"
+printf '1' > "$STATE_DIR/skeptic/pending/proj-d"
 
 out=$(compose_cycle "$RESERVED_ONLY" 10 "$STALE_BODY" 2>"$WORK/err.mask")
 assert_contains "the cancelling case is CAUGHT, not masked" \
     "$(cat "$WORK/err.mask")" "snapshot lists 1 window(s), 0 live + 1 dead-window marker(s), body carries 0"
 assert_not_contains "the closed window is no longer served as active" \
-    "$out" "nuc-arm-scatter (active, state=busy)"
+    "$out" "proj-d (active, state=busy)"
 assert_contains "the dead-window row that replaced it IS served" \
-    "$out" "nuc-arm-scatter dead-window-skeptic-pending"
+    "$out" "proj-d dead-window-skeptic-pending"
 
 # Control, the other direction: a staged dead-window row whose marker has since
 # been resolved must also re-render, or the emit keeps claiming an unvalidated
 # result that is now validated.
-rm -f "$STATE_DIR/skeptic/pending/nuc-arm-scatter"
-DEAD_ONLY='  - nuc-arm-scatter dead-window-skeptic-pending (marker 900s old; window GONE)'
+rm -f "$STATE_DIR/skeptic/pending/proj-d"
+DEAD_ONLY='  - proj-d dead-window-skeptic-pending (marker 900s old; window GONE)'
 out=$(compose_cycle "$RESERVED_ONLY" 10 "$DEAD_ONLY" 2>"$WORK/err.mask2")
 assert_contains "a resolved marker with a stale dead row re-renders" \
     "$(cat "$WORK/err.mask2")" "body carries 1"
 assert_not_contains "the stale dead-window row is dropped" \
-    "$out" "nuc-arm-scatter"
+    "$out" "proj-d"
 
 # Control, the silent case: body and disk agree on BOTH counts ⇒ no re-render.
 # Without this arm the two assertions above could pass on a gate that fires
 # unconditionally.
 printf '1' > "$STATE_DIR/skeptic/pending/ghost-w"
 AGREE_BODY='  - ghost-w dead-window-skeptic-pending (marker 900s old; window GONE)
-  - nuc-arm-scatter (active, state=busy)'
+  - proj-d (active, state=busy)'
 out=$(compose_cycle "$ONE_WORKER" 10 "$AGREE_BODY" 2>"$WORK/err.mask3")
 assert_not_contains "1 live + 1 dead, body carries both ⇒ gate silent" \
     "$(cat "$WORK/err.mask3")" "snapshot lists"
@@ -496,7 +496,7 @@ assert_contains "freshly re-rendered body reports 0s" \
 out=$(compose_cycle "$ONE_WORKER" 320 "$STALE_BODY" 1 30 2>"$WORK/err.7")
 assert_contains "timed-out empty re-render keeps the section" \
     "$out" "--- workspace snapshot ---"
-assert_contains "...serving the staged body" "$out" "nuc-arm-scatter"
+assert_contains "...serving the staged body" "$out" "proj-d"
 assert_contains "...labelled STALE" "$out" "STALE"
 assert_contains "...with its true age, not 0s" "$out" "rendered 32"
 assert_contains "...and a verify-with-tmux instruction" "$out" "verify with tmux before acting"
@@ -509,7 +509,7 @@ assert_contains "timeout logs the empty-render fallback" \
 # (An earlier revision used a plain sleep and self-SKIPped on a fast host —
 # and that skip is precisely where the empty-PARTIAL defect below hid.)
 TWO_WORKERS="$ONE_WORKER
-kompot-bench|0|5"
+proj-e|0|5"
 out=$(compose_cycle "$TWO_WORKERS" 320 "$STALE_BODY" 2 30 hang-after-first 2>"$WORK/err.8")
 assert_contains "partial (non-empty) timed-out render is labelled PARTIAL" \
     "$out" "PARTIAL"

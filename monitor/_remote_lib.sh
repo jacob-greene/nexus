@@ -154,7 +154,7 @@ _remote_bind_guard() {
     # accepted here: breadth is a conscious operator choice, malformation is not.
     if [[ -n "$cidr" ]] && ! _remote_cidr_is_valid "$cidr"; then
         printf 'remote: REFUSING monitor.remote.from_cidr=%s — not a well-formed CIDR.\n' "$cidr" >&2
-        printf '  Use e.g. 140.107.0.0/16 (a subnet), %s/32 (one client), or 0.0.0.0/0 (any source).\n' "$bind" >&2
+        printf '  Use e.g. 198.51.0.0/16 (a subnet), %s/32 (one client), or 0.0.0.0/0 (any source).\n' "$bind" >&2
         return 1
     fi
     # Routable (non-loopback) bind is SENSITIVE: from_cidr is REQUIRED. Empty is
@@ -163,7 +163,7 @@ _remote_bind_guard() {
         printf 'remote: REFUSING bind_address=%s without monitor.remote.from_cidr — a routable bind\n' "$bind" >&2
         printf '  is SENSITIVE access; pin the source range. Recommended: your campus/LAN subnet,\n' >&2
         printf '  set once — e.g.\n' >&2
-        printf '    monitor.remote.from_cidr: "140.107.0.0/16"   (a broad subnet)\n' >&2
+        printf '    monitor.remote.from_cidr: "198.51.0.0/16"   (a broad subnet)\n' >&2
         printf '  tighten to "%s/32" for a single client (max security), or "0.0.0.0/0" to allow\n' "$bind" >&2
         printf '  ANY source (conscious opt-in — exposes the pre-auth SSH surface to the whole\n' >&2
         printf '  reachable network). Or bind loopback (127.0.0.1) and reach it via an SSH\n' >&2

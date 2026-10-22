@@ -48,7 +48,7 @@
 # heartbeat's `external_waits` array. Caller renders it verbatim in
 # the operator-facing `--- idle workers ---` block so the contract
 # violation surfaces with the offending job id (e.g.
-# `orphan_kinds=slurm:52527284_4,ci:your-org/runs/26304173692`).
+# `orphan_kinds=slurm:12345284_4,ci:your-org/runs/26304173692`).
 # Capped at 80 chars; longer lists are truncated with `…`.
 #
 # `content_hash` is appended whenever the pane was actually captured
@@ -1287,7 +1287,7 @@ _heartbeat_handle_counts() {
 # i.e. ` · <cmd> · 1 shell, 1 monitor · ← for agents`. The two
 # counters share one ` · … · ` segment, joined by `, `. Standalone
 # forms are ` · 2 shells · ` (no monitor) and ` · 1 monitor · ` (no
-# shell). This was the paper-benchmark false-idle root cause: a worker
+# shell). This was the proj-x false-idle root cause: a worker
 # idling between turns with a live background shell only ever shows
 # the status-line form (the spinner "still running" form appears only
 # during active tool execution), and the old regex matched neither

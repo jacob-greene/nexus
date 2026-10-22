@@ -68,12 +68,12 @@ assert_eq "negative control: guard TRIPS on an nxr1_ token (exit 3)" "$?" "3"
 # the fingerprint line (non-secret by design) and the scan noise that made the
 # live log 49 MB.
 cat > "$WORK/clean" <<'EOF'
-[2026-07-09T21:00:00+00:00] remote-sshd: supervisor up: sshd=/usr/sbin/sshd bind=140.107.222.134 port=22022 principals_dir=/home/op/.claude/nexus-remote
+[2026-07-09T21:00:00+00:00] remote-sshd: supervisor up: sshd=/usr/sbin/sshd bind=198.51.100.34 port=22022 principals_dir=/home/op/.claude/nexus-remote
 [2026-07-09T21:00:00+00:00] remote-sshd: exec: /usr/sbin/sshd -D -e -p 22022
-Connection from 140.107.222.134 port 51484 on 140.107.222.134 port 22022
-Did not receive identification string from 140.107.222.134 port 51484
-Accepted publickey for op from 140.107.116.184 port 40122 ssh2: ED25519 SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU
-Postponed publickey for op from 140.107.116.184 port 40122 ssh2 [preauth]
+Connection from 198.51.100.34 port 51484 on 198.51.100.34 port 22022
+Did not receive identification string from 198.51.100.34 port 51484
+Accepted publickey for op from 198.51.100.84 port 40122 ssh2: ED25519 SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU
+Postponed publickey for op from 198.51.100.84 port 40122 ssh2 [preauth]
 [2026-07-09T21:05:00+00:00] remote-sshd: FATAL: channel-only policy but authorized_keys line 3 lacks a forced command (would grant a shell)
 [2026-07-09T21:05:00+00:00] remote-sshd: WARNING: authorized_keys line 3 without 'restrict' hardening
 [2026-07-09T21:05:01+00:00] remote-sshd: log rotated in place (was 8388609 bytes; kept last 2000 lines)

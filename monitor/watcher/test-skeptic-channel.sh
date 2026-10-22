@@ -902,7 +902,7 @@ echo '=== re-wrap-up guard: scoped to the CURRENT LIFE of a window name ==='
 #
 # The floor is the window's most recent FRESH `spawn` action-log event
 # (`spawn-worker.sh` writes it as the lifecycle-birth anchor). These cases
-# are modelled on the live log shapes: `mouse-bm` (one verdict, then a
+# are modelled on the live log shapes: `proj-c` (one verdict, then a
 # fresh spawn whose worker DID need a skeptic) and `cc-auto-update` (one
 # verdict, then a daily cron re-spawning the same name for weeks).
 
@@ -915,7 +915,7 @@ spawn_ev() { # window [mode]
     ( cmd_log_action monitor --event spawn "${x[@]}" ) >/dev/null 2>&1
 }
 
-# --- CASE 1: mouse-bm — verdict, then a FRESH spawn into the same name ---
+# --- CASE 1: proj-c — verdict, then a FRESH spawn into the same name ---
 RTASK=recycled-name
 RSK=recycled-name-skeptic
 mk_prov "$RTASK" require 0 false ""

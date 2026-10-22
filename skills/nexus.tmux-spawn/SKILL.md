@@ -500,7 +500,7 @@ the full criteria.
 ## Naming convention
 
 Short, descriptive, kebab-case window names tied to the task or
-project: `repro-skills`, `data-mgmt`, `slurm-update`, `kompot-fig3`,
+project: `repro-skills`, `data-mgmt`, `slurm-update`, `proj-fig3`,
 `<shared-node-tool>-list`. The watcher's `tmux list-windows` snapshot surfaces
 the name on the dashboard, so use something a human can identify at a
 glance.

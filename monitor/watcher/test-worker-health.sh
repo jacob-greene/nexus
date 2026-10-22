@@ -33,7 +33,7 @@ echo "=== worker-health.sh basics ==="
 
 # (1) --health running with runtime → well-formed file.
 reset
-if run --health running --kind slurm --job-id 52527284 --runtime 7200 \
+if run --health running --kind slurm --job-id 12345284 --runtime 7200 \
        --note "DE sweep" >/dev/null 2>&1; then
     ok "running write exits 0"
 else

@@ -692,12 +692,12 @@ LOG="$STATE_DIR/action-log.jsonl"
 export MOCK_TMUX_WINDOWS="$(printf 'orphw|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_orphw=idle-orphan-async
-export MOCK_ORPHAN_KINDS_orphw="slurm:52527284_4,ci:abc/runs/9"
+export MOCK_ORPHAN_KINDS_orphw="slurm:12345284_4,ci:abc/runs/9"
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains "orphan-async → row emitted" "$out" \
     $'orphw\tidle-orphan-async'
 assert_contains "orphan-async row carries orphan_kinds csv as detail" "$out" \
-    "slurm:52527284_4,ci:abc/runs/9"
+    "slurm:12345284_4,ci:abc/runs/9"
 
 # window-retain MUST NOT suppress idle-orphan-async.
 rm -f "$STATE_DIR/idle-state.tsv"
@@ -874,7 +874,7 @@ seed_engagement_log_matching_activity
 seed_frozen_child bgc4 120 500
 mkdir -p "$STATE_DIR/worker-health"
 cat > "$STATE_DIR/worker-health/bgc4.json" <<EOF
-{"window":"bgc4","job_kind":"slurm","job_id":"52527284","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
+{"window":"bgc4","job_kind":"slurm","job_id":"12345284","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
 EOF
 export MOCK_PANE_STATE_bgc4=working-background
 export MOCK_BG_SHELLS_bgc4=1 MOCK_BG_RELIABLE_bgc4=1 MOCK_BG_CPU_bgc4=500
@@ -1095,7 +1095,7 @@ seed_engagement_log_matching_activity
 seed_frozen_child bgcap1 4000 500        # frozen 4000s > ceiling 3600
 mkdir -p "$STATE_DIR/worker-health"
 cat > "$STATE_DIR/worker-health/bgcap1.json" <<EOF
-{"window":"bgcap1","job_kind":"slurm","job_id":"52527999","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
+{"window":"bgcap1","job_kind":"slurm","job_id":"12345999","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
 EOF
 export MOCK_PANE_STATE_bgcap1=working-background
 export MOCK_BG_SHELLS_bgcap1=1 MOCK_BG_RELIABLE_bgcap1=1 MOCK_BG_CPU_bgcap1=500
@@ -1286,14 +1286,14 @@ out=$(PATH="$STUB_DIR:$PATH" bash -c "
     NEXUS_ROOT='$NEXUS_ROOT'
     source '$PROBE'
     list_really_idle_workers() {
-        printf 'orphw\tidle-orphan-async\t120\tslurm:52527284_4\n'
+        printf 'orphw\tidle-orphan-async\t120\tslurm:12345284_4\n'
     }
     render_idle_section
 " 2>/dev/null)
 assert_contains  "orphan-async advisory line"           "$out" \
                  "orphw idle-orphan-async"
 assert_contains  "advisory quotes the offending job"    "$out" \
-                 "slurm:52527284_4"
+                 "slurm:12345284_4"
 assert_contains  "advisory points at the contract"      "$out" \
                  "worker-defaults"
 
@@ -1367,16 +1367,16 @@ rm -f "$STATE_DIR/idle-state.tsv"
 LOG="$STATE_DIR/action-log.jsonl"
 RETAIN_TS=$(date -Is -d "@$(( OLD_TS + 10 ))")
 cat > "$LOG" <<EOF
-{"ts":"$RETAIN_TS","agent":"monitor","event":"window-retain","window":"repltime-histones","reason":"open-ended-issue-81-prs-await-review"}
+{"ts":"$RETAIN_TS","agent":"monitor","event":"window-retain","window":"proj-alpha-series","reason":"open-ended-issue-38-prs-await-review"}
 EOF
-export MOCK_TMUX_WINDOWS="$(printf 'repltime-histones|%s' "$OLD_TS")"
+export MOCK_TMUX_WINDOWS="$(printf 'proj-alpha-series|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
-export MOCK_PANE_STATE_repltime_histones=idle
+export MOCK_PANE_STATE_proj_alpha_series=idle
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains  "no-wrap-up + retain → retained"      "$out" \
-                 $'repltime-histones\tretained'
+                 $'proj-alpha-series\tretained'
 assert_not_contains "no no-wrap-up row when retained"  "$out" \
-                    $'repltime-histones\tno-wrap-up'
+                    $'proj-alpha-series\tno-wrap-up'
 
 # ---- Test 14: retain does NOT suppress `wrapped-but-stub` -------------
 
@@ -1517,8 +1517,8 @@ out=$(PATH="$STUB_DIR:$PATH" bash -c "
     source '$PROBE'
     list_really_idle_workers() {
         printf 'foo-window\twrapped\t60\t\n'
-        printf 'echo-density\tretained\t3600\tloaded-context-dm-kernel-figures\n'
-        printf 'repltime-histones\tretained\t7200\topen-ended-issue-81-prs-await-review\n'
+        printf 'proj-density\tretained\t3600\tloaded-context-dm-kernel-figures\n'
+        printf 'proj-alpha-series\tretained\t7200\topen-ended-issue-38-prs-await-review\n'
         printf 'nexus-self-fix-wrap-up\tretained\t900\tpost-merge-loaded-context\n'
     }
     render_idle_section
@@ -1527,15 +1527,15 @@ assert_contains  "wrapped row renders normally"          "$out" \
                  "- foo-window wrapped up"
 assert_contains  "footer prefix shows count"             "$out" \
                  "(3 retained windows suppressed:"
-assert_contains  "footer lists echo-density"             "$out" \
-                 "echo-density (loaded-context-dm-kernel-figures)"
-assert_contains  "footer lists repltime-histones"        "$out" \
-                 "repltime-histones (open-ended-issue-81-prs-await-review)"
+assert_contains  "footer lists proj-density"             "$out" \
+                 "proj-density (loaded-context-dm-kernel-figures)"
+assert_contains  "footer lists proj-alpha-series"        "$out" \
+                 "proj-alpha-series (open-ended-issue-38-prs-await-review)"
 assert_contains  "footer lists nexus-self-fix-wrap-up"   "$out" \
                  "nexus-self-fix-wrap-up (post-merge-loaded-context)"
 # Sanity: no per-window "retained" row in the body.
 assert_not_contains "no per-row retained line"            "$out" \
-                    "  - echo-density"
+                    "  - proj-density"
 
 # ---- Test 19: footer truncates long reasons ---------------------------
 
@@ -1590,7 +1590,7 @@ assert_not_contains "cycle 3: betaretain dropped"          "$out3" "betaretain"
 
 # ---- Test 21: retain survives cursor/render activity ------------------
 #
-# Reproduces the echo-density bug from issue #111 directly. The
+# Reproduces the proj-density bug from issue #111 directly. The
 # tmux #{window_activity} epoch advances post retain.ts (autosuggest
 # blink, cursor move, status-bar tick) but pane-state stays idle.
 # Pre-fix, `(( activity_epoch <= retain_ts_epoch ))` consumed the

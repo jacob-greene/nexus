@@ -146,7 +146,7 @@ nexus asset repo below.
 | **kdpeak** | KDE-based ATAC peak caller | `<your-org>/kdpeak` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **spatial-smooth** | Composable spatial & cell-state smoothing of gene signatures | `<your-org>/spatial-smooth` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **convert2anndata** | R package: SingleCellExperiment / Seurat → AnnData | `<your-org>/convert2anndata` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
-| **annzarro** | Zarr-based AnnData visualization tool | `<your-org>/annzarro` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
+| **myviewer** | Zarr-based AnnData visualization tool | `<your-org>/myviewer` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **barnacle** | Persistent shared-node HPC workspaces via self-extending SLURM chains | `<your-org>/shared-node-tool` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **labsh** | Project-local JupyterLab management CLI for humans & agents | `katosh/labsh` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **agent_sandbox** | Sandbox AI agents on HPC / SLURM (the lab's agent sandbox) | `katosh/agent_sandbox` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
@@ -154,7 +154,7 @@ nexus asset repo below.
 | **genextf** | Associate transcription factors to genes via accessible sites | `<your-org>/genextf` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **jupyter_kernel_inspector** | Inspect & list Jupyter kernels | `<your-org>/jupyter_kernel_inspector` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **unprintable** | Find & remove hidden characters in text files | `<your-org>/unprintable` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
-| **fh-hpc-skills** | Claude Code skills for <your-institution> HPC usage | `<your-org>/hpc-skills` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
+| **hpc-skills** | Claude Code skills for <your-institution> HPC usage | `<your-org>/hpc-skills` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **agent_container** | Responsible-usage tooling for AI coding agents | `<your-org>/agent_container` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **otheruser_annotation** | Utilities to ease cell-type annotation | `<your-org>/otheruser_annotation` | **otheruser (`@<other-nexus>`)** — operator-confirmed owner (`@<operator>` committed on her behalf) | `<your-org>/<other-nexus>` |
 | **scEcho** (a.k.a. "echo") | Statistical framework for desynchronized cell states + driver genes/REs from paired scRNA + scATAC | `<your-org>/scEcho` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |
@@ -200,7 +200,7 @@ redact internal identifiers first. Route the <your-org>-side report to
 >
 > **Ambiguous / low-signal repos not tabled** (a member should claim
 > or disclaim them): `spatial-trajectory`, `spatial-visualization`
-> (`@otheruser`, 1 commit each — likely scratch); `dolimap`,
+> (`@otheruser`, 1 commit each — likely scratch); `mysite`,
 > `knmap` (`@<operator>` knowledge-base engines, not single-cell tools).
 
 ## Maintaining this table

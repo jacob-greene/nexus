@@ -352,7 +352,7 @@ service declaration of window-name + workdir + launch-cmd +
 healthcheck). `--dry-run` shows what it would do without launching;
 `--list` echoes the parsed registry. This closes the 2026-06-07
 incident where only the orchestrator came back and the watcher +
-dolimap-serve + deploy-watch + annzarro all stayed dead until
+mysite-serve + deploy-watch + myviewer all stayed dead until
 re-established by hand.
 
 This manual on-wake step can be made automatic: wiring

@@ -70,18 +70,18 @@
 # keeps the tabs. The trailing 5th column is the optional <logfile>; the
 # 6th is the optional <policy> (auto-restart | emit-only).
 #
-# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log
+# mysite-serve   $NEXUS_ROOT/work/myproject/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log
 #
 # Same service, but pinned emit-only (watcher emits + lets the orchestrator
 # decide instead of auto-restarting — the 6th column):
-# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log   emit-only
+# mysite-serve   $NEXUS_ROOT/work/myproject/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log   emit-only
 #
 # JupyterLab services (jupyter-*) are NOT hand-written here: run
 # `monitor/jupyter-up.sh <project-dir>` and it appends/maintains the
 # row itself (and `--down` removes it). A maintained row looks like:
 # jupyter-myproj   $NEXUS_ROOT/work/myproj   /abs/path/monitor/labsh-supervised.sh   /abs/path/monitor/jupyter-health.sh   $NEXUS_ROOT/work/myproj/.jupyter/labsh-service.log
 # deploy-watch    $NEXUS_ROOT/work/myproj/website   ./deploy-watch.sh   pgrep -f deploy-watch.sh   $NEXUS_ROOT/work/myproj/website/deploy.log
-# annzarro        $NEXUS_ROOT/work/annzarro   ./run-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8766/   $NEXUS_ROOT/work/annzarro/annzarro.log
+# myviewer        $NEXUS_ROOT/work/myviewer   ./run-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8766/   $NEXUS_ROOT/work/myviewer/myviewer.log
 #
 # The confined remote SSH endpoint (agent-channel RFC Part A) is NOT
 # hand-written either: run `monitor/remote-up.sh` and it appends/maintains

@@ -47,7 +47,7 @@ one.
 
 When the work is driven by a specific GitHub issue or PR, embed the
 number in the slug, e.g.
-`diff-dynamics_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
+`proj-x_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
 lets future workers retrieve the chain via
 `ls reports/*issue53* 2>/dev/null`.
 

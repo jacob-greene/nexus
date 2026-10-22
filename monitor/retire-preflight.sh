@@ -51,7 +51,7 @@
 #      the freshness window, AND its stamped session-id is NOT the
 #      window's own spawn session-id. This is the exact gap the incident
 #      exposed. The session-id qualifier closes a second false positive
-#      (coembed-283-followup, 2026-07-17): a submit carrying the
+#      (proj-x-followup, 2026-07-17): a submit carrying the
 #      window's OWN session-id is the worker's pane self-activity
 #      (autosuggest / post-wrap typing / its own tool loop), never the
 #      operator — who drives a DIFFERENT session and never raw-types into
@@ -476,7 +476,7 @@ if (( up_epoch > 0 )); then
         [[ "$slack" =~ ^[0-9]+$ ]] || slack=120
     fi
 
-    # Self-attribution guard (coembed-283-followup false positive,
+    # Self-attribution guard (proj-x-followup false positive,
     # 2026-07-17). Even with NO covering machine-input stamp, a submit
     # stamped with the window's OWN spawn session-id is machine/self
     # input (autosuggest / post-wrap typing / the worker's own tool
