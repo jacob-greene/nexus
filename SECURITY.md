@@ -4,9 +4,13 @@
 
 **Do not open a public issue for security vulnerabilities.**
 
-Use GitHub's [private vulnerability reporting](https://github.com/<your-org>/nexus-code/security/advisories/new)
+Use GitHub's [private vulnerability reporting](https://github.com/jacob-greene/nexus/security/advisories/new)
 to submit a report. This keeps the details confidential until a fix
 is available.
+
+If that page does not offer a report form, private reporting is
+switched off on this repository. Then open a public issue that asks
+for a private contact. Put no details of the vulnerability in it.
 
 Please include:
 

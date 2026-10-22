@@ -15,7 +15,7 @@ place to start if you suspect compromise.
     *claims* to enforce — anything beyond that is out of scope.
 
 For reporting a vulnerability, see [Reporting a vulnerability](#reporting-a-vulnerability)
-below or the repo-root [`SECURITY.md`](https://github.com/<your-org>/nexus-code/blob/main/SECURITY.md).
+below or the repo-root [`SECURITY.md`](https://github.com/jacob-greene/nexus/blob/main/SECURITY.md).
 
 ## Threat model
 
@@ -340,9 +340,19 @@ and STOP for review" on external-public; nothing auto-submits.
 
 **Do not open a public issue for security vulnerabilities.**
 
-Use GitHub's [private vulnerability reporting](https://github.com/<your-org>/nexus-code/security/advisories/new)
-on `<your-org>/nexus-code` to submit a report. This keeps the details
+Use GitHub's [private vulnerability reporting](https://github.com/jacob-greene/nexus/security/advisories/new)
+on `jacob-greene/nexus` to submit a report. This keeps the details
 confidential until a fix is available.
+
+If that page does not offer a report form, private reporting is
+switched off on the repository. Then open a public issue that asks
+for a private contact. Put no details of the vulnerability in it.
+
+An operator who forks this repository must do two things. First,
+enable private vulnerability reporting (Settings, then Security).
+Then point the links in this section and in `SECURITY.md` at the
+fork. `monitor/watcher/test-security-report-route.sh` fails while
+either link still holds a template placeholder.
 
 In scope for the nexus codebase specifically:
 
