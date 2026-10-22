@@ -529,9 +529,22 @@ _respawn_compose_launcher() {
     local launcher="$1" nexus_root="$2" continue_flag="$3" settings_flag="$4"
     local target_window="${5:-orchestrator}"
     local session_id="${6:-}"
+    local prompt_arg_file="${7:-}"
     local sid_export=''
     [[ -n "$session_id" ]] \
         && printf -v sid_export 'export NEXUS_ORCH_SESSION_ID="%s"\n' "$session_id"
+    # Optional 7th arg (jacob-greene/nexus#230 Defect A): a file whose
+    # content becomes claude's positional first prompt. The launcher reads
+    # it, deletes it, and passes it as one argv string, the same way
+    # spawn-worker.sh starts every worker. Claude Code then sees a real
+    # user turn. A pasted first turn arrives wrapped in <pasted_content>
+    # with no user text around it, and a cold orchestrator may refuse to
+    # act on it and wait for an operator "go".
+    local prompt_read='' prompt_arg=''
+    if [[ -n "$prompt_arg_file" ]]; then
+        printf -v prompt_read 'prompt=$(<"%s")\nrm -f "%s"\n' "$prompt_arg_file" "$prompt_arg_file"
+        prompt_arg=' "$prompt"'
+    fi
     cat > "$launcher" <<LAUNCHER
 #!/bin/bash
 rm -f "$launcher"
@@ -541,7 +554,7 @@ export NEXUS_ORCHESTRATOR_WINDOW="$target_window"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so the
 # orchestrator invokes nexus tools by name; guarded silent no-op if absent.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
-${sid_export}exec "$CLAUDE_BIN" --dangerously-skip-permissions $continue_flag $settings_flag
+${prompt_read}${sid_export}exec "$CLAUDE_BIN" --dangerously-skip-permissions $continue_flag $settings_flag${prompt_arg}
 LAUNCHER
     chmod +x "$launcher"
 }
@@ -784,10 +797,16 @@ _respawn_paste_prompt_file() {
 #                         pin to render a recovery prompt (issue #176,
 #                         main.sh respawn_agent). Ignored when
 #                         --no-continue is also passed.
-#   --prompt-file PATH    After spawn, paste this file's contents into
-#                         the new window and submit with Enter. Without
+#   --prompt-file PATH    Deliver this file's contents as the new
+#                         session's first prompt. A COLD (fresh) spawn
+#                         passes it as claude's positional prompt
+#                         argument (#230), so it is a real user turn.
+#                         A resume spawn, a file over
+#                         RESPAWN_PROMPT_ARG_MAX_BYTES (100000), or
+#                         RESPAWN_PROMPT_DELIVERY=paste pastes it into
+#                         the new window and submits with Enter. Without
 #                         this flag, the window comes up empty and the
-#                         caller paste a prompt separately.
+#                         caller pastes a prompt separately.
 #   --log-fn NAME         Name of a bash function the helper calls for
 #                         significant transitions (one string arg).
 #                         Default `:` (no-op).
@@ -938,7 +957,32 @@ _respawn_orchestrator() {
     # legacy --continue path doesn't know it (empty → no env marker).
     local spawn_sid="$session_id"
     [[ -z "$spawn_sid" && "$mode" == "resume" ]] && spawn_sid="$resume_sid"
-    _respawn_compose_launcher "$launcher" "$NEXUS_ROOT" "$continue_flag" "$settings_flag" "$target" "$spawn_sid"
+
+    # jacob-greene/nexus#230 Defect A: on a COLD spawn, hand the prompt to
+    # claude as its positional first prompt instead of pasting it. A cold
+    # session has no earlier user turn, and a paste-only first turn has
+    # been refused as untrusted pasted text (7 h 21 min with no acting
+    # orchestrator). Resume spawns keep the paste: their conversation
+    # already carries the role, and the cold-resume dialog of newer
+    # Claude Code builds has not been tested with a positional prompt.
+    # A prompt over the cap also keeps the paste: Linux limits one argv
+    # string to 128 KiB (MAX_ARG_STRLEN). RESPAWN_PROMPT_DELIVERY=paste
+    # forces the paste path (tests of the paste pipeline use it).
+    local prompt_arg_file=""
+    local prompt_arg_max="${RESPAWN_PROMPT_ARG_MAX_BYTES:-100000}"
+    if [[ -n "$prompt_file" && -f "$prompt_file" && "$mode" == "fresh" \
+          && "${RESPAWN_PROMPT_DELIVERY:-arg}" != "paste" ]]; then
+        local prompt_bytes
+        prompt_bytes=$(wc -c < "$prompt_file" 2>/dev/null) || prompt_bytes=""
+        if [[ "$prompt_bytes" =~ ^[0-9]+$ ]] && (( prompt_bytes <= prompt_arg_max )); then
+            prompt_arg_file=$(mktemp "$tmpdir/nexus-respawn-prompt-XXXXXX") \
+                && cp -- "$prompt_file" "$prompt_arg_file" \
+                || { rm -f "$prompt_arg_file" 2>/dev/null; prompt_arg_file=""; }
+        else
+            "$log_fn" "prompt-file is ${prompt_bytes:-?} bytes (cap ${prompt_arg_max}); delivering by paste"
+        fi
+    fi
+    _respawn_compose_launcher "$launcher" "$NEXUS_ROOT" "$continue_flag" "$settings_flag" "$target" "$spawn_sid" "$prompt_arg_file"
 
     local spawn_rc=0
     _respawn_spawn_window "$target" "$NEXUS_ROOT" "$launcher" "$force_replace" "$streak_start" \
@@ -950,12 +994,12 @@ _respawn_orchestrator() {
         # log) and propagate rc=5 so the caller records it distinctly
         # from a spawn failure. Clean up the unused launcher.
         "$log_fn" "respawn re-verify guard aborted the kill for '$target' (live orchestrator present); no window destroyed"
-        rm -f "$launcher"
+        rm -f "$launcher" ${prompt_arg_file:+"$prompt_arg_file"}
         return 5
     fi
     if (( spawn_rc != 0 )); then
         "$log_fn" "tmux new-window failed for '$target'"
-        rm -f "$launcher"
+        rm -f "$launcher" ${prompt_arg_file:+"$prompt_arg_file"}
         return 3
     fi
     # Issue #203: pin the orchestrator session-id the moment the window
@@ -998,6 +1042,22 @@ _respawn_orchestrator() {
 
     local pane_state_bin="${PANE_STATE_BIN:-$NEXUS_ROOT/monitor/pane-state.sh}"
     local readiness_budget="${FRESH_SPAWN_READINESS_BUDGET_SECONDS:-30}"
+
+    # Argv delivery (see above): the launcher already handed the prompt to
+    # claude. Never paste it as well, which would submit it twice. Only
+    # look for evidence that the first turn started, and log it.
+    if [[ -n "$prompt_arg_file" ]]; then
+        "$log_fn" "prompt delivered as claude's positional first prompt (not pasted; #230)"
+        if [[ -x "$pane_state_bin" ]]; then
+            local arg_state
+            if arg_state=$(_respawn_wait_for_submit_evidence "$target" "$readiness_budget" "$pane_state_bin"); then
+                "$log_fn" "first-turn verify: state=${arg_state} — turn started"
+            else
+                "$log_fn" "first-turn verify: no busy state within ${readiness_budget}s (last state='${arg_state:-unknown}'); not re-sending"
+            fi
+        fi
+        return 0
+    fi
     local readiness_poll="${FRESH_SPAWN_READINESS_POLL_SECONDS:-1}"
     local post_paste_verify="${FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS:-3}"
     local legacy_wait="${FRESH_SPAWN_CLAUDE_WAIT_SECONDS:-5}"
