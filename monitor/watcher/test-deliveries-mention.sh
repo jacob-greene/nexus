@@ -35,7 +35,8 @@ PASS=0
 FAIL=0
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -210,9 +211,9 @@ assert_contains "in-\$REPO comment surfaces with NO @ required"        "$out" "i
 echo '=== timeout flags are passed to EVERY curl (wedge-safety guard 1) ==='
 # argv log from the run above. Both the listing and per-delivery curls
 # must carry --connect-timeout and --max-time.
-n_maxtime=$(grep -c -- '--max-time' "$ARGV_LOG" 2>/dev/null || echo 0)
-n_connect=$(grep -c -- '--connect-timeout' "$ARGV_LOG" 2>/dev/null || echo 0)
-n_detail=$(grep -c '/app/hook/deliveries/' "$ARGV_LOG" 2>/dev/null || echo 0)
+n_maxtime=$(grep -c -- '--max-time' "$ARGV_LOG" 2>/dev/null) || n_maxtime=0
+n_connect=$(grep -c -- '--connect-timeout' "$ARGV_LOG" 2>/dev/null) || n_connect=0
+n_detail=$(grep -c '/app/hook/deliveries/' "$ARGV_LOG" 2>/dev/null) || n_detail=0
 # 1 listing call + 3 per-delivery calls = 4 curls, each with both flags.
 assert_eq "every curl carries --max-time (>=4)"        "$(( n_maxtime >= 4 ? 1 : 0 ))" "1"
 assert_eq "every curl carries --connect-timeout (>=4)" "$(( n_connect >= 4 ? 1 : 0 ))" "1"

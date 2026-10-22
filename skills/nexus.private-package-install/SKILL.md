@@ -14,6 +14,17 @@ Bootstrap scripts that install private dependencies MUST use the **user's OAuth 
 
 This mirrors the fail-loud rule in `nexus.bot` (empty `GH_TOKEN` → exit non-zero, never fall through to user `gh` auth). Same principle, inverted direction: there we refuse silent bot → user fallback for writes; here we refuse silent user → bot fallback for reads.
 
+### Get the PAT from `ng user-pat`, not from a bare `gh auth token`
+
+`monitor/user-pat.sh` (alias `ng user-pat`) is the nexus's accessor for exactly this token, and it is the form to prefer everywhere `gh auth token` appears below. What it buys over the bare call:
+
+- **A resolution chain**, highest first: `$NEXUS_USER_PAT` → `$GITHUB_PAT` → `gh auth token` → `$NEXUS_USER_PAT_FILE` (default `~/.claude/.nexus-user-pat`, chmod 600). A bare `gh auth token` is only the third of those, so it fails on any host where `gh` is not logged in even though a PAT is provisioned.
+- **It refuses to read `GH_TOKEN` or `GITHUB_TOKEN`, deliberately** — by nexus convention those carry the BOT installation token at many call sites, and quietly substituting one reproduces the precise silent-404 this skill exists to prevent.
+- **Distinct exit codes**: `0` token printed (or validation/probe succeeded), `2` no PAT available (stderr says how to provision one), `3` validation/probe FAILED (401 / 403 / 404). Two failures that a bare `gh auth token` collapses into one empty string.
+- **Pre-flight verbs**: `./monitor/user-pat.sh --validate` (the PAT is alive — hits `/user`) and `./monitor/user-pat.sh --probe <owner>/<repo>` (the PAT can actually read THAT repo). Run `--probe` before a ten-minute bootstrap: a `repo`-scope-too-narrow PAT fails identically to a missing one, and only the probe separates them.
+
+Every form below is written with `$(gh auth token)` because that is the primitive; inside a nexus, substitute `$(./monitor/user-pat.sh)` for it verbatim.
+
 ## R — `remotes::install_github` and friends
 
 ```bash
@@ -53,14 +64,17 @@ GITHUB_TOKEN="$(gh auth token)" uv run --with \
   my_script.py
 ```
 
-The env-var form assumes `gh auth setup-git` has been run for the user (standard nexus setup), so the git-credential helper routes `GITHUB_TOKEN` to `github.com` clones. Where that's not guaranteed — e.g. a CI runner that doesn't carry `gh` config — embed the token in the URL directly:
+The env-var form assumes `gh auth setup-git` has been run for the user (standard nexus setup), so the git-credential helper routes `GITHUB_TOKEN` to `github.com` clones. Where that's not guaranteed — e.g. a CI runner that doesn't carry `gh` config — hand git the token through `GIT_ASKPASS`:
 
 ```bash
-uv pip install \
-  "git+https://x-access-token:$(gh auth token)@github.com/<your-org>/<repo>@<sha>"
+ap=$(mktemp "${TMPDIR:?}/askpass.XXXXXX") && chmod 700 "$ap"
+printf '#!/bin/sh\nexec gh auth token\n' > "$ap"
+GIT_ASKPASS="$ap" GIT_TERMINAL_PROMPT=0 uv pip install \
+  "git+https://x-access-token@github.com/<your-org>/<repo>@<sha>"
+rm -f "$ap"
 ```
 
-Same pattern `<your-org>.sandbox-gotchas` rule 3 uses for one-shot bot-token pushes; it bypasses the credential helper entirely.
+**Never embed the token in the URL** (`https://x-access-token:$(gh auth token)@…`). That URL sits in the argv of `uv`, `git` and every `git-remote-https` it spawns, and argv is readable in `/proc` by every same-uid agent for the whole install (<your-org>/nexus-code#1840); a PAT outlives any session. The askpass form puts only the username in the URL; git asks the script for the password over a pipe.
 
 ## Python — plain `pip install git+...` (fallback only)
 
@@ -108,9 +122,9 @@ Any tool that authenticates a private-repo `git clone` under the hood follows th
 
 Tools that don't go through GitHub auth (CRAN via `install.packages`, Bioconductor via `BiocManager::install`, PyPI via `uv pip install <name>`, conda-forge / bioconda via mamba) are unaffected by this skill — install them the normal way per `hpc.r` / `hpc.python`.
 
-## Cross-check with <hpc-skills>
+## Cross-check with hpc-skills
 
-This skill **does not** restate the general packaging conventions on <your-institution> infrastructure: uv vs Lmod-module Python, virtual-env placement, `fhR` / `renv`, Apptainer pull mechanics, the conda-forge mirror, NFS-metadata latency behind the `pip` hang. Those live in `hpc.python`, `hpc.r`, `hpc.containers`, `hpc.reproducibility`, and `<your-org>.sandbox-gotchas` respectively — read them for the underlying mechanics. This skill scopes specifically to the **nexus-bot-context auth layer**: bot installation token 404s on private installs, user OAuth via `gh auth token` works, and the fail-loud rule that prevents silent fallback between the two. When in doubt about packaging mechanics, defer to the `fh.*` skill; when in doubt about which token to pass, this skill is canonical.
+This skill **does not** restate the general packaging conventions on <your-institution> infrastructure: uv vs Lmod-module Python, virtual-env placement, `fhR` / `renv`, Apptainer pull mechanics, the conda-forge mirror, NFS-metadata latency behind the `pip` hang. Those live in `hpc.python`, `hpc.r`, `hpc.containers`, `hpc.reproducibility`, and `<your-org>.sandbox-gotchas` respectively — read them for the underlying mechanics. This skill scopes specifically to the **nexus-bot-context auth layer**: bot installation token 404s on private installs, user OAuth via `gh auth token` works, and the fail-loud rule that prevents silent fallback between the two. When in doubt about packaging mechanics, defer to the `hpc.*` skill; when in doubt about which token to pass, this skill is canonical.
 
 ## Documented field example
 

@@ -22,6 +22,27 @@ INTERVAL="${MONITOR_INTERVAL:-$("$_cfg" monitor.interval_seconds 60)}"
 REPO="${MONITOR_REPO:-$("$_cfg" github.repo)}"
 USER_LOGIN="${MONITOR_USER_LOGIN:-$("$_cfg" github.user_login)}"
 TARGET="${MONITOR_TARGET:-$("$_cfg" monitor.target_window orchestrator)}"
+# EXPORTED so every child of the watcher can resolve which window is the
+# orchestrator (your-org/nexus-code#1155 residual 2, #1171 R2-C).
+#
+# `pane-state.sh` §1b consults the orchestrator activity marker for that pane
+# and no other, so it must know the name. Threading `--orchestrator-window`
+# through the call sites was the WRONG SHAPE and was measured so: a first pass
+# enumerated the executors, found one, and shipped a comment naming three
+# non-passing callers. The real count is SIX under `monitor/watcher/` alone
+# (`_idle_probe.sh`, `_over_limit.sh`, `_orphan_async.sh`, `_respawn.sh`,
+# `main.sh`, `spawn-fresh-orchestrator.sh`), and the miss was caused by a
+# `| head -12` on the enumeration itself. Any per-call-site fix has a permissive
+# default arm for every site the author failed to list — by construction, not by
+# carelessness. Exporting once covers the whole process tree and cannot miss one.
+#
+# Idempotent: `MONITOR_TARGET` is the INPUT override read on the line above, so
+# a child that re-sources this file resolves the identical value.
+# Guarded: an EMPTY export is not the same as no export. Every consumer here
+# uses `${MONITOR_TARGET:-…}`, which treats empty as unset, but exporting an
+# empty value would silently change that for any future `${MONITOR_TARGET-…}`
+# reader — so do not create the hazard.
+[[ -n "$TARGET" ]] && export MONITOR_TARGET="$TARGET"
 # Cockpit (svc.sh dashboard) window name. The cockpit pane runs svc.sh,
 # not claude, so the idle/liveness probe must exempt it from the
 # dead-worker sweep — see _idle_list_worker_windows (your-org/your-nexus#204).
@@ -100,18 +121,95 @@ MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS="${MONITOR_FULL_STATE_SAFETY_FLOOR_SECON
 # effective floor the longer the canonical stays continuously unchanged:
 # each time sustained idle crosses the next power-of-two multiple of the
 # base, the effective floor doubles, capped at the max below. base=900,
-# max=3600 → 900s while recently-active, 1800s after ~30 min idle, 3600s
-# after ~60 min idle (≈1 wake/hour on a still night). It SNAPS BACK to the
-# base the instant the canonical changes (main.sh resets the idle-streak
-# anchor), so a genuine transition is never delayed — this only rarefies
-# the no-change liveness heartbeat, never the change-triggered emit. The
-# heartbeat still fires at the (stretched) floor, so a wedged orchestrator
-# is still poked. Set enabled=false to restore the fixed-floor behaviour;
-# max<=base also disables the stretch. Operator-tunable.
+# max=7200 → 900s while recently-active, 1800s after ~30 min idle, 3600s
+# after ~60 min idle, 7200s after ~2 h idle (≈1 wake / 2 h on a still
+# night). It SNAPS BACK to the base the instant the canonical changes
+# (main.sh resets the idle-streak anchor), so a genuine transition is never
+# delayed — this only rarefies the no-change liveness heartbeat, never the
+# change-triggered emit. The heartbeat still fires at the (stretched)
+# floor, so a wedged orchestrator is still poked. Set enabled=false to
+# restore the fixed-floor behaviour; max<=base also disables the stretch.
+# Operator-tunable.
+#
+# Default raised 3600 → 7200 (watcher-emit-noise): once the discriminating
+# fixes below (stale-snapshot re-stat, change-emit stamp reset,
+# dead-window decision skip) remove the misleading/redundant/no-op emits,
+# the residual deep-idle heartbeat is a pure liveness proof — halving its
+# overnight rate is the operator-requested noise reduction. CLAMP-SAFE: the
+# orchestrator dead-threshold clamp (main.sh) is derived from the BASE
+# floor + full_state_emit_interval, NOT this max, so raising the max does
+# NOT change the clamp arithmetic or trip the startup WARN. The only trade
+# is a longer dead-threshold stand-down window on a deep-idle night
+# (the stale_paste_ceiling makes the probe stand down once a paste ages
+# past it, so wedge DETECTION latency on a still night rises from ~1 h to
+# ~2 h worst case — acceptable for a quiet overnight workspace, and the
+# deliberate quiet-night behaviour the operator asked for). The ceiling is
+# intentionally NOT raised in lockstep: raising it would ARM the probe
+# longer, the opposite of the deep-idle stand-down this backoff wants.
+#
+# Default raised 7200 → 86400 (your-org/nexus-code#1736, operator
+# 2026-10-04: "we should not waste tokens at all if everything is calm").
+# With base 900 the rungs are 900, 1800, …, 57600, then the 86400 cap
+# once the board has been actionably unchanged for 32 h (115200 s). The
+# cap is exact (#659). Same CLAMP-SAFE argument as above: the clamp reads
+# the base floor, and past stale_paste_ceiling the dead-threshold probe
+# stands down (_orchestrator_liveness.sh, `paste-too-stale`). The trade,
+# stated: on a board calm for a day, a wedged orchestrator is noticed at
+# the next heartbeat, up to 24 h later, or at the next actionable event.
 MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED="${MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED:-$("$_cfg" monitor.full_state.idle_backoff_enabled true)}"
 case "$MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED" in true|false) ;; *) MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED=true ;; esac
-MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.full_state.idle_backoff_max_seconds 3600)}"
-[[ "$MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3600
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.full_state.idle_backoff_max_seconds 86400)}"
+[[ "$MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=86400
+# A pane-state READ FAILED row that persists this many CONSECUTIVE full-state
+# polls is ACTIONABLE (your-org/nexus-code#1738 F2): it emits at once and
+# snaps the backoff back, instead of waiting for a heartbeat up to 24 h away.
+# Below it, a READ FAILED row is churn and projects as `live`. CHOSEN 3: one
+# poll is MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS (600 s), so 3 is ~20-30 min
+# of an instrument failing on the same window every time it was asked, long
+# enough that a render-budget timeout under a load spike (one or two polls)
+# does not page anyone, short enough to be an operator's same-session problem.
+MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS="${MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS:-$("$_cfg" monitor.full_state.read_failed_persist_polls 3)}"
+[[ "$MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS" =~ ^[1-9][0-9]*$ ]] || MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS=3
+# --- Discriminating emit-noise reduction knobs (watcher-emit-noise) ------
+# Three narrowly-scoped, individually-reversible suppressions of emit
+# CLASSES that wake the orchestrator with nothing actionable. Each
+# defaults ON and is a pure rarefaction/dedup — none removes the liveness
+# heartbeat (design invariant nexus-code #72 / #104).
+#
+# (1) restat_windows — the periodic `--- workspace snapshot ---` section is
+# served from the async-staged full_state_snap.out (snap_interval_seconds
+# cadence, below; emit_interval/4 by default), so a
+# window killed BETWEEN async renders lingers as a live "idle Ns" row until
+# the next pass — actively misleading (2026-07-21 00:37 emit listed two
+# kill-window'd windows as live while its OWN fresh prelude header counted
+# them gone). When true, compose_emit re-stats the staged snapshot against
+# the CURRENT tmux window set and drops rows for windows that no longer
+# exist. Pass-through when the live query is empty (tmux transient) so a
+# real snapshot is never nuked. false ⇒ pre-fix behaviour.
+MONITOR_FULL_STATE_RESTAT_WINDOWS="${MONITOR_FULL_STATE_RESTAT_WINDOWS:-$("$_cfg" monitor.full_state.restat_windows true)}"
+case "$MONITOR_FULL_STATE_RESTAT_WINDOWS" in true|false) ;; *) MONITOR_FULL_STATE_RESTAT_WINDOWS=true ;; esac
+# (2) reset_stamp_on_emit — restart the full-state HEARTBEAT due-clock
+# (FULL_STATE_STAMP) from ANY successful paste, not only a full-state emit.
+# A change/resurface poll already proved liveness and warmed the paste
+# channel; without this reset the periodic full-state fires again moments
+# later (2026-07-21 00:36 poll → 00:38 poll-full-state double-wake) carrying
+# no new signal. Moves only the DUE re-evaluation cadence; the genuine
+# timeout heartbeat is governed by the canonical-cache mtime + effective
+# floor (untouched), so the heartbeat still fires at the (stretched) floor
+# and the startup clamp arithmetic is unchanged. false ⇒ pre-fix behaviour.
+MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT="${MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT:-$("$_cfg" monitor.full_state.reset_stamp_on_emit true)}"
+case "$MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT" in true|false) ;; *) MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT=true ;; esac
+# (3) skip_dead_windows — a pending decision is only actionable in a LIVE
+# window (the operator answers the prompt IN the window). When a
+# skeptic-parked worker (or its skeptic) is killed, _idle_skeptic_parked
+# lapses and the lingering decision file re-surfaces the dead window's
+# "waiting for input" every cooldown — a pure resurface no-op (2026-07-21
+# 00:33/00:34 pubfork-skills[-skeptic] re-nags, both kill-window'd ~00:34).
+# When true, render_pending_decisions drops rows for windows absent from
+# the current tmux set. Pass-through when the live query is empty so a real
+# decision is never lost. false ⇒ pre-fix behaviour.
+MONITOR_PENDING_SKIP_DEAD_WINDOWS="${MONITOR_PENDING_SKIP_DEAD_WINDOWS:-$("$_cfg" monitor.pending_decisions.skip_dead_windows true)}"
+case "$MONITOR_PENDING_SKIP_DEAD_WINDOWS" in true|false) ;; *) MONITOR_PENDING_SKIP_DEAD_WINDOWS=true ;; esac
 # ---- full-state snapshot STAGING freshness (issue #14) -------------------
 #
 # The `--- workspace snapshot ---` body is produced by the ASYNC
@@ -255,6 +353,50 @@ export MONITOR_CONTEXT_ROTATION_ENABLED \
        MONITOR_CONTEXT_ROTATION_WORKER_TOKENS \
        MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS \
        MONITOR_CONTEXT_SCAN_STALE_SECONDS
+# Per-surface edge damper for `watcher_alert=` blocks
+# (your-org/nexus-code#966). The cooldown above cannot express an alert:
+# it keys on `id=<N>`, and an alert has none — nor can any other hop in
+# `_gh_filter_dedup_pipeline` express one. So an alert staged in
+# `github_poll.out` was re-pasted on EVERY `comment_surface` fire
+# until the 600s tick happened to replace the staged bytes
+# (measured 2026-08-17: one escalation, 62 pastes in ten minutes,
+# all `held_s=2403`).
+#
+# This knob MUST exceed the `github_poll` interval (600s) or a single
+# staged generation still lands more than once — that bound, not
+# operator taste, is why the default is 900 rather than tracking
+# `monitor.emit_cooldown_seconds` at 300. A kind change (degraded ->
+# recovered) and a content change both bypass it immediately, so the
+# damper never delays a genuine state edge; it only collapses replays of
+# one. 0 disables the filter.
+#
+# THIS line is the value production reads; `_emit_filters.sh`'s `${…:-900}` is
+# unreachable under the watcher and is the branch every unit test takes. That
+# gap is not hypothetical for THIS knob — it shipped here as a surviving mutant
+# (production 900 -> 1800 produced zero failures across three suites) and was
+# caught by review, not by the tests. `test-knob-default-agrees.sh` now holds
+# all five spellings together.
+MONITOR_ALERT_EMIT_COOLDOWN_SECONDS="${MONITOR_ALERT_EMIT_COOLDOWN_SECONDS:-$("$_cfg" monitor.alert_emit_cooldown_seconds 900)}"
+[[ "$MONITOR_ALERT_EMIT_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_ALERT_EMIT_COOLDOWN_SECONDS=900
+# Sweep-independent operator-comment surfacing cadence (your-org/
+# nexus-code#562). The `comment_surface` task re-checks the deliveries
+# queue + github staging every N seconds and pastes a minimal
+# comments-only emit — never waiting on the per-window sweep. Default
+# 15 matches deliveries_poll (webhook comments surface within ~one
+# tick); the post-tick nudge pulls it forward on fresh events anyway.
+# 0 disables the task: compose_emit's backstop then owns surfacing
+# (pre-#562 behaviour).
+MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS="${MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS:-$("$_cfg" monitor.comment_surface.interval_seconds 15)}"
+[[ "$MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS=15
+# Shared pane-state recording acceptance TTL (your-org/nexus-code#562).
+# Read-mode assessments (over-limit scan, compose-time prelude,
+# full-state snapshot) serve the sweep's per-window recording when it
+# is at most this old; past it they fall back to a direct pane-state
+# fork (fail-open) and repair the cache. Default 90 = 3× the
+# authoritative recorder cadence (idle_section @30s). 0 disables the
+# cache wholesale (every consumer forks — pre-#562 behaviour).
+MONITOR_PANE_CACHE_TTL_SECONDS="${MONITOR_PANE_CACHE_TTL_SECONDS:-$("$_cfg" monitor.pane_cache.ttl_seconds 90)}"
+[[ "$MONITOR_PANE_CACHE_TTL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_PANE_CACHE_TTL_SECONDS=90
 # Content-hash dedup gate. Computed AFTER compose_report renders the
 # body and BEFORE paste_to_target: when the stable-content hash of
 # the candidate body matches a recently-emitted hash (ring, below)
@@ -383,6 +525,130 @@ MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-$("$
 # sequence it must not cut short (skeptic finding, PR #116). An explicit
 # config value or env value still wins.
 MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS="${MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS:-$("$_cfg" monitor.over_limit.stale_grace_seconds "")}"
+# The visibility knobs added by your-org/nexus-code#592/#593, bridged here
+# by #976. They shipped read-only from the environment: `_over_limit.sh`
+# consumed all three via `${VAR:-N}` while nothing in this file resolved
+# them, so `monitor.over_limit.suppression_reminder_seconds: 7200` in an
+# operator's config was accepted by the YAML parser, read by nothing, and
+# reported by nothing. A configuration surface that swallows its input is
+# this workspace's dominant defect class, and it sat on the module whose
+# entire job is telling the operator their channel is muted — the operator
+# whose 15-min bell cadence is wrong for their site reaches for exactly
+# `suppression_reminder_seconds`, and it was the one lever with no wire.
+#
+# `test-over-limit-config-bridge.sh` is the guard, and it asserts the
+# BEHAVIOUR each knob governs rather than the variable's value: a bridge
+# test that stops at `[[ -n $VAR ]]` reproduces the same defect one layer
+# up, since a name that resolves and reaches no decision is still ignored.
+MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS="${MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS:-$("$_cfg" monitor.over_limit.observation_staleness_seconds 600)}"
+MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS="${MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS:-$("$_cfg" monitor.over_limit.suppression_alert_seconds 900)}"
+MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS="${MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS:-$("$_cfg" monitor.over_limit.suppression_reminder_seconds 3600)}"
+
+# ---- login/auth hold (your-org/nexus-code#1518) ---------------------------
+#
+# Bridged HERE, not consumed straight from the environment in `_auth_hold.sh`.
+# `#976` measured the cost of the other arrangement on this very module's
+# neighbour: three `monitor.over_limit.*` visibility knobs shipped read-only
+# from the environment, so an operator setting them in config had them parsed,
+# read by nothing, and reported by nothing — on the module whose whole job is
+# telling the operator their channel is muted. These four govern WHEN the
+# operator's own pane is written to, which is a worse surface to swallow input
+# on, so they are wired from the start.
+#
+# Every value below is one WE CHOSE, and is labelled as chosen rather than as a
+# convention: `escape_after_seconds` is the operator's stated "~1h"
+# (2026-09-12); the other three are ours.
+MONITOR_AUTH_HOLD_ENABLED="${MONITOR_AUTH_HOLD_ENABLED:-$("$_cfg" monitor.watcher.auth_hold.enabled true)}"
+# The operator's number: how long an emit may be held before the watcher sends
+# Escape and pastes anyway. Aged from when the emit was FIRST held.
+MONITOR_AUTH_HOLD_ESCAPE_AFTER_SECONDS="${MONITOR_AUTH_HOLD_ESCAPE_AFTER_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.escape_after_seconds 3600)}"
+# Chosen: a pane `content_hash` change inside this window defers the escape by
+# one window at a time — the actively-driven-login deferral. 300 s is long
+# enough to cover a human reading a consent screen and short enough that an
+# abandoned login still clears within a few multiples of it.
+MONITOR_AUTH_HOLD_ACTIVE_GRACE_SECONDS="${MONITOR_AUTH_HOLD_ACTIVE_GRACE_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.active_grace_seconds 300)}"
+# Chosen: the ABSOLUTE ceiling, and it FAILS OPEN — past it the hold releases
+# whatever the pane says. 2x escape_after. Its existence is the reason the
+# deferral above cannot compound into a permanently silent board, which is the
+# `#1517` failure with a different sensor.
+MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS="${MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.max_hold_seconds 7200)}"
+# Chosen: mirrors monitor.over_limit.observation_staleness_seconds. A hold row
+# is only as good as the last cycle that actually SAW the dialog; a watcher
+# that stopped observing must not keep the channel shut on a memory.
+MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS="${MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS:-$("$_cfg" monitor.watcher.auth_hold.observation_staleness_seconds 600)}"
+# ---- API-unreachable hold (your-org/nexus-code#1845) ----------------------
+#
+# Bridged here from the start, for `#976`'s reason (see the login hold above):
+# these govern when the watcher HOLDS the operator's channel and when it pastes
+# into worker panes on its own. Every value is one WE CHOSE.
+MONITOR_API_HOLD_ENABLED="${MONITOR_API_HOLD_ENABLED:-$("$_cfg" monitor.watcher.api_hold.enabled true)}"
+# Chosen: a transport-class marker counts toward ENTRY for this long after its
+# turn failed. The harness retries a failed request for minutes before the turn
+# ends, so two sessions hit by one outage land well inside 10 min of each other.
+MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS="${MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS:-$("$_cfg" monitor.watcher.api_hold.signal_window_seconds 600)}"
+# Chosen: distinct sessions needed to enter (the orchestrator alone always
+# suffices). 2, so ONE worker's network blip keeps its existing owner — the
+# orchestrator's `interrupted` row — and the hold is reserved for a shared cause.
+MONITOR_API_HOLD_MIN_SESSIONS="${MONITOR_API_HOLD_MIN_SESSIONS:-$("$_cfg" monitor.watcher.api_hold.min_sessions 2)}"
+# Chosen: the async probe's minimum spacing while held, and each attempt's own
+# bound (curl --max-time; the outer timeout adds 5 s).
+MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS="${MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.api_hold.probe_interval_seconds 60)}"
+MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS="${MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS:-$("$_cfg" monitor.watcher.api_hold.probe_timeout_seconds 10)}"
+# Empty → ANTHROPIC_BASE_URL, else https://api.anthropic.com.
+MONITOR_API_HOLD_PROBE_URL="${MONITOR_API_HOLD_PROBE_URL:-$("$_cfg" monitor.watcher.api_hold.probe_url "")}"
+# Empty → the watcher's own NODE_OPTIONS. Set this to the resolver override the
+# harness runs with (e.g. `-r /path/force-dns.js`). The node probe tries both
+# `dns.lookup` and `dns.resolve*`, because a `dns.setServers` override reaches
+# only the second (skeptic ncbundle29-sk F2, F2b).
+MONITOR_API_HOLD_PROBE_NODE_OPTIONS="${MONITOR_API_HOLD_PROBE_NODE_OPTIONS:-$("$_cfg" monitor.watcher.api_hold.probe_node_options "")}"
+# Chosen: the ABSOLUTE ceiling, failing OPEN. 12 h: well past the measured
+# 4 h 46 m outage of 2026-10-15, short enough that a probe stuck on
+# "unreachable" while the agents work cannot mute the board for a day.
+MONITOR_API_HOLD_MAX_HOLD_SECONDS="${MONITOR_API_HOLD_MAX_HOLD_SECONDS:-$("$_cfg" monitor.watcher.api_hold.max_hold_seconds 43200)}"
+# Chosen: mirrors the login hold's observation staleness — a row the step has
+# not refreshed for this long releases the gates.
+MONITOR_API_HOLD_STALENESS_SECONDS="${MONITOR_API_HOLD_STALENESS_SECONDS:-$("$_cfg" monitor.watcher.api_hold.staleness_seconds 600)}"
+# Chosen: never two resume nudges to one window inside this, across holds, so a
+# flapping API cannot become a paste storm.
+MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS="${MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.api_hold.nudge_min_interval_seconds 900)}"
+# ---- operator alert (your-org/nexus-code#1548, #1533, #1534) ---------------
+# The text-carrying, turn-independent alert `_operator_alert.sh` raises when
+# the watcher alone knows the operator must act (a logged-out orchestrator, an
+# emit-only service down while the emit route is unavailable). All chosen.
+# push_enabled: the `monitor/notify.sh` leg (Pushover → ntfy → SMTP). Its only
+# evidence is API ACCEPTANCE; whether a device rendered it is unverified.
+MONITOR_OPERATOR_ALERT_PUSH_ENABLED="${MONITOR_OPERATOR_ALERT_PUSH_ENABLED:-$("$_cfg" monitor.watcher.operator_alert.push_enabled true)}"
+# github_enabled: one bot-authored `operator-alert: <key>` issue per standing
+# condition on github.repo, @-pinging user_login; closed on clear.
+MONITOR_OPERATOR_ALERT_GITHUB_ENABLED="${MONITOR_OPERATOR_ALERT_GITHUB_ENABLED:-$("$_cfg" monitor.watcher.operator_alert.github_enabled true)}"
+# reminder_seconds: a standing condition re-alerts at this cadence (#976: one
+# announcement, slow reminders). 3600 = the over-limit reminder's number.
+MONITOR_OPERATOR_ALERT_REMINDER_SECONDS="${MONITOR_OPERATOR_ALERT_REMINDER_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.reminder_seconds 3600)}"
+# clear_holddown_seconds: a `clear` finalises only after the condition has
+# been absent this long; a raise inside it is a FLAP (no re-ring, no re-file).
+MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS="${MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.clear_holddown_seconds 300)}"
+# comment_interval_seconds: at most one GitHub COMMENT per key per interval
+# (reminders, re-opens, the clear note); open/close state changes are never capped.
+MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS="${MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.comment_interval_seconds 3600)}"
+# net_timeout_seconds: the bound on each network leg (they run detached).
+MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS="${MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS:-$("$_cfg" monitor.watcher.operator_alert.net_timeout_seconds 60)}"
+# turn_failure_gate_seconds: how long a fresh `turn-failure/<target>.json`
+# marker with recovery=operator gates orchestrator-liveness (#1520/#1517).
+# Mirrors the auth-hold observation staleness: the marker is a point event
+# refreshed by every failed turn, so a wedged pane that stops producing them
+# releases the gate after this window.
+MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS="${MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS:-$("$_cfg" monitor.watcher.turn_failure_gate_seconds 600)}"
+# How long after the watcher pastes a resume brief and retires a row that
+# window stays un-re-stampable (your-org/nexus-code#1141). The stale signal
+# that produced the resume is cleared by the turn the brief STARTS, so until
+# that turn ends the same evidence is still readable and would re-create the
+# row — which is the measured loop: five windows re-stamped, one resume brief
+# pasted 62 s after the last, 63 emits held in an hour. 300 s is the same
+# order as the wake margin and is bounded on both sides: long enough to cover
+# a resumed turn's first tool call, and short next to a limit episode, which
+# lasts hours. It gates RE-CREATION only, never the refresh of a live row, so
+# a genuine hold is unaffected.
+MONITOR_OVER_LIMIT_RESUME_SUPPRESSION_SECONDS="${MONITOR_OVER_LIMIT_RESUME_SUPPRESSION_SECONDS:-$("$_cfg" monitor.over_limit.resume_suppression_seconds 300)}"
 # Orchestrator-liveness fresh-spawn fallback. Layered on top of the
 # PR #147 session-id pin: the pin fixed *who* gets resumed; this fallback
 # ensures the orchestrator's absence is *detectable* and *recoverable*
@@ -542,6 +808,14 @@ MONITOR_SNAPSHOT_GIT_TIMEOUT_SECONDS="${MONITOR_SNAPSHOT_GIT_TIMEOUT_SECONDS:-$(
 # continue with a partial sweep rather than delay the first emit forever.
 MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS="${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS:-$("$_cfg" monitor.startup_render_timeout_seconds 20)}"
 [[ "$MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS=20
+# Per-window allowance ADDED to the budget above for the per-emit workspace
+# renders (your-org/nexus-code#1406). Those renders probe every worker pane, so
+# their cost is O(windows) — measured at ~1.3 s per live window at loadavg ~40
+# (0.5 s on an absent pane) — and a constant budget chosen when the board was
+# small is exceeded on exactly the days the board is busiest. Budget =
+# startup_render_timeout_seconds + windows × this. 0 restores the constant.
+MONITOR_RENDER_SECONDS_PER_WINDOW="${MONITOR_RENDER_SECONDS_PER_WINDOW:-$("$_cfg" monitor.render_seconds_per_window 2)}"
+[[ "$MONITOR_RENDER_SECONDS_PER_WINDOW" =~ ^[0-9]+$ ]] || MONITOR_RENDER_SECONDS_PER_WINDOW=2
 # Emit-FUNCTIONAL liveness is the HEARTBEAT itself (no separate knob). The
 # watcher bumps watcher-heartbeat ONLY at the end of a correct compose cycle
 # (main.sh), so `_watcher_alive`'s existing heartbeat-age thresholds
@@ -620,6 +894,97 @@ MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE="${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-
 # silent). NOTE the bootstrap caveat: only a version-aware watcher can
 # auto-restart anything, so the FIRST deploy of this feature is itself
 # still a manual `monitor/svc.sh restart watcher`.
+# ---- primary-clone deployment drift (your-org/nexus-code#614) ------------
+# Detects that the RUNNING clone is behind the remote branch — the
+# question version_restart cannot answer, because it compares on-disk
+# files against the running instance and is therefore blind to a pull
+# that never happened. Detection only; the pull stays a human-timed
+# orchestrator action. `branch` is the deployment branch this clone
+# tracks; `commits`/`hours` are OR-ed thresholds (a burst of merges vs
+# a single long-stale commit are different shapes of the same gap).
+MONITOR_CLONE_DRIFT_ENABLED="${MONITOR_CLONE_DRIFT_ENABLED:-$("$_cfg" monitor.clone_drift.enabled true)}"
+MONITOR_CLONE_DRIFT_INTERVAL_SECONDS="${MONITOR_CLONE_DRIFT_INTERVAL_SECONDS:-$("$_cfg" monitor.clone_drift.interval_seconds 3600)}"
+[[ "$MONITOR_CLONE_DRIFT_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CLONE_DRIFT_INTERVAL_SECONDS=3600
+# The branch merged fixes land on. NOT resolved here (your-org/nexus-code#763):
+# it is a repo-wide property with a second consumer — `cc-auto-update-apply.sh`'s
+# deployment gate — and two independent lookups of one property drift apart.
+# The shared resolver honours $MONITOR_INTEGRATION_BRANCH, then the DEPRECATED
+# $MONITOR_CLONE_DRIFT_BRANCH (which is why an env override set by a test or an
+# operator still wins here), then the new config key, then the deprecated one.
+_ib_sh="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_integration_branch.sh"
+# FAIL LOUD AND NAMED, never silently degrade. Without the resolver there is
+# no honest answer for this key — a `${…:-dev}` fallback here would be a
+# second claimant, which is the exact thing #763 exists to remove. Left
+# unguarded, the failure mode was a bare `unbound variable` two lines down
+# (the source fails non-fatally, then the function is undefined): a real
+# breakage reported as a shell accident. Named refusal instead.
+if [[ ! -r "$_ib_sh" ]]; then
+    echo "watcher: cannot read $_ib_sh — the integration-branch resolver" >&2
+    echo "  (your-org/nexus-code#763). Every consumer of 'the branch merged" >&2
+    echo "  fixes land on' resolves through it; without it the clone-drift" >&2
+    echo "  detector and the cc-auto-update deployment gate would each have" >&2
+    echo "  to guess, and could disagree. Refusing to start on a partial tree." >&2
+    exit 1
+fi
+# shellcheck source=../_integration_branch.sh
+source "$_ib_sh"
+# Called WITHOUT a command substitution so the resolver's provenance
+# ($NEXUS_INTEGRATION_BRANCH_SOURCE) survives into the watcher's shell — a
+# `$( )` is a subshell and would discard it.
+_nexus_resolve_integration_branch
+MONITOR_INTEGRATION_BRANCH="$NEXUS_INTEGRATION_BRANCH_VALUE"
+# Back-compat alias. Every in-tree reader now goes through the resolver, but
+# an operator script or a fork may still read this name; it is kept as an
+# ALIAS of the resolved value rather than a second lookup, so it cannot
+# disagree with the canonical answer.
+MONITOR_CLONE_DRIFT_BRANCH="$MONITOR_INTEGRATION_BRANCH"
+MONITOR_CLONE_DRIFT_COMMITS="${MONITOR_CLONE_DRIFT_COMMITS:-$("$_cfg" monitor.clone_drift.commits 5)}"
+[[ "$MONITOR_CLONE_DRIFT_COMMITS" =~ ^[0-9]+$ ]] || MONITOR_CLONE_DRIFT_COMMITS=5
+MONITOR_CLONE_DRIFT_HOURS="${MONITOR_CLONE_DRIFT_HOURS:-$("$_cfg" monitor.clone_drift.hours 24)}"
+[[ "$MONITOR_CLONE_DRIFT_HOURS" =~ ^[0-9]+$ ]] || MONITOR_CLONE_DRIFT_HOURS=24
+# Wall-clock bound on the two NETWORK calls the check makes. This runs
+# on the async scheduler slot the wedge guard (#367) protects; a drift
+# check must never be the thing that freezes the loop.
+MONITOR_CLONE_DRIFT_TIMEOUT_SECONDS="${MONITOR_CLONE_DRIFT_TIMEOUT_SECONDS:-$("$_cfg" monitor.clone_drift.timeout_seconds 30)}"
+[[ "$MONITOR_CLONE_DRIFT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CLONE_DRIFT_TIMEOUT_SECONDS=30
+
+# ---- GraphQL backoff bound + ingest-degradation escalation ---------------
+# your-org/nexus-code#594: no gate may withhold operator communication on
+# the strength of a computed instant alone. The ceiling is measured from
+# the OBSERVATION that armed the backoff, and it overrides whatever reset
+# the API supplied — an unbounded suppression has no worst case.
+MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS="${MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.graphql.backoff_max_seconds 900)}"
+[[ "$MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS=900
+MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS="${MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS:-$("$_cfg" monitor.graphql.backoff_announce_seconds 300)}"
+[[ "$MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS=300
+# your-org/nexus-code#595: a repeatedly-failing fetch on the operator
+# channel must escalate out-of-band, not just log.
+MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS="${MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS:-$("$_cfg" monitor.graphql.degraded_escalate_seconds 1800)}"
+[[ "$MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS=1800
+# Restatement cadence while a surface is STILL degraded. 3600 -> 900
+# (your-org/nexus-code#966 follow-up) — the silent half of the emit-storm
+# outage: the escalation announced once and the channel then went quiet for
+# the rest of the hour while the surface kept failing, and quiet is what a
+# genuine recovery also looks like from the operator's side (a real one emits
+# `ingest-recovered`).
+#
+# THIS is the value production uses. `_github.sh`'s `${…:-900}` fallback is
+# only reached when the var is unset, which never happens under the watcher
+# because this line sets and exports it — so a default changed THERE alone is
+# dead code behind a green suite. `test-knob-default-agrees.sh` pins all five
+# spellings of a knob's default together for exactly that reason — add a row
+# to its table when you add a knob, or the next one repeats this.
+MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS="${MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS:-$("$_cfg" monitor.graphql.degraded_remind_seconds 900)}"
+[[ "$MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS=900
+# your-org/nexus-code#595: search pagination. Page size bounds the work
+# ONE query asks GitHub to do; the cap and budget bound the walk.
+MONITOR_GRAPHQL_SEARCH_PAGE_SIZE="${MONITOR_GRAPHQL_SEARCH_PAGE_SIZE:-$("$_cfg" monitor.graphql.search_page_size 10)}"
+[[ "$MONITOR_GRAPHQL_SEARCH_PAGE_SIZE" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_SEARCH_PAGE_SIZE=10
+MONITOR_GRAPHQL_SEARCH_MAX_PAGES="${MONITOR_GRAPHQL_SEARCH_MAX_PAGES:-$("$_cfg" monitor.graphql.search_max_pages 40)}"
+[[ "$MONITOR_GRAPHQL_SEARCH_MAX_PAGES" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_SEARCH_MAX_PAGES=40
+MONITOR_GRAPHQL_SEARCH_BUDGET_SECONDS="${MONITOR_GRAPHQL_SEARCH_BUDGET_SECONDS:-$("$_cfg" monitor.graphql.search_budget_seconds 180)}"
+[[ "$MONITOR_GRAPHQL_SEARCH_BUDGET_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_GRAPHQL_SEARCH_BUDGET_SECONDS=180
+
 MONITOR_VERSION_RESTART_ENABLED="${MONITOR_VERSION_RESTART_ENABLED:-$("$_cfg" monitor.version_restart.enabled true)}"
 MONITOR_VERSION_CHECK_INTERVAL_SECONDS="${MONITOR_VERSION_CHECK_INTERVAL_SECONDS:-$("$_cfg" monitor.version_restart.interval_seconds 60)}"
 [[ "$MONITOR_VERSION_CHECK_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_VERSION_CHECK_INTERVAL_SECONDS=60
@@ -647,7 +1012,7 @@ MONITOR_VERSION_SELF_LOOP_LIMIT="${MONITOR_VERSION_SELF_LOOP_LIMIT:-$("$_cfg" mo
 MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS="${MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS:-$("$_cfg" monitor.version_restart.self_loop_window_seconds 3600)}"
 [[ "$MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_VERSION_SELF_LOOP_WINDOW_SECONDS=3600
 # The tmux window hosting the services cockpit TUI (the drift ask
-# names it; `tmux new-window -n services 'monitor/svc.sh'` is the
+# names it; `tmux new-window -n services 'monitor/svc.sh --show-secrets'` is the
 # documented launch in svc.sh's header).
 MONITOR_COCKPIT_WINDOW="${MONITOR_COCKPIT_WINDOW:-$("$_cfg" monitor.cockpit_window services)}"
 # Continuous service-health watch (service-health-watch). The
@@ -702,10 +1067,12 @@ MONITOR_SERVICE_HEALTH_FLAP_CEILING="${MONITOR_SERVICE_HEALTH_FLAP_CEILING:-$("$
 # cold JupyterLab env build (CPython + jupyterlab + extensions onto the NFS uv
 # cache) blocks the healthcheck for minutes (~615s observed); the watcher
 # defers to the supervisor for the life of that build so it can't kill it
-# mid-flight (your-org/nexus-code#326 follow-up), but caps the defer here so a
-# pathological wedged build is still recoverable. Default 1800 (30 min) — well
-# above the observed build and the supervisor's 900s START_GRACE, so a genuine
-# cold build never trips it. 0 disables the cold-build defer entirely. Env:
+# mid-flight (your-org/nexus-code#326 follow-up). Measured on the BUILD's own
+# age (never the incident's): inside it the build is protected; past it, only
+# while it is still making progress, up to LABSH_COLD_BUILD_HARD_CAP (7200s) —
+# the shared verdict `labsh_build_release` (your-org/nexus-code#1676; a
+# load-100 build took >30 min, so an absolute 1800s bound killed every rebuild).
+# Default 1800. 0 disables the cold-build defer entirely. Env:
 # MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS.
 MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-$("$_cfg" monitor.service_health.cold_build_ceiling_seconds 1800)}"
 [[ "$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
@@ -728,8 +1095,10 @@ MONITOR_REPORTS_ROLL_INTERVAL_SECONDS="${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS:-
 MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS="${MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS:-$("$_cfg" monitor.reports_roll.min_age_seconds 300)}"
 [[ "$MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS=300
 # Watcher-supervision (your-org/your-nexus, mutual-liveness design). The
-# ORCHESTRATOR arms a persistent Monitor that revives a crashed watcher
-# and touches a supervisor heartbeat each tick. The watcher's only role
+# ORCHESTRATOR arms a Monitor that revives a crashed watcher and touches a
+# supervisor heartbeat each tick — a LEASE, not a persistent loop: since
+# Claude Code 2.1.271 it expires after at most 30 min and must be re-armed
+# by the orchestrator (your-org/nexus-code#1532). The watcher's only role
 # is the `--- arm watcher supervisor ---` emit reminder when that
 # heartbeat is stale/absent (the Monitor isn't armed). ENABLED gates that
 # reminder; ON by default — an unarmed supervisor means a watcher crash
@@ -789,9 +1158,15 @@ MONITOR_REQUESTS_RETENTION_SECONDS="${MONITOR_REQUESTS_RETENTION_SECONDS:-$("$_c
 export MONITOR_REQUESTS_ENABLED MONITOR_REQUESTS_REEMIT_COOLDOWN_SECONDS \
        MONITOR_REQUESTS_MAX_PER_EMIT MONITOR_REQUESTS_FAIRNESS \
        MONITOR_REQUESTS_MAX_AGE_SECONDS MONITOR_REQUESTS_RETENTION_SECONDS
+export MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS \
+       MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS \
+       MONITOR_FULL_STATE_RESTAT_WINDOWS MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT \
+       MONITOR_PENDING_SKIP_DEAD_WINDOWS
 export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL_SPAWN_GRACE_SECONDS MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS MONITOR_HEARTBEAT_STALENESS_SECONDS MONITOR_NOTIFICATIONS_LOG_MAX_BYTES \
        MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS \
        MONITOR_EMIT_COOLDOWN_SECONDS MONITOR_EMIT_HISTORY_RETENTION_SECONDS \
+       MONITOR_ALERT_EMIT_COOLDOWN_SECONDS \
+       MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS MONITOR_PANE_CACHE_TTL_SECONDS \
        MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS MONITOR_EMIT_DEDUP_RING_SIZE \
        MONITOR_REEMIT_ENABLED MONITOR_REEMIT_MAX_AGE_SECONDS MONITOR_REEMIT_LIVE_RECHECK \
        MONITOR_REEMIT_BACKOFF_SECONDS \
@@ -801,6 +1176,7 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_FUNCTIONAL_SLA_SECONDS MONITOR_FUNCTIONAL_MAX_EMITS \
        MONITOR_SNAPSHOT_GIT_ENABLED MONITOR_SNAPSHOT_REPORTS_TIMEOUT_SECONDS \
        MONITOR_SNAPSHOT_GIT_TIMEOUT_SECONDS MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS \
+       MONITOR_RENDER_SECONDS_PER_WINDOW \
        MONITOR_WATCHER_SELF_HEAL_ENABLED MONITOR_EMIT_DELIVERY_FAIL_LIMIT \
        MONITOR_CC_UPDATE_INTERVAL_SECONDS MONITOR_CC_UPDATE_PACKAGE \
        MONITOR_CC_UPDATE_SKILL_PATH MONITOR_CC_UPDATE_FETCH_TIMEOUT_SECONDS \
@@ -817,7 +1193,25 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_REPORTS_ROLL_ENABLED MONITOR_REPORTS_ROLL_INTERVAL_SECONDS MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS \
        MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS \
        MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS MONITOR_OVER_LIMIT_MAX_ATTEMPTS \
-       MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS
+       MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS \
+       MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS \
+       MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS \
+       MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS \
+       MONITOR_OVER_LIMIT_RESUME_SUPPRESSION_SECONDS \
+       MONITOR_AUTH_HOLD_ENABLED MONITOR_AUTH_HOLD_ESCAPE_AFTER_SECONDS \
+       MONITOR_AUTH_HOLD_ACTIVE_GRACE_SECONDS MONITOR_AUTH_HOLD_MAX_HOLD_SECONDS \
+       MONITOR_AUTH_HOLD_OBSERVATION_STALENESS_SECONDS \
+       MONITOR_API_HOLD_ENABLED MONITOR_API_HOLD_SIGNAL_WINDOW_SECONDS \
+       MONITOR_API_HOLD_MIN_SESSIONS MONITOR_API_HOLD_PROBE_INTERVAL_SECONDS \
+       MONITOR_API_HOLD_PROBE_TIMEOUT_SECONDS MONITOR_API_HOLD_PROBE_URL \
+       MONITOR_API_HOLD_PROBE_NODE_OPTIONS \
+       MONITOR_API_HOLD_MAX_HOLD_SECONDS MONITOR_API_HOLD_STALENESS_SECONDS \
+       MONITOR_API_HOLD_NUDGE_MIN_INTERVAL_SECONDS \
+       MONITOR_OPERATOR_ALERT_PUSH_ENABLED MONITOR_OPERATOR_ALERT_GITHUB_ENABLED \
+       MONITOR_OPERATOR_ALERT_REMINDER_SECONDS MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS \
+       MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS \
+       MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS \
+       MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS
 # Crash-loop guard for `respawn_agent`. If more than RESPAWN_LOOP_LIMIT
 # respawns happen within RESPAWN_LOOP_WINDOW seconds, the watcher
 # stops respawning the orchestrator until the sliding window empties
@@ -838,7 +1232,6 @@ RATELIMIT_PROBE="${MONITOR_RATELIMIT_PROBE:-$("$_cfg" monitor.watcher.ratelimit_
 RATELIMIT_HEURISTIC_MIN="${MONITOR_RATELIMIT_HEURISTIC_MIN:-$("$_cfg" monitor.watcher.ratelimit_heuristic_minutes 30)}"
 RATELIMIT_ACK_TIMEOUT_S="${MONITOR_RATELIMIT_ACK_TIMEOUT_S:-$("$_cfg" monitor.watcher.ratelimit_ack_timeout_s 60)}"
 PROBE_MODEL="${MONITOR_PROBE_MODEL:-$("$_cfg" monitor.watcher.probe_model claude-haiku-4-5-20251001)}"
-API_ERROR_BACKOFF_MIN="${MONITOR_API_ERROR_BACKOFF_MIN:-$("$_cfg" monitor.watcher.api_error_backoff_minutes 30)}"
 # AskUserQuestion / chip-bar dialog handling (Case D — dialog-guard).
 # Layer A1 (the `PreToolUse` matcher in
 # `monitor/orchestrator-settings.json`) blocks the orchestrator from

@@ -8,8 +8,17 @@
 # liveness task). The missing half was: who revives a CRASHED watcher?
 # An earlier draft added a bespoke always-on daemon; the operator chose a
 # simpler, symmetric answer — the ORCHESTRATOR'S own always-on agent loop
-# IS the external supervisor the watcher needs. The orchestrator arms a
-# persistent `Monitor` whose until-loop runs THIS script every interval:
+# IS the external supervisor the watcher needs. Two callers run THIS
+# script (your-org/nexus-code#1532):
+#   * PRIMARY: monitor/watcher-supervise-probe.sh, a persistent longjob
+#     watch armed by monitor/arm-watcher-supervisor.sh. The plugin
+#     dispatcher is not bound by the 30-minute Monitor cap and polls
+#     independently of the orchestrator's turns, and the probe runs the
+#     revive itself, so no re-arm lease and no turn are needed.
+#   * FALLBACK (plugin dispatcher NOT ARMED): a `Monitor` until-loop, a
+#     lease of at most 30 minutes the orchestrator re-arms on each expiry.
+#     Its gap while the orchestrator cannot take a turn is real (7 h 13 m
+#     on 2026-09-17); stated in skills/nexus.service-recovery.
 #
 #     Monitor({command:
 #       'until ! /ABS/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
@@ -44,7 +53,22 @@
 
 set -uo pipefail
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-_nexus_root=$(cd "$_script_dir/.." && pwd)
+# your-org/nexus-code#1084 / #577. THE STATE THIS TICK WRITES BELONGS TO THE
+# PRIMARY. This file had zero $NEXUS_ROOT references and rooted itself at its
+# own script location, so run from a secondary clone it wrote the supervision
+# heartbeat — and escalated incidents — under `work/<clone>/monitor/.state`,
+# where the orchestrator never looks. That is the #577 harm: not destruction,
+# but state written where nothing reads it, which is indistinguishable from a
+# supervisor that had nothing to say.
+#
+# `nexus_primary_root` de-nests a candidate out of any `<primary>/work/<clone>`
+# it sits under. Sourced, never re-implemented: two resolvers disagreeing is
+# what #1077 was.
+# shellcheck source=_nexus-root.sh
+source "$_script_dir/_nexus-root.sh"
+_nexus_root=$(nexus_primary_root "${NEXUS_ROOT:-$_script_dir/..}") \
+    || _nexus_root=$(cd "$_script_dir/.." && pwd)
+[[ -n "$_nexus_root" ]] || _nexus_root=$(cd "$_script_dir/.." && pwd)
 _cfg="$_nexus_root/config/load.sh"
 # shellcheck source=watcher/_lib.sh
 source "$_script_dir/watcher/_lib.sh"

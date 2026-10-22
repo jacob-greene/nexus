@@ -217,7 +217,47 @@ launch_new() {
     cch_launch_cmd
 }
 
-BASELINE=$(launch_baseline)
+# ---- the two DELIBERATE deltas since the baseline ------------------------
+# The upstream merge (issue 162) added two things to the launch line, both on
+# purpose, and NOTHING else may differ:
+#   (a) `TMUX_TMPDIR=<q>` through the `env -i` wall, ahead of
+#       ANTHROPIC_BASE_URL, so a hook in the pane cannot fall back to the
+#       PRODUCTION tmux socket (your-org/nexus-code#1042);
+#   (b) the CCH_EXTRA_ENV `%s` splice ahead of TERM=, which leaves ONE extra
+#       space when empty.
+# Rather than re-pin a new literal, the expected string is the git-read
+# baseline with exactly these two edits applied — each must hit exactly
+# once, or the derivation itself fails (a drifted anchor must not turn every
+# comparison below into baseline-vs-baseline).
+CCH_TMUX_TMPDIR='/tmp/cc harness/tmux "sock"'
+CCH_EXTRA_ENV=''
+export CCH_TMUX_TMPDIR CCH_EXTRA_ENV
+with_deltas() {   # <baseline-shaped launch string> -> the expected new string
+    local in="$1" q a='
+ANTHROPIC_BASE_URL=' t='
+TERM='
+    printf -v q '%q' "$CCH_TMUX_TMPDIR"
+    local n_a n_t
+    n_a=$(grep -c '^ANTHROPIC_BASE_URL=' <<<"$in"); n_t=$(grep -c '^TERM=' <<<"$in")
+    if [[ "$n_a" != 1 || "$n_t" != 1 ]]; then
+        printf 'DELTA-ANCHOR-MISSING(a=%s t=%s)' "$n_a" "$n_t"; return 1
+    fi
+    # The variable NAME is held apart from its `=`: this is string data being
+    # built, not a tmux call, and a literal `NAME=` here reads to
+    # lint-no-tmux-server-kill.sh as a TMUX_TMPDIR-scoped invocation.
+    local pin_name='TMUX_TMPDIR'
+    in="${in/"$a"/$'\n'"${pin_name}=$q ANTHROPIC_BASE_URL="}"
+    in="${in/"$t"/$'\n'"${CCH_EXTRA_ENV} TERM="}"
+    printf '%s' "$in"
+}
+
+BASELINE_RAW=$(launch_baseline)
+BASELINE=$(with_deltas "$BASELINE_RAW")
+if [[ "$BASELINE" == DELTA-ANCHOR-MISSING* || "$BASELINE" == "$BASELINE_RAW" ]]; then
+    printf '  FAIL: could not apply the two documented deltas to the baseline (%s)\n' "${BASELINE:0:60}" >&2
+    FAIL=$(( FAIL + 1 ))
+    summary
+fi
 
 echo
 echo "=== cch_launch_cmd: default is byte-for-byte the pre-knob string ==="
@@ -282,7 +322,7 @@ else
         eval "$SETTINGS_BLOCK"
         printf '%s' "$launch"
     }
-    SETTINGS_MAIN=$(launch_settings_main)
+    SETTINGS_MAIN=$(with_deltas "$(launch_settings_main)")
     unset CCH_SKIP_PERMISSIONS
     assert_eq "settings file -> identical to main's settings form" \
         "$(PATH="$FAKE_PATH" cch_launch_cmd "$SETTINGS_FILE")" "$SETTINGS_MAIN"
@@ -290,6 +330,14 @@ else
     assert_eq "empty settings argument -> identical to baseline" \
         "$(PATH="$FAKE_PATH" cch_launch_cmd "")" "$BASELINE"
 fi
+
+echo
+echo "=== cch_launch_cmd: the CCH_EXTRA_ENV splice lands where (b) says ==="
+# 8. A non-empty CCH_EXTRA_ENV fills the splice and changes nothing else.
+CCH_EXTRA_ENV='NEXUS_ROOT=/x'
+assert_eq "CCH_EXTRA_ENV set -> baseline with the assignment before TERM=" \
+    "$(launch_new)" "$(with_deltas "$BASELINE_RAW")"
+CCH_EXTRA_ENV=''
 
 # ---- summary -------------------------------------------------------------
 summary

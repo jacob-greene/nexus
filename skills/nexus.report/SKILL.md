@@ -29,7 +29,7 @@ one.
 
 - **`{reports-dir}`** — the **absolute** reports path injected
   into every worker's prompt as part of the `## Worker
-  environment` header (e.g. `$NEXUS_ROOT/reports`).
+  environment` header (e.g. `/shared/your-lab-m/user/<operator>/nexus/reports`).
   Do **not** use a relative `reports/` from your workdir — when
   the workdir is a secondary clone (worktree / fresh clone), a
   relative path lands in that clone's tree and the orchestrator
@@ -37,7 +37,7 @@ one.
   (`monitor/spawn-worker.sh`) inject the absolute path so the
   destination is unambiguous.
 - **`{project}`** — name of the `work/` subdirectory being worked on
-  (e.g. `kompot`, `<hpc-skills>`, `labsh`). Use `nexus` for
+  (e.g. `kompot`, `hpc-skills`, `labsh`). Use `nexus` for
   workspace-level tasks that span projects.
 - **`{YYYY-MM-DD}`** — ISO date.
 - **`{HHMMSS}`** — 24h time. UTC or local — be consistent across the
@@ -50,6 +50,28 @@ number in the slug, e.g.
 `proj-x_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
 lets future workers retrieve the chain via
 `ls reports/*issue53* 2>/dev/null`.
+
+To search report **content** (not just filenames) — "has this come up
+before?" — use `monitor/ng report-grep <pattern>`, NOT a bare
+`grep -r … reports/`. The operator's `grep` wraps `ugrep --ignore-files`
+and `reports/.gitignore` is a bare `*`, so a recursive grep returns a
+SILENT zero over the whole corpus (`<your-org>/nexus-code#618`);
+`report-grep` fails loud (exit 3 + diagnostic) instead of handing back a
+false "no". Filename globs like `ls reports/*issue53*` are explicit
+arguments and are never suppressed.
+
+**And a filename glob keyed on a WINDOW NAME is a silent zero of its own**
+(`<your-org>/nexus-code#1195`). The `{project}` slug in a report's filename is
+**cwd-derived** — `report-init` takes the first segment after the last `/work/`
+in `$PWD`, falling back to the window name only when it ran outside a `work/`
+tree — while the frontmatter `window:` field comes from live tmux. Measured on
+this corpus they disagree for **136 of 709** reports, and **21** windows are
+indexed under two or more slugs. It errs both ways: for one live window a
+filename grep returns 6 where the frontmatter says 3.
+
+Use `monitor/ng reports-for-window <window>`, which keys on the frontmatter and
+keeps the three answers apart: rc 0 found, rc 1 looked-and-found-none, rc 2
+**COULD NOT LOOK**.
 
 Example: `reports/kompot_2026-04-14_153200_fig2-revision.md`.
 
@@ -65,21 +87,51 @@ canonical sections. `monitor/ng report-init <slug>` produces a
 correctly-frontmatter'd skeleton — use it instead of hand-rolling
 the metadata block.
 
+Four fields are **enforced** by `ng report-check` (`project`, `date`,
+`session-id`, `status`); the rest are conventional — `report-init` writes them
+all and you should keep them, but their absence is not what the checker fails
+on. The annotations below say which is which, because "required" that nothing
+checks and "required" that blocks your wrap-up are different promises.
+
 ```markdown
 ---
-project: <slug>          # required — `work/` subdir, or `nexus` for workspace-level
-date: <YYYY-MM-DD>       # required — ISO date
-session-id: <uuid>       # required — Claude Code session id; must NOT be the literal "unknown"
-window: <tmux-window>    # required when spawned via spawn-worker.sh; else "<unset>"
-trigger: <issue#> [comment-id]   # key always present; value may be empty when nothing external kicked this off
-status: completed | partial | blocked   # required — canonical value
+project: <slug>          # ENFORCED — `work/` subdir, or `nexus` for workspace-level
+date: <YYYY-MM-DD>       # ENFORCED — ISO date
+session-id: <uuid>       # ENFORCED — Claude Code session id; must NOT be the literal "unknown"
+window: <tmux-window>    # conventional — written by report-init from live tmux; else "<unset>"
+trigger: <issue#> [comment-id]   # conventional — key always present; value may be empty when nothing external kicked this off
+status: completed | partial | blocked   # ENFORCED — exactly one of these three
+disposition: no-further-pass | second-pass   # REQUIRED whenever the wrap-up runs with
+                         # a REQUIRED skeptic — spawned `--skeptic require`, or
+                         # `--skeptic-decision require` under `auto` (and under
+                         # `deny`, which escalates) — WHETHER OR NOT you are a
+                         # skeptic: `ng wrap-up` REFUSES to file the spawn-skeptic
+                         # request without it (<your-org>/nexus-code#1512, #1095).
+                         # report-init seeds `TODO`; replace it with your own view,
+                         # and delete the line only when no skeptic is required.
+                         # Absent is fine then; UNREADABLE is refused (only those
+                         # two values parse — `merge`, `credible`, `revise` do NOT).
+fanout: <N> spawned / <M> returned   # optional; validated only when present, M <= N.
+                         # M counts subagents that RETURNED, used or not. If the
+                         # report sets some returned results aside, append
+                         # ` / <K> used` (K <= M): all returned with K < M gets a
+                         # neutral note, never the INCOMPLETE line
+                         # (<your-org>/nexus-code#1140).
 ---
 
 # {Title}
 
 ## Summary
+- Write every issue number this report claims or discharges BARE
+  at least once here (`#1329`, not `` `#1329` ``): `ng wrap-up`
+  projects this section verbatim into the issue comment, and a
+  backticked `#N` creates no cross-reference event on that issue, so
+  the issue reads as unowned (<your-org>/nexus-code#1396; the `nexus.bot`
+  skill carries the measurement).
 - One or two sentences. `ng wrap-up` quotes this into the link
   comment posted to the issue thread.
+- The FIRST SENTENCE is what a thread reader sees. Make it state
+  the result on its own — see "`## Summary` is the comment" below.
 
 ## What Was Done
 - Concise list of actions taken and files changed.
@@ -127,14 +179,83 @@ State`, `What Remains`, `How to Resume`) are mandatory.
 when something hurt, omitted when nothing did.
 
 `monitor/ng report-check <path>` validates a report against this
-schema (frontmatter fields, sections, body length ≥
+schema (frontmatter fields, the five sections, body length ≥
 `monitor.report_min_chars` default 500, absence of placeholder
-text like `TODO` / `FIXME` / `<...>` / `_(fill in)_`). `ng wrap-up`
+text — `TODO` / `FIXME` / `<...>` / `_(fill in)_` / `_(later)_` — and,
+when a `## Dispositions` section is present, that every bullet parses as
+`- #N — ALREADY-ADDRESSED|VOID-AS-WRITTEN|GENUINELY-OPEN — text`). It
+exits **0** complete, **1** incomplete with the specifics on stderr,
+**2** file missing or unreadable — so a `1` is a report to fix and a `2`
+is a path to fix. `ng wrap-up`
 runs `report-check` as a pre-flight and refuses to ship a stub
 asset URL — fix the report first, or pass `--allow-stub` to
 forward `--allow-todo` to the check for an intentional checkpoint.
 Existing pre-frontmatter reports don't need backfill; the schema
 is enforced going forward only.
+
+### `## Summary` IS the comment — what the composer guarantees
+
+`ng wrap-up`'s link comment is a **projection** of your report, and
+**every stage of that projection discards something.** The mechanism,
+not a closed list — the list below is what is known today, and the
+guarantee is stated in terms of the mechanism precisely because a
+count of steps is the kind of thing that turns out to be wrong (it
+already did: this block said "two" and there were three —
+`<your-org>/nexus-code#1116` review, F2):
+
+| stage | what it discards | filed as |
+|---|---|---|
+| report → `## Summary` | every other section, including one you appended | `#862` |
+| `## Summary` → flattened text | every `**Key:** value` line, as metadata | `#1116` F2 |
+| flattened text → teaser | everything after the first sentence, capped at 200 chars | `#1114` |
+
+The middle one is the surprising one and is worth knowing by shape: a
+Summary written **entirely** as `**Verdict:** BLOCK` / `**Confidence:**
+high` / `**Findings:** …` flattens to **nothing**. It used to publish a
+bare title at exit 0 with the trigger rocketed — a comment carrying no
+verdict at all. It is now refused like any other empty composition.
+One line of ordinary prose anywhere in the section is enough.
+
+**The guarantee**, stated over the mechanism rather than over the
+list: **at whatever stage the projection loses your claim, `wrap-up`
+publishes nothing rather than publishing the residue.** It exits **3**
+and names the cause and the ways out. A stage nobody has enumerated
+yet is covered by this sentence; it would not have been covered by a
+sentence about two steps. Exit
+3 is not a failed step — no step failed, so re-running it unchanged
+reproduces it exactly; only you can clear it.
+
+**What it does NOT guarantee**, said plainly so nobody reads more
+into it: that the teaser is a *good* summary, or that `## Summary`
+describes your report. Those are properties of your prose and no
+composer can check them. It guarantees only that a fragment is never
+silently substituted for a claim.
+
+**Two practical consequences.**
+
+1. **A superseding verdict must reach the OPENING of `## Summary`.**
+   Reports are append-only, so the natural place for a corrected
+   conclusion is a new section at the bottom — and the composer never
+   reads it. Editing `## Summary` is necessary and **not sufficient**:
+   the teaser is its first sentence capped at 200 characters, so a
+   correction added further down the section still leaves the composed
+   body byte-identical and `wrap-up` still exits 3. Put it in the first
+   sentence, or pass `--comment-body-file`. (Measured the hard way on
+   `#1116`: two re-wraps, both correctly reporting NOTHING PUBLISHED.)
+2. **Put at least one line of prose in `## Summary`.** An all-`**Key:**`
+   section composes to nothing and is refused.
+3. **Open with a sentence that stands alone.** The teaser is cut at
+   the first *safe* sentence boundary; abbreviations, versions and
+   initials (`e.g.` `Dr.` `Fig.` `v2.` `2.1.`) no longer end it, and
+   a fragment is refused rather than posted. A one-word Summary
+   (`Done.`) will be refused — that is the composer working.
+
+Keeping the coupling (`## Summary` is the teaser source) is
+deliberate. It is the one section `report-check` guarantees exists
+and is non-stub, so it is the only source with a check behind it;
+and it is what makes an idempotent re-run detectable — compose from
+the whole report and every re-wrap would edit the comment. The
+coupling was never the defect. The **unannounced loss** was.
 
 ## Why `Infrastructure Issues` matters (read this even if nothing came up)
 
@@ -177,8 +298,11 @@ the section.
    sets `Status: completed`.
 2. **Before going idle.** Partial work, waiting on input or a
    decision: write a report capturing the partial state, set
-   `Status: idle` or `blocked`. The orchestrator and any successor
-   agent can resume from it.
+   `status: partial` or `status: blocked`. The orchestrator and any
+   successor agent can resume from it. (**Not `idle`** — the canonical
+   set is exactly `completed | partial | blocked` and `ng report-check`
+   refuses anything else, so a report saying `status: idle` fails the
+   wrap-up pre-flight.)
 3. **Context pressure.** If your context window is filling up,
    write a report **before** it's lost. A crashed session with no
    report is wasted compute.
@@ -197,6 +321,24 @@ This means it's normal for a single project to accumulate multiple
 reports per session — `reports/kompot_2026-04-14_103000_fig2-start.md`
 followed by `reports/kompot_2026-04-14_153200_fig2-done.md` is the
 intended shape.
+
+### Amending a report whose skeptic gate is already released
+
+`retire-preflight` check 1c re-reads your report's frontmatter LIVE, so any
+later write to a `disposition: second-pass` report re-arms the gate — by design,
+because an amended report is a new artefact. Follow-up RECORDS ("PR opened",
+"round 2 closed") are not new claims, and they carry the release with them when
+appended under this exact heading, with every byte above it left untouched:
+
+```markdown
+## Follow-up records (no new claims)
+```
+
+The gate hashes the bytes above the heading and carries the release only when
+they are byte-identical to what a recorded verdict or `ng skeptic resolve
+--disposition` covered, and only when no other `#`/`##` section follows. An edit
+to the reviewed text, or a new section, re-arms it. A new CLAIM belongs in a new
+report and is meant to be reviewed.
 
 ## How to share a report on GitHub
 
@@ -220,6 +362,14 @@ url=$(./monitor/ng upload reports/<your-report>.md)
 on the asset repo's `main` branch and prints a SHA-pinned
 `blob/<sha>/...` URL that renders as a page on github.com.
 See the `nexus.bot` skill for the full upload-rule cheatsheet.
+
+**Material for a GitHub reader goes up as a nexus asset, never only as a
+claude.ai Artifact** (<your-org>/nexus-code#1856). The GitHub reader cannot open
+Artifact links. Upload plans, figures and schematics with `ng upload` and link
+the asset in the report and its `## Summary`; ship an `.md` or images beside
+any HTML, because raw HTML does not render on GitHub. `ng wrap-up` warns when
+its link comment names an Artifact with no asset beside it (the report's own
+asset link does not count, since it is not a copy of that deliverable).
 
 ## The skeptic decision at wrap-up
 
@@ -277,9 +427,10 @@ ng wrap-up <issue> <report> --repo ... \
 This logs a `skeptic-verdict` event, clears the reviewed worker's
 pending marker, and applies the bounded-recursion decision (a
 second-pass skeptic only on substantive new issues, capped at
-`monitor.skeptic.max_depth` default 2, escalating to the operator at
-the cap). The skeptic's report uses the standard five sections plus
-its verdict and the evidence backing it.
+`monitor.skeptic.max_depth`, **default 3** — so a chain runs at most
+`max_depth + 1` passes — escalating to the operator at the cap). The
+skeptic's report uses the standard five sections plus its verdict and
+the evidence backing it.
 
 ## See Also
 
@@ -296,7 +447,10 @@ its verdict and the evidence backing it.
   feeds into: mandate, spawn modes, comms channel, verdict ladder,
   bounded recursion.
 - `nexus.tmux-spawn` — when spawning a follow-up worker, briefing it
-  with prior-report context (`ls reports/{project}_*`) is part of
+  with prior-report context (`ls reports/{project}_*` — but see the note
+  below: that slug is cwd-derived and is NOT the window name) is part of
   the spawn pattern.
-- nexus root `CLAUDE.md` — the canonical "Agent Reports (CRITICAL)"
-  section the workspace relies on.
+- nexus root `CLAUDE.md` — the canonical "Reports — write one before
+  you finish, idle, or run out of context" section the workspace relies
+  on. (The old citation named an "Agent Reports (CRITICAL)" heading that
+  no longer exists — <your-org>/nexus-code#568 C8.)

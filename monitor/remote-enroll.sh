@@ -26,7 +26,9 @@
 #   issue-token --principal P [--ttl S]
 #                               mint a one-time token (printed to stdout,
 #                               OUT-OF-BAND ONLY); record it hashed+TTL'd
-#   enroll --pubkey F --token T [--principal P]
+#   enroll --pubkey F (--token-stdin | --token T) [--principal P]
+#                               prefer --token-stdin: --token T puts the secret
+#                               in world-readable argv (your-org/nexus-code#1846)
 #                               consume T → append the forced-command
 #                               authorized_keys line for its principal
 #   enroll-invite --principal P [--ttl S]
@@ -60,6 +62,17 @@
 #   token invalid/expired/replayed · 4 dependency missing (ssh-keygen).
 
 set -uo pipefail
+
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
 
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=_remote_lib.sh
@@ -170,7 +183,7 @@ _mint_token() {
 # ── issue-token ───────────────────────────────────────────────────────
 cmd_issue_token() {
     local principal="" ttl=""
-    while (( $# > 0 )); do
+    _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             --ttl)       ttl="${2:-}";       shift 2 || die "--ttl needs seconds" ;;
@@ -228,7 +241,7 @@ _safe_pubkey() {
 # ── enroll ────────────────────────────────────────────────────────────
 cmd_enroll() {
     local pubkey="" token="" principal="" token_stdin=0
-    while (( $# > 0 )); do
+    _argloop_prev_2=-1; while (( $# > 0 )); do (( $# != _argloop_prev_2 )) || _argloop_stuck "$1"; _argloop_prev_2=$#
         case "$1" in
             --pubkey)    pubkey="${2:-}";    shift 2 || die "--pubkey needs a file" ;;
             --token)     token="${2:-}";     shift 2 || die "--token needs a value" ;;
@@ -282,13 +295,14 @@ cmd_enroll() {
     local keypair; keypair=$(_safe_pubkey "$pubkey") || exit 2
 
     # Build the authorized_keys line PER COMMAND POLICY (RFC §4.2).
+    # POSTURE-AWARE from= pin (your-org/nexus-code#902): under a loopback bind
+    # the peer is the local end of the carrier tunnel, so the list must permit
+    # loopback or sshd refuses the key before our wrapper can exempt it.
     local from_cidr; from_cidr=$(_remote_from_cidr)
+    local from_list; from_list=$(_remote_from_pin_list) \
+        || die "enroll: from_cidr has illegal characters: $from_cidr"
     local from_opt=""
-    if [[ -n "$from_cidr" ]]; then
-        # crude CIDR/host sanity (no spaces, no quotes) — defence in depth.
-        [[ "$from_cidr" =~ ^[0-9A-Fa-f:.*/_,-]+$ ]] || die "enroll: from_cidr has illegal characters: $from_cidr"
-        from_opt="from=\"$from_cidr\""
-    fi
+    [[ -n "$from_list" ]] && from_opt="from=\"$from_list\""
     local policy; policy=$(_remote_command_policy)
     local ak="$d/authorized_keys" line
     if [[ "$policy" == unfiltered ]]; then
@@ -320,7 +334,11 @@ cmd_enroll() {
 
     local mode_desc="channel-only (forced-command, request-only)"
     [[ "$policy" == unfiltered ]] && mode_desc="unfiltered (sandbox-confined SHELL — arbitrary commands)"
-    warn "enrolled principal '$principal' — policy: $mode_desc${from_cidr:+, from=$from_cidr}. Token consumed."
+    # Report the pin AS WRITTEN, not the configured cidr it was derived from
+    # (your-org/nexus-code#902). Saying `from=<cidr>` while the line carries the
+    # posture-aware list is a small lie in exactly the place an operator reads to
+    # confirm what a credential permits.
+    warn "enrolled principal '$principal' — policy: $mode_desc${from_list:+, from=$from_list}. Token consumed."
     warn "  Authorized: $ak"
     warn "  The client connects with its PRIVATE key (which never left its host)."
 }
@@ -356,7 +374,7 @@ cmd_enroll() {
 #     are stripped.
 cmd_enroll_invite() {
     local principal="" ttl=""
-    while (( $# > 0 )); do
+    _argloop_prev_3=-1; while (( $# > 0 )); do (( $# != _argloop_prev_3 )) || _argloop_stuck "$1"; _argloop_prev_3=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             --ttl)       ttl="${2:-}";       shift 2 || die "--ttl needs seconds" ;;
@@ -375,13 +393,22 @@ cmd_enroll_invite() {
 
     local d; d=$(_ensure_principals_dir)
     # Optional from= pin (mirror cmd_enroll): the enroll line AND the resulting
-    # channel line are pinned to the same source range.
+    # channel line are pinned to the same source range. Both route through
+    # _remote_from_pin_list, so the posture-awareness (#902) cannot drift
+    # between them — an enroll line the client cannot reach is exactly as fatal
+    # as a channel line it cannot reach.
     local from_cidr; from_cidr=$(_remote_from_cidr)
+    # TRANSITIONAL pin for the ENROLL line only. During a pending posture change
+    # the client is still arriving over the OLD route, so a line pinned solely to
+    # the NEW posture's CIDR refuses it pre-auth and the invitation cannot be
+    # redeemed — the lockout the invite-first ordering exists to prevent,
+    # reproduced inside its own remedy. The union covers both; the PERMANENT line
+    # the enroll session reconstructs still uses _remote_from_pin_list, so it
+    # lands correct for the new posture. With no pending change the two are equal.
+    local from_list; from_list=$(_remote_from_pin_list_transitional) \
+        || die "enroll-invite: from_cidr has illegal characters: $from_cidr"
     local from_opt=""
-    if [[ -n "$from_cidr" ]]; then
-        [[ "$from_cidr" =~ ^[0-9A-Fa-f:.*/_,-]+$ ]] || die "enroll-invite: from_cidr has illegal characters: $from_cidr"
-        from_opt="from=\"$from_cidr\""
-    fi
+    [[ -n "$from_list" ]] && from_opt="from=\"$from_list\""
 
     # Mint the token first — its hash tags the enroll line + is baked into the
     # enroll session's forced command (binding the enroll key to this token).
@@ -534,7 +561,7 @@ cmd_gc_tokens() {
 #                       own) the belt is REQUIRED to deny a shell.
 cmd_carrier_authline() {
     local pubkey="" port="" comment="nexus-remote-carrier" explicit=0 shell_belt=1
-    while (( $# > 0 )); do
+    _argloop_prev_4=-1; while (( $# > 0 )); do (( $# != _argloop_prev_4 )) || _argloop_stuck "$1"; _argloop_prev_4=$#
         case "$1" in
             --pubkey)        pubkey="${2:-}";  shift 2 || die "--pubkey needs <file|->" ;;
             --port)          port="${2:-}";    shift 2 || die "--port needs a value" ;;
@@ -609,7 +636,7 @@ cmd_carrier_authline() {
 # ── revoke ────────────────────────────────────────────────────────────
 cmd_revoke() {
     local principal=""
-    while (( $# > 0 )); do
+    _argloop_prev_5=-1; while (( $# > 0 )); do (( $# != _argloop_prev_5 )) || _argloop_stuck "$1"; _argloop_prev_5=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             *) die "revoke: unknown flag: $1" ;;

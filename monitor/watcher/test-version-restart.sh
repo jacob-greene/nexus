@@ -75,9 +75,28 @@ source "$_script_dir/_mod_b.sh"
 source "$_script_dir/../_shared.sh"
 echo watcher-fixture v1
 EOF
-printf '#!/usr/bin/env bash\n# mod a v1\n' > "$WD/_mod_a.sh"
-printf '#!/usr/bin/env bash\n# mod b v1\n' > "$WD/_mod_b.sh"
+# DEPTH-2 modules (your-org/nexus-code#1746): _mod_a.sh sources one the way
+# _lib.sh sources _fs_probe.sh, _mod_b.sh one through a variable the way
+# _config.sh sources _integration_branch.sh. Plus the two shapes that must NOT
+# join the set: a COMMENTED source line, and a reference to a file that does
+# not exist (kept, it would make the set permanently TORN).
+cat > "$WD/_mod_a.sh" <<'EOF'
+#!/usr/bin/env bash
+# mod a v1
+source "${BASH_SOURCE[0]%/*}/../_deep.sh"
+# source "${BASH_SOURCE[0]%/*}/../_ghost.sh"
+[[ -r "${BASH_SOURCE[0]%/*}/../_missing.sh" ]] && source "${BASH_SOURCE[0]%/*}/../_missing.sh"
+EOF
+cat > "$WD/_mod_b.sh" <<'EOF'
+#!/usr/bin/env bash
+# mod b v1
+_lv="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_viavar.sh"
+source "$_lv"
+EOF
 printf '#!/usr/bin/env bash\n# shared v1\n' > "$MON/_shared.sh"
+printf '#!/usr/bin/env bash\n# deep v1\n'   > "$MON/_deep.sh"
+printf '#!/usr/bin/env bash\n# viavar v1\n' > "$MON/_viavar.sh"
+printf '#!/usr/bin/env bash\n# ghost v1\n'  > "$MON/_ghost.sh"
 
 # Cockpit source set members the module hashes: svc.sh +
 # bootstrap-recover.sh + watcher/_lib.sh + watcher/_version_restart.sh.
@@ -88,6 +107,7 @@ cat > "$MON/svc.sh" <<EOF
 #!/usr/bin/env bash
 # cockpit fixture v1
 printf '%s\n' "\$*" >> "$SVC_CAPTURE"
+printf 'actor=%s\n' "\${SVC_RESTART_ACTOR:-unset}" >> "$SVC_CAPTURE.actor"
 exit 0
 EOF
 chmod +x "$MON/svc.sh"
@@ -199,8 +219,34 @@ set_out=$(_version_watcher_source_set "$WD/main.sh")
 assert_contains "set includes main.sh"   "$set_out" "$WD/main.sh"
 assert_contains "set includes _mod_a.sh" "$set_out" "$WD/_mod_a.sh"
 assert_contains "set includes _mod_b.sh" "$set_out" "$WD/_mod_b.sh"
-assert_contains "set includes ../-relative module" "$set_out" "$WD/../_shared.sh"
-assert_eq "set has exactly 4 entries" "$(printf '%s\n' "$set_out" | wc -l | tr -d ' ')" "4"
+assert_contains "set includes ../-relative module" "$set_out" "$MON/_shared.sh"
+assert_contains "#1746: set includes a DEPTH-2 module (sourced by a module)" "$set_out" "$MON/_deep.sh"
+assert_contains "#1746: set includes a depth-2 module sourced through a variable" "$set_out" "$MON/_viavar.sh"
+assert_not_contains "#1746: a COMMENTED source line does not join the set" "$set_out" "_ghost.sh"
+assert_not_contains "#1746: a reference to a MISSING file is dropped (never a permanent TORN)" "$set_out" "_missing.sh"
+assert_eq "set has exactly 6 entries" "$(printf '%s\n' "$set_out" | wc -l | tr -d ' ')" "6"
+h_before=$(_version_hash_files $(_version_watcher_source_set "$WD/main.sh"))
+printf '#!/usr/bin/env bash\n# deep v2\n' > "$MON/_deep.sh"
+h_after=$(_version_hash_files $(_version_watcher_source_set "$WD/main.sh"))
+assert_eq "#1746: the set still hashes (not TORN)" "$([[ -n "$h_after" ]] && echo yes)" "yes"
+[[ "$h_before" != "$h_after" ]] \
+    && { printf '  PASS: #1746: a pull changing ONLY a depth-2 module changes the watcher hash\n'; PASS=$((PASS+1)); } \
+    || { printf '  FAIL: #1746: depth-2 module edited, watcher hash unchanged — the watcher would run stale code\n' >&2; FAIL=$((FAIL+1)); }
+printf '#!/usr/bin/env bash\n# deep v1\n' > "$MON/_deep.sh"
+
+echo '=== watcher source set over the REAL tree (#1746) ==='
+# A fixture cannot test SELECTION over the real loaders, so ask the real
+# main.sh. These three are reached ONLY through libraries; each was outside
+# the depth-1 set.
+real_set=$(_version_watcher_source_set "$_real_dir/main.sh")
+_real_mon=$(cd "$_real_dir/.." && pwd)
+for m in _fs_probe.sh _cc_transcript_roots.sh _pane-live.sh; do
+    assert_contains "#1746: real set includes monitor/$m (sourced by a library)" "$real_set" "$_real_mon/$m"
+done
+_rs_missing=0
+while IFS= read -r f; do [[ -f "$f" ]] || _rs_missing=$((_rs_missing + 1)); done <<<"$real_set"
+assert_eq "#1746: every real set member exists (no TORN)" "$_rs_missing" "0"
+assert_eq "#1746: the real set hashes" "$([[ -n "$(_version_hash_files $real_set)" ]] && echo yes)" "yes"
 
 echo '=== service script resolver ==='
 got=$(_version_service_script "$ROOT/work/svc" "./serve.sh --port 1")
@@ -319,9 +365,28 @@ assert_contains "section carries the restart command" "$sec1" "monitor/svc.sh"
 assert_contains "section carries the ack path" "$sec1" "rm $EM/drift-cockpit"
 assert_eq "second emit silent (re-nag guarded)" "$rc2" "1"
 assert_empty "second emit body empty" "$sec2"
-# No window_id recorded (pre-feature record / resolver failed): the
-# recipe falls back to the name — never breaks on old drift files.
-assert_contains "id-less record: kill targets the window name" "$sec1" "tmux kill-window -t services"
+# No window_id recorded (pre-feature record / resolver failed).
+#
+# THIS ASSERTION USED TO PIN THE DEFECT (your-org/nexus-code#701 item B). The
+# fallback it guarded — `${window_id:-${window:-services}}` — rendered a
+# NAME-targeted `tmux kill-window`, which is the 2026-06-11 incident this
+# whole feature exists to prevent: the orchestrator, one window index from the
+# cockpit, executed a name-targeted kill that destroyed its own window. The
+# fallback fired exactly when the id could not be resolved, i.e. in the
+# degraded conditions where a mis-aim is likeliest.
+#
+# The old record must still produce a WORKING recipe — that part of the intent
+# was right — so the recipe now resolves the id at paste time and the `&&`
+# chain stops if it comes back empty. Both halves are asserted: no bare
+# name-targeted kill, and a recipe that still restarts the cockpit.
+assert_not_contains "id-less record: renders NO name-targeted kill-window" \
+    "$sec1" "tmux kill-window -t services"
+assert_contains "id-less record: resolves the id at paste time instead" \
+    "$sec1" 'wid=$(tmux list-windows'
+assert_contains "id-less record: still restarts the cockpit" \
+    "$sec1" "tmux new-window -dn services"
+assert_contains "id-less record: the relaunched cockpit shows secrets (#1821)" \
+    "$sec1" "monitor/svc.sh --show-secrets"
 # ID-targeted recipe (2026-06-11 incident: a name/index-aimed kill from
 # the orchestrator destroyed the orchestrator's own window): with a
 # window_id recorded, the surfaced kill targets the immutable @id.
@@ -330,6 +395,7 @@ _version_write_drift_record "$EM_ID" cockpit OLDHASH NEWHASH "cockpit running ol
 sec_id=$(_version_emit_section "$EM_ID" "$ROOT")
 assert_contains "id record: kill targets the window ID" "$sec_id" "tmux kill-window -t @42"
 assert_contains "id record: new-window still uses the name" "$sec_id" "new-window -dn services"
+assert_contains "id record: the relaunched cockpit shows secrets (#1821)" "$sec_id" "monitor/svc.sh --show-secrets"
 assert_contains "id record: recipe explains the ID targeting" "$sec_id" "window ID of 'services'"
 _version_write_drift_record "$EM" cockpit OLDHASH NEWERHASH "cockpit running old code" services
 sec3=$(_version_emit_section "$EM" "$ROOT")
@@ -376,6 +442,10 @@ assert_eq "service pending after first observation" \
 run_tick   # stable -> drift -> restart
 assert_eq "service restart fired exactly once" "$(count_lines "$SVC_CAPTURE")" "1"
 assert_contains "restart used the svc.sh verb" "$(cat "$SVC_CAPTURE")" "restart svcA"
+# your-org/nexus-code#1456: the restart marker svc.sh stamps must name THIS
+# module, or the health monitor attributes the recovery to an operator.
+assert_eq "restart names its actor as version-restart (SVC_RESTART_ACTOR)" \
+    "$(cat "$SVC_CAPTURE.actor")" "actor=version-restart"
 assert_eq "watcher channel untouched by service drift" "$(count_lines "$LAUNCH_CAPTURE")" "0"
 assert_no_file "no cockpit ask from service drift" "$VDIR/drift-cockpit"
 run_tick
@@ -480,5 +550,52 @@ assert_eq "dead supervisor: baseline adopted silently" \
     "$(_version_field "$VDIR/service-svcA.running" hash)" \
     "$(_version_hash_files "$ROOT/work/svc/./serve.sh")"
 assert_no_file "dead supervisor: no ask record" "$VDIR/drift-service-svcA"
+
+echo '=== clone-drift advisory names the services a pull will restart (your-org/nexus-code#1456) ==='
+# EXACT arm: the nexus root is a repository whose last-fetched origin/dev
+# rewrites svcA's launch script — the diff the clone WILL RECEIVE. The
+# advisory's pull and the incoming set it names are the SAME ref the drift
+# record measured (your-org/nexus-code#1529, w241sk F3).
+git -C "$ROOT" init -q 2>/dev/null
+git -C "$ROOT" -c user.email=t@t -c user.name=t add -A >/dev/null 2>&1
+git -C "$ROOT" -c user.email=t@t -c user.name=t commit -q -m base >/dev/null 2>&1
+printf '#!/usr/bin/env bash\n# serve v3 (incoming)\nsleep 300\n' > "$ROOT/work/svc/serve.sh"
+git -C "$ROOT" -c user.email=t@t -c user.name=t commit -q -am incoming >/dev/null 2>&1
+_incoming=$(git -C "$ROOT" rev-parse HEAD)
+git -C "$ROOT" reset -q --hard HEAD~1
+git -C "$ROOT" update-ref refs/remotes/origin/dev "$_incoming"
+EM3="$WORK/em-clone"; mkdir -p "$EM3"
+_version_write_drift_record "$EM3" clone "" "$_incoming" "behind|1|2|dev|1 commits behind (threshold 5)"
+sec_cd=$(NEXUS_SERVICES_REGISTRY="$REGISTRY" _version_emit_section "$EM3" "$ROOT")
+assert_contains "advisory: the pull recipe names the measured ref (#1529 w241sk F3)" "$sec_cd" "pull --ff-only origin dev"
+assert_contains "advisory: …and calls it the operator's configuration" "$sec_cd" "monitor.integration_branch"
+assert_not_contains "advisory: never prescribes a checkout on the clone" "$sec_cd" "git checkout"
+# w241sk D4: the fixture root is `git init` (master) and the record measured
+# dev, so the mismatch NOTE fires; a record measuring master does not.
+assert_contains "advisory: checked-out branch (master) ≠ measured (dev) → mismatch NOTE" "$sec_cd" "checked out on master, not dev"
+EM3b="$WORK/em-clone-same"; mkdir -p "$EM3b"
+_version_write_drift_record "$EM3b" clone "" "$_incoming" "behind|1|2|master|1 commits behind (threshold 5)"
+sec_same=$(NEXUS_SERVICES_REGISTRY="$REGISTRY" _version_emit_section "$EM3b" "$ROOT")
+assert_contains "control: the same-branch record still prints the pull recipe" "$sec_same" "pull --ff-only origin master"
+assert_not_contains "control: …and no mismatch NOTE" "$sec_same" "align monitor.integration_branch"
+assert_contains "advisory: names the service the incoming diff restarts" "$sec_cd" "WILL RESTART: svcA (work/svc/serve.sh)"
+assert_contains "advisory: says which origin ref it was measured against" "$sec_cd" "as LAST FETCHED"
+# CONTROL: an incoming diff that does not touch the launch script names none.
+git -C "$ROOT" update-ref refs/remotes/origin/dev "$(git -C "$ROOT" rev-parse HEAD)"
+EM4="$WORK/em-clone2"; mkdir -p "$EM4"
+_version_write_drift_record "$EM4" clone "" "OTHERSHA" "behind|1|2|dev|1 commits behind (threshold 5)"
+sec_cd2=$(NEXUS_SERVICES_REGISTRY="$REGISTRY" _version_emit_section "$EM4" "$ROOT")
+assert_not_contains "control: no launch script in the diff -> no WILL RESTART line" "$sec_cd2" "WILL RESTART"
+assert_contains "control: …and the tracked population is still named" "$sec_cd2" "none — no registered launch script is in that diff; the tracked ones are: svcA (work/svc/serve.sh)"
+# GENERIC arm: a root with no repository at all — the population that CAN
+# restart is listed, and the line says the diff was not readable.
+ROOT2="$WORK/nexus-norepo"; mkdir -p "$ROOT2/monitor" "$ROOT2/work/svc"
+printf '#!/usr/bin/env bash\nsleep 300\n' > "$ROOT2/work/svc/serve.sh"
+printf 'svcZ\t%s\t./serve.sh\ttrue\t%s\n' "$ROOT2/work/svc" "$ROOT2/work/svc/serve.log" > "$ROOT2/monitor/services.registry"
+EM5="$WORK/em-clone3"; mkdir -p "$EM5"
+_version_write_drift_record "$EM5" clone "" "ZSHA" "behind|2|3|dev|2 commits behind (threshold 5)"
+sec_cd3=$(NEXUS_SERVICES_REGISTRY="$ROOT2/monitor/services.registry" _version_emit_section "$EM5" "$ROOT2")
+assert_contains "generic arm: the diff is declared unreadable" "$sec_cd3" "not readable locally"
+assert_contains "generic arm: the version-tracked population is named" "$sec_cd3" "svcZ (work/svc/serve.sh)"
 
 th_summary_and_exit

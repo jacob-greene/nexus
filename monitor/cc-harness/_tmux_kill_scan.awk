@@ -1,0 +1,541 @@
+# monitor/cc-harness/_tmux_kill_scan.awk — scanner for lint-no-tmux-server-kill.sh
+#
+# Emits "line:rule:text" for each violation. Split out of the lint so the
+# data-vs-code analysis is testable on its own and readable as one thing.
+#
+# WHY A PARSER AND NOT A REGEX. The first version of this lint decided
+# "is this an invocation?" by requiring whitespace on both sides of the verb.
+# That silently misreads `assert_contains "…" "tmux kill-window -t @42"` as a
+# CALL — the verb is whitespace-delimited inside a quoted string. Under the
+# original kill-server-only ruleset that mistake was invisible; the moment the
+# verb family widened to kill-window it would have produced a wave of false
+# positives on assertion strings, and the fix for those is always a pragma,
+# which is precisely how a counted escape hatch erodes into noise.
+#
+# So: split each line into COMMAND FRAGMENTS, and treat a verb as an
+# invocation only when its fragment's command word is a tmux reference.
+
+function strip_comment(s,   i, c, sq, dq, out) {
+    # Remove a trailing comment. A '#' only opens a comment when it is
+    # unquoted AND at a word boundary. tmux format strings (`#{window_index}`,
+    # `#S`) must survive, hence the word-boundary requirement rather than a
+    # naive index($0,"#").
+    sq = 0; dq = 0; out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "'" && !dq) sq = !sq
+        else if (c == "\"" && !sq) dq = !dq
+        else if (c == "#" && !sq && !dq) {
+            # word boundary = start of line or preceded by whitespace
+            if (i == 1 || substr(s, i-1, 1) ~ /[[:space:]]/) return out
+        }
+        out = out c
+    }
+    return out
+}
+
+function is_tmux_word(w) {
+    # A token glued by glue_quoted_space() is a quoted string containing
+    # whitespace — a string literal, never a command word. Rejecting it here
+    # matters because this test is a SUBSTRING match: glue `"tmux kill-server"`
+    # into one token and it trivially "contains tmux", which promoted a hook
+    # fixture into a rule2 report. Nothing is lost — before gluing, the same
+    # literal split into `"command":"tmux` / `kill-server"` and was rejected
+    # too. The one form this cannot see is a tmux binary whose PATH contains a
+    # space (`"/opt/my tools/tmux" kill-server`); that was already invisible,
+    # for the same reason, so this is not a new blind spot.
+    if (w ~ /\003/) return 0
+    # Strip shell decoration: quotes, $, {}, (), backticks, path prefix.
+    gsub(/["'\''`${}()]/, "", w)
+    sub(/^.*\//, "", w)
+    return (tolower(w) ~ /tmux/)
+}
+
+# --- a quoted string is ONE word, whatever whitespace it contains ------------
+#
+# WHY. Word-splitting happens BEFORE quote-stripping everywhere downstream, so
+# `"tmux kill-server"` arrives as the two tokens `"tmux` and `kill-server"`, and
+# `sub_verb`'s decoration-stripper then turns the second into a bare
+# `kill-server`. The quote it removed was the DELIMITER of the string literal —
+# the very character proving the verb is data. Thirteen lines of
+# `monitor/watcher/test-bash-footgun-guard.sh` (hook fixtures of the form
+# `run '{"tool_input":{"command":"tmux kill-server"}}'`) were reported as
+# unscoped call sites this way, and because `gate.sh` runs this lint as a
+# pre-flight the whole gate refused before a single scenario ran.
+#
+# Deleting the decoration-stripper is NOT the fix: it is what lets
+# `"$REAL_TMUX" kill-server` — the real culprit of your-org/nexus-code#644 — be
+# recognised as a tmux invocation at all. The defect is that splitting on
+# whitespace erases the distinction between a delimiter and decoration.
+#
+# So glue instead: inside a quoted region, whitespace is not a word boundary.
+# `"tmux kill-server"` becomes a SINGLE token, and `is_tmux_word` rejects any
+# glued token outright (see there) — so the fragment is never read as a tmux
+# invocation and there is no following word for `sub_verb` to promote.
+# `"$REAL_TMUX"` holds no whitespace and is untouched, so the incident fixture
+# still fires on both rule1 and rule2, byte-for-byte as before.
+#
+# Ordering is load-bearing: this runs AFTER the trap/eval unwrap, so a
+# `trap 'tmux kill-server …'` body — whose opening quote the unwrap has already
+# consumed, precisely because it IS deferred code — is not glued and stays
+# visible. Same quote bookkeeping as strip_comment().
+function glue_quoted_space(s,   i, c, sq, dq, out) {
+    sq = 0; dq = 0; out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "'" && !dq) sq = !sq
+        else if (c == "\"" && !sq) dq = !dq
+        else if ((sq || dq) && c ~ /[[:space:]]/) c = "\003"
+        out = out c
+    }
+    return out
+}
+
+# A `;` INSIDE QUOTES (your-org/nexus-code#1579). tmux ends a command at any
+# argument whose LAST character is `;` (unless `\;`) — judged AFTER the shell has
+# removed its quotes (#1578). So `tmux display-message 'hi;' kill-server` runs
+# kill-server, and the blanket `;` -> shell-separator substitution in fragments()
+# tore that line into `tmux display-message 'hi` and `' kill-server`, the second
+# fragment had no tmux command word, and the line scanned CLEAN. Measured on six
+# planted lines at f13cfb74: every QUOTED `;`-ended shape was missed.
+# Rule, per quoted `;`:
+#   * preceded by `\`            -> literal to tmux: an inert placeholder (\004);
+#   * the LAST character of its shell WORD (the closing quote follows it, and a
+#     word boundary follows that) -> a TMUX separator: emit the closing quote,
+#     then the separator mark \002 that fragments() already splits sub-commands on;
+#   * anywhere else              -> data: the inert placeholder.
+# An EMPTY quote pair glued after the closing quote (`'hi;'''`, `"hi;"""`,
+# `'hi;'""`) adds nothing to the shell word, so it is skipped before the
+# boundary test (semisplitsk2 F6: those shapes scanned CLEAN).
+function mark_quoted_semis(s,   i, c, n, sq, dq, out, q, after, j) {
+    sq = 0; dq = 0; out = ""; n = length(s)
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "'" && !dq) { sq = !sq; out = out c; continue }
+        if (c == "\"" && !sq) { dq = !dq; out = out c; continue }
+        if (c == ";" && (sq || dq)) {
+            if (i > 1 && substr(s, i-1, 1) == "\\") { out = out "\004"; continue }
+            q = sq ? "'" : "\""
+            j = i + 2
+            while (substr(s, j, 2) == "''" || substr(s, j, 2) == "\"\"") j += 2
+            after = substr(s, j, 1)
+            if (substr(s, i+1, 1) == q && (after == "" || after ~ /[[:space:];&|)]/)) {
+                out = out q "\002"; i = j - 1
+                if (sq) sq = 0; else dq = 0
+                continue
+            }
+            out = out "\004"; continue
+        }
+        out = out c
+    }
+    return out
+}
+
+function unbalanced_quote(w,   i, c, sq, dq) {
+    # Does this token end inside a quote? Same quote bookkeeping as
+    # strip_comment above.
+    sq = 0; dq = 0
+    for (i = 1; i <= length(w); i++) {
+        c = substr(w, i, 1)
+        if (c == "'" && !dq) sq = !sq
+        else if (c == "\"" && !sq) dq = !dq
+    }
+    return (sq || dq)
+}
+
+# --- words that PRECEDE a command without being it (#1650 N3) ---------------
+#
+# A kill prefixed by a shell KEYWORD (`then`, `do`, `else`, `if`, `elif`,
+# `while`, `until`) or by a WRAPPER that execs its argument (`timeout N`,
+# `nohup`, `sudo`, `nice`, `setsid`) returned that word as the command word,
+# is_tmux_word said no, and the line scanned CLEAN under every rule — the same
+# class as the `(` / `!` opener closed in #1646. `if c; then tmux kill-server`
+# is the commonest shape: `;` splits it and `then tmux kill-server` is a
+# fragment of its own. Wrappers are consumed WITH their arguments, because a
+# wrapper's option VALUE (`timeout -s KILL 5`, `sudo -u root`) is not the
+# command word either.
+#
+# `stdbuf` and `ionice` joined the list in your-org/nexus-code#1652: both exec
+# their argv, and `stdbuf -oL tmux kill-server` / `ionice -c3 tmux kill-server`
+# scanned CLEAN (measured at 33a44f48).
+#
+# BOUNDARY: a wrapper not listed here (`xargs`, `flock F`, `watch`, `ssh`, …)
+# still hides the call. The list is the shapes a kill is plausibly written
+# behind in this repo, not every program that execs its argv.
+function is_keyword(w) {
+    return (w == "if" || w == "elif" || w == "while" || w == "until" \
+         || w == "then" || w == "do" || w == "else")
+}
+# Index of the first word AFTER a wrapper and its arguments, or 0 when parts[i]
+# is not a wrapper. `sudo`'s and `timeout`'s value-taking options are listed
+# explicitly; any other `-x` is a bare flag.
+function skip_wrapper(parts, n, i,   w, need_duration) {
+    w = parts[i]
+    if (w == "nohup" || w == "setsid") return i + 1
+    if (w == "nice") {
+        i++
+        while (i <= n && parts[i] ~ /^-/) { if (parts[i] == "-n") i++; i++ }
+        return i
+    }
+    if (w == "sudo") {
+        i++
+        while (i <= n && parts[i] ~ /^-/) {
+            if (parts[i] == "--") { i++; break }
+            if (parts[i] ~ /^-[ugCDhpRrtTU]$/) i++
+            i++
+        }
+        return i
+    }
+    # stdbuf: -i/-o/-e take a MODE, glued (`-oL`) or separate (`-o L`); the
+    # long forms are `--output=L`, one word.
+    if (w == "stdbuf") {
+        i++
+        while (i <= n && parts[i] ~ /^-/) {
+            if (parts[i] == "--") { i++; break }
+            if (parts[i] ~ /^-[ioe]$/) i++
+            i++
+        }
+        return i
+    }
+    # ionice: -c CLASS, -n LEVEL, -p/-P/-u ID take a value unless glued
+    # (`-c3`); -t is a bare flag. (`ionice -p PID` with no command runs
+    # nothing, so a following tmux word cannot occur there.)
+    if (w == "ionice") {
+        i++
+        while (i <= n && parts[i] ~ /^-/) {
+            if (parts[i] == "--") { i++; break }
+            if (parts[i] ~ /^-[cnpPu]$/) i++
+            i++
+        }
+        return i
+    }
+    if (w == "timeout") {
+        i++
+        while (i <= n && parts[i] ~ /^-/) {
+            if (parts[i] == "--") { i++; break }
+            if (parts[i] == "-s" || parts[i] == "-k") i++
+            i++
+        }
+        return i + 1          # the DURATION
+    }
+    return 0
+}
+
+# Index (into split(frag, …, /[[:space:]]+/) after leading whitespace is
+# stripped) of the word first_command_word returned. The socket-pin and target
+# tests read the invocation FROM THIS WORD ON (tmux_tail), so a wrapper's own
+# `-S` / `-t` (`sudo -S`, `sudo -t TYPE`) cannot vouch for the tmux call
+# (#1121 arm order: a permissive match on the wrong words decides first).
+function first_command_word(frag,   n, i, parts, w, j) {
+    # Drop leading VAR=value environment assignments, then return the command
+    # word. `TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" kill-server` -> `"$REAL_TMUX"`.
+    cw_idx = 0
+    sub(/^[[:space:]]+/, "", frag)
+    n = split(frag, parts, /[[:space:]]+/)
+    for (i = 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (is_keyword(w)) continue
+        # A CASE ARM (your-org/nexus-code#1652). `case W in PAT) tmux kill-server ;;`
+        # returned `case` as the command word, and a multi-line arm
+        # `PAT) tmux kill-server ;;` returned the PATTERN — is_tmux_word said no
+        # both times and the line scanned CLEAN under every rule. Live instance:
+        # test-claude-md-tmux-socket-selection.sh's _cleanup. `case WORD in` is
+        # consumed as a unit; a word ending in an unquoted `)` BEFORE the command
+        # word is a case pattern (`*)`, `"$D"/*)`, `(x)`; `a|b)` arrives as `b)`
+        # because `|` is split on). Before the command word no other shell
+        # construct yields such a word except a `$(…)` tail (`x=$(date) tmux …`
+        # splits on `$(` into `date) tmux …`), where skipping it is also right.
+        # Over-report, never under-report: the safe direction for this lint.
+        if (w == "case") { i += 2; continue }     # WORD and `in`; the loop's i++ lands on the pattern
+        if (w ~ /\)$/ && !unbalanced_quote(w)) continue
+        j = skip_wrapper(parts, n, i)
+        if (j) { i = j - 1; continue }
+        # env-assignment prefix (VAR=..., possibly quoted value)
+        if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+            # The VALUE may be quoted and contain whitespace, so the split
+            # above cut it in half: `IFS=" " tmux kill-server` arrives as
+            # `IFS="`, `"`, `tmux`, … The prefix arm swallowed `IFS="` and the
+            # loop then returned `"` as the command word, `is_tmux_word("")`
+            # said no, and an UNSCOPED kill-server was reported clean. That is
+            # the same assignment-prefix blind spot as your-org/nexus-code#775,
+            # but fail-OPEN rather than fail-closed: #775 cries wolf on a
+            # correct doc snippet, this one waves a real server-killer through.
+            # Rejoin tokens until the quote balances.
+            while (unbalanced_quote(w) && i < n) { i++; w = w parts[i] }
+            continue
+        }
+        # command modifiers that precede the real command word
+        if (w == "exec" || w == "command" || w == "builtin" || w == "time") continue
+        if (w == "env") continue
+        # A SUBSHELL OPENER or a NEGATION standing as its own word
+        # (your-org/nexus-code#1646). `( tmux kill-server )` returned `(` as the
+        # command word, is_tmux_word said no, and the line scanned CLEAN under
+        # EVERY rule, rule1 included; `! tmux kill-server` likewise. `(tmux`
+        # glued was always seen (is_tmux_word strips the paren).
+        if (w == "(" || w == "!") continue
+        if (w ~ /^-/) continue          # env's -u FLAG etc.
+        if (w == "TMUX" || w == "TMUX_TMPDIR") continue   # `env -u TMUX <cmd>`
+        cw_idx = i
+        return w
+    }
+    return ""
+}
+
+# The invocation from its tmux command word on. Call right after
+# first_command_word(frag), which sets cw_idx.
+function tmux_tail(frag,   n, i, parts, out) {
+    sub(/^[[:space:]]+/, "", frag)
+    n = split(frag, parts, /[[:space:]]+/)
+    out = ""
+    for (i = cw_idx; i <= n; i++) out = out (out == "" ? "" : " ") parts[i]
+    return out
+}
+
+# --- tmux's REAL command grammar (your-org/nexus-code#892, skeptic F2/F3) ----
+#
+# tmux accepts any UNAMBIGUOUS PREFIX of a command name, so `kill-ser` IS
+# `kill-server`. Matching full names let every abbreviation of every kill verb
+# scan CLEAN; measured, `tmux kill-ser` killed a real server while this lint
+# reported nothing. Nothing else in tmux's command set begins with `k`, so
+# prefix-matching against the four kill verbs cannot capture a legitimate
+# non-kill command. An abbreviation matching SEVERAL kill verbs (`kill-s`) is
+# ambiguous to tmux and would be rejected by tmux itself; resolving it to the
+# strictest reading costs nothing.
+function kill_canon(w,   n, arr, i, hit, cnt) {
+    if (w == "") return ""
+    # killp / killw are BUILT-IN SHORT FORMS, not command-aliases
+    # (`list-commands` prints `kill-pane (killp)`), and they are NOT prefixes of
+    # the long names — so a prefix rule over the long names alone misses them.
+    n = split("kill-server kill-session kill-window kill-pane killp killw", arr, " ")
+    hit = ""; cnt = 0
+    for (i = 1; i <= n; i++)
+        if (substr(arr[i], 1, length(w)) == w) { hit = arr[i]; cnt++ }
+    if (cnt > 1) return "kill-server"
+    if (hit == "killp") return "kill-pane"
+    if (hit == "killw") return "kill-window"
+    return hit
+}
+
+# The verb of ONE sub-command. `is_first` says whether this sub-command still
+# carries the leading `tmux` word (and any env prefix / global flags) ahead of
+# its verb; later sub-commands in a `\;` sequence do not.
+function sub_verb(sc, is_first,   n, parts, i, w, seen_cmd, want_val) {
+    n = split(sc, parts, /[[:space:]]+/)
+    seen_cmd = is_first ? 0 : 1
+    want_val = 0
+    for (i = 1; i <= n; i++) {
+        w = parts[i]
+        if (w == "") continue
+        if (!seen_cmd) {
+            if (w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue
+            if (w == "exec" || w == "command" || w == "builtin" || w == "time") continue
+            if (w == "env") continue
+            if (w ~ /^-/) continue
+            if (w == "TMUX" || w == "TMUX_TMPDIR") continue
+            if (is_tmux_word(w)) { seen_cmd = 1; continue }
+            continue
+        }
+        if (want_val) { want_val = 0; continue }     # value of -L/-S/-c/-f
+        if (w ~ /^-/) {
+            if (w ~ /^-[^-]*[cfLS]$/) want_val = 1
+            continue
+        }
+        gsub(/["'\''`${}()]/, "", w)
+        return w
+    }
+    return ""
+}
+
+# Split a line into command fragments on shell separators. Deliberately
+# includes the bodies of `trap '...'` / `eval '...'` / `$(...)`, because a
+# kill inside a trap body is a real deferred invocation — the very form that
+# armed the incident.
+function fragments(s, out,   tmp, n, i, j, m, sub2, k, cnt) {
+    # `\;` is a TMUX COMMAND SEPARATOR, not a shell one (your-org/nexus-code#892,
+    # skeptic F3). Splitting on it as if it were shell punctuation tore
+    # `tmux list-windows \; kill-server` into two fragments, and the second lost
+    # its `tmux` command word — so the kill was invisible and the line scanned
+    # CLEAN. Measured: that exact command killed a real server. Protect it here
+    # and let the verb scanner treat it as the sub-command separator it is.
+    s = mark_quoted_semis(s)          # #1579: a quoted `;` is tmux's, or data — never the shell's
+    gsub(/\\;/, "\002", s)
+    gsub(/\|\||&&|;|\||\$\(|`|\{|\}/, "\001", s)
+    # trap 'BODY' / eval 'BODY' — unwrap so BODY is analysed as code.
+    gsub(/(^|\001)[[:space:]]*(trap|eval)[[:space:]]+['\''"]/, "\001", s)
+    # A quoted string is one word — AFTER the unwrap above, so deferred bodies
+    # stay code while string literals stop yielding a bare verb. See
+    # glue_quoted_space().
+    s = glue_quoted_space(s)
+    n = split(s, tmp, /\001/)
+    cnt = 0
+    for (i = 1; i <= n; i++) if (tmp[i] ~ /[^[:space:]]/) out[++cnt] = tmp[i]
+    return cnt
+}
+
+function has_socket_pin(frag) {
+    return (frag ~ /(^|[^[:alnum:]_-])-(L|S)([[:space:]]|=)/)
+}
+function pins_default_socket(frag) {
+    # -L default / -S <path>/default is syntactically a pin and semantically
+    # the operator's own server. Fatal, and it satisfies has_socket_pin().
+    return (frag ~ /(^|[^[:alnum:]_-])-L[[:space:]]+["'\'']?default["'\'']?([[:space:]]|$)/ \
+         || frag ~ /(^|[^[:alnum:]_-])-S[[:space:]]+[^[:space:]]*\/default([[:space:]]|$)/)
+}
+function has_targeted(frag) {
+    return (frag ~ /(^|[^[:alnum:]_-])-t([[:space:]]|=)/)
+}
+function neutralises_tmux(frag) {
+    # LOCAL neutralisation only — on THIS command. A file-scoped search was the
+    # original design and it was wrong twice over: it fired on zero lines of the
+    # file that caused the incident (which carries `unset TMUX` inside a heredoc
+    # at line 277), and a single `unset TMUX` in a COMMENT silenced the rule for
+    # a whole file. Both are self-service hatches; neither is counted.
+    return (frag ~ /env[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-u[[:space:]]+TMUX([[:space:]]|$)/)
+}
+
+# --- TMUX_TMPDIR set by an EARLIER command on the same line (#1646) -----------
+#
+# rule2 used to look for `TMUX_TMPDIR=` only INSIDE the tmux fragment, i.e. the
+# prefix form `TMUX_TMPDIR=x tmux …`. Two shapes put the assignment in a
+# PRECEDING fragment instead, and both scanned CLEAN while being exactly as
+# unisolated ($TMUX still outranks the tmpdir):
+#     ( export TMUX_TMPDIR=…; tmux … )
+#     export TMUX_TMPDIR=…; tmux …        (and `&&`, and a plain `TMUX_TMPDIR=…;`)
+# A carrier is a fragment that EXPORTS or ASSIGNS TMUX_TMPDIR and runs no
+# command of its own. Once one is seen, every LATER tmux fragment on the line is
+# judged as if it carried the prefix. FAIL-CLOSED on scope: a carrier inside a
+# subshell that has already CLOSED (`( export TMUX_TMPDIR=x ); tmux …`) still
+# counts — that over-reports, which is the safe direction for this lint, and
+# the remedy (-L/-S or `env -u TMUX` on the call) is the same one-flag fix.
+# Neutralisation is still accepted ONLY on the tmux command itself; an
+# `unset TMUX` in an earlier fragment is NOT honoured, for the reason given at
+# neutralises_tmux().
+#
+# BOUNDARY: this is still per LINE. An `export TMUX_TMPDIR=…` on one line and a
+# tmux call on a LATER line is not connected — that is the file-scoped design
+# this lint abandoned, and the remedy for it is the same rule the header states.
+function tmpdir_carrier(frag,   t) {
+    t = frag
+    sub(/^[[:space:]]*(\([[:space:]]*)*/, "", t)
+    # `if c; then export TMUX_TMPDIR=…; tmux …` (#1650 N3): the keyword is not
+    # the command either.
+    while (match(t, /^(if|elif|while|until|then|do|else|!)[[:space:]]+(\([[:space:]]*)*/))
+        t = substr(t, RLENGTH + 1)
+    if (t ~ /^(export|declare|typeset|local|readonly)([[:space:]]|$)/)
+        return (t ~ /[[:space:]]TMUX_TMPDIR([=[:space:]]|$)/)
+    # A bare assignment (no command word follows it) sets the shell variable,
+    # and TMUX_TMPDIR is normally already EXPORTED in an agent's environment.
+    return (t ~ /(^|[[:space:]])TMUX_TMPDIR=/ && first_command_word(frag) == "")
+}
+
+# The ONE command word the `# tmux-shim-writer:` pragma may exempt from rule2
+# (#1646). nx_write_tmux_shim (monitor/watcher/_tmux-fixture.sh) is not a tmux
+# invocation: it READS TMUX_TMPDIR at WRITE time and bakes it into a shim of the
+# form `exec env -u TMUX TMUX_TMPDIR=<dir> <real tmux> -L <sock>`, and refuses a
+# wrapper binary. It reaches rule2 only because is_tmux_word is a SUBSTRING
+# test and its name contains "tmux". Exact match after decoration is stripped,
+# so the pragma cannot be moved onto a real `tmux` / `"$REAL_TMUX"` call.
+function is_shim_writer(w) {
+    gsub(/["'\''`${}()]/, "", w)
+    return (w == "nx_write_tmux_shim")
+}
+
+# `-v with_file=1` prefixes every finding with FILENAME, so the lint can scan
+# its whole population in ONE awk process instead of one awk + one sed per file
+# (your-org/nexus-code bundle-0923: ~700 forks, 22 s per lint call under load,
+# twice per gate run). Every rule below is decided from the current line alone,
+# so nothing carries across a file boundary; FNR is per-file either way.
+{
+    raw = $0
+    # PREFILTER. Every finding below needs a fragment whose first command word
+    # passes is_tmux_word(), i.e. contains "tmux" (any case) once is_tmux_word's
+    # own quote/brace set is deleted. Deleting that set from the WHOLE line can
+    # only join more letters, never fewer, so a line failing this test cannot
+    # produce a finding: skipping it changes no output, and it skips the
+    # per-character passes below on ~99% of lines (19 s -> <1 s over all 967
+    # tracked files, bundle-0923). Keep the class IDENTICAL to is_tmux_word's.
+    probe = raw
+    gsub(/["'\''`${}()]/, "", probe)
+    if (tolower(probe) !~ /tmux/) next
+    pfx = with_file ? FILENAME ":" : ""
+    line = strip_comment(raw)
+    pragma = (raw ~ /#[[:space:]]*tmux-scoped:/)
+    shimw  = (raw ~ /#[[:space:]]*tmux-shim-writer:/)
+
+    nf = fragments(line, frag)
+    carried = 0
+    ex_shimw = 0; ex_scoped = 0
+    for (fi = 1; fi <= nf; fi++) {
+        f = frag[fi]
+        if (tmpdir_carrier(f)) { carried = 1; continue }
+        cw = first_command_word(f)
+        if (cw == "" || !is_tmux_word(cw)) continue     # not a tmux invocation
+        # The pin / target / verb tests read the invocation from its tmux word
+        # on, never a wrapper's options (#1650 N3; see tmux_tail).
+        ft = tmux_tail(f)
+
+        # Split this invocation into its `\;`-separated sub-commands and take
+        # the verb of each: a kill in ANY position counts, not just the first.
+        nsc = split(ft, sc, /\002/)
+
+        # --- rule4: a pin that names the DEFAULT socket is not isolation ----
+        if (pins_default_socket(ft)) {
+            printf "%s%d:rule4-pins-default-socket:%s\n", pfx, FNR, raw
+            continue
+        }
+
+        # --- rule2: TMUX_TMPDIR is never sufficient on its own --------------
+        # Fires on ANY tmux invocation, not only destructive ones: an
+        # unisolated `new-session` pollutes the operator's server and an
+        # unisolated `kill-window` can end it. The defect is the SCOPING
+        # IDIOM, not the verb, so keying on the idiom closes the class.
+        # `carried`: the tmpdir was set by an EARLIER fragment (#1646). The
+        # `# tmux-shim-writer:` pragma exempts ONLY nx_write_tmux_shim — never a
+        # tmux call — and it is counted and pinned by the lint's --selftest.
+        if ((f ~ /TMUX_TMPDIR=/ || carried) && !has_socket_pin(ft) && !neutralises_tmux(f)) {
+            if (shimw && is_shim_writer(cw)) ex_shimw++
+            else printf "%s%d:rule2-tmux-tmpdir-insufficient:%s\n", pfx, FNR, raw
+        }
+
+        # --- rules 1 and 3, PER SUB-COMMAND --------------------------------
+        # Each `\;`-separated sub-command carries its own verb and its own
+        # `-t`; the socket pin is global to the invocation and so is still
+        # tested against the whole fragment.
+        for (si = 1; si <= nsc; si++) {
+            verb = kill_canon(sub_verb(sc[si], si == 1))
+            if (verb == "") continue
+
+            # --- rule1: kill-server must be socket-pinned at the call site -
+            if (verb == "kill-server" && !has_socket_pin(ft)) {
+                if (pragma) ex_scoped++
+                else printf "%s%d:rule1-killserver-unscoped:%s\n", pfx, FNR, raw
+            }
+
+            # --- rule3: a kill that can end the server must name a target --
+            # Untargeted kill-session/window/pane acts on the CURRENT one;
+            # when that is the last of its kind the server exits. Proven for
+            # kill-window: killing the last window of the last session leaves
+            # "no server running".
+            if (verb != "kill-server" && !has_targeted(sc[si])) {
+                if (pragma) ex_scoped++
+                else printf "%s%d:rule3-untargeted-kill:%s\n", pfx, FNR, raw
+            }
+        }
+    }
+    # THE PRAGMA COUNTERS READ THESE, AND NOTHING ELSE (your-org/nexus-code#1650
+    # N2). The lint used to count pragmas with its OWN regex over the raw text,
+    # a second matcher beside this one: `"nx_write_tmux_shim"` and
+    # `exec nx_write_tmux_shim` were EXEMPTED here and counted 0 there, so an
+    # exemption could be added without moving the pin. Now an exemption is
+    # counted exactly when THIS code grants one. ONE MARKER PER EXEMPTION
+    # GRANTED, not per line (your-org/nexus-code#1652 item 2): a line whose
+    # pragma exempts two kills (`"$P" kill-server; "$P" kill-server`, or a
+    # `\;` sequence carrying rule1 AND rule3) used to emit one marker, so a
+    # second exemption could be added to an already-exempt line without
+    # moving the pin. Every consumer counts marker LINES (grep -c, and
+    # --pragma-files' per-file tally), so repeating the marker is the whole
+    # change. Off unless `-v emit_exempt=1`, so the verdict scan never sees them.
+    for (xi = 1; emit_exempt && xi <= ex_shimw; xi++)  printf "%s%d:exempt-shim-writer:%s\n", pfx, FNR, raw
+    for (xi = 1; emit_exempt && xi <= ex_scoped; xi++) printf "%s%d:exempt-tmux-scoped:%s\n", pfx, FNR, raw
+}

@@ -66,6 +66,303 @@ role.)
 | `auto` | No specification at spawn — **the worker decides** at wrap-up. | Presents the responsible-default heuristic and requires the worker to record a decision (`--skeptic-decision require\|deny --skeptic-rationale "<why>"`). Enforced by default (`enforce_auto_decision: true`): wrap-up *fails* until a decision + rationale is recorded. |
 | `deny` | No skeptic (trivial / low-impact / disabled at spawn). | Proceeds; records "skeptic explicitly denied at spawn." A worker may still *escalate* deny→require if it discovers the work was riskier than the spawn assumed (recorded). |
 
+### A SUPERSEDING verdict must reach `## Summary`
+
+A second-pass verdict is the shape this protocol structurally produces: a
+skeptic re-pinned on a delta renders a verdict that supersedes its first. The
+append-only report convention says to write it as a new section at the bottom
+— and `ng wrap-up` composes the link comment from `## Summary` **alone**, so a
+verdict written where the convention says to write it leaves the thread showing
+the superseded one. The surface an orchestrator scans when deciding whether to
+merge then under-credits the target (`<your-org>/nexus-code#862`, observed live
+on `#847`).
+
+`wrap-up` no longer hides this: it publishes nothing, exits **3**, and says so.
+Exit 3 is not a failed step and a retry cannot clear it — edit `## Summary` in
+place so the correction is IN the composed body, or pass
+`--comment-body-file`. Related: a teaser that composes to a fragment is refused
+outright rather than posted (`#1114`). Both are the same contract, and it is
+written up in `skills/nexus.report/SKILL.md` under "`## Summary` IS the
+comment".
+
+### When the gate stays shut on a verdict that DID come back
+
+The marker is removed by exactly **three** writers, and the third is the
+repair rather than the ordinary path: a skeptic's `--skeptic-role` wrap-up
+(`monitor/ng:5345`) and `skeptic-channel close`
+(`skeptic-channel.sh:1375`) are the two that discharge it in the normal
+course; **`skeptic-channel resolve` (`skeptic-channel.sh:1618`) is the
+audited release** — see "the release is `ng skeptic resolve`" below. If a
+verdict exists but neither of the first two ran against the *primary* state
+dir, the gate stays shut on its own — `retire-preflight` reports
+`safe=0 … required skeptic marker is LIVE` for a window whose verdict you
+can read — until someone runs `resolve`. **Do not `rm` the marker**: a guard
+whose only visible bypass is hand-deleting it is a guard that trains its own
+bypass, which is why `resolve` exists and writes a rationale beside the
+record.
+
+**Several rounds can be open on ONE target at once** (<your-org>/<your-nexus>#414).
+A round is an open `armed` row on the ledger, one per deliverable (issue, report
+path) and keyed by its sha; the pending marker is their AGGREGATE. So parallel
+batch skeptics on one window are supported, with three rules: each reviewer
+files its verdict with `--skeptic-subject <the report it reviewed>`, which
+closes only that round and leaves the marker while any other round is open
+(the banner says `open rounds : N other round(s) still open`); its
+report-predates-round check is measured against ITS round's arm, not a
+sibling's newer one; and `skeptic close` leaves the channel OPEN (no `DONE`, no
+release, **exit 16**) only on positive evidence that another round is live: an
+open arm armed after the closer's own round's arm and before its verdict, or a
+live recorded reviewer other than the closer. An earlier round abandoned by a
+sequential re-arm under a new report path is released as before (#1810 F1). `ng skeptic-arm` opening
+a sibling round archives only the terminal sentinels and leaves the live
+`*.answered.md`. The target retires only when every round is closed: the last
+verdict releases the marker, or `ng skeptic resolve` releases them all on the
+record (naming the review with `--reviewer` while any edge is live, below). A marker with no ledger is a legacy single round and behaves as before.
+
+**Ask the ledger which kind of "missing" this is before you do anything.**
+
+```zsh
+monitor/ng skeptic-evidence <window>     # READ-ONLY; authorises nothing
+```
+
+It answers the question the marker cannot: *does a verdict EXIST, could the
+bookkeeping match it, and **which verdict is the standing one**?*
+`evidence=none` means nobody reviewed the work — get a review.
+`evidence=unmatched-subject | no-open-arm | verdict-without-arm |
+unmatched-other | ambiguous-arms | rearm-after-close | superseded-verdict |
+prior-verdict-other-artefact | attributed` all mean a verdict **was
+delivered** and the record cannot match it. There is deliberately **no class** for "supersession
+could not be established" — that lives on `superseded=?`, because a
+single-winner precedence chain is the wrong shape for a property orthogonal to
+the one it ranks: placed high it masks a definite matching answer, placed low it
+is unreachable. All of them mean — repair the record, and do **not** file a
+`spawn-skeptic` request or push the reviewer, which has already discharged.
+`evidence=?` means it could not tell, and asserts nothing in either direction.
+`retire-preflight` now carries the same tag in its refusal, so you usually get
+the answer without asking. Every class prints the discharge rows that produced
+it, so you can check the classification rather than believe it
+(<your-org>/nexus-code#1156).
+
+**`superseded=` is the one to read even when another class wins**, and it has
+**three** states, because a later verdict row is not automatically a superseding
+one:
+
+| `superseded=` | what it means | what to do |
+|---|---|---|
+| `1` | same issue, **differing** verdicts — a reader taking the cleanly-attributed row gets an answer that no longer holds | **take the later one** |
+| `0` | different issues (unrelated **tasks** — neither supersedes the other), or the same verdict recorded twice (a **re-record**) | nothing; the attributed row is fine |
+| `?` | an issue field is absent, so the relation **cannot be established** | read both rows before acting on either |
+
+`superseded_why=` names which of those it is, so the judgement is checkable
+rather than trusted.
+
+**`0` also covers "the question does not apply", which is why you read
+`superseded_why` and not the number.** `sup_state` is computed only when a
+cleanly-matched row exists, so a ledger whose verdicts are ALL unmatched cannot
+reach `1` or `?` — it falls through to `0`, whose gloss above is "the attributed
+row is fine" when `attributed_verdict=-` sits on the same line. Measured over the
+64 ledgers in this nexus's live `.state/skeptic/pending` on 2026-08-31: **19**
+print `matched=0 superseded=0`, and **14 of those carry a delivered
+`standing_verdict`**. Those now read
+`superseded_why=no-attributed-row-to-supersede`. The VALUE stays `0` — only `1`
+licenses discarding a verdict, and a third value would be a gate change wearing a
+wording fix (`<your-org>/nexus-code#1199`). Distinct from `standing_stale`, which
+answers whether the standing verdict is about the CURRENT artefact; this answers
+whether `superseded` is answering anything at all.
+
+**`standing_stale=` is the other three-valued field, and its `0` is NARROW.**
+It answers whether the standing verdict is about the artefact's *current* bytes,
+and it is **ledger-internal by design** — it reads `armed` rows, never the file
+on disk. So it can only ever see an amendment that was *re-armed*:
+
+| `standing_stale=` | what it means | what to do |
+|---|---|---|
+| `1` | a later `armed` row names a **different** sha — the standing verdict is about superseded bytes | read the REPORT alongside the ledger; do not treat the verdict as current |
+| `0` | a later `armed` row names the **SAME** sha — the artefact was re-hashed at the same path and is unchanged | nothing; the standing verdict is current |
+| `?` | **nothing established it** — no later arm at all, no standing verdict, no artefact named, or an unparseable ledger | read the report; `?` is not "fine" |
+
+**A `0` here is a MEASURED currency claim, and only a same-sha re-arm earns
+one.** "No arm after the standing verdict" used to print `0`, and that was the
+one value it must never print: `ng send` — the transport a re-pin arrives on —
+writes neither an arm nor a discharge, so a report **amended in place** and
+re-reviewed leaves a ledger byte-identical in shape to a healthy one. Both then
+printed `standing_stale=0 standing_stale_why=no-arm-after-the-standing-verdict`:
+one line, two opposite realities, with the value that means *checked, and
+current* on the case where nothing was checked. It now reads
+`standing_stale=? standing_stale_why=no-arm-after-the-standing-verdict-artefact-bytes-not-re-examined`.
+`retire-preflight` acts only on `1`, so this is a wording-and-honesty change and
+not a gate change (`<your-org>/nexus-code#1199`).
+
+**The `?` arm is DEFENSIVE, not common**, and an earlier revision of this table
+said the opposite. It cited `#1146` — which is about the task/`disposition:`
+field in report FRONTMATTER, a *different field* from a ledger row’s issue —
+and asserted an absent issue was "the common case". Measured on this board:
+**0 of 72** `discharged` rows and **0 of 88** `armed` rows lack one. The arm is
+still right to exist, because `_skeptic_record_discharge` writes `${issue:--}`
+so a wrap-up with no issue produces one by construction; it has simply never
+fired on real data here. Cited here because a prevalence claim that measures
+zero is exactly the kind of thing a skeptic should refuse to inherit — and this
+one was inherited, from me, through a skeptic brief.
+
+**Only `1` licenses "take the later one"** — that instruction *discards a
+verdict*, and deciding it from ledger order alone would be window-keyed
+newest-wins, the container error `#1156` exists to fix and `#962` forbids. It
+can be excluded from the gate and still re-enter through the **prose**, and the
+prose is what an operator acts on. Measured on a planted ledger: `credible` on
+issue 1156 by `sk-a`, then `suspect` on issue **1200** by `sk-b` — two
+unrelated tasks, and an order-only rule told the reader to discard a valid
+verdict. And identical verdicts are **not** a supersession: nothing is weaker or
+stronger about two identical strings.
+
+Seven ways a delivered verdict goes unmatched. The middle four were all observed
+on ONE afternoon, and before this existed each produced a byte-identical
+refusal — which is what fired three duplicate `spawn-skeptic` requests (one for
+a PR that had already merged) and two pushes at reviewers that had already
+discharged:
+
+- **State fork (<your-org>/nexus-code#577).** A skeptic spawned via a
+  *secondary clone's* `spawn-worker.sh` used to inherit
+  `NEXUS_ROOT=<clone>`, so its spawn record, its require-marker and its
+  verdict report all landed in `work/<clone>/monitor/.state` and
+  `work/<clone>/reports` — while the marker blocking retirement sat in the
+  primary. Now fixed at the source (`spawn-worker.sh` resolves the primary
+  root; `ng report-init` pins to the corpus), but an old marker can still
+  be sitting there.
+- **Re-armed after the fact** (`evidence=rearm-after-close`). A worker re-runs
+  `wrap-up … --skeptic-decision require` *after* a verdict already
+  returned, opening a round no one will answer.
+- **The report was AMENDED after arming** (`evidence=unmatched-subject`). An
+  arm names the report's CONTENT HASH; editing the report moves the hash off
+  the armed one, and the reviewer's `--skeptic-subject` then recorded
+  `asserted-not-armed` — a verdict that names an artefact nobody armed.
+
+  **Pass the PATH and this now attributes** (<your-org>/nexus-code#1156).
+  `--skeptic-subject reports/<the report you read>.md` is matched back to the
+  arm that named that path on the same issue, and the round closes with detail
+  `asserted-path`; the hash you actually held is kept in the row's eighth field
+  as the drift evidence. **A bare sha is still a claim about BYTES** and is
+  refused exactly as before — so is a path armed on a different issue, and a
+  path nobody armed. The class is deliberately not `asserted`: "I read the
+  revision that was armed" and "I read a LATER revision of the same
+  deliverable" are different facts and this record keeps them apart.
+- **Several rounds armed against ONE report path** (`evidence=ambiguous-arms`).
+  Three `wrap-up` runs arm three rounds; one discharge could not close three
+  arms, so it attributed nothing.
+
+  **This no longer happens for one deliverable** (<your-org>/nexus-code#1156). A
+  DELIVERABLE is `(issue, report path)` and the sha says which REVISION of it;
+  a later arm on the same deliverable now REPLACES the earlier open arm, so
+  three `wrap-up` runs over one report leave one arm and an ordinary verdict
+  attributes — **with no flag at all**. Arms on DIFFERENT paths still stay
+  distinct and still go ambiguous, which is the honest answer: state cannot say
+  which of two artefacts the reviewer saw.
+- **A SUPERSEDING verdict** (`evidence=superseded-verdict`, `superseded=1`). Two
+  real verdicts from one reviewer on one target. The target landed a fix **while
+  the skeptic was still reviewing**; the skeptic re-derived its findings against
+  the new head rather than accepting the fix on its description, and amending
+  its report to publish that moved the content hash off the arm. Arming happened
+  once, against the original report. **The ledger then records the WEAKER first
+  verdict as matched and the stronger later one as unmatched.**
+
+  Two discharges for one arm is a **legitimate state, not a duplicate** — and
+  note what this costs if left unnamed: it fires precisely *because* the skeptic
+  did the harder, more correct thing. A reviewer that ignored the moving head,
+  or re-armed and started over, would have recorded cleanly. A bookkeeping layer
+  whose failure mode selects **against** the behaviour the protocol wants is a
+  design fault, not an accounting gap. `--skeptic-subject <the report path>` on
+  the amended report is the clean way to record it, and since
+  <your-org>/nexus-code#1156 it ATTRIBUTES rather than landing
+  `asserted-not-armed` — the superseding verdict closes the arm and the record
+  keeps both hashes. Pass the PATH, not a sha: a sha is a claim about bytes and
+  is still matched as one.
+- **NOBODY EVER ARMED A SUBJECT** (`evidence=verdict-without-arm`, detail
+  `no-arm-on-record`). The armed state has TWO writers and only one of them
+  recorded a subject: a worker's `wrap-up --skeptic-decision require` wrote the
+  marker AND an `armed` row, while `spawn-worker.sh --skeptic-role` wrote the
+  marker ALONE. Its own source says it is "the ONLY thing that restores the
+  block" for a second-or-later pass — so every re-validation round, the rounds
+  that exist *because* something was already found wrong, armed with nothing the
+  ledger could credit. `spawn-worker.sh` now records the arm it establishes,
+  against the report the reviewer is POINTED at, via `ng skeptic-arm`.
+
+  Worse, such a verdict used to be DROPPED entirely, so the key reported
+  `evidence=none` — *get a review* — for work a reviewer had finished. It is now
+  recorded with subject `-`, which authorises nothing. **Do not confuse this with
+  `no-open-arm`**, which means a ledger EXISTS and everything on it is
+  discharged — the ordinary terminal verdict of a chain that closed cleanly,
+  where nothing is owed and no repair is needed. Here nothing ever armed the key,
+  and the repair is to the ARM (`<your-org>/nexus-code#1207`, `#1191`).
+- **The other ledger.** `$STATE_DIR/obligations` records the same dependency
+  separately, and it can hold a **live edge** while the skeptic ledger is fully
+  settled (matching hash, `attributed`, verdict recorded). `retire-preflight`
+  names this as a `TWO-LEDGER DESYNC` and points at
+  `ng obligation settle`/`ng skeptic close` — the fix is to settle the EDGE, not
+  to ask for another review.
+
+### Settling the EDGE does not release the CHANNEL
+
+`skeptic-channel.sh close` is the **sole** writer of the `DONE` sentinel, and
+`obligations.sh` writes nothing under `skeptic/<task>/` at all.
+
+Do not try to establish that with a census of the `_done_sentinel` accessor —
+**the writer does not use it.** `cmd_close` builds `"$dir/DONE"` literally
+(`skeptic-channel.sh:1037`); the accessor's only non-comment sites are its own
+definition and the READER in `await`. An earlier revision of this section cited
+those two as "the writer in `close` and the reader in `await`", which is wrong
+about which sites they are — the right total for the wrong reason. Keying on the
+sentinel PATH does not rescue it either: the write is `mv -f "$tmp" "$sentinel"`,
+so no `DONE` literal appears on the writing line at all. The claim is
+behavioural, so it is tested behaviourally — settle a real edge and look for the
+file (`test-skeptic-arm-recording.sh`).
+
+So **`ng obligation settle` cannot release a counterpart sitting in `await`**, and
+it never could. The two verbs read as interchangeable at the point of use — both
+end an obligation, in different ledgers — and settling then walking away leaves
+the target looping to its timeout. `settle` now says so on stderr, naming
+`ng skeptic close <creditor>` and whether the require-marker is still live.
+
+**And mind the NAME**: a reviewer awaits on its OWN channel, not its target's, so
+closing the target releases nothing. `retire-preflight` detects this shape
+directly and names the right window (`<your-org>/nexus-code#1190`).
+
+When diagnosing it, note the ordering trap: running `close` *before* `settle`
+cannot tell you which of them wrote the sentinel. The answer is structural, not
+experimental.
+
+The release is **`ng skeptic resolve <window> --reason "<why>"`** —
+orchestrator-only (refused inside a worker), rationale mandatory and
+substantive, refuses when there is no marker, appends the reason to
+`.<window>.cleared-rationale` beside the marker and logs a
+`skeptic-resolve` event. **Never `rm` the marker**: hand-clearing is what
+this verb exists to replace, and a guard that trains its own bypass is
+worse than no guard.
+
+**A resolve names the review it settles** (`<your-org>/nexus-code#1848`).
+- **No obligation edge is live:** `resolve <window>` behaves as above (a
+  marker clear or a disposition release).
+- **Any edge is live:** it is REFUSED (rc 9). The refusal prints the exact
+  command for each live reviewer:
+  `ng skeptic resolve <window> --reviewer <w> --reason "…"`.
+- **`--reviewer W`** settles ONLY W's edge. While other reviewers are still
+  live, the marker, the ledger, the await and any owed-delta record are left
+  for them, and `--delta-owed`, `--withdraw-delta` and `--disposition` are
+  refused.
+- **`--all-reviewers`** settles every live reviewer, deliberately and on the
+  record.
+
+Why the edge count was not the test: edges supersede by time. In the
+2026-10-16 incident the one live edge belonged to the OTHER reviewer, so the
+resolve credited a review its `--reason` was not about. If the review your
+`--reason` cites is not among the live reviewers the refusal lists, its edge
+is already gone: settle nothing.
+
+It is not a waive. `--skeptic-waive` says *no skeptic was required after
+all* and is recorded as a decision about the **requirement**; `resolve`
+says *the validation happened, here is where it landed* and is recorded as
+a statement about the **evidence**. Waive also only ever clears the marker
+of the window whose own wrap-up invokes it, so it structurally cannot
+release another window's gate.
+
 The orchestrator picks the mode at spawn time. When in doubt, leave it
 unspecified (`auto`) and trust the worker's wrap-up decision — that is
 the design's default and its point.
@@ -84,6 +381,81 @@ completed hand-off for cleanup to act on. The marker is the gate for a
 validate); the undecided state is gated by the wrap-up failure itself.
 With `enforce_auto_decision` off (advisory), an undecided wrap-up records
 `auto-undecided` and proceeds — the documented escape hatch.
+
+### Declining a pass closes THAT chain — `resolve` releases the await too
+
+Decline with `ng skeptic resolve <window> --reason "…" [--disposition]` (or
+`ng request reply <id> --status declined`, which calls it), **never** with
+`close`: a `DONE` planted on a decline is exactly what a later pass misreads.
+
+**A decline is REFUSED while a skeptic is still live** on the origin
+(`<your-org>/nexus-code#1848`; measured on ncbundle29). Declining a duplicate
+request discharged a review that was still running. The reply now passes
+`--refuse-live-reviewer`, and on its refusal you choose one of two forms:
+- `--status spawned --worker <live reviewer>`: the request is covered by the
+  review already running, and ITS verdict discharges the gate;
+- `--status declined --settle-live-reviewer`: the live review is abandoned on
+  purpose, and is settled with the gate.
+`resolve` now also writes a `RELEASED` sentinel stamped `kind: resolution`, so
+an `await` on that window — live, or re-entered after the marker was already
+gone — ends with **exit 14** and the orchestrator's reason instead of waiting
+for a reviewer that was never coming (measured twice on 2026-09-17: a declined
+depth-2 left the skeptic `working-background` and un-retirable until a separate
+`close`). `ng request reply … --status declined --skeptic-resolved` skips
+`resolve` by design, so it runs `skeptic-channel.sh release` instead: that verb
+ends a WAIT and never a GATE, and it **refuses** (the reply is then refused too,
+nothing written) while a marker, an outstanding arm or a live reviewer shows the
+review is still PENDING. `ng skeptic status` carries `done_at=`,
+`done_delivered=`, `released=` and `marker=` so a `done=1` can no longer hide
+that it is hours old and predates the live reviewer.
+
+### A resolution that PROMISES a further review must RECORD it — `--delta-owed`
+
+`ng wrap-up` deliberately does not re-arm a gate the orchestrator resolved
+(`#815`: a worker must not be able to reverse a resolution by wrapping up). So a
+resolution whose `--reason` says *"a delta review will follow"* promises
+something nothing keeps: measured on `killsafe` 2026-09-18, the worker fixed four
+kill-direction findings, ran a plain wrap-up, no request was filed, and the
+window read *"can retire"* with the fixes never reviewed. When a further review
+IS owed, say so as a record:
+
+```bash
+ng skeptic resolve <window> --reason "<why round N is settled>" [--disposition] \
+    --delta-owed "<what the delta review must cover>"
+```
+
+It releases the current wait as before, and additionally: `retire-preflight`
+**refuses** while the record stands; the worker's next plain `ng wrap-up`
+**arms and files the spawn-skeptic request** (the orchestrator's own recorded
+instruction, not the worker reversing anything — `#815` is unchanged for every
+resolution without the flag); `release` refuses; a released `await` is told a
+delta is owed. The record leaves only by being armed or by an EXPLICIT
+`ng skeptic resolve <window> --reason "…" --withdraw-delta` — a resolve carrying
+neither flag is refused, because `ng request reply --status declined` calls
+`resolve` and a routine decline must not evaporate a promise as a side effect. A
+`--reason` that merely READS as a promise gets a loud warning naming the flag.
+
+### A settlement is about a SUBJECT, not a window (#1619)
+
+`#815`'s suppression and the `close` settlement (`#1209`) used to be keyed on the
+WINDOW, so round 1's resolution bound every later round: a second round of new
+work (new code, a NEW report) wrapped up with `--skeptic-decision require` got
+*"ALREADY RESOLVED — NOT RE-ARMING"*, no arm, no request, rc 0 — and a reviewer
+spawned by hand then recorded `unmatched-subject`, because the arm it should
+attribute to never existed. Both now ask the ledger whether this DELIVERABLE —
+`(issue, report path)`, the ledger's own notion (#1156) — was ever armed here:
+
+| wrap-up of… | result |
+|---|---|
+| a deliverable never armed on this window | **arms** — marker, `armed` row, spawn-skeptic request |
+| the same report, same bytes | declines; files ONE `kind=skeptic-rearm-declined` request |
+| the same report, amended (the `#815` "write your findings and wrap up" case) | declines the same way — so complying cannot re-block the worker |
+| a ledger that cannot say (no subject-bearing arm) | declines as before, and reports it |
+
+The decline keeps rc 0 on purpose (the step runs before the upload, so a
+non-zero would refuse the hand-off itself) and is put to the orchestrator as an
+adjudication request, one per `(window, sha)` ever — identical re-runs never
+re-file. Adjudicate with `ng skeptic-arm` + a spawn, or `ng request ack`.
 
 ### The push signal (`kind=spawn-skeptic` request, #545)
 
@@ -104,13 +476,62 @@ still cover it). The inbox is **on by default** as of #545
 
 The request `## Details` carries **pointers** (not inline copies): `issue`
 + `trigger-comment` (the operator's original ask), `report-path` +
-`report-asset-url` + `link-comment-url` (the deliverable), the worker's
+`report-asset-url` + `link-comment-url` (**both are SNAPSHOTS pinned when the
+request was filed, and are NOT re-pointed if the report is amended and
+re-wrapped — `report-path` is the authoritative, current deliverable; read
+that**, `<your-org>/nexus-code#1148`), the worker's
 `worker-prompt-file` (the orchestrator's spawn brief + woven-in operator
 context), `window`/`session-id`, and `depth`/`orig`/`mode`. The
 orchestrator composes the skeptic brief from these, spawns
 `spawn-worker.sh --skeptic-role`, and the spawn **auto-acks** the request
 (join key `request.origin == --skeptic-target`), so it self-clears without
 a manual `ng request ack`.
+
+**A WORKER MAY NOT SPAWN ITS OWN SKEPTIC, and this is now ENFORCED
+(`<your-org>/nexus-code#1098`).** `spawn-worker.sh --skeptic-role
+--skeptic-target <w>` REFUSES with exit 20 when the spawning agent IS
+`<w>` — matched on the session id recorded for `<w>`, or on the spawning
+window's own `$NEXUS_WORKER_WINDOW`. It was prose here and nowhere else
+until a careful worker walked straight through it: on 2026-08-27 a worker
+filed a request at 23:43:53 and spawned its own reviewer at 23:44:35, 39 s
+before the orchestrator acted on that same request. Two agents reviewed
+one target, and one read a mandate written by the party under review. The
+hazard is not a wrong answer — the brief that worker wrote was good — it
+is an **unexamined region**, and an omission is invisible from inside the
+brief that omits it. That is why brief-composition belongs to the
+orchestrator, which has the spawn context the worker does not.
+
+If you are a worker and you want review: file `ng request file --origin <your-window> --kind spawn-skeptic --slug <slug> --message '<what to review and why>'` and
+stop. If a self-spawn is genuinely intended, it must be loud and audited
+the way `GH_IMPERSONATE` is — `NEXUS_SKEPTIC_SELF_SPAWN=1` **plus**
+`NEXUS_SKEPTIC_SELF_SPAWN_REASON='<why>'`, both required, recorded in
+`monitor/.state/skeptic-self-spawn.log`.
+
+**Is a reviewer already on this? — `live-skeptic-window` (`#771`).** The
+request carries a tri-state field so the orchestrator does not have to
+reconstruct the answer from tmux by hand:
+
+- `yes: <window> (state=<s>) …` — a reviewer exists. **Re-pin it**; do not
+  spawn a duplicate. The incumbent holds an enumeration a fresh skeptic
+  would have to rebuild, and a second one starts blind to any findings the
+  first has retracted.
+- `no (…)` — checked, and nothing is there. The evidence is quoted.
+- `unknown (…)` — the probe could not look (no tmux, no window list, no
+  `jq`). **Not** the same claim as `no`.
+
+A window counts as live when it is named by either the **spawn record**
+(`monitor/.state/windows/<w>.json`, `skeptic_role` + `skeptic_target` — the
+authority) **or** the legacy `<target>-skeptic` convention (kept as a union
+member, so a window predating the records still counts), **and** a tmux
+window of that name exists now, **and** the pane does not positively assert a
+dead agent. It used to be the name match *alone* — which **43% of skeptic
+windows on the reporting nexus** do not follow (one operator's store, not a
+universal rate), so `fig4sk` reviewing `fig4rev` was invisible and four
+duplicate requests were filed in twelve minutes. **Wrapped-up is not gone**: an `idle` skeptic is the most
+re-pinnable state there is. The field errs toward `yes`, because it never
+suppresses the request — a wrong `yes` costs one look at a named window,
+while a wrong `no` costs a duplicate reviewer posting into an issue the
+operator is reading.
 
 **The orchestrator's say — `deliberate`.** The request carries a
 `deliberate` flag so the orchestrator spends attention only when it matters:
@@ -221,6 +642,30 @@ the wrap-up's `--skeptic-verdict`):
 | `check` | Keep, but specific concerns must be resolved first. | Pause; resolve before building on it. |
 | `suspect` | Strong reason to doubt; do not build on it. | Stop. Triggers a second pass. |
 | `refuted` | The worker's result (or the spec it followed) is wrong. | The finding is overturned; route the correction. Triggers a second pass. |
+
+### State your disposition — the verdict is not a finding count
+
+Write **one line** in your report saying whether the chain should
+continue:
+
+```
+Disposition: no-further-pass
+Disposition: second-pass
+```
+
+**Why this is required and not decorative.** `ng wrap-up` DERIVES a
+second-pass recommendation from `--skeptic-findings` — a **count**. A
+count is severity-blind by construction: one cosmetic nit and one
+merge-blocking defect are both `findings=1`. That derived value overrode
+reports whose own text concluded no further pass was warranted, three
+times in one session (<your-org>/nexus-code#599), each costing an
+orchestrator adjudication of a question the report had already answered.
+
+Your disposition is the better evidence, so state it. When the derived
+recommendation and your stated disposition **disagree**, wrap-up now says
+so loudly and files the request with `recommendation=DISPUTED` rather
+than picking one — **the orchestrator adjudicates.** Neither value is
+silently allowed to win.
 
 ---
 
@@ -394,7 +839,48 @@ going idle, and stays parked there for the duration of the review.
 **State machine (per request):** `open ──ack──▶ ack ──answer──▶
 answered` (a worker may also answer a still-`.open.md` directly, which
 implicitly acks). **Channel sentinel:** `close` drops a `DONE` file; the
-worker's `await` detects it and exits **10**.
+worker's `await` detects it and exits **10**. There is also **11**
+(`COUNTERPART-FINISHED` — the skeptic recorded its verdict without closing
+the channel, so nothing further can arrive: stop re-entering and retire),
+and a displaced waiter exits **12** (`DISPLACED` — a newer `await` claimed
+this channel under `#615`'s one-live-waiter lock and reaped this one; the
+newer one is LIVE, so do **not** re-arm, and the reaper leaves a line in
+`<channel>/.await-displaced`). A skeptic or the orchestrator can also
+**defer**: `ng skeptic defer <task> --reason "<why>" [--until "<condition>"]`
+releases the worker's CURRENT wait with exit **13** (`DEFERRED`) while the
+requirement STANDS — the pending marker is untouched, so retirement stays
+gated; the worker reads the reason, acts on it, and RE-ENTERS `await`
+(<your-org>/nexus-code#845 claim H). The channel tree under
+`<state>/skeptic/` is **pruned at retirement**: a retired window's channel
+moves to `skeptic/.archive/<task>.retired-<ts>/` and `reset` archives a
+prior round to `skeptic/.archive/<task>.reset-<ts>/`, so any survey over
+live channels is a survey of survivors — read the archive too
+(<your-org>/nexus-code#1434). A TERM that is *not* a displacement — an
+operator `kill`, a `timeout` wrapper — still exits **143**
+(`<your-org>/nexus-code#1178`).
+
+**RUN `await` BACKGROUNDED AND ENDING IN `exit $rc`, or every one of those
+codes reaches you as 0** (`<your-org>/nexus-code#1161):
+
+```bash
+monitor/skeptic-channel.sh await <task>; rc=$?; echo "AWAIT_RC=$rc"; exit $rc
+```
+
+Backgrounding is compulsory rather than a preference: the await budget is
+900 s and the Bash tool ceiling is 600 s, so the timeout path cannot finish
+in the foreground. But backgrounding is not what flattens the code — **a
+`;`-list reports its LAST statement's status**, so a trailing `echo` does
+it, and so does a bare trailing `rc=$?`. **Capturing is not the fix;
+`exit $rc` is.** Measured over this board's transcripts: of 369
+backgrounded `await` invocations, **11** ended in `exit $rc` — the other
+97% reported 0 whatever actually happened, and `11` ("do NOT re-enter")
+reads identically to `0` ("re-enter"), which is an infinite loop.
+
+A correct `exit 4` renders as *"failed with exit code 4"* and is the
+ROUTINE outcome. **Do not tidy the `exit $rc` away to silence it.** And
+treat the counterpart's STATE — its pane state, its report on disk,
+`settled_at` — as the primary signal, with the exit code as corroboration;
+that is the only remedy that also covers 143.
 
 **Race-safety.** Every state-producing write — `ask`, `answer`, `close`
 — builds into a temp file in the channel dir and `mv -f`s it into the
@@ -412,6 +898,7 @@ ng skeptic ask <task> <slug> --file question.md          # or pipe via -
 
 # WORKER blocks until a request lands, acks it (→ .ack.md), exits:
 ng skeptic await <task>           # exit 0 acked; exit 10 DONE; exit 4 timeout (re-enter)
+#   run it via the Bash tool's run_in_background — NOT async-run.sh (#1523, below)
 
 # Worker answers (appends reply, renames .ack.md → .answered.md — the signal):
 ng skeptic answer <task> 1 --message "Confirmed config drift; fixed to 5e-5."
@@ -438,10 +925,91 @@ with a new slug.
 into): **0** — it acked open request(s) (now `*.ack.md`); read each,
 `answer` them, then RE-ENTER await. **4** — timed out with nothing
 pending; RE-ENTER await. **10** — `DONE` sentinel; the skeptic closed the
-channel, stop looping and retire. **2** — bad task/channel. While parked
-in `await` the loop refreshes the worker's skeptic-pending marker mtime
-every poll — that heartbeat is what the watcher reads to classify the
-worker `parked-awaiting-skeptic` (below).
+channel, stop looping and retire. **11** — `COUNTERPART-FINISHED`; the
+skeptic recorded its verdict (which clears your pending marker) but never
+ran `close`, so no `DONE` will ever arrive. Do **not** re-enter await —
+read its report and retire. **13** — `DEFERRED`; your wait was released
+WITHOUT discharging the requirement (the marker still gates you): act on the
+printed reason/condition, then RE-ENTER await. **12** — `DISPLACED`; a NEWER
+`await` claimed this channel and reaped yours (the one-live-waiter lock,
+`#615`/`#1178`). Your listener is gone and the newer one is LIVE — do **not**
+re-arm, that would displace it in turn. **2** — bad task/channel.
+**14** — `ENDED-WITHOUT-VERDICT`; the wait ended (stderr names the cause:
+`close`, `resolve`, or `marker-cleared`) and the ledger records **no verdict
+covering the current arm**. A channel CLOSING is not a verdict ARRIVING, and an
+orchestrator DECLINING is not a review: do **not** re-enter await, do **not**
+report the work as reviewed, and tell the orchestrator if you expected a
+verdict. **15** — `NO-ROUND-OPEN`; either the `DONE` on the channel was already
+delivered to an earlier await and nothing has opened a round since, or you
+timed out with no marker and no outstanding arm at all. Nobody is appointed to
+end this wait, so do **not** loop on it (<your-org>/nexus-code#1537, #1538).
+
+**10 and 11 are qualified by the ledger, in one direction only.** `await` asks
+`ng skeptic-evidence` once, at the moment it would end. A POSITIVE "no verdict
+covers the current arm" (`verdicts=0`, or `standing_stale=1`) turns a 10/11 into
+14. A ledger that is absent or could not be read keeps the legacy code and says
+`UNVERIFIED` on stderr — the change can turn a "done" into a "not done", never
+the reverse. Retirement is decided by `retire-preflight`, not by any of these.
+
+**Re-tasking a RETAINED skeptic opens no round — open one.** `ng send` is a
+transport; it writes no marker and no arm, so the target's next `await` has
+nothing to wait on (it exits 15 on the previous round's already-delivered
+`DONE`, where it used to exit 10 and advise retiring mid-review). Before
+re-tasking, the orchestrator runs
+`ng skeptic-arm <target> --report <report under review>`: since #1537 it
+writes the `armed` row, archives the prior round — its `DONE`/`RELEASED`
+sentinels **and its `*.answered.md` correspondence**, moved (never deleted) to
+`skeptic/.archive/<task>.reset-<ts>/`, path printed on stderr and logged as a
+`skeptic-reset` event (#1609) — **and** writes the
+pending marker, which is what `await` and retire-preflight check 1b read.
+The retained skeptic then reviews the new bytes and files its verdict from a
+**new report** (`ng report-init`): a verdict wrap-up whose report predates the
+round it would discharge is refused, because re-running round 1's wrap-up would
+discharge round 2 with nothing reviewed (skprotosk F5).
+
+**`ask <task-id>` names the channel the question LANDS IN, not who is asking.**
+A skeptic asks on its TARGET's channel. A worker that "asks its skeptic" on its
+own `<task-id>` files a request onto its own channel and is woken by its own
+question (#1538).
+*(That is the full await vocabulary; `skeptic-channel.sh`'s own `Exit codes`
+header block is the authority. The codes it lists that `await` cannot return
+are `3` tmux/paste failure and `5` nudge skipped — both `nudge`'s — and `6`,
+`reconcile`'s.)*
+
+**How to run it — the WAKE, not only the rc** (<your-org>/nexus-code#1523).
+The await budget is 900 s against the Bash tool's 600 s foreground ceiling,
+so `await` runs BACKGROUNDED, and BACKGROUNDED means **the Bash tool's
+`run_in_background` option**: the harness re-invokes you when the job exits,
+which is what makes the typed rc above actionable (its Bash `timeout` must
+exceed the await budget: the 30-min default covers 900 s, so raise it only
+with `await_timeout_seconds`, and read a harness stop notice as re-enter;
+`#1685`). Alternatively a
+`Monitor` until-loop, for a condition rather than a job. It does **not**
+mean `monitor/async-run.sh` — that launcher RETAINS the rc and re-invokes
+nobody, so an await run through it expires correctly (rc 4, retained) into
+an agent that is not running to read it. Measured on w237sk, 2026-09-12:
+`asyncrun:… terminal rc=4 elapsed=902s`, then 809 s idle until the watcher's
+orphan-async backstop pasted the verdict. Run each re-entry the same way; the
+rc-preserving `…; rc=$?; echo "AWAIT_RC=$rc"; exit $rc` form (`#1161`) and
+the `run_in_background` launch are two separate properties and you need
+both. The rule behind it lives in the worker floor
+(`skills/nexus.worker-defaults/SKILL.md`, *A retained exit status is not an
+armed wake*): a parked agent must be able to name what will RE-INVOKE it.
+
+While parked in `await` the loop refreshes the worker's skeptic-pending
+marker mtime every poll — that heartbeat is what the watcher reads to
+classify the worker `parked-awaiting-skeptic` (below).
+
+**The heartbeat establishes that the WAITER is alive. It does not
+establish that the WAIT is meaningful** — those are different properties,
+and conflating them is what left two workers parked indefinitely on
+skeptics that had finished hours earlier (<your-org>/nexus-code#615). What
+ends the wait is the **counterpart**, so `await` now checks the
+counterpart directly: a pending marker it observed live and that has
+since vanished means the verdict landed, and it exits **11** instead of
+blocking to timeout. Re-arming also **reaps** the previous waiter — one
+live `await` per (worker, channel), enforced rather than assumed, after
+five concurrent awaits stacked up on one channel at ~1/min.
 
 ### Reconcile — the skeptic's wrap-time ack check
 
@@ -473,10 +1041,15 @@ header). The nudge:
 - **skips a busy / user-typing pane** (resolved via `pane-state.sh`): a
   busy worker will re-enter await on its own turn; a typing pane belongs
   to the operator. Never steamroll either. The worker window **name** is
-  resolved to its tmux **index** before the probe (`pane-state.sh` is
-  index-keyed); if the index can't be resolved the nudge **fails safe
-  and skips** rather than pasting into a pane whose state is unknowable.
-  `--force` overrides.
+  resolved to its tmux **index** before the probe, and if the index can't
+  be resolved the nudge **fails safe and skips** rather than pasting into
+  a pane whose state is unknowable. `--force` overrides. *(That resolution
+  is now belt-and-braces, not a requirement: `pane-state.sh` has accepted a
+  NAME — as well as an index and a `session:window` — since
+  `<your-org>/nexus-code#905`; it resolves one via `resolve_window_index`
+  internally. `skeptic-channel.sh:1793`'s "pane-state.sh is INDEX-keyed"
+  comment predates that and is stale. The fail-safe-on-unresolvable
+  behaviour is unaffected.)*
 - **rate-limits** per window (default 120 s) so a flapping skeptic can't
   spam the pane. `--force` overrides.
 - **no-ops** when there are no open requests.
@@ -486,6 +1059,141 @@ tmux (`exit 3` if absent — the worker may have been closed; recreate via
 `spawn-worker.sh --resume` or re-ask after it's back). The
 autosuggest-ghost-text hazard and window-resolution pitfalls are handled
 inside paste-followup.sh's VI-safe sequence; do not hand-roll around it.
+
+### Notify-delta — waking a *pinned skeptic* that a new round exists
+
+`nudge` wakes a **target** that owes its reviewer an answer. The mirror
+direction had nothing, and its absence is `<your-org>/nexus-code#845`:
+
+> A worker that finishes a round parks awaiting its skeptic's verdict.
+> Its skeptic — correctly **pinned across rounds** rather than retired —
+> idles awaiting a delta **it has not been told exists**. Neither side can
+> release the other, and nothing surfaces the pair as blocked.
+
+Both windows are behaving correctly: a worker may not paste into a window
+it did not create, and an idle pane observes nothing. Measured: **seven
+pairs in one session**, the longest **4h 6m**; then **2h 18m** for
+`tmuxwrap`/`sk897` on 2026-08-14, where the orchestrator had explicitly
+promised to route the head and did not.
+
+**You almost never run this by hand.** `ng wrap-up` fires it for you: when
+a `require` re-arm finds a **live pinned skeptic** for the wrapping window,
+it reopens the obligation edge and notifies that reviewer, printing a
+`=== PINNED SKEPTIC NOTIFIED ===` block. The spawn-skeptic request is still
+filed — this removes the orchestrator from the **critical path** of a pair
+that already knows about each other, not from the decision.
+
+```bash
+ng skeptic notify-delta <skeptic-window> --target <window> [--round N] \
+    [--detail "<what changed>"] [--force] [--min-interval S]
+```
+
+Same guards as `nudge`, from the same `_wake_gate` — one gate, two
+directions, because a second transcription is how two copies of a rule
+drift apart. A reviewer's pane is not more interruptible than a worker's.
+
+**Why this is not "a worker pasting into a window it did not create":** it
+is the *tooling* pasting, on the path `nudge` has crossed in the other
+direction since it existed (a skeptic nudges a worker whose window it did
+not create). The invariant is *no ad-hoc `tmux send-keys` between agents*,
+and this honours it — same `paste-followup.sh`, same machine-input stamp,
+same audit event. The message is a **notice**, not an instruction: it names
+the delta and points at the record, and does not tell the reviewer what to
+conclude.
+
+**Failure modes:**
+
+| Situation | What happens |
+|---|---|
+| No live skeptic | Nothing notified. The spawn request is the whole mechanism, as before. Silent. |
+| Could not look (no tmux / no jq / malformed record) | Nothing notified, and it **says so** — `unknown` never collapses into "none" (`#771`). Route by hand. |
+| Skeptic pane busy / typing / unresolvable | Deferred (rc 5) with a reason. **The obligation edge is still recorded**, so `retire-preflight` protects the pair even when the wake did not land. |
+
+### Obligations — the record that a pair depends on each other
+
+The notify above breaks the deadlock going forward. The other half of
+`#845` is that **nothing could see the dependency at all** — which is how
+`sk911` was retired while it still owed `papercuts` a delta re-run, at
+`retire-preflight` `safe=1`, with a `window-retain` already logged. The
+preflight answers *"is anyone typing"*, not *"does this window still owe
+or is it owed something"*.
+
+An **obligation** is a directed edge `DEBTOR owes(kind) CREDITOR` between
+two windows. It is opened by the mechanism that already knows the linkage,
+so nobody has to remember it:
+
+| Opened by | Edge |
+|---|---|
+| `spawn-worker.sh --skeptic-role --skeptic-target T` | `<new skeptic>` owes `T` a verdict (and the chain root, when recursive) |
+| `ng wrap-up` re-arming a `require` round with a live pinned skeptic | that skeptic owes the target the new round |
+
+| Ended by | How |
+|---|---|
+| `ng skeptic close <target>` | the protocol's **own** end-of-pairing signal — it already means "the skeptic closed the channel; stop looping and retire", and it releases the target's `await` with exit 10 |
+| a **later** reviewer pinned to the same target | supersession — the pairing was handed over, so the earlier reviewer is free |
+| the creditor window leaving tmux | a window that does not exist depends on nobody |
+| `ng skeptic resolve <target> --reviewer <w> --reason "…"` | an orchestrator adjudicating ONE review as done. It settles only `<w>`'s edge, and is **required** while any edge is live (rc 9 otherwise, `<your-org>/nexus-code#1848`). `--all-reviewers` discharges **every** reviewer of that window deliberately (the old default, `<your-org>/nexus-code#926` F5) |
+| `ng obligation settle --debtor <w> --reason "…"` | the audited manual release (reason ≥ 20 chars, on the record). `--creditor <w>` discharges every reviewer of `w` instead |
+
+**A FILED VERDICT DOES NOT END THE PAIRING**, and this is the correction that
+`sk926` forced (`<your-org>/nexus-code#926`). The first version settled the edge
+on the debtor's first verdict, *and* derived a release from the creditor's
+pending marker going absent — which the same verdict clears. So the edge
+existed only over `[spawn → first verdict]`, and **the hazard begins exactly
+where that interval ends**. Replayed from the recorded action log:
+
+```
+08:58:04  skeptic-spawn   sk911 -> papercuts     edge opens
+09:19:36  skeptic-verdict sk911 -> papercuts     edge CLOSED here
+09:21:21  window-retain   sk911                  <- the retirement
+10:41:37  skeptic-spawn   sk911b -> papercuts    a THIRD reviewer needed
+```
+
+`papercuts` was still being worked at 10:55. A verdict discharges **one
+round**; a retained reviewer is the designated reviewer for the *next* round
+too — that is why it is retained rather than retired — so it is owed again the
+moment its target pushes a delta, and there is no instant in between at which
+destroying it is safe. The verdict is *recorded* on the edge (`ng obligation
+show`) and releases nothing.
+
+`retire-preflight` **check 1d** refuses to retire a live debtor.
+Default-deny over the edge state: `live` and `unknown` refuse; only the four
+states that *positively* assert this reviewer is no longer the one its target
+depends on release it.
+
+**The DONE sentinel is matched by CONTENT + INODE**, never by timestamp. Both
+`opened_at` and `stat -c %Y` are second-resolution, so a reopen and a close in
+the same second are indistinguishable by time — and the readings that
+ambiguity must separate are "closed after this round was armed" (release) and
+"the previous round's sentinel" (`#469`, do **not** release). A bare `touch`
+(a `find -exec touch`, a restore, a filesystem migration) would otherwise
+manufacture a release and retire a live reviewer. `close` rewrites the
+`closed:` line *and* republishes via `mktemp` + `mv -f`, so a genuine close
+changes both; two closes inside one second are still caught by the inode, and
+a recycled inode is still caught by the content.
+
+```bash
+ng obligation pairs                  # who is waiting on whom, right now
+ng obligation list --debtor <w>      # what this window owes, and in what state
+ng obligation gate  <w>              # the predicate check 1d asks
+ng obligation settle --debtor <w> --reason "<why this reviewer is no longer owed>"
+ng skeptic close <target>            # the ordinary ending — do this, not settle
+```
+
+**Retiring a reviewer now needs the pairing closed first.** That is a workflow
+change and it is the intended one: the protocol has always told the final
+skeptic to `close` the channel, nothing checked it, and the check is what makes
+the instruction real — exactly as check 1b made `require` real.
+
+**It stays silent on healthy pairs**, which is what keeps it from being
+disabled by whoever is under time pressure. It fires only when somebody is
+retiring a *debtor*; a parked target with a working skeptic never reaches
+it, and every ordinary ending releases it automatically.
+
+**A `window-retain` is not an obligation.** A retain is a note about one
+window; an obligation is a relation between two. `retire-preflight` reads
+the second and not the first, deliberately — that is why the retain logged
+for `sk911` did not save it.
 
 ### Parked-awaiting-skeptic — the watcher exemption
 
@@ -520,6 +1228,83 @@ state machine — see the graph and classifications table in
 (transitions: `wrapped` → `parked_skeptic` on a `require` wrap-up →
 `retired_task` once a verdict clears the marker) and the orchestrator's
 do-not-close handling in [`skills/nexus.window-cleanup`](../nexus.window-cleanup/SKILL.md).
+
+### Operational gotchas when driving skeptics
+
+Four traps that repeatedly cost idle worker-hours:
+
+- **The `pending/<name>` marker is the authoritative "parked" signal — a
+  busy pane is NOT.** A `require`/`auto` worker that wrapped can enter a
+  periodic re-check/await loop whose pane reads `state=busy` with a long
+  running timer (`✻ Worked 1h18m`) — indistinguishable from a worker
+  still researching, and it suppresses the clean `parked-skeptic`
+  transition emit. So on **every wake**, glance at `ls -A
+  monitor/.state/skeptic/pending/` *before* trusting a busy timer: a
+  marker present ⇒ the worker wrapped and is waiting for you to spawn its
+  skeptic — spawn it now; a genuinely-researching worker has no marker.
+
+- **Verify a skeptic WINDOW actually exists — by its ROLE RECORD, never by its
+  NAME.** On a `parked-awaiting-skeptic`, do not trust the "skeptic reviewing"
+  emit alone — ask `monitor/ng skeptic window <worker>`, which reads the spawn
+  provenance records (`skeptic_role` / `skeptic_target`, written by
+  `spawn-worker.sh`) and then checks each named window against tmux by exact
+  name. Exit 0 = a recorded skeptic window is live; 1 = the records positively
+  show none live; 3 = could not tell (treat as doubt, not as "none"). Do NOT
+  `grep skeptic` over `tmux list-windows`: a window NAME is not a field, the
+  launcher's convention is `<target>sk`, and measured 2026-09-15 that predicate
+  could not see **151 of 613** recorded skeptic windows — every recent one —
+  and its false "none" prescribes a DUPLICATE spawn (<your-org>/nexus-code#1536).
+  If a `skeptic-request` is logged but no
+  window exists (pre-#545 sessions could log the request without filing
+  the spawn-skeptic channel; the orphan backstop is 600 s), spawn it
+  manually — `--skeptic-role` **requires** a real `-p` prompt file **and a
+  real `-r` report. `-r` is the only thing that gives the arm a SUBJECT**
+  (<your-org>/nexus-code#1251): without it `spawn-worker.sh` writes the marker
+  alone and appends no `armed` row, the verdict lands `no-arm-on-record`, and
+  nothing later can repair it — the ledger is append-only and that class is
+  terminal, so the only repairable moment is this one. This recipe is the
+  RECURSIVE shape, where `spawn-worker.sh` is the ONLY writer of the arm:
+  ```bash
+  ./monitor/spawn-worker.sh -n <w>-skeptic -c <worker-workdir> \
+    -p <skeptic-prompt-file> -r <the-report-the-skeptic-must-read> \
+    --skeptic-role --skeptic-target <w> \
+    --skeptic-orig <w> \
+    --skeptic-subject <what-it-reviews>   # e.g. proj#275 — see below
+  ```
+  **Pass `--skeptic-subject` whenever the target has more than one review in
+  flight** (`<your-org>/nexus-code#1849`). It is recorded on the reviewer's
+  obligation edge. Two edges that both carry one supersede only for the SAME
+  subject, so a second reviewer of a different PR can no longer void the
+  first one's edge mid-review. Without subjects, a later reviewer supersedes
+  only one that has already filed a verdict.
+  Omit `--model` — the skeptic then inherits the `model` pin in
+  `monitor/worker-settings.json`, so it tracks the operator's current
+  default instead of a hardcoded id that goes stale on every release.
+
+- **A skeptic that reached a verdict but ENDED ITS TURN before wrap-up.**
+  The watcher flags `<skeptic> idle … WITHOUT wrap-up`. Read the pane
+  first: a reached verdict + a "now close / wait then close" plan with no
+  spinner and no running `Monitor` ⇒ **stalled** — nudge it through the
+  sequence (`report-init → reconcile → ng wrap-up … --skeptic-role
+  --skeptic-verdict <v> --skeptic-findings <n> → ng skeptic close
+  <target>`). A live `✻ …ing · Monitor still running` ⇒ it's re-deriving
+  async (good rigor) — let it finish, do not nudge.
+
+- **A skeptic-channel answer misattributes as an operator submit.** When a
+  parked worker answers the skeptic's question, the prompt-submit surfaces
+  as a `UserPromptSubmit` the attribution logic can't tell from a real
+  operator paste — the window hardens to `operator-engaged (src=submit)`
+  and `retire-preflight.sh` returns `safe=0`. That gate is **correct to
+  refuse** — do not force-kill. When the window is verifiably done
+  (wrapped + credible verdict + channel closed), clear it with the
+  *designed* release, not a kill: `monitor/ng engaged-done --window <w>`
+  → preflight immediately returns `safe=1`. And if you drove the skeptic
+  **externally** (spawned/closed it yourself rather than through the
+  worker's channel), the worker's await loop waits on its own channel
+  forever — paste an explicit RELEASE (`paste-followup <worker>`:
+  "skeptic already ran, verdict `<v>`, closed — STOP the await loop, do
+  not re-enter, end your turn") or it re-enters indefinitely and re-pins
+  `safe=0` each pass.
 
 ---
 
@@ -622,6 +1407,31 @@ ng wrap-up <issue> <report-path> --repo <owner>/<repo> \
     [--skeptic-pr <n>] [--skeptic-head <sha>]    # bind the verdict to a commit
 ```
 
+**State the count, or state a disposition — do not leave both blank.**
+`--skeptic-findings` is optional and its ABSENCE IS RECORDED AS ABSENCE
+(`<your-org>/nexus-code#881`): omitted, it prints `not stated`, logs
+`findings-stated=false` with no `findings` key, and never reaches the
+threshold comparison. It used to be silently defaulted to `0` — the one
+value that means "nothing found" — which made *"I measured zero"* and
+*"I never said"* the same record, on the gate that decides whether
+another pass is warranted. Now, with **neither** a count nor a readable
+`disposition:`, wrap-up **REFUSES** (exit 1, `YOU STATED NEITHER A COUNT
+NOR A DISPOSITION`) rather than terminating on a number nobody supplied —
+it stopped being an escalation when `#1137` landed, and this line said
+"escalates" for longer than that was true. Either statement ends the chain
+honestly, and both are one line: `--skeptic-findings 0` (you looked and
+found nothing new) or `disposition: no-further-pass` in your report
+frontmatter.
+
+`ng report-init` now seeds **`disposition: TODO`** into every report's
+frontmatter, and `report-check` **refuses** until you replace it —
+measured on `dev`: a filled report still carrying `TODO` exits 1
+(`unreadable in frontmatter — value-not-a-token`, plus the placeholder
+rule), and exits 0 once the value is real. So the field is a forcing
+function rather than a scaffold, and it applies to **every** report rather
+than only to windows that can be identified as skeptics
+(`<your-org>/nexus-code#1146`).
+
 This logs `skeptic-verdict`, clears the **immediately-reviewed** worker's
 pending marker, and applies the recursion decision above. `--skeptic-orig`
 is read from the skeptic's own provenance when present (so you usually
@@ -705,10 +1515,20 @@ ng skeptic await <your-window>
 #   exit 4  → timed out, nothing pending: RE-ENTER await.
 #   exit 10 → DONE sentinel: the skeptic closed the channel; stop looping
 #             and proceed to retire.
+#   exit 14 → ENDED-WITHOUT-VERDICT: closed or released with NO verdict on
+#             the ledger for the current arm. Not a review. Do not re-enter;
+#             do not claim review; tell the orchestrator if one was expected.
+#   exit 15 → NO-ROUND-OPEN: nothing is armed (or the DONE is an old,
+#             already-delivered one). Do not loop; a round must be opened.
+#   LAUNCH: the Bash tool's run_in_background (it re-invokes you on exit),
+#           ending in `exit $rc` (#1161). NOT async-run.sh — it retains the
+#           rc and wakes nobody (#1523; "How to run it" above).
 ```
 
 If you drift idle without re-entering await, a `nudge` (from the
-skeptic's `reconcile`) wakes you. You physically cannot retire until the
+skeptic's `reconcile`) wakes you — and the commonest way to drift idle
+is to have launched the await through a launcher that cannot re-invoke
+you (`#1523`). You physically cannot retire until the
 skeptic returns a verdict (clearing your pending marker) — the
 `retire-preflight.sh` gate enforces it.
 
@@ -770,9 +1590,49 @@ file a fresh request — exactly as before.
 | `monitor.skeptic.findings_threshold` | `MONITOR_SKEPTIC_FINDINGS_THRESHOLD` | `1` | New-findings count that (absent suspect/refuted) triggers a second pass. Floored at 1. |
 | `monitor.skeptic.enforce_auto_decision` | `MONITOR_SKEPTIC_ENFORCE_AUTO_DECISION` | `true` | When on (the default), an `auto`-mode wrap-up *fails* until the worker records a decision. Set false for advisory-only. |
 | `monitor.skeptic.rewrap_guard` | `MONITOR_SKEPTIC_REWRAP_GUARD` | `true` | When on (the default), a `require` wrap-up whose pass has ALREADY returned a verdict does not re-open the round (see "Re-wrapping up after a verdict" below). Set false to restore the unconditional pre-guard behaviour. |
-| `monitor.skeptic.await_timeout_seconds` | `MONITOR_SKEPTIC_AWAIT_TIMEOUT_SECONDS` | `900` | Per-call `await` timeout. On timeout `await` exits 4 and the worker re-enters; it bounds a single blocking call (the loop heartbeats throughout). |
+| `monitor.skeptic.await_timeout_seconds` | `MONITOR_SKEPTIC_AWAIT_TIMEOUT_SECONDS` | `900` | Per-call `await` timeout. On timeout `await` exits 4 and the worker re-enters; it bounds a single blocking call (the loop heartbeats throughout). The re-entry happens only if the launch can re-invoke the worker — `run_in_background`, not `async-run.sh` (`#1523`). |
 | `monitor.skeptic.await_interval_seconds` | `MONITOR_SKEPTIC_AWAIT_INTERVAL_SECONDS` | `5` | `await` poll interval (also the heartbeat cadence). |
 | `monitor.skeptic.await_hang_seconds` | `MONITOR_SKEPTIC_AWAIT_HANG_SECONDS` | `600` | Hang-vs-wait threshold. A parked worker is exempt from idle flagging only while its pending-marker mtime is within this window; a marker stale beyond it lets a genuine hang resurface. |
+
+---
+
+## A stamped window doing worker work
+
+The skeptic role is derived from the window's **provenance record**
+(`skeptic_role: true`), and a window is stamped for its **lifetime**, not
+for one task. A retained skeptic that later authors a patch therefore
+hits the role gate on a wrap-up that is not a verdict at all.
+
+**Do not invent a verdict to get past it.** If the window authored the
+work being wrapped up, any verdict it supplies is a self-review written
+against another window's markers — and downstream it is indistinguishable
+from an independent clearance, which is precisely what this protocol
+exists to prevent. Say the true thing instead
+(`<your-org>/nexus-code#879`):
+
+```bash
+ng wrap-up <issue> <report> --repo <owner>/<repo> \
+    --not-a-skeptic-verdict "<what non-skeptic work this window did>"
+```
+
+It runs the **ordinary worker wrap-up** from there — so your own work
+gets the normal skeptic decision for its spawn mode — and records
+`skeptic-role-not-asserted` with your reason. The reason is mandatory and
+must be substantive (>=20 chars), the `GH_IMPERSONATE_REASON` shape: an
+opt-out nobody has to justify is a way to dodge an obligation.
+
+It **discharges nothing** — not the stamped target's marker, and not
+**your own**. If you still owe a verdict you still owe it, that target
+stays blocked, and so do you; file it separately with a
+`--skeptic-role --skeptic-verdict <v>` wrap-up. When a producer branch
+would have cleared your own marker (spawn mode `deny`, an explicit
+`--skeptic-decision deny`, or an operator waive) the removal is
+suppressed and wrap-up prints `SKEPTIC MARKER KEPT`, because an opt-out
+is a statement about *this hand-off*, not a release of a *pending
+obligation* (`<your-org>/nexus-code#879` F1 — this paragraph asserted the
+right behaviour before the code implemented it). The flag is mutually
+exclusive with `--skeptic-role` and `--skeptic-verdict`, and refused
+outright on a window that was never stamped.
 
 ---
 
@@ -782,9 +1642,13 @@ All written to `monitor/.state/action-log.jsonl`:
 
 - `skeptic-request` — a skeptic is required for `target-window` at `depth`.
 - `skeptic-spawn` — a skeptic was dispatched (`window` reviews `target-window`).
-- `skeptic-verdict` — a verdict landed (`verdict`, `target-window`, `findings`,
+- `skeptic-verdict` — a verdict landed (`verdict`, `target-window`,
+  `findings-stated`, and `findings` only when a count was supplied — `#881`;
   `head` = the commit it covers, `head-source`, `pr`).
 - `skeptic-decision` — an `auto`/`deny`/`waived` decision was recorded.
+- `skeptic-role-not-asserted` — a skeptic-STAMPED window wrapped up
+  ORDINARY WORKER WORK via `--not-a-skeptic-verdict` (`reason` is
+  mandatory). See "A stamped window doing worker work" below.
 - `skeptic-escalate` — issues persist at the depth cap; operator needed.
 - `skeptic-nudge` — a worker was nudged about pending requests.
 
@@ -811,9 +1675,27 @@ are the orchestrator's gate: a window with a pending marker has produced
 a result that has **not yet** been validated. The gate is **enforced in
 code**, not merely advisory — `monitor/retire-preflight.sh` (the
 mandatory synchronous pre-kill check, see `skills/nexus.window-cleanup`)
-returns `safe=0 reason=skeptic-pending…` while a marker is live, so the
-orchestrator physically cannot retire the window until a skeptic returns
-a verdict (clearing the marker) or an operator waives.
+returns
+
+```
+safe=0 window=<w> pane=<state> reason=required skeptic marker is LIVE — refusing kill; if a verdict exists, use `ng skeptic resolve <window> --reason …`
+```
+
+— `retire-preflight.sh:emit()` formats `safe=%s window=%s pane=%s reason=%s`,
+and this reason carries one further suffix when the ledger can be read:
+` | evidence=<class>: …` from `_sk_ev_clause` (empty when the class cannot be
+established, so do not match on it). While a marker is live, so the orchestrator cannot retire the window until
+a skeptic returns a verdict (clearing the marker), an operator waives, or
+`ng skeptic resolve` releases it on the record.
+
+**One carve-out, and it is the one that lets a kill through.** An
+**ORPHANED** marker — `_idle_skeptic_orphaned` says no live skeptic past
+the grace — does **not** block: `retire-preflight` notes it on *stderr*
+(so the single stdout verdict stays authoritative), prints the
+`ng skeptic-evidence` class, and **falls through**. So "physically cannot
+retire" holds for a live pairing, not unconditionally. When that note says
+`ledger evidence: none`, the kill is about to STRAND the required
+validation — read it before proceeding.
 
 ---
 

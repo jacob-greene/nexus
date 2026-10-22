@@ -48,9 +48,20 @@
 
 set -euo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 MODE=print
 PROBE_REPO=""
-while (( $# > 0 )); do
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --validate)         MODE=validate; shift ;;
         --probe)            MODE=probe; PROBE_REPO="${2:-}"; shift 2 ;;
@@ -108,8 +119,11 @@ fi
 
 api_probe() {
     local path="$1"
+    # The PAT goes through a process-substitution header file, never argv: argv
+    # is readable in /proc by every same-uid agent, and a PAT outlives any
+    # session (#1840).
     curl -sS -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer ${PAT}" \
+        -H @<(printf 'Authorization: Bearer %s\n' "$PAT") \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/${path}"

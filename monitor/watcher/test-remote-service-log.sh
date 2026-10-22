@@ -72,7 +72,7 @@ cat > "$WORK/clean" <<'EOF'
 [2026-07-09T21:00:00+00:00] remote-sshd: exec: /usr/sbin/sshd -D -e -p 22022
 Connection from 198.51.100.34 port 51484 on 198.51.100.34 port 22022
 Did not receive identification string from 198.51.100.34 port 51484
-Accepted publickey for op from 198.51.100.84 port 40122 ssh2: ED25519 SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU
+Accepted publickey for op from 198.51.100.84 port 40122 ssh2: ED25519 SHA256:vtAv+bY//ucx6gAep3zsWpb0xGssKiFRrvpJFCJy5SI
 Postponed publickey for op from 198.51.100.84 port 40122 ssh2 [preauth]
 [2026-07-09T21:05:00+00:00] remote-sshd: FATAL: channel-only policy but authorized_keys line 3 lacks a forced command (would grant a shell)
 [2026-07-09T21:05:00+00:00] remote-sshd: WARNING: authorized_keys line 3 without 'restrict' hardening
@@ -82,7 +82,7 @@ _remote_secret_guard "$WORK/clean" >/dev/null 2>&1
 assert_eq "a realistic supervisor+sshd VERBOSE transcript is secret-free (exit 0)" "$?" "0"
 
 # A fingerprint must NOT be treated as a secret (else the guard is unusable here).
-printf 'ED25519 SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU\n' > "$WORK/fp"
+printf 'ED25519 SHA256:vtAv+bY//ucx6gAep3zsWpb0xGssKiFRrvpJFCJy5SI\n' > "$WORK/fp"
 _remote_secret_guard "$WORK/fp" >/dev/null 2>&1
 assert_eq "a host-key FINGERPRINT is not a secret (exit 0)" "$?" "0"
 

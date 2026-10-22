@@ -72,6 +72,15 @@ tmux() {
                     *)  shift ;;
                 esac
             done
+            # Exact targets (your-org/nexus-code#1524): `_unstick.sh` now reads
+            # through `_unstick_exact_target`, which answers the `@<n>` id the
+            # `list-windows` arm below synthesises, or `:=<name>`. Map both back
+            # to the window NAME the pane fixtures are keyed on — a stub that
+            # only knows bare names answers "no pane" to the fixed code.
+            target="${target#:=}"
+            if [[ "$target" =~ ^@([0-9]+)$ ]]; then
+                target=$(printf '%s\n' "$WINDOWS_LIST" | awk -v n="${BASH_REMATCH[1]}" 'NF && ++i == n')
+            fi
             if [[ -n "$target" && -f "$PANES_DIR/$target" ]]; then
                 cat "$PANES_DIR/$target"
                 return 0
@@ -82,21 +91,41 @@ tmux() {
             # Honour the -F format minimally: tests seed WINDOWS_LIST
             # with rows already shaped for the format the unit under
             # test requests. For resolve_window_id's
-            # `-F '#{window_id}\t#{window_name}'` (#323), synthesize a
+            # `-F '#{window_id}<D>#{window_name}'` (#323), synthesize a
             # deterministic @<lineno> id per window so the resolver
             # yields a stable @id the assertions can pin.
+            #
+            # The delimiter is EXTRACTED from the requested format, never
+            # assumed. It used to be hardcoded as a TAB, so when the resolver
+            # moved off TAB (your-org/nexus-code#699 — a C/POSIX locale makes
+            # tmux rewrite a TAB in `-F` output, turning every present window
+            # into a false "absent") this stub kept answering in the old
+            # shape and two assertions failed for a reason that had nothing
+            # to do with what they test. A stub that hardcodes what it claims
+            # to parse is the same defect class as the code under test.
             local F=""
             while (( $# > 0 )); do
                 case "$1" in -F) F="$2"; shift 2 ;; *) shift ;; esac
             done
-            if [[ "$F" == *'#{window_id}'* ]]; then
-                printf '%s\n' "$WINDOWS_LIST" | awk 'NF{printf "@%d\t%s\n", NR, $0}'
+            if [[ "$F" == *'#{window_id}'*'#{window_name}'* ]]; then
+                local d="${F#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
+                printf '%s\n' "$WINDOWS_LIST" | awk -v d="$d" 'NF{printf "@%d%s%s\n", NR, d, $0}'
             else
                 printf '%s\n' "$WINDOWS_LIST"
             fi
             return 0
             ;;
-        send-keys|load-buffer|paste-buffer|delete-buffer|rename-window|set-window-option|kill-window|new-window)
+        new-window)
+            printf '%s %s\n' "$sub" "$*" >> "$ACTIONS"
+            # `-P -F '#{window_id}'` prints the created window's id; the rc=3
+            # contract in `_respawn_spawn_window` reads that handle rather than
+            # a presence-by-NAME probe (your-org/nexus-code#1327). This arm's
+            # `list-windows` sibling above already synthesises `@<n>` ids, so
+            # the vocabulary is not new to this stub — only this arm was silent.
+            printf '@1\n'
+            return 0
+            ;;
+        send-keys|load-buffer|paste-buffer|delete-buffer|rename-window|set-window-option|kill-window)
             printf '%s %s\n' "$sub" "$*" >> "$ACTIONS"
             return 0
             ;;
@@ -152,11 +181,10 @@ RATELIMIT_PROBE="false"
 RATELIMIT_HEURISTIC_MIN="30"
 RATELIMIT_ACK_TIMEOUT_S="60"
 PROBE_MODEL="claude-haiku-4-5-20251001"
-API_ERROR_BACKOFF_MIN="30"
 ON_DIALOG="auto-dismiss"
 export AUTO_UNSTICK WATCHER_WINDOW TARGET UNSTICK_DIR UNSTICK_LOG \
        ACTION_LOG RATELIMIT_PROBE RATELIMIT_HEURISTIC_MIN \
-       RATELIMIT_ACK_TIMEOUT_S PROBE_MODEL API_ERROR_BACKOFF_MIN \
+       RATELIMIT_ACK_TIMEOUT_S PROBE_MODEL \
        ON_DIALOG
 
 # shellcheck source=_unstick.sh
@@ -179,10 +207,23 @@ assert_not_contains "Case D does NOT fire on a non-target window named 'orchestr
 actions_content=$(<"$ACTIONS")
 assert_contains "Case D dismissal pastes into the configured target window" \
     "$actions_content" "paste-buffer"
-assert_contains "Case D paste-buffer targets the configured window" \
-    "$actions_content" "-t $CUSTOM_TARGET"
+# Bare OR exact (`:=<name>`, your-org/nexus-code#1524) — but on the
+# paste-buffer line itself, so a matching Escape elsewhere cannot satisfy it.
+_ttc_paste=$(grep -E '^paste-buffer ' <<<"$actions_content" || true)
+if [[ "$_ttc_paste" =~ -t\ (:=)?${CUSTOM_TARGET}($|[[:space:]]) ]]; then
+    printf '  PASS: %s\n' "Case D paste-buffer targets the configured window"; PASS=$((PASS + 1))
+else
+    printf '  FAIL: %s — paste-buffer line: %s\n' "Case D paste-buffer targets the configured window" "${_ttc_paste:-<none>}" >&2; FAIL=$((FAIL + 1))
+fi
 assert_not_contains "no Case D Escape sent to the 'orchestrator'-named bystander" \
     "$actions_content" "send-keys -t orchestrator Escape"
+# The same bystander in the EXACT spellings #1524 introduced — without these the
+# bare-name row above would pass vacuously against the fixed code. `@3` is the
+# id the list-windows arm synthesises for `orchestrator` (3rd row).
+assert_not_contains "no Case D Escape sent to the bystander by exact name (:=)" \
+    "$actions_content" "send-keys -t :=orchestrator Escape"
+assert_not_contains "no Case D Escape sent to the bystander by window id" \
+    "$actions_content" "send-keys -t @3 Escape"
 
 # Case B heads-up paste: must land in the configured target.
 : > "$ACTIONS"
@@ -192,8 +233,31 @@ _cascade_heads_up_orchestrator 1 "stuck-worker"
 actions_content=$(<"$ACTIONS")
 assert_contains "Case B heads-up pastes into the configured target window" \
     "$actions_content" "paste-buffer"
-assert_contains "Case B paste targets the configured window, not 'orchestrator'" \
-    "$actions_content" "-t $CUSTOM_TARGET"
+# THE PASTE LINE ITSELF, and in the EXACT-window spelling (your-org/nexus-code#1598).
+#
+# This assertion used to grep the whole action log for a bare `-t <target>`, and
+# it was NOT measuring the paste. The bare spelling it matched came from case B's
+# BLIND pre-Enter (`tmux send-keys -t "$target" Enter`, base _unstick.sh), which
+# #1598 removed because an Enter pressed into the orchestrator's pane on no
+# evidence submits whatever is in its input box. The paste has ALWAYS gone
+# through pd_deliver, which targets `:=<name>` — so the old predicate named the
+# paste, matched a different call, and would have passed for a paste aimed
+# anywhere.
+#
+# A BARE `-t <name>` is not a safe target: tmux resolves it by unique PREFIX when
+# the exact window is gone, so a paste aimed at `w` can land on a live `w-sk`
+# (#1524). `:=` is the documented exact form. The assertion is therefore
+# TIGHTENED rather than loosened — it now requires the paste-buffer line to carry
+# the exact spelling positively, which a bare target would NOT satisfy.
+# grep -m1, never `| head`: -m1 stops at the first match with NO PIPELINE, so
+# this site does not join the early-exit-reader population (that population is
+# PINNED by test-early-exit-reader-manifest.sh, and my first draft of this fix
+# joined it — a fix can enlist in a population its author was not thinking
+# about). Same first-match semantics, no writer to take EPIPE, nothing for
+# pipefail to invert (#622).
+paste_line=$(grep -am1 -E "^paste-buffer " <<<"$actions_content")
+assert_contains "Case B paste targets the configured window EXACTLY, not by prefix (#1524)" \
+    "$paste_line" "-t :=$CUSTOM_TARGET"
 
 # ---- 3: idle-probe worker enumeration -------------------------------------
 
@@ -258,12 +322,18 @@ fi
 
 echo '=== main.sh paste_to_target: liveness stamp follows the configured target ==='
 
+# Since your-org/nexus-code#562 paste_to_target is a per-target flock
+# wrapper around _paste_to_target_unlocked — extract BOTH.
 fn_body=$(sed -n '/^paste_to_target() {/,/^}/p' "$_main_sh")
-if [[ -z "$fn_body" ]]; then
-    echo "FAIL: could not extract paste_to_target() from $_main_sh" >&2
+fn_body_unlocked=$(sed -n '/^_paste_to_target_unlocked() {/,/^}/p' "$_main_sh")
+if [[ -z "$fn_body" || -z "$fn_body_unlocked" ]]; then
+    echo "FAIL: could not extract paste_to_target()/_paste_to_target_unlocked() from $_main_sh" >&2
     FAIL=$(( FAIL + 1 ))
 else
     eval "$fn_body"
+    eval "$fn_body_unlocked"
+    # The lock wrapper logs on lock-timeout; provide a no-op logger.
+    declare -F log >/dev/null 2>&1 || log() { :; }
     # paste_to_target now resolves name→@id (#323); provide the real
     # resolver. It calls the `tmux` shell-function stubbed above, which
     # synthesizes @<lineno> ids for the window_id format.

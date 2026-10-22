@@ -1,0 +1,1535 @@
+#!/usr/bin/env bash
+# nexus-root-sensitivity — detect test suites that leak the INHERITED
+# $NEXUS_ROOT (your-org/nexus-code#655, #706, #708).
+#
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS, AND WHY IT IS NOT ANOTHER PASS/FAIL DIFF
+# ---------------------------------------------------------------------------
+#
+# monitor/spawn-worker.sh honours an INHERITED NEXUS_ROOT over its own
+# script-relative root (#577), and exports NEXUS_ROOT into every worker. So a
+# suite that builds a FIXTURE nexus and spawns against it is, inside an agent
+# shell, silently spawning against the OPERATOR'S PRIMARY TREE instead.
+#
+# Four members of this class are known. The existing detectors are both
+# OUTPUT-BASED — they compare exit status / assertion tallies between an
+# `NEXUS_ROOT`-unset and an `NEXUS_ROOT`-exported run:
+#
+#   * .github/workflows/tests.yml, job `inherited-root` — the whole band under
+#     an exported root, every push.
+#   * a human running the band twice and diffing (how #706 and #708 were found).
+#
+# Both are structurally blind to the class's dominant form. Measured on
+# test-worker-nproc-bound.sh with its scrub removed (#655 round 12, reproduced
+# by its skeptic): the re-root FIRES, three spawn rows and three
+# windows/*.json provenance records are written into the inherited tree, and
+# *every assertion still passes* — byte-identical output, rc=0. A PASS/FAIL
+# diff cannot see that, by construction. The suite is SENSITIVE BUT GREEN.
+#
+# The contamination is nonetheless real, and it is an ARTIFACT rather than an
+# opinion: as of 2026-08-05 the operator's primary action log holds 616 spawn
+# rows whose `workdir` is under /tmp/ — 23% of every spawn event it has ever
+# recorded — all carrying `rerooted-from`, across 41 fixture window names.
+#
+# So this tool measures the SIDE EFFECT, not the verdict:
+#
+#   probe   — PRESENT TENSE. Run a suite with NEXUS_ROOT exported to a fresh
+#             decoy nexus root, then diff the decoy tree. Any byte written
+#             into it is a leak, whatever the suite's exit status.
+#   audit   — RETROSPECTIVE. Enumerate members from fixture spawn rows already
+#             in an action log, then re-probe each implicated suite so the
+#             report distinguishes "still leaks" from "leaked once, fixed".
+#
+# ---------------------------------------------------------------------------
+# WHY THE PROPERTY IS TESTED BEHAVIOURALLY AND NOT BY GREPPING FOR A SPELLING
+# ---------------------------------------------------------------------------
+#
+# The property is "this suite controls NEXUS_ROOT for its spawns". It has at
+# least three spellings in this repo — `unset NEXUS_ROOT`, `env -u NEXUS_ROOT`,
+# and pinning `NEXUS_ROOT=<fixture>` at every spawn call site — and #655's own
+# round 12 enumerated the class with `grep 'unset NEXUS_ROOT'`, a SPELLING test
+# standing in for the PROPERTY test. It inflated the candidate set 2.3x (28
+# reported, 12 real) and produced a published false positive, because 16 suites
+# satisfy the property by pinning instead of scrubbing.
+#
+# A lint that greps three spellings instead of one is the same defect with a
+# longer list; the fourth spelling still walks past it. `probe` asserts the
+# property itself, so any spelling that achieves it passes and any that does
+# not fails. `spellings` reproduces the static view for COMPARISON ONLY — it is
+# a diagnostic, never the gate.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES NOT CATCH — stated, not glossed
+# ---------------------------------------------------------------------------
+#
+# This is a WRITE detector. A suite that only READS the inherited root leaks
+# nothing into the decoy and is reported hermetic. test-erofs-escalation.sh
+# (#708) is exactly that shape: it PATH-shadows `sandbox-notify` and
+# locals-env.sh fronts $NEXUS_ROOT/monitor/notifywrap ahead of the stub. That
+# member is caught by the OUTPUT-based `inherited-root` CI job, because the
+# read changed its assertions.
+#
+# The instruments are complements, and the honest coverage statement is:
+#
+#   leak changes assertions   -> caught by `inherited-root` (output-based)
+#   leak writes to the root   -> caught by `probe` (this tool) — for the suites
+#                                its spelling-derived population SELECTS
+#   leak writes through `ng`  -> caught by `attribute` (this tool) — for EVERY
+#                                suite that RAN in the exported band, because
+#                                `ng`'s usage tap names its producer (#720)
+#   leak only READS, silently -> caught by NONE of them. Residual blind spot.
+#
+# Run them all. None alone is a census.
+#
+# ---------------------------------------------------------------------------
+# THE SOURCE ARM'S PRECONDITION (your-org/nexus-code#1431, #1707)
+# ---------------------------------------------------------------------------
+#
+# `probe` also diffs the SOURCE checkout's monitor/.state and reports/, for
+# suites that re-root past the decoy. Until #1707 that diff saw NEW PATHS
+# only, so its verdict carried an unstated precondition: it was sound only
+# from a CLEAN monitor/.state. An append to a file that already existed read
+# hermetic, and in a `band` only the suite that first created a shared file
+# was blamed while every later appender passed.
+#
+# That precondition is REMOVED. Every pre-existing path's size, mtime and
+# inode is snapshotted around each suite, and a file that grew, shrank, was
+# rewritten, replaced or removed gates exactly like a new one — attributed to
+# the suite that ran between the two snapshots, so a serial band blames every
+# appender, not just the creator. What remains is a WEAKER precondition, and
+# it is detected rather than assumed: NOTHING ELSE writes the source root
+# while the probe runs. A configured nexus (config/nexus.yml present — the
+# operator's primary) fails it by construction, so there a modified file is
+# printed UNATTRIBUTED and does not gate; NEW paths gate either way. CI
+# checkouts, worktrees and fresh clones satisfy it. `_src_snapshot` states the
+# residue a stat triple cannot see.
+#
+# ---------------------------------------------------------------------------
+# THE POPULATION QUESTION IS ANSWERED BY RUNNING, NOT BY READING (#1336)
+# ---------------------------------------------------------------------------
+#
+# `band`'s default population, `fixture_suites()`, is a SPELLING predicate —
+# a four-spelling grep for "this suite reaches ng" plus a three-name grep for
+# "this suite spawns". The header above already condemns spelling tests for
+# the VERDICT; the same defect lived one level out, in the POPULATION: a
+# suite invoking `./monitor/ng` bare in command position, one reaching `ng`
+# through `"$_test_dir/../ng"`, and one reaching it through the very verb it
+# tests all walked past the predicate, leaked into the operator's live state,
+# and were outside the gate (#1336's measured members; #1455 was a fourth).
+# Replacing four spellings with seven repeats the mistake with a longer list.
+#
+# The property — "this suite starts a process that resolves state through
+# `_resolve_state_dir`" — is not decidable by reading. It IS decidable by
+# running, and the exported-root CI band already runs EVERY suite with
+# NEXUS_ROOT pointed at the checkout: whatever any of them writes into that
+# checkout's monitor/.state is the run-derived population, at zero extra
+# cost, and `ng`'s usage tap writes each row's producing suite as `src`
+# (watcher/run-tests.sh sets NEXUS_TEST_SUITE per child; #720). `attribute`
+# reads that and GATES on it. So `fixture_suites()` is what it always was —
+# a pre-filter for the EXPENSIVE per-suite decoy probe — and is no longer the
+# gate's only notion of who is in the class.
+#
+# Two files carry the producer field and are gated: `ng-usage.jsonl` (`src`,
+# #720) and `longjob/arming.log` (column 5, written by
+# `_longjob-plugin.sh:_lj_plugin_log` from the same NEXUS_TEST_SUITE). The
+# second joined after the bundle-2609 soak measured 17 fixture rows in the
+# operator's LIVE arming.log — rows this gate printed as UNATTRIBUTED and did
+# not flip on, in exactly the file an agent is sent to for a diagnosis.
+#
+# What `attribute` cannot see, stated: a write into the inherited root that
+# carries no producer field — the tmux wrapper's refusal logs, `_trash.sh`'s
+# `.trash/<stamp>` entries, a spawn row — is printed as UNATTRIBUTED and does
+# not flip the exit code. Those need a producer field of their own before
+# they can gate; until then they are a warning a reader must chase.
+#
+# Usage:
+#   monitor/nexus-root-sensitivity.sh probe <suite.sh>...
+#   monitor/nexus-root-sensitivity.sh band [--timeout N] [--shard K/N] [suite.sh...]
+#   monitor/nexus-root-sensitivity.sh select [--shard K/N]
+#   monitor/nexus-root-sensitivity.sh attribute <root>
+#   monitor/nexus-root-sensitivity.sh audit [--log PATH] [--no-verify]
+#   monitor/nexus-root-sensitivity.sh spellings [suite.sh...]
+#   monitor/nexus-root-sensitivity.sh self-test
+#
+# Exit: 0 = no leak among suites that produced evidence
+#       1 = at least one suite leaked
+#       2 = usage / environment error
+#       3 = incomplete: a suite timed out or declined to run, so the run is
+#           NOT a clean bill of health (never reported as 0).
+
+set -uo pipefail
+
+PROG=${0##*/}
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+TIMEOUT_SECS=${NRS_TIMEOUT:-420}
+MAX_LEAK_LINES=${NRS_MAX_LEAK_LINES:-25}
+KEEP_DECOY=0
+VERIFY=1
+SHARD=""
+AUDIT_LOG=""
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+say() { printf '%s\n' "$*"; }
+
+loadavg() { cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo 'n/a'; }
+
+# ---------------------------------------------------------------------------
+# Decoy construction.
+#
+# The decoy is the WHOLE TRACKED WORKING TREE, mirroring the CI job's
+# "$GITHUB_WORKSPACE is a sufficient decoy root" reasoning. It is not a
+# convenience choice — it is the difference between a measurement and a false
+# negative, and this tool's own first self-test proved it:
+#
+#   A decoy of monitor/ + config/ ALONE satisfies spawn-worker.sh's
+#   `_sw_root_is_nexus` predicate (`-x $root/monitor/spawn-worker.sh` and
+#   `-d $root/config`, spawn-worker.sh:598) and the re-root FIRES — but the
+#   spawn then dies at `spawn-worker: floor file missing:
+#   $decoy/skills/nexus.worker-defaults/SKILL.md` with rc=2, BEFORE writing any
+#   state. Nothing leaks, and the known positive comes back `hermetic`.
+#
+# So `_sw_root_is_nexus` is NECESSARY BUT NOT SUFFICIENT for a decoy. A thin
+# decoy does not merely under-report; it reports the exact opposite of the
+# truth, silently, on the one suite we already know is a member. `probe_vacuity_guard`
+# below is the backstop for the general case, since the next required path is
+# not something this file can enumerate ahead of time either.
+#
+# Tracked files only: node_modules/ and locals/ are gitignored and absent from
+# a GitHub checkout too, so their absence here is faithful rather than a gap.
+# The ONE gitignored file that is planted is `config/nexus.yml`, naming the
+# decoy as its own `nexus.root` — see the block inside, and #1349.
+# ---------------------------------------------------------------------------
+make_decoy() {
+    local dest="$1"
+    mkdir -p "$dest" || return 1
+
+    local list; list=$(mktemp "${TMPDIR:-/tmp}/nrs-files-XXXXXX")
+    if git -C "$REPO_ROOT" ls-files -z > "$list" 2>/dev/null && [ -s "$list" ]; then
+        tar -C "$REPO_ROOT" --null -T "$list" --ignore-failed-read -cf - 2>/dev/null \
+            | tar -xf - -C "$dest" 2>/dev/null
+    else
+        # Not a git checkout — fall back to the two directories that at least
+        # satisfy the predicate, and let the vacuity guard catch the shortfall.
+        cp -a "$REPO_ROOT/monitor" "$dest/" 2>/dev/null
+        cp -a "$REPO_ROOT/config"  "$dest/" 2>/dev/null
+    fi
+    rm -f "$list"
+
+    # A decoy carrying the source tree's own .state would make the baseline
+    # snapshot noisy and could mask a leak inside an already-large file. So the
+    # CONTENTS go — but the DIRECTORY is recreated EMPTY, and that is not a
+    # detail (your-org/nexus-code#833).
+    #
+    # Deleting the directory outright made this probe structurally blind to
+    # every leak that only writes into a directory that ALREADY EXISTS, and the
+    # operator's live tree always has one. `ng`'s usage tap is exactly that
+    # shape: `[[ -n "$verb" && -d "$STATE_DIR" ]] || return 0` — it never
+    # creates its state dir, it only appends when one is there. Measured, same
+    # suite, same exported root, the only difference being this directory:
+    #
+    #   root without monitor/.state -> no write at all      -> "hermetic"
+    #   root with    monitor/.state -> 13 rows appended      -> LEAK
+    #
+    # So `test-ng-report-check.sh` and `test-ng-reply-repo.sh` were reported
+    # hermetic by this tool while demonstrably writing into the inherited root
+    # on a CI runner (#720's attribution). The verdict was not wrong about what
+    # it looked at; the decoy was missing the condition the class needs.
+    rm -rf "$dest/monitor/.state"
+    mkdir -p "$dest/monitor/.state"
+
+    # THE DECOY MUST NAME ITSELF IN config/nexus.yml (your-org/nexus-code#1349).
+    # `config/nexus.yml` is gitignored, so a tracked-files decoy has none, and
+    # `config/load.sh nexus.root` in it answers nexus.example.yml's placeholder
+    # `/path/to/nexus`. That matters because the STATE-class resolver chain
+    # (`ng`, `obligations.sh`, `request-channel.sh`, `skeptic-channel.sh`,
+    # `paste-followup.sh`) is FOUR arms — NEXUS_STATE_DIR, NEXUS_ROOT, config
+    # nexus.root, script-relative — and a suite "fixed" by `env -u NEXUS_ROOT`
+    # advances to arm 3. On the operator's primary, arm 3 IS the primary, so
+    # the suite writes into live state at home; in a placeholder-rooted decoy,
+    # arm 3 points at a directory that does not exist, `ng`'s usage tap
+    # (`[[ -d "$STATE_DIR" ]]`) no-ops, NOTHING is written, and this probe
+    # reported the suite HERMETIC — a false negative produced by following the
+    # gate's own remediation text. With the decoy naming itself, arm 3 lands
+    # in `$dest/monitor/.state` and the leak is visible. The plant is the
+    # tracked template with ONLY nexus.root rewritten, so every other key
+    # (github.repo, …) resolves exactly as it did before.
+    if [ -f "$dest/config/nexus.example.yml" ]; then
+        sed "s|^\([[:space:]]*root:[[:space:]]*\)/path/to/nexus[[:space:]]*\$|\1$dest|" \
+            "$dest/config/nexus.example.yml" > "$dest/config/nexus.yml" 2>/dev/null \
+            || rm -f "$dest/config/nexus.yml"
+    fi
+    # Verified behaviourally, not by grep: the loader itself must answer the
+    # decoy. A decoy that cannot is still a valid SPAWN-class decoy, so this
+    # warns rather than refuses — but it says so, because a silent downgrade
+    # is the class this tool exists to detect.
+    local _seen_root=""
+    if [ -x "$dest/config/load.sh" ]; then
+        _seen_root=$(env -u NEXUS_ROOT -u NEXUS_CONFIG "$dest/config/load.sh" nexus.root 2>/dev/null) || _seen_root=""
+    fi
+    if [ "$_seen_root" != "$dest" ]; then
+        printf '%s: WARNING — decoy config/nexus.yml does not resolve nexus.root to the decoy (got %s); the STATE-class arm-3 leak (#1349) is NOT observable in this probe\n' \
+               "$PROG" "${_seen_root:-<empty>}" >&2
+    fi
+
+    [ -d "$dest" ] && [ -x "$dest/monitor/spawn-worker.sh" ] && [ -d "$dest/config" ] || {
+        printf '%s: decoy at %s does NOT satisfy _sw_root_is_nexus — probe would be vacuous\n' \
+               "$PROG" "$dest" >&2
+        return 1
+    }
+    return 0
+}
+
+# Did the run prove anything? A suite whose spawns died because the DECOY was
+# missing a file cannot leak, and reporting that as `hermetic` is a false
+# negative dressed as a clean bill of health — the precise failure this tool
+# exists to retire, one level up. Any complaint naming the decoy path alongside
+# a missing/not-found signal means the probe was vacuous, and it says so.
+probe_vacuity_guard() {
+    local out="$1" decoy="$2"
+    # `<<<` rather than a pipe into `grep -q`: a -q grep exits at its first
+    # match and SIGPIPEs the upstream reader, which is a red under
+    # test-sigpipe-assertion-lint.sh.
+    grep -qiE 'missing|not found|no such file|cannot (open|read|find)|unreadable' \
+        <<<"$(grep -F -- "$decoy" "$out" 2>/dev/null)"
+}
+
+# Snapshot every path under the decoy: type, relative path, and for regular
+# files a content hash. Content-hashing rather than mtime/size alone because a
+# same-size in-place rewrite within one second is a real leak shape and stat
+# granularity would miss it.
+snapshot() {
+    local root="$1" out="$2"
+    {
+        find "$root" -mindepth 1 -type f -print0 2>/dev/null \
+            | sort -z \
+            | xargs -0 -r md5sum 2>/dev/null \
+            | sed "s|$root/||"
+        find "$root" -mindepth 1 \( -type d -o -type l \) -printf 'DIR-OR-LINK %P\n' 2>/dev/null \
+            | sort
+    } > "$out" 2>/dev/null
+    return 0
+}
+
+# _src_snapshot <root> — one TSV row per path under <root>/monitor/.state and
+# <root>/reports: `path  type  size  mtime  inode`, byte-sorted by path.
+# Directories carry `-` for the three stat fields: a directory's mtime moves
+# whenever an entry is added or removed, which the path set already reports,
+# so counting it again would only double-count the same write.
+#
+# STAT, NOT A CONTENT HASH, AND THAT IS A MEASURED CHOICE (your-org/nexus-code#1707).
+# The arm's job is "did this suite write into a file that was already there",
+# and every write(2) moves the file's mtime: measured 2026-10-01, a same-size
+# rewrite one process launch after the first write moved %T@ by 0.39 s on
+# tmpfs and by 0.015 s on this host's NFS, which reports microseconds. Size
+# catches an append whatever the clock does; inode catches a tmp+mv
+# replacement. Hashing every pre-existing file would cost O(state size) per
+# probe to detect only the residue the triple misses: a SAME-SIZE rewrite on
+# the SAME inode whose mtime was explicitly restored (utime/`touch -d`), or one
+# landing inside the filesystem's timestamp tick of the BEFORE snapshot. That
+# residue is a stated boundary, not a gap nobody looked at.
+_src_snapshot() {
+    local root="$1" d
+    for d in monitor/.state reports; do
+        [ -d "$root/$d" ] || continue
+        find "$root/$d" -mindepth 1 -printf "$d/%P\t%y\t%s\t%T@\t%i\n" 2>/dev/null
+    done | awk -F'\t' 'BEGIN{OFS="\t"} $2=="d"{$3="-";$4="-";$5="-"} {print}' \
+         | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -u
+}
+
+# _src_changes <before> <after> — every way the source tree moved, one line
+# each: `NEW <path>`, `REMOVED <path>`, `GREW +<n>B <path>`,
+# `SHRANK -<n>B <path>`, `REPLACED <path>` (new inode), `REWRITTEN <path>`
+# (same size, same inode, mtime moved), `RETYPED <path>`.
+#
+# The #1431 arm counted NEW paths only (`comm -13` over the path set), so an
+# APPEND to a file that already existed read HERMETIC (#1707): in one band the
+# suite that first CREATED monitor/.state/longjob/arming.log was blamed and
+# every later suite appending rows to it passed, and a single probe was sound
+# only from a clean monitor/.state. Each probe diffs ITS OWN before/after pair,
+# so in a serial band every change is attributed to the suite that ran
+# between the two snapshots, appenders included.
+_src_changes() {
+    # FILENAME, not the `NR == FNR` idiom: with an EMPTY before-file (a clean
+    # monitor/.state) NR == FNR stays true through the AFTER file, and every
+    # new path was read as a before-row and printed REMOVED — which a quiet
+    # root gates anyway, and a contended one demoted to UNATTRIBUTED.
+    awk -F'\t' '
+        FILENAME == ARGV[1] { b[$1] = $0; next }
+        {
+            if (!($1 in b)) { print "NEW " $1; next }
+            split(b[$1], o, "\t"); delete b[$1]
+            if (o[2] != $2)      print "RETYPED " $1
+            else if ($2 == "d")  next
+            else if (o[3] != $3) printf "%s %s%dB %s\n", ($3 > o[3] ? "GREW" : "SHRANK"), ($3 > o[3] ? "+" : "-"), ($3 > o[3] ? $3 - o[3] : o[3] - $3), $1
+            else if (o[5] != $5) print "REPLACED " $1
+            else if (o[4] != $4) print "REWRITTEN " $1
+        }
+        END { for (p in b) print "REMOVED " p }
+    ' "$1" "$2" | LC_ALL=C sort -k2
+}
+
+# _src_contended <root> — is something OTHER than this probe writing into
+# <root>'s state while it runs? Only then is a change there unattributable.
+#
+# The discriminator is STRUCTURAL: `config/nexus.yml` is gitignored, so a CI
+# checkout, a worktree and a fresh clone never have one, and a configured
+# nexus — the operator's primary, where the watcher and every agent's `ng`
+# append to monitor/.state continuously — always does. Its error direction,
+# stated: a configured nexus whose watcher is down and whose agents are idle
+# is called contended anyway, which DEMOTES its modification evidence to
+# unattributed (never to hermetic, and never hides a NEW path); a tree written
+# by something this file cannot see while lacking nexus.yml is called quiet,
+# and then that writer's churn is blamed on the suite — the loud direction.
+# NRS_SOURCE_CONTENDED=0|1 overrides it, which is how the tests reach both arms.
+_src_contended() {
+    case "${NRS_SOURCE_CONTENDED:-}" in
+        1) return 0 ;; 0) return 1 ;;
+    esac
+    [ -e "$1/config/nexus.yml" ]
+}
+
+# WHEN the discriminator is read matters as much as WHAT it reads
+# (your-org/nexus-code#1718). It used to be read AFTER the suite ran, and
+# config/nexus.yml is outside `_src_snapshot`'s scope — so a suite that PLANTED
+# one demoted its own appends to UNATTRIBUTED and read hermetic, and in a band
+# every later suite inherited the demotion: measured, two appending suites gave
+# rc 0, `hermetic 2`, `leaked-at-source 0`. That is the SILENT direction the
+# error statement above promises never to take. So `probe_one` samples it at
+# the BEFORE-snapshot, `run_probes` samples it ONCE before the first suite and
+# holds it for the band (NRS_BAND_CONTENDED), and a config/nexus.yml that
+# APPEARS during a probe is itself reported as a NEW source path.
+_src_contended_at_start() {
+    case "${NRS_BAND_CONTENDED:-}" in
+        1) return 0 ;; 0) return 1 ;;
+    esac
+    _src_contended "$1"
+}
+
+# _pgrp_alive <pgid> — pids still alive (not zombies) in process group <pgid>
+# AND in this shell's session, one per line (your-org/nexus-code#1718).
+#
+# The suite runs under `timeout`, which makes itself a process-group leader, so
+# everything the suite started and did not detach shares that group. Selected
+# by pgid + session, NEVER by argv: a suite's argv is not unique to it (#851),
+# and the session check keeps a recycled group number from naming a stranger.
+# A child that left the group on purpose (setsid, setpgid — a tmux server, a
+# daemon) is NOT seen: that is the stated boundary of the straggler wait.
+_pgrp_alive() {
+    local pgid="$1" sid
+    sid=$(ps -o sess= -p "$$" 2>/dev/null | tr -d ' ')
+    [ -n "$sid" ] || return 0
+    ps -e -o pgid=,sess=,stat=,pid= 2>/dev/null \
+        | awk -v g="$pgid" -v s="$sid" '$1 == g && $2 == s && $3 !~ /^Z/ { print $4 }'
+}
+
+# ---------------------------------------------------------------------------
+# _nrs_marker_reason <suite> <marker-name>
+#
+# The ONE parser for both exemption markers (`allow-inherited-root`,
+# `allow-source-leak`). Prints the reason and returns 0 when the suite
+# DECLARES the marker; prints nothing and returns 1 when it does not; prints
+# nothing and returns 2 when the marker is present but carries NO reason.
+#
+# ANCHORED AS A COMMENT AT LINE START, and that is the whole point
+# (your-org/nexus-code#1454). The first version was `grep -m1 -F '<marker>'`
+# over the whole file — so a suite that merely QUOTED the marker (a fixture
+# literal in a `mk_target '...'` argument, a heredoc, a comment ABOUT the
+# marker) was read as declaring it, and whatever followed the string up to end
+# of line became a non-empty "reason". The gate's own unit suite, a band
+# member, plants both markers as fixture DATA and was therefore self-exempt on
+# BOTH arms: a real leak from it would have read ALLOWED with a reason ending
+# in the shell literal's `' \` — which is the tell, and how it was found.
+#
+#   a fixture that contains the construct it tests is indistinguishable from
+#   the construct itself to any predicate that does not anchor.
+#
+# The reason separator is matched as a TOKEN (`—`, `–`, `-`, `:`) rather than
+# a character class: under a C locale a bracket expression is byte-wise, so
+# `[—-]` stripped two bytes of a three-byte en dash and left a stray byte as a
+# "non-empty" reason. NRS_MARKER_TEST exists so a test can ask the parser
+# directly (`marker-reason <suite> <name>`) without running a probe.
+# ---------------------------------------------------------------------------
+_nrs_marker_reason() {
+    local suite="$1" name="$2" line reason
+    line=$(grep -m1 -E "^[[:space:]]*#[[:space:]]*nexus-root-sensitivity:[[:space:]]*${name}([^[:alnum:]_-]|$)" "$suite" 2>/dev/null) || return 1
+    [ -n "$line" ] || return 1
+    reason=$(sed -E "s/^[[:space:]]*#[[:space:]]*nexus-root-sensitivity:[[:space:]]*${name}//" <<<"$line" \
+             | sed -E 's/^[[:space:]]*(—|–|-+|:)?[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$reason" ] || return 2
+    printf '%s' "$reason"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# probe_one <suite-path>
+#
+# Prints one TSV record on stdout:
+#   <suite>\t<verdict>\t<rc>\t<tally>\t<leaked-paths-count>\t<loadavg>
+# and a human block on fd 3 (collected by the caller).
+#
+# verdict: LEAK | LEAK-AT-SOURCE | ALLOWED | ALLOWED-AT-SOURCE | hermetic | SKIP | ENVSKIP | TIMEOUT | VACUOUS
+# ---------------------------------------------------------------------------
+probe_one() {
+    local suite="$1"
+    local rel="${suite#"$REPO_ROOT"/}"
+    local work decoy before after rc out tally verdict leaked_n la_before
+    local marker_reason=""
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/nrs-XXXXXX") || { echo "mktemp failed" >&2; return 2; }
+    decoy="$work/decoy"
+    before="$work/before.txt"; after="$work/after.txt"; out="$work/out.txt"
+
+    if ! make_decoy "$decoy"; then
+        rm -rf "$work"; return 2
+    fi
+    snapshot "$decoy" "$before"
+    # THE SOURCE CHECKOUT IS SNAPSHOTTED TOO (your-org/nexus-code#1431). A suite
+    # that re-roots itself from BASH_SOURCE (`export NEXUS_ROOT="$_repo_root"`)
+    # overrides the probe's NEXUS_ROOT before any child runs, so every child's
+    # resolver answers the SOURCE tree: nothing lands in the decoy, nothing in
+    # the output names the decoy, and the suite read HERMETIC while writing
+    # into the checkout's live monitor/.state (measured: heartbeat/w1.json, 84
+    # bytes, created in the checkout by a suite this probe called clean). So
+    # the two directories such a write can reach — monitor/.state and reports/
+    # under the SOURCE root — are diffed as well, and a NEW file there is the
+    # distinct verdict LEAK-AT-SOURCE, which GATES like LEAK. The arm's first
+    # CI run (PR #1449, job 101067989046) found `test-link-nexus-tools.sh`
+    # writing `monitor/.state/.trash/…` into the checkout through `_trash.sh`'s
+    # BASH_SOURCE-rooted default (#1451); that suite carries the per-suite
+    # `allow-source-leak` marker naming #1451 until it lands, and everyone
+    # else stays gated.
+    #
+    # A MODIFIED pre-existing file is a write too (your-org/nexus-code#1707).
+    # The arm used to count NEW paths only, on the argument that an operator's
+    # primary appends to existing files continuously. That made an APPEND
+    # invisible everywhere, not just on the primary: a probe was sound only
+    # from a clean monitor/.state, and in a band only the suite that first
+    # created a shared file was blamed. So every pre-existing file's
+    # size/mtime/inode is snapshotted too and any change gates — EXCEPT in a
+    # CONTENDED root (`_src_contended`: a configured nexus other writers share),
+    # where a modification cannot be attributed to this suite and is printed
+    # as UNATTRIBUTED instead of gating. NEW paths gate in both.
+    # NRS_SOURCE_ROOT exists so this arm is testable against a planted root.
+    local src_root="${NRS_SOURCE_ROOT:-$REPO_ROOT}"
+    local src_before="$work/src-before.txt" src_after="$work/src-after.txt"
+    _src_snapshot "$src_root" > "$src_before" 2>/dev/null
+    # Contention is sampled HERE, before the suite can change the answer (#1718).
+    local src_contended=0 src_cfg_before=0
+    _src_contended_at_start "$src_root" && src_contended=1
+    [ -e "$src_root/config/nexus.yml" ] && src_cfg_before=1
+
+    # Tripwire: no record referencing THIS DECOY may appear in the REAL state
+    # directory. Contaminating the operator's canonical state is exactly the
+    # harm this tool measures, so it is worth a check — but the check must be
+    # attributable, and its coverage must be stated (see AXIS below).
+    #
+    # It used to compare the action log's LINE COUNT before and after, and that
+    # is unsound on a live primary: the orchestrator writes to that log
+    # continuously, so a multi-minute probe races it. It fired on the first
+    # real run and the growth was two unrelated `paste-followup` rows for
+    # another window — a false positive of exactly the "silence/noise used as
+    # a proxy" shape this chain keeps paying for. Match on the decoy path
+    # instead; that cannot be produced by anyone but this probe.
+
+    la_before=$(loadavg)
+
+    # env -i is deliberately NOT used: the point is to reproduce the AGENT's
+    # environment, which is where this class bites.
+    #
+    # NEXUS_LOCALS moves WITH NEXUS_ROOT. Leaving it pointing at the operator's
+    # real locals/ defeats the isolation in a way that reads as a clean result:
+    # bash_env.sh fronts $NEXUS_LOCALS/bin, so a bare `ng` in a suite resolves
+    # to the PRIMARY's wrapper and writes to the PRIMARY's state — off the
+    # decoy entirely, so the probe sees nothing and reports `hermetic`. The
+    # canonical drive (`env -u NEXUS_ROOT -u NEXUS_LOCALS`) and CI's unit cells
+    # (tests.yml `unit`) both treat the two as one axis, and so must this.
+    #
+    # NEXUS_STATE_DIR is SCRUBBED (your-org/nexus-code#1349, #1386). It is arm
+    # 1 of the STATE-class chain and unconditional, so an ambient pin from the
+    # agent's shell — the very remedy #1349 prescribes for ad-hoc tooling —
+    # would catch every `ng` write the suite makes and route it OFF the decoy,
+    # and every suite would probe `hermetic` regardless of what it does. A
+    # suite that pins its own is unaffected: it sets the variable itself.
+    #
+    # `&` + `wait` rather than a foreground call only to learn timeout's pid,
+    # which is the suite's process-group id (see `_pgrp_alive`). `<&0` keeps
+    # the suite's stdin what it was: an async command in a non-interactive
+    # shell otherwise gets /dev/null.
+    local tpid
+    timeout -k 10 "$TIMEOUT_SECS" \
+        env -u NEXUS_STATE_DIR NEXUS_ROOT="$decoy" NEXUS_LOCALS="$decoy/locals" \
+            bash "$suite" >"$out" 2>&1 <&0 &
+    tpid=$!
+    wait "$tpid"
+    rc=$?
+
+    # STRAGGLERS (your-org/nexus-code#1718). Every change between the two
+    # snapshots is blamed on this suite, so a process it left running would
+    # otherwise write AFTER the after-snapshot and be blamed on the NEXT suite
+    # — loudly in the default case, silently if that suite carries
+    # allow-source-leak. So the after-snapshot waits, BOUNDED by
+    # NRS_STRAGGLER_GRACE seconds, for the suite's process group to drain,
+    # and kills what is left at the deadline (TERM, then KILL), exactly as
+    # `timeout` does to the same group on expiry. Either way the next suite's
+    # window starts clean. Reported, not gated: the write a straggler makes
+    # inside the grace is caught by the diff below like any other.
+    local strag_grace="${NRS_STRAGGLER_GRACE:-10}" strag="" strag_n=0 strag_t0=$SECONDS
+    [[ "$strag_grace" =~ ^[0-9]+$ ]] || strag_grace=10
+    strag=$(_pgrp_alive "$tpid")
+    if [ -n "$strag" ]; then
+        strag_n=$(grep -c . <<<"$strag")
+        while [ -n "$strag" ] && (( SECONDS - strag_t0 < strag_grace )); do
+            sleep 0.2; strag=$(_pgrp_alive "$tpid")
+        done
+        if [ -n "$strag" ]; then
+            kill -TERM -- "-$tpid" 2>/dev/null
+            local _k
+            for _k in 1 2 3 4 5 6 7 8 9 10; do
+                strag=$(_pgrp_alive "$tpid"); [ -n "$strag" ] || break; sleep 0.2
+            done
+            [ -z "$strag" ] || kill -KILL -- "-$tpid" 2>/dev/null
+            strag="killed"
+        else
+            strag="exited"
+        fi
+    fi
+
+    snapshot "$decoy" "$after"
+
+    # AXIS, stated because a tripwire's silence is worth exactly what its
+    # coverage is: this scans EVERY file under the real .state directory (not
+    # just action-log.jsonl, which was the first version's blind spot), and it
+    # matches on the DECOY PATH. So it sees any write that RECORDS a path, and
+    # it is blind to a write that records none — `notify-decisions.jsonl` and
+    # `ng-usage.jsonl` rows carry a window and a message, not a root, so a leak
+    # into those files would not trip this. Do not quote its silence as "the
+    # primary was not written to"; quote it as "no path-bearing row named this
+    # decoy". The real containment is NEXUS_ROOT/NEXUS_LOCALS both pointing at
+    # the decoy; this is defence in depth with a known edge.
+    local real_state="${NEXUS_ROOT:-}/monitor/.state"
+    if [ -d "$real_state" ] \
+       && grep -rqlF -- "$decoy" "$real_state" 2>/dev/null; then
+        printf '%s: FATAL — a record naming this decoy reached the REAL state dir %s\n' \
+               "$PROG" "$real_state" >&2
+        printf '%s: during the probe of %s. The decoy did not contain the write.\n' "$PROG" "$rel" >&2
+        grep -rlF -- "$decoy" "$real_state" 2>/dev/null | head -5 | sed 's/^/    /' >&2
+        # `exit` here would only leave the command substitution this function
+        # runs inside — the caller would sail on. Drop a sentinel the caller
+        # checks instead. (Observed: an `exit 2` here was swallowed and the
+        # band continued to completion.)
+        : > "${NRS_ABORT_SENTINEL:-/dev/null}"
+        rm -rf "$work"
+        return 2
+    fi
+
+    local leakfile="$work/leak.txt"
+    diff "$before" "$after" 2>/dev/null | grep -E '^[<>]' > "$leakfile"
+    leaked_n=$(grep -c . "$leakfile" ; true)
+    leaked_n=${leaked_n%%[!0-9]*}
+    : "${leaked_n:=0}"
+
+    # #1431 + #1707: every change under the SOURCE root's monitor/.state and
+    # reports/ — new paths AND modified, replaced or removed pre-existing ones.
+    _src_snapshot "$src_root" > "$src_after" 2>/dev/null
+    local srcchg="$work/src-changes.txt" srcleak="$work/src-leak.txt" srcunattr="$work/src-unattr.txt"
+    _src_changes "$src_before" "$src_after" > "$srcchg" 2>/dev/null
+    # A configuration that APPEARED is a write into the source checkout, and
+    # the one write that would otherwise switch this arm off (#1718).
+    if [ "$src_cfg_before" = 0 ] && [ -e "$src_root/config/nexus.yml" ]; then
+        printf 'NEW config/nexus.yml\n' >> "$srcchg"
+    fi
+    if [ "$src_contended" = 1 ]; then
+        grep -E '^NEW ' "$srcchg" > "$srcleak"
+        grep -vE '^NEW ' "$srcchg" > "$srcunattr"
+    else
+        cp "$srcchg" "$srcleak"
+        : > "$srcunattr"
+    fi
+    local srcleak_n srcunattr_n
+    srcleak_n=$(grep -c . "$srcleak"; true); srcleak_n=${srcleak_n%%[!0-9]*}; : "${srcleak_n:=0}"
+    srcunattr_n=$(grep -c . "$srcunattr"; true); srcunattr_n=${srcunattr_n%%[!0-9]*}; : "${srcunattr_n:=0}"
+
+    tally=$(grep -oE '=== summary: [0-9]+ passed, [0-9]+ failed ===' "$out" | tail -1)
+    [ -n "$tally" ] || tally=$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$out" | tail -1)
+    [ -n "$tally" ] || tally='(no tally)'
+
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        verdict=TIMEOUT
+    elif [ "$rc" -eq 77 ]; then
+        verdict=SKIP            # declined to run: NO EVIDENCE, not a clean bill
+    elif [ "$rc" -eq 69 ]; then
+        # ENVSKIP (your-org/nexus-code#1283): the suite RAN, asserted, and then
+        # found the MACHINE unable to supply what it needed. Like SKIP this is
+        # NO EVIDENCE — it just says something different about WHY.
+        #
+        # WITHOUT THIS ARM A 69 FALLS PAST EVERY ARM TO `else verdict=hermetic`,
+        # i.e. a CLEAN BILL OF HEALTH for a suite that produced no evidence —
+        # in the tool whose own exit-code note says a run that MEASURED NOTHING
+        # must never return 0. The `rc != 0` shape that catches an unknown code
+        # in run-tests.sh has no counterpart here: this classifier's terminal
+        # arm is PERMISSIVE, so a new exit code is absorbed as a pass rather
+        # than refused. Adding the token is the whole fix; the arm order is
+        # irrelevant because every arm here is literal equality on `$rc`.
+        verdict=ENVSKIP
+    elif [ "$srcleak_n" -gt 0 ]; then
+        # your-org/nexus-code#1431: the write went PAST the decoy into the
+        # source checkout. This is the direction the decoy diff cannot see,
+        # and it is checked BEFORE the decoy arm so a suite that leaks into
+        # BOTH is reported on the axis that was invisible. It GATES BY
+        # DEFAULT, exactly like LEAK. The ONLY exemption is the same mechanism
+        # the decoy arm already proves out — a PER-SUITE, REASON-REQUIRED
+        # marker, `nexus-root-sensitivity: allow-source-leak — <reason>` —
+        # which keeps the known leaker VISIBLE and ATTRIBUTED (printed under
+        # its own heading, counted) while everyone else stays gated. A global
+        # off-switch was the first cut and was refused (w221sk on PR #1449):
+        # "we disabled the guard" and "we know about this one, here is why,
+        # and everything else is still watched" are not the same mechanism,
+        # and only the second survives a leak nobody has met yet. The
+        # allow-inherited-root marker does NOT reach here: it argues about
+        # writes into an INHERITED root, and a BASH_SOURCE re-root is the
+        # suite choosing the checkout, which needs its own argument.
+        verdict=LEAK-AT-SOURCE
+        local sreason srrc=0
+        sreason=$(_nrs_marker_reason "$suite" allow-source-leak) || srrc=$?
+        if [ "$srrc" -eq 0 ]; then
+            verdict=ALLOWED-AT-SOURCE
+            marker_reason="$sreason"
+        elif [ "$srrc" -eq 2 ]; then
+            marker_reason="INVALID: allow-source-leak marker present but carries no reason"
+        fi
+    elif [ "$leaked_n" -gt 0 ]; then
+        # THE THIRD DISJUNCT of round 12's `scrub OR pin OR explicit marker`,
+        # wired into the GATE rather than only into the `spellings` diagnostic.
+        # It was advertised in the remediation text for four commits while
+        # nothing read it — a remediation instruction that does not work is
+        # worse than none, because the author follows it and the gate still
+        # reddens.
+        #
+        # The reason is REQUIRED. A bare marker is an unexplained exemption,
+        # and the whole point of an opt-out is that someone wrote down why; a
+        # marker with nothing after it is reported as invalid and still LEAKs.
+        verdict=LEAK
+        local reason mrrc=0
+        reason=$(_nrs_marker_reason "$suite" allow-inherited-root) || mrrc=$?
+        if [ "$mrrc" -eq 0 ]; then
+            verdict=ALLOWED
+            marker_reason="$reason"
+        elif [ "$mrrc" -eq 2 ]; then
+            marker_reason="INVALID: marker present but carries no reason"
+        fi
+    elif probe_vacuity_guard "$out" "$decoy"; then
+        # No leak, but the run complained that the DECOY was incomplete — so
+        # "no leak" is not a finding. Never silently downgraded to hermetic.
+        verdict=VACUOUS
+    else
+        verdict=hermetic
+    fi
+
+    {
+        printf '\n--- %s\n' "$rel"
+        printf '    verdict=%s rc=%s tally=[%s] loadavg=[%s] leaked-paths=%s\n' \
+               "$verdict" "$rc" "$tally" "$la_before" "$leaked_n"
+        if [ "$verdict" = LEAK-AT-SOURCE ] || [ "$verdict" = ALLOWED-AT-SOURCE ]; then
+            printf '    *** WROTE INTO THE SOURCE CHECKOUT, not the decoy (#1431) — a BASH_SOURCE re-root walks past NEXUS_ROOT: pin NEXUS_STATE_DIR in the suite.\n' >&3
+            printf '    changes under %s (first %s):\n' "$src_root" "$MAX_LEAK_LINES" >&3
+            head -n "$MAX_LEAK_LINES" "$srcleak" | sed 's/^/      > /' >&3
+            if [ "$verdict" = ALLOWED-AT-SOURCE ]; then
+                printf '    ALLOWED-AT-SOURCE by an explicit marker — reason: %s\n' "$marker_reason" >&3
+            elif [ -n "$marker_reason" ]; then
+                printf '    marker REJECTED — %s\n' "$marker_reason" >&3
+            fi
+        fi
+        if [ -n "$strag" ]; then
+            printf '    STRAGGLER — %s: %s process(es) of this suite'"'"'s process group outlived it (#1718); the after-snapshot\n' "$strag" "$strag_n"
+            printf '    waited up to %ss for them, so their writes are attributed HERE and never to the next suite.\n' "$strag_grace"
+        fi
+        if [ "$srcunattr_n" -gt 0 ]; then
+            # Printed whatever the verdict: a demotion is not an absence.
+            printf '    UNATTRIBUTED — %s pre-existing path(s) under %s changed during this probe, but the root is CONTENDED\n' "$srcunattr_n" "$src_root"
+            printf '    (a configured nexus other writers share; #1707), so they are NOT counted against this suite. First %s:\n' "$MAX_LEAK_LINES"
+            head -n "$MAX_LEAK_LINES" "$srcunattr" | sed 's/^/      ? /'
+            printf '    Probe from a worktree or a fresh clone to make these attributable.\n'
+        fi
+        if [ "$verdict" = LEAK ] || [ "$verdict" = ALLOWED ] \
+           || { [ "$leaked_n" -gt 0 ] && [[ "$verdict" = *-AT-SOURCE ]]; }; then   # both roots: print both lists
+            # The combination that matters: GREEN and LEAKING is invisible to
+            # every output-based detector in this repo.
+            if [ "$rc" -eq 0 ] && [ "$verdict" = LEAK ]; then
+                printf '    *** SENSITIVE BUT GREEN — rc=0 while writing into the inherited root.\n'
+                printf '    *** No PASS/FAIL diff, local or in CI, can see this.\n'
+            fi
+            if [ "$verdict" = ALLOWED ]; then
+                printf '    ALLOWED by an explicit marker — reason: %s\n' "$marker_reason"
+                printf '    (still reported: an exemption is not an absence.)\n'
+            elif [ -n "$marker_reason" ]; then
+                printf '    marker REJECTED — %s\n' "$marker_reason"
+            fi
+            printf '    paths written into the decoy (first %s):\n' "$MAX_LEAK_LINES"
+            sed "s|^|      |" "$leakfile" | head -n "$MAX_LEAK_LINES"
+        fi
+        if [ "$verdict" = SKIP ]; then
+            printf '    suite declined to run (exit 77) — NO EVIDENCE. Not a pass.\n'
+        fi
+        if [ "$verdict" = ENVSKIP ]; then
+            printf '    suite RAN and declined on environment grounds (exit 69) — NO EVIDENCE.\n'
+            printf '    Not a pass and not a leak: this run says nothing either way.\n'
+        fi
+        if [ "$verdict" = VACUOUS ]; then
+            printf '    *** VACUOUS — nothing leaked, but the run reported the DECOY\n'
+            printf '    *** itself was incomplete, so the spawn died before it could\n'
+            printf '    *** write. This proves nothing. Complaints naming the decoy:\n'
+            grep -F -- "$decoy" "$out" 2>/dev/null \
+                | grep -iE 'missing|not found|no such file|cannot (open|read|find)|unreadable' \
+                | head -5 | sed 's|^|      |'
+        fi
+    } >&3
+
+    # Columns 7-8 (#1718): demoted source paths and the straggler outcome, so
+    # the band summary can COUNT them — a demotion nobody counts is invisible.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$verdict" "$rc" "$tally" "$leaked_n" "$la_before" "$srcunattr_n" "${strag:--}"
+
+    if [ "$KEEP_DECOY" = 1 ]; then
+        printf '%s: decoy retained at %s\n' "$PROG" "$work" >&2
+    else
+        rm -rf "$work"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Suite population: files that build a FIXTURE nexus, i.e. that create a temp
+# tree and copy a real monitor/ script into it. This is a DISCOVERY heuristic
+# for the default band selection only — it never decides the verdict, and
+# `probe` accepts explicit paths so a suite the heuristic misses can still be
+# measured. Stated because #655's round 12 published a heuristic population as
+# if it were a census.
+# ---------------------------------------------------------------------------
+# THE POPULATION IS DERIVED FROM THE CLASS, NOT INHERITED FROM ONE INSTANCE OF
+# IT (your-org/nexus-code#833).
+#
+# The original predicate was "builds a temp root AND references
+# spawn-worker/launcher/bootstrap-recover", which is exactly right for `#655`'s
+# SPAWNING class: those three scripts are the ones that honour an inherited
+# NEXUS_ROOT when they spawn. `#833` is a DIFFERENT class through the same
+# variable — a fixture that runs `ng`, whose `_resolve_state_dir` prefers the
+# inherited root — and such a fixture need not mention any of those three.
+#
+# So fixing the decoy (which made the probe able to SEE the class) did not make
+# the gate LOOK at the suites that exhibit it: `watcher/test-ng-reply-repo.sh`
+# and `watcher/test-ng-report-check.sh` are measured leakers and neither was in
+# the population. Blindness moved from "cannot see" to "does not look", which is
+# the same defect one level out and reads identically from the summary.
+#
+# The union, one arm per class, each naming the consumer that honours the
+# inherited root:
+#
+#   SPAWN  spawn-worker.sh | launcher.sh | bootstrap-recover.sh
+#   NG     a fixture `ng` — the binary is COPIED or INVOKED from a temp tree
+#
+# The `ng` arm is deliberately broad: any suite that puts `ng` in a fixture is a
+# candidate, because the resolution order is a property of `ng`, not of what the
+# suite does with it. Over-inclusion costs a probe; under-inclusion is how a
+# known offender sits outside the gate.
+#
+# VERIFIED BY THE ONLY TEST THAT MATTERS: all three measured leakers are in this
+# population — asserted by `test-nrs-population.sh`, which names them, so a
+# future narrowing of this predicate reddens instead of silently shrinking the
+# gate.
+#
+# AND IT IS STILL A SPELLING LIST, WHICH IS WHY IT IS NO LONGER THE ONLY GATE
+# (your-org/nexus-code#1336). A fifth spelling (`./monitor/ng` bare in command
+# position), a sixth (`"$_test_dir/../ng"`) and a seventh (reaching `ng`
+# through the dispatcher under test) each walked past it, exactly as the
+# header's own warning about spelling tests predicted one level up. This
+# predicate selects what the EXPENSIVE decoy probe is run against; the
+# class-wide question is answered by `cmd_attribute` over what the whole
+# exported band actually wrote (see the header). Do NOT widen this list to
+# chase a new spelling — add the suite's `src` row to the attribution gate's
+# evidence instead, which needs no predicate at all.
+fixture_suites() {
+    local f
+    for f in "$REPO_ROOT"/monitor/test-*.sh "$REPO_ROOT"/monitor/watcher/test-*.sh; do
+        [ -f "$f" ] || continue
+        # Every member builds a throwaway root; that is common to both classes.
+        grep -qE 'mktemp -d|TMPDIR' "$f" 2>/dev/null || continue
+        # SPAWN class (#655): honours the inherited root when it spawns.
+        if grep -qE 'spawn-worker\.sh|launcher\.sh|bootstrap-recover\.sh' "$f" 2>/dev/null; then
+            printf '%s\n' "$f"; continue
+        fi
+        # NG class (#833): a fixture `ng`, copied into or invoked from the temp
+        # tree. `_resolve_state_dir` prefers the inherited NEXUS_ROOT over the
+        # fixture, so the copy is not a sandbox.
+        if grep -qE 'cp .*/ng"?( |$)|/monitor/ng"|NG="\$[A-Za-z_]*/monitor/ng"|setup_fake_nexus' "$f" 2>/dev/null; then
+            printf '%s\n' "$f"; continue
+        fi
+    done
+}
+
+
+# shard_select K/N — the K-th of N disjoint slices of the population on stdin
+# (your-org/nexus-code#1703). The serial band outgrew one CI job: 124 suites
+# fitted in ~17 min at bbf8fa86, 146 at 3d022b09 were cancelled at the 30-min
+# ceiling with no output. So CI runs it as a matrix, one slice per cell.
+#
+# The slice is taken over a BYTE-sorted list, so every cell computes the same
+# order whatever its locale, and member i goes to slice (i mod N)+1. The
+# slices are therefore disjoint and their union is the whole population —
+# test-nrs-population.sh asserts exactly that through `select`, because a
+# matrix that silently drops a slice is a gate that does not look.
+# The spec is validated in main(), where `die` ends the script: in here it
+# would run in a pipeline subshell and end only that.
+shard_valid() {
+    [[ "$1" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] <= BASH_REMATCH[2] ))
+}
+shard_select() {
+    LC_ALL=C sort | awk -v k="${1%/*}" -v n="${1#*/}" '(NR - 1) % n == k - 1'
+}
+
+# The population `band` walks by default, sliced when --shard was given.
+selected_suites() {
+    if [ -n "$SHARD" ]; then fixture_suites | shard_select "$SHARD"
+    else fixture_suites
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# attribute <root> — the RUN-DERIVED population, gated (your-org/nexus-code#1336).
+#
+# Reads <root>/monitor/.state/ng-usage.jsonl — what every suite that ran under
+# NEXUS_ROOT=<root> made `ng` append there — and groups rows by `src`, the
+# producing suite `ng`'s usage tap records from NEXUS_TEST_SUITE (#720). A
+# suite named by a row wrote into the inherited root: LEAK, unless it declares
+# the anchored `allow-inherited-root` marker with a reason (ALLOWED — printed,
+# counted, not failing, the same mechanism the decoy arm proves out). Rows
+# with an empty `src` (a production `ng` call, or a suite run outside
+# run-tests.sh) and any OTHER file under monitor/.state are UNATTRIBUTED:
+# printed, never gating — the limit is in the output, not hidden.
+#
+# Exit: 0 = no attributable write (file absent, or no row names a suite, or
+#           every named suite carries a valid marker)
+#       1 = at least one named, unmarked suite
+#       2 = usage
+# ---------------------------------------------------------------------------
+cmd_attribute() {
+    local root="${1:-}"
+    [ -n "$root" ] || die "attribute needs <root>"
+    [ -d "$root" ] || die "attribute: no such root: $root"
+    local usage="$root/monitor/.state/ng-usage.jsonl"
+    local arming="$root/monitor/.state/longjob/arming.log"
+    # The tree the named suites are LOOKED UP in. NRS_SUITE_ROOT is the same
+    # seam `_grep_producers` honours, and it exists here for the same reason
+    # (your-org/nexus-code#1511): before it, the only way to test this arm was
+    # to plant an executable `test-zz-attr-*.sh` INTO THE LIVE CHECKOUT — a
+    # file in CI's discovery glob, cleaned up by an EXIT trap that a SIGKILLed
+    # band never runs. Production callers leave it unset and read this tree.
+    local suite_root="${NRS_SUITE_ROOT:-$REPO_ROOT}"
+    say "# nexus-root-sensitivity: RUN-DERIVED attribution over $root/monitor/.state"
+    say "# every suite that ran under NEXUS_ROOT=<root> is in this population; no predicate selects it (#1336)."
+    local n_leak=0 n_allow=0 n_unattr=0 n_rows=0 n_files=0 k kc
+    for k in "$usage" "$arming"; do [ -f "$k" ] && n_files=$(( n_files + 1 )); done
+    if [ "$n_files" -gt 0 ]; then
+        for k in "$usage" "$arming"; do
+            [ -f "$k" ] || continue
+            kc=$(grep -c . "$k" 2>/dev/null); kc=${kc%%[!0-9]*}; n_rows=$(( n_rows + ${kc:-0} ))
+        done
+        # src -> row count, per file. `src` is written JSON-safe by `ng` and
+        # tab-safe by `_lj_plugin_log` (the same restricted character class),
+        # so a field extraction by sed / awk is sound here.
+        local src cnt where suite_path reason mrrc
+        while IFS=$'\t' read -r cnt src where; do
+            [ -n "$cnt" ] || continue
+            # An EMPTY src travels as `-` (both producers above), because a
+            # tab-separated empty field COLLAPSES under `read` with IFS=tab and
+            # the filename would slide into the src slot — measured: exit 1 on
+            # a production row, attributed by name to "ng-usage.jsonl".
+            if [ -z "$src" ] || [ "$src" = "-" ]; then
+                n_unattr=$(( n_unattr + cnt ))
+                printf '  UNATTRIBUTED  %5s row(s) with no src in %s — a production call, or a suite run outside run-tests.sh (not gated)\n' "$cnt" "$where"
+                continue
+            fi
+            suite_path="$suite_root/monitor/$src"
+            if [ ! -f "$suite_path" ]; then
+                # Named, but not a file in THIS tree — report it as a leak by
+                # name rather than as unattributed: the row says who it was.
+                n_leak=$(( n_leak + 1 ))
+                printf '  LEAK          %5s row(s)  %s   in %s (src names a suite not present under %s/monitor — attributed by name)\n' "$cnt" "$src" "$where" "$suite_root"
+                continue
+            fi
+            mrrc=0; reason=$(_nrs_marker_reason "$suite_path" allow-inherited-root) || mrrc=$?
+            if [ "$mrrc" -eq 0 ]; then
+                n_allow=$(( n_allow + 1 ))
+                printf '  ALLOWED       %5s row(s)  %s   marker reason: %s\n' "$cnt" "$src" "$reason"
+            else
+                n_leak=$(( n_leak + 1 ))
+                printf '  LEAK          %5s row(s)  %s   in %s\n' "$cnt" "$src" "$where"
+                [ "$mrrc" -eq 2 ] && printf '                marker REJECTED — present but carries no reason\n'
+            fi
+        done < <({
+            [ -f "$usage" ] && sed -n 's/.*"src":"\([^"]*\)".*/\1/p; /"src":"/!s/.*/-/p' "$usage" 2>/dev/null \
+                 | sort | uniq -c | awk '{c=$1; $1=""; sub(/^ /,""); printf "%s\t%s\tng-usage.jsonl\n", c, ($0=="" ? "-" : $0)}'
+            [ -f "$arming" ] && awk -F'\t' 'NF { if (NF >= 5 && $5 != "") print $5; else print "-" }' "$arming" 2>/dev/null \
+                 | sort | uniq -c | awk '{c=$1; $1=""; sub(/^ /,""); printf "%s\t%s\tlongjob/arming.log\n", c, $0}'
+        })
+    else
+        say "  (no $usage and no $arming — no attributable row reached the inherited root)"
+    fi
+    # Everything else under monitor/.state is a write no tap attributes.
+    # Listed so a reader knows it is there; never gating here.
+    local other
+    other=$(find "$root/monitor/.state" -mindepth 1 -type f ! -name 'ng-usage.jsonl' ! -path '*/longjob/arming.log' -printf '%P\n' 2>/dev/null | sort)
+    if [ -n "$other" ]; then
+        say "  UNATTRIBUTED files under monitor/.state (no producer field — printed, not gated):"
+        printf '%s\n' "$other" | sed 's/^/    > /'
+    fi
+    say ""
+    printf '=== attribution summary: rows %s   leaking suites %s   allowed-by-marker %s   unattributed rows %s ===\n' \
+           "$n_rows" "$n_leak" "$n_allow" "$n_unattr"
+    if [ "$n_leak" -gt 0 ]; then
+        say "LEAK: a suite is NAMED by its own rows in the inherited root. Fix: pin its state dir"
+        say "  (th_pin_ng_state \"\$NG\" \"\$STATE\"), or declare the marker with a reason:"
+        say "  # nexus-root-sensitivity: allow-inherited-root — <reason>"
+        return 1
+    fi
+    say "no attributable write into the inherited root."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The STATIC spelling view — a diagnostic for comparison with `band`, NEVER a
+# gate. Reports which of the three known spellings each suite uses.
+# ---------------------------------------------------------------------------
+cmd_spellings() {
+    local -a suites
+    if [ "$#" -gt 0 ]; then suites=("$@"); else mapfile -t suites < <(fixture_suites); fi
+    say "# static spelling view — DIAGNOSTIC ONLY, not the gate."
+    say "# suite<TAB>scrub<TAB>pin<TAB>marker"
+    local f scrub pin marker
+    for f in "${suites[@]}"; do
+        scrub=no; pin=no; marker=no
+        grep -qE '^[[:space:]]*(unset[[:space:]]+NEXUS_ROOT|env -u NEXUS_ROOT)' "$f" && scrub=yes
+        grep -qE 'env -u NEXUS_ROOT' "$f" && scrub=yes
+        grep -qE 'NEXUS_ROOT=(\"?\$)' "$f" && pin=yes
+        _nrs_marker_reason "$f" allow-inherited-root >/dev/null 2>&1 && marker=yes
+        printf '%s\t%s\t%s\t%s\n' "${f#"$REPO_ROOT"/}" "$scrub" "$pin" "$marker"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# audit — retrospective enumeration from an action log.
+# ---------------------------------------------------------------------------
+
+# Map a fixture window name to the suite that produces it.
+#   stage 1: literal match of the whole name
+#   stage 2: strip a trailing -<digits> (a $$ / PID suffix) and match the stem
+#            as a prefix literal. `cwd-leak-test-2250` evaded #655 round 12's
+#            first pass for exactly this reason, so the fallback is not
+#            optional.
+# A name that matches NOTHING is reported as UNMAPPED. It is never dropped:
+# a silently discarded row is an under-count of the class, which is the error
+# mode this whole file is about.
+
+# Files matching `needle` in a line that is not itself an action-log RECORD.
+# A file that embeds a log fixture (this tool's own test suite does) contains
+# every window name it tests, and a naive grep attributes those windows to it —
+# which then gets probed, comes back hermetic, and is reported as a
+# "historical member" that was never a member at all. A line recording a spawn
+# is evidence ABOUT a window, never a producer OF one, so it is excluded.
+_grep_producers() {
+    local needle="$1" f out=""
+    # EMPTY NEEDLE -> NO PRODUCERS, never EVERY producer (your-org/nexus-code#1093).
+    # `grep -F -- ""` matches every line of every file, so an empty `$needle`
+    # turns this from "which suites produce this window name?" into "all of
+    # them" — and `map_window_to_suite` would then report every suite as
+    # implicated. Reachable: the caller's `$win` comes from `jq -r … .window`
+    # over the action log, where a row carrying `"window": ""` yields the empty
+    # string. Loud-but-wrong rather than silently-passing, which is why this is
+    # a diagnostic-quality fix and not the one #1093 is really about — but a
+    # tool whose job is to name the guilty suite must not name all of them.
+    [ -n "$needle" ] || { printf ''; return 0; }
+    # NRS_SUITE_ROOT exists so this exclusion is TESTABLE. Pointed at the real
+    # tree it is unfalsifiable from inside the repo: the only way to exercise
+    # "a file that merely records a window is not its producer" is to have such
+    # a file in the search set, and planting one under monitor/watcher/test-*.sh
+    # would put it in CI's discovery glob. A mutant proved the point — with the
+    # exclusion deleted the suite stayed green, because the fixture had been
+    # made non-self-referential and the assertion was passing for the wrong
+    # reason.
+    local root="${NRS_SUITE_ROOT:-$REPO_ROOT}"
+    for f in "$root"/monitor/test-*.sh "$root"/monitor/watcher/test-*.sh; do
+        [ -f "$f" ] || continue
+        # `<<<`, not a pipe into `grep -q` — see probe_vacuity_guard.
+        if grep -qv '"event"[[:space:]]*:[[:space:]]*"spawn"' \
+              <<<"$(grep -F -- "$needle" "$f" 2>/dev/null)" \
+           && grep -qF -- "$needle" "$f" 2>/dev/null; then
+            out+="$f"$'\n'
+        fi
+    done
+    printf '%s' "$out"
+}
+
+map_window_to_suite() {
+    local win="$1" hits stem
+    hits=$(_grep_producers "$win")
+    if [ -z "$hits" ]; then
+        stem="${win%-*}"
+        if [ "$stem" != "$win" ] && [ -n "$stem" ]; then
+            hits=$(_grep_producers "$stem-")
+        fi
+    fi
+    if [ -z "$hits" ]; then printf 'UNMAPPED\n'; return 0; fi
+    printf '%s\n' "$hits" | grep -v '^$' | sed "s|${NRS_SUITE_ROOT:-$REPO_ROOT}/||" | sort -u | paste -sd,
+}
+
+cmd_audit() {
+    local log="${AUDIT_LOG:-${NEXUS_ROOT:-}/monitor/.state/action-log.jsonl}"
+    [ -f "$log" ] || die "no action log at $log (pass --log PATH)"
+    command -v jq >/dev/null || die "jq required"
+
+    say "# nexus-root-sensitivity: RETROSPECTIVE audit"
+    say "# log: $log"
+    say ""
+
+    local total fixture
+    total=$(jq -c 'select(.event=="spawn")' "$log" | wc -l)
+    fixture=$(jq -c 'select(.event=="spawn") | select(.workdir != null and (.workdir|startswith("/tmp/"))) | select(has("rerooted-from"))' "$log" | wc -l)
+    say "spawn rows total                         : $total"
+    say "  ... with a /tmp/ workdir + rerooted-from: $fixture"
+    if [ "$fixture" -eq 0 ]; then
+        say ""
+        say "No fixture spawn rows. NOTE: this is a RETROSPECTIVE instrument —"
+        say "a sensitive suite that has never been RUN with NEXUS_ROOT exported"
+        say "leaves no row. Zero here is not a clearance; run \`band\` for the"
+        say "present-tense property test."
+        return 0
+    fi
+
+    local -a wins
+    mapfile -t wins < <(jq -r 'select(.event=="spawn") | select(.workdir != null and (.workdir|startswith("/tmp/"))) | select(has("rerooted-from")) | .window' "$log" | sort -u)
+    say "  ... distinct fixture window names       : ${#wins[@]}"
+    say "  ... window                              : $(jq -r 'select(.event=="spawn") | select(.workdir != null and (.workdir|startswith("/tmp/"))) | .ts' "$log" | sort | sed -n '1p' ) -> $(jq -r 'select(.event=="spawn") | select(.workdir != null and (.workdir|startswith("/tmp/"))) | .ts' "$log" | sort | tail -1)"
+    say ""
+
+    local w s
+    local -a implicated=()
+    say "window -> suite"
+    for w in "${wins[@]}"; do
+        s=$(map_window_to_suite "$w")
+        printf '  %-26s %s\n' "$w" "$s"
+        [ "$s" = UNMAPPED ] || implicated+=("$s")
+    done
+
+    local -a uniq_suites=()
+    mapfile -t uniq_suites < <(printf '%s\n' "${implicated[@]}" | tr ',' '\n' | sort -u | grep -v '^$')
+    say ""
+    say "implicated suites: ${#uniq_suites[@]}"
+
+    if [ "$VERIFY" = 0 ]; then
+        printf '%s\n' "${uniq_suites[@]}"
+        say ""
+        say "(--no-verify: NOT classified. A detector hit means this suite"
+        say " contaminated canonical state AT SOME POINT — never that it is"
+        say " broken NOW. Re-run without --no-verify to classify.)"
+        return 0
+    fi
+
+    # ---------------------------------------------------------------------
+    # The MANDATORY cross-check. #655 round 12 published a fifth member off a
+    # detector hit alone and had to retract it: the suite had been FIXED six
+    # days earlier. Detector-positive is a statement about the PAST.
+    #
+    # And the classification is BEHAVIOURAL, not `git log -S`. Round 12 dated
+    # that fix by `git log -S` and concluded the pin "predates the rows by
+    # hours"; the commit is 2026-07-30T13:20:16 and the rows span 12:53 ->
+    # 13:28, so 22 rows precede it and 2 follow it. The dating was wrong and
+    # the conclusion survived only because a live re-run happened to agree.
+    # Re-running the suite is the evidence; git archaeology is a footnote.
+    # ---------------------------------------------------------------------
+    say ""
+    say "re-probing each implicated suite (present tense) ..."
+    local rec verdict any_current=0 incomplete=0
+    exec 3>&1
+    for s in "${uniq_suites[@]}"; do
+        # SOURCE GONE is an UNMEASURED suite, not a benign note. It used to
+        # `continue` without touching `incomplete`, so an audit whose every
+        # implicated suite had been renamed exited 0 — "no current members"
+        # from zero classifications.
+        [ -f "$REPO_ROOT/$s" ] || {
+            printf '  %-52s UNKNOWN (source gone — renamed or deleted)\n' "$s"
+            incomplete=1
+            continue
+        }
+        rec=$(probe_one "$REPO_ROOT/$s" 3>/dev/null)
+        verdict=$(printf '%s' "$rec" | cut -f2)
+        case "$verdict" in
+            LEAK|LEAK-AT-SOURCE) printf '  %-52s MEMBER (still leaks: %s)\n' "$s" "$verdict"; any_current=1 ;;
+            # NOT "historical member": window->suite is a text heuristic and can
+            # over-include (a suite that merely mentions the name). Hermetic
+            # means "does not leak today" — which covers both a member that was
+            # fixed and a file that was never a producer at all. Distinguishing
+            # those needs the suite's history, not this run, so it is not
+            # claimed here.
+            hermetic) printf '  %-52s hermetic now (fixed, or never a producer)\n' "$s" ;;
+            SKIP)     printf '  %-52s UNKNOWN (declined to run — no evidence)\n' "$s"; incomplete=1 ;;
+            ENVSKIP)  printf '  %-52s UNKNOWN (ran, declined on environment grounds — no evidence)\n' "$s"; incomplete=1 ;;
+            TIMEOUT)  printf '  %-52s UNKNOWN (timed out at %ss)\n' "$s" "$TIMEOUT_SECS"; incomplete=1 ;;
+            *)        printf '  %-52s UNKNOWN (%s)\n' "$s" "$verdict"; incomplete=1 ;;
+        esac
+    done
+    exec 3>&-
+
+    say ""
+    say "BOUNDARY: retrospective only. A sensitive suite never run under an"
+    say "exported NEXUS_ROOT leaves no row here — this is a LOWER BOUND, with a"
+    say "blind spot disjoint from the output-based detectors'."
+    [ "$incomplete" = 1 ] && return 3
+    [ "$any_current" = 1 ] && return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# band / probe
+# ---------------------------------------------------------------------------
+run_probes() {
+    local -a suites=("$@")
+    local rec verdict n_leak=0 n_herm=0 n_skip=0 n_to=0 n_vac=0 n_allow=0 n_unmeasured=0 n_srcleak=0 n_allowsrc=0
+    local n_envskip=0 n_unknownverdict=0 n_done=0 n_unattr_paths=0 n_unattr_suites=0 n_strag=0
+    local human; human=$(mktemp "${TMPDIR:-/tmp}/nrs-human-XXXXXX")
+    local recs;  recs=$(mktemp "${TMPDIR:-/tmp}/nrs-recs-XXXXXX")
+
+    say "# nexus-root-sensitivity: PRESENT-TENSE property probe"
+    say "# suites: ${#suites[@]}   timeout: ${TIMEOUT_SECS}s   loadavg: $(loadavg)"
+
+    # The sentinel exists because `probe_one` runs inside a command
+    # substitution: an `exit` in there ends only the subshell.
+    export NRS_ABORT_SENTINEL="${NRS_ABORT_SENTINEL:-$(mktemp "${TMPDIR:-/tmp}/nrs-abort-XXXXXX")}"
+    rm -f "$NRS_ABORT_SENTINEL"
+
+    # ONE contention sample for the whole band, taken before the first suite
+    # runs (your-org/nexus-code#1718): a suite that plants config/nexus.yml
+    # must not demote every suite after it. An explicit override still wins.
+    if [ -z "${NRS_SOURCE_CONTENDED:-}" ] && [ -z "${NRS_BAND_CONTENDED:-}" ]; then
+        local NRS_BAND_CONTENDED=0
+        _src_contended "${NRS_SOURCE_ROOT:-$REPO_ROOT}" && NRS_BAND_CONTENDED=1
+        # Deliberately NOT exported: the suites under probe must not inherit
+        # it, or this tool's own suite, run inside a band, would test a frozen
+        # answer instead of the discriminator.
+    fi
+
+    local s
+    for s in "${suites[@]}"; do
+        # A path that is not there was never measured. Counted, not skipped
+        # past with a friendly line — an unexamined suite silently dropped from
+        # the denominator is how a run of nothing reads as a run of clean.
+        [ -f "$s" ] || {
+            say "NOT MEASURED: $s (no such file)"
+            n_unmeasured=$((n_unmeasured+1))
+            printf '%s\tNOT-MEASURED\t-\t(no such file)\t0\t-\n' "$s" >> "$recs"
+            continue
+        }
+        exec 3>>"$human"
+        local t0=$SECONDS
+        rec=$(probe_one "$s")
+        exec 3>&-
+        n_done=$((n_done+1))
+        # PROGRESS, on stderr and NOW (#1703). The human-readable section is
+        # buffered and printed after the loop, so a band killed at its job
+        # ceiling used to leave nothing at all — run 36799007596 printed no
+        # line in 30 minutes. One line per suite says where the time went.
+        printf '[%d/%d] %4ds %s %s\n' "$n_done" "${#suites[@]}" "$(( SECONDS - t0 ))" \
+            "$(printf '%s' "$rec" | cut -f2)" "${s#"$REPO_ROOT"/}" >&2
+        if [ -e "$NRS_ABORT_SENTINEL" ]; then
+            cat "$human"
+            say ""
+            say "ABORTED: a probe wrote into the operator's REAL state (see FATAL above)."
+            say "Refusing to continue — fix the isolation before trusting any verdict."
+            rm -f "$human" "$recs" "$NRS_ABORT_SENTINEL"
+            return 2
+        fi
+        # An empty record means probe_one bailed before producing a verdict —
+        # mktemp failed, or the decoy could not be built. Same rule: that is
+        # NOT MEASURED, and it must not vanish from the accounting.
+        if [ -z "$rec" ]; then
+            say "NOT MEASURED: $s (probe could not run — decoy or tempdir failure)"
+            n_unmeasured=$((n_unmeasured+1))
+            printf '%s\tNOT-MEASURED\t-\t(probe could not run)\t0\t-\n' "$s" >> "$recs"
+            continue
+        fi
+        printf '%s\n' "$rec" >> "$recs"
+        verdict=$(printf '%s' "$rec" | cut -f2)
+        local _ua _st
+        _ua=$(printf '%s' "$rec" | cut -f7); _st=$(printf '%s' "$rec" | cut -f8)
+        if [[ "$_ua" =~ ^[0-9]+$ ]] && [ "$_ua" -gt 0 ]; then
+            n_unattr_paths=$(( n_unattr_paths + _ua )); n_unattr_suites=$(( n_unattr_suites + 1 ))
+        fi
+        case "$_st" in exited|killed) n_strag=$((n_strag+1)) ;; esac
+        case "$verdict" in
+            LEAK) n_leak=$((n_leak+1)) ;; LEAK-AT-SOURCE) n_srcleak=$((n_srcleak+1)) ;;
+            ALLOWED-AT-SOURCE) n_allowsrc=$((n_allowsrc+1)) ;; hermetic) n_herm=$((n_herm+1)) ;;
+            ALLOWED) n_allow=$((n_allow+1)) ;;
+            SKIP) n_skip=$((n_skip+1)) ;; TIMEOUT) n_to=$((n_to+1)) ;;
+            ENVSKIP) n_envskip=$((n_envskip+1)) ;;
+            VACUOUS) n_vac=$((n_vac+1)) ;;
+            # DEFAULT ARM, previously ABSENT. A verdict this case does not
+            # enumerate used to be counted in NOTHING, so it appeared in neither
+            # `n_measured` nor `n_noevidence` and the two silently failed to sum
+            # to the selection — an under-report that reads as a smaller, calmer
+            # board. Counted as no-evidence, which is the fail-CLOSED direction.
+            *) n_unknownverdict=$((n_unknownverdict+1)) ;;
+        esac
+    done
+
+    cat "$human"
+    say ""
+    say "=== nexus-root-sensitivity summary ==="
+    local n_measured=$(( n_leak + n_srcleak + n_herm + n_allow + n_allowsrc ))
+    local n_noevidence=$(( n_skip + n_to + n_vac + n_unmeasured + n_envskip + n_unknownverdict ))
+    printf 'requested: %s   MEASURED: %s   (leaked %s, leaked-at-source %s, allowed-by-marker %s, allowed-at-source-by-marker %s, hermetic %s)\n' \
+           "${#suites[@]}" "$n_measured" "$n_leak" "$n_srcleak" "$n_allow" "$n_allowsrc" "$n_herm"
+    printf 'no evidence: %s   (skipped %s, env-declined %s, timed out %s, vacuous %s, not measured %s, unknown-verdict %s)\n' \
+           "$n_noevidence" "$n_skip" "$n_envskip" "$n_to" "$n_vac" "$n_unmeasured" "$n_unknownverdict"
+    # Always printed, zero included (#1718): a demotion to UNATTRIBUTED does
+    # not gate, so this line is the only place a band says it happened.
+    printf 'unattributed (contended source root, NOT gated): %s path(s) in %s suite(s)   stragglers: %s suite(s)\n' \
+           "$n_unattr_paths" "$n_unattr_suites" "$n_strag"
+    if [ "$n_allow" -gt 0 ]; then
+        say ""
+        say "LEAKING BUT EXEMPTED by an explicit marker (reported, not failed):"
+        awk -F'\t' '$2=="ALLOWED" {printf "  %s   rc=%s  %s\n", $1, $3, $4}' "$recs"
+    fi
+    if [ "$n_leak" -gt 0 ]; then
+        say ""
+        say "LEAKING suites:"
+        awk -F'\t' '$2=="LEAK" {printf "  %s   rc=%s  %s\n", $1, $3, $4}' "$recs"
+        say ""
+        say "Fix — AND THE TWO CLASSES TAKE DIFFERENT FIXES (your-org/nexus-code#1306):"
+        say "  SPAWN class: make the suite control NEXUS_ROOT for its spawns —"
+        say "    scrub it (unset / env -u) or pin it to the fixture at every"
+        say "    spawn call site."
+        say "  NG class: pin NEXUS_STATE_DIR — th_pin_ng_state \"\$NG\" \"\$STATE\"."
+        say "    A SCRUB IS NOT ENOUGH HERE and this probe CANNOT TELL YOU SO:"
+        say "    ng's _resolve_state_dir falls through NEXUS_ROOT to config"
+        say "    nexus.root, which on an operator's primary IS the primary. That"
+        say "    key is gitignored, so the decoy answers a placeholder whose"
+        say "    monitor/.state does not exist and the usage tap no-ops — a"
+        say "    scrub-fixed suite reads HERMETIC here and still writes at home."
+        say "Any spelling that makes this probe hermetic is accepted — subject to"
+        say "the caveat above; if the leak is deliberate, add the marker line:"
+        say "  # nexus-root-sensitivity: allow-inherited-root — <reason>"
+    fi
+    if [ "$n_noevidence" -gt 0 ]; then
+        say ""
+        say "INCOMPLETE: $n_noevidence selected suite(s) produced no evidence."
+        say "This run is NOT a clean bill of health for them."
+        awk -F'\t' '$2=="VACUOUS"||$2=="SKIP"||$2=="ENVSKIP"||$2=="TIMEOUT"||$2=="NOT-MEASURED" \
+                    {printf "  %-52s %s\n", $1, $2}' "$recs"
+    fi
+
+    # EXIT CODES. The one that matters is 77.
+    #
+    # A run that MEASURED NOTHING used to print `leaked: 0 ... hermetic: 0` and
+    # return 0 — a clean bill of health from zero measurements, issued by the
+    # tool built to retire exactly that. `probe /nonexistent/x.sh` was a green.
+    # So "measured clean" and "measured nothing" are now different exit states,
+    # and the second is never 0.
+    #
+    #   0  every measured suite is clean AND at least one was measured
+    #   1  at least one leak (an ALLOWED marker does not count)
+    #   2  aborted — a probe wrote into the operator's real state
+    #   3  partially measured: some evidence, some suites produced none
+    #   77 NOT MEASURED: no suite produced any evidence at all
+    if [ "$n_allowsrc" -gt 0 ]; then
+        say ""
+        say "WROTE INTO THE SOURCE CHECKOUT BUT EXEMPTED by an explicit per-suite marker (reported, not failed; #1431):"
+        awk -F'\t' '$2=="ALLOWED-AT-SOURCE" {printf "  %s   rc=%s  %s\n", $1, $3, $4}' "$recs"
+    fi
+    if [ "$n_srcleak" -gt 0 ]; then
+        say ""
+        say "WROTE INTO THE SOURCE CHECKOUT, not the decoy (your-org/nexus-code#1431) — FAILED:"
+        awk -F'\t' '$2=="LEAK-AT-SOURCE" {printf "  %s   rc=%s  %s\n", $1, $3, $4}' "$recs"
+        say "  A BASH_SOURCE re-root walks past NEXUS_ROOT (a helper resolving its state dir from its own"
+        say "  location, e.g. monitor/_trash.sh); pin NEXUS_STATE_DIR / the helper's own override in the suite."
+        say "  A KNOWN, ARGUED instance may carry a per-suite marker (the reason is REQUIRED, and it"
+        say "  should name the issue that expires it):"
+        say "  # nexus-root-sensitivity: allow-source-leak — <reason, e.g. #1451>"
+    fi
+    rm -f "$human" "$recs"
+    if [ "$n_leak" -gt 0 ] || [ "$n_srcleak" -gt 0 ]; then return 1; fi
+    if [ "$n_measured" -eq 0 ]; then
+        say ""
+        say "NOT MEASURED: no suite produced any evidence. This is NOT a pass —"
+        say "it is the absence of a measurement, and it exits 77 so it cannot be"
+        say "mistaken for one."
+        return 77
+    fi
+    if [ "$n_noevidence" -gt 0 ]; then return 3; fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# self-test — NON-VACUITY. The instrument is run against a KNOWN POSITIVE and a
+# KNOWN NEGATIVE before any of its zeros are quotable.
+#
+# This is the check #655 round 12 skipped and then named as the round's own
+# lesson: it shipped 28 clean greens from a detector that was blind to the
+# member everyone already knew about. A zero from an instrument whose firing
+# rate nobody measured is not evidence.
+#
+# The known positive is deliberately a suite that is GREEN while leaking, so
+# the test proves the detector sees what a PASS/FAIL diff cannot.
+# ---------------------------------------------------------------------------
+cmd_self_test() {
+    local victim="$REPO_ROOT/monitor/watcher/test-worker-nproc-bound.sh"
+    [ -f "$victim" ] || die "known positive $victim is missing — self-test cannot run"
+
+    # NOT `local`: the EXIT trap fires after this function's scope is gone, and
+    # a trap body referencing a dead local aborts under `set -u` — leaving the
+    # mutant behind in the real test directory, where the CI discovery glob
+    # would pick it up. (Observed; that is why this is a global.)
+    NRS_MUTANT="$REPO_ROOT/monitor/watcher/test-zz-nrs-selftest-mutant.sh"
+
+    # Known positive: the fourth member with its scrub reverted. Written into
+    # the real test dir because the suite resolves its own directory to find
+    # spawn-worker.sh; removed in the trap.
+    sed 's/^unset NEXUS_ROOT$/: # scrub removed by nexus-root-sensitivity self-test/' \
+        "$victim" > "$NRS_MUTANT" || die "could not build mutant"
+    trap 'rm -f "${NRS_MUTANT:-}"' EXIT INT TERM
+
+    local mutant="$NRS_MUTANT"
+    if grep -qE '^unset NEXUS_ROOT$' "$mutant"; then
+        die "mutant still scrubs — the sed did not apply, self-test would be vacuous"
+    fi
+
+    say "# self-test: the detector against a known positive and a known negative"
+    say "# loadavg: $(loadavg)"
+    say ""
+
+    exec 3>&1
+    say "[1/2] KNOWN POSITIVE — $(basename "$victim") with its scrub removed"
+    local rec_pos; rec_pos=$(probe_one "$mutant")
+    say "[2/2] KNOWN NEGATIVE — $(basename "$victim") unmodified"
+    local rec_neg; rec_neg=$(probe_one "$victim")
+    exec 3>&-
+
+    local v_pos rc_pos t_pos v_neg
+    v_pos=$(printf '%s' "$rec_pos" | cut -f2); rc_pos=$(printf '%s' "$rec_pos" | cut -f3)
+    t_pos=$(printf '%s' "$rec_pos" | cut -f4)
+    v_neg=$(printf '%s' "$rec_neg" | cut -f2)
+
+    say ""
+    say "=== self-test result ==="
+    printf 'known positive : verdict=%s rc=%s tally=[%s]\n' "$v_pos" "$rc_pos" "$t_pos"
+    printf 'known negative : verdict=%s\n' "$v_neg"
+    say ""
+
+    local ok=0
+    # LEAK-AT-SOURCE is a FIRING too: the source arm is checked first, so a
+    # mutant that leaks into BOTH roots wears that verdict (#1431).
+    if { [ "$v_pos" = LEAK ] || [ "$v_pos" = LEAK-AT-SOURCE ]; } && [ "$rc_pos" = 0 ]; then
+        say "PASS: the detector FIRED on a suite that exited 0 with every"
+        say "      assertion passing. That is the sensitive-but-green case, and"
+        say "      it is invisible to every PASS/FAIL diff in this repo."
+    elif [ "$v_pos" = LEAK ] || [ "$v_pos" = LEAK-AT-SOURCE ]; then
+        say "WARN: the known positive was RED (rc=$rc_pos), so this run shows"
+        say "      only that the detector fires — not that it catches the GREEN"
+        say "      case, which is the one output-based detectors miss."
+    elif [ "$v_pos" = VACUOUS ]; then
+        say "FAIL: the probe was VACUOUS on the known positive — the decoy was"
+        say "      incomplete, so the spawn died before it could leak. This says"
+        say "      nothing about the detector. Fix the decoy, not the verdict."
+        ok=1
+    elif [ "$rc_pos" != 0 ]; then
+        # INCONCLUSIVE, and the distinction is load-bearing. On a GitHub runner
+        # the mutant lands in the RED cell of #655's 2x2: no node_modules/
+        # (gitignored) and no `claude` on PATH, so `_claude-bin.sh` finds
+        # nothing, the spawn exits non-zero, and NOTHING IS EVER WRITTEN. A
+        # detector cannot be shown blind against a positive that never emitted
+        # a signal — that would be reading "the environment could not stage the
+        # experiment" as "the instrument failed", which is the same
+        # proxy-for-the-property error this whole issue is about.
+        #
+        # Exit 77 = SKIP, the repo's "declined to run, NO EVIDENCE" convention
+        # (#568 A6). Never 0: this is not a pass. The synthetic equivalents in
+        # test-nexus-root-sensitivity.sh cover the same property with fixtures
+        # that leak regardless of environment, and those DO run in CI.
+        say "INCONCLUSIVE: the known positive did not run green — it exited"
+        say "      rc=$rc_pos with [$t_pos], so no spawn occurred and there was"
+        say "      no leak for the detector to miss. This environment cannot"
+        say "      stage the sensitive-but-green case (a runner has neither"
+        say "      node_modules/ nor claude on PATH, so the spawn fails first)."
+        say "      NOT a pass and NOT a demonstration of blindness."
+        return 77
+    else
+        say "FAIL: the known positive ran GREEN and the detector did not fire."
+        say "      It is blind — the exact failure this self-test exists for."
+        ok=1
+    fi
+    if [ "$v_neg" != hermetic ]; then
+        say "FAIL: the known NEGATIVE did not come back hermetic (got $v_neg)."
+        say "      The detector cannot distinguish; its positives are worthless."
+        ok=1
+    else
+        say "PASS: the known negative came back hermetic — the detector"
+        say "      discriminates rather than firing on everything."
+    fi
+    return $ok
+}
+
+# ---------------------------------------------------------------------------
+main() {
+    [ "$#" -ge 1 ] || die "usage: $PROG {probe|band|select|attribute|audit|spellings|self-test} [...]"
+    local sub="$1"; shift
+    local -a rest=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --timeout) TIMEOUT_SECS="$2"; shift 2 ;;
+            --log)     AUDIT_LOG="$2"; shift 2 ;;
+            --no-verify) VERIFY=0; shift ;;
+            --keep-decoy) KEEP_DECOY=1; shift ;;
+            --shard)   SHARD="$2"; shift 2 ;;
+            --) shift; rest+=("$@"); break ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    if [ -n "$SHARD" ]; then
+        shard_valid "$SHARD" || die "--shard wants K/N with 1 <= K <= N, got '$SHARD'"
+    fi
+    case "$sub" in
+        probe)
+            [ "${#rest[@]}" -gt 0 ] || die "probe needs at least one suite path"
+            run_probes "${rest[@]}" ;;
+        band)
+            if [ "${#rest[@]}" -gt 0 ]; then
+                [ -z "$SHARD" ] || die "--shard slices the default population; it does not combine with explicit suites"
+                run_probes "${rest[@]}"
+            else
+                local -a all; mapfile -t all < <(selected_suites)
+                [ "${#all[@]}" -gt 0 ] || die "no fixture-building suites discovered${SHARD:+ in shard $SHARD}"
+                run_probes "${all[@]}"
+            fi ;;
+        # The population `band` would walk, one path per line — the seam the
+        # partition assertion in test-nrs-population.sh reads (#1703).
+        select)
+            [ "${#rest[@]}" -eq 0 ] || die "select takes no suite arguments"
+            selected_suites ;;
+        audit)      cmd_audit ;;
+        attribute)  cmd_attribute "${rest[@]}" ;;
+        spellings)  cmd_spellings "${rest[@]}" ;;
+        # Test seam for the marker parser (#1454): prints the reason, exit 0 on
+        # a declared marker, 1 when absent, 2 when present without a reason.
+        marker-reason)
+            [ "${#rest[@]}" -eq 2 ] || die "marker-reason needs <suite> <allow-inherited-root|allow-source-leak>"
+            # _nrs_marker_reason prints its value with NO trailing newline —
+            # correct for its `$(...)` callers, which strip one anyway — so
+            # this user-facing arm terminates the line itself. Before, the
+            # subcommand's output ran straight into the operator's prompt
+            # (visible with `od -c`). Empty on rc 1/2 stays empty.
+            _mr_rc=0; _mr=$(_nrs_marker_reason "${rest[0]}" "${rest[1]}") || _mr_rc=$?
+            [ -n "$_mr" ] && printf '%s\n' "$_mr"
+            return "$_mr_rc" ;;
+        self-test)  cmd_self_test ;;
+        *) die "unknown subcommand '$sub'" ;;
+    esac
+}
+
+main "$@"

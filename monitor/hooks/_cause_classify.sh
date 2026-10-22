@@ -69,7 +69,18 @@ cause_classify_error() {
             printf 'transient\tpaste'; return 0 ;;
         model_not_found|not_found_error)
             printf 'config\trespawn'; return 0 ;;
-        authentication_error|permission_error|auth_error|forbidden)
+        # `authentication_failed` is the token the REAL binary emits for an
+        # expired OAuth login: all 40 `authentication_failed` StopFailure captures
+        # (37 from the orchestrator, 2 from cc-auto-update, 1 from guardkey —
+        # corrected from "40 of 40 orchestrator" by skeptic oplivesk F4) across
+        # the 2026-08-19..21 and 2026-09-17 outages carry exactly
+        # `"error":"authentication_failed"` with the copy `Login expired ·
+        # Please run /login` (monitor/.state/stopfailure-raw-captures.jsonl).
+        # Before it was listed here that payload fell through to the message
+        # probe, matched nothing, and classified `unknown:paste` — so the
+        # "auth has no in-band recovery" conclusion #1520 credits this file
+        # with was unreachable for the one token production produces.
+        authentication_error|authentication_failed|permission_error|auth_error|forbidden)
             printf 'auth\toperator'; return 0 ;;
     esac
 
@@ -86,7 +97,11 @@ cause_classify_error() {
             printf 'conversation\trespawn'; return 0 ;;
         *"may not exist"*|*"access to it"*|*"selected model"*)
             printf 'config\trespawn'; return 0 ;;
-        *"authentic"*|*"credential"*|*"unauthorized"*|*"forbidden"*)
+        # The harness's own login copy (`Login expired · Please run /login`)
+        # and the 401 mid-retry render (`OAuth token has expired`) name none
+        # of the four words below; listed by their measured wording.
+        *"authentic"*|*"credential"*|*"unauthorized"*|*"forbidden"* \
+        |*"login expired"*|*"run /login"*|*"token has expired"*|*"please log in"*)
             printf 'auth\toperator'; return 0 ;;
     esac
 
@@ -94,5 +109,47 @@ cause_classify_error() {
     # failures are transient blips, and `paste` is the least
     # destructive recovery. The operator still sees the row.
     printf 'unknown\tpaste'
+    return 0
+}
+
+# cause_classify_class <error_token> <last_assistant_message>
+#   → prints `transport` | `server` | `other`, exit 0.
+#
+# The ERROR CLASS, a second axis beside `category` (your-org/nexus-code#1845).
+# `category` cannot carry it: the harness reports a DNS failure and an
+# Anthropic 500 with the SAME token, `server_error` — measured on all 35
+# EAI_AGAIN StopFailure payloads of 2026-10-15 — so both classify
+# `transient:paste` above, and `category` is a field other modules SELECT on
+# (#1050), so re-labelling one of them would change every reader. This is a
+# separate function, read only by `monitor/watcher/_api_hold.sh`.
+#
+#   transport  the request never reached the API: resolution, connect, reset.
+#              Matched on the MESSAGE (the token cannot tell it apart) by the
+#              Node/libc error names and the harness's own copy, `Can't reach
+#              the API server — check your internet or DNS (EAI_AGAIN)`; plus
+#              the `connection_error` token, should a release emit it.
+#   server     the API answered with a failure (5xx, overloaded).
+#   other      everything else, including an empty input.
+#
+# Ordered transport FIRST: a message that names both (a 503 page served by a
+# proxy that then reset) is a transport failure from where the nexus stands.
+cause_classify_class() {
+    local errl msgl
+    errl=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    msgl=$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')
+    case "$errl" in
+        connection_error|api_connection_error) printf 'transport'; return 0 ;;
+    esac
+    case "$msgl" in
+        *eai_again*|*enotfound*|*econnrefused*|*econnreset*|*etimedout*|*ehostunreach*|*enetunreach*|*"reach the api server"*|*"connection error"*)
+            printf 'transport'; return 0 ;;
+    esac
+    case "$errl" in
+        server_error|overloaded_error|overloaded|api_error) printf 'server'; return 0 ;;
+    esac
+    case "$msgl" in
+        *"api error: 5"*|*overloaded*|*"internal server error"*) printf 'server'; return 0 ;;
+    esac
+    printf 'other'
     return 0
 }

@@ -75,6 +75,14 @@
 #  24.  --no-orchestrator and --services-only both skip the orchestrator
 #       step (the latter because the orchestrator is the per-turn
 #       caller); workers still recover.
+#  (25-38: cold boot, the auto-continue plan — see each case's header.)
+#  39.  A WRAPPED worker with follow-up live (dispatched after its wrap-up)
+#       is resumed on --continue, and the plan's 5th column plus the
+#       rendered brief say WHY: active vs follow-up. A wrapped-and-idle
+#       worker is not. The predicate's signal-by-signal cases live in
+#       test-bootstrap-recover-followup.sh.
+#  40.  The machine-input half of the follow-up predicate is read BEFORE
+#       the watcher relaunch prunes it.
 #
 # Run: bash monitor/watcher/test-bootstrap-recover.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -94,6 +102,55 @@ pass() { echo "ok:   $*"; PASS=$(( PASS + 1 )); }
 # shellcheck source=_test_helpers.sh
 . "$_real_test_dir/_test_helpers.sh"
 
+# Write the spawn-worker stub at the production default path
+# ($_script_dir/spawn-worker.sh). Two behaviours, because recovery uses
+# spawn-worker for two different jobs:
+#
+#   --resume <w>            RESURRECTION. Records its argv, and — when
+#                           $ROOT/spawn-worker.creates-window exists —
+#                           really creates the tmux window via the stub.
+#                           That flag is what lets the cold-boot cases
+#                           assert the OBSERVABLE property ("no worker
+#                           window came back") instead of a proxy; the
+#                           older cases assert on the recorded argv and
+#                           leave it off.
+#   --resume <w> --dry-run  RESOLUTION ONLY (your-org/nexus-code#651).
+#                           The cold-boot manifest asks spawn-worker to
+#                           resolve session-id + workdir without spawning
+#                           anything, so the stub prints the real
+#                           `resolved:` line shape and records the call to
+#                           a SEPARATE file — a resolver call must never
+#                           be mistakable for a resurrection.
+#
+# rc is staged via $ROOT/spawn-worker.rc / $ROOT/spawn-worker.dryrun.rc.
+write_spawn_worker_stub() {
+    cat > "$ROOT/monitor/spawn-worker.sh" <<SW
+#!/usr/bin/env bash
+dry=0
+for a in "\$@"; do [ "\$a" = "--dry-run" ] && dry=1; done
+if [ "\$dry" = 1 ]; then
+    echo "\$*" >> "$ROOT/spawn-worker.dryrun.calls"
+    rc=0
+    [ -f "$ROOT/spawn-worker.dryrun.rc" ] && read -r rc < "$ROOT/spawn-worker.dryrun.rc"
+    if [ "\$rc" = 0 ]; then
+        printf 'resolved: window=%s session=sid-%s workdir=%s jsonl=%s nudge=off (heartbeat-absent)\n' \\
+            "\$2" "\$2" "$ROOT/work/\$2" "$ROOT/work/\$2/t.jsonl"
+    else
+        echo "spawn-worker: --resume: cannot resolve a session-id for window '\$2'." >&2
+    fi
+    exit "\$rc"
+fi
+echo "WORKER \$*" >> "$ROOT/order.log"
+echo "\${NEXUS_AUTOCONTINUE_TOKEN:-<none>}" >> "$ROOT/spawn-worker.tokens"
+echo "\$*" >> "$SPAWN_CALLS"
+[ -f "$ROOT/spawn-worker.creates-window" ] && tmux new-window -n "\$2"
+rc=0
+[ -f "$ROOT/spawn-worker.rc" ] && read -r rc < "$ROOT/spawn-worker.rc"
+exit "\$rc"
+SW
+    chmod +x "$ROOT/monitor/spawn-worker.sh"
+}
+
 # Build an isolated <root>/monitor/{bootstrap-recover.sh,watcher/_lib.sh}
 # tree with stubbed config, launcher, and tmux. Sets globals ROOT,
 # RECOVER, REG, BIN, WINDOWS, SENDS, LAUNCHER_CALLS.
@@ -110,15 +167,69 @@ build_case() {
     # nexus#202) — copy it so the engaged-capture is real, not the
     # degraded active-only fallback.
     cp "$_real_test_dir/_idle_probe.sh" "$ROOT/monitor/watcher/_idle_probe.sh"
+    # …and _idle_probe.sh now REFUSES TO LOAD without the window-key encoder
+    # (your-org/nexus-code#941): its top-of-file guard `return 2`s when
+    # ../_bookkeeping.sh is unreadable, so EVERY function in that file —
+    # `_openg_marked` included — silently fails to be defined and the
+    # engaged-capture degrades to the active-only fallback. Measured: with the
+    # encoder absent `declare -F _openg_marked` is empty; with it staged the
+    # function is defined; at the pre-#941 _idle_probe.sh it was defined
+    # either way. Same class as the _log-mode.sh / _version_restart.sh gaps
+    # above — a helper that a fixture forgot to stage degrades to something
+    # counted by nothing.
+    cp "$_real_test_dir/../_bookkeeping.sh" "$ROOT/monitor/_bookkeeping.sh"
     # bootstrap-recover.sh sources ../_log-mode.sh for `_ensure_service_log`
     # (your-org/nexus-code#484). Without it the staged tree would run the
     # launcher with the helper UNDEFINED — service logs silently created
     # group-writable again, and the suite green anyway. Stage the real one.
     cp "$_real_test_dir/../_log-mode.sh" "$ROOT/monitor/_log-mode.sh"
+    # bootstrap-recover.sh sources ../_dropped_manifest.sh for the
+    # cold-boot manifest path + once-only delivery marker (your-org/
+    # nexus-code#651). Stage the real one: the cold-boot cases below
+    # assert on the manifest FILE, so a stubbed-out helper would test
+    # nothing, and a missing one would leave the cold-boot path calling
+    # undefined functions.
+    cp "$_real_test_dir/../_dropped_manifest.sh" "$ROOT/monitor/_dropped_manifest.sh"
+    # …and ../_autocontinue_plan.sh, the plan a --continue recovery writes
+    # before the orchestrator spawn (the 2026-09-27 restart). Missing, every
+    # ac_* call is rc 127 and the plan is silently never written.
+    cp "$_real_test_dir/../_autocontinue_plan.sh" "$ROOT/monitor/_autocontinue_plan.sh"
+    # bootstrap-recover.sh sources watcher/_version_restart.sh for
+    # `_version_record_service_running` (issue #186). It was never staged:
+    # every case ran with the source FAILING and the helper undefined, so
+    # the version stamp `_recover_launch_service` promises to write was
+    # silently never written under test — and the source error leaked into
+    # every stderr assertion as noise. Same class as the `_log-mode.sh`
+    # gap above: a missing helper degrades to rc 127, which is counted by
+    # nothing.
+    cp "$_real_test_dir/_version_restart.sh" "$ROOT/monitor/watcher/_version_restart.sh"
+    # bootstrap-recover.sh's `_recover_worker_last_report` no longer greps
+    # filenames: it shells out to `$NEXUS_ROOT/monitor/ng reports-for-window`,
+    # which keys on the frontmatter `window:` field (your-org/nexus-code#1195,
+    # merged as #1303). `ng` was never staged here, so that call hit
+    # `[[ -x "$ng" ]] || return 2` and EVERY manifest entry rendered the
+    # "COULD NOT LOOK" arm — the cold-boot manifest's last-report field, the
+    # one an orchestrator reads to decide whether a dropped worker had already
+    # finished, degraded to "I could not look" for every worker and the suite
+    # said so in three assertions at once. Stage the real `ng` (with the
+    # primary-root resolver it refuses to start without) so this exercises the
+    # real resolver rather than a stub of it — same rule as _log-mode.sh and
+    # _version_restart.sh above. `_bookkeeping.sh`, `ng`'s other hard
+    # dependency, is already staged.
+    cp "$_real_test_dir/../ng" "$ROOT/monitor/ng"
+    chmod +x "$ROOT/monitor/ng"
+    cp "$_real_test_dir/../_nexus-root.sh" "$ROOT/monitor/_nexus-root.sh"
     RECOVER="$ROOT/monitor/bootstrap-recover.sh"
     REG="$ROOT/monitor/services.registry"
     BIN="$ROOT/bin"
     WINDOWS="$ROOT/windows";    : > "$WINDOWS"
+    # Pane table for the agent-liveness predicate (`_nexus_window_has_live_agent`,
+    # _lib.sh): `<pane_pid>|<window_name>|<pane_dead>` per row. Absent by
+    # default, which is the fail-safe LIVE answer — so a case that means to
+    # exercise liveness MUST seed it, or it passes on the fallback instead of
+    # on evidence (your-org/nexus-code#651 skeptic r2 / the P1b survivor).
+    PANES="$ROOT/panes";        : > "$PANES"
+    FIXTURE_PANE_PIDS=()
     SENDS="$ROOT/sends";        : > "$SENDS"
     LAUNCHER_CALLS="$ROOT/launcher.calls"
 
@@ -135,6 +246,20 @@ build_case() {
 #!/usr/bin/env bash
 case "\$1" in
   list-windows) cat "$WINDOWS" 2>/dev/null ;;
+  list-panes)   fmt=""
+                shift
+                while [ \$# -gt 0 ]; do
+                  case "\$1" in -F) fmt="\$2"; shift 2 ;; *) shift ;; esac
+                done
+                [ -s "$PANES" ] || exit 0
+                while IFS='|' read -r p_pid w_name p_dead; do
+                  [ -n "\$w_name" ] || continue
+                  line="\$fmt"
+                  line="\${line//'#{window_name}'/\$w_name}"
+                  line="\${line//'#{pane_dead}'/\$p_dead}"
+                  line="\${line//'#{pane_pid}'/\$p_pid}"
+                  printf '%s\n' "\$line"
+                done < "$PANES" ;;
   has-session)  exit 0 ;;
   new-window)   shift
                 while [ \$# -gt 0 ]; do
@@ -153,15 +278,8 @@ TM
     # rc staged in $ROOT/spawn-worker.rc (default 0). Never touches
     # tmux — worker-respawn tests assert on the recorded calls.
     SPAWN_CALLS="$ROOT/spawn-worker.calls"
-    cat > "$ROOT/monitor/spawn-worker.sh" <<SW
-#!/usr/bin/env bash
-echo "WORKER \$*" >> "$ROOT/order.log"
-echo "\$*" >> "$SPAWN_CALLS"
-rc=0
-[ -f "$ROOT/spawn-worker.rc" ] && read -r rc < "$ROOT/spawn-worker.rc"
-exit "\$rc"
-SW
-    chmod +x "$ROOT/monitor/spawn-worker.sh"
+    SPAWN_DRY_CALLS="$ROOT/spawn-worker.dryrun.calls"
+    write_spawn_worker_stub
 
     # spawn-fresh-orchestrator stub at the production default path
     # ($_script_dir/watcher/spawn-fresh-orchestrator.sh): records its
@@ -193,6 +311,51 @@ seed_snapshot() {
         echo '--- git ---'
     } > "$ROOT/monitor/.state/last-snapshot.txt"
 }
+
+# Seed the boot-intent record entry.sh leaves for the worker walk
+# (your-org/nexus-code#651): seed_boot_intent <fresh|continue|garbage>
+# [age-seconds]. Default age 5 s — a real cold boot reaches recovery in
+# seconds; the TTL cases pass an age past the ttl deliberately.
+seed_boot_intent() {
+    local mode="$1" age="${2:-5}"
+    printf 'mode=%s\nts=%s\nsource=entry.sh\npid=1\n' \
+        "$mode" "$(( $(date +%s) - age ))" \
+        > "$ROOT/monitor/.state/boot-intent"
+}
+
+# Make the spawn-worker stub really create the window it resumes, so a
+# case can assert on the window list rather than on recorded argv.
+worker_respawns_create_windows() { : > "$ROOT/spawn-worker.creates-window"; }
+
+# Seed one pane row for the liveness predicate:
+#   seed_pane <window> live|corpse
+# `live` spawns a real process whose argv contains `claude` (so the /proc walk
+# is genuinely exercised, not short-circuited) on a non-dead pane. `corpse` is
+# the remain-on-exit shape: pane_dead=1, and the pid ALSO resolves to a
+# claude-named process — because a corpse whose pid resolves to nothing passes
+# with or without the `pane_dead` guard, and would pin nothing.
+#
+# Real pids only: an earlier fixture used pid 1 and appeared to pin the guard,
+# but only on a host whose init is `bwrap` with `claude` in its argv. Never
+# build a fixture on a pid you do not control.
+seed_pane() {
+    local window="$1" kind="$2" pid dead=0
+    setsid bash -c "exec -a claude-fixture-$window sleep 45" >/dev/null 2>&1 &
+    pid=$!
+    FIXTURE_PANE_PIDS+=("$pid")
+    [[ "$kind" == corpse ]] && dead=1
+    printf '%s|%s|%s\n' "$pid" "$window" "$dead" >> "$PANES"
+    sleep 0.2
+}
+
+# Window names currently in the tmux stub's world.
+tmux_windows() { cat "$WINDOWS" 2>/dev/null; }
+
+# Path of the cold-boot dropped-worker manifest in this fixture.
+manifest_path() { printf '%s/monitor/.state/cold-boot-dropped-workers.md' "$ROOT"; }
+
+# Newest `<name>.archived.<epoch>` sibling of a state file, or empty.
+archived_of() { ls -1 "$1".archived.* 2>/dev/null | sort | tail -1; }
 
 # Append one action-log event: log_event <event> <window> [extra-json].
 log_event() {
@@ -316,8 +479,19 @@ cleanup_case() {
     # Reap any helper PID a case spawned explicitly (live-supervisor /
     # recycled-pid fixtures).
     [[ -n "${HELPER_PID:-}" ]] && th_kill_own_child "$HELPER_PID"
+    # Reap seed_pane's fixture processes. Identity-checked by argv: after a
+    # PID-space wrap a blind kill would signal whatever recycled the number.
+    local _fp
+    for _fp in "${FIXTURE_PANE_PIDS[@]+"${FIXTURE_PANE_PIDS[@]}"}"; do
+        if kill -0 "$_fp" 2>/dev/null \
+           && grep -q claude-fixture- \
+              <<<"$(tr '\0' ' ' < "/proc/$_fp/cmdline" 2>/dev/null)"; then
+            kill "$_fp" 2>/dev/null
+        fi
+    done
     rm -rf "$ROOT"
-    unset ROOT RECOVER REG BIN WINDOWS SENDS LAUNCHER_CALLS SPAWN_CALLS ORCH_CALLS FAUX_PID HELPER_PID
+    unset ROOT RECOVER REG BIN WINDOWS PANES SENDS LAUNCHER_CALLS SPAWN_CALLS \
+          SPAWN_DRY_CALLS ORCH_CALLS FAUX_PID HELPER_PID FIXTURE_PANE_PIDS
 }
 
 # Write a heartbeat whose pid is alive AND argv-identified as a watcher
@@ -380,12 +554,12 @@ if [[ "$(printf '%s\n' "$parsed" | wc -l)" == "2" ]]; then
 else
     fail "expected 2 records, got: $parsed"
 fi
-if printf '%s\n' "$parsed" | grep -qF "$HOME/wd-a"; then
+if grep -qF "$HOME/wd-a" <<<"$parsed"; then
     pass "~ expanded to \$HOME in workdir"
 else
     fail "~ not expanded: $parsed"
 fi
-if printf '%s\n' "$parsed" | grep -qF "$ROOT/wd-b"; then
+if grep -qF "$ROOT/wd-b" <<<"$parsed"; then
     pass "\$NEXUS_ROOT expanded in workdir"
 else
     fail "\$NEXUS_ROOT not expanded: $parsed"
@@ -986,7 +1160,7 @@ else
     fail "skip/include reasons wrong: $(grep -E 'w-wrapped' "$ROOT/err")"
 fi
 if grep -q "operator-engaged windows captured:" "$ROOT/err" \
-   && grep "operator-engaged windows captured:" "$ROOT/err" | grep -q "w-wrapped-engaged"; then
+   && grep -q "w-wrapped-engaged" <<<"$(grep "operator-engaged windows captured:" "$ROOT/err")"; then
     pass "engaged set captured (before watcher relaunch) and logged"
 else
     fail "engaged capture not logged: $(grep -i captured "$ROOT/err")"
@@ -1014,6 +1188,1002 @@ if [[ ! -f "$ORCH_CALLS" ]] && grep -q "orchestrator: skipped" "$ROOT/err" \
     pass "--services-only: orchestrator AND watcher skipped (orchestrator is the caller), workers still recover"
 else
     fail "rc=$RC orch=$(cat "$ORCH_CALLS" 2>/dev/null) launcher=$(cat "$LAUNCHER_CALLS" 2>/dev/null) spawn=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# ============================================================================
+# Cold boot — `./watcher` without `--continue` must resurrect NOTHING
+# (your-org/nexus-code#651).
+#
+# Every case below asserts the property on the OBSERVABLE outcome — which
+# tmux windows exist afterwards — not on whether a flag was set. That is
+# why these cases turn on `worker_respawns_create_windows`: with the
+# argv-recording stub alone, "no worker came back" and "the stub was
+# called but records nothing visible" are indistinguishable, and the test
+# would be asserting a proxy for the thing it claims to prove.
+# ============================================================================
+
+# --- Case 25: cold boot resurrects nothing, archives everything, reports it --
+echo '=== case 25: cold boot (mode=fresh) — no worker window created, state archived, manifest written ==='
+build_case 25
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+mkdir -p "$ROOT/reports"
+# REAL frontmatter, not an empty file: `ng reports-for-window` matches the
+# `window:` key inside a leading `---` fence and ignores the filename
+# entirely (your-org/nexus-code#1195). An empty file is invisible to it, so
+# the assertions below would pass or fail on the wrong mechanism.
+cat > "$ROOT/reports/nexus_2026-07-30_120000_w-alpha-notes.md" <<'RPT'
+---
+window: w-alpha
+session-id: sid-w-alpha
+---
+
+Notes filed by w-alpha before the crash.
+RPT
+snap_before=$(cat "$ROOT/monitor/.state/last-snapshot.txt")
+seed_boot_intent fresh
+run_recover
+
+# (a) THE property: no worker window came back.
+if [[ "$(tmux_windows)" != *w-alpha* ]] && [[ "$(tmux_windows)" != *w-beta* ]]; then
+    pass "cold boot: NO worker window was created (observed on the tmux window list)"
+else
+    fail "cold boot created worker windows: $(tmux_windows) err=$(cat "$ROOT/err")"
+fi
+
+# (b) …and no resurrection was even attempted. The manifest's resolver
+#     calls are --dry-run and land in a different file, so this stays a
+#     clean "spawn-worker was never asked to spawn".
+if [[ ! -f "$SPAWN_CALLS" ]]; then
+    pass "cold boot: spawn-worker never invoked in resume (spawning) mode"
+else
+    fail "resume calls made on a cold boot: $(cat "$SPAWN_CALLS")"
+fi
+
+# (c) Nothing unrecoverable: the snapshot is archived, not deleted, and
+#     byte-identical.
+snap_arch=$(archived_of "$ROOT/monitor/.state/last-snapshot.txt")
+if [[ ! -f "$ROOT/monitor/.state/last-snapshot.txt" ]] \
+   && [[ -n "$snap_arch" ]] && [[ "$(cat "$snap_arch")" == "$snap_before" ]]; then
+    pass "cold boot: prior worker snapshot archived (.archived.<epoch>), content intact, never deleted"
+else
+    fail "snapshot archive: still=$([[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] && echo yes || echo no) arch='$snap_arch'"
+fi
+
+# (d) The intent is one-shot: consumed (archived) so the SessionStart /
+#     per-turn recoveries that share this script keep resuming workers.
+intent_arch=$(archived_of "$ROOT/monitor/.state/boot-intent")
+if [[ ! -f "$ROOT/monitor/.state/boot-intent" ]] && [[ -n "$intent_arch" ]] \
+   && grep -q 'mode=fresh' "$intent_arch"; then
+    pass "cold boot: boot-intent consumed — archived, not left to fire against a later recovery"
+else
+    fail "boot-intent not consumed: still=$([[ -f "$ROOT/monitor/.state/boot-intent" ]] && echo yes || echo no) arch='$intent_arch'"
+fi
+
+# (e) The orchestrator is handed a manifest it can act on: both dropped
+#     windows, each with the session-id + workdir the canonical resolver
+#     returned, its last report, and the exact re-spawn command.
+man=$(manifest_path)
+if [[ -s "$man" ]] \
+   && grep -q '### `w-alpha`' "$man" && grep -q '### `w-beta`' "$man" \
+   && grep -q 'session-id: `sid-w-alpha`' "$man" \
+   && grep -q "workdir: \`$ROOT/work/w-alpha\`" "$man" \
+   && grep -q 'reports/nexus_2026-07-30_120000_w-alpha-notes.md' "$man" \
+   && grep -q 'monitor/spawn-worker.sh --resume w-beta' "$man" \
+   && grep -qF "$(basename "$snap_arch")" "$man"; then
+    pass "cold boot: manifest lists every dropped worker with session-id, workdir, last report, re-spawn command, and where its evidence was archived"
+else
+    fail "manifest wrong: $(cat "$man" 2>/dev/null)"
+fi
+# EXACT-LINE, not substring. A `grep -q` containment check cannot tell
+# "correct" from "correct plus garbage": the `${report:+…}${report:-…}` pair
+# that emitted the path TWICE satisfied every containment assertion above and
+# shipped green (your-org/nexus-code#651 skeptic, finding 4 + its infra note).
+# It lands on the field that tells the orchestrator a dropped worker had
+# already finished, and a doubled path is one an agent can mis-copy.
+if grep -qxF -- '- last report: `reports/nexus_2026-07-30_120000_w-alpha-notes.md`' "$man"; then
+    pass "manifest 'last report' line is EXACTLY right (exact-match: a duplicated path would redden here, a substring check would not)"
+else
+    fail "last-report line malformed: $(grep 'last report' "$man" 2>/dev/null)"
+fi
+# …and the empty arm renders as the alternative ALONE, not both arms.
+if grep -qxF -- '- last report: (none found under reports/)' "$man"; then
+    pass "manifest 'last report' empty arm renders the placeholder alone (w-beta has no report)"
+else
+    fail "empty last-report arm malformed: $(grep 'last report' "$man" 2>/dev/null)"
+fi
+
+# (f) The resolver really was the canonical one, invoked read-only.
+if [[ -f "$SPAWN_DRY_CALLS" ]] \
+   && grep -qx -- "--resume w-alpha --dry-run" "$SPAWN_DRY_CALLS" \
+   && grep -qx -- "--resume w-beta --dry-run" "$SPAWN_DRY_CALLS"; then
+    pass "cold boot: manifest resolved session/workdir via spawn-worker --dry-run (canonical resolver, no reimplementation)"
+else
+    fail "dry-run resolver calls: $(cat "$SPAWN_DRY_CALLS" 2>/dev/null)"
+fi
+
+# The summary says "candidate(s)", not "dropped": since the liveness fix routed
+# the tmux-survived shape here, some candidates may still be running and were
+# never dropped. The authoritative split is the manifest writer's own line.
+if grep -q "workers: cold boot — resurrected none; 2 snapshot candidate(s)" "$ROOT/err" \
+   && grep -q "dropped-manifest: wrote .* (2 dropped, 0 still alive)" "$ROOT/err" \
+   && (( RC == 0 )); then
+    pass "cold boot: loud summary on stderr with the dropped-vs-still-alive split, exit 0"
+else
+    fail "rc=$RC err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 25b: the THIRD last-report arm — "could not look" ------------------
+# The arm that has no other coverage, and the one that silently ate case 25's
+# three assertions when `ng` went unstaged: `_recover_worker_last_report`
+# propagates rc 2 rather than folding it into "none", because on the
+# resumption surface "I could not look" and "there is none" send an
+# orchestrator in opposite directions (your-org/nexus-code#1195, #813, #618).
+# Here the reports corpus is ABSENT, so the real `ng` really returns 2.
+echo '=== case 25b: cold boot, reports corpus not enumerable — manifest says COULD NOT LOOK, never "(none found)" ==='
+build_case 25b
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+rm -rf "$ROOT/reports"
+seed_boot_intent fresh
+run_recover
+man=$(manifest_path)
+if grep -qxF -- '- last report: COULD NOT LOOK — the reports corpus was not enumerable' "$man" \
+   && ! grep -qF -- '- last report: (none found under reports/)' "$man"; then
+    pass "cold boot: an unenumerable corpus renders COULD NOT LOOK, NOT the positive negative"
+else
+    fail "could-not-look arm wrong: $(grep 'last report' "$man" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 26: --continue keeps today's behaviour, unchanged ------------------
+echo '=== case 26: --continue boot (mode=continue) — workers resumed, nothing archived, no manifest ==='
+build_case 26
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+seed_boot_intent continue
+run_recover
+if [[ "$(tmux_windows)" == *w-alpha* ]] && [[ "$(tmux_windows)" == *w-beta* ]] \
+   && [[ -f "$SPAWN_CALLS" ]] \
+   && grep -qx -- "--resume w-alpha" "$SPAWN_CALLS" \
+   && grep -qx -- "--resume w-beta" "$SPAWN_CALLS"; then
+    pass "--continue: both worker windows really came back (unchanged resume behaviour)"
+else
+    fail "continue-boot windows='$(tmux_windows)' calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(cat "$ROOT/err")"
+fi
+# The resolver DOES run on a continue boot now, and on purpose: it supplies
+# the session ids of the auto-continue plan the orchestrator's brief renders
+# (the 2026-09-27 restart). What must stay absent is the cold-boot state.
+if [[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] \
+   && [[ ! -s "$(manifest_path)" ]]; then
+    pass "--continue: snapshot left in place, no dropped-worker manifest"
+else
+    fail "continue-boot touched cold-boot state: snap=$([[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] && echo kept || echo gone) man=$(cat "$(manifest_path)" 2>/dev/null | head -1)"
+fi
+if [[ ! -f "$ROOT/monitor/.state/boot-intent" ]] \
+   && [[ -n "$(archived_of "$ROOT/monitor/.state/boot-intent")" ]]; then
+    pass "--continue: boot-intent also one-shot (archived once acted on)"
+else
+    fail "continue boot-intent not consumed"
+fi
+cleanup_case
+
+# --- Case 27: no intent at all → ordinary mid-life recovery, unchanged -------
+# The SessionStart hook, bootstrap.sh's per-turn refresh and a manual
+# `svc.sh up` all land here with NO boot-intent. Those are crash
+# recoveries, not boots: resuming is exactly right, and a cold-boot
+# regression here would silently disarm the workspace's crash recovery.
+echo '=== case 27: no boot-intent (mid-life recovery) — workers resumed as before ==='
+build_case 27
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+run_recover
+if [[ "$(tmux_windows)" == *w-alpha* ]] \
+   && [[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] \
+   && [[ ! -s "$(manifest_path)" ]] \
+   && ! grep -q 'cold boot' "$ROOT/err"; then
+    pass "no boot-intent: crash recovery still resumes workers (no cold-boot behaviour leaked in)"
+else
+    fail "mid-life recovery changed: windows='$(tmux_windows)' err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 28: expired intent is ignored, loudly ------------------------------
+# An intent whose boot never reached the worker walk (bring-up aborted,
+# instance guard refused) must not fire days later against an unrelated
+# recovery and wipe a live board. It expires INTO today's behaviour.
+echo '=== case 28: boot-intent older than the TTL → archived and ignored, workers resumed ==='
+build_case 28
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+seed_boot_intent fresh 4000          # > default ttl 900 s
+run_recover
+if [[ "$(tmux_windows)" == *w-alpha* ]] \
+   && grep -q 'boot-intent: IGNORING' "$ROOT/err" \
+   && grep -q 'ttl=900s' "$ROOT/err" \
+   && [[ ! -f "$ROOT/monitor/.state/boot-intent" ]] \
+   && [[ -n "$(archived_of "$ROOT/monitor/.state/boot-intent")" ]]; then
+    pass "expired boot-intent: ignored loudly, archived, worker still resumed"
+else
+    fail "stale-intent handling: windows='$(tmux_windows)' err=$(cat "$ROOT/err")"
+fi
+# …and the TTL is configurable: the same record inside a widened TTL IS
+# honoured, so the guard is a bound and not a hardcoded 900.
+build_case 28b
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+seed_boot_intent fresh 4000
+RECOVER_BOOT_INTENT_TTL=99999 run_recover
+if [[ "$(tmux_windows)" != *w-alpha* ]] && grep -q 'FRESH boot requested' "$ROOT/err"; then
+    pass "boot-intent TTL is configurable (RECOVER_BOOT_INTENT_TTL widens it; same record then honoured)"
+else
+    fail "ttl override ignored: windows='$(tmux_windows)' err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 29: --dry-run resolves but never consumes --------------------------
+# boot-recover.sh runs `--dry-run` as a pure health probe at SessionStart.
+# A probe that ATE the boot intent would leave the real run resurrecting
+# everything — the exact bug this change exists to remove, reintroduced
+# through the back door.
+echo '=== case 29: --dry-run on a cold boot — decides, archives nothing, consumes nothing ==='
+build_case 29
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+seed_boot_intent fresh
+run_recover --dry-run
+if [[ -f "$ROOT/monitor/.state/boot-intent" ]] \
+   && [[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] \
+   && [[ ! -s "$(manifest_path)" ]] \
+   && [[ "$(tmux_windows)" != *w-alpha* ]] \
+   && grep -q 'would DROP 1 worker' "$ROOT/err"; then
+    pass "--dry-run: cold-boot decision reported, but intent + snapshot untouched and no manifest written"
+else
+    fail "dry-run consumed state: intent=$([[ -f "$ROOT/monitor/.state/boot-intent" ]] && echo kept || echo EATEN) err=$(cat "$ROOT/err")"
+fi
+# The real run that follows the probe must still see the intent.
+run_recover
+if [[ "$(tmux_windows)" != *w-alpha* ]] && [[ ! -f "$ROOT/monitor/.state/boot-intent" ]]; then
+    pass "--dry-run then real run: the probe left the intent for the real run, which still dropped"
+else
+    fail "post-probe real run: windows='$(tmux_windows)' err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 30: an unresolvable worker is still reported, never dropped silently
+echo '=== case 30: dropped worker whose session cannot be resolved is still listed ==='
+build_case 30
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-ghost
+log_event spawn w-ghost
+echo 11 > "$ROOT/spawn-worker.dryrun.rc"
+seed_boot_intent fresh
+run_recover
+man=$(manifest_path)
+if [[ -s "$man" ]] \
+   && grep -q '### `w-ghost`' "$man" \
+   && grep -q 'UNRESOLVED' "$man" \
+   && grep -q 'cannot resolve a session-id' "$man"; then
+    pass "unresolvable dropped worker still listed, with the resolver's own diagnostic (no silent omission)"
+else
+    fail "ghost worker missing from manifest: $(cat "$man" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 31: manifest delivery is once-only, and re-arms on a new cold boot -
+# The manifest reaches the orchestrator through two surfaces
+# (spawn-fresh-orchestrator's situation report, bootstrap.sh's on-wake
+# stdout). Both share these helpers, so the once-only rule is tested
+# here, once, on the shared implementation.
+echo '=== case 31: _dropped_manifest_* — pending → delivered once → re-pending on a new manifest ==='
+build_case 31
+# shellcheck source=/dev/null
+source "$ROOT/monitor/_dropped_manifest.sh"
+sd="$ROOT/monitor/.state"
+if ! _dropped_manifest_pending "$sd"; then
+    pass "no manifest → nothing pending (the common case stays silent)"
+else
+    fail "pending with no manifest on disk"
+fi
+printf '# first drop\n' > "$(_dropped_manifest_path "$sd")"
+first=$(_dropped_manifest_deliver "$sd")
+if [[ "$first" == "# first drop" ]] && ! _dropped_manifest_pending "$sd"; then
+    pass "manifest delivered once, then no longer pending"
+else
+    fail "first delivery: '$first' pending-after=$(_dropped_manifest_pending "$sd" && echo yes || echo no)"
+fi
+if ! _dropped_manifest_deliver "$sd" >/dev/null; then
+    pass "second delivery attempt is a no-op (a settled question is not re-opened)"
+else
+    fail "manifest re-delivered"
+fi
+if [[ -s "$(_dropped_manifest_path "$sd")" ]]; then
+    pass "delivery marks, never deletes — the manifest survives as the audit record"
+else
+    fail "manifest deleted by delivery"
+fi
+sleep 1                              # mtime granularity: make the rewrite strictly newer
+printf '# second drop\n' > "$(_dropped_manifest_path "$sd")"
+second=$(_dropped_manifest_deliver "$sd")
+if [[ "$second" == "# second drop" ]]; then
+    pass "a NEW cold boot's manifest goes pending again (newer-than-marker, no marker bookkeeping to forget)"
+else
+    fail "second cold boot not re-delivered: '$second'"
+fi
+cleanup_case
+
+# --- Case 32: a cold boot that drops nothing leaves no stale manifest --------
+# An undelivered manifest from an earlier cold boot must never be read as
+# a description of THIS one — that would hand the orchestrator a list of
+# workers to reconsider that this boot never had.
+echo '=== case 32: cold boot with nothing to drop → prior manifest archived, none written ==='
+build_case 32
+seed_healthy_watcher
+printf '# stale drop from a previous boot\n' > "$(manifest_path)"
+seed_snapshot orchestrator services            # infra only: no worker candidates
+seed_boot_intent fresh
+run_recover
+if [[ ! -s "$(manifest_path)" ]] \
+   && [[ -n "$(archived_of "$(manifest_path)")" ]] \
+   && grep -q 'cold boot — nothing to drop' "$ROOT/err"; then
+    pass "empty cold boot: stale manifest archived (not delivered as if it were this boot's)"
+else
+    fail "stale manifest survived: $(cat "$(manifest_path)" 2>/dev/null) err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 33: the COLD_BOOT refusal arm, isolated ---------------------------
+# your-org/nexus-code#651 skeptic, finding 3. Case 25 proves a cold boot
+# resurrects nothing, but it cannot tell you WHICH of the two guards did it:
+# the snapshot archive empties the candidate set before the workers step is
+# even reached, so deleting the `elif (( COLD_BOOT == 1 ))` arm outright left
+# the suite fully green. That arm had ZERO coverage while being load-bearing —
+# whenever the `mv` fails (read-only or full state dir, permissions change,
+# concurrent writer) it is the ONLY thing between a cold boot and a full
+# resurrection, and `_recover_archive_state_file` handles that failure by
+# logging a WARNING and carrying on.
+#
+# So: make the archive genuinely fail (read-only state dir) and assert the
+# refusal still holds. The test is deliberately non-vacuous — it asserts the
+# archive DID fail and the arm DID fire, so a run that never reached the
+# workers step (an aborted preflight, say) reddens instead of passing quietly.
+echo '=== case 33: archive fails → the COLD_BOOT refusal arm alone must stop resurrection ==='
+build_case 33
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+seed_boot_intent fresh
+chmod 500 "$ROOT/monitor/.state"
+run_recover
+chmod 700 "$ROOT/monitor/.state"      # restore before cleanup_case's rm -rf
+if grep -q "WARNING failed to archive" "$ROOT/err" \
+   && grep -qF "$ROOT/monitor/.state/last-snapshot.txt" "$ROOT/err" \
+   && [[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]]; then
+    pass "archive-fails fixture is real: the snapshot mv failed and the file is still in place"
+else
+    fail "fixture did not reach the intended state: err=$(cat "$ROOT/err")"
+fi
+if grep -q "workers: cold boot (no --continue) — resurrecting nothing" "$ROOT/err"; then
+    pass "the refusal arm actually fired (not a run that aborted before the workers step)"
+else
+    fail "refusal arm never reached: err=$(cat "$ROOT/err")"
+fi
+if [[ "$(tmux_windows)" != *w-alpha* ]] && [[ ! -f "$SPAWN_CALLS" ]]; then
+    pass "archive failed AND no worker window came back — the refusal arm is independently load-bearing"
+else
+    fail "resurrection despite cold boot: windows='$(tmux_windows)' calls=$(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 34: the manifest must not call LIVE workers dropped ---------------
+# your-org/nexus-code#651 skeptic r2, finding 1 — a defect the liveness fix
+# newly EXPOSED rather than one it left alone.
+#
+# Before that fix, reaching the cold-boot path required no orchestrator window
+# at all, which in practice meant the tmux server had died and taken every
+# worker with it: "everything in the snapshot is gone" was true by
+# construction. The fix deliberately routes the tmux-SURVIVED crash shape here
+# too (claude segfaults / OOMs / `/exit`s — the whole point of the change) —
+# and in that shape every worker window is still running. Building the manifest
+# straight from the snapshot then hands a fresh orchestrator a categorical
+# "they are NOT running now" about windows it can see for itself, with a
+# `--resume` instruction attached.
+echo '=== case 34: cold boot with a still-ALIVE worker → partitioned, not mislabelled ==='
+# Three shapes, because two would not discriminate the PREDICATE:
+#   w-gone   — no window at all           → dropped
+#   w-alive  — window + live agent        → still running
+#   w-corpse — window + DEAD pane         → dropped
+# w-corpse is the load-bearing one. With a name-only check
+# (`_recover_window_exists` alone) it would be filed under "still running" —
+# the same corpse-is-not-liveness misreading this PR exists to remove, merely
+# relocated from entry.sh into the manifest. A two-shape fixture cannot tell
+# the two predicates apart; verified by mutation (the name-only mutant
+# survived until this row existed).
+build_case 34
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-gone w-alive w-corpse
+log_event spawn w-gone
+log_event spawn w-alive
+log_event spawn w-corpse
+echo w-alive  >> "$WINDOWS"         # survived the orchestrator's death
+echo w-corpse >> "$WINDOWS"         # remain-on-exit leftover: listed, but dead
+seed_pane w-alive  live
+seed_pane w-corpse corpse
+seed_boot_intent fresh
+run_recover
+man=$(manifest_path)
+if [[ -s "$man" ]] \
+   && grep -q '^# Cold boot dropped 2 worker agent(s)$' "$man"; then
+    pass "manifest counts only genuinely dropped workers (live one excluded, corpse INCLUDED)"
+else
+    fail "header wrong: $(head -1 "$man" 2>/dev/null)"
+fi
+# The categorical "NOT running" claim must cover w-gone and NOT w-alive. Assert
+# on SECTION MEMBERSHIP, not mere presence — the old manifest also "mentioned"
+# the live worker, which is exactly what made it wrong.
+gone_sec=$(awk '/^## Dropped/{f=1;next} /^## Still running/{f=0} f' "$man")
+live_sec=$(awk '/^## Still running/{f=1;next} /^---$/{f=0} f' "$man")
+if [[ "$gone_sec" == *'`w-gone`'* ]] && [[ "$gone_sec" != *'w-alive'* ]] \
+   && [[ "$live_sec" == *'`w-alive`'* ]] && [[ "$live_sec" != *'w-gone'* ]]; then
+    pass "each worker is in the RIGHT section: w-gone under Dropped, w-alive under Still running"
+else
+    fail "sections wrong — dropped='$gone_sec' still='$live_sec'"
+fi
+# THE predicate assertion: a corpse window EXISTS in tmux, so a name check
+# calls it alive. Only real agent-liveness puts it where it belongs.
+if [[ "$gone_sec" == *'`w-corpse`'* ]] && [[ "$live_sec" != *'w-corpse'* ]]; then
+    pass "a remain-on-exit CORPSE worker is Dropped, not Still-running (agent liveness, not window presence)"
+else
+    fail "corpse misfiled — dropped='$gone_sec' still='$live_sec'"
+fi
+# The live worker must not carry a --resume instruction: acting on it exits 13
+# on a live pane, and telling an orchestrator to do that is the misinformation.
+if [[ "$live_sec" != *"--resume w-alive"* ]] \
+   && [[ "$live_sec" == *"Do NOT"* ]]; then
+    pass "live worker carries no --resume instruction (and the section says so explicitly)"
+else
+    fail "live worker still advertised as resumable: $live_sec"
+fi
+# And the property that must never regress: still nothing resurrected.
+if [[ ! -f "$SPAWN_CALLS" ]] && [[ "$(tmux_windows)" != *w-gone* ]]; then
+    pass "cold boot with a live worker present: still resurrects nothing, and leaves the live one running"
+else
+    fail "resurrection: calls=$(cat "$SPAWN_CALLS" 2>/dev/null) windows='$(tmux_windows)'"
+fi
+if [[ "$(tmux_windows)" == *w-alive* ]]; then
+    pass "the live worker was left ALONE — declining to resurrect is not terminating"
+else
+    fail "live worker vanished: $(tmux_windows)"
+fi
+cleanup_case
+
+# --- Case 35: a --continue recovery announces its workers BEFORE the orchestrator ---
+# The 2026-09-27 restart: the orchestrator's brief is composed the moment it
+# is spawned, which is BEFORE recovery resumes any worker. The plan must
+# therefore already exist when spawn-fresh-orchestrator runs, name every
+# worker it is about to resume with its session id, and be finished after.
+echo '=== case 35: --continue — plan written before the orchestrator spawn, finished after ==='
+build_case 35
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+echo "ORCH \$*" >> "$ROOT/order.log"
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+PLAN35="$ROOT/monitor/.state/auto-continue-plan.tsv"
+AT_SPAWN="$ROOT/plan-at-orch-spawn"
+if [[ -f "$AT_SPAWN" ]] \
+   && grep -qP '^w-alpha\tsid-w-alpha\tpending\t' "$AT_SPAWN" \
+   && grep -qP '^w-beta\tsid-w-beta\tpending\t' "$AT_SPAWN" \
+   && grep -qP '^#owner\t[0-9]+\t[0-9]+\t\S+\t[0-9]+\trunning\tcontinue$' "$AT_SPAWN"; then
+    pass "plan EXISTED at orchestrator spawn: both workers pending with session ids, boot=continue"
+else
+    fail "plan at orchestrator spawn: $(cat "$AT_SPAWN" 2>/dev/null || echo ABSENT) err=$(grep -i plan "$ROOT/err")"
+fi
+if grep -qP '^#owner\t.*\tdone\tcontinue$' "$PLAN35" \
+   && grep -qP '^w-alpha\tsid-w-alpha\tresumed\t' "$PLAN35" \
+   && grep -qP '^w-beta\tsid-w-beta\tresumed\t' "$PLAN35"; then
+    pass "plan finished after the walk: rows resumed, owner line done"
+else
+    fail "final plan: $(cat "$PLAN35" 2>/dev/null)"
+fi
+tok35=$(awk -F'\t' 'NR==1{print $4}' "$PLAN35" 2>/dev/null)
+if [[ -n "$tok35" ]] && [[ "$(sort -u "$ROOT/spawn-worker.tokens" 2>/dev/null)" == "$tok35" ]]; then
+    pass "recovery's own resumes carried the plan token (its exemption from exit 27)"
+else
+    fail "tokens seen by spawn-worker: $(cat "$ROOT/spawn-worker.tokens" 2>/dev/null) want $tok35"
+fi
+# The walk resumed EXACTLY the set the plan announced — one candidate list.
+if [[ "$(grep -c -- '--resume w-' "$SPAWN_CALLS" 2>/dev/null)" == 2 ]]; then
+    pass "the walk resumed exactly the planned set (no second, divergent candidate list)"
+else
+    fail "resume calls: $(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 36: nothing to resume → no plan (the per-turn refresh stays silent) ---
+echo '=== case 36: every candidate already alive — no plan written ==='
+build_case 36
+seed_healthy_watcher
+seed_snapshot w-alpha
+log_event spawn w-alpha
+echo w-alpha >> "$WINDOWS"
+run_recover --services-only
+if [[ ! -e "$ROOT/monitor/.state/auto-continue-plan.tsv" ]]; then
+    pass "no pending worker → no plan file (brief unchanged)"
+else
+    fail "plan written with nothing pending: $(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")"
+fi
+cleanup_case
+
+# --- Case 37: plan and walk use ONE cap rule (skeptic F2 on #1660) ----------
+# cap=2, w-alpha alive, w-beta and w-gamma dead. The walk counts EVERY
+# candidate it reaches toward the cap, alive or not, so it resumes w-beta and
+# stops at w-gamma. The plan must say exactly that: w-beta pending, w-gamma
+# over-cap. Before the fix the plan skipped alive windows before counting and
+# promised w-gamma as pending too — a worker the walk never resumed.
+echo '=== case 37: cap — the plan applies the same cap rule as the walk; over-cap rows are recorded ==='
+build_case 37
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta w-gamma
+log_event spawn w-alpha
+log_event spawn w-beta
+log_event spawn w-gamma
+echo w-alpha >> "$WINDOWS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+RECOVER_MAX_WORKERS=2 run_recover
+PLAN37="$ROOT/monitor/.state/auto-continue-plan.tsv"
+if grep -qP '^w-beta\tsid-w-beta\tpending\t' "$ROOT/plan-at-orch-spawn" \
+   && grep -qP '^w-gamma\t-\tover-cap:2\t' "$ROOT/plan-at-orch-spawn" \
+   && ! grep -qP '^w-alpha\t' "$ROOT/plan-at-orch-spawn"; then
+    pass "plan at spawn: w-beta pending, w-gamma over-cap, alive w-alpha not listed"
+else
+    fail "plan at spawn: $(cat "$ROOT/plan-at-orch-spawn" 2>/dev/null)"
+fi
+if grep -qx -- '--resume w-beta' "$SPAWN_CALLS" 2>/dev/null \
+   && ! grep -q -- '--resume w-gamma' "$SPAWN_CALLS" 2>/dev/null; then
+    pass "walk resumed exactly the promised w-beta and stopped at the cap before w-gamma"
+else
+    fail "resume calls: $(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+if ! grep -qP '\tpending\t' "$PLAN37" && grep -qP '^w-gamma\t-\tover-cap:2\t' "$PLAN37"; then
+    pass "final plan: no row left pending, w-gamma recorded over-cap"
+else
+    fail "final plan: $(cat "$PLAN37")"
+fi
+cleanup_case
+
+# --- Case 37b: the skeptic's exact F2 reproduction (probe case 37) ----------
+# cap=1, w-alpha alive, w-beta dead. The walk counts w-alpha and stops, so
+# w-beta is NOT resumed. Before the fix the brief said w-beta "pending, its
+# window will appear"; now it must say w-beta is NOT auto-continued, even
+# though nothing at all is pending.
+echo '=== case 37b: cap=1 with the only dead worker past the cap — named, never promised ==='
+build_case 37b
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+echo w-alpha >> "$WINDOWS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+RECOVER_MAX_WORKERS=1 run_recover
+if grep -qP '^w-beta\t-\tover-cap:1\t' "$ROOT/plan-at-orch-spawn" 2>/dev/null \
+   && ! grep -qP '\tpending\t' "$ROOT/plan-at-orch-spawn"; then
+    pass "w-beta is in the plan at spawn as over-cap:1, and nothing is promised pending"
+else
+    fail "plan at spawn: $(cat "$ROOT/plan-at-orch-spawn" 2>/dev/null || echo ABSENT)"
+fi
+if ! grep -q -- '--resume w-beta' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "worker 'w-beta': NOT respawned — sanity cap" "$ROOT/err"; then
+    pass "the walk did not resume w-beta, exactly as the plan said"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+# Render what the BRIEF saw: the at-spawn snapshot, re-owned by a live
+# process so it reads as active (the real owner, recovery, has exited).
+mkdir -p "$ROOT/at-spawn"
+sleep 60 & OWN37b=$!
+_st=$(cat "/proc/$OWN37b/stat"); _st="${_st##*) }"; set -- $_st; START37b="${20}"; set --
+awk -F'\t' -v OFS='\t' -v p="$OWN37b" -v t="$START37b" 'NR==1{$2=p; $3=t} {print}' \
+    "$ROOT/plan-at-orch-spawn" > "$ROOT/at-spawn/auto-continue-plan.tsv"
+render37b=$(PATH="$BIN:$PATH" bash -c 'source "$1"; ac_plan_render "$2"' _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/at-spawn")
+kill "$OWN37b" 2>/dev/null; wait "$OWN37b" 2>/dev/null
+if grep -qF -- '- `w-beta`: session `-` — **NOT auto-continued**: past recovery' <<<"$render37b" \
+   && grep -qF -- 'recover.max_workers=1' <<<"$render37b" \
+   && ! grep -qF -- '**pending**' <<<"$render37b"; then
+    pass "the brief at spawn names w-beta NOT auto-continued with the cap as the reason, and promises nothing"
+else
+    fail "rendered at spawn: $render37b"
+fi
+cleanup_case
+
+# --- Case 38: a concurrent recovery never replaces a live plan (skeptic F1) --
+# A plan owned by ANOTHER live process lists w-alpha pending. This recovery
+# must not overwrite it, must not resume w-alpha (the owner is doing it), and
+# must not mark it done.
+echo '=== case 38: a second recovery leaves a live plan and its pending windows alone ==='
+build_case 38
+seed_healthy_watcher
+seed_snapshot w-alpha
+log_event spawn w-alpha
+sleep 120 & OWN38=$!
+_st38=$(cat "/proc/$OWN38/stat"); _st38="${_st38##*) }"; set -- $_st38; START38="${20}"; set --
+printf '#owner\t%s\t%s\ttok-A\t1\trunning\tcontinue\nw-alpha\tsid-A\tpending\t1\n' "$OWN38" "$START38" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+before38=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")
+run_recover --services-only
+if [[ "$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")" == "$before38" ]]; then
+    pass "the live plan is byte-identical: not replaced, not finished"
+else
+    fail "plan changed: $(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")"
+fi
+if ! grep -q -- '--resume w-alpha' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "concurrent recovery is auto-continuing it" "$ROOT/err"; then
+    pass "the second recovery left w-alpha to the owner, and said so"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(grep -i concurrent "$ROOT/err")"
+fi
+# The library half: a non-owner token can neither update a row nor finish.
+lib_rc38=$(bash -c 'source "$1"; ac_plan_set_status "$2" w-alpha resumed tok-B; r1=$?; ac_plan_finish "$2" tok-B; r2=$?; echo "$r1 $r2"' \
+    _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/monitor/.state")
+after38=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")
+if [[ "$lib_rc38" == "2 2" && "$after38" == "$before38" ]]; then
+    pass "a stale owner: set_status and finish are refused with rc 2 and write nothing"
+else
+    fail "non-owner write: rcs='$lib_rc38' plan=$after38"
+fi
+kill "$OWN38" 2>/dev/null; wait "$OWN38" 2>/dev/null
+cleanup_case
+
+# --- Case 39: the brief names WHY each worker is resumed ----------------------
+# The 2026-09-28 17:05 restart: two wrapped workers with follow-up in flight
+# were dropped. Now they are candidates, and the plan the orchestrator's brief
+# renders carries a 5th column saying why — so "it wrapped" is not read as
+# "it is done", and an active worker is told apart from a follow-up one.
+echo '=== case 39: --continue — follow-up worker resumed, plan and brief carry the why ==='
+build_case 39
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-act w-fu w-done
+log_event spawn w-act
+log_event spawn w-fu
+log_event wrap-up w-fu
+log_event paste-followup w-fu ',"rc":"0"'
+log_event spawn w-done
+log_event wrap-up w-done
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+echo "ORCH \$*" >> "$ROOT/order.log"
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+AT39="$ROOT/plan-at-orch-spawn"
+if [[ -f "$AT39" ]] \
+   && grep -qP '^w-act\tsid-w-act\tpending\t[0-9]+\tactive$' "$AT39" \
+   && grep -qP '^w-fu\tsid-w-fu\tpending\t[0-9]+\tfollow-up:dispatched$' "$AT39" \
+   && ! grep -q '^w-done' "$AT39"; then
+    pass "plan at orchestrator spawn: active + follow-up pending with their why; wrapped-and-idle absent"
+else
+    fail "plan at orchestrator spawn: $(cat "$AT39" 2>/dev/null || echo ABSENT) err=$(grep -E 'w-(act|fu|done)' "$ROOT/err")"
+fi
+calls39=$(cat "$SPAWN_CALLS" 2>/dev/null)
+if grep -q -- '--resume w-act' <<<"$calls39" && grep -q -- '--resume w-fu' <<<"$calls39" \
+   && ! grep -q -- '--resume w-done' <<<"$calls39"; then
+    pass "walk resumed w-act and w-fu, not w-done"
+else
+    fail "resume calls: [$calls39]"
+fi
+# Render the plan AS IT STOOD at the orchestrator spawn (owner alive, rows
+# pending), the way spawn-fresh-orchestrator.sh composes the brief.
+mkdir -p "$ROOT/at-spawn39"
+awk -F'\t' -v OFS='\t' -v p="$$" 'NR == 1 { $2 = p; $3 = "X"; $6 = "running" } { print }' "$AT39" \
+    > "$ROOT/at-spawn39/auto-continue-plan.tsv"
+st39=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null)
+sed -i "1s/\tX\t/\t$st39\t/" "$ROOT/at-spawn39/auto-continue-plan.tsv"
+brief39=$(PATH="$BIN:$PATH" bash -c 'source "$1"; ac_plan_render "$2"' _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/at-spawn39")
+if grep -qF '`w-fu`: session `sid-w-fu`' <<<"$brief39" \
+   && grep -qF '(why: wrapped, but follow-up live: dispatched)' <<<"$brief39" \
+   && grep -qF '(why: active, interrupted mid-task)' <<<"$brief39"; then
+    pass "brief names why: active vs wrapped-but-follow-up-live"
+else
+    fail "brief: $brief39"
+fi
+cleanup_case
+
+# --- Case 40: machine-input captured BEFORE the watcher relaunch -------------
+# The watcher's first cycle prunes machine-input.tsv rows for windows not in
+# tmux — at a restart, every not-yet-respawned worker. A worker whose only
+# follow-up evidence is a machine-input stamp (an `ng send --stamp-only`
+# delivery, which logs no action-log event) must still be resumed. The
+# launcher stub DELETES the ledger when the watcher is relaunched, modelling
+# that prune; recovery must already have read it.
+echo '=== case 40: follow-up evidence captured before the watcher relaunch prunes it ==='
+build_case 40
+worker_respawns_create_windows
+seed_snapshot w-stamped
+log_event spawn w-stamped
+log_event wrap-up w-stamped
+# One stamp an hour after log_event's fixed 12:00 wrap-up.
+printf 'w-stamped\t%s000000\tpaste-followup\t\n' \
+    "$(( $(date -d '2026-06-10T12:00:00-07:00' +%s) + 3600 ))" \
+    > "$ROOT/monitor/.state/machine-input.tsv"
+printf '#!/usr/bin/env bash\necho called >> "%s"\nrm -f "%s"\n' \
+    "$LAUNCHER_CALLS" "$ROOT/monitor/.state/machine-input.tsv" \
+    > "$ROOT/monitor/watcher/launcher.sh"
+chmod +x "$ROOT/monitor/watcher/launcher.sh"
+run_recover
+if [[ -f "$LAUNCHER_CALLS" ]] && [[ ! -e "$ROOT/monitor/.state/machine-input.tsv" ]]; then
+    pass "precondition: the watcher was relaunched and the ledger pruned"
+else
+    fail "precondition not met: launcher=$(cat "$LAUNCHER_CALLS" 2>/dev/null) mi=$(ls "$ROOT/monitor/.state/machine-input.tsv" 2>&1)"
+fi
+if grep -q -- '--resume w-stamped' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -qF "worker 'w-stamped': wrapped BUT follow-up live (delivered)" "$ROOT/err"; then
+    pass "w-stamped resumed on the stamp read before the prune"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(grep -E 'w-stamped|machine' "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 41: an interrupted walk's queue survives the next boot -------------
+# 2026-10-12 (RO8): a --continue recovery was resuming 12 workers when a
+# read-only incident hit; the next boot's plan listed 4, because the
+# relaunched watcher had rewritten last-snapshot.txt from live tmux mid-walk
+# and the plan was rebuilt from that alone. Boot 1 here: 5 workers, the
+# walk is KILLED (SIGKILL on its owner pid, so no trap and no finish) on the
+# 3rd resume. The watcher's snapshot then holds only the 2 that came up, and
+# the sandbox restart empties tmux. Boot 2 must still plan — and resume —
+# the 3 unreached workers.
+echo '=== case 41: boot 2 keeps the unfinished plan queue of an interrupted boot 1 ==='
+build_case 41
+seed_healthy_watcher
+seed_snapshot w-a w-b w-c w-d w-e
+for w41 in w-a w-b w-c w-d w-e; do log_event spawn "$w41"; done
+# Resolver half identical to write_spawn_worker_stub; the resume half
+# creates the window, except on the INTERRUPT_AT-th call, where it kills the
+# recovery that owns the plan (its pid is the plan's owner field).
+cat > "$ROOT/monitor/spawn-worker.sh" <<SW
+#!/usr/bin/env bash
+for a in "\$@"; do
+    if [ "\$a" = "--dry-run" ]; then
+        printf 'resolved: window=%s session=sid-%s workdir=%s jsonl=%s nudge=off (heartbeat-absent)\n' \\
+            "\$2" "\$2" "$ROOT/work/\$2" "$ROOT/work/\$2/t.jsonl"
+        exit 0
+    fi
+done
+n=\$(( \$(cat "$ROOT/resume.count" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "$ROOT/resume.count"
+echo "\$*" >> "$SPAWN_CALLS"
+if [ -f "$ROOT/interrupt-at" ] && [ "\$n" = "\$(cat "$ROOT/interrupt-at")" ]; then
+    owner=\$(awk -F'\t' 'NR == 1 { print \$2 }' "$ROOT/monitor/.state/auto-continue-plan.tsv")
+    kill -9 "\$owner"
+    exit 1
+fi
+tmux new-window -n "\$2"
+exit 0
+SW
+chmod +x "$ROOT/monitor/spawn-worker.sh"
+echo 3 > "$ROOT/interrupt-at"
+seed_boot_intent continue
+run_recover
+PLAN41="$ROOT/monitor/.state/auto-continue-plan.tsv"
+if [[ "$RC" == 137 ]] && grep -qP '^#owner\t[0-9]+\t[0-9]+\t[^\t]+\t[0-9]+\trunning\t' "$PLAN41" \
+   && [[ "$(cat "$SPAWN_CALLS")" == $'--resume w-a\n--resume w-b\n--resume w-c' ]]; then
+    pass "precondition: boot 1 was killed on its 3rd resume, plan left running"
+else
+    fail "precondition: rc=$RC calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] plan=$(cat "$PLAN41" 2>/dev/null)"
+fi
+# The watcher's last snapshot before the incident: only what came up. Then
+# the sandbox restart: tmux holds nothing of the old board.
+seed_snapshot w-a w-b
+grep -vxE 'w-[a-e]' "$WINDOWS" > "$WINDOWS.new"; mv "$WINDOWS.new" "$WINDOWS"
+rm -f "$ROOT/interrupt-at" "$ROOT/resume.count" "$SPAWN_CALLS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+AT41="$ROOT/plan-at-orch-spawn"
+miss41=""
+for w41 in w-c w-d w-e; do
+    grep -qP "^$w41\tsid-$w41\tpending\t" "$AT41" 2>/dev/null || miss41+=" $w41"
+done
+if [[ -z "$miss41" ]]; then
+    pass "boot 2's plan still lists the 3 unreached workers (w-c w-d w-e) as pending"
+else
+    fail "boot 2's plan lost:$miss41 — plan=$(cat "$AT41" 2>/dev/null || echo ABSENT)"
+fi
+calls41=$(cat "$SPAWN_CALLS" 2>/dev/null)
+miss41=""
+for w41 in w-a w-b w-c w-d w-e; do
+    grep -qx -- "--resume $w41" <<<"$calls41" || miss41+=" $w41"
+done
+if [[ -z "$miss41" ]] && grep -qP '^#owner\t.*\tdone\t' "$PLAN41" \
+   && ! grep -qP '\tpending\t' "$PLAN41"; then
+    pass "boot 2 resumed all 5 and finished its plan (no row left pending)"
+else
+    fail "boot 2 missed:$miss41 calls=[$calls41] plan=$(cat "$PLAN41")"
+fi
+# A FINISHED plan is not a queue: boot 3 with every window up writes none
+# and carries nothing.
+run_recover --services-only
+if [[ -z "$(cat "$SPAWN_CALLS" 2>/dev/null | sed -n '6,$p')" ]] \
+   && ! grep -q 'UNFINISHED auto-continue plan' "$ROOT/err"; then
+    pass "a done plan is not carried: boot 3 resumed nothing more"
+else
+    fail "boot 3: calls=[$(cat "$SPAWN_CALLS")] err=$(grep -i unfinished "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 41b: a drained queue is finished, not carried forever --------------
+# An unfinished plan (owner dead) whose every window is now up: this recovery
+# has nothing to plan, so it must mark that plan done with its own token.
+echo '=== case 41b: an unfinished plan whose windows are all up is marked done ==='
+build_case 41b
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-b
+echo w-a >> "$WINDOWS"; echo w-b >> "$WINDOWS"
+now41=$(date +%s)
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-a\tsid-w-a\tresumed\t1\tactive\nw-b\tsid-w-b\tpending\t1\tactive\n' "$now41" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qP "^#owner\t999999999\t1\ttok-old\t$now41\tdone\t" "$ROOT/monitor/.state/auto-continue-plan.tsv" \
+   && ! grep -q -- '--resume' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "queue is drained" "$ROOT/err"; then
+    pass "drained: the prior plan is marked done, nothing resumed"
+else
+    fail "drained: plan=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv") calls=$(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 41c: a cold boot retires the unfinished plan with the snapshot -----
+# The carried windows are dropped workers too (named in the manifest), and the
+# plan is archived, so a later mid-life recovery cannot carry them back.
+echo '=== case 41c: cold boot drops the carried windows and archives the plan ==='
+build_case 41c
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(date +%s)" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+seed_boot_intent fresh
+run_recover
+run_recover --services-only
+if ! grep -q -- '--resume' "$SPAWN_CALLS" 2>/dev/null \
+   && [[ ! -e "$ROOT/monitor/.state/auto-continue-plan.tsv" ]] \
+   && compgen -G "$ROOT/monitor/.state/auto-continue-plan.tsv.archived.*" >/dev/null; then
+    pass "cold boot: nothing resumed (then or by the next mid-life run), plan archived"
+else
+    fail "cold boot: calls=$(cat "$SPAWN_CALLS" 2>/dev/null) state=$(ls "$ROOT/monitor/.state")"
+fi
+cleanup_case
+
+# --- Case 41d: a STALE unfinished plan is not a queue (#1810 skeptic F3) ----
+# A worker killed by hand long after the interrupted boot must not be
+# resurrected from that boot's plan. Over the age bound the plan carries
+# nothing and is marked done; inside it, the same plan is carried (control).
+echo '=== case 41d: an unfinished plan older than the age bound is not carried ==='
+build_case 41d
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 180000 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if ! grep -q -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q 'OLDER than 172800s' "$ROOT/err" \
+   && grep -qP '^#owner\t999999999\t1\ttok-old\t[0-9]+\tdone\t' "$ROOT/monitor/.state/auto-continue-plan.tsv"; then
+    pass "stale: a 50 h old plan is not carried (w-c not resumed) and is marked done"
+else
+    fail "stale: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] plan=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv") err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+build_case 41d2
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 3600 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qx -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null; then
+    pass "CONTROL fresh: a 1 h old unfinished plan IS carried (w-c resumed)"
+else
+    fail "CONTROL fresh: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+# 41d3 (#1811): a plan as old as the LONGEST measured RO outage (18.06 h,
+# onset to the next `watcher up:`) is still a queue. The 6 h first default
+# dropped it, and with it the workers the interrupted recovery owed.
+build_case 41d3
+seed_healthy_watcher
+seed_snapshot w-a
+log_event spawn w-a
+log_event spawn w-c
+echo w-a >> "$WINDOWS"
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-c\tsid-w-c\tpending\t1\tactive\n' "$(( $(date +%s) - 65100 ))" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+run_recover --services-only
+if grep -qx -- '--resume w-c' "$SPAWN_CALLS" 2>/dev/null \
+   && ! grep -q 'OLDER than' "$ROOT/err"; then
+    pass "long outage: an 18.1 h old unfinished plan IS carried (w-c resumed, #1811)"
+else
+    fail "long outage: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)] err=$(grep -i 'auto-continue' "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 41e: carried windows do not reorder the snapshot's (#1810 F3) -----
+# Candidates walk in the snapshot's order, then each carried window in the
+# unfinished plan's row order. A `sort -u` over the union would walk
+# w-b w-m w-z; the stable order is w-m (snapshot), then w-z, w-b (plan rows).
+echo '=== case 41e: snapshot order first, then carried windows in plan order ==='
+build_case 41e
+seed_healthy_watcher
+seed_snapshot w-m
+for w41 in w-m w-z w-b; do log_event spawn "$w41"; done
+printf '#owner\t999999999\t1\ttok-old\t%s\trunning\tcontinue\nw-z\tsid-w-z\tpending\t1\tactive\nw-b\tsid-w-b\tpending\t1\tactive\n' "$(date +%s)" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+seed_boot_intent continue
+run_recover
+if [[ "$(cat "$SPAWN_CALLS" 2>/dev/null)" == $'--resume w-m\n--resume w-z\n--resume w-b' ]]; then
+    pass "order: snapshot window first, then carried windows in plan row order"
+else
+    fail "order: calls=[$(cat "$SPAWN_CALLS" 2>/dev/null)]"
 fi
 cleanup_case
 

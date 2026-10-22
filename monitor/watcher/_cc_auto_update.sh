@@ -44,8 +44,23 @@
 #
 # Idempotency layers:
 #   1. last-fire-date stamp        — at most one fire per calendar day.
-#   2. evaluator-window-alive      — never two concurrent evaluators
+#   2. evaluator-window-LIVE       — never two concurrent evaluators
 #      (plus spawn-worker.sh's own exit-7 window-name collision guard).
+#      DEFERS the day, it does not consume it: this arm must NOT stamp
+#      last-fire-date, or a crashed-but-alive window cancels the round
+#      instead of postponing it (your-org/nexus-code#968). Its own
+#      `last-skip-date` marker keeps the audit row once-per-day while
+#      the fire itself retries every tick.
+#      LIVE, not merely PRESENT: window existence is a proxy for "an
+#      evaluator is working", and a crashed session keeps its pane alive
+#      forever. A pane POSITIVELY stalled for
+#      CC_AUTO_EVALUATOR_STALE_SECONDS is reclaimed; every other reading
+#      (working, indeterminate, stall too young) still defers — an
+#      allowlist with a default-DENY arm, because the fire path KILLS
+#      that window before spawning. And CC_AUTO_SKIP_STREAK_ALERT
+#      consecutive deferred days notify the operator: a round that has
+#      stopped running must not be visible only as a TSV row nobody
+#      reads, which is exactly how #968 survived.
 #   3. already-pinned              — `_cc_update_decide` rc=1 (current)
 #      when candidate == effective version; no re-eval of a version
 #      already running.
@@ -78,6 +93,11 @@ _cc_auto_module_dir="${BASH_SOURCE[0]%/*}"
 [[ "$_cc_auto_module_dir" == "${BASH_SOURCE[0]}" ]] && _cc_auto_module_dir=.
 # shellcheck source=../_log-mode.sh
 source "$_cc_auto_module_dir/../_log-mode.sh"
+# The COMPAT/NOT-COMPAT classifier and the retry schedule (your-org/nexus-code
+# #1657): only a COMPAT outcome holds an update, and nothing waits for an
+# operator.
+# shellcheck source=../_cc-hold-policy.sh
+source "$_cc_auto_module_dir/../_cc-hold-policy.sh"
 unset _cc_auto_module_dir
 
 # Evaluator window name. Fixed so the window-alive guard and
@@ -162,6 +182,62 @@ _cc_auto_log_decision() {
         >> "$dir/decisions.tsv" 2>/dev/null || true
 }
 
+# _cc_auto_surface_safe_refused <auto_dir> <candidate> <now>
+#
+# your-org/nexus-code#1400. If the last recorded outcome is `safe-refused`,
+# log it and notify, at most once per day (stamp `last-safe-refused-nag-date`),
+# and escalate when the two most recent safe-refused rows in decisions.tsv
+# carry the SAME detail — the same reason twice is a standing defect in the
+# gate, which is exactly the case that went unnoticed for two days.
+_cc_auto_surface_safe_refused() {
+    local dir="${1:?dir required}" candidate="${2:-?}" now="${3:-$(date +%s)}"
+    local f="$dir/last-eval" decision detail last_cand
+    [[ -f "$f" ]] || return 0
+    decision=$(_cc_update_field "$f" decision 2>/dev/null || true)
+    [[ "$decision" == "safe-refused" ]] || return 0
+    detail=$(_cc_update_field "$f" detail 2>/dev/null || true)
+    last_cand=$(_cc_update_field "$f" candidate 2>/dev/null || true)
+    local today stamp last_nag=""
+    today=$(date -d "@$now" +%F 2>/dev/null || date +%F)
+    stamp="$dir/last-safe-refused-nag-date"
+    [[ -f "$stamp" ]] && last_nag=$(tr -d '[:space:]' < "$stamp" 2>/dev/null || true)
+    [[ "$last_nag" == "$today" ]] && return 0
+    printf '%s\n' "$today" > "$stamp" 2>/dev/null || true
+    # repetition: the two most recent safe-refused rows share a detail
+    local n_same=0
+    if [[ -r "$dir/decisions.tsv" ]]; then
+        n_same=$(awk -F'\t' -v d="$detail" '$3=="safe-refused"{r[++n]=$4} END{c=0; for(i=n;i>=1&&r[i]==d;i--)c++; print c+0}' "$dir/decisions.tsv" 2>/dev/null || echo 0)
+        [[ "$n_same" =~ ^[0-9]+$ ]] || n_same=0
+    fi
+    local kind="safe-refused-unapplied" msg
+    msg="cc-auto-update: candidate ${last_cand:-$candidate} evaluated SAFE but was NOT applied (${detail:-no detail}) — a defect in the gate, not in the candidate; the pin stays stale until someone looks (#1400)"
+    if (( n_same >= 2 )); then
+        kind="safe-refused-repeat"
+        msg="cc-auto-update: SAME safe-refused reason ${n_same} fires running (${detail:-no detail}) for ${last_cand:-$candidate} — a STANDING defect in the gate, not a transient tree state; the pin has been stale that many days (#1400)"
+    fi
+    # A dirty gated tree is the gate WORKING, not a defect in it
+    # (your-org/nexus-code#1475): the cause is a local tracked edit in the live
+    # clone and the remedy is the operator's. last-eval carries no file list, so
+    # point at the command that names them; the apply-side refusal note (and its
+    # notification) carry the list itself.
+    if [[ "$detail" == "gate-evidence:gated-tree-dirty" ]]; then
+        msg="cc-auto-update: candidate ${last_cand:-$candidate} evaluated SAFE but NOT applied (same-reason streak ${n_same}) — tracked edit(s) in the live clone block the bump (${detail}); see \`git status --porcelain --untracked-files=no\`, then stash (and keep it stashed until the next fire) or commit and push (#1475)"
+    fi
+    # An UNDISPOSITIONED OPAQUE RELEASE is not a gate defect and not the
+    # operator's to fix (your-org/nexus-code#1526): the evaluating agent clears
+    # it with --opaque-disposition. Audit row and log line stay; no page.
+    if [[ "$detail" == changelog-completeness:opaque-release=* ]]; then
+        msg="cc-auto-update: candidate ${last_cand:-$candidate} awaits the evaluating agent's opaque-release disposition (${detail}; same-reason streak ${n_same}) — no human action is requested (#1526)"
+        _cc_auto_log_decision "$dir" "${last_cand:-$candidate}" "$kind" "${detail:-} same-reason-streak=$n_same"
+        declare -F log >/dev/null 2>&1 && log "$msg"
+        return 0
+    fi
+    _cc_auto_log_decision "$dir" "${last_cand:-$candidate}" "$kind" "${detail:-} same-reason-streak=$n_same"
+    declare -F log >/dev/null 2>&1 && log "$msg"
+    command -v sandbox-notify >/dev/null 2>&1 && sandbox-notify "$msg" || true
+    return 0
+}
+
 # _cc_auto_last_eval_skip <auto_dir> <candidate>
 #
 # rc 0 iff <candidate> was already evaluated and its outcome is
@@ -171,18 +247,37 @@ _cc_auto_log_decision() {
 # non-zero (do not skip). The last-eval file is written by
 # cc-auto-update-apply.sh's outcome recorder in the same key=value
 # shape _cc_update_field parses.
+#
+# NARROWED (your-org/nexus-code#1657). This guard used to skip a blocked
+# candidate on EVERY later day until a newer release appeared — "awaiting the
+# operator". After the 2.1.278 compat block that meant three days of
+# `skipped-awaiting-operator` while the fix was being written, and the
+# operator stepping in by hand. Now nothing waits for an operator:
+#   · only a COMPAT outcome (`cc_hold_class`) can skip at all — a
+#     NOT-COMPAT one (block-not-compat, block-unattributable, …) never does;
+#   · a COMPAT hold is skipped only on the SAME DAY it was recorded, and only
+#     while the live HEAD is still the one it was measured at (`[head]`). A
+#     new day re-evaluates it regardless; a moved HEAD (the fix may have
+#     landed) re-evaluates it at once.
 _cc_auto_last_eval_skip() {
     local dir="${1:?dir required}" candidate="${2:?candidate required}"
+    local now="${3:-$(date +%s)}" live_head="${4:-unknown}"
     local f="$dir/last-eval"
     [[ -f "$f" ]] || return 1
-    local last decision
+    local last decision detail date_s rec_day today rec_head
     last=$(_cc_update_field "$f" candidate 2>/dev/null || true)
     [[ "$last" == "$candidate" ]] || return 1
     decision=$(_cc_update_field "$f" decision 2>/dev/null || true)
-    case "$decision" in
-        block|compat-pr-opened|compat-pr-commented) return 0 ;;
-        *) return 1 ;;
-    esac
+    detail=$(_cc_update_field "$f" detail 2>/dev/null || true)
+    cc_hold_is_hold "$decision" "$detail" || return 1
+    date_s=$(_cc_update_field "$f" date 2>/dev/null || true)
+    rec_day=$(date -d "$date_s" +%F 2>/dev/null) || return 1
+    today=$(date -d "@$now" +%F 2>/dev/null || date +%F)
+    [[ "$rec_day" == "$today" ]] || return 1
+    rec_head=""
+    [[ "$detail" =~ live_head=([0-9a-f]{40}) ]] && rec_head="${BASH_REMATCH[1]}"
+    [[ -n "$rec_head" && "$live_head" != "unknown" && "$rec_head" != "$live_head" ]] && return 1
+    return 0
 }
 
 # _cc_auto_window_alive <window>
@@ -193,10 +288,174 @@ _cc_auto_last_eval_skip() {
 # kill the dead window before spawning).
 _cc_auto_window_alive() {
     local window="${1:?window required}"
-    tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$window" || return 1
+    grep -Fxq -- "$window" <<<"$(tmux list-windows -F '#W' 2>/dev/null)" || return 1
     local dead
     dead=$(tmux display-message -p -t "$window" '#{pane_dead}' 2>/dev/null || echo "")
     [[ "$dead" != "1" ]]
+}
+
+# ---- evaluator LIVENESS, not merely window existence (#968 part 2) --------
+#
+# `_cc_auto_window_alive` answers "does a window of this name exist with a
+# live pane". That is a PROXY for "an evaluator is working", and on
+# 2026-08-20 the two came apart: an evaluator whose turn crashed on
+# `Login expired` two minutes after spawn kept its pane alive indefinitely.
+# The window existed, no work was happening, and the guard could not tell
+# the difference — so the round deferred forever instead of once.
+#
+# DIRECTION OF THE DEFAULT. The dangerous act here is PROCEEDING, not
+# deferring: the fire path below KILLS $CC_AUTO_WINDOW (the dead
+# remain-on-exit cleanup) before spawning, so a wrong "not working"
+# verdict destroys a live evaluator mid-run. Deferring costs one tick
+# (`check_interval_seconds`, 300 s by default) and is now a real retry
+# rather than a cancellation. So this is an ALLOWLIST with a
+# default-DENY arm: only a reading that POSITIVELY establishes a stall,
+# sustained, lets the round reclaim the window.
+#
+# Arm-order shadowing (your-org/nexus-code#1121) cannot bite here: both
+# lists are matched by exact string equality over sets measured
+# DISJOINT, so no input matches two arms and no reordering changes an
+# answer. That is a property of the arms, not luck — it would stop
+# holding the day either list gained a glob.
+
+# States that positively assert the evaluator is DRIVING WORK FORWARD.
+_CC_AUTO_WORKING_STATES=(busy user-typing working-background working-self-paced)
+# States that positively assert it is NOT: no turn is running and nothing
+# resumes one without a human. Reclaimable — but only after
+# CC_AUTO_EVALUATOR_STALE_SECONDS of CONTINUOUS stall, so an evaluator
+# read in the seconds between window creation and its first turn is
+# never mistaken for a corpse.
+_CC_AUTO_STALLED_STATES=(idle autosuggest-only blocked over-limit absent idle-orphan-async)
+# Everything else — `empty`, `unknown`, an unreadable probe, and any
+# state this file has never heard of — is INDETERMINATE and denies.
+# DO NOT hand-maintain these against a copied vocabulary list: the
+# terminal arm is what covers a state added upstream, and
+# test-cc-auto-update.sh asserts every member of
+# `monitor/pane-state.sh --states` lands in exactly one class.
+
+# How long a pane must stay continuously stalled before the round may
+# reclaim its window. 30 min: far longer than any legitimate pause
+# between an evaluator's turns, far shorter than a day.
+: "${CC_AUTO_EVALUATOR_STALE_SECONDS:=1800}"
+# Consecutive DEFERRED days after which the operator is told the routine
+# has stopped running. One skip is routine; two is a stuck round.
+: "${CC_AUTO_SKIP_STREAK_ALERT:=2}"
+
+# _cc_auto_evaluator_class <window> [nexus_root]
+#
+# Prints `<class> <state>` where class is working|stalled|indeterminate.
+# Never fails; an unreadable probe is a class, not an error.
+_cc_auto_evaluator_class() {
+    local window="${1:?window required}" nexus_root="${2:-.}"
+    local cmd raw state="" s
+    cmd="${CC_AUTO_PANE_STATE_CMD:-$nexus_root/monitor/pane-state.sh}"
+    raw=""
+    if [[ -x "$cmd" ]]; then
+        raw=$("$cmd" "$window" 2>/dev/null) || raw=""
+    fi
+    # Parsed with a bash match rather than a `| sed | head` pipeline: the
+    # pipeline's exit status would be `head`'s, and under pipefail an
+    # early-closing `head` reports 141 for a perfectly good read.
+    [[ "$raw" =~ state=([a-z-]+) ]] && state="${BASH_REMATCH[1]}"
+    if [[ -z "$state" ]]; then
+        printf 'indeterminate unreadable\n'
+        return 0
+    fi
+    # Input already queued behind the running turn is work in flight
+    # whatever the base verdict says (your-org/nexus-code#607).
+    case "$raw" in *queued=1*) printf 'working %s\n' "$state"; return 0 ;; esac
+    for s in "${_CC_AUTO_WORKING_STATES[@]}"; do
+        [[ "$state" == "$s" ]] && { printf 'working %s\n' "$state"; return 0; }
+    done
+    for s in "${_CC_AUTO_STALLED_STATES[@]}"; do
+        [[ "$state" == "$s" ]] && { printf 'stalled %s\n' "$state"; return 0; }
+    done
+    printf 'indeterminate %s\n' "$state"
+}
+
+# _cc_auto_evaluator_stale <auto_dir> <window> <now_epoch> [nexus_root]
+#
+# rc 0 → the window is NOT a live evaluator: positively stalled for at
+#        least CC_AUTO_EVALUATOR_STALE_SECONDS, so the round may reclaim
+#        it.
+# rc 1 → treat it as live. Covers working, indeterminate, and a stall
+#        not yet old enough.
+#
+# Sets CC_AUTO_EVAL_CLASS / CC_AUTO_EVAL_STATE / CC_AUTO_EVAL_STALL_AGE
+# for the caller's audit row, so the reading that produced the verdict
+# is in the record rather than inferred from it.
+_cc_auto_evaluator_stale() {
+    local dir="${1:?dir required}" window="${2:?window required}"
+    local now="${3:?now required}" nexus_root="${4:-.}"
+    local marker="$dir/evaluator-stalled-since"
+    local threshold="${CC_AUTO_EVALUATOR_STALE_SECONDS:-1800}"
+    [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=1800
+
+    local reading class state
+    reading=$(_cc_auto_evaluator_class "$window" "$nexus_root")
+    class="${reading%% *}"
+    state="${reading#* }"
+    CC_AUTO_EVAL_CLASS="$class"
+    CC_AUTO_EVAL_STATE="$state"
+    CC_AUTO_EVAL_STALL_AGE=0
+
+    case "$class" in
+        working)
+            # Positive evidence of work is the ONLY thing that clears an
+            # accrued stall. An indeterminate reading deliberately does
+            # not: `empty` is a documented transient, and letting it
+            # reset the clock would make a stall unaccruable — a pane
+            # flickering idle/empty would defer forever, which is the
+            # very failure this axis exists to end.
+            rm -f "$marker" 2>/dev/null || true
+            return 1
+            ;;
+        stalled) ;;
+        *) return 1 ;;
+    esac
+
+    mkdir -p "$dir" 2>/dev/null || true
+    local since=""
+    [[ -f "$marker" ]] && since=$(tr -dc '0-9' < "$marker" 2>/dev/null || true)
+    if [[ -z "$since" ]]; then
+        printf '%s\n' "$now" > "$marker" 2>/dev/null || true
+        return 1
+    fi
+    CC_AUTO_EVAL_STALL_AGE=$(( now - since ))
+    (( CC_AUTO_EVAL_STALL_AGE >= threshold )) || return 1
+    return 0
+}
+
+# _cc_auto_skip_streak_bump <auto_dir> — increment and print the count of
+# CONSECUTIVE days on which the round deferred. Called once per deferred
+# day (the caller's own once-per-day gate).
+_cc_auto_skip_streak_bump() {
+    # NOT one `local` statement: bash 4.4 evaluates every RHS of a single
+    # `local` before assigning any of them, so `f="$dir/…"` on the same
+    # line dies with `dir: unbound variable` under `set -u` — and the
+    # caller then reads an EMPTY streak that coerces to 1 forever, which
+    # is this bundle's own defect class (a guard that silently never
+    # counts). Measured on bash 4.4.20, this host.
+    local dir="${1:?dir required}"
+    local f="$dir/skip-streak" n=0 first=""
+    if [[ -f "$f" ]]; then
+        n=$(_cc_update_field "$f" days 2>/dev/null || echo 0)
+        first=$(_cc_update_field "$f" first 2>/dev/null || echo "")
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    n=$(( n + 1 ))
+    [[ -n "$first" ]] || first=$(date -Is 2>/dev/null || echo unknown)
+    mkdir -p "$dir" 2>/dev/null || true
+    local tmp="$f.tmp.$$"
+    { printf 'days=%s\nfirst=%s\nlast=%s\n' "$n" "$first" \
+        "$(date -Is 2>/dev/null || echo unknown)"; } > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    printf '%s\n' "$n"
+}
+
+# _cc_auto_skip_streak_clear <auto_dir> — the round got past the guard.
+_cc_auto_skip_streak_clear() {
+    rm -f "${1:?dir required}/skip-streak" 2>/dev/null || true
 }
 
 # _cc_auto_render_prompt <template> <out> [KEY=VALUE]...
@@ -421,6 +680,10 @@ _cc_auto_write_restart_outcome() {
 #     pid, the armed marker, or a live watchdog window (the running
 #     version stays old until the respawn stamps the new one, so without
 #     this every tick in that window would re-fire);
+#   - the INSTALLED binary (`node_modules/.bin/claude --version`) does not
+#     yet report the pin, or cannot be read (your-org/nexus-code#1670): the
+#     pin is written before the install lands, so this DEFERS to the next
+#     tick without stamping the cooldown;
 #   - we are inside the post-attempt COOLDOWN. The cooldown bounds retries
 #     after ANY attempt, so a FAILED one (stale-pin abort, watchdog-spawn
 #     failure) retries slowly instead of every tick. A SUCCESS heals the
@@ -452,9 +715,8 @@ _cc_auto_reconcile_pending_restart() {
     #    foreground pre-flight (exit 21).
     local sid
     sid=$(tr -d '[:space:]' < "$state_dir/orchestrator-session-id" 2>/dev/null || true)
-    printf '%s' "$sid" | grep -qE \
-        '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
-        || return 0
+    grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
+        <<<"$sid" || return 0
     local slug jsonl
     slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
     jsonl="$projects_dir/$slug/$sid.jsonl"
@@ -521,6 +783,54 @@ _cc_auto_reconcile_pending_restart() {
         (( now - mt < cooldown )) && return 0
     fi
 
+    # 6b. THE BINARY ON DISK MUST ALREADY BE THE ONE WE RESTART ONTO
+    #     (your-org/nexus-code#1670 item 5). Step 1 reads the PIN, and
+    #     `safe` writes the pin BEFORE `install-claude-local.sh` swaps the
+    #     binary in — so for the install's duration "running < pin" is true
+    #     while node_modules still holds the OLD build, or none at all (the
+    #     old install moved aside). Measured on the 2026-09-27 bump: pin
+    #     written 04:27:23, `reconcile-fired` 04:27:25, install done ~04:27:30.
+    #     A hand-off fired then meets an absent or half-installed binary at
+    #     the watchdog spawn, aborts, and leaves the split behind a
+    #     30-minute cooldown.
+    #
+    #     So the installed binary's own `--version` must report the pin
+    #     before we fire. DEFER, not abort: return BEFORE the cooldown stamp
+    #     below, so the next tick (the cc_auto cadence, ~5 min) retries.
+    #     FAIL CLOSED: an unreadable, empty or malformed `--version` is
+    #     compared to nothing — it is SHAPE-validated to X.Y.Z first and
+    #     otherwise defers (CLAUDE.md FALLBACK-COLLAPSE: a sentinel must not
+    #     be able to compare equal). This is a pure tightening: the only
+    #     restart it removes is one whose target binary is not on disk yet.
+    #
+    #     Logged to the watcher log ONCE per (installed, pin) pair, not per
+    #     tick; deliberately NO decisions.tsv row — column 3 of that file
+    #     SELECTS (monitor/_cc-hold-policy.sh classifies every word), and a
+    #     new token there would be a behavioural change to the hold policy.
+    #
+    #     CHOSEN bound: `timeout 20` on `--version`. A healthy binary answers
+    #     in well under a second; 20 s tolerates a loaded shared host, and a
+    #     hung half-installed binary cannot stall the watcher tick for
+    #     longer. The wrapper's own statuses (124/137) are not read — only
+    #     the parsed version is, and an expired call parses to nothing,
+    #     which defers.
+    local installed_bin="${CC_AUTO_CLAUDE_BIN:-$nexus_root/node_modules/.bin/claude}"
+    local installed_raw="" installed=""
+    installed_raw=$(timeout 20 "$installed_bin" --version 2>/dev/null < /dev/null) || installed_raw=""
+    installed=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$installed_raw" | sed -n 1p)
+    if [[ ! "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$installed" != "$effective" ]]; then
+        local dmark="$auto_dir/reconcile-deferred.last"
+        local dkey="installed=${installed:-unreadable} effective=$effective"
+        if [[ "$(cat "$dmark" 2>/dev/null)" != "$dkey" ]]; then
+            mkdir -p "$auto_dir" 2>/dev/null || true
+            printf '%s\n' "$dkey" > "$dmark" 2>/dev/null || true
+            declare -F log >/dev/null 2>&1 \
+                && log "cc-auto-update: version-split (running=$running pin=$effective) NOT reconciled yet — $installed_bin reports '${installed:-<unreadable>}', not the pin; deferring (no cooldown) until the installed binary is the pin (your-org/nexus-code#1670)"
+        fi
+        return 0
+    fi
+    rm -f "$auto_dir/reconcile-deferred.last" 2>/dev/null || true
+
     # 7. Fire. Stamp the cooldown BEFORE launching (a partially-failed
     #    launch must not re-fire next tick), audit + log + notify, then hand
     #    off to the SAME detached watchdog-mediated `restart-orchestrator`
@@ -583,18 +893,145 @@ _cc_auto_update_tick() {
     # cadence, ~5 min by default) heals the split promptly instead.
     _cc_auto_reconcile_pending_restart "$nexus_root" "$state_dir" "$package" "$now"
 
-    _cc_auto_due "$now" "$fire_time" "$stamp" || return 0
+    # THE FLOOR TRACKS THE VERIFIED CC (your-org/nexus-code#1657). At most
+    # hourly, and a no-op unless the integration branch moved or a newer
+    # version was gate-verified here since the last check: propose raising the
+    # shared package.json floor to the version this nexus runs and verified
+    # (`monitor/cc-floor.sh`; one bot PR, never lowers, no checkout). Bounded
+    # by a timeout and never fails the tick.
+    local _fl_stamp="$auto_dir/cc-floor-last-check" _fl_age=999999
+    [[ -f "$_fl_stamp" ]] && _fl_age=$(( now - $(stat -c %Y "$_fl_stamp" 2>/dev/null || echo 0) ))
+    if (( _fl_age >= ${CC_AUTO_FLOOR_CHECK_SECONDS:-3600} )) && [[ -x "${CC_AUTO_FLOOR_CMD:-$nexus_root/monitor/cc-floor.sh}" ]]; then
+        : > "$_fl_stamp" 2>/dev/null || true
+        local _fl_out
+        _fl_out=$(timeout 90 "${CC_AUTO_FLOOR_CMD:-$nexus_root/monitor/cc-floor.sh}" propose --if-base-moved 2>&1 < /dev/null) || true
+        case "$_fl_out" in
+            *"proposed: "*|*"already proposed"*) declare -F log >/dev/null 2>&1 && log "cc-auto-update: ${_fl_out##*$'\n'}" ;;
+        esac
+    fi
+
+    # THE RETRY PATH (your-org/nexus-code#1657). The daily fire is no longer
+    # the only fire: an outcome that did not apply and is not a COMPAT hold
+    # wrote `retry-at` (apply.sh's record_outcome), and a COMPAT hold wrote a
+    # re-check that fires once the live HEAD moves. Bounded per day
+    # (CC_AUTO_RETRY_MAX_PER_DAY) so a persistent cause costs a fixed number
+    # of evaluations; the daily fire resets nothing and is never suppressed.
+    local live_head retry_fire=0 retry_why retry_rc=0
+    live_head=$(cc_repo_head "$nexus_root")
+    if ! _cc_auto_due "$now" "$fire_time" "$stamp"; then
+        retry_why=$(cc_hold_retry_due "$auto_dir" "$now" "$live_head") || retry_rc=$?
+        case "$retry_rc" in
+            0) retry_fire=1 ;;
+            3) # exhausted for today: said ONCE per day, then the daily fire
+               # takes over tomorrow.
+               if [[ ! -f "$auto_dir/retry-exhausted-$(_cc_auto_day "$now")" ]]; then
+                   : > "$auto_dir/retry-exhausted-$(_cc_auto_day "$now")" 2>/dev/null || true
+                   _cc_auto_log_decision "$auto_dir" "-" "retry-exhausted" "$retry_why"
+                   declare -F log >/dev/null 2>&1 && log "cc-auto-update: $retry_why — the next daily fire re-evaluates"
+               fi
+               return 0 ;;
+            *) return 0 ;;
+        esac
+    fi
     today=$(_cc_auto_day "$now")
 
     # Guard 2 — one evaluator at a time. A still-live evaluator window
-    # (e.g. yesterday's run still in flight) consumes today's fire so
-    # the log carries exactly one line about it.
+    # (e.g. yesterday's run still in flight) DEFERS today's fire.
+    #
+    # It used to CONSUME it: this arm stamped `last-fire-date`, and the fire
+    # predicate is `now >= today@fire_time AND last-fire-date != today`, so
+    # stamping here cancelled the day outright rather than postponing it
+    # (your-org/nexus-code#968). That is not a theoretical difference. On
+    # 2026-08-20 an evaluator's turn crashed on `Login expired` about two
+    # minutes after spawn, before it wrote anything; its process stayed alive,
+    # so a window that could not do any work satisfied this guard, and the
+    # 08-21 round was cancelled silently — and every subsequent round would
+    # have been, for as long as the corpse existed. A security-relevant
+    # evaluation stops running and nothing says so.
+    #
+    # Not stamping makes the guard self-healing: the next tick
+    # (`check_interval_seconds`, 300 by default) retries, and the day resumes
+    # the moment the stale window goes away. The stamp was never what stopped
+    # a genuine double-spawn — `spawn-worker.sh`'s exit-7 name-collision guard
+    # is, and it still is; the stamp only stopped the RETRY.
+    #
+    # The skip row and the log line stay once-per-day, keyed on their own
+    # marker rather than on the fire stamp. Retrying every 300 s would
+    # otherwise write ~288 identical `skipped-window-alive` rows a day, and a
+    # log that repeats is read exactly as often as one that is silent.
+    #
+    # WINDOW EXISTENCE IS NOT EVALUATOR LIVENESS (#968 part 2). The
+    # 2026-08-20 corpse satisfied `_cc_auto_window_alive` for as long as it
+    # existed, so not stamping alone turns one silent cancellation into an
+    # unbounded silent deferral — the same round never running, differently
+    # spelled. `_cc_auto_evaluator_stale` adds the missing axis: a pane that
+    # has been POSITIVELY stalled for CC_AUTO_EVALUATOR_STALE_SECONDS is not
+    # a live evaluator and its window is reclaimed. Every other reading —
+    # working, indeterminate, or a stall too young — still defers.
+    local eval_live=0 eval_detail=""
     if _cc_auto_window_alive "$CC_AUTO_WINDOW"; then
-        _cc_auto_stamp "$stamp" "$now"
-        _cc_auto_log_decision "$auto_dir" "-" "skipped-window-alive" "window=$CC_AUTO_WINDOW"
-        declare -F log >/dev/null 2>&1 \
-            && log "cc-auto-update: evaluator window '$CC_AUTO_WINDOW' still alive from a prior run; skipping today's fire"
+        if _cc_auto_evaluator_stale "$auto_dir" "$CC_AUTO_WINDOW" "$now" "$nexus_root"; then
+            _cc_auto_log_decision "$auto_dir" "-" "evaluator-window-reclaimed" \
+                "window=$CC_AUTO_WINDOW state=$CC_AUTO_EVAL_STATE stalled_for=${CC_AUTO_EVAL_STALL_AGE}s"
+            declare -F log >/dev/null 2>&1 \
+                && log "cc-auto-update: evaluator window '$CC_AUTO_WINDOW' has been stalled (state=$CC_AUTO_EVAL_STATE) for ${CC_AUTO_EVAL_STALL_AGE}s with no work in flight — reclaiming it and firing today's round"
+            rm -f "$auto_dir/evaluator-stalled-since" 2>/dev/null || true
+        else
+            eval_live=1
+            eval_detail="window=$CC_AUTO_WINDOW class=$CC_AUTO_EVAL_CLASS state=$CC_AUTO_EVAL_STATE stalled_for=${CC_AUTO_EVAL_STALL_AGE}s"
+        fi
+    else
+        rm -f "$auto_dir/evaluator-stalled-since" 2>/dev/null || true
+    fi
+
+    if (( eval_live )); then
+        local skip_stamp="$auto_dir/last-skip-date" last_skip=""
+        [[ -f "$skip_stamp" ]] && last_skip=$(tr -d '[:space:]' < "$skip_stamp" 2>/dev/null || true)
+        if [[ "$last_skip" != "$today" ]]; then
+            _cc_auto_stamp "$skip_stamp" "$now"
+            local streak
+            streak=$(_cc_auto_skip_streak_bump "$auto_dir")
+            [[ "$streak" =~ ^[0-9]+$ ]] || streak=1
+            _cc_auto_log_decision "$auto_dir" "-" "skipped-window-alive" \
+                "$eval_detail streak=$streak"
+            declare -F log >/dev/null 2>&1 \
+                && log "cc-auto-update: evaluator window '$CC_AUTO_WINDOW' still alive from a prior run ($eval_detail); DEFERRING today's fire (retries each tick until the window clears)"
+            # SURFACE A REPEATED SKIP (#968 part 3). One deferral is
+            # routine. N consecutive days of them means the update
+            # evaluation has stopped running, and until this the ONLY
+            # trace of that was a TSV row nothing reads — the whole
+            # reason a cancelled round went unnoticed for a day and would
+            # have gone unnoticed indefinitely.
+            local alert="${CC_AUTO_SKIP_STREAK_ALERT:-2}"
+            [[ "$alert" =~ ^[0-9]+$ && "$alert" -gt 0 ]] || alert=2
+            # RE-NAG GUARD (your-org/nexus-code#1342): escalate when the streak
+            # FIRST reaches the threshold, then again every `repeat` deferred
+            # days — the same idiom `_cc_auto_write_restart_outcome` uses 283
+            # lines up, and for the same reason: an alert that fires every day
+            # is not read. Measured before this guard: 5 notifications over six
+            # deferred days where the restart arm would have sent 1.
+            local repeat="${CC_AUTO_SKIP_STREAK_REPEAT:-7}"
+            [[ "$repeat" =~ ^[0-9]+$ && "$repeat" -gt 0 ]] || repeat=7
+            if (( streak >= alert )) \
+               && (( streak == alert || (streak - alert) % repeat == 0 )); then
+                _cc_auto_log_decision "$auto_dir" "-" "skipped-window-alive-escalation" \
+                    "streak=$streak $eval_detail"
+                declare -F log >/dev/null 2>&1 \
+                    && log "cc-auto-update: the daily update evaluation has now been DEFERRED $streak days running by window '$CC_AUTO_WINDOW' ($eval_detail). No candidate has been evaluated in that time. Inspect the window, or close it: monitor/.state/cc-auto-update/decisions.tsv"
+                command -v sandbox-notify >/dev/null 2>&1 \
+                    && sandbox-notify "cc-auto-update: daily evaluation deferred ${streak} days running — evaluator window '$CC_AUTO_WINDOW' ($CC_AUTO_EVAL_STATE) is blocking every round" || true
+            fi
+        fi
         return 0
+    fi
+    _cc_auto_skip_streak_clear "$auto_dir"
+
+    if (( retry_fire )); then
+        # Consumed only once Guard 2 let the fire through, so a live
+        # evaluator postpones a retry instead of eating it.
+        cc_hold_retry_consume "$auto_dir" "$now"
+        _cc_auto_log_decision "$auto_dir" "-" "retry-fired" "$retry_why"
+        declare -F log >/dev/null 2>&1 && log "cc-auto-update: retry fire ($retry_why)"
     fi
 
     # Fresh registry decide at fire time (don't trust a possibly-24h-old
@@ -646,22 +1083,79 @@ _cc_auto_update_tick() {
         return 0
     fi
 
+    # A SAFE-REFUSED OUTCOME NOTIFIES SOMEBODY (your-org/nexus-code#1400).
+    # `safe-refused` is "the candidate is fine, I could not apply it" — a
+    # defect in US, not in the candidate — and it used to write one TSV row
+    # and go dark; the daily fire then reproduced it byte-for-byte. Two days
+    # of false BLOCKs surfaced only because the operator asked. So the tick
+    # itself says so, once per day, via the log and sandbox-notify, naming the
+    # reason and the candidate, and it says LOUDER when the previous refusal
+    # carried the same reason (a standing defect, not a transient tree state).
+    _cc_auto_surface_safe_refused "$auto_dir" "$candidate" "$now"
+
     # Guard 4 — candidate already surfaced to the operator (block or
     # compat-pr outcome). A newer candidate falls through and re-arms.
-    if _cc_auto_last_eval_skip "$auto_dir" "$candidate"; then
+    if _cc_auto_last_eval_skip "$auto_dir" "$candidate" "$now" "$live_head"; then
         _cc_auto_stamp "$stamp" "$now"
-        _cc_auto_log_decision "$auto_dir" "$candidate" "skipped-awaiting-operator" \
-            "last-eval=$(_cc_update_field "$auto_dir/last-eval" decision 2>/dev/null || echo '?')"
+        _cc_auto_log_decision "$auto_dir" "$candidate" "skipped-compat-hold-same-day" \
+            "last-eval=$(_cc_update_field "$auto_dir/last-eval" decision 2>/dev/null || echo '?') live_head=$live_head"
         declare -F log >/dev/null 2>&1 \
-            && log "cc-auto-update: candidate $candidate already surfaced (awaiting operator); skipping re-eval"
+            && log "cc-auto-update: candidate $candidate is on a COMPAT hold recorded today at this same HEAD; re-evaluated when the HEAD moves or at the next daily fire (#1657)"
         return 0
     fi
 
     # Clean up a dead remain-on-exit evaluator window from a prior life
     # so spawn-worker's collision check (exit 7) doesn't refuse.
-    if tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$CC_AUTO_WINDOW"; then
+    if grep -Fxq -- "$CC_AUTO_WINDOW" <<<"$(tmux list-windows -F '#W' 2>/dev/null)"; then
         tmux kill-window -t "$CC_AUTO_WINDOW" 2>/dev/null || true
     fi
+
+    # Resolve the tracking issue, or REFUSE to fire (your-org/nexus-code#866).
+    #
+    # This used to interpolate the configured value straight into the prompt,
+    # where the template pairs it with SURFACE_REPO. A bare number therefore
+    # resolved against whatever repo the template happened to name — so a
+    # reference written for one repo was consumed against another, and every
+    # write landed, succeeded, and was never seen. Nothing errored, because
+    # nothing checked that the number and the repo came from the same place.
+    #
+    # A qualified reference carries its own repo, so the two cannot drift.
+    # An unqualified one is REFUSED here rather than guessed: the evaluator
+    # does not fire, the reason is logged, and the decision is recorded. That
+    # is a deliberately worse outcome than firing — a skipped evaluation is
+    # visible on the next fire, whereas a misrouted one is invisible forever.
+    # Unset is the common case and has nothing to resolve, so the resolver is
+    # only consulted when a value EXISTS. That also keeps "no standing issue"
+    # working on a root where the resolver is somehow absent, while a value
+    # that cannot be checked still refuses (below) — absence of the checker is
+    # not evidence the reference is fine.
+    local _ref_out _ref_rc=3 _track_repo="" _track_issue=""
+    local _track_raw="${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-}"
+    _track_raw="${_track_raw#"${_track_raw%%[![:space:]]*}"}"
+    if [[ -n "$_track_raw" ]]; then
+        if [[ -r "$nexus_root/monitor/issue-ref.sh" ]]; then
+            _ref_out=$(bash "$nexus_root/monitor/issue-ref.sh" "$_track_raw" \
+                --field monitor.cc_auto_update.tracking_issue 2>&1)
+            _ref_rc=$?
+        else
+            _ref_out="issue-ref: REFUSING — resolver missing at $nexus_root/monitor/issue-ref.sh; cannot verify the tracking reference"
+            _ref_rc=4
+        fi
+    fi
+    case "$_ref_rc" in
+        0)  _track_repo=$(printf '%s\n' "$_ref_out" | sed -n 's/^REPO=//p')
+            _track_issue=$(printf '%s\n' "$_ref_out" | sed -n 's/^ISSUE=//p') ;;
+        3)  : ;;   # unset — legitimate: no standing issue, evaluator opens one if it must
+        *)  declare -F log >/dev/null 2>&1 && log \
+                "ERROR cc-auto-update: monitor.cc_auto_update.tracking_issue is not a qualified owner/repo#N reference; REFUSING to fire rather than posting to a guessed repo"
+            printf '%s\n' "$_ref_out" | while IFS= read -r _l; do
+                declare -F log >/dev/null 2>&1 && log "cc-auto-update:   $_l"
+            done
+            _cc_auto_stamp "$stamp" "$now"
+            _cc_auto_log_decision "$auto_dir" "$candidate" "refused-unqualified-tracking-issue" \
+                "value=${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-} (want owner/repo#N)"
+            return 0 ;;
+    esac
 
     # Render the evaluator prompt.
     local template="${CC_AUTO_PROMPT_TEMPLATE:-$nexus_root/monitor/cc-auto-update-prompt.md}"
@@ -673,7 +1167,8 @@ _cc_auto_update_tick() {
             "STATE_DIR=$state_dir" \
             "DATE=$today" \
             "SURFACE_REPO=${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}" \
-            "TRACKING_ISSUE=${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-}" \
+            "TRACKING_ISSUE=${_track_issue}" \
+            "TRACKING_REPO=${_track_repo}" \
             "GUIDE=${MONITOR_CC_UPDATE_SKILL_PATH:-skills/nexus.cc-update/GUIDE.md}"; then
         declare -F log >/dev/null 2>&1 \
             && log "ERROR cc-auto-update: prompt template missing/unreadable at $template; cannot spawn evaluator"
@@ -694,6 +1189,12 @@ _cc_auto_update_tick() {
     printf '%s\n' "$candidate" > "$state_dir/cc-update-surfaced" 2>/dev/null || true
 
     local spawn_cmd="${CC_AUTO_SPAWN_CMD:-$nexus_root/monitor/spawn-worker.sh}"
+    # The evaluator's window NAME, written where the PreToolUse hook reads it
+    # (your-org/nexus-code#1529, w241sk D2): `bash-footgun-guard.sh`'s
+    # `cc-update-git` arm scopes on this name and cannot otherwise see a
+    # custom CC_AUTO_WINDOW that was exported to the watcher but not to the
+    # evaluator. Best-effort: a write that fails leaves the env default.
+    printf '%s\n' "$CC_AUTO_WINDOW" > "$auto_dir/evaluator-window" 2>/dev/null || true
     declare -F log >/dev/null 2>&1 \
         && log "cc-auto-update FIRED: candidate=$candidate installed=${pinned:-?} spawning evaluator window=$CC_AUTO_WINDOW prompt=$prompt_file"
     if "$spawn_cmd" -n "$CC_AUTO_WINDOW" -c "$nexus_root" -p "$prompt_file" >/dev/null 2>&1; then

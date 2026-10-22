@@ -620,7 +620,7 @@ printf '\n--- 5. the verdict record carries the head ---\n'
 ALOG="$NEXUS_STATE_DIR/action-log.jsonl"
 : > "$ALOG"
 out=$( _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
-        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "$VALIDATED_FULL" "" 2>&1 ); rc=$?
+        1 "" "" "" credible "worker-w3" 1 0 "" "" "" "" 0 "" 0 "$VALIDATED_FULL" "" 2>&1 ); rc=$?
 assert_eq "T5.1a the role path returns 0" "$rc" "0"
 ev=$(grep '"event":"skeptic-verdict"' "$ALOG" | tail -1)
 assert_contains "T5.1b the event carries the head" "$ev" "\"head\":\"$VALIDATED_FULL\""
@@ -647,7 +647,7 @@ git -C "$WT" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 WT_HEAD=$(git -C "$WT" rev-parse HEAD)
 : > "$ALOG"
 out=$( cd "$WT" && _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
-        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "" "" 2>&1 ); rc=$?
+        1 "" "" "" credible "worker-w3" 1 0 "" "" "" "" 0 "" 0 "" "" 2>&1 ); rc=$?
 ev=$(grep '"event":"skeptic-verdict"' "$ALOG" | tail -1)
 assert_contains "T5.1j the head came from the worktree" "$ev" '"head-source":"worktree"'
 assert_contains "T5.1k the hint prints a placeholder head" "$out" "--head <pr-head-sha>"
@@ -656,7 +656,7 @@ assert_not_contains "T5.1l and not the worktree sha" "$out" "--head ${WT_HEAD:0:
 # T5.2 a malformed --skeptic-head is refused rather than recorded.
 : > "$ALOG"
 out=$( _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
-        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "not-a-sha" "" 2>&1 ); rc=$?
+        1 "" "" "" credible "worker-w3" 1 0 "" "" "" "" 0 "" 0 "not-a-sha" "" 2>&1 ); rc=$?
 assert_eq "T5.2a a malformed head fails the wrap-up" "$rc" "1"
 assert_contains "T5.2b with a message naming the flag" "$out" "--skeptic-head"
 
@@ -664,7 +664,7 @@ assert_contains "T5.2b with a message naming the flag" "$out" "--skeptic-head"
 # recording a verdict that cannot gate anything.
 : > "$ALOG"
 out=$( cd "$TMP" && _wrapup_skeptic_step 155 "" "jacob-greene/nexus" \
-        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "" "" 2>&1 ); rc=$?
+        1 "" "" "" credible "worker-w3" 1 0 "" "" "" "" 0 "" 0 "" "" 2>&1 ); rc=$?
 assert_eq "T5.3a still returns 0 (a missing head does not fail a wrap-up)" "$rc" "0"
 assert_contains "T5.3b but the block warns the head is UNKNOWN" "$out" "UNKNOWN"
 
@@ -673,7 +673,7 @@ assert_contains "T5.3b but the block warns the head is UNKNOWN" "$out" "UNKNOWN"
 : > "$ALOG"; reset_calls
 FX_BODY="$BODY_NONE"; FX_HEAD_SHA="$VALIDATED_FULL"
 out=$( _wrapup_skeptic_step 155 "skeptic-w9" "jacob-greene/nexus" \
-        1 "" "" "" credible "worker-w3" 1 0 "" "" 0 "" 175 2>&1 ); rc=$?
+        1 "" "" "" credible "worker-w3" 1 0 "" "" "" "" 0 "" 0 "" 175 2>&1 ); rc=$?
 ev=$(grep '"event":"skeptic-verdict"' "$ALOG" | tail -1)
 assert_eq "T5.4a the role path returns 0" "$rc" "0"
 assert_contains "T5.4b the head came from the pull request" "$ev" '"head-source":"pr-175"'

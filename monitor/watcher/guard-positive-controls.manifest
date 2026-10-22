@@ -1,0 +1,216 @@
+# guard-positive-controls.manifest — every guard that declares a population
+# (`guard-populations.manifest`) and the POSITIVE CONTROL it ships with: the
+# assertion in which a PLANTED violation is demonstrably caught, or a planted
+# malformed input demonstrably REFUSED. Recorded as DATA rather than prose,
+# because prose cannot be made to fail.
+#
+# Enforced by:  bash monitor/watcher/test-guard-positive-controls.sh
+#
+# ── WHY THIS FILE EXISTS (your-org/nexus-code#1264 R4, #1477) ──────────────
+#
+# "Every guard must ship with a planted violation it demonstrably catches, and
+# go red if that plant stops being caught." The case that made it a rule:
+# `test-assert-shims-wrapped.sh` was GREEN for the whole of an 18-hour outage
+# CAUSED BY THE GUARD IT TESTS (#1477) — its hermetic seam could not observe the
+# guard's own failure class. A guard never seen to fail is not evidence; a
+# suite whose plants are all inside a seam proves only the seam.
+#
+# ── THE SWEEP IS THE POINT (#1264's binding finding) ───────────────────────
+#
+# A rule adopted without an enumeration of its current violators reproduces
+# the defect #1264 diagnoses (c386bff added a rule, its test, and left the
+# documented violation in the pre-push gate for 14 days). So this file is the
+# sweep: one row per declaring guard, ALL of them, and the guards with NO
+# positive control are named as `NONE` rows with a reason and bounded by the
+# `none-ceiling` below — a ratchet, never a running total. Census taken at
+# dev 2a299572, 2026-09-06, by reading each suite's assertion labels for a
+# planted violation the guard is asserted to catch.
+#
+# ── NO NAME-DERIVATION (the #1121 shape) ───────────────────────────────────
+#
+# A grep over each suite for "control|plant|potency" is a HEURISTIC — it
+# under-finds (five suites spell their plant `fixture:`, `the pre-fix red`,
+# `positive.sh:3:`) and over-finds (`Control A: extracted exactly N forms` is a
+# GENERATOR check, not a plant). So the control is DECLARED per row, as a
+# verbatim substring of the assertion label in the owner suite; the only
+# generated thing is the guard set the rows are checked against.
+#
+# ── WHAT A ROW CLAIMS, AND WHAT IT DOES NOT ─────────────────────────────────
+#
+# Structural: the guard exists and is tracked, and the named label appears
+# verbatim in it — so a renamed or deleted plant reddens here. Whether the
+# plant is actually CAUGHT is the owner suite's own assertion, which this
+# ratchet does not re-run; a `plant` row whose owner stops asserting red on
+# its plant is a defect in the OWNER (its label would change) and shows here
+# only if the label text moves.
+#
+# ── COLUMNS  guard|control_label|kind|reason ────────────────────────────────
+#
+#   plant     a planted VIOLATION the guard is asserted to flag / detect / fire on
+#   refusal   a planted MALFORMED input (empty path, unparseable file, missing
+#             rows) the guard is asserted to REFUSE with a stated status —
+#             the fail-closed direction, deliberately distinguished from a plant
+#   none      no positive control found in the suite's assertion labels at the
+#             census ref; bounded by the ceiling; the reason says what a plant
+#             would have to look like AND carries an OWNER — a tracker ref
+#             (`#NNN` / `owner/repo#NNN`) or an expiry (`until:YYYY-MM-DD`) —
+#             so the exemption has to be re-justified rather than inherited
+#             (your-org/nexus-code#1469: an unowned exemption invites a shrug,
+#             and that one turned out to be unnecessary as well as unowned)
+#
+# none-ceiling: 0
+#
+monitor/watcher/test-ambient-shell-option-scope.sh|P1 fires on a planted masking intersection|plant|planted violation is asserted caught
+monitor/watcher/test-api-hold.sh|B two sessions with transport errors → HELD|plant|two transport-class (EAI_AGAIN) StopFailure markers from two sessions are planted and asserted to ENTER the hold; the same plant with the class swapped to a real 500 is asserted NOT to, and part F re-runs the fixture with the hold disabled and asserts today's behaviour, so the suite can tell the two apart
+monitor/watcher/test-argloop-progress-guard.sh|and WOULD false-positive if both sites shared one name|plant|planted violation is asserted caught
+monitor/watcher/test-argv-credential-lint.sh|pre-fix sites: all 10 flagged|plant|planted violation is asserted caught
+monitor/watcher/test-assets-untracked.sh|a force-added assets/ file makes the predicate report 1|plant|planted violation is asserted caught
+monitor/watcher/test-awk-v-escape-lint.sh|positive.sh:3:|plant|planted violation is asserted caught
+monitor/watcher/test-backtick-label-lint.sh|planted: exactly the two unescaped double-quoted labels are flagged|plant|planted violation is asserted caught
+monitor/watcher/test-bootstrap-recover-followup.sh|F2 wrapped-then-dispatched|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-618-remedies.sh|plain grep -r finds 0 files (bug reproduced)|plant|planted violation is asserted caught (re-censused after the w225 skeptic word-list pass: the earlier label "finds both planted files" was the REMEDY positive control; the plant is the wrong form returning the silent zero)
+monitor/watcher/test-claude-md-ancestor-timeline.sh|the naive cross-ref series is 3 0 0 1|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-arm-order-shadowing.sh|Control B: the two orders DISAGREE on the same input|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-backtick-substitution.sh|Control C: …with stderr EMPTY — nothing to notice|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-block-coverage.sh|Control B (COMMENT-ONLY mention): reported UNREAD|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-count-provenance.sh|cat-file -e REFUSES a bogus path at LOC_A|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-claude-md-count-vs-list.sh|fixture C yields exactly 1 row|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-dash-pattern-option.sh|and printed NOTHING, so it filtered nothing|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-fromisoformat.sh|positive control: the OLD|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-grep-bre-dialect.sh|Control C: the BRE form EXITS 0 (it is SILENT, not broken)|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-grep-h-order.sh|stand-in grep -h: alphabetical, argument order gone|plant|planted violation is asserted caught (re-censused after the w225 skeptic: the earlier label was a generator check, the header's own over-find example)
+monitor/watcher/test-claude-md-guards-for-diff.sh|Claim 5: a guard that cannot answer its population REFUSES (exit 2)|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-claude-md-lstree-pathspec.sh|Control C: the ls-tree form exits 0 (it is SILENT, not broken)|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-marker-ownership.sh|PC1: an unmanifested marker IS detected|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-merge-enumeration.sh|DOCUMENTED form 1, run on the fixture, sees only the ONE true merge|plant|planted violation is asserted caught (re-censused after the w225 skeptic: the earlier label was a presence control, the plant is the fixture arm)
+monitor/watcher/test-claude-md-nullcmd-redirect.sh|fires: the incident line, bare at the start of a call|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-pane-state-vocabulary.sh|a planted INVENTED state is detected|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-pathspec-glob-depth.sh|B the trapped form crosses / on the planted layout|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-pipeline-status.sh|the manufacturing form EXITS 0 (control C)|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-population-enrolment.sh|NEGATIVE CONTROL: a suite that only MENTIONS CLAUDE.md is out|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-printf-status-clobber.sh|it ALSO catches the 137 that -s KILL injects|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-procmatch-argv.sh|DOES match the plant (|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-python-backref-escape.sh|the repr shows the backreference replaced by a control byte|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-repo-walkup.sh|POSITIVE CONTROL: toplevel at the ROOT *is* the root|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-shell-wrapped-coreutil.sh|through the PLANTED wrapper the count is a silent 0|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-shopt-dynamic-scope.sh|and the parity check FIRES for a token the prose does not name|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-window-key-vocabulary.sh|pane-state.sh refuses the ambiguous key with the DOCUMENTED status|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-claude-md-worktree-blind-spot.sh|reports/ignored_fixture.txt IS gitignored|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-zsh-path-tie.sh|the destroying form EXITS 0 (control C)|plant|planted violation is asserted caught
+monitor/watcher/test-dangerous-rm-decide-hook.sh|wk.timeout.deny: behavior|plant|an IN-CLASS dangerous-rm request (the class the hook exists to decide) is asserted DECIDED — denied at the deadline; every must-not-flip row is read against it (your-org/nexus-code#1632)
+monitor/watcher/test-degraded-enter-exit.sh|H3 positive control: a planted composition IS flagged|plant|planted violation is asserted caught (your-org/nexus-code#1724)
+monitor/watcher/test-early-exit-reader-manifest.sh|and the sed-q arm demonstrably fires when one exists|plant|planted violation is asserted caught
+monitor/watcher/test-empty-needle-local-copies.sh|the shared definer itself refuses an empty needle|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-empty-needle-production.sh|and the refusal NAMES the empty anchor|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-empty-needle-vacuous-helpers.sh|the #1038/#1092 spelling|plant|planted violation is asserted caught
+monitor/watcher/test-entry-signals.sh|the pre-fix red|plant|planted violation is asserted caught
+monitor/watcher/test-errexit-assignment-status.sh|planted: the one-line and the two-line shapes are flagged, nothing else|plant|planted violation is asserted caught
+monitor/watcher/test-flock-fd-cloexec.sh|fixture: exactly the two bad sites flagged|plant|planted violation is asserted caught
+monitor/watcher/test-fs-evidence-df-status.sh|failing df yields fs_source=unknown|plant|planted violation is asserted caught
+monitor/watcher/test-full-state-actionable-backoff.sh|a pane going ABSENT at deep idle emits at once|plant|planted violation is asserted caught -- at a 40 h idle streak an actionable change (a pane going absent) is planted and must emit in that tick and snap the anchor back, beside an activity-only flip that must NOT; potency-checked: the suite copied onto base 78e59f60 fails 11 of 24, the predicted flip set exactly (your-org/nexus-code#1736)
+monitor/watcher/test-gh-stub-contract.sh|PLANT: a stub that captures --jq and never applies it is BLIND|plant|planted violation is asserted caught
+monitor/watcher/test-grep-delegation-arms.sh|no DELEGATES/REACHES rows -> usage refusal (2)|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-guard-closure-boundary.sh|TALLY CONTROL: a SILENT gate scores 0/1|plant|planted violation is asserted caught
+monitor/watcher/test-guards-for-diff.sh|CONTROL: dropping one sentinel from a real population IS seen|plant|planted violation is asserted caught
+monitor/watcher/test-heartbeat-schema-agreement.sh|POTENCY: the planted .phantom_field read is reported as unwritten|plant|planted violation is asserted caught
+monitor/watcher/test-helper-honesty.sh|is still caught (prefix arm)|plant|planted violation is asserted caught
+monitor/watcher/test-heredoc-backtick-lint.sh|planted: exactly the two expanding-body backtick lines are flagged|plant|planted violation is asserted caught
+monitor/watcher/test-knob-default-agrees.sh|control: a PRODUCTION-side drift is REJECTED|plant|planted violation is asserted caught
+monitor/watcher/test-mutation-gate-bounds.sh|the continuation line is REFUSED (exit 3)|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-ng-usage-flag-coverage.sh|CONTROL a planted drift is detected|plant|planted violation is asserted caught
+monitor/watcher/test-nullglob-bare-form-manifest.sh|and the predicate FIRES on a planted prelude that does set it|plant|planted violation is asserted caught
+monitor/watcher/test-operator-path-literals-manifest.sh|the pre-#1275 README snippet is caught|plant|planted violation is asserted caught
+monitor/watcher/test-over-limit-orchestrator-activity.sh|D2 POTENCY: a third toucher on UserPromptSubmit is DETECTED|plant|planted violation is asserted caught
+monitor/watcher/test-pane-state.sh|planted monitor_handles/background_bash_count|plant|planted violation is asserted caught
+monitor/watcher/test-public-mirror-build-entry-guard.sh|saying it would have scrubbed the caller's cwd|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-run-tests-accounting-verdict.sh|CONTROL a genuine failure still exits 1|plant|planted violation is asserted caught
+monitor/watcher/test-run-tests-empty-outfile.sh|SERIAL: …and says why, naming the directory it refused to write to|refusal|planted malformed input is refused with a stated status (re-censused after the w225 skeptic: the earlier label counted a source-text occurrence, not the driven refusal)
+monitor/watcher/test-run-tests-header-ref.sh|the ENCLOSING repository's sha is NOT borrowed|plant|planted violation is asserted caught
+monitor/watcher/test-shell-files.sh|both-shell: the planted population is 3 under bash|plant|planted violation is asserted caught
+monitor/watcher/test-sigpipe-assertion-lint.sh|an unmarked pipe-into-grep-q in this file is flagged|plant|planted violation is asserted caught
+monitor/watcher/test-skeptic-evidence-class-agreement.sh|POSITIVE CONTROL: a class deleted from ONE arm IS caught, and named|plant|planted violation is asserted caught (your-org/nexus-code#1483): one evidence class is deleted from ONE of the two retire-preflight arms in a COPY and the membership comparison is asserted to name it; the NEGATIVE arm runs an unmodified copy through the same override so "caught the plant" is distinguishable from "reddens on any copy"
+monitor/watcher/test-skeptic-resolve-scoped.sh|INCIDENT: resolve pipe citing gate-sk, no --reviewer: REFUSED (rc 9)|plant|the 2026-10-16 incident is replayed (gate-sk then alerts-sk a minute later; since #1849 both edges stay live) and a target-keyed resolve citing gate-sk with no --reviewer is asserted REFUSED with both edges left live; mutating the named-review check makes it settle every live edge and flip this case
+monitor/watcher/test-skeptic-round-identity.sh|re-armed with a different sha, then closed: exit 14|plant|a PLANTED ledger reproducing `promote`'s measured state (a verdict on sha A, a re-arm with sha B, then a close — `standing_stale=1`, asserted as a fixture precondition on the line above it) is asserted CAUGHT: await must answer 14 ENDED-WITHOUT-VERDICT, where the pre-fix tree answered 10 (seen red against efd4e3a8 in the revert check, your-org/nexus-code#1573)
+monitor/watcher/test-spawn-shape-manifest.sh|a planted call site absent from the manifest IS reported UNCLASSIFIED|plant|planted violation is asserted caught (your-org/nexus-code#1483): a scratch git repo with one spawn call site and a manifest that omits it; asserted on the MESSAGE rather than the exit code, because a three-file fixture also trips the non-degeneracy floor and rc 1 alone would be satisfied by a suite whose UNCLASSIFIED arm had been deleted
+monitor/watcher/test-stamp-clear-splitbrain.sh|POTENCY: the OLD hardcoded clear leaves the stamp behind (the defect)|plant|planted violation is asserted caught
+monitor/watcher/test-stub-claude-manifest.sh|R1 control: #1076 plant B|plant|planted violation is asserted caught
+monitor/watcher/test-subshell-exit-guards.sh|an unparseable file REFUSES (rc 3), it does not report zero sites|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-summary-honesty-manifest.sh|AXIS A: a hand-rolled summary is ledger=no|plant|planted violation is asserted caught
+monitor/watcher/test-test-fence-state.sh|inherited primary OUTSIDE the fence is refused|plant|the #1680 leak mechanism is PLANTED — an inherited NEXUS_ROOT naming a primary OUTSIDE the fence, the July rows' route — and spawn-worker.sh is asserted to refuse it (launcher roots in the clone, the refusal is loud, the fake primary's .state stays empty); case A replays the incident through mutation-gate.sh with a positive control that the fixture's own log got the row (your-org/nexus-code#1680)
+monitor/watcher/test-th-require-fixture-repo.sh|#1429 an EMPTY path is refused at 97|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-tmux-socket-ceiling.sh|outcome 2: a too-long path exits|plant|planted violation is asserted caught
+monitor/watcher/test-tmux-window-resolver.sh|B1 no-server: refuses in the issue's terms|refusal|planted malformed input is refused with a stated status
+monitor/watcher/test-tmux-selection-restore.sh|A11 CONTROL: select-window by NAME with a duplicate present fails (rc 1)|plant|the #1524 hazard the restore exists to avoid is PLANTED (a same-named stale window beside the owned one, and a prefix sibling) and demonstrated to fire through tmux 2.6 itself — by-name select fails rc 1 with the duplicate and lands on the sibling with the exact name absent — while the by-@id restore lands on the owned window; D9/A10 additionally assert a dead or names-only tmux is refused rc 3 and writes/moves nothing (your-org/nexus-code#1528)
+monitor/watcher/test-guard-positive-controls.sh|PC1: a guard joining the index with no row IS detected|plant|planted violation is asserted caught (the rule applied to its own enforcer)
+monitor/watcher/test-skills-catalog.sh|PC3: a directory with no row IS detected|plant|planted violation is asserted caught
+monitor/watcher/test-claude-md-entry-budget.sh|PC2: the planted over-budget entry IS detected|plant|planted violation is asserted caught
+monitor/watcher/test-suite-declaration-census.sh|PC1: a new non-declaring suite with no row IS detected|plant|planted violation is asserted caught
+monitor/watcher/test-ci-band-coverage.sh|a reported suite outside the population is REFUSED (2), never read as complete|refusal|planted malformed input (a verdict for a suite outside the population) is refused with a stated status
+monitor/watcher/test-tee-reopen-lint.sh|tee <fd-path> is flagged|plant|planted violation is asserted caught
+monitor/watcher/test-count-fallback-lint.sh|#730: workflow YAML under .github/ IS in scope|plant|planted violation is asserted caught
+monitor/watcher/test-tmux-shim-gate3-safety.sh|quoted $(command -v tmux) — two quote chars from the old control|plant|planted violation is asserted caught
+monitor/watcher/test-cc-auto-update.sh|#1614/#1131: 2c-paste=gate is refused when the paste scenario did not run (vimode alone does not pay for it), and the reason says so|refusal|planted malformed input (a gate-policy violation planted in the fixture) is refused with a stated status, and #1131 CONTROL pins that the refusal is distinguishable from the inert one
+monitor/watcher/test-cc-auto-update-default-docs.sh|the mutant is caught: exactly one doc missing|plant|planted doc copy with the derived phrase stripped is asserted caught; a second plant flips the CODE literal and every doc must redden
+monitor/watcher/test-cc-hold-policy.sh|F1 REPRODUCTION: the candidate's own RED log as its control is REFUSED|refusal|the skeptic's planted self-control (the candidate's own RED gate log passed as the installed-version control) is asserted REFUSED, never accepted as pre-existing (your-org/nexus-code#1657 round 2); further plants: a new failing assertion inside an already-red scenario holds, a pragma planted in pane-state.sh refuses the gate, a malformed COMPAT block holds rather than applies
+monitor/watcher/test-cc-update-no-remote-code.sh|p1: exactly one violation, in the planted file, rule named|plant|a `pull --ff-only origin "$branch"` appended to a copy of the watcher drive is asserted caught by name; further plants cover each file class (a remote worktree in apply.sh, a dev-naming advisory in _version_restart.sh, a harness run from a clone variable, the retired control re-invited in the evaluator prompt, a remote checkout in the GUIDE, a URL clone in the watchdog prompt); an unmodified copy is the control, and an EMPTY population is asserted REFUSED (99), never green
+monitor/watcher/test-report-schema-disposition-doc.sh|…and would FAIL the require-path pin|plant|planted copy of the schema carrying the pre-#1512 text is asserted to fail the pin that the real schema passes
+monitor/watcher/test-pane-state-restart-quiescence.sh|L2 the restart gate REFUSES a pane holding real work|plant|planted violation is asserted caught (a second, NON-quiescent work root planted beside the supervisor-shaped wait root; the gate must refuse)
+monitor/watcher/test-pane-state-mcp-helper.sh|M1 one background-shell root (the tool shell), not two|plant|a real process tree is planted (a fake claude, a same-session non-shell `npm` running `sh`, a detached tool shell) and the helper's sh is asserted NOT counted; deleting the #1851 skip makes the census count it and flips this case, while the blocked-tool-shell, gate-off and left-session negatives (M2-M4) must not flip
+monitor/watcher/test-pane-state-footer-eol.sh|at end of row — the Monitor-only wait|plant|a planted 2.1.302 footer row ending at the count (`· 2 monitors`, no hint after it) must read mon=2 (your-org/nexus-code#1866); the base parser at 414bd080 reads 0 on it and on the six other MUST-FIX rows, and deleting pass 2 flips exactly those seven, while the transcript-row negatives (L10, L11) must not flip
+monitor/watcher/test-auth-hold.sh|B reworded login STILL classifies blocked (the hold's real key)|plant|a login dialog REWORDED so that none of the three recognised login strings survives is planted and asserted to still classify state=blocked, the STRUCTURAL key the hold rests on; the label arm's loss on that plant is stated in the adjacent assertion rather than hidden
+monitor/watcher/test-operator-alert.sh|8 fixture: timeout is absent from the stripped PATH|plant|a PATH stripped of `timeout` is planted and the module is asserted to SKIP both network legs and record why (your-org/nexus-code#1553 F2: a notifier that ran unbounded); the adjacent §9 plants an unwritable state dir and asserts the caller still returns 0 and the bell still rings
+monitor/watcher/test-operator-alert-property.sh|PC: a planted LIVENESS violation (20 min critical, no email) is flagged|plant|a schedule with a 20 min critical run and NO email is planted and the checker is asserted to report a LIVENESS violation for that key; the adjacent control plants two emails 60 s apart (SAFETY), and a clean control (the same run with its email at +0) must NOT be flagged (your-org/nexus-code#1653)
+monitor/watcher/test-trap-bare-return-lint.sh|M2 the re-inserted bare return reddens the lint|plant|the REAL file (cc-restart-watchdog-loop.sh) with its fixed `return 1` reverted to a bare `return` is asserted caught, named by function and TERM-trap chain; P1-P5 plant synthetic chains beside it
+monitor/watcher/test-claude-md-tmux-socket-selection.sh|P1: a WRONG form silently 'fixed' to env -u TMUX IS detected|plant|planted violation is asserted caught: the block's third form — the one whose whole job is to be WRONG — is rewritten into a remedy, and the shape check must flag it; P2 plants a LOST form beside it and the count pin must flag that. Both are DOCUMENTATION regressions, the only kind a CLAUDE.md marker suite can suffer, and both are silent (every form still runs)
+monitor/watcher/test-guards-for-diff-sweepers.sh|§1 an undeclared git-ls-files sweeper is NAMED|plant|a planted undeclared sweeper is asserted named; the comment-only, --error-unmatch, fixture-find and declaring plants are asserted NOT named
+monitor/watcher/test-mutation-gate-subject.sh|§1 the isolating case is in the flip set|plant|a planted subject defect (the threshold guard deleted) is asserted caught by the isolating case, and NOT by the case a different guard defends (#1519)
+monitor/watcher/test-realmodel-overlimit-unmeasured.sh|§3 blank throughout -> unmeasured|plant|a planted never-painting frame is asserted UNMEASURED (never pass); a planted wrong classifier answer is asserted FAIL
+monitor/watcher/test-run-tests-runner-signal.sh|§1 the runner exits 4 (NOT A VERDICT), not 143 and not 0|plant|a planted SIGTERM mid-sweep is asserted reported as NOT A VERDICT with the END marker; SIGKILL is asserted to leave NO marker (the control)
+monitor/watcher/test-run-tests-shape-census.sh|B1 an unreachable tracked suite reddens the run (rc 1)|plant|a planted tracked suite under a directory no root walks is asserted to redden the run (your-org/nexus-code#1620); a suite merely filtered out by --filter, and one under the new monitor/cc-harness/ root, are asserted NOT named (the controls)
+monitor/watcher/test-population-primary-shape.sh|control (1) naive walker: SELECTED|plant|a planted guard whose --population walks the repo root is asserted SELECTED for a planted work/ path, and a planted walk-then-filter guard — invisible to selection — is asserted caught by the find tripwire; a planted git-enumerating guard is asserted NOT selected
+monitor/watcher/test-paste-deliver.sh|a PLANTED second paste-buffer site is flagged, by file|plant|a fixture repository with a second executable `tmux paste-buffer` outside the primitive is asserted flagged by file (the comment beside it is asserted NOT flagged), and a planted `set-buffer` argv payload is asserted flagged (#1590, #1591)
+monitor/watcher/test-claude-md-fallback-collapse.sh|form 3 prints verified — for an expectation it never had|plant|planted violation is asserted caught: the block's disabled-check form is RUN and its always-passing verdict asserted, with CONTROL B (the same comparison fed 8 prints MISMATCH) proving the comparison is live (your-org/nexus-code#1496)
+monitor/test-conflict-marker-lint.sh|the diff3 base marker (the one this repo actually had)|plant|planted violation is asserted caught: the exact diff3 marker bytes that reached dev are fed to the lint pattern and must match (your-org/nexus-code#1301 enrolment)
+monitor/test-lint-errexit-branch.sh|shape(s) disagree, as required|plant|planted violation is asserted caught: each lint MUTANT must break the bash-adjudicated manifest (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-diagnostics-outlive-their-paths.sh|POSITIVE CONTROL: the detector finds a planted doomed-path citation|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-fixture-port-lint.sh|POSITIVE CONTROL: an unmarked arithmetic port derivation is flagged|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-launcher-empty-target.sh|C: --target with no value at all -> exit 2|refusal|planted malformed input is refused with a stated status: a bare --target is refused at exit 2 rather than hanging (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-paste-bracketed.sh|no '-p' → paste is NOT bracketed (reproduces the pre-fix bug)|plant|planted violation is asserted caught: an unbracketed paste is driven and its missing bracket markers detected (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-public-mirror-dictionary-coverage.sh|leak-gate FAILS on a token planted from its own denylist (gate is live)|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-public-mirror-overlay-files.sh|a planted AU001 (bare apt-get update) lints rc 1|plant|planted violation is asserted caught (your-org/nexus-code#1557)
+monitor/watcher/test-public-mirror-verify-build.sh|§5 exit 11|plant|a binary is rewritten exactly as the pre-#1812 build did, and verify-build.py alone must refuse it naming the file REWRITTEN; §2 and §3 plant an unreviewed binary and four parse-breaking substitutions (your-org/nexus-code#1812)
+monitor/watcher/test-registry-unreadable-refusal.sh|sweep POSITIVE CONTROL: the predicate fires on this suite's own tracked fixtures|plant|planted violation is asserted caught: the sweep predicate must fire on the defeated form this suite carries as tracked fixtures (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-remote-posture-change.sh|routable move + unpinned + no invitation → REFUSED|plant|planted violation is asserted caught: a fixture home with an unpinned credential on a routable move is refused rc 1 (your-org/nexus-code#1301 enrolment; the wiring census's own bypass plants report through bare _th_pass lines, which this census does not accept as assertion lines)
+monitor/watcher/test-request-state-field.sh|2 POSITIVE CONTROL A: an inline|plant|planted violation is asserted caught: an inline == done state read is flagged by the population lint (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-skeptic-verdict-evidence.sh|NON-VACUITY: the split-across-lines shape is caught, not missed|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-state-dir-propagation.sh|POSITIVE CONTROL: the defect shape is a NON-compliant member|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-strip-heredocs.sh|fail-safe: an unterminated heredoc yields the file UNSTRIPPED|refusal|planted malformed input is refused with a stated status: an unterminated heredoc is returned unstripped, loudly, never partially stripped (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-zsh-modifier-lint.sh|the lint pattern matches a known-bad line (not vacuous)|plant|planted violation is asserted caught (your-org/nexus-code#1301 enrolment)
+monitor/watcher/test-codex-run.sh|rc 0 with NO terminal event -> rc 7 indeterminate, never completed|plant|a planted stub that exits 0 with no terminal event is caught as indeterminate, never read as completed
+monitor/watcher/test-codex-run-real.sh|hang -> rc 4 timeout|plant|a planted hung backend is caught as a typed timeout within the bound, not a hang or a pass
+monitor/watcher/test-codex-worker.sh|no \$CODEX_HOME/auth.json and no custom provider -> rc 25|refusal|a planted missing Codex login is REFUSED (25) before any window exists, never a worker parked on a login screen
+monitor/watcher/test-pane-state-codex.sh|CONTROL, same tree, binary named codax: the gate still says absent|plant|the identity differential: the same planted process tree reads absent when the binary is not codex, so the codex arm is what flips it
+monitor/watcher/test-integration/test-codex-worker-e2e.sh|and NEVER absent (a Codex pane is a live agent)|plant|a real Codex worker driven through a task must never be classified absent (the pre-#1640 kill hazard)
+monitor/watcher/test-integration/test-codex-busy-phases.sh|no kill-authorised sample while the answer streams|plant|the real TUI streaming with no Working line (skeptic F1) must never be kill-authorised
+monitor/watcher/test-mail-path-lint.sh|POSITIVE a runnable mail line in DOCUMENTATION is flagged: rc 1|plant|a planted runnable mail command in a documentation file is asserted caught (and one plant per construct family in code)
+monitor/watcher/test-notify-mail-policy.sh|a planted redirect to another address puts NOTHING on the wire (0 sends)|refusal|a planted redirect (NEXUS_EMAIL_TO naming a non-operator address) is REFUSED at rc 5 with no connection opened
+monitor/watcher/test-agents-md-guard.sh|A3 no CLAUDE.md: work/proj/AGENTS.md is LOADED|plant|an AGENTS.md planted under a fixture NEXUS_ROOT with no CLAUDE.md on the walk is asserted to be reported LOADED, and B1 asserts the same plant reaches the worker prompt as UNTRUSTED DATA (your-org/nexus-code#1671)
+monitor/watcher/test-cc-harness-teardown-remnant.sh|A no /tmp/cc-harness-* remnant after teardown|plant|a stub claude that writes its exit bookkeeping AFTER the HUP is planted in a harness pane, and teardown is asserted to leave no remnant; the adjacent positive control asserts the late write DID happen (a marker OUTSIDE the run dir, since teardown now removes the dir rather than moving it aside, your-org/nexus-code#1767), so the absence is not vacuous (your-org/nexus-code#1670 item 4)
+monitor/watcher/test-labsh-pin.sh|five rounds against a FAILING refresh launch it ONCE|plant|planted violation is asserted caught — a planted FAILING pin tool (exit 1) against the supervisor's lifted refresh helpers; potency-checked: a broken lift turns it red (48/3), and the skeptic's own run with LABSH_SVC_REPIN_RETRY_HOURS=0 launched 5 of 5 (your-org/nexus-code#1677)
+monitor/watcher/test-uv-builds-gc.sh|.tmpFD kept: an fd is open in it (planted)|plant|planted violation is asserted caught -- a live process this suite starts holds an fd inside a 30-day-old dir that every other rule would reap; also planted: a live cwd and a dir newer than a copied-bash `uv` builder and an flock holder of the cache lock (your-org/nexus-code#1686)
+monitor/test-lint-citations.sh|branch-pinned permalink (looks pinned)|plant|planted violation is asserted caught (your-org/nexus-code#1747: declares a population from this bundle on)
+monitor/test-lint-workflows.sh|unsplit-cc-harness|plant|planted workflow mutation is asserted flagged (your-org/nexus-code#1747: declares a population from this bundle on)
+monitor/watcher/test-textguard-lint.sh|inline assert_eq over a repo-anchored source|plant|planted violation is asserted caught (your-org/nexus-code#1747: declares a population from this bundle on)
+monitor/watcher/test-tmuxwrap-lint-conformance.sh|and shim refuses:|plant|planted violation is asserted caught (your-org/nexus-code#1747: declares a population from this bundle on)
+monitor/watcher/test-uncounted-abort-lint.sh|P1 the #783 abort form is flagged|plant|planted violation is asserted caught (your-org/nexus-code#1747: declares a population from this bundle on)
+monitor/watcher/test-lint-suites-declare-population.sh|POSITIVE: a lint suite that declares nothing is flagged|plant|planted violation is asserted caught (your-org/nexus-code#1747: the ratchet declares at birth)
+monitor/watcher/test-requests-dir.sh|C2 positive control: a planted composition IS flagged|plant|planted violation is asserted caught (your-org/nexus-code#1723: declares a population from this bundle on)
+monitor/watcher/test-recover-service-gh-env.sh|B (scoped, unwrapped caller): a bare gh resolves to the wrapper|plant|the incident-shaped caller env (scoped config dir, no wrapper on PATH) is planted and the relaunched stub service is asserted to resolve gh to the nexus wrapper anyway; red on base (your-org/nexus-code#1764)
+monitor/watcher/test-request-decline-ledger-timeout.sh|release with every ledger read timing out: rc 8 (could not determine), not 7|plant|every ledger read is given a REAL 0.001 s bound so it times out, and release must answer rc 8 rather than the ping-pong-inducing rc 7; red on base (your-org/nexus-code#1771)
+monitor/watcher/test-urgent-decision-surface.sh|A1 exactly one row, the open request|plant|an open dangerous-rm request is planted beside tombstoned, expired, resolved, dead-window and other-kind rows, and exactly the open one must render; red on base, where the fast-path renderer does not exist (your-org/nexus-code#1768)
+monitor/watcher/test-settings-overlay.sh|malformed overlay -> non-zero|plant|a truncated operator overlay is planted and the resolver is asserted to REFUSE (non-zero, no path), not fall back to the tracked defaults (your-org/nexus-code#614); declaring since #1779
+monitor/watcher/test-host-pin-lint.sh|LIVE POSITIVE a pinned row in the untracked registry: rc 1|plant|a literal node in a .deploy/endpoint URL is asserted caught, with one plant per pin shape across registry rows, Caddyfiles and endpoints, and the same plants in --live mode over an untracked operator tree
+monitor/watcher/test-bootstrap-recover-ro-nudge.sh|R1 outstanding STOP → --nudge-ro|plant|a planted read-only STOP with no later RESUME and no later spawn is asserted to make recovery pass --nudge-ro (your-org/nexus-code#1807)
+monitor/watcher/test-rv-load-classify.sh|POTENCY: a strict check that gave up on INDETERMINATE is a FAIL, not unmeasured|plant|the pre-#1674 give-up trace is planted and asserted to classify fail, so the UNMEASURED arm cannot absorb a real defect (your-org/nexus-code#1795)
+monitor/watcher/test-skeptic-parallel-rounds.sh|retire refused: round 3 still open|plant|three rounds are armed on one target and one is discharged; retire is asserted refused while a sibling round is open (your-org/nexus-code#1804)
+monitor/watcher/test-tmux-fixture-conf-lint.sh|POSITIVE CONTROL: new-session without -f is flagged|plant|a fixture tmux server start without -f is planted and asserted flagged (your-org/nexus-code#1809)

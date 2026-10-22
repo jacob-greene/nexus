@@ -47,6 +47,74 @@ if [ -n "${NEXUS_LOCALS_PATH_ONLY:-}" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# MOVE-TO-FRONT, not prepend-if-absent (your-org/nexus-code#578 repair).
+#
+# The blocks below used to guard each prepend on `case ":$PATH:" in *":$dir:"*)`
+# — i.e. "already present, skip". That tests PRESENCE and ignores POSITION, so a
+# wrapper dir sitting ANYWHERE in PATH — including buried behind linuxbrew —
+# made this file decline to re-front it. That is the whole #578 failure:
+#
+#   1. `tmux new-window` hands the worker's login zsh an environment that ALREADY
+#      carries the front block (tmux's own env was captured from a shell that had
+#      sourced this file), at positions 1-4.
+#   2. That login zsh runs ~/.zshrc -> ~/.localrc, which re-prepends linuxbrew +
+#      ~/Projects/utilities, BURYING the block to position ~13.
+#   3. The launcher (`/bin/bash /tmp/spawn-launcher-*.sh`) sources this file. The
+#      presence guard sees ghwrap in PATH and skips -> the block stays buried.
+#   4. `claude` inherits that PATH, and Claude Code FREEZES it verbatim into
+#      shell-snapshots/snapshot-zsh-*.sh as the final `export PATH=` line.
+#   5. Every Bash-tool command runs `zsh -c "source <snapshot> && <cmd>"`. Our
+#      ZDOTDIR .zshenv re-fronts correctly, and then the snapshot's `export PATH=`
+#      CLOBBERS it. So the per-command re-front (front-path.zsh) can never repair
+#      a bad snapshot — the launcher's PATH is the only one that matters.
+#
+# Whether step 1 happened at all is what made this look like a "race that flips":
+# if the ancestor env did NOT already carry the block, the presence guard missed
+# and the prepend landed at position 1 (the pre-2026-07-30 "good" snapshots).
+#
+# So: strip every existing copy of $1, then prepend it. Idempotent, corrects a
+# buried entry, and cannot accumulate duplicates. POSIX shell only (no bashisms,
+# no subprocess) — this file is sourced by bash AND zsh. Empty PATH elements are
+# preserved verbatim: an empty element means "cwd", and silently dropping it
+# would change resolution semantics for whoever set it.
+_le_front_dir() {
+    [ -n "${1:-}" ] || return 0
+    if [ -z "${PATH:-}" ]; then
+        export PATH="$1"
+        return 0
+    fi
+    _le_fd_dir="$1"
+    _le_fd_out=""
+    _le_fd_empty=1          # 1 until the first surviving element is collected
+    _le_fd_rest="$PATH"
+    while :; do
+        case "$_le_fd_rest" in
+            *:*) _le_fd_head="${_le_fd_rest%%:*}"; _le_fd_rest="${_le_fd_rest#*:}"; _le_fd_more=1 ;;
+            *)   _le_fd_head="$_le_fd_rest";       _le_fd_rest="";                  _le_fd_more=0 ;;
+        esac
+        if [ "$_le_fd_head" != "$_le_fd_dir" ]; then
+            if [ "$_le_fd_empty" = 1 ]; then
+                _le_fd_out="$_le_fd_head"; _le_fd_empty=0
+            else
+                _le_fd_out="$_le_fd_out:$_le_fd_head"
+            fi
+        fi
+        [ "$_le_fd_more" = 1 ] || break
+    done
+    if [ "$_le_fd_empty" = 1 ]; then
+        export PATH="$_le_fd_dir"
+    else
+        export PATH="$_le_fd_dir:$_le_fd_out"
+    fi
+    unset _le_fd_dir _le_fd_out _le_fd_empty _le_fd_rest _le_fd_head _le_fd_more 2>/dev/null
+    return 0
+}
+
+# Re-front locals/bin. The prepend-if-absent above (shared with PATH-ONLY mode,
+# whose operator-interactive semantics are deliberately left alone) is not enough
+# in full mode for the same reason the wrapper dirs were not: it can be buried.
+[ -d "$_le_locals/bin" ] && _le_front_dir "$_le_locals/bin"
+
 # Redirect ALL of uv's $HOME/XDG-derived state into the nexus-wide tree.
 export UV_PYTHON_INSTALL_DIR="$_le_locals/uv/python"
 export UV_CACHE_DIR="$_le_locals/uv/cache"
@@ -101,25 +169,61 @@ export UV_LINK_MODE="${UV_LINK_MODE:-hardlink}"
 # operator's interactive shells (PATH-ONLY mode, returned above) never
 # see it. Prepended BEFORE notifywrap/ghwrap so those keep the very-front
 # slots (established invariant: ghwrap leads).
-if [ -d "$_le_root/monitor/pipwrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/pipwrap:"*) : ;;           # already present
-        *) export PATH="$_le_root/monitor/pipwrap:${PATH:-}" ;;
-    esac
-fi
+# Board-lethal tmux-kill guard — PATH-FRONT `tmux` shim (monitor/tmuxwrap),
+# same mechanism as ghwrap (your-org/nexus-code#892; remedy for the session
+# surface named in #889). Ending the tmux server ends the session bwrap holds
+# open under --die-with-parent, so it tears down the ENTIRE SANDBOX — watcher,
+# every worker, every service (2026-08-09; and five times in 33 minutes on
+# 2026-07-30, #644). The corpus lint cannot see a command an agent TYPES, or one
+# nested in a script it writes at runtime; a real executable covers every child.
+#
+# NOTE THE INVERTED POLARITY versus ghwrap, and do not "fix" it: this shim's
+# default arm is PASS-THROUGH. monitor/ issues 46 kill-window calls and ~200
+# tmux window operations, so a shim that refused when confused would wedge the
+# control surface — the very outage it prevents. It refuses ONLY on
+# positively-identified lethality against the BOARD socket, and it is inert on
+# the hot path (`list-windows`/`display-message` exec straight through after a
+# pure argv walk — no subprocess, no server query).
+#
+# Full mode only — the operator's interactive shells (PATH-ONLY mode, returned
+# above) never see it. Prepended BEFORE pipwrap/notifywrap/ghwrap so those keep
+# the very-front slots (established invariant: ghwrap leads).
+# Fronted in reverse of the desired final order, so the LAST call wins the
+# very-front slot. Final order:
+#   ghwrap : notifywrap : pipwrap : tmuxwrap : locals/bin : …
+# (established invariant: ghwrap leads). Same order as front-path.zsh and
+# bash_env.sh, both of which already move-to-front correctly.
+# your-org/nexus-code#1188 - PER-WRAPPER fixture opt-out. Semantics, the
+# no-blanket rule and the reason a typo is silent here: see the block comment
+# in monitor/shellenv/bash_env.sh. Honoured HERE as well as there because this
+# file is sourced by ng, by every launcher and by the wrappers themselves, so a
+# marker honoured only in bash_env.sh is re-armed by the first descendant that
+# sources this one (measured: patching bash_env.sh alone still returned
+# monitor/tmuxwrap/tmux from the grandchild).
+#
+# COVERAGE BOUNDARY, STATED SO NOBODY ASSUMES OTHERWISE: this marker does NOT
+# cover the `$_le_locals/bin` front earlier in this file. That is the
+# `claude`-stub surface of #746, guarded on the test side by
+# th_require_stub_claude, and putting it under the same marker has a strictly
+# larger blast radius (it is the whole nexus toolchain, not one wrapper). It is
+# deliberately out of scope and wants its own decision.
+_le_front_off() {
+    case " ${NEXUS_PATH_FRONT_OFF:-} " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+[ -d "$_le_root/monitor/tmuxwrap" ]   && ! _le_front_off tmuxwrap && _le_front_dir "$_le_root/monitor/tmuxwrap"
+[ -d "$_le_root/monitor/pipwrap" ]    && ! _le_front_off pipwrap && _le_front_dir "$_le_root/monitor/pipwrap"
+[ -d "$_le_root/monitor/notifywrap" ] && ! _le_front_off notifywrap && _le_front_dir "$_le_root/monitor/notifywrap"
+[ -d "$_le_root/monitor/ghwrap" ]     && ! _le_front_off ghwrap && _le_front_dir "$_le_root/monitor/ghwrap"
 
-if [ -d "$_le_root/monitor/notifywrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/notifywrap:"*) : ;;        # already present
-        *) export PATH="$_le_root/monitor/notifywrap:${PATH:-}" ;;
-    esac
-fi
-
-if [ -d "$_le_root/monitor/ghwrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/ghwrap:"*) : ;;            # already present
-        *) export PATH="$_le_root/monitor/ghwrap:${PATH:-}" ;;
-    esac
+# The BOARD's tmux socket, recorded from the launcher's own $TMUX so the shim
+# above can still identify it inside an `env -u TMUX` child — the one shape that
+# defeats every other route to the answer. Full mode only, so the operator's own
+# shells are unaffected. Harmless when unset (the shim falls back to $TMUX, then
+# to the compiled default socket for this uid).
+if [ -n "${TMUX:-}" ] && [ -z "${NEXUS_TMUX_SOCKET:-}" ]; then
+    NEXUS_TMUX_SOCKET="${TMUX%%,*}"
+    export NEXUS_TMUX_SOCKET
 fi
 
 # Fail-CLOSED bot identity. The PATH-front wrapper above is a SHADOW, not a
@@ -193,4 +297,7 @@ if [ -f "$_le_root/monitor/shellenv/bash_env.sh" ] \
     export BASH_ENV="$_le_root/monitor/shellenv/bash_env.sh"
 fi
 
+# Do not leak the helper into the sourcing shell (it is an implementation
+# detail of this file, and agents' interactive shells source it).
+unset -f _le_front_dir 2>/dev/null || :
 unset _le_src _le_root _le_locals 2>/dev/null

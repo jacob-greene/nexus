@@ -78,8 +78,14 @@ Mutual liveness contract:
 
 - **You → watcher.** At the start of every turn, run
   `monitor/watcher/bootstrap.sh`. It checks
-  `monitor/.state/watcher-heartbeat` mtime, respawns the watcher via
-  `monitor/watcher/launcher.sh` if stale (> 2× poll interval), and
+  `monitor/.state/watcher-heartbeat` mtime + the recorded pid, respawns
+  the watcher via `monitor/watcher/launcher.sh` only on ESTABLISHED
+  death — `_watcher_alive` buckets 2/3: heartbeat age past
+  `5 × interval`, or a heartbeat whose pid is no longer a live watcher
+  *and* whose instance flock is free, or no heartbeat file at all. An
+  aging-but-alive heartbeat (bucket 1, past `2 × interval + 15` s) and a
+  live-but-wedged loop (bucket 4) are BOTH left alone here; the
+  supervisor owns the wedged case. It also
   prints any archived diffs newer than
   `monitor/.state/last-ack.txt` so you can catch up on anything
   missed between turns. Bootstrap updates `last-ack.txt` to now on
@@ -123,11 +129,11 @@ Mutual liveness contract:
     `UserPromptSubmit` hook bumped `orchestrator-paste-received`,
     after the watcher's last paste: healthy. The paste-received
     branch covers long tool turns where Stop hasn't fired yet.
-  - If `paste_response_grace_seconds` (default 60) has elapsed
+  - If `paste_response_grace_seconds` (default 120) has elapsed
     without either bump, the watcher transitions to
     pasted-without-response and gives `unstick_window_seconds`
-    (default 180) for cases A–D in `_unstick.sh` (permission
-    Enter, rate-limit cascade, api-error Enter, AskUQ chip-bar
+    (default 150) for the cases in `_unstick.sh` (permission
+    prompt surfaced, rate-limit cascade, AskUQ chip-bar
     Escape) to recover.
   - If `orchestrator_dead_threshold_seconds` (default 300)
     elapses without recovery: fresh-spawn. The new agent
@@ -178,10 +184,10 @@ ng pr create --head <b> [--base main] --title <t> --body-file <f>
               # auto-requests review from $github.user_login
               # opt-out: --no-reviewer; override: --reviewer <login>
 ng pr edit <n> [--title <t>] [--body-file <f>]
-ng pr merge <n> [--squash|--merge|--rebase] [--delete-branch]
+ng pr merge <n> [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch]
 ng pr view <n>
 ng preflight <owner/repo>                    # bot installed on this repo? (yes/no)
-ng upload <path> [--repo-path <p>] [--message <m>]
+ng upload <path> [--repo-path <p>] [--message <m>] [--replace]   # exit 5: destination holds DIFFERENT content (#1639)
 ```
 
 Most pr / issue / show verbs accept `--repo OWNER/NAME` to target a
@@ -194,7 +200,13 @@ there — beats waiting for GitHub's confusing "Resource not accessible
 by integration" error.
 
 Raw `gh` escape hatch — use this when `ng` doesn't cover the case.
-**The bot is now the DEFAULT even for a bare `gh`**: a PATH-front
+**Mint explicitly and verify:** `GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+gh <write> …`, then `"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url>`.
+The bot is also the default for a bare `gh`, but that path is a
+BACKSTOP, not the mechanism — it has been observed broken on a live
+clone (five operator-authored writes in one day, `#497`), and the
+failure is silent because GitHub mutes the operator's own notification.
+The wrapper, for reference: a PATH-front
 `gh` wrapper (`monitor/ghwrap/gh`, prepended to the front of `PATH`
 for every agent shell) auto-injects the bot token on WRITE verbs
 (`pr`/`issue` create·comment·edit·…, `release upload`, `api` with a
@@ -261,13 +273,22 @@ the full rules.
      if missing).
 4. Render the dashboard into the overview issue body, between the
    `<!-- NEXUS_DASHBOARD_START -->` / `<!-- NEXUS_DASHBOARD_END -->`
-   markers. Sections:
-   - **Decisions Needed** (with links to per-decision issues)
-   - **Active Agents** (table: window | project | task | started | last activity)
-   - **Blocked / Waiting**
-   - **Recently Completed** (last ~3 days)
-   - **Project Status** (per `work/*` repo)
-   - **Next Actions** (ranked)
+   markers — unless `status_surface.kind` is `external` in
+   `config/nexus.yml` (`config/load.sh status_surface.kind
+   overview-dashboard`): then the operator runs their own status page,
+   so skip this step and do not maintain the dashboard; the overview
+   issue stays the routing surface (<your-org>/nexus-code#1839,
+   `skills/nexus.dashboard/SKILL.md`). Sections:
+   - **`## Identity`** — what this nexus IS (host, repos, watcher paths); generate with `monitor/ng nexus-identity`
+   - **`## Infra`** — watcher/services/cockpit health
+   - **`## Services`** — registered services and their state
+   - **`## In-flight`** — active windows (window | project | task | started | last activity)
+   - **`## Awaiting operator`** — decisions blocked on the operator, with links to per-decision issues
+   - **`## Recent landings`** — merged PRs / completed work (last ~3 days)
+
+   These six headings are the SCHEMA — `ng dashboard validate` matches them
+   with `grep -Fx` and exits 1 on any that is missing. Scaffold with
+   `monitor/ng dashboard scaffold`, then validate before you put.
 
    Use `monitor/ng dashboard put --body-file <path>` — it re-reads the
    live body, splices your new middle in between the markers, and
@@ -289,7 +310,16 @@ the full rules.
    presence. If the heartbeat is missing or stale, spawn the watcher
    via:
 
-       monitor/watcher/launcher.sh --target <your-tmux-window>
+       monitor/svc.sh restart watcher      # or: monitor/watcher/launcher.sh --replace
+
+   Do NOT pass `--target <window>`: it defaults to config
+   `monitor.target_window`, and hard-coding it is the `#459`
+   anti-pattern. Note what the code actually refuses — the guard
+   `_require_arg` at `monitor/watcher/launcher.sh:111-117` exits 2 on an
+   EMPTY `--target` / `--window` (the shape an unset variable expands
+   to), NOT on a non-empty hard-coded one, which is still accepted and
+   still overrides config. So the flag remains a live footgun; the rule
+   is a convention, not an enforced one.
 
    The launcher spawns the watcher HEADLESS — `setsid`-detached,
    no tmux window, with `monitor/watcher/main.sh`'s output appended
@@ -322,7 +352,9 @@ Sections, in order:
 5. `--- dashboard ---` last-updated timestamp. Gentle reminder only —
    if the value looks stale AND state has shifted since, refresh via
    `monitor/ng dashboard put`. Not a hard rule; ignore when nothing's
-   moved.
+   moved. With `status_surface.kind: external` this is instead
+   `--- status surface ---`, a pointer to the operator's page (and its
+   landings feed, if configured); it asks for no put.
 
 **First action on every wake**: run `monitor/watcher/bootstrap.sh`.
 It is a single tool call that (a) checks the watcher heartbeat and
@@ -361,7 +393,14 @@ cold-boot guard) into a `SessionStart` (`resume`) hook fires recovery
 the instant you are brought back via `claude --resume`. Snippet at
 `monitor/boot-recover.session-start-hook.json`; see the README's
 "Cold-boot recovery trigger" for the in-sandbox vs outside-sandbox
-mechanics. With the hook installed, the direct `bootstrap-recover.sh`
+mechanics. **Then run `monitor/boot-recover-hook-check.sh`** — a hook
+whose command does not exist is silent on every channel you are looking
+at (measured against 2.1.246: stdout, stderr and rc byte-identical to no
+hooks at all, for both `async` settings and both matchers). It IS
+recorded in the session transcript, in `--output-format stream-json
+--verbose`, and in `--debug-file`, but none of those is on by default —
+so in practice nothing tells you the hook is not wired.
+`<your-org>/nexus-code#1174`. With the hook installed, the direct `bootstrap-recover.sh`
 call above is a belt-and-suspenders fallback, not the sole trigger.
 
 Record meaningful actions in the append-only action log so the
@@ -474,12 +513,12 @@ Full criteria in `skills/nexus.window-cleanup/SKILL.md`
 
 ### Processing local-state changes
 
-- New `reports/*.md` → update Active Agents / Recently Completed in
+- New `reports/*.md` → update In-flight / Recent landings in
   the overview issue body. If the report indicates a new decision
   needed, create a per-thread issue (`nexus:decision`). If it has
   an `## Infrastructure Issues` section, file each entry per
   `## Capturing improvement ideas` below.
-- tmux window added/removed → update Active Agents.
+- tmux window added/removed → update In-flight.
 - git HEAD or clean↔dirty change → update Project Status.
 
 For trivial deltas (single dirty/clean flip, no other change), end the
@@ -519,9 +558,10 @@ block indefinitely. Protocol:
    in place, and `mv` the decision file to its `.handled.json`
    tombstone so the relay doesn't re-fire while the operator decides.
 
-After processing, end the turn. The watcher keeps running in its own
-tmux window; the next wake is whenever it pastes the next report
-into yours.
+After processing, end the turn. The watcher keeps running headless
+(`setsid`-detached, no tmux window — log at
+`monitor/.state/watcher.log`); the next wake is whenever it pastes the
+next report into your window.
 
 ### Draining the request inbox (`--- requests ---`)
 

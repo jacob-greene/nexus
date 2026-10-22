@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unit tests for monitor/install-labsh.sh — the bootstrap-side installer
-# for operator/labsh.
+# for katosh/labsh.
 #
 # Sandbox-correct path:
 #   target = $SANDBOX_PROJECT_DIR/work/labsh
@@ -29,14 +29,13 @@ REAL_GIT=$(command -v git) || { echo "FATAL: real git not found"; exit 1; }
 
 PASS=0
 FAIL=0
-assert_eq() {
-    local label="$1" got="$2" want="$3"
-    if [[ "$got" == "$want" ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    else printf '  FAIL: %s — got %q want %q\n' "$label" "$got" "$want" >&2; FAIL=$(( FAIL + 1 )); fi
-}
+# assert_eq / assert_contains come from _test_helpers.sh (sourced above).
+# A byte-identical local copy used to shadow the helper here — dead code by
+# definition, and the kind that quietly diverges (your-org/nexus-code#568 D8).
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s — needle %q not in %q\n' "$label" "$needle" "$haystack" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_ok() { local l="$1"; shift; if "$@"; then printf '  PASS: %s\n' "$l"; PASS=$(( PASS+1 )); else printf '  FAIL: %s\n' "$l" >&2; FAIL=$(( FAIL+1 )); fi; }
@@ -55,7 +54,7 @@ if [[ "\${1-}" == "clone" ]]; then
     mkdir -p "\$target"
     echo "STUB-CLONE" > "\$target/README.md"
     "\$REAL_GIT" -C "\$target" init -q
-    "\$REAL_GIT" -C "\$target" remote add origin https://github.com/operator/labsh.git
+    "\$REAL_GIT" -C "\$target" remote add origin https://github.com/katosh/labsh.git
     exit 0
 fi
 exec "\$REAL_GIT" "\$@"
@@ -102,7 +101,7 @@ SBX1="$WORK/sandbox-1"; mkdir -p "$SBX1"
 run_install "$SBX1" "$STUBS"
 assert_eq "exit 0" "$LAST_RC" "0"
 assert_ok "clone landed (.git present)" test -d "$SBX1/work/labsh/.git"
-assert_contains "stdout mentions operator/labsh#3 caveat" "$LAST_STDOUT" "operator/labsh#3"
+assert_contains "stdout mentions katosh/labsh#3 caveat" "$LAST_STDOUT" "katosh/labsh#3"
 run_install "$SBX1" "$NOCLONE" --check
 assert_eq "--check passes on complete install" "$LAST_RC" "0"
 

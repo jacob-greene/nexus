@@ -42,11 +42,16 @@
 #                            machinery — `up` does not (and must not)
 #                            spawn the orchestrator directly.
 #   svc.sh start <name>      start one service iff not running (same
-#                            idempotent decision path as recovery)
+#                            idempotent decision path as recovery);
+#                            clears a stop request
 #   svc.sh stop <name>       stop a service: TERM its supervisor's
-#                            process group, escalate to KILL after 5 s
-#   svc.sh restart <name>    stop + start (`restart watcher` uses
-#                            launcher.sh --replace)
+#                            process group, escalate to KILL after 5 s.
+#                            Records a stop request (.state/services/
+#                            <name>.stop-requested) that the watcher's
+#                            auto-restart and recovery honour: the row
+#                            reads STOPPED, not DOWN, until start/restart
+#   svc.sh restart <name>    stop + start, clears a stop request
+#                            (`restart watcher` uses launcher.sh --replace)
 #   svc.sh --force <verb> <name>
 #                            override the cold-build guard. stop/restart of a
 #                            labsh service REFUSE while a uvx cold build is in
@@ -54,6 +59,34 @@
 #                            time): restarting discards the build and starts the
 #                            clock over, which is what makes a slow bring-up
 #                            look like a crash loop. Also via SVC_FORCE=1.
+#                            A refusal exits 75 (not 1), so a caller can tell
+#                            "deliberately not done" from "tried and failed".
+#   svc.sh --show-secrets [<verb> …]
+#                            do NOT redact secret-named URL query parameters
+#                            (a JupyterLab `?token=`) in the URL cell. Every
+#                            launcher of the services COCKPIT passes it; the
+#                            default for a bare `svc.sh` and for `status`
+#                            stays REDACTING. Also via SVC_SHOW_SECRETS=1.
+#                            May be combined with --force, in either order.
+#   svc.sh orphans           READ-ONLY: list supervisor processes with ppid 1
+#                            whose source path no registry row names, or which
+#                            run from outside $NEXUS_ROOT (a retired clone, an
+#                            ephemeral scratch dir). Signals nothing. Exit 0 =
+#                            none found AND both positive controls held; 1 =
+#                            found; 3 = REFUSED, could not determine.
+#   svc.sh retire-orphan <pid> [--yes]
+#                            the SANCTIONED retirement path for exactly the
+#                            set `orphans` prints (your-org/nexus-code#1034
+#                            rec. 2). Re-runs the scan and REFUSES (rc 2) any
+#                            pid it does not classify as an orphan — a
+#                            registered supervisor is never touched, and a
+#                            scan whose controls did not hold retires nothing.
+#                            Without --yes it prints the plan (the supervisor
+#                            + its descendants, by recorded PPid, and the
+#                            signals) and exits 4. With --yes: TERM the
+#                            process group, escalate to KILL after the grace,
+#                            append a row to monitor/.state/svc-retire.log.
+#                            0 = retired; 1 = signalled but still present.
 #   svc.sh logs <name>       tail -F the service's log(s) in this
 #                            terminal — for labsh JupyterLab services
 #                            the server's own stdout
@@ -78,7 +111,9 @@
 # Launch the dashboard as its own tmux window (name must match
 # monitor.services_window, default `services`, so the watcher's
 # idle probe exempts it from the dead-worker sweep):
-#   tmux new-window -n services 'monitor/svc.sh'
+#   tmux new-window -n services 'monitor/svc.sh --show-secrets'
+# (--show-secrets: the cockpit is where the operator copies the JupyterLab
+# URL from, so it shows tokens; see the URL-cell comment below, #1821.)
 #
 # Env:
 #   NEXUS_ROOT  — live nexus root the registry + logs + state are read
@@ -86,6 +121,7 @@
 #                 Point it at a checkout to drive the cockpit off that
 #                 tree.
 #   SVC_REFRESH — dashboard auto-refresh interval, seconds (default 5).
+#   SVC_SHOW_SECRETS — 1 = same as --show-secrets (default 0: redact).
 
 set -uo pipefail
 
@@ -106,6 +142,11 @@ REFRESH="${SVC_REFRESH:-5}"
 # non-interactive caller exporting SVC_FORCE=1.
 SVC_FORCE="${SVC_FORCE:-0}"
 
+# Show secret-named URL query parameters unredacted (svc_redact_url). Set by
+# `--show-secrets`, or by exporting SVC_SHOW_SECRETS=1. Only an exact `1`
+# disables redaction: any other value redacts, the safe direction.
+SVC_SHOW_SECRETS="${SVC_SHOW_SECRETS:-0}"
+
 # Reuse the recovery path's primitives so health/launch/liveness
 # semantics match exactly. bootstrap-recover.sh guards its main behind
 # a BASH_SOURCE test, so sourcing yields the functions (and, via its
@@ -120,6 +161,14 @@ source "$_script_dir/bootstrap-recover.sh"
 # ONE definition of "a build is running" — see _labsh_build_evidence.sh.
 # shellcheck source=_labsh_build_evidence.sh
 source "$_script_dir/_labsh_build_evidence.sh" 2>/dev/null || true
+
+# The logged-out predicate (`_auth_hold_expiry_standing`, functions only) so
+# the orchestrator row can say LOGGED-OUT (your-org/nexus-code#1548 row E).
+# During the 2026-09-17 outage this cockpit showed a green `UP` for a
+# logged-out agent for 7 h, `UP` being derived from window existence alone.
+# Guarded: an older tree without the module keeps the old row.
+# shellcheck source=watcher/_auth_hold.sh
+[[ -r "$_script_dir/watcher/_auth_hold.sh" ]] && source "$_script_dir/watcher/_auth_hold.sh" 2>/dev/null || true
 
 # The tmux window the watcher pastes into — the orchestrator's home.
 # The cockpit window name (this dashboard) is config-resolved too, so
@@ -168,9 +217,31 @@ fi
 # line: name\tworkdir\tlaunch\thealth\tlogfile  (logfile may be empty →
 # caller defaults it). Blank/`#` lines skipped; a row with fewer than the
 # 4 required fields is skipped with a warning, never fatal.
+# Registry readability — the REPLICATED half of the contract documented in
+# bootstrap-recover.sh ("registry READABILITY: three states, not two",
+# your-org/nexus-code#1266). svc.sh is a THIRD parser, absent from that
+# issue's consumer table; it feeds the cockpit, so an unreadable registry
+# rendered an EMPTY service list that reads exactly like "you have no
+# services". Replicated rather than sourced (the cockpit does not source
+# bootstrap-recover.sh); the CONTRACT is identical. Keep in step.
+#   0  readable, or genuinely ABSENT (both are adjudications)
+#  79  exists and could not be read — no statement about contents available
+svc_registry_readable() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -f "$file" ]] || return 79
+    # `2>/dev/null` FIRST — redirections apply left to right.
+    { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
 svc_parse_registry() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    if ! svc_registry_readable "$file"; then
+        echo "[svc] registry: NOT READABLE at $file — refusing to report its contents (rc 79)" >&2
+        return 79
+    fi
+    [[ -e "$file" ]] || return 0
     local line name workdir launch health logfile rest
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -184,7 +255,9 @@ svc_parse_registry() {
         workdir="${workdir/#\~/$HOME}"; workdir="${workdir//\$NEXUS_ROOT/$NEXUS_ROOT}"
         logfile="${logfile/#\~/$HOME}"; logfile="${logfile//\$NEXUS_ROOT/$NEXUS_ROOT}"
         printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$workdir" "$launch" "$health" "$logfile"
-    done < "$file"
+    # Two separate opens (probe, then this); a fault between them is a SHORT
+    # read, which is worse than a zero because it is plausible.
+    done < "$file" || return 79
 }
 
 # Resolve a service's logfile: explicit 5th column if present, else the
@@ -256,6 +329,100 @@ svc_supervisor() {
     esac
 }
 
+# A JUST-LAUNCHED SERVICE IS NOT DOWN (2026-10-12 sandbox restarts).
+#
+# Measured on 2026-10-12: across four sandbox restarts, myviewer, jupyterlab,
+# svc-a and nexus-remote-ssh "came back DOWN" and were restarted by
+# hand every time. They were not missed by recovery. bootstrap-recover.sh
+# relaunched every one of them (fresh pid records, live supervisors), but it
+# spawns the ORCHESTRATOR FIRST and the services after it, so the resumed
+# orchestrator's first `svc.sh status` sampled them seconds after launch. Their
+# healthchecks had not passed yet (myviewer serves ~5 s after launch,
+# svc-a ~10 s, nexus-remote-ssh's wrapper waits ~2-7 s before
+# exec'ing sshd, a labsh cold build takes minutes), and this table printed the
+# same red `DOWN` it prints for a dead service. The hand restart then killed a
+# warm-up that was about to succeed: myviewer answered its first curl with 200
+# at 16:27:06Z and was SIGTERMed at 16:27:23Z by the restart. The four share
+# one property, startup latency, and nothing else.
+#
+# So: a failing healthcheck next to a LIVE supervisor whose process started
+# less than SVC_STARTUP_GRACE_SECONDS ago renders `STARTING`, never `DOWN`.
+# Past the grace it reads `DOWN` exactly as before, so a supervisor that is
+# alive but can never bring its service up is still flagged, just not in its
+# first minutes. Default 300 s: the longest measured bring-up among the four is
+# a labsh cold build of ~2-3 min after a restart (service-health events,
+# 2026-10-05..11). The row still counts as needing attention (it is not UP).
+SVC_STARTUP_GRACE_SECONDS="${SVC_STARTUP_GRACE_SECONDS:-300}"
+[[ "$SVC_STARTUP_GRACE_SECONDS" =~ ^[0-9]+$ ]] || SVC_STARTUP_GRACE_SECONDS=300
+
+# _svc_supervisor_age <name> <pid> — seconds since the supervisor process
+# started. Kernel start-time (jiffies since boot) against /proc/uptime first;
+# the pid record's mtime (it is rewritten at every launch) as the fallback.
+# Prints nothing and returns 1 when neither can be read.
+_svc_supervisor_age() {
+    local name="$1" pid="$2" st up hz age pf mt
+    st=$(_recover_starttime "$pid" 2>/dev/null) || st=''
+    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null) || up=''
+    up="${up%%.*}"
+    hz=$(getconf CLK_TCK 2>/dev/null) || hz=''
+    if [[ "$st" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+$ && "$hz" =~ ^[1-9][0-9]*$ ]]; then
+        age=$(( up - st / hz ))
+        (( age >= 0 )) && { printf '%s' "$age"; return 0; }
+    fi
+    pf=$(_recover_pidfile "$name")
+    mt=$(stat -c '%Y' "$pf" 2>/dev/null) || return 1
+    [[ "$mt" =~ ^[0-9]+$ ]] || return 1
+    age=$(( $(date +%s) - mt ))
+    (( age >= 0 )) || age=0
+    printf '%s' "$age"
+}
+
+# THE STATUS PATH'S HEALTHCHECK IS BOUNDED (your-org/nexus-code#1601).
+#
+# `_recover_service_healthy` (bootstrap-recover.sh) runs a registry healthcheck
+# with NO time limit, which is right for recovery and wrong for a READOUT: on
+# 2026-09-21 `tmpfs-guard.sh --check` walked a /tmp holding 15,234 depth-1
+# entries and `svc.sh status` printed ZERO lines in 180 s. Every service was
+# healthy; the one readout that says so was not answering, so the board was
+# blind — not "a service is down" but "nobody can say".
+#
+# So each row's check runs under `timeout`, and a check that does not finish
+# renders `UNKNOWN` with the bound in its DETAIL — never nothing, and never
+# `DOWN`, which would send a reader to restart a service that may be fine. A
+# row that cannot be measured still needs attention, and it gets it: the
+# priority renderer keys on `up != UP`.
+#
+# TIMED OUT IS DECIDED BY THE STATUS SET *AND* THE CLOCK. `timeout` injects 124
+# (137 after `-k`), but a healthcheck may exit 124 on its own (CLAUDE.md, the
+# `timeout` status-injection entry); requiring the elapsed wall clock to have
+# reached the bound separates the two. A callee's own 124 inside the bound stays
+# DOWN, as it always was.
+#
+# The run shape (subshell cd, script over /dev/fd so no argv carries a
+# pattern, rc 100 == alive-with-a-finding) MIRRORS `_recover_service_healthy`
+# and must stay in step with it — that function's own comment names this
+# replication hazard for its watcher twin. `timeout` without `--foreground`
+# signals its whole process group, so the check's children (the guard's
+# `find`) go with it rather than outliving the row.
+#
+# SVC_STATUS_HEALTH_TIMEOUT: seconds per row (default 20). Only the READOUT is
+# bounded; start/stop/restart/recovery keep the unbounded check.
+SVC_STATUS_HEALTH_TIMEOUT="${SVC_STATUS_HEALTH_TIMEOUT:-20}"
+[[ "$SVC_STATUS_HEALTH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || SVC_STATUS_HEALTH_TIMEOUT=20
+
+_svc_row_health() {   # <workdir> <health> -> prints UP | DOWN | UNKNOWN
+    local workdir="$1" health="$2" rc=0 t0=$SECONDS
+    ( cd "$workdir" 2>/dev/null \
+        && timeout -k 2 "$SVC_STATUS_HEALTH_TIMEOUT" bash <(printf '%s' "$health") ) >/dev/null 2>&1 || rc=$?
+    if (( rc == 124 || rc == 137 )) && (( SECONDS - t0 >= SVC_STATUS_HEALTH_TIMEOUT )); then
+        printf 'UNKNOWN'
+    elif (( rc == 0 || rc == 100 )); then
+        printf 'UP'
+    else
+        printf 'DOWN'
+    fi
+}
+
 # --- external-bind detection (display only) --------------------------------
 # Healthchecks probe http://localhost:PORT, but a service bound to
 # 0.0.0.0/::/a routable IP is reachable from outside — render the real
@@ -312,11 +479,11 @@ svc_display_url() {
     fi
 }
 
-# Tokened, directly-openable URL for a labsh JupyterLab service. This
-# cockpit serves an internal lab network, so showing the token is the
-# point: the DETAIL cell is meant to be copy-pasted straight into a
-# browser. Reads PORT/SCHEME from .jupyter/labsh-service.env and the
-# token from .jupyter/token (both written by labsh-supervised.sh /
+# Tokened, directly-openable URL for a labsh JupyterLab service. The
+# RENDERED cell never shows the token: svc_detail_url passes this through
+# svc_redact_url, which keeps the full URL in a mode-0600 file and names
+# that file in the cell. Reads PORT/SCHEME from .jupyter/labsh-service.env
+# and the token from .jupyter/token (both written by labsh-supervised.sh /
 # labsh); host rewritten to the FQDN when the bind is external (same
 # rule as svc_display_url). Returns 1 when no port is recorded — the
 # caller falls back to the generic endpoint; a missing token degrades
@@ -334,13 +501,59 @@ svc_jupyter_url() {
     printf '%s' "$url"
 }
 
-# Best-effort human endpoint for a healthcheck: the URL for curl checks
-# (rewritten to the real host when externally bound), pid:N for pgrep
-# checks, else "-". Purely cosmetic.
+# A service's OWN declaration of the endpoint it serves, read from its tree:
+# `<workdir>/.deploy/endpoint`, first line, one URL.
+#
+# WHY A FILE AND NOT A REGISTRY COLUMN (your-org/nexus-code#1144). The DETAIL
+# cell used to be derived ENTIRELY from the healthcheck COMMAND TEXT, so it was
+# a property of HOW A HEALTHCHECK IS SPELLED rather than of the service. That
+# inverts the incentive, because the better probe is the one that loses: an
+# inline `curl -fsS … http://localhost:8773/` renders a copy-pasteable URL,
+# while a SCRIPT healthcheck — which is what you must write when the endpoint is
+# auth-gated, or when one probe has to assert several properties — renders `-`,
+# indistinguishable from a service that genuinely has no endpoint.
+#
+# The precedent is `svc_jupyter_url`, which already reads PORT/SCHEME from the
+# service's own `.jupyter/labsh-service.env` rather than from anything the
+# registry says. This generalises it: the endpoint is the SERVICE's fact, so ask
+# the service. A registry column would have worked too, but it needs an operator
+# edit per service, it is the 7th positional field behind two optional ones, and
+# three other tools parse that file.
+#
+# VALIDATE THE SHAPE, NEVER MERELY NON-EMPTINESS. The bytes come from a file
+# outside this repo and land in a terminal render, so a URL that is not
+# URL-shaped is REFUSED rather than printed: an emptiness check would pass a
+# line of ANSI escapes. Returns 1 when there is nothing valid to show, so the
+# caller falls through to its next source. Never errors.
+svc_declared_endpoint() {
+    local workdir="${1:-}" line
+    # A URL contains no whitespace, so stripping all of it also eats a stray
+    # CR from a CRLF file — which would otherwise fail the shape check for a
+    # reason nobody could see.
+    local re='^https?://[A-Za-z0-9._~:/?#@%+=,&-]+$'
+    [[ -n "$workdir" ]] || return 1
+    line=$(head -1 "$workdir/.deploy/endpoint" 2>/dev/null) || return 1
+    line="${line//[[:space:]]/}"
+    [[ "$line" =~ $re ]] || return 1
+    svc_display_url "$line"
+}
+
+# Best-effort human endpoint for a service: the URL named in a curl-style
+# healthcheck, else the service's own `.deploy/endpoint` declaration, else
+# pid:N for pgrep checks, else "-". All of them rewritten to the real host when
+# externally bound. Purely cosmetic — nothing here changes what is PROBED, and
+# healthcheck commands are still never rewritten (see the rule above).
+#
+# ORDER. The healthcheck's URL is consulted FIRST, so every rendering that was
+# correct before this change is byte-identical after it — the declaration is
+# additive and cannot silently redirect a cell that already worked. The cost of
+# that choice, stated because it is a real limit: a service whose healthcheck
+# names a URL that is NOT its front door cannot override the cell from its tree.
 svc_endpoint() {
-    local health="$1" url pat pid
+    local health="$1" workdir="${2:-}" url pat pid
     url=$(grep -oE 'https?://[^ ]+' <<<"$health" | head -1)
     if [[ -n "$url" ]]; then svc_display_url "$url"; return; fi
+    if url=$(svc_declared_endpoint "$workdir"); then printf '%s' "$url"; return; fi
     if [[ "$health" == *pgrep* ]]; then
         pat=$(sed -nE 's/.*pgrep[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-f[[:space:]]+([^ ]+).*/\2/p' <<<"$health")
         [[ -z "$pat" ]] && pat=$(sed -nE 's/.*pgrep[[:space:]]+([^ -][^ ]*).*/\1/p' <<<"$health")
@@ -349,6 +562,154 @@ svc_endpoint() {
         return
     fi
     printf '%s' '-'
+}
+
+# svc_detail_url <workdir> <health> <up> — the URL cell's derivation, the ONE
+# place it is computed: a SERVING labsh JupyterLab shows its tokened URL
+# (svc_jupyter_url), everything else the healthcheck/declared endpoint
+# (svc_endpoint). The status table renders it, and svc_url_warnings asks it,
+# so the two cannot disagree (the #1742 WARN once fired on a jupyterlab row
+# whose cell showed a URL, because it asked svc_endpoint alone).
+svc_detail_url() {
+    local workdir="$1" health="$2" up="${3:-}" name="${4:-}" detail=""
+    [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
+    [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
+    svc_redact_url "$detail" "$name"
+}
+
+# A URL CELL NEVER CARRIES A SECRET (2026-10-12, token in agent transcripts).
+#
+# The jupyterlab row printed `…/lab?token=<the live token>`, so every agent that
+# ran `svc.sh status` copied the JupyterLab credential into its transcript, and
+# from there into reports and issue comments. "This cockpit serves an internal
+# lab network" was the old reason to show it; an agent transcript is not a lab
+# network. So every query parameter whose NAME ends in token / key / secret /
+# password / passwd (case-insensitive: `token`, `access_token`, `api_key`,
+# `client_secret`, …) has its VALUE replaced in the rendered cell, for every
+# row and every URL source (labsh, healthcheck text, `.deploy/endpoint`).
+#
+# The full URL is not lost: it is written to `$STATE_DIR/services/<name>.url`,
+# mode 0600, and the cell names that file, so the operator still has a
+# copy-pasteable URL one `cat` away. Written only when it changed (the cockpit
+# re-renders every few seconds), via a 0600 temp file + rename, so the secret
+# is never readable at a wider mode even for an instant. When the file cannot
+# be written (read-only tree, no name) the cell still redacts and says the URL
+# was not saved — the failure direction is "less convenient", never "leaked".
+#
+# Over-matching is the safe direction and is accepted: a parameter named
+# `monkey=` is redacted too. NOT covered: a password in URL userinfo
+# (`https://user:pw@host`) — no registered service uses that shape.
+#
+# THE COCKPIT SHOWS IT ANYWAY (your-org/nexus-code#1821, operator 2026-10-13).
+# The cockpit is where the operator goes to copy the JupyterLab URL, so a
+# redacted cell there sent them to a `cat` for the one thing the pane exists
+# to show. `--show-secrets` (or SVC_SHOW_SECRETS=1) returns the URL unchanged,
+# and every launcher of the cockpit passes it. The operator's reasoning, kept
+# so nobody re-litigates it: the token is reachable only from inside the
+# internal network, and agents already have full access to the service it
+# guards, so showing it to an agent exposes nothing new. The DEFAULT stays
+# redacting — a bare `svc.sh` and `svc.sh status` — so the shared transcript
+# path (agents running `status`) does not copy the credential by habit.
+# The 0600 `.url` file is still written when secrets are shown.
+SVC_SECRET_PARAM_RE='(token|key|secret|password|passwd)$'
+
+svc_url_file() { printf '%s/services/%s.url' "$STATE_DIR" "$1"; }
+
+# _svc_save_secret_url <name> <url> — persist the full URL at mode 0600.
+# Returns 0 when the file holds exactly <url> at mode 600 afterwards.
+_svc_save_secret_url() {
+    local name="$1" url="$2" f dir tmp cur mode
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    f=$(svc_url_file "$name"); dir="${f%/*}"
+    if [[ -f "$f" && ! -L "$f" ]]; then
+        cur=$(<"$f") 2>/dev/null || cur=''
+        mode=$(stat -c '%a' "$f" 2>/dev/null) || mode=''
+        [[ "$cur" == "$url" && "$mode" == 600 ]] && return 0
+    fi
+    mkdir -p "$dir" 2>/dev/null || return 1
+    tmp=$(umask 077; mktemp "$dir/.$name.url.XXXXXX" 2>/dev/null) || return 1
+    if printf '%s\n' "$url" > "$tmp" 2>/dev/null && chmod 600 "$tmp" 2>/dev/null \
+       && mv -f "$tmp" "$f" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+# svc_redact_url <url> [<service-name>] — print <url> with every secret-named
+# query parameter's value replaced. Unchanged when there is nothing to redact.
+svc_redact_url() {
+    local url="$1" name="${2:-}" base q frag='' p k out='' hit=0 ph
+    if [[ "$url" != *\?* ]]; then printf '%s' "$url"; return 0; fi
+    base="${url%%\?*}"; q="${url#*\?}"
+    if [[ "$q" == *'#'* ]]; then frag="#${q#*#}"; q="${q%%#*}"; fi
+    local -a parts=() kept=()
+    IFS='&' read -r -a parts <<<"$q"
+    for p in "${parts[@]}"; do
+        k="${p%%=*}"; k="${k,,}"
+        if [[ "$p" == *=* && "$k" =~ $SVC_SECRET_PARAM_RE ]]; then
+            kept+=("${p%%=*}=@@REDACTED@@"); hit=1
+        else
+            kept+=("$p")
+        fi
+    done
+    if (( ! hit )); then printf '%s' "$url"; return 0; fi
+    if [[ "$SVC_SHOW_SECRETS" == 1 ]]; then
+        [[ -n "$name" ]] && _svc_save_secret_url "$name" "$url"
+        printf '%s' "$url"; return 0
+    fi
+    if [[ -n "$name" ]] && _svc_save_secret_url "$name" "$url"; then
+        ph="<redacted: see $(svc_url_file "$name")>"
+    else
+        ph='<redacted: full URL not saved>'
+    fi
+    out=$(IFS='&'; printf '%s' "${kept[*]}")
+    printf '%s?%s%s' "$base" "${out//@@REDACTED@@/$ph}" "$frag"
+}
+
+# svc_health_is_http <workdir> <health> — does this row's healthcheck probe an
+# HTTP endpoint? (your-org/nexus-code#1742.) The URL cell above is derived from
+# the healthcheck TEXT or from `<workdir>/.deploy/endpoint`; a service whose
+# healthcheck is a SCRIPT that curls a port and that declares no endpoint
+# rendered `-` with nothing telling its author either convention existed — the
+# 2026-10-05 `tools/healthcheck.sh` row on :8774. So: true when the healthcheck
+# text, or the first 64 KiB of the script it names (resolved against the
+# workdir when relative), carries curl/wget, an http(s) URL, or an HTTP request
+# line (`HTTP/1.`, what a hand-written probe sends over /dev/tcp). A bare
+# `/dev/tcp/` connect is NOT HTTP: it is how a TCP port check is written, and
+# counting it warned on nexus-remote-ssh, an SSH service. A
+# heuristic over SOURCE TEXT, and it errs toward SILENCE: a probe written in
+# another language, or one that builds its URL at runtime, reads as not-HTTP and
+# earns no warning. It only ever ADDS a warning; nothing here changes what is
+# probed or rendered.
+svc_health_is_http() {
+    local workdir="${1:-}" health="${2:-}" re='(^|[^A-Za-z0-9_-])(curl|wget)([^A-Za-z0-9_-]|$)|https?://|HTTP/1\.'
+    [[ "$health" =~ $re ]] && return 0
+    local first="${health%%[[:space:]]*}"
+    [[ -n "$first" ]] || return 1
+    [[ "$first" == /* ]] || first="$workdir/$first"
+    [[ -f "$first" && -r "$first" ]] || return 1
+    # CAPTURE, THEN MATCH: `head | grep -q` exits at the match and can SIGPIPE
+    # the producer, which under pipefail reads as no-match (#622).
+    local body
+    body=$(head -c 65536 -- "$first" 2>/dev/null) || return 1
+    [[ "$body" =~ $re ]]
+}
+
+# svc_url_warnings — one line per registered service whose healthcheck probes
+# HTTP but whose URL cell would render `-` (#1742). Printed by `svc.sh status`
+# on STDERR, so the table and its exit code are unchanged. The cell is asked of
+# svc_detail_url, the same derivation the table uses, as it renders a SERVING
+# row (`UP`): the question is "does this service have a URL anyone can show",
+# not "is it up right now" — the table already says that.
+svc_url_warnings() {
+    local i
+    for (( i=1; i<=SVC_N; i++ )); do
+        svc_health_is_http "${SVC_WORKDIR[$i]}" "${SVC_HEALTH[$i]}" || continue
+        [[ "$(svc_detail_url "${SVC_WORKDIR[$i]}" "${SVC_HEALTH[$i]}" UP)" == '-' ]] || continue
+        printf 'svc.sh: WARN service %s probes HTTP but shows no URL: write its URL (one line, e.g. http://localhost:PORT/) to %s/.deploy/endpoint, or name the URL in the healthcheck column (skills/nexus.services/SKILL.md; your-org/nexus-code#1742)\n' \
+            "${SVC_NAME[$i]}" "${SVC_WORKDIR[$i]}"
+    done
 }
 
 # Compact age: 45s / 12m / 3h.
@@ -365,6 +726,11 @@ fmt_age() {
 # Populated by load_services(): parallel arrays indexed 1..N for the menu.
 declare -a SVC_NAME SVC_WORKDIR SVC_LAUNCH SVC_HEALTH SVC_LOG
 SVC_N=0
+# 1 when the registry EXISTS and could not be READ, so SVC_N==0 is "could not
+# look" rather than "nothing registered" (your-org/nexus-code#1266). The two
+# render differently everywhere SVC_N==0 is reported; a flag nobody reads
+# would be the same silence in a new place.
+SVC_REGISTRY_UNREADABLE=0
 
 load_services() {
     SVC_NAME=() SVC_WORKDIR=() SVC_LAUNCH=() SVC_HEALTH=() SVC_LOG=()
@@ -379,6 +745,16 @@ load_services() {
         SVC_HEALTH[$SVC_N]="$health"
         SVC_LOG[$SVC_N]="$(svc_logfile "$workdir" "$logfield")"
     done < <(svc_parse_registry "$SERVICES_REGISTRY")
+    # `while … done < <(cmd)` DISCARDS cmd's rc, so the parser's 79 is
+    # unobservable at the loop; re-ask the predicate here. An unreadable
+    # registry must not render as an empty cockpit — "you have no services"
+    # and "I could not read your services" are different sentences
+    # (your-org/nexus-code#1266).
+    if ! svc_registry_readable "$SERVICES_REGISTRY"; then
+        SVC_REGISTRY_UNREADABLE=1
+    else
+        SVC_REGISTRY_UNREADABLE=0
+    fi
 }
 
 # --- advertised capability: jupyterlab --------------------------------------
@@ -440,6 +816,9 @@ svc_require() {
     echo "svc.sh: unknown service '$name' (registry: $SERVICES_REGISTRY)" >&2
     if (( SVC_N > 0 )); then
         echo "  registered: ${SVC_NAME[*]:1:$SVC_N} (+ watcher)" >&2
+    elif (( SVC_REGISTRY_UNREADABLE )); then
+        echo "  registry at $SERVICES_REGISTRY is NOT READABLE — the name may well be registered;" >&2
+        echo "  this listing could not be produced. ('watcher' is still addressable.)" >&2
     else
         echo "  registry is empty; 'watcher' is still addressable" >&2
     fi
@@ -657,17 +1036,31 @@ render_core_rows() {
             "no crash-revival — orchestrator must arm the supervisor Monitor"
     fi
 
-    if _recover_window_exists "$TARGET_WINDOW"; then
-        up='UP'; upc="$C_G"
-    else
+    local logged_out=0
+    if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 \
+        && STATE_DIR="$STATE_DIR" _auth_hold_expiry_standing; then
+        logged_out=1
+    fi
+    if ! _recover_window_exists "$TARGET_WINDOW"; then
         up='DOWN'; upc="$C_R"
+    elif (( logged_out )); then
+        # The window exists and the session inside it cannot take a turn.
+        # `UP` here was the 2026-09-17 reading for 7 h 24 m (#1548).
+        up='LOGGED-OUT'; upc="$C_R"
+    else
+        up='UP'; upc="$C_G"
     fi
     # The watcher is the orchestrator's supervisor: it spawns/revives
     # the target window via its liveness machinery. Colour the word by
     # the watcher's own state so a dead supervisor is visible here too.
     sup='watcher'
     case "$rc" in 0) supc="$C_DIM" ;; 1) supc="$C_Y" ;; *) supc="$C_R" ;; esac
-    if [[ -f "$ORCH_HB" ]]; then
+    if (( logged_out )); then
+        local _lo_first _lo_age
+        _lo_first=$(cut -f1 "$STATE_DIR/auth-expired.tsv" 2>/dev/null)
+        if [[ "$_lo_first" =~ ^[0-9]+$ ]]; then _lo_age=$(( $(date +%s) - _lo_first )); else _lo_age=0; fi
+        detail="run /login in the orchestrator window — logged out for $(fmt_age "$_lo_age"); no agent can take a turn"
+    elif [[ -f "$ORCH_HB" ]]; then
         detail="last turn $(fmt_age "$(_watcher_heartbeat_age "$ORCH_HB")") ago"
     else
         detail='no turn-end heartbeat'
@@ -693,8 +1086,13 @@ build_footer() {
     fi
     if (( SVC_N == 0 )); then
         FOOT+=('')
-        printf -v l '%sno registered services%s (expected at %s)' \
-            "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        if (( SVC_REGISTRY_UNREADABLE )); then
+            printf -v l '%sREGISTRY NOT READABLE%s at %s — this is NOT "no services"; the list below is EMPTY because it could not be read' \
+                "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        else
+            printf -v l '%sno registered services%s (expected at %s)' \
+                "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        fi
         FOOT+=("$l")
     fi
     if (( advertise && ! compact )); then
@@ -829,14 +1227,25 @@ render_status() {
     for (( i=1; i<=SVC_N; i++ )); do
         name="${SVC_NAME[$i]}"; workdir="${SVC_WORKDIR[$i]}"
         launch="${SVC_LAUNCH[$i]}"; health="${SVC_HEALTH[$i]}"
-        if _recover_service_healthy "$workdir" "$health"; then
-            up='UP';   upc="$C_G"
-        else
-            up='DOWN'; upc="$C_R"
-        fi
+        detail=''
+        case "$(_svc_row_health "$workdir" "$health")" in
+            UP)      up='UP';      upc="$C_G" ;;
+            UNKNOWN) up='UNKNOWN'; upc="$C_Y"
+                     detail="healthcheck did not finish within ${SVC_STATUS_HEALTH_TIMEOUT}s — health UNKNOWN, not DOWN (your-org/nexus-code#1601)" ;;
+            *)       up='DOWN';    upc="$C_R" ;;
+        esac
         # Health verdict feeds the supervisor cell so a dead pid record next
         # to a passing healthcheck renders as `orphan`, never a bare `stale`.
         sup="$(svc_supervisor "$name" "$launch" "$up")"
+        # A live supervisor launched moments ago whose service is not answering
+        # YET is STARTING, not DOWN — see SVC_STARTUP_GRACE_SECONDS above.
+        local _age=''
+        if [[ "$up" == DOWN && "$sup" == pid:* ]] \
+           && _age=$(_svc_supervisor_age "$name" "${sup#pid:}") \
+           && (( _age < SVC_STARTUP_GRACE_SECONDS )); then
+            up='STARTING'; upc="$C_Y"
+            detail="supervisor launched ${_age}s ago; healthcheck not passing yet — still STARTING, not DOWN; do not restart (reads DOWN after ${SVC_STARTUP_GRACE_SECONDS}s)"
+        fi
         case "$sup" in
             pid:*)  supc="$C_G" ;;
             stale)  supc="$C_R" ;;
@@ -852,18 +1261,29 @@ render_status() {
                 ;;
             *)      supc="$C_DIM" ;;
         esac
+        # DOWN because someone ran `svc.sh stop` is not an outage
+        # (your-org/nexus-code#1827): say so, in a colour that is not an alarm.
+        local _sdesc
+        if [[ "$up" == DOWN ]] && _sdesc=$(_svc_stop_request_desc "$name"); then
+            up='STOPPED'; upc="$C_DIM"
+            detail="stopped by request ${_sdesc} — not an outage; auto-restart suspended until 'svc.sh start $name'"
+        fi
         # A labsh JupyterLab service that is SERVING shows its reachable,
         # tokened URL; everything else falls back to the healthcheck-
         # derived endpoint. Keyed on the raw healthcheck, not the possibly
         # degraded STATUS word — a DEGRADED service is still serving, and
         # withholding its URL would help nobody.
-        detail=''
-        [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
-        [[ -n "$detail" ]] || detail=$(svc_endpoint "$health")
+        # A non-serving row keeps a detail already set above (a hung check's
+        # "did not finish within" note); a serving one always shows its URL.
+        if [[ "$up" == UP || "$up" == DEGRADED || -z "$detail" ]]; then
+            detail=$(svc_detail_url "$workdir" "$health" "$up" "$name")
+        fi
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
         R_TXT[$i]="$ROW"
         line_cost "$ROW"; R_COST[$i]=$COST
+        # STOPPED stays pinned too: a service held down on purpose is
+        # something to keep in view, and the pager labels hidden rows "UP".
         if [[ "$up" != UP || "$sup" == stale || "$sup" == orphan ]]; then
             R_ATT[$i]=1
         else
@@ -989,7 +1409,7 @@ _follow_split() {
     local cmd='exec tail -n 200 -F' f
     for f in "$@"; do printf -v cmd '%s %q' "$cmd" "$f"; done
     if [[ -n "$SVC_LOG_PANE" ]] \
-       && tmux list-panes -F '#{pane_id}' 2>/dev/null | grep -qxF "$SVC_LOG_PANE"; then
+       && grep -qxF "$SVC_LOG_PANE" <<<"$(tmux list-panes -F '#{pane_id}' 2>/dev/null)"; then
         tmux respawn-pane -k -t "$SVC_LOG_PANE" "$cmd" 2>/dev/null
     else
         SVC_LOG_PANE=$(tmux split-window -d -v -p 40 -P -F '#{pane_id}' "$cmd" 2>/dev/null)
@@ -1044,8 +1464,12 @@ _close_log_pane() {
 _cockpit_wrong_launch_guard() {
     local self_info win_id win_name
     if self_info=$(_nexus_self_pane_window); then
-        win_id="${self_info%%$'\t'*}"
-        win_name="${self_info#*$'\t'}"
+        # Delimiter is '|', never a TAB: a non-UTF-8 locale rewrites a TAB in
+        # tmux `-F`/`display-message -p` output to `_`, which used to collapse
+        # both fields into one mangled string and make this guard fail OPEN
+        # (your-org/nexus-code#701 item A).
+        win_id="${self_info%%|*}"
+        win_name="${self_info#*|}"
         if [[ "$win_name" == "$TARGET_WINDOW" ]]; then
             if ! _nexus_window_has_orchestrator "$win_id"; then
                 tmux rename-window -t "$win_id" "${SERVICES_WINDOW}-misplaced" 2>/dev/null || true
@@ -1058,7 +1482,7 @@ the orchestrator's absence from the watcher and blocks recovery.
 The window has been renamed off '$TARGET_WINDOW' (unless a live
 orchestrator shares it) so the watcher can respawn the real orchestrator.
 Run the cockpit in its own window instead:
-  tmux new-window -dn $SERVICES_WINDOW $0
+  tmux new-window -dn $SERVICES_WINDOW $0 --show-secrets
 MSG
             exit 4
         fi
@@ -1141,6 +1565,7 @@ _orchestrator_redirect() {
 cmd_status() {
     load_services
     render_status
+    svc_url_warnings >&2
     (( SVC_FS_OK )) || return 1
     # Non-zero on duplicate / decapitated watcher groups (nexus-code#491)
     # so scripts and supervisors can KEY on the anomaly instead of
@@ -1176,14 +1601,166 @@ cmd_start() {
         orchestrator|"$TARGET_WINDOW") _orchestrator_redirect ;;
     esac
     svc_require "$name"
+    # An explicit start withdraws a stop request (your-org/nexus-code#1827);
+    # an automated caller never does.
+    local _sdesc
+    if _svc_actor_is_automated && _sdesc=$(_svc_stop_request_desc "$name"); then
+        echo "[svc] $name: REFUSING an automated start (actor ${SVC_RESTART_ACTOR}) — stopped by request $_sdesc" >&2
+        return "$SVC_STOP_REQUESTED_RC"
+    fi
+    _svc_clear_stop_sentinel "$name"
     local outcome
     outcome=$(recover_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}" "${SVC_LOG[$REG_I]}")
     echo "[svc] $name: $outcome" >&2
     case "$outcome" in
         healthy|relaunched|supervisor-alive|window-present) return 0 ;;
+        # A green healthcheck over a dead supervisor record is NOT a
+        # successful start (your-org/nexus-code#606): `start` did nothing, and
+        # the thing that is serving answers to nobody. Fail loudly and name
+        # the one verb that actually reconciles.
+        healthy-unsupervised)
+            echo "[svc] $name:   the healthcheck passes but the daemon is UNSUPERVISED — 'start' cannot adopt a running daemon." >&2
+            echo "[svc] $name:   Reconcile: monitor/svc.sh restart $name" >&2
+            return 1 ;;
         *) return 1 ;;
     esac
+}
+
+# Locate the daemon behind an ORPHANED service — one whose healthcheck
+# passes while its supervisor record is stale. Prints the ONE verified pid,
+# or returns non-zero when the owner cannot be identified UNAMBIGUOUSLY.
+#
+# IDENTIFY-BY-BASENAME ALONE IS A FOOTGUN, and it drew blood while this fix
+# was being written: matching the wrapper BASENAME (`serve-supervised.sh`)
+# hit four unrelated production rows that share that wrapper, and the caller
+# TERMed all of them. The basename cannot be dropped either — registry launch
+# fields are commonly RELATIVE (`./serve-supervised.sh`) while the running
+# cmdline is absolute, so the token as written matches nothing. What makes a
+# basename match safe is the SECOND half of the predicate:
+#   (a) /proc/<pid>/cmdline mentions the wrapper basename, AND
+#   (b) /proc/<pid>/cwd IS the service's workdir — recovery launches every
+#       supervisor with `cd <workdir>`, and it is the workdir, not the
+#       script, that distinguishes two rows sharing one wrapper.
+# `pgrep` only PROPOSES; every candidate is re-verified from /proc before it
+# is named to a caller that will signal it. We never `pkill -f` — pattern
+# killing matches the watcher's own command line and has taken it down.
+#
+# AMBIGUITY IS FATAL, NEVER RESOLVED BY GUESSING: a service has exactly one
+# supervisor, so two or more survivors mean the predicate did not identify
+# it. Refuse. Killing "all the matches" is precisely the blast radius this
+# whole change exists to prevent.
+# Results are returned in GLOBALS, not on stdout: a caller capturing stdout
+# with $(…) would run this in a subshell, and the ambiguity verdict set there
+# would be discarded — the guard would then be unreachable, silently.
+#   _SVC_LOCATE_PID        the single identified pid (return 0)
+#   _SVC_LOCATE_AMBIGUOUS  space-separated candidates when >1 matched
+# Returns 0 iff exactly one candidate was positively identified.
+_SVC_LOCATE_PID=''
+_SVC_LOCATE_AMBIGUOUS=''
+_svc_locate_orphan_daemon() {
+    local launch="$1" workdir="$2" tok base pid cl cwd uid wd_real
+    local -a hits=()
+    _SVC_LOCATE_PID=''; _SVC_LOCATE_AMBIGUOUS=''
+    tok=${launch%% *}
+    base=${tok##*/}
+    [[ -n "$base" ]] || return 1
+    command -v pgrep >/dev/null 2>&1 || return 1
+    uid=$(id -u 2>/dev/null) || return 1
+    wd_real=$(readlink -f "$workdir" 2>/dev/null)
+    [[ -n "$wd_real" ]] || return 1
+    while read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        (( pid == $$ || pid == PPID )) && continue
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        cl=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null ) || continue
+        [[ "$cl" == *"$base"* ]] || continue
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+        [[ "$cwd" == "$wd_real" ]] || continue
+        hits+=( "$pid" )
+    done < <(pgrep -u "$uid" -f -- "$base" 2>/dev/null)
+    if (( ${#hits[@]} == 1 )); then _SVC_LOCATE_PID="${hits[0]}"; return 0; fi
+    (( ${#hits[@]} > 1 )) && _SVC_LOCATE_AMBIGUOUS="${hits[*]}"
+    return 1
+}
+
+# Genuinely reconcile an orphaned service: locate the daemon, stop it,
+# restart it under a supervisor, leave a valid record. Where it CANNOT, it
+# fails loudly with the reason rather than reporting health — a passing
+# healthcheck is never sufficient evidence that a reconcile worked
+# (your-org/nexus-code#606).
+_svc_reconcile_orphan() {
+    local name="$1" workdir="$2" launch="$3" health="$4" logfile="$5"
+    local st="$6" why="$7"
+    local pf pid i
+    pf=$(_recover_pidfile "$name")
+    echo "[svc] $name: ORPHANED DAEMON — healthcheck passes, supervisor record is $st${why:+ ($why)}. Reconciling." >&2
+
+    # No command substitution: the verdict comes back in globals (see the
+    # function's header) precisely so the ambiguity branch stays reachable.
+    if _svc_locate_orphan_daemon "$launch" "$workdir"; then
+        pid="$_SVC_LOCATE_PID"
+    else
+        if [[ -n "$_SVC_LOCATE_AMBIGUOUS" ]]; then
+            echo "[svc] $name: CANNOT RECONCILE — discovery is AMBIGUOUS: pids $_SVC_LOCATE_AMBIGUOUS all match" >&2
+            echo "[svc] $name:   '${launch%% *}' in $workdir. A service has ONE supervisor, so this predicate has" >&2
+            echo "[svc] $name:   not identified it — and killing every match is how a targeted bounce becomes an" >&2
+            echo "[svc] $name:   outage. Nothing was signalled. Resolve by hand, by recorded pid." >&2
+        else
+            echo "[svc] $name: CANNOT RECONCILE — no process we can see runs '${launch%% *}' with cwd $workdir." >&2
+            echo "[svc] $name:   Something IS answering the healthcheck, so the listener belongs to a process outside" >&2
+            echo "[svc] $name:   this view: another container/pid-namespace (a record whose reason is 'foreign-namespace'" >&2
+            echo "[svc] $name:   is the signature), or another UID entirely. Identify the owner before acting:" >&2
+            echo "[svc] $name:     ss -ltnpe | grep <port>     # uid:65534 with no pid = not ours, do NOT kill" >&2
+            echo "[svc] $name:   A daemon you cannot see is one you must not signal. Escalate to the operator." >&2
+        fi
+        echo "[svc] $name:   Pid record PRESERVED at $pf (evidence)." >&2
+        return 1
+    fi
+
+    echo "[svc] $name: located daemon pid $pid (cwd $workdir) — TERM to its process group" >&2
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "[svc] $name: pid $pid still alive after 5s — KILL" >&2
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    sleep 0.5
+
+    # The daemon we could see is gone. If the healthcheck STILL passes, then
+    # whatever is serving was never ours — exactly the case a green probe
+    # would otherwise launder into "reconciled".
+    if _recover_service_healthy "$workdir" "$health"; then
+        echo "[svc] $name: CANNOT RECONCILE — killed the process(es) we found, yet the healthcheck STILL passes." >&2
+        echo "[svc] $name:   A DIFFERENT process is serving this endpoint — the healthcheck cannot tell it from ours" >&2
+        echo "[svc] $name:   (a port probe, or an SSH banner, proves only that SOMETHING answers). Do not kill blindly:" >&2
+        echo "[svc] $name:   identify the listener's owner first (ss -ltnpe), then escalate to the operator." >&2
+        return 1
+    fi
+
+    rm -f "$pf"
+    local outcome
+    outcome=$(recover_service "$name" "$workdir" "$launch" "$health" "$logfile")
+    echo "[svc] $name: relaunch outcome: $outcome" >&2
+    case "$outcome" in
+        relaunched|healthy) ;;
+        *)  echo "[svc] $name: CANNOT RECONCILE — the daemon was stopped but the relaunch reported '$outcome'." >&2
+            echo "[svc] $name:   The service is now DOWN and unsupervised. See the service log, then retry." >&2
+            return 1 ;;
+    esac
+    # Insist on a VALID record: a reconcile that leaves no live supervisor
+    # has not reconciled, however green the probe goes.
+    _recover_supervisor_probe "$name" "$launch"
+    if [[ "$_RECOVER_SUP_STATE" != alive:* ]]; then
+        echo "[svc] $name: CANNOT RECONCILE — relaunched, but no live supervisor record exists (state: $_RECOVER_SUP_STATE${_RECOVER_STALE_REASON:+, $_RECOVER_STALE_REASON})." >&2
+        return 1
+    fi
+    echo "[svc] $name: reconciled — daemon bounced, supervisor $_RECOVER_SUP_STATE, record $pf" >&2
+    return 0
 }
 
 # TERM the supervisor's process group (setsid made it a session+group
@@ -1191,29 +1768,101 @@ cmd_start() {
 # KILL after 5 s, then drop the pidfile. A passing healthcheck after
 # that is loudly flagged — a daemonizing child (e.g. nginx) can escape
 # the group and needs its own shutdown.
+# SEED THE SERVER-ENV PIN FROM A HEALTHY SERVER WE ARE ABOUT TO STOP
+# (your-org/nexus-code#1692). The pin (#1676/#1677) is captured by the
+# supervisor after a healthy start — so the FIRST start under code carrying the
+# pin feature is always unpinned, and a pull that changes labsh-supervised.sh
+# triggers exactly that start through the version-aware restart. Measured on
+# the deploy of #1677: the healthy server was stopped at 11:15:17 and the
+# relaunch resolved unpinned against an index with ONE new release
+# (charset-normalizer 3.5.1→3.5.2) — a ~30-min cold build of the env that was
+# serving warm a moment earlier. svc.sh is invoked FRESH from disk, so it runs
+# the new code even while the OLD supervisor is being replaced: capture here,
+# from the still-running server, and the relaunch is pinned to the env that
+# was just serving. Best-effort and BOUNDED: it never blocks or fails the stop.
+_seed_labsh_pin() {
+    local name="$1" workdir="$2" launch="$3" health="$4" tool="$_script_dir/labsh-pin.sh"
+    [[ "$launch" == *labsh-supervised.sh* ]] || return 0
+    [[ -x "$tool" && -d "$workdir/.jupyter" ]] || return 0
+    [[ -s "$workdir/.jupyter/labsh-server.pin" ]] && return 0
+    _recover_service_healthy "$workdir" "$health" || return 0
+    if timeout -k 5 60 "$tool" capture "$workdir" >/dev/null 2>&1; then
+        echo "[svc] $name: seeded the server-env pin from the running healthy server before stopping it — the relaunch resolves to the SAME env (warm)" >&2
+    else
+        echo "[svc] $name: could not seed a server-env pin before the stop (see $workdir/.jupyter/labsh-pin.log) — the relaunch runs unpinned" >&2
+    fi
+    return 0
+}
+
+# REPLACE, DON'T BOUNCE (your-org/nexus-code#1693). When the version-aware
+# restart replaces a labsh supervisor (`SVC_RESTART_MODE=replace`, inside
+# `restart` only — never `stop`), the old supervisor may leave a healthy server
+# it owns running for its successor. That needs two things from here:
+#   * a one-shot MARK naming the supervisor pid, so `on_term` can tell
+#     "replaced" from "stopped";
+#   * a TERM to the supervisor ALONE. labsh backgrounds the server without job
+#     control, so a server the supervisor started sits in ITS process group,
+#     and the group TERM of a plain stop would kill the server whatever
+#     `on_term` decided (measured on the live service: jupyter-lab's pgid is
+#     the supervisor's).
+# The supervisor answers with an ACK naming its pid when it handed off. No ACK
+# (it stopped the server, or it is code from before this change) means the
+# rest of its group is TERMed as a plain stop would, so the worst case of a
+# replace is exactly today's bounce.
+_labsh_replace_wanted() {
+    local workdir="$1" launch="$2"
+    (( ${_SVC_RESTART_REPLACE:-0} && ${_SVC_STOP_IN_RESTART:-0} )) || return 1
+    [[ "$launch" == *labsh-supervised.sh* && -d "$workdir/.jupyter" ]]
+}
+_labsh_write_replace_mark() {
+    local f="$1/.jupyter/labsh-supervisor.replace" pid="$2"
+    rm -f "$1/.jupyter/labsh-supervisor.handoff"
+    printf 'pid=%s\nat=%s\n' "$pid" "$(date +%s)" > "$f.tmp.$$" 2>/dev/null \
+        && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+}
+_SVC_HANDED_OFF=0
+
 _stop_service() {
     local name="$1" workdir="$2" launch="$3" health="$4"
-    local pf pid i
+    local pf pid i replace=0 ack
+    _SVC_HANDED_OFF=0
     pf=$(_recover_pidfile "$name")
     if ! _recover_service_running "$name" "$launch"; then
+        # ORPHAN CHECK BEFORE ANY REMOVAL (your-org/nexus-code#606). The old
+        # code deleted the record first and only then noticed the healthcheck
+        # still passed — discarding the record of the daemon it had just
+        # failed to stop, and then advising `restart`, which called straight
+        # back into here. Order matters: probe, then decide.
+        _recover_supervisor_probe "$name" "$launch"
+        local st="$_RECOVER_SUP_STATE" why="$_RECOVER_STALE_REASON"
+        if _recover_service_healthy "$workdir" "$health"; then
+            echo "[svc] $name: REFUSING to drop the pid record — the healthcheck PASSES but no live supervisor holds it (record: $st${why:+, $why})." >&2
+            echo "[svc] $name:   A daemon is SERVING UNSUPERVISED. 'stop' cannot stop what it does not track, and deleting" >&2
+            echo "[svc] $name:   the record would destroy the only evidence of which supervisor died. Record PRESERVED." >&2
+            echo "[svc] $name:   Reconcile (locates the daemon, bounces it, re-supervises): monitor/svc.sh restart $name" >&2
+            return 1
+        fi
         echo "[svc] $name: no live supervisor — nothing to stop" >&2
-        # Removing the record does NOT stop an orphaned daemon: the supervisor
-        # is what we track, and it is already gone. Say so loudly, or `stop`
-        # reads as "service stopped" while the daemon keeps serving,
-        # unsupervised and now unrecorded.
+        # Healthcheck FAILS too: the record is consistent litter (the
+        # supervisor died and took the service with it), so dropping it is
+        # safe and keeps recovery from tripping over a dead pid.
         if [[ -f "$pf" ]]; then
             rm -f "$pf"
-            echo "[svc] $name: removed stale pidfile" >&2
-            if _recover_service_healthy "$workdir" "$health"; then
-                echo "[svc] $name: WARNING — the healthcheck STILL PASSES: an orphaned daemon is serving without a supervisor, and its pid record is now gone." >&2
-                echo "[svc] $name:           'stop' removed the record, not the daemon. Use 'svc.sh restart $name' to reconcile (it will bounce the daemon)." >&2
-            fi
+            echo "[svc] $name: removed stale pid record ($st${why:+, $why}); service is down, so nothing is left unsupervised" >&2
         fi
         return 0
     fi
     read -r pid < "$pf" 2>/dev/null
-    echo "[svc] $name: stopping supervisor pid $pid (TERM to its process group)" >&2
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    _seed_labsh_pin "$name" "$workdir" "$launch" "$health"
+    if _labsh_replace_wanted "$workdir" "$launch" && [[ "$pid" =~ ^[0-9]+$ ]] \
+        && _labsh_write_replace_mark "$workdir" "$pid"; then
+        replace=1
+        echo "[svc] $name: REPLACING supervisor pid $pid (TERM to the supervisor only; it hands a healthy server it owns to its successor, else stops it)" >&2
+        kill -TERM "$pid" 2>/dev/null
+    else
+        echo "[svc] $name: stopping supervisor pid $pid (TERM to its process group)" >&2
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    fi
     for i in 1 2 3 4 5 6 7 8 9 10; do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
@@ -1222,8 +1871,32 @@ _stop_service() {
         echo "[svc] $name: still alive after 5s — KILL" >&2
         kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
         sleep 0.2
+    elif (( replace )); then
+        ack=$(sed -n '/^pid=/{s///p;q;}' "$workdir/.jupyter/labsh-supervisor.handoff" 2>/dev/null)
+        if [[ "$ack" == "$pid" ]]; then
+            _SVC_HANDED_OFF=1
+        else
+            # It did not hand off: finish the stop a plain `stop` would have made.
+            kill -TERM -- "-$pid" 2>/dev/null || true
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 -- "-$pid" 2>/dev/null || break
+                sleep 0.5
+            done
+            kill -0 -- "-$pid" 2>/dev/null && { kill -KILL -- "-$pid" 2>/dev/null || true; }
+        fi
+    fi
+    if (( replace )); then
+        rm -f "$workdir/.jupyter/labsh-supervisor.replace" "$workdir/.jupyter/labsh-supervisor.handoff"
     fi
     rm -f "$pf"
+    if (( _SVC_HANDED_OFF )); then
+        if _recover_service_healthy "$workdir" "$health"; then
+            echo "[svc] $name: supervisor replaced — the healthy server was left running for its successor to adopt (#1693)" >&2
+            return 0
+        fi
+        _SVC_HANDED_OFF=0
+        echo "[svc] $name: the supervisor handed off, but the server is no longer healthy — a fresh supervisor will start one" >&2
+    fi
     if _recover_service_healthy "$workdir" "$health"; then
         echo "[svc] $name: WARNING — healthcheck still passes after stop; a daemonized child likely escaped the process group" >&2
         return 1
@@ -1363,17 +2036,21 @@ _restart_watcher() {
 # REFUSED. A guard against an operator footgun that becomes a footgun. Two
 # bounds now stop that:
 #
-#   1. AGE CAP. Past the ceiling a "build" is pathological BY DEFINITION, not
-#      in flight. The cap is the MINIMUM of the watcher's ceiling and the
-#      supervisor's reap budget, so this guard can never outlast the layer that
-#      is about to act — they cannot drift into a deadlock.
-#   2. PROGRESS. A build is protected only while it is MOVING. We sample a
-#      monotone counter (CPU time + bytes written + build-log growth) across
-#      calls; a build that has not advanced it for LABSH_BUILD_STALL_SECONDS is
-#      presumed wedged and released early.
+#   1. AGE. Up to the SOFT ceiling (the MINIMUM of the watcher's ceiling and
+#      the supervisor's reap budget, so this guard never outlasts the layer
+#      about to act) a build is protected unconditionally. Past it, a build is
+#      protected ONLY while it is MOVING (2). Past the HARD cap
+#      (LABSH_COLD_BUILD_HARD_CAP, default 7200s) it is released regardless.
+#      The soft ceiling used to be a hard one: "past 1800s ⇒ pathological BY
+#      DEFINITION". That definition was false — on 2026-09-29 a build on a
+#      load-100 node was still progressing at 30 min and was killed there, by
+#      this layer's siblings using the same number (your-org/nexus-code#1676).
+#   2. PROGRESS. A monotone counter (CPU time + bytes written + build-log
+#      growth) sampled across calls; a build that has not advanced it for
+#      LABSH_BUILD_STALL_SECONDS is presumed wedged and released.
 #
 # On AMBIGUITY (counters unreadable, no prior sample) we protect — but that
-# protection is hard-bounded by the age cap, so the worst case is a bounded
+# protection is hard-bounded by the hard cap, so the worst case is a bounded
 # delay of automated recovery, never a permanent refusal.
 #
 # NOTE the stall window must be generous: a HEALTHY build on this NFS cache was
@@ -1382,7 +2059,7 @@ _restart_watcher() {
 # progressing. Calling that "wedged" is precisely the mistake this guard exists
 # to prevent, so the default is 600s — ~6.7x the longest stall actually observed.
 
-# The age cap: never outlast the layer that is about to act on this build.
+# The SOFT ceiling: never outlast the layer that is about to act on this build.
 _coldbuild_cap() {
     local watcher_ceiling=1800 reap_budget="${LABSH_COLD_BUILD_BUDGET:-1800}" cap
     if [[ -n "${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-}" ]]; then
@@ -1399,67 +2076,28 @@ _coldbuild_cap() {
     printf '%s' "$cap"
 }
 
-# A monotone progress counter for a live build: CPU consumed + bytes written +
-# build-log growth. Any increase is forward motion. Prints nothing and fails if
-# it cannot be read (⇒ caller treats as "cannot establish a stall").
-_coldbuild_progress() {
-    local pid="$1" workdir="$2" stat rest ticks=0 wchar=0 bg=0
-    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
-    rest=${stat#*") "}                        # drop "pid (comm) " — comm may hold spaces
-    # shellcheck disable=SC2086
-    set -- $rest                              # ${12}=utime, ${13}=stime (fields 14/15 overall)
-    # ${12} NOT $12 — the latter is ${1}2, i.e. the state char with a "2" glued on.
-    [[ "${12:-}" =~ ^[0-9]+$ && "${13:-}" =~ ^[0-9]+$ ]] || return 1
-    ticks=$(( ${12} + ${13} ))
-    wchar=$(awk '/^wchar/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
-    [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
-    bg=$(stat -c %s "$workdir/.jupyter/labsh.bg.log" 2>/dev/null)
-    [[ "$bg" =~ ^[0-9]+$ ]] || bg=0
-    printf '%s' $(( ticks + wchar + bg ))
-}
+# Forward progress, the stall window and the hard cap are decided by ONE shared
+# predicate, `labsh_build_release` in _labsh_build_evidence.sh — the same one
+# the watcher's service-health defer and the supervisor's stale-build reaper
+# consult (your-org/nexus-code#1676). This guard used to carry its own
+# progress sampler and an AGE-ONLY cap; on 2026-09-29 every layer killed
+# still-progressing builds at their 1800s bound on a load-100 node, and the
+# next build started from zero. The cap computed above is now the SOFT ceiling:
+# past it a build must be seen MOVING to stay protected.
 
-# True iff the build has PROVABLY made no forward progress for >= the stall
-# window. Samples persist across invocations under STATE_DIR. Unprovable ⇒ 1
-# (not stalled ⇒ keep protecting, bounded by the age cap).
-_coldbuild_stalled() {
-    local name="$1" pid="$2" workdir="$3"
-    local stall="${LABSH_BUILD_STALL_SECONDS:-600}"
-    local f="$STATE_DIR/service-health/$name.buildprogress"
-    local now cur prev_pid prev_ts prev_cur
-
-    [[ "$stall" =~ ^[0-9]+$ ]] && (( stall > 0 )) || return 1
-    cur=$(_coldbuild_progress "$pid" "$workdir") || return 1
-    now=$(date +%s 2>/dev/null) || return 1
-    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
-
-    # `< "$f"` on a missing file is a REDIRECT failure: bash reports it itself
-    # ("No such file or directory") and the `2>/dev/null` on `read` is applied
-    # too late to suppress it. On every first-sight refusal that leaked a raw
-    # shell error into the operator's face. Test for readability first.
-    if [[ -r "$f" ]]; then
-        read -r prev_pid prev_ts prev_cur < "$f" || true
-    fi
-
-    # A different pid, an unreadable sample, or forward motion ⇒ re-baseline.
-    if [[ "${prev_pid:-}" != "$pid" ]] \
-       || [[ ! "${prev_ts:-}"  =~ ^[0-9]+$ ]] \
-       || [[ ! "${prev_cur:-}" =~ ^[0-9]+$ ]] \
-       || (( cur > prev_cur )); then
-        printf '%s %s %s\n' "$pid" "$now" "$cur" > "$f" 2>/dev/null || true
-        return 1
-    fi
-
-    # Same pid, counter has not advanced since prev_ts. Deliberately do NOT
-    # refresh the timestamp — the stall is measured from when motion stopped.
-    (( now - prev_ts >= stall ))
-}
+# Exit status of a REFUSAL. Distinct from 1 (a failed stop/start) so a caller
+# can tell "not done, deliberately, because a build is in flight" from "tried
+# and failed": the watcher must not count a refusal as a restart attempt
+# toward its flap ceiling (it did, 2026-09-29: attempt 1/3 was a refusal).
+SVC_COLDBUILD_REFUSED_RC=75
 
 _coldbuild_guard() {
-    local name="$1" workdir="$2" launch="$3" ev pid age mins cap stall
+    local name="$1" workdir="$2" launch="$3" ev pid age mins cap stall hard verdict
 
     (( SVC_FORCE )) && return 0
     [[ "$launch" == *labsh-supervised.sh* ]] || return 0
     declare -F labsh_build_in_progress >/dev/null || return 0
+    declare -F labsh_build_release >/dev/null || return 0
 
     ev=$(labsh_build_in_progress "$workdir") || return 0
     pid="${ev%% *}"; age="${ev##* }"
@@ -1467,22 +2105,12 @@ _coldbuild_guard() {
     mins=$(( age / 60 ))
     cap=$(_coldbuild_cap)
     stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+    hard="${LABSH_COLD_BUILD_HARD_CAP:-7200}"
 
-    # cap 0 ⇒ the watcher's cold-build defer is disabled outright. If the layer
-    # that owns the policy will not defer, this guard must not defer either.
-    (( cap == 0 )) && return 0
-
-    # (1) past the cap it is pathological BY DEFINITION — let it be killed.
-    if (( cap > 0 && age >= cap )); then
-        echo "svc.sh: '$name' has a labsh build (pid $pid) running ${mins}m (${age}s) — at or past the ${cap}s cold-build ceiling." >&2
-        echo "svc.sh: a build this old is presumed WEDGED, not in flight. Allowing the restart so recovery can proceed." >&2
-        return 0
-    fi
-
-    # (2) alive but not MOVING for the whole stall window ⇒ presumed wedged.
-    if _coldbuild_stalled "$name" "$pid" "$workdir"; then
-        echo "svc.sh: '$name' has a labsh build (pid $pid, ${mins}m old) that has made NO forward progress" >&2
-        echo "svc.sh: (no CPU, no bytes written, no log growth) for >= ${stall}s — presumed wedged. Allowing the restart." >&2
+    # RELEASED (defer disabled, stalled, or past the hard cap) ⇒ allow, and say why.
+    if verdict=$(labsh_build_release "$pid" "$age" "$workdir" "$cap"); then
+        echo "svc.sh: '$name' has a labsh build (pid $pid): ${verdict#* }." >&2
+        echo "svc.sh: allowing the restart so recovery can proceed." >&2
         return 0
     fi
 
@@ -1490,29 +2118,79 @@ _coldbuild_guard() {
 svc.sh: REFUSING to stop '$name' — a labsh cold build is in flight AND PROGRESSING.
 
   build pid $pid, running ${mins}m (${age}s); no URL bound yet.
-  A cold uvx bring-up takes ~19 min on this NFS cache (measured 2026-07-13:
-  15m24s to link 96 packages + ~2min to import and bind).
+  (${verdict#* })
+  A cold uvx bring-up takes ~19 min on this NFS cache when the node is quiet
+  (measured 2026-07-13) and well over 30 min at load ~100 (2026-09-29).
 
-  Stopping now DISCARDS that build and starts the ~19-minute clock over from
-  zero. Repeating it is what turns a slow bring-up into an apparent crash loop.
+  Stopping now DISCARDS that build and starts the clock over from zero.
+  Repeating it is what turns a slow bring-up into an apparent crash loop.
 
-  This refusal is BOUNDED. It lifts when EITHER:
+  This refusal is BOUNDED. Past the ${cap}s ceiling it lifts as soon as EITHER:
     - the build stops making progress (no CPU, no bytes written, no log growth)
-      for ${stall}s — note this is only re-checked when someone calls svc.sh
-      again, so it will not fire on its own while nothing is trying to stop it; or
-    - the build is ${cap}s old, at which point it is presumed wedged.
+      for ${stall}s — re-checked on every call, by this command, the watcher
+      and the supervisor, which share one progress sample; or
+    - the build is ${hard}s old (hard cap), at which point it is released.
 
-  The watcher (policy auto-restart) forces a restart through this guard once the
-  service has been unhealthy past its cold-build ceiling, so a WEDGED build is
-  recovered without you. A build that is merely SLOW is what this refusal
-  protects — and it will bind on its own.
+  The watcher (policy auto-restart) applies the SAME verdict, so it will not
+  restart a build that is merely slow, and will restart a wedged one without you.
 
   Watch it instead:  tail -f $workdir/.jupyter/labsh.bg.log
   Override now:      svc.sh --force restart $name
                      (or SVC_FORCE=1 svc.sh restart $name)
 EOF
+    return "$SVC_COLDBUILD_REFUSED_RC"
+}
+
+# --- operator stop intent (your-org/nexus-code#1827) -----------------------
+# `stop <name>` records WHY the service is down, so the automatic start paths
+# (watcher service-health auto-restart, the recovery sweep behind `up` and
+# boot, a watcher/version-restart `restart`) leave it down instead of reading
+# a dead supervisor as an outage. Measured before this: a deliberate stop to
+# hold an auto-deploy was auto-restarted ~3 min later and deployed exactly the
+# content it was holding. The path is bootstrap-recover.sh's
+# `_recover_stop_sentinel`; only an explicit `start`/`restart <name>` clears it.
+# Exit code for a refused automated restart of a service stopped by request.
+# Distinct from the cold-build refusal (75) so a caller can tell the two apart.
+SVC_STOP_REQUESTED_RC=76
+
+_svc_write_stop_sentinel() {
+    local name="$1" f; f=$(_recover_stop_sentinel "$name")
+    if mkdir -p "${f%/*}" 2>/dev/null \
+       && { printf 'at=%s\n'  "$(date +%s 2>/dev/null || echo 0)"
+            printf 'iso=%s\n' "$(date -Is 2>/dev/null || date)"
+            printf 'by=%s\n'  "${NEXUS_WORKER_WINDOW:-${USER:-unknown}}"
+          } > "$f" 2>/dev/null; then
+        echo "[svc] $name: recorded the stop request ($f) — watcher auto-restart and recovery will leave it DOWN until 'svc.sh start|restart $name'" >&2
+        return 0
+    fi
+    echo "[svc] $name: WARNING — could not record the stop request at $f; the watcher's service-health auto-restart WILL bring it back" >&2
     return 1
 }
+
+# Prints "since <iso> by <who>" and returns 0 iff a stop request stands.
+_svc_stop_request_desc() {
+    local f; f=$(_recover_stop_sentinel "$1")
+    [[ -e "$f" ]] || return 1
+    local iso by
+    iso=$(sed -n 's/^iso=//p;T;q' "$f" 2>/dev/null)
+    by=$(sed -n 's/^by=//p;T;q' "$f" 2>/dev/null)
+    printf 'since %s by %s' "${iso:-?}" "${by:-?}"
+}
+
+_svc_clear_stop_sentinel() {
+    local name="$1" desc
+    desc=$(_svc_stop_request_desc "$name") || return 0
+    if rm -f "$(_recover_stop_sentinel "$name")" 2>/dev/null; then
+        echo "[svc] $name: cleared the stop request ($desc)" >&2
+    else
+        echo "[svc] $name: WARNING — could not clear the stop request ($desc); automatic restarts stay suspended" >&2
+    fi
+}
+
+# An automated caller (the watcher, version-restart) names itself in
+# SVC_RESTART_ACTOR; an operator/orchestrator leaves it unset. Only an
+# explicit caller may override a stop request.
+_svc_actor_is_automated() { [[ "${SVC_RESTART_ACTOR:-operator}" != operator ]]; }
 
 cmd_stop() {
     local name="$1"
@@ -1522,7 +2200,11 @@ cmd_stop() {
     esac
     svc_require "$name"
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
-        "${SVC_LAUNCH[$REG_I]}" || return 1
+        "${SVC_LAUNCH[$REG_I]}" || return
+    # Record intent BEFORE the kill, so a health tick racing the stop sees a
+    # requested stop rather than a fresh outage. Not when `restart` calls us:
+    # its `start` follows immediately and the service is meant to come back.
+    (( ${_SVC_STOP_IN_RESTART:-0} )) || _svc_write_stop_sentinel "${SVC_NAME[$REG_I]}"
     _stop_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}"
 }
@@ -1549,6 +2231,14 @@ _record_restart_marker() {
 
 cmd_restart() {
     local name="$1"
+    # SVC_RESTART_MODE=replace (the version-aware restart sets it) asks a
+    # labsh supervisor to hand its healthy server over rather than stop it
+    # (#1693; see _labsh_replace_wanted). Read once and UNSET, so it cannot
+    # leak through the relaunch into the supervisor — and from there into
+    # every shell of the lab's terminals.
+    local _SVC_RESTART_REPLACE=0
+    [[ "${SVC_RESTART_MODE:-}" == replace ]] && _SVC_RESTART_REPLACE=1
+    unset SVC_RESTART_MODE
     case "$name" in
         # THE canonical, idempotent watcher restart — see _restart_watcher.
         watcher) _restart_watcher; return ;;
@@ -1559,10 +2249,45 @@ cmd_restart() {
     # already-stopped service is benign and must not block the start — but it
     # would also swallow a guard refusal, so the guard cannot live only there.
     svc_require "$name"
+    # A stop request outranks an AUTOMATED restart (your-org/nexus-code#1827).
+    # The watcher checks the sentinel before calling us; this is the backstop
+    # for the race where `stop` lands between its check and this call.
+    local _sdesc
+    if _svc_actor_is_automated && _sdesc=$(_svc_stop_request_desc "$name"); then
+        echo "[svc] $name: REFUSING an automated restart (actor ${SVC_RESTART_ACTOR}) — stopped by request $_sdesc; 'svc.sh start $name' resumes it" >&2
+        return "$SVC_STOP_REQUESTED_RC"
+    fi
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
-        "${SVC_LAUNCH[$REG_I]}" || return 1
+        "${SVC_LAUNCH[$REG_I]}" || return
+    # An explicit restart is the operator saying "run it": the stop request
+    # is withdrawn. After the guard, so a refused restart keeps it.
+    _svc_clear_stop_sentinel "$name"
     _record_restart_marker "$name"
-    cmd_stop "$name" || true
+    # ORPHAN PATH FIRST (your-org/nexus-code#606). The plain stop→start
+    # sequence cannot reconcile an orphan: `stop` has no live supervisor to
+    # signal, and `start` short-circuits on the daemon's own passing
+    # healthcheck — so the bounce this verb promises never happened, and it
+    # printed `healthy`. Detect the state up front and do the real work.
+    local _n="${SVC_NAME[$REG_I]}" _w="${SVC_WORKDIR[$REG_I]}"
+    local _l="${SVC_LAUNCH[$REG_I]}" _h="${SVC_HEALTH[$REG_I]}" _g="${SVC_LOG[$REG_I]}"
+    _recover_supervisor_probe "$_n" "$_l"
+    if [[ "$_RECOVER_SUP_STATE" != alive:* ]] && _recover_service_healthy "$_w" "$_h"; then
+        _svc_reconcile_orphan "$_n" "$_w" "$_l" "$_h" "$_g" \
+            "$_RECOVER_SUP_STATE" "$_RECOVER_STALE_REASON"
+        return
+    fi
+    _SVC_STOP_IN_RESTART=1 cmd_stop "$name" || true
+    # A replaced supervisor left its healthy server running (#1693). `start`
+    # would see a green healthcheck with no supervisor and launch nothing, so
+    # the successor is launched here; its bring-up probe adopts the server.
+    if (( _SVC_HANDED_OFF )); then
+        if _recover_launch_service "$_n" "$_w" "$_l" "$_g"; then
+            echo "[svc] $name: relaunched — the new supervisor adopts the running server" >&2
+            return 0
+        fi
+        echo "[svc] $name: FAILED to launch the successor supervisor — the server is SERVING UNSUPERVISED; see $_g" >&2
+        return 1
+    fi
     cmd_start "$name"
 }
 
@@ -1590,6 +2315,562 @@ cmd_logs() {
 }
 
 # --- entrypoint ---------------------------------------------------------------
+# --- retire-orphan: the SANCTIONED retirement path (your-org/nexus-code#1034) ----
+#
+# WHOSE AUTHORISATION THIS IS, stated because it is the whole point. The two
+# orphans #1034 found were `setsid`-detached session leaders, so
+# `proc-kill-authorized` refused them `not-owned` — CORRECTLY: that guard keys
+# on session ownership because a hand-rolled kill list once reaped sibling
+# agents' runs (#851), and a detached supervisor is never in anyone's session.
+# The workspace could therefore CREATE a supervised daemon from any clone and
+# RETIRE it from nowhere. This verb is the missing path, and its authorisation
+# is deliberately NOT session ownership. It is two things, both explicit:
+#
+#   1. THE SCAN'S CLASSIFICATION. `cmd_orphans` is re-run here and the pid
+#      must appear in ITS orphan set — ppid 1, a supervisor-shaped script, at
+#      a path NO registry row names — with all three of its controls held.
+#      A registered supervisor never appears in that set (control C is the
+#      independent instrument that refuses when the scan disagrees with the
+#      pidfile probe), so a registered service cannot be retired through
+#      here even by pid. A scan that REFUSED (rc 3) retires nothing.
+#   2. THE OPERATOR'S EXPLICIT `--yes`. Without it the verb prints the plan
+#      and exits 4 — not 0 (nothing was retired) and not 2 (nothing was
+#      refused): a plan is a third state and it must not read as either.
+#
+# WHAT IS SIGNALLED, and why not by name. The kill set is the supervisor plus
+# its DESCENDANTS as recorded in /proc's PPid chain (depth-bounded), delivered
+# to the supervisor's PROCESS GROUP first (a setsid supervisor is its own group
+# leader, pid == pgid, exactly as `svc.sh stop` reasons) and to the individual
+# pids as a fallback. Nothing here matches a NAME: a sibling agent's argv
+# carries every script name in this file verbatim (#1073), and the scan has
+# already identified the process by its /proc identity.
+#
+# THE KILL IS A SEAM. `NEXUS_SVC_KILL_CMD`, when set, receives the exact
+# arguments `kill` would and is invoked INSTEAD of it; liveness is read from
+# `$SVC_PROCFS` (the scan's own seam). Both exist so the suite can drive the
+# refusal arms and the computed kill list against a PLANTED procfs with no
+# live processes — a real setsid daemon in a test is unreapable if the suite
+# dies mid-run. Nothing in production sets either.
+#
+# Exit codes:
+#   0  retired: every pid in the set is gone from procfs
+#   1  signalled (TERM, then KILL after the grace) but still present — inspect
+#   2  REFUSED: not an orphan by the scan, the scan itself refused, bad args
+#   4  PLAN ONLY (no --yes): printed what it would do, did nothing
+
+# _svc_orphan_descendants <pid> — descendants by recorded PPid, depth <= 3,
+# one per line. Reads the same procfs seam the scan reads.
+_svc_orphan_descendants() {
+    local root="$1" depth=0 d pid ppid f
+    local -a frontier=( "$root" ) next=()
+    while (( depth < 3 )) && (( ${#frontier[@]} > 0 )); do
+        next=()
+        for d in "$SVC_PROCFS"/[0-9]*; do
+            pid=${d##*/}
+            ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+            [[ "$ppid" =~ ^[0-9]+$ ]] || continue
+            for f in "${frontier[@]}"; do
+                [[ "$ppid" == "$f" ]] && { printf '%s\n' "$pid"; next+=( "$pid" ); break; }
+            done
+        done
+        frontier=( "${next[@]}" )
+        depth=$(( depth + 1 ))
+    done
+    return 0
+}
+
+_svc_retire_signal() {   # _svc_retire_signal <sig> <target>
+    if [[ -n "${NEXUS_SVC_KILL_CMD:-}" ]]; then
+        "$NEXUS_SVC_KILL_CMD" "-$1" -- "$2"
+    else
+        kill "-$1" -- "$2" 2>/dev/null
+    fi
+}
+
+_svc_retire_alive() {   # sets `alive` from the caller's `kill_set`; rc 0 iff any remain
+    local p
+    alive=()
+    for p in "${kill_set[@]}"; do [[ -d "$SVC_PROCFS/$p" ]] && alive+=( "$p" ); done
+    (( ${#alive[@]} > 0 ))
+}
+
+cmd_retire_orphan() {
+    local pid="" yes=0 a
+    for a in "$@"; do
+        case "$a" in
+            --yes) yes=1 ;;
+            -*)    die "retire-orphan: unknown flag $a (usage: svc.sh retire-orphan <pid> [--yes])" ;;
+            *)     [[ -z "$pid" ]] || die "retire-orphan: one pid at a time (got '$pid' and '$a')"; pid="$a" ;;
+        esac
+    done
+    [[ "$pid" =~ ^[0-9]+$ ]] || { echo "[svc] retire-orphan: usage: svc.sh retire-orphan <pid> [--yes]" >&2; return 2; }
+
+    # ARM 1 — THE SCAN DECIDES. Its stdout carries the machine-readable ORPHAN
+    # rows (SVC_ORPHANS_TSV=1 adds them beside the human report); its rc is
+    # the verdict on the SCAN, read before any row is believed.
+    local scan_out scan_rc=0
+    scan_out=$(SVC_ORPHANS_TSV=1 cmd_orphans 2>&1) || scan_rc=$?
+    if (( scan_rc == 3 )); then
+        echo "[svc] retire-orphan: REFUSED — the orphans scan itself REFUSED (rc 3), so no classification" >&2
+        echo "[svc] retire-orphan:   is available to authorise a retirement. Its reason:" >&2
+        # awk, not `grep | head`: an early-exit reader would join the
+        # early-exit-reader manifest for a diagnostic whose status nobody reads.
+        awk '/REFUSED|CONTROL/ && n++ < 3 { print "[svc] retire-orphan:     " $0 }' <<<"$scan_out" >&2
+        return 2
+    fi
+    if (( scan_rc == 0 )); then
+        echo "[svc] retire-orphan: REFUSED — the scan found NO orphans, so pid $pid is not one." >&2
+        echo "[svc] retire-orphan:   A registered supervisor is retired with \`svc.sh stop <name>\`, never here." >&2
+        return 2
+    fi
+    if (( scan_rc != 1 )); then
+        echo "[svc] retire-orphan: REFUSED — the orphans scan exited $scan_rc, which is not a verdict I know." >&2
+        return 2
+    fi
+    local row src
+    row=$(awk -F'\t' -v p="$pid" '$1 == "ORPHAN" && $2 == p { print; exit }' <<<"$scan_out")
+    if [[ -z "$row" ]]; then
+        echo "[svc] retire-orphan: REFUSED — pid $pid is NOT in the scan's orphan set." >&2
+        echo "[svc] retire-orphan:   The scan classifies as orphans ONLY: ppid 1, a supervisor-shaped script, a path" >&2
+        echo "[svc] retire-orphan:   no registry row names. A REGISTERED supervisor, a process with a live parent," >&2
+        echo "[svc] retire-orphan:   or a non-supervisor never qualifies, whatever its pid. The scan's orphan set:" >&2
+        awk -F'\t' '$1 == "ORPHAN" { printf "[svc] retire-orphan:     pid %s  %s\n", $2, $3 }' <<<"$scan_out" >&2
+        return 2
+    fi
+    src=$(cut -f3 <<<"$row")
+
+    # THE KILL SET — recorded relationships, never names.
+    local -a kill_set=( "$pid" ) alive=()
+    local d
+    while IFS= read -r d; do [[ -n "$d" ]] && kill_set+=( "$d" ); done < <(_svc_orphan_descendants "$pid")
+
+    local grace="${NEXUS_SVC_RETIRE_GRACE:-5}"
+    echo "[svc] retire-orphan: pid $pid is an orphan by the scan: $src"
+    echo "[svc] retire-orphan:   kill set (supervisor + descendants by recorded PPid): ${kill_set[*]}"
+    echo "[svc] retire-orphan:   plan: TERM process group $pid (fallback: each pid), wait ${grace}s, KILL survivors"
+    if (( ! yes )); then
+        echo "[svc] retire-orphan: PLAN ONLY — nothing was signalled. Re-run with --yes to retire (exit 4)."
+        return 4
+    fi
+
+    # ARM 2 — THE OPERATOR SAID SO. Log FIRST, so the record exists whether or
+    # not the signals land (stamp-then-act fails loud; act-then-stamp fails silent).
+    local logdir="${NEXUS_STATE_DIR:-$STATE_DIR}"
+    mkdir -p "$logdir" 2>/dev/null || true
+    printf '%s\tuser=%s\tpid=%s\tsrc=%s\tkill_set=%s\tby=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "$(id -un 2>/dev/null || echo '?')" \
+        "$pid" "$src" "${kill_set[*]}" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-operator}}" \
+        >> "$logdir/svc-retire.log" 2>/dev/null \
+        || echo "[svc] retire-orphan: WARNING — could not append to $logdir/svc-retire.log" >&2
+
+    local p waited=0
+    _svc_retire_signal TERM "-$pid" || for p in "${kill_set[@]}"; do _svc_retire_signal TERM "$p"; done
+    while _svc_retire_alive && (( waited < grace )); do sleep 1; waited=$(( waited + 1 )); done
+    if _svc_retire_alive; then
+        echo "[svc] retire-orphan: still present after TERM + ${grace}s: ${alive[*]} — escalating to KILL"
+        _svc_retire_signal KILL "-$pid" || for p in "${alive[@]}"; do _svc_retire_signal KILL "$p"; done
+        sleep 1
+    fi
+    if _svc_retire_alive; then
+        echo "[svc] retire-orphan: WARNING — still present after KILL: ${alive[*]}. Inspect: ps -o pid,ppid,pgid,args -p ${alive[*]}" >&2
+        return 1
+    fi
+    echo "[svc] retire-orphan: retired pid $pid (${#kill_set[@]} process(es)); logged to $logdir/svc-retire.log"
+    return 0
+}
+
+# --- orphans: READ-ONLY enumeration of UNREGISTERED supervisors ------------
+#
+# A DIFFERENT ORPHAN FROM `_svc_reconcile_orphan` ABOVE, and the distinction is
+# the whole reason this verb exists (your-org/nexus-code#1034). That one is a
+# REGISTERED service whose healthcheck passes while its supervisor RECORD is
+# stale — it is found by name, through the registry, via _recover_pidfile. Its
+# domain is exactly the registry.
+#
+# This one is a supervisor with NO REGISTRY ROW AT ALL: a `*-supervised.sh`
+# left running from a retired clone or an ephemeral scratch directory after the
+# agent that started it went away. Nothing keyed on a registry name can see it,
+# because there is no name to key on. `status`, the cockpit and every existing
+# verb iterate `load_services`, i.e. the registry — so an unregistered
+# supervisor is outside their domain BY CONSTRUCTION, not by oversight. #1034
+# reported three `remote-sshd-supervised.sh` processes of which one was
+# registered, one held a LIVE sshd on a port nobody knew about, and concluded
+# "enumeration first: today nobody can even LIST the problem". This is that
+# enumeration.
+#
+# STRICTLY READ-ONLY. It signals nothing, writes nothing and starts nothing;
+# there is deliberately no `--reap` and no kill path here, so the verb cannot
+# become the thing that retires a live service by mistake. Retirement is
+# recommendation 2 of #1034 and is NOT implemented here.
+#
+# ── ppid==1 IS NOT THE DISCRIMINATOR ────────────────────────────────────────
+# Every CORRECTLY supervised service is also ppid 1: `recover_service` detaches
+# with `setsid`, so re-parenting to init is the NORMAL state, not the anomaly.
+# Measured on this nexus 2026-09-02, `ps -eo pid=,ppid=` over supervisor-shaped
+# processes: 10 of 10 had ppid 1, and 9 of them were healthy registered
+# services. A verb keyed on ppid alone would flag the entire stack.
+# The discriminator is the SOURCE PATH: is this the script the registry says
+# should be running, at the path the registry says it should run from?
+#
+# ── THE POPULATION PREDICATE UNDER-COUNTS, AND HERE IS THE DIRECTION ────────
+# Candidates are drawn from the UNION of two rules:
+#   (1) basename matches the basename of some registry launch command — this
+#       is what catches a foreign clone running the SAME script from a
+#       DIFFERENT path, which is exactly #1034's two orphans;
+#   (2) basename matches the supervisor SHAPE (`*-supervised.sh`, `*-watch.sh`,
+#       `watch.sh`) — this catches a supervisor from a clone whose registry row
+#       we do not have.
+# Rule (2) alone is demonstrably insufficient ON THIS REGISTRY: the
+# `myviewer-collab` row launches `run-supervised-collab.sh`, whose basename
+# does NOT end in `-supervised.sh`, so a shape-only predicate misses it. Rule
+# (1) alone is insufficient because a retired clone may run a script this
+# registry never mentions. The union is still an APPROXIMATION and it errs
+# DOWNWARD: a supervisor with a novel name from a clone with no registry row is
+# invisible to both rules. That is stated rather than hidden, per this repo's
+# rule that a source-text predicate for a runtime property must declare which
+# way it is wrong.
+#
+# ── WHY A ZERO HERE NEEDS TWO POSITIVE CONTROLS ─────────────────────────────
+# "No orphans" and "my scan is broken" produce the same empty table, and a
+# confident zero it cannot vouch for is this repo's dominant defect class. So
+# `none found` is reported ONLY when both controls hold, and REFUSED (rc 3)
+# otherwise:
+#   CONTROL A (the walk)    — the /proc walk must see this very process. If it
+#                             cannot see a pid we KNOW exists, no absence it
+#                             reports means anything.
+#   CONTROL B (the matcher) — at least one REGISTERED supervisor must have been
+#                             matched by the predicate. A matcher that has
+#                             never matched anything has not been shown to be
+#                             able to match, so its zero is unvouched.
+# Control B fails legitimately when the whole stack is down. That is REFUSED,
+# not "none" — the honest answer is that this scan cannot tell.
+#
+# Exit codes:
+#   0  scan complete, NO orphans — and both controls held
+#   1  scan complete, orphans FOUND (count on stdout)
+#   3  REFUSED — could not determine (a control failed, or /proc is unusable).
+#      DISTINCT from 0 on purpose: "none found" and "I could not look" are
+#      different claims and only one of them is a clearance.
+
+# The process table this verb reads. Overridable ONLY so the test suite can
+# plant a synthetic one: creating a REAL ppid-1 process to test a ppid-1
+# detector would need `setsid` inside a test, which is both a footgun and
+# unreapable if the suite dies mid-run. A planted tree exercises the exact same
+# classification code with no live processes at all. Defaults to /proc; nothing
+# in production sets it.
+SVC_PROCFS="${SVC_PROCFS:-/proc}"
+
+# _svc_proc_argv_script <pid> — the script this pid is running, as invoked:
+# argv[0] when executed directly, argv[1] under an interpreter. Empty when the
+# cmdline is unreadable or holds neither. Reads /proc directly rather than
+# matching `ps` output text, because a sibling agent's PROMPT contains these
+# script names verbatim and a text match would return the DESCRIPTION of a
+# process instead of the process (your-org/nexus-code#1073).
+_svc_proc_argv_script() {
+    local pid="$1" a n=0
+    local -a args=()
+    [[ -r "$SVC_PROCFS/$pid/cmdline" ]] || return 1
+    while IFS= read -r -d '' a; do
+        args+=( "$a" ); n=$(( n + 1 ))
+        (( n >= 3 )) && break
+    done < "$SVC_PROCFS/$pid/cmdline"
+    (( ${#args[@]} > 0 )) || return 1
+    case "${args[0]}" in
+        */bash|bash|*/sh|sh|*/dash|dash|*/zsh|zsh|*/env|env)
+            [[ ${#args[@]} -gt 1 ]] && { printf '%s' "${args[1]}"; return 0; }
+            return 1 ;;
+    esac
+    printf '%s' "${args[0]}"
+    return 0
+}
+
+# _svc_abs_path <maybe-relative> <cwd> — absolute form, WITHOUT requiring the
+# path to exist. A retired clone's script may have been deleted out from under
+# the running process, and `readlink -f` on a vanished path still composes the
+# absolute name, which is what we want to REPORT.
+_svc_abs_path() {
+    local p="$1" cwd="$2"
+    [[ "$p" == /* ]] || p="$cwd/$p"
+    _svc_norm_path "$p"
+}
+
+# _svc_norm_path <abs-path> — collapse `//`, `/./` and `x/..` LEXICALLY.
+#
+# NOT `readlink -f`, which returns EMPTY for a path that does not exist — and a
+# retired clone's script being deleted out from under its still-running process
+# is the CENTRAL case here, so resolving would blank exactly the orphan we came
+# to report.
+#
+# THIS IS NOT COSMETIC, and it is the bug the first live run actually had. The
+# registry writes workdirs as `$NEXUS_ROOT/work/x` with launch `./serve.sh`,
+# composing `/work/x/./serve.sh`, while the running process carries the
+# ABSOLUTE `/work/x/serve.sh`. Those are the same file and differ by three
+# characters, so a string compare called 8 of 10 healthy registered services
+# ORPHANS on this nexus at 2026-09-02T10:06Z. A false positive on this verb is
+# a nudge toward killing a live production service, so it is the expensive
+# direction.
+_svc_norm_path() {
+    local p="$1" out="" seg
+    local -a parts=() keep=()
+    while [[ "$p" == *//* ]]; do p="${p//\/\///}"; done
+    local IFSSAVE="$IFS"; IFS='/'; read -r -a parts <<<"$p"; IFS="$IFSSAVE"
+    for seg in "${parts[@]}"; do
+        case "$seg" in
+            ''|'.') continue ;;
+            '..')   [[ ${#keep[@]} -gt 0 ]] && unset 'keep[-1]' && keep=( "${keep[@]}" ) ;;
+            *)      keep+=( "$seg" ) ;;
+        esac
+    done
+    for seg in "${keep[@]}"; do out="$out/$seg"; done
+    printf '%s' "${out:-/}"
+}
+
+cmd_orphans() {
+    [[ $# -eq 0 ]] || die "usage: svc.sh orphans   (read-only; takes no arguments)"
+
+    # NOTE — there is deliberately no separate `[[ -d "$SVC_PROCFS/$$" ]]` pre-check
+    # here. There used to be, and it made CONTROL A below UNREACHABLE AS A
+    # DISTINCT FAILURE: both fire on exactly the same condition, so the earlier
+    # one always won and the later one could be disarmed with no test noticing.
+    # A mutant that pre-set `self_seen=1` left the suite fully green. Two guards
+    # for one condition is not defence in depth; it is one guard plus an
+    # untested claim. Control A now carries it alone, and is proven live by
+    # mutation (M2).
+
+    # Expected supervisor paths + basenames, from the registry.
+    local -a expect_path=() expect_name=() expect_base=()
+    local line name workdir launch health logfile tok abs
+    while IFS=$'\t' read -r name workdir launch health logfile; do
+        [[ -n "$name" ]] || continue
+        tok=${launch%% *}
+        [[ -n "$tok" ]] || continue
+        abs=$(_svc_abs_path "$tok" "$workdir")
+        expect_path+=( "$abs" ); expect_name+=( "$name" ); expect_base+=( "${tok##*/}" )
+    done < <(svc_parse_registry "$SERVICES_REGISTRY")
+
+    if ! svc_registry_readable "$SERVICES_REGISTRY"; then
+        echo "[svc] orphans: REFUSED — the registry at $SERVICES_REGISTRY EXISTS and could NOT be READ." >&2
+        echo "[svc] orphans:   This is NOT 'no services registered'. No classification is possible." >&2
+        return 3
+    fi
+    if (( ${#expect_path[@]} == 0 )); then
+        echo "[svc] orphans: REFUSED — the registry at $SERVICES_REGISTRY yielded no rows, so there is" >&2
+        echo "[svc] orphans:   nothing to classify AGAINST. Every supervisor would read as unregistered," >&2
+        echo "[svc] orphans:   which is an artefact of the empty registry, not a finding." >&2
+        return 3
+    fi
+
+    # ---- the scan ---------------------------------------------------------
+    local self_seen=0 registered_seen=0 orphan_n=0
+    local -a o_pid=() o_src=() o_why=()
+    local d pid ppid script cwd src i matched base
+
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        # CONTROL A is set HERE — before the readability filter below — because
+        # it asserts that the WALK ENUMERATED this entry, which is a different
+        # claim from "the entry was parseable". A `continue` past an unreadable
+        # cmdline must not be able to retract the walk's own positive control.
+        (( pid == $$ )) && self_seen=1        # CONTROL A
+        [[ -r "$d/cmdline" ]] || continue
+        script=$(_svc_proc_argv_script "$pid") || continue
+        [[ -n "$script" ]] || continue
+        base=${script##*/}
+
+        # population: registry basename OR supervisor shape
+        matched=0
+        for i in "${!expect_base[@]}"; do
+            [[ "$base" == "${expect_base[$i]}" ]] && { matched=1; break; }
+        done
+        if (( ! matched )); then
+            case "$base" in
+                *-supervised.sh|*-supervised-*.sh|*-watch.sh|watch.sh|deploy-watch.sh) matched=1 ;;
+            esac
+        fi
+        (( matched )) || continue
+
+        cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=""
+        src=$(_svc_abs_path "$script" "${cwd:-/}")
+
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" =~ ^[0-9]+$ ]] || continue
+
+        # Is this exactly a registry-declared supervisor path?
+        local is_reg=0
+        for i in "${!expect_path[@]}"; do
+            [[ "$src" == "${expect_path[$i]}" ]] && { is_reg=1; break; }
+        done
+        if (( is_reg )); then
+            registered_seen=1                  # CONTROL B
+            continue
+        fi
+
+        # Not registry-declared. Only ppid 1 is an ORPHAN — a supervisor with a
+        # live parent is somebody's child and is being managed by whoever
+        # started it; reporting it would be a false positive on, for instance,
+        # a test fixture's own supervisor.
+        (( ppid == 1 )) || continue
+
+        local why
+        case "$src" in
+            "$NEXUS_ROOT"/*) why="unregistered: inside NEXUS_ROOT but no registry row names this path" ;;
+            *)               why="unregistered: source path is OUTSIDE NEXUS_ROOT ($NEXUS_ROOT)" ;;
+        esac
+        o_pid+=( "$pid" ); o_src+=( "$src" ); o_why+=( "$why" )
+        orphan_n=$(( orphan_n + 1 ))
+    done
+
+    # ---- controls ---------------------------------------------------------
+    if (( ! self_seen )); then
+        echo "[svc] orphans: REFUSED — CONTROL A FAILED: the walk over $SVC_PROCFS did not enumerate" >&2
+        echo "[svc] orphans:   this very process (pid $$), so no scan is possible. A scan that cannot see a" >&2
+        echo "[svc] orphans:   pid it KNOWS exists cannot vouch for any absence it reports." >&2
+        return 3
+    fi
+    # CONTROL C — AN INDEPENDENT INSTRUMENT MUST NOT DISAGREE.
+    #
+    # Controls A and B are both self-referential: they ask this scan whether it
+    # can see things, using this scan. Neither can catch a matcher that matches
+    # the WRONG set, and that is not hypothetical — the first live version of
+    # this verb passed BOTH while calling 8 of 10 healthy registered services
+    # orphans, because control B only ever needed ONE match and two registry
+    # rows happened to use absolute launch paths.
+    #
+    # So ask a DIFFERENT instrument the same question: `_recover_supervisor_state`
+    # resolves a service by NAME through its pidfile, a path with nothing in
+    # common with the /proc argv walk above. If it says a registered service's
+    # supervisor is alive at pid N, and this scan put pid N in the orphan list,
+    # then one of the two is wrong and this verb must not adjudicate its own
+    # correctness. Refuse.
+    local _cc_i _cc_st _cc_pid _cc_j
+    for _cc_i in "${!expect_name[@]}"; do
+        _cc_st=$(_recover_supervisor_state "${expect_name[$_cc_i]}" "${expect_path[$_cc_i]}" 2>/dev/null)
+        [[ "$_cc_st" == alive:* ]] || continue
+        _cc_pid="${_cc_st#alive:}"
+        for _cc_j in "${!o_pid[@]}"; do
+            [[ "${o_pid[$_cc_j]}" == "$_cc_pid" ]] || continue
+            echo "[svc] orphans: REFUSED — CONTROL C FAILED: pid $_cc_pid is flagged as an orphan here," >&2
+            echo "[svc] orphans:   but the INDEPENDENT pidfile probe resolves it as the live supervisor of the" >&2
+            echo "[svc] orphans:   REGISTERED service '${expect_name[$_cc_i]}'. Two instruments disagree about a" >&2
+            echo "[svc] orphans:   registered service, so this scan's classification is not trustworthy and" >&2
+            echo "[svc] orphans:   nothing here should be acted on. Source seen: ${o_src[$_cc_j]}" >&2
+            echo "[svc] orphans:   Registry expects: ${expect_path[$_cc_i]}" >&2
+            return 3
+        done
+    done
+
+    if (( ! registered_seen )); then
+        echo "[svc] orphans: REFUSED — CONTROL B FAILED: the predicate matched NO registered supervisor," >&2
+        echo "[svc] orphans:   so it has not been shown able to match one. Either the whole stack is down" >&2
+        echo "[svc] orphans:   (check \`svc.sh status\`) or the population predicate is broken; this scan" >&2
+        echo "[svc] orphans:   cannot tell those apart, and 'none found' would be a guess." >&2
+        if (( orphan_n > 0 )); then
+            echo "[svc] orphans:   NOTE: $orphan_n candidate(s) WERE flagged and are printed below — a" >&2
+            echo "[svc] orphans:   positive finding does not need control B. The REFUSAL is about the ZERO." >&2
+            _svc_orphans_report
+        fi
+        return 3
+    fi
+
+    if (( orphan_n == 0 )); then
+        echo "orphans: none found"
+        echo "  scanned $SVC_PROCFS; population = registry launch basenames ∪ supervisor shape"
+        echo "  CONTROL A (walk saw pid $$): ok"
+        echo "  CONTROL B (matched a registered supervisor): ok"
+        echo "  registry: $SERVICES_REGISTRY (${#expect_path[@]} rows)"
+        return 0
+    fi
+
+    _svc_orphans_report
+    return 1
+}
+
+# Printing is a separate function so the control-B refusal path can show its
+# candidates without duplicating the formatter. Reads the o_* arrays from the
+# caller's scope (bash dynamic scope on `local`).
+_svc_orphans_report() {
+    local i pid src ssout have_pid_attr
+    printf 'orphans: %s unregistered supervisor(s) with ppid 1\n' "${#o_pid[@]}"
+    # Machine-readable rows for `retire-orphan` (SVC_ORPHANS_TSV=1): one per
+    # orphan, `ORPHAN<TAB>pid<TAB>source<TAB>descendants`. Emitted from the
+    # SAME arrays the human report prints, so the two cannot disagree.
+    if [[ "${SVC_ORPHANS_TSV:-0}" == 1 ]]; then
+        for i in "${!o_pid[@]}"; do
+            printf 'ORPHAN\t%s\t%s\t%s\n' "${o_pid[$i]}" "${o_src[$i]}" \
+                "$(_svc_orphan_descendants "${o_pid[$i]}" | tr '\n' ' ' | sed 's/ $//')"
+        done
+    fi
+    ssout=$(ss -lntp 2>/dev/null) || ssout=""
+    have_pid_attr=0
+    [[ "$ssout" == *"pid="* ]] && have_pid_attr=1
+    for i in "${!o_pid[@]}"; do
+        pid="${o_pid[$i]}"; src="${o_src[$i]}"
+        printf '\n  pid      %s\n' "$pid"
+        printf '  source   %s\n' "$src"
+        printf '  why      %s\n' "${o_why[$i]}"
+        printf '  exists   %s\n' "$( [[ -e "$src" ]] && echo 'yes' || echo 'NO — the script file is GONE (retired clone or cleaned scratch dir)' )"
+        printf '  cwd      %s\n' "$(readlink "$SVC_PROCFS/$pid/cwd" 2>/dev/null || echo '<unreadable>')"
+        printf '  uptime   %ss\n' "$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo '?')"
+        printf '  started  %s\n' "$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//' || echo '?')"
+        _svc_orphan_children "$pid"
+        _svc_orphan_sockets  "$pid" "$ssout" "$have_pid_attr"
+    done
+    printf '\nREAD-ONLY: nothing above was signalled, stopped or restarted. To retire ONE of\n'
+    printf 'the pids above (and only one the scan classifies as an orphan), the sanctioned\n'
+    printf 'path is: svc.sh retire-orphan <pid>   (plan)   then   --yes   (your-org/nexus-code#1034).\n'
+}
+
+# Descendants (one level, plus their own children) — enough to show what a
+# supervisor is actually holding open without walking the whole tree.
+_svc_orphan_children() {
+    local parent="$1" d pid ppid n=0 cl
+    printf '  children\n'
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" == "$parent" ]] || continue
+        cl=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+        printf '    %-8s %s\n' "$pid" "$(printf '%s' "${cl:0:160}")"
+        n=$(( n + 1 ))
+    done
+    (( n == 0 )) && printf '    (none — supervising nothing)\n'
+    return 0
+}
+
+# Listening sockets held by the supervisor or any of its children.
+# `ss -lntp` attributes a pid directly. When it produces NO pid attribution at
+# all we say so rather than printing an empty list: "ss could not tell us" and
+# "this process listens on nothing" are different facts, and a live sshd on an
+# unknown port is precisely what #1034 was about.
+_svc_orphan_sockets() {
+    local parent="$1" ssout="$2" have="$3" d pid ppid n=0
+    local -a pids=( "$parent" )
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" == "$parent" ]] && pids+=( "$pid" )
+    done
+    printf '  listening\n'
+    if [[ -z "$ssout" ]]; then
+        printf '    UNKNOWN — `ss -lntp` produced no output (ss missing or refused); NOT a claim of none\n'
+        return 0
+    fi
+    if (( ! have )); then
+        printf '    UNKNOWN — `ss -lntp` returned no pid attribution on this host; NOT a claim of none\n'
+        return 0
+    fi
+    local p line
+    for p in "${pids[@]}"; do
+        while IFS= read -r line; do
+            [[ "$line" == *"pid=$p,"* ]] || continue
+            printf '    %s\n' "$line"
+            n=$(( n + 1 ))
+        done <<<"$ssout"
+    done
+    (( n == 0 )) && printf '    (none)\n'
+    return 0
+}
+
 usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
 
 main() {
@@ -1604,15 +2885,22 @@ main() {
     # --force: override the cold-build guard (see _coldbuild_guard). Accepted
     # before the verb so `svc.sh --force restart jupyterlab` reads naturally.
     # Also honoured via the SVC_FORCE env var, for non-interactive callers.
-    if [[ "${1:-}" == "--force" ]]; then
-        SVC_FORCE=1
-        shift
-    fi
+    # --show-secrets: do not redact URL secrets (#1821). Leading global flags
+    # are accepted in either order.
+    while (( $# > 0 )); do
+        case "$1" in
+            --force)        SVC_FORCE=1; shift ;;
+            --show-secrets) SVC_SHOW_SECRETS=1; shift ;;
+            *) break ;;
+        esac
+    done
 
     case "${1:-}" in
         -h|--help)        usage ;;
         status|--status|-1) cmd_status ;;
         up)               shift; cmd_up "$@" ;;
+        orphans)          shift; cmd_orphans "$@" ;;
+        retire-orphan)    shift; cmd_retire_orphan "$@" ;;
         start|stop|restart|logs)
             local verb="$1" name="${2:-}"
             [[ -n "$name" ]] || die "usage: svc.sh $verb <name>"

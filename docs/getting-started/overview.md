@@ -49,19 +49,13 @@ You'll need the following before the [Install](install.md) walkthrough. None are
 - **[`agent-sandbox`](https://github.com/katosh/agent_sandbox).** Kernel-enforced filesystem sandbox. Installed per-user with `brew install agent-sandbox` after `brew tap katosh/tools`. Required.
 - **A GitHub account with admin on a private repo.** You'll create a private repo to host issues and assets, and a GitHub App to act as the bot. Both belong to you (or your org).
 - **Claude Code.** Today's reference orchestrator. The architecture is agent-agnostic but the launch prompt assumes Claude Code; other harnesses need a re-port.
-- **The `gh` CLI authenticated as your GitHub user.** Used for smoke tests and the one-time asset-repo creation. The bot identity uses its own GitHub App tokens, not your `gh` auth.
-- **A handful of standard shell tools** — `bash`, `tmux`, `git`, `jq`, `openssl`, `python3` with `pyyaml`, `curl`. Listed in `monitor/README.md` "Tech stack".
+- **The `gh` CLI.** The binary is a hard runtime dependency — `monitor/ng` shells out to `gh api` for every GitHub call. Authenticating it *as your GitHub user* is optional: the bot supplies its own GitHub App token, and your personal auth is only used for the one-time asset-repo creation (which has a browser fallback).
+- **A handful of standard shell tools** — `bash`, `tmux`, `git`, `gh`, `jq`, `openssl`, `python3` with `pyyaml`, `curl`. Listed in `monitor/README.md` "Tech stack".
 
 Optional but recommended:
 
 - **A phone-push channel** — Pushover (preferred), ntfy (fallback), or email (emergency tier). Configured under `notifications.*` in `config/nexus.yml`. See [Operating → Notifications](../operating/notifications.md).
 - **[`labsh`](https://github.com/katosh/labsh)** — project-local JupyterLab with persistent kernels. Worth installing if any of your projects load slow-to-build state (large DataFrames, fitted models) that agents would otherwise rebuild every turn.
-
-!!! note "<your-lab> operators"
-    See the [<your-lab> addendum](../admin/site-addendum.md) for
-    the lab-specific persistent-host pattern (`<login-node>` → `<shared-node-tool>` →
-    shared HPC node), the `<hpc-mount>` filesystem path, and the
-    `<hpc-skills>` add-on.
 
 ## Where to next
 

@@ -20,9 +20,13 @@
 #      pastes into the orchestrator window and spawns it there;
 #      agent-sandbox confines the Claude Code sessions' writes.
 #
-#   2. Resume-intent reconciliation: decide whether the orchestrator
-#      the watcher is about to spawn should be FRESH (default) or
-#      should RESUME the prior session (`--continue`). The mechanism
+#   2. Resume-intent reconciliation: decide whether the WORKSPACE the
+#      watcher is about to bring up should be FRESH (default) or should
+#      RESUME the prior work (`--continue`). Two state files carry that
+#      one decision to the two independent things that act on it — the
+#      orchestrator session pin, and the boot-intent file that governs
+#      the worker walk (see "boot-intent handoff" below,
+#      your-org/nexus-code#651). For the orchestrator the mechanism
 #      is the orchestrator session-id pin
 #      (`monitor/.state/orchestrator-session-id`) — the exact state
 #      file the watcher's spawn path reads (`_respawn_choose_resume_
@@ -43,8 +47,16 @@
 #          contract from "most recent jsonl" to "pinned orchestrator
 #          session", which is strictly safer and deterministic.
 #      Skipped entirely when the orchestrator window is already
-#      alive — the flag is moot and the live session's pin must not
-#      be touched.
+#      alive — the flag is moot, the live session's pin must not be
+#      touched, and a live board must not be torn down by what is an
+#      idempotent bring-up.
+#      The WORKER half is the boot-intent file
+#      (`monitor/.state/boot-intent`, `mode=fresh|continue`), consumed
+#      once by `monitor/bootstrap-recover.sh`. Without it a cold boot
+#      resurrected every worker that was alive before — on 2026-07-30
+#      that turned one sandbox-killing worker into a self-sustaining
+#      outage loop, since each ~3-minute death faithfully brought its
+#      own killer back.
 #
 #   3. Stack bring-up: delegate to `monitor/svc.sh up` (which
 #      delegates to `monitor/bootstrap-recover.sh`) — the same
@@ -75,10 +87,17 @@
 # main.sh / _target_absent.sh.
 #
 # Flags:
-#   --continue            keep the orchestrator session-id pin so the
-#                         watcher resumes the pinned session
-#                         (`claude --resume <sid>`); without a valid
-#                         pin the watcher spawns fresh.
+#   --continue            resume the prior workspace: keep the
+#                         orchestrator session-id pin so the watcher
+#                         resumes the pinned session (`claude --resume
+#                         <sid>`; without a valid pin it spawns fresh),
+#                         AND record `mode=continue` in the boot-intent
+#                         file so bootstrap-recover resumes the prior
+#                         worker agents. Omitting it is a genuinely COLD
+#                         boot of the WHOLE workspace: no orchestrator
+#                         resume, no worker resurrection, and a
+#                         dropped-worker manifest handed to the
+#                         orchestrator on its first turn.
 #   --i-accept-no-sandbox start even when NOT inside the agent-sandbox,
 #                         accepting the loss of kernel-enforced
 #                         isolation (a runaway agent can then write
@@ -113,7 +132,7 @@ while (( $# > 0 )); do
     case "$1" in
         --continue) CONTINUE=1; shift ;;
         --i-accept-no-sandbox) IACCEPT_NO_SANDBOX=1; shift ;;
-        -h|--help)  sed -n '2,89p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,108p' "$0"; exit 0 ;;
         *) echo "watcher: unknown flag: $1" >&2; exit 1 ;;
     esac
 done
@@ -169,12 +188,78 @@ fi
 
 # --- resume-intent reconciliation -----------------------------------------
 
-TARGET="$("$_cfg" monitor.target_window orchestrator)"
+TARGET="$("$_cfg" monitor.target_window orchestrator)"; _target_rc=$?
+# CONSULT THE rc, AND REFUSE AN EMPTY VALUE (your-org/nexus-code#1093).
+# `$TARGET` is the needle of the boot-detection test at the `grep -qxF` below,
+# and an empty needle there fails OPEN in a way `-x` normally prevents:
+# `grep -qxF ""` does NOT match `orchestrator\nemptyneedle`, but a HERE-STRING
+# on an EMPTY command substitution supplies ONE EMPTY LINE — so when tmux fails
+# or the server is absent, the empty needle matches that manufactured line and
+# `orch_present=1`. "Is the orchestrator here?" is then answered PRESENT on no
+# evidence, and a broken environment is exactly when entry.sh runs.
+#
+# Both routes to an empty TARGET are MEASURED, not hypothesised, and the first
+# is the one an unconsulted rc cannot even see:
+#   * `monitor: {target_window: ""}` in config/nexus.yml -> rc 0, empty stdout.
+#     A key present-but-empty is a config typo, and load.sh's default only
+#     covers a MISSING key, so nothing downstream is loud.
+#   * no config found at all -> rc 1, empty stdout, diagnostic on stderr.
+# Before this, `$?` was discarded on the same line it was produced — CLAUDE.md's
+# `fromisoformat` mode 2: the error is not lost, it is merely off the path that
+# produces the answer.
+#
+# REFUSING (rather than falling back to `orchestrator`) is this repo's settled
+# policy for this exact value: launcher.sh:113 already exits 2 on `--target ""`
+# rather than substituting its default, and test-launcher-empty-target.sh pins
+# that. A watcher that guesses its own cockpit's name is worse than one that
+# stops.
+if (( _target_rc != 0 )) || [[ -z "$TARGET" ]]; then
+    echo "watcher: monitor.target_window resolved EMPTY (config read rc=$_target_rc) —" \
+         "refusing to boot rather than guess. An empty window name makes the" \
+         "orchestrator-present test below match a here-string's manufactured empty" \
+         "line and report PRESENT on no evidence (your-org/nexus-code#1093)." >&2
+    exit 2
+fi
 # Cockpit window name — config-resolved so the rename here, the idle-probe
 # exemption, svc.sh, and bootstrap-recover all track one value
 # (your-org/your-nexus#204). Env override: MONITOR_SERVICES_WINDOW.
 SERVICES_WINDOW="${MONITOR_SERVICES_WINDOW:-$("$_cfg" monitor.services_window services)}"
 PIN_FILE="$_nexus_root/monitor/.state/orchestrator-session-id"
+BOOT_INTENT_FILE="$_nexus_root/monitor/.state/boot-intent"
+
+# Hand the fresh-vs-continue intent to the WORKER walk (your-org/
+# nexus-code#651). The pin reconciliation below covers the orchestrator
+# and nothing else; every worker agent that was alive before is
+# resurrected independently, by `monitor/bootstrap-recover.sh`'s worker
+# step (issue #197), which runs long after this script has exited —
+# `svc.sh up` -> `bootstrap-recover.sh` -> `spawn-worker.sh --resume`.
+# A shell variable cannot cross that hop, so the intent is handed over as
+# a plain STATE FILE next to the pin, in the same spirit and under the
+# same archive-never-delete convention.
+#
+#   mode=fresh     cold boot — bootstrap-recover must resurrect NOTHING,
+#                  archive the prior worker state, and leave the incoming
+#                  orchestrator a manifest of what it dropped.
+#   mode=continue  `--continue` — today's resume behaviour, unchanged.
+#
+# The file is ONE-SHOT: bootstrap-recover archives it to
+# `boot-intent.archived.<epoch>` the moment it acts on it. That matters
+# because bootstrap-recover is ALSO the ordinary crash-recovery path (the
+# SessionStart hook, `bootstrap.sh`'s per-turn refresh, `svc.sh up`); an
+# intent left lying around would turn every later mid-life recovery into
+# a worker massacre. It carries a timestamp for the same reason from the
+# other side — an intent whose boot never reached the worker walk expires
+# instead of firing days later.
+_write_boot_intent() {
+    local mode="$1"
+    mkdir -p "$(dirname "$BOOT_INTENT_FILE")" 2>/dev/null || true
+    if printf 'mode=%s\nts=%s\nsource=entry.sh\npid=%s\n' \
+            "$mode" "$(date +%s)" "$$" > "$BOOT_INTENT_FILE" 2>/dev/null; then
+        return 0
+    fi
+    echo "watcher: WARNING: could not write the boot-intent file at $BOOT_INTENT_FILE — the stack bring-up will fall back to its default (resume prior workers)" >&2
+    return 1
+}
 
 # Wrong-window guard (issue #203 follow-up, 2026-06-11 incident class).
 # This script ends by RENAMING its own window to '$SERVICES_WINDOW' and
@@ -200,20 +285,56 @@ ERR
     exit 2
 fi
 
+# Boot-vs-bring-up is decided by AGENT LIVENESS, not by a window name
+# (your-org/nexus-code#651 skeptic, finding 1). `_respawn.sh` sets
+# `remain-on-exit on`, so a claude that segfaults, OOMs, is `/exit`ed, or
+# wedges-then-dies leaves its window LISTED with a dead pane — and reading that
+# corpse as a running supervisor is what made `./watcher` skip this whole
+# reconciliation and resurrect the entire worker board, in the COMMONEST crash
+# shape and the one the operator actually hit. Same class as `#643`.
+#
+# The predicate lives in `_lib.sh` as `_nexus_window_has_live_agent` (sourced
+# at the top of this script) because `bootstrap-recover.sh` needs the identical
+# judgement when it partitions the cold-boot manifest into dropped-vs-still-
+# running. One definition, so the two can never disagree about "alive".
+# Its fail-safe direction is LIVE and its contract is "only ask about a window
+# you know exists" — hence the `&&` composition below.
+
 orch_present=0
-if tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$TARGET"; then
+if grep -qxF "$TARGET" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
     orch_present=1
 fi
 
-if (( orch_present == 1 )); then
-    # A live orchestrator window means no cold spawn will happen; the
-    # flag (either way) must not touch the pin, which names the LIVE
-    # session and is what makes the watcher's next respawn
-    # deterministic.
+# "Is this a boot?" is ONE question, and it is answered by liveness, not by a
+# window name. Conflating the two is what produced finding 1 — and answering it
+# differently for the pin and for the worker intent would re-introduce exactly
+# the two-decisions-from-one-flag confusion this whole change exists to remove.
+# So a `remain-on-exit` corpse counts as ABSENT for both halves: on a default
+# boot its pin is archived (the operator asked for a fresh orchestrator) and the
+# fresh boot-intent is written (they asked for no resurrection).
+orch_live=0
+if (( orch_present == 1 )) && _nexus_window_has_live_agent "$TARGET"; then
+    orch_live=1
+fi
+if (( orch_present == 1 && orch_live == 0 )); then
+    echo "watcher: a window named '$TARGET' exists but holds NO live agent (dead pane / no claude in its process tree) — treating this as a genuine boot, not an idempotent bring-up. \`remain-on-exit\` leaves a crashed orchestrator's window listed; its presence is not evidence of life (your-org/nexus-code#651)" >&2
+fi
+
+if (( orch_live == 1 )); then
+    # A LIVE orchestrator means no cold spawn will happen; the flag (either
+    # way) must not touch the pin, which names the LIVE session and is what
+    # makes the watcher's next respawn deterministic.
+    # The boot-intent file is left untouched for the same reason: this is not
+    # a boot. Re-running `./watcher` against a live orchestrator is an
+    # idempotent bring-up, and writing `mode=fresh` would drop the worker
+    # board out from under a running supervisor — a destructive reading of
+    # what is meant to be a no-op. Note the gate is `orch_live`, NOT
+    # `orch_present`: see `_nexus_window_has_live_agent` (_lib.sh) for why a window
+    # name cannot answer this.
     if (( CONTINUE == 1 )); then
         echo "watcher: orchestrator window '$TARGET' already alive — --continue has no effect" >&2
     else
-        echo "watcher: orchestrator window '$TARGET' already alive — no spawn, pin untouched" >&2
+        echo "watcher: orchestrator window '$TARGET' already alive — no spawn, pin untouched, worker resume behaviour unchanged (re-running ./watcher on a live stack is an idempotent bring-up, not a boot)" >&2
     fi
 else
     # The watcher's cold-boot spawn reads the pin via
@@ -226,6 +347,18 @@ else
         # shellcheck disable=SC1091
         . "$_script_dir/_respawn.sh"
         _have_resolver=1
+    fi
+    # Worker-side intent, written for BOTH modes so the worker walk never
+    # has to infer it from the pin's absence (a missing pin is also what a
+    # never-yet-run nexus looks like).
+    if (( CONTINUE == 1 )); then
+        if _write_boot_intent continue; then
+            echo "watcher: --continue — worker agents alive in the last snapshot will be resumed by the stack bring-up" >&2
+        fi
+    else
+        if _write_boot_intent fresh; then
+            echo "watcher: fresh boot (default) — NO worker agent will be resumed; the prior worker state is archived and the incoming orchestrator is handed a manifest of what was dropped. Pass --continue to resume instead" >&2
+        fi
     fi
     if (( CONTINUE == 1 )); then
         if (( _have_resolver == 1 )); then
@@ -299,11 +432,14 @@ fi
 # (your-org/nexus-code#313 item 4). Non-fatal: a timeout still drops into
 # the cockpit, which shows the live state and the verify diagnostics.
 echo "watcher: waiting for the stack to converge (watcher + orchestrator + services)..." >&2
-if "$_script_dir/verify-stack.sh"; then
-    echo "watcher: stack is up — opening the cockpit." >&2
-else
-    echo "watcher: stack not fully converged yet — landing in the cockpit to inspect (key 0 tails the watcher log; the orchestrator may still be spawning)." >&2
-fi
+"$_script_dir/verify-stack.sh"; _vs_rc=$?
+case "$_vs_rc" in
+    0) echo "watcher: stack is up — opening the cockpit." >&2 ;;
+    # 3 = everything up EXCEPT a JupyterLab cold build still materialising
+    # (your-org/nexus-code#1675). Not healthy, and not a failure to chase.
+    3) echo "watcher: stack is up except a JupyterLab cold build still in progress (not healthy yet; the supervisor finishes it) — opening the cockpit." >&2 ;;
+    *) echo "watcher: stack not fully converged yet — landing in the cockpit to inspect (key 0 tails the watcher log; the orchestrator may still be spawning)." >&2 ;;
+esac
 
 # --- become the cockpit -----------------------------------------------------
 
@@ -325,4 +461,5 @@ fi
 # (the watcher and services are setsid-detached).
 tmux rename-window -t "$OWN_WINDOW_ID" "$SERVICES_WINDOW" 2>/dev/null || true
 echo "watcher: opening the service cockpit (q quits the view; the stack keeps running)" >&2
-exec "$_monitor_dir/svc.sh"
+# --show-secrets: the cockpit shows the JupyterLab token (your-org/nexus-code#1821).
+exec "$_monitor_dir/svc.sh" --show-secrets

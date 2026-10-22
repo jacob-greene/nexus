@@ -37,6 +37,19 @@ export NEXUS_STATE_DIR="$TMP/ng-state"
 mkdir -p "$NEXUS_STATE_DIR"
 
 # ── load _write_provenance_record from spawn-worker.sh ────────────────────────
+# The window-key encoder must come first: since your-org/nexus-code#941 the
+# extracted function keys its output file with `wk_encode`, which lives in
+# _bookkeeping.sh and is loaded by spawn-worker.sh's PREAMBLE — the half this
+# eval-extract deliberately does not run. Without it `$(wk_encode …)` is an
+# undefined command, the substitution yields the EMPTY string, and every record
+# lands at `<windows>/.json`: T1, T2 and T6 all fail, and they fail for a
+# reason that looks nothing like "the encoder was missing".
+# shellcheck source=monitor/_bookkeeping.sh
+source "$SCRIPT_DIR/_bookkeeping.sh"
+declare -F wk_encode >/dev/null 2>&1 || {
+    printf 'FAIL  setup: wk_encode not available after sourcing _bookkeeping.sh\n' >&2
+    exit 1
+}
 # Extract the function definition (the first ^}$ at column 0 closes it).
 eval "$(awk '/^_write_provenance_record\(\)/,/^}$/' "$SPAWN_SH")"
 
@@ -65,14 +78,30 @@ else
     fi
 fi
 
-# ── T2: window name sanitization ─────────────────────────────────────────────
+# ── T2: window name encoding ─────────────────────────────────────────────────
+# WAS "special chars → _". your-org/nexus-code#941 replaced that mapping
+# because it is MANY-TO-ONE: `a.b` and `a_b` collided on one state file, and
+# nine call sites key an irreversible decision (verdict clearing, state prune)
+# on it. The encoding is now percent-encoding, and the property under test is
+# INJECTIVITY, not merely "no punctuation in the filename" — so the second leg
+# below is the one that would have caught the original defect.
 WIN2="my window/name:odd"
 _write_provenance_record "$NEXUS_ROOT" "$WIN2" "" "task" "/wd" "/pf" ""
-SAFE="my_window_name_odd"
+SAFE="my%20window%2Fname%3Aodd"
 if [[ -f "$WINDOWS_DIR/${SAFE}.json" ]]; then
-    ok "T2: window name sanitized (special chars → _)"
+    ok "T2: window name percent-encoded (space→%20, /→%2F, :→%3A)"
 else
-    fail "T2: expected sanitized file $WINDOWS_DIR/${SAFE}.json not found (got: $(ls "$WINDOWS_DIR/"))"
+    fail "T2: expected encoded file $WINDOWS_DIR/${SAFE}.json not found (got: $(ls "$WINDOWS_DIR/"))"
+fi
+
+# T2b: the point of the change — two names the OLD sanitiser mapped together
+# must now land in two distinct files.
+_write_provenance_record "$NEXUS_ROOT" "coll.ide" "" "task" "/wd" "/pf" ""
+_write_provenance_record "$NEXUS_ROOT" "coll_ide" "" "task" "/wd" "/pf" ""
+if [[ -f "$WINDOWS_DIR/coll%2Eide.json" && -f "$WINDOWS_DIR/coll_ide.json" ]]; then
+    ok "T2b: 'coll.ide' and 'coll_ide' no longer share one state file"
+else
+    fail "T2b: injectivity lost — got: $(ls "$WINDOWS_DIR/")"
 fi
 
 # ── T3: tombstone recipe writes .handled.json with required keys ─────────────
@@ -118,17 +147,17 @@ fi
 # ── T5: ng interactive-sessions --dry-run renders markdown with table header ─
 OUTPUT=$(NEXUS_ROOT="$TMP/nexus" NEXUS_STATE_DIR="$TMP/ng-state" \
     "$NG" interactive-sessions --dry-run 2>/dev/null)
-if printf '%s' "$OUTPUT" | grep -q '<!-- interactive-sessions:start -->'; then
+if grep -q '<!-- interactive-sessions:start -->' <<<"$OUTPUT"; then
     ok "T5: output contains start marker"
 else
     fail "T5: output missing start marker"
 fi
-if printf '%s' "$OUTPUT" | grep -q '| Window | Topic | Status |'; then
+if grep -q '| Window | Topic | Status |' <<<"$OUTPUT"; then
     ok "T5: output contains table header"
 else
     fail "T5: output missing table header — got: $(printf '%s' "$OUTPUT" | head -5)"
 fi
-if printf '%s' "$OUTPUT" | grep -q '<!-- interactive-sessions:end -->'; then
+if grep -q '<!-- interactive-sessions:end -->' <<<"$OUTPUT"; then
     ok "T5: output contains end marker"
 else
     fail "T5: output missing end marker"
@@ -150,7 +179,7 @@ fi
 # T1 wrote a provenance record for "test-interactive" with kind=interactive.
 OUTPUT6=$(NEXUS_ROOT="$TMP/nexus" NEXUS_STATE_DIR="$TMP/ng-state" \
     "$NG" interactive-sessions --dry-run 2>/dev/null)
-if printf '%s' "$OUTPUT6" | grep -q 'test-interactive'; then
+if grep -q 'test-interactive' <<<"$OUTPUT6"; then
     ok "T6: output lists 'test-interactive' from provenance record"
 else
     # The task kind (T2 write) is 'task' not 'interactive', so only T1 record
@@ -179,8 +208,8 @@ BLOCK_V2="${START_M}"$'\n''## v2'$'\n'"${END_M}"
 BODY_BEFORE="## Intro\n\nSome text."
 BODY_AFTER=$(printf '%s\n\n%s' "$BODY_BEFORE" "$BLOCK_V1")
 # Verify appended body contains both intro and block.
-if printf '%s' "$BODY_AFTER" | grep -q 'Some text.' \
-   && printf '%s' "$BODY_AFTER" | grep -q "$START_M"; then
+if grep -q 'Some text.' <<<"$BODY_AFTER" \
+   && grep -q "$START_M" <<<"$BODY_AFTER"; then
     ok "T8a: block absent case: appended"
 else
     fail "T8a: block absent case: unexpected body"
@@ -195,9 +224,9 @@ NEW_BODY=$(printf '%s' "$BODY_AFTER" \
          in_block { next }
          { print }')
 
-if printf '%s' "$NEW_BODY" | grep -q 'Some text.' \
-   && printf '%s' "$NEW_BODY" | grep -q '## v2' \
-   && ! printf '%s' "$NEW_BODY" | grep -q '## v1'; then
+if grep -q 'Some text.' <<<"$NEW_BODY" \
+   && grep -q '## v2' <<<"$NEW_BODY" \
+   && ! grep -q '## v1' <<<"$NEW_BODY"; then
     ok "T8b: block present case: replaced v1 with v2, non-block content preserved"
 else
     fail "T8b: block present case — got: $(printf '%s' "$NEW_BODY")"

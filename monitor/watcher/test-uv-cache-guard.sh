@@ -368,7 +368,9 @@ grep -q '^repair_uv_cache()' "$LABSH" \
     || bad "(14) labsh wiring" "repair_uv_cache is not defined"
 # The call must precede `labsh start` inside _start_cycle.
 call_line=$(grep -n '^ *repair_uv_cache  *#' "$LABSH" | head -1 | cut -d: -f1)
-start_line=$(grep -n '^ *labsh start --port' "$LABSH" | head -1 | cut -d: -f1)
+# The start now goes through labsh_start_pinned (the uvx-pin shim wrapper);
+# the first `--port` start CALL in either spelling is the one that must follow.
+start_line=$(grep -nE '^ *(labsh start|labsh_start_pinned) --port' "$LABSH" | head -1 | cut -d: -f1)
 if [[ -n "$call_line" && -n "$start_line" ]] && (( call_line < start_line )); then
     ok "(14) repair_uv_cache is called before 'labsh start' (line $call_line < $start_line)"
 else

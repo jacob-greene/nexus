@@ -89,6 +89,8 @@
 set -uo pipefail
 _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_self_dir/../_test_helpers.sh"
+# shellcheck source=_renderer_scrape_check.sh
+. "$_self_dir/_renderer_scrape_check.sh"
 . "$_self_dir/../../cc-harness/_lib.sh"
 
 cch_skip_if_disabled
@@ -210,34 +212,71 @@ fi
 # check + stamp read, all against the LIVE pane hosting the real binary.
 echo
 echo "--- phase B: production pane-state classifies the live pane over-limit ---"
-ps_out=$(PATH="$CCH_DIR/.bin:$PATH" NEXUS_STATE_DIR="$OL_STATE" \
-    "$CCH_PANE_STATE" "$CCH_SESSION:$IDX" 2>&1)
+# Through cch_pane_state, NOT a hand-rolled copy of its body. The copy that
+# used to be here predated the socket pins in _lib.sh and therefore queried
+# the PRODUCTION tmux server, where this session does not exist — so it
+# returned nothing and both assertions below read as renderer drift
+# (your-org/nexus-code#1042 A).
+ps_out=$(CCH_PANE_STATE_DIR="$OL_STATE" cch_pane_state "$IDX" 2>&1)
 ps_state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$ps_out")
 ps_reset=$(grep -oE 'reset_at=[^ ]+' <<<"$ps_out" | sed 's/^reset_at=//')
 echo "        pane-state: state=${ps_state:-<none>} reset_at=${ps_reset:-<none>}"
 assert_eq "live pane classifies over-limit via the stamp" "over-limit" "$ps_state"
 assert_eq "pane-state carries the reset token"            "$WANT_TOKEN" "$ps_reset"
 
-# Opportunistic renderer-scrape sub-check: when the real TUI painted
-# the failed-turn frame (it renders the API error text, i.e. the
-# notice), _detect_over_limit must classify it WITHOUT the stamp.
-# The render gap makes painting nondeterministic in this sandbox, so
-# a blank frame downgrades to a loud note, never a silent pass.
-pane_text=$(cch_capture "$IDX")
-if grep -q "hit your" <<<"$pane_text"; then
-    ps2_out=$(PATH="$CCH_DIR/.bin:$PATH" NEXUS_STATE_DIR="$OL_STATE" \
-        "$CCH_PANE_STATE" --over-limit-file "$CCH_DIR/no-such-stamp.json" \
-        "$CCH_SESSION:$IDX" 2>&1)
-    ps2_state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$ps2_out")
-    if [[ "$ps2_state" == "over-limit" ]]; then
-        echo "  PASS: renderer scrape classifies the REAL painted notice (no stamp)"; PASS=$((PASS+1))
-    else
+# The DISCRIMINATING renderer-scrape sub-check: the REAL painted notice must
+# classify over-limit WITHOUT the stamp, which is how production reads it. The
+# render gap makes painting nondeterministic in this sandbox, so the capture is
+# RETRIED for a bounded time — and a frame that never paints is UNMEASURED, a
+# third outcome that cannot finish GREEN (your-org/nexus-code#1530). This block
+# used to end in an `else` that printed a `note:` and carried on: "could not
+# measure" became "measured and fine", in a scenario `cc-harness/gate.sh` reads.
+# The check itself lives in _renderer_scrape_check.sh so its three outcomes are
+# driven without a real binary (test-realmodel-overlimit-unmeasured.sh).
+UNMEASURED=0
+rsc_check "$IDX" "$OL_STATE" "$CCH_DIR/no-such-stamp.json"
+pane_text="$RSC_PANE_TEXT"
+case "$RSC_VERDICT" in
+    pass)
+        echo "  PASS: renderer scrape classifies the REAL painted notice (no stamp; frame painted on capture $RSC_ATTEMPTS_USED)"; PASS=$((PASS+1)) ;;
+    fail)
+        ps2_state="$RSC_STATE"
         echo "  FAIL: real pane paints the notice but renderer scrape says '$ps2_state'" >&2
         FAIL=$((FAIL+1))
-    fi
-else
-    echo "  note: TUI frame blank (known render gap) — renderer-scrape sub-check not exercisable this run; fixture coverage in test-pane-state.sh"
-fi
+        # A renderer-scrape failure is unreadable without the frame it
+        # scraped. `_detect_over_limit` bottom-anchors on `tail -n 15`, so
+        # show where the notice actually landed relative to that window —
+        # a notice pushed above row 15 by extra TUI chrome looks identical
+        # to no notice at all from the assertion's side.
+        {
+            echo "  --- diagnostic: where is the notice relative to the 15-row scan window? ---"
+            printf '  total rows captured: %s\n' "$(wc -l <<<"$pane_text")"
+            printf '  notice on row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | tac | grep -n 'hit your' | cut -d: -f1 | tr '\n' ' ')"
+            printf '  "resets" on row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | tac | grep -n 'resets' | cut -d: -f1 | tr '\n' ' ')"
+            # Same distances counting NON-BLANK rows only. Fullscreen pads the
+            # gap between transcript and input box with blank rows, so the raw
+            # and non-blank distances diverge sharply — that divergence is the
+            # whole diagnosis, and it is invisible in the raw number alone.
+            printf '  non-blank rows: %s; notice at non-blank row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | grep -cv '^[[:space:]]*$')" \
+                "$(printf '%s\n' "$pane_text" | grep -v '^[[:space:]]*$' | tac \
+                     | grep -n 'hit your' | cut -d: -f1 | tr '\n' ' ')"
+            echo "  --- bottom 20 rows ---"
+            printf '%s\n' "$pane_text" | tail -n 20 | cat -v | sed 's/^/  | /'
+        } >&2 ;;
+    *)
+        UNMEASURED=1
+        {
+            echo "  UNMEASURED: the TUI frame stayed BLANK across $RSC_ATTEMPTS_USED captures (known render gap) — the"
+            echo "              renderer-scrape sub-check DID NOT RUN. This is not a pass: the surface this"
+            echo "              scenario exists to measure (what production reads WITHOUT a stamp) was not"
+            echo "              exercised. The scenario will exit 69 (ENVSKIP) unless something else FAILED;"
+            echo "              cc-harness/gate.sh counts that as RED. Fixture coverage of the scrape is in"
+            echo "              test-pane-state.sh — against a CAPTURED frame, never this binary's."
+        } >&2 ;;
+esac
 
 # ---- phase B2: limit notices that carry NO reset time ---------------------
 # jacob-greene/nexus#173. Claude Code 2.1.268 ships a budget-exhaustion
@@ -524,7 +563,7 @@ else
 fi
 _over_limit_record_held "2026-07-15_11-00-00_held1.md" "poll-resurface"
 _over_limit_record_held "2026-07-15_11-01-00_held2.md" "poll-full-state"
-held_n=$(grep -c $'\theld\t' "$HELD_LOG" 2>/dev/null || echo 0)
+held_n=$(grep -c $'\theld\t' "$HELD_LOG" 2>/dev/null) || held_n=0
 if [[ "$held_n" == "2" ]]; then
     echo "  PASS: held emits recorded in off-time log (n=$held_n)"; PASS=$((PASS+1))
 else
@@ -567,8 +606,11 @@ row=$(_over_limit_load "_orchestrator")
 IFS=$'\t' read -r k w r tok re fs na at <<<"$row"
 _over_limit_write_row "$k" "$w" "$r" "$tok" "$re" "$fs" "$(( $(date +%s) - 1 ))" "$at"
 
-NEXUS_ROOT="$OL_ROOT" PATH="$CCH_DIR/.bin:$PATH" \
-    _over_limit_process_wakes "$WIN"
+# Through cch_with_tmux_env: this function resolves a tmux window index, and
+# on the ambient socket that window does not exist. The probe then answers
+# "absent" — a well-formed answer to the wrong server — so the gate never
+# reopens and nothing is pasted (your-org/nexus-code#1042 A).
+NEXUS_ROOT="$OL_ROOT" cch_with_tmux_env _over_limit_process_wakes "$WIN"
 
 if _over_limit_orchestrator_paused; then
     echo "  FAIL: emit gate still closed after wake — held emits would never flush" >&2
@@ -594,4 +636,14 @@ for want in "WHAT HAPPENED" "STATE NOW" "LOG OF THE OFF-TIME" "over-limit-held.l
 done
 
 cch_teardown
+# AN UNMEASURED DISCRIMINATING SUB-CHECK CANNOT FINISH GREEN (#1530). A FAIL
+# outranks it — `th_summary_and_exit` reports that red as it always has. Only a
+# run with no failure and a sub-check that never ran leaves by 69, with the ENV
+# line the ENVSKIP contract asks for, so the reader is sent to the MACHINE and
+# not into the renderer.
+if [[ "$(rsc_exit_code "$FAIL" "$UNMEASURED")" == 69 ]]; then
+    printf '=== summary: %d passed, %d failed — and 1 DISCRIMINATING sub-check UNMEASURED ===\n' "$PASS" "$FAIL"
+    echo "ENV: the real TUI never painted the failed-turn frame on this host, so the renderer scrape could not be exercised (your-org/nexus-code#1530). Exit 69 — not a pass, not a product failure." >&2
+    exit 69
+fi
 th_summary_and_exit

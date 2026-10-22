@@ -75,7 +75,7 @@ these six H2 sections, in this order:
 
 | Section | Populated by |
 |---------|--------------|
-| `## Identity` | **Pointer** to the `ng nexus-identity` block above — never a copy (single source of truth) |
+| `## Identity` | **Pointer** to the `ng nexus-identity` block above — never a copy (single source of truth). The generated block's own `## Nexus Identity` heading also satisfies this slot (`#886`), so `ng nexus-identity > body.md` + the other five sections validates clean |
 | `## Infra` | Operator-narrated: watcher / orchestrator / CC-pin health |
 | `## Services` | Auto-populatable from `monitor/services.registry` (name + healthcheck); narrate exceptions |
 | `## In-flight` | Active worker windows (mirrors `tmux list-windows` + heartbeats). **Live windows ONLY** — see below |
@@ -86,8 +86,17 @@ Verbs:
 
 ```
 ng dashboard scaffold                 # print the canonical skeleton (hints inline)
-ng dashboard validate [--body-file P] # strict: exit 1 on missing section OR over budget
-ng dashboard put --body-file P        # splice + PATCH; WARNS on both, never blocks
+ng dashboard validate                 # strict, on the LIVE dashboard (the default; #958)
+ng dashboard validate [--body-file P|-]  # a candidate; exit 1 if a required section is
+                                      #   missing OR DUPLICATED (#1058),
+                                      #   or the body is OVER BUDGET. `-` = stdin.
+ng dashboard put --body-file P        # splice + PATCH, then READ BACK to prove it landed
+                                      #   (#1118). Refuses: a body containing a marker
+                                      #   (#959), a live body without exactly ONE marker
+                                      #   pair, anything over GitHub's 262144-byte cap.
+                                      #   rc 4 = could not verify != failed. Cache and
+                                      #   freshness stamp only after verification.
+                                      #   WARNS on missing sections + over budget, never blocks.
 ng dashboard get                      # fetch the current dashboard middle
 ng dashboard get --stat               # size breakdown ONLY — never the body
 ```
@@ -146,6 +155,87 @@ ng dashboard get > /tmp/dashboard-archive.md
 ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive-<date>.md
 ```
 
+**`put --body-file` takes SECTIONS-ONLY — never the whole fetched body.**
+`put` splices `<f>` *between* the issue's `NEXUS_DASHBOARD_START/END`
+markers, preserving the intro + markers and replacing only the content
+between them. So `<f>` must be the six `##` sections alone — no intro, no
+`NEXUS_DASHBOARD_*` markers. **The trap:** fetching the current body
+(`gh api …/issues/1 --jq .body`), editing it, and passing that whole
+thing back to `put` nests the entire body (intro + markers + content)
+*inside* the markers, one level deeper per `put` — a real overview `#1`
+accumulated **8 nested marker pairs** (~4100 lines) this way. For routine
+updates keep a sections-only file and `put` that. If a body already has
+multiple marker pairs, do **not** `put` it — extract the intro (everything
+before the first `NEXUS_DASHBOARD_START`), append one clean marker pair
+wrapping fresh sections-only content, and PATCH wholesale
+(`jq -Rs '{body:.}' | gh api -X PATCH …/issues/1 --input -`); verify
+`grep -c NEXUS_DASHBOARD_START` on the live body `== 1` and
+`ng dashboard validate`.
+
+## Presence is not uniqueness
+
+The dashboard verbs' recurring defect is a check that answers a WEAKER
+question than the one it reports on. `put`'s precondition asserted the
+markers were PRESENT and never that they were UNIQUE — the same sentence
+`#1058` writes about `validate` and section headings. A body carrying two
+`NEXUS_DASHBOARD_END` markers passed it and then silently no-oped: rc 0, URL
+printed, stderr empty, body unchanged. Measured at 198,236 bytes, 64 KB UNDER
+GitHub's cap, so size was not the cause.
+
+Two habits follow, and they are the whole skill:
+
+1. **Exactly one.** One START, one END, one of each required section. Ask it
+   at every entry point — `get`, `put` and `validate` — because whichever one
+   you skip is the one that hands the next verb a corrupt body. `get` matters
+   most: it produces what `put` consumes, so a bad `get` arms the next
+   round-trip.
+2. **Prove the write with an INDEPENDENT GET, not with the PATCH response.**
+   A 200 is not evidence — and neither is the response body. Measured on
+   scratch issue `<your-org>/nexus-code#1128`: an over-cap PATCH returns 200
+   whose `.body` is **the body you sent**, while the store keeps the old one
+   (`response_echoed_sent = YES` in every case, swallows included; the limit is
+   262,144 **bytes**, and 262,144 lands while 262,145 swallows). A check
+   comparing against that response compares the request with itself — its
+   true-positive set for a swallow is empty. This PR shipped exactly that
+   mistake and six tests "proved" it worked against a mock that had the forge
+   backwards. Only a separate GET observes the store.
+
+   Do NOT reconcile byte counts instead: size is a proxy that drifts.
+
+If a dashboard genuinely reaches the cap, `put` REFUSES and says by how much,
+splitting the total into the dashboard region and the prose outside it — so
+you can see whether trimming the dashboard can even help. It does not
+auto-trim: what to drop is editorial judgement, and a publish verb that
+quietly publishes something other than what it was handed is the same defect
+wearing better clothes.
+
+## Two modes — `status_surface.kind` (<your-org>/nexus-code#1839)
+
+The dashboard is the DEFAULT status surface, not the only one. An operator
+may run their own status page and opt out in `config/nexus.yml`:
+
+```yaml
+status_surface:
+  kind: external                        # default: overview-dashboard
+  url_file: work/status-page/.deploy/endpoint   # optional; first line = URL
+  feed: work/status-page/landings.tsv   # optional; the page's landings file
+```
+
+| | `overview-dashboard` (default; also an ABSENT key) | `external` |
+|---|---|---|
+| orchestrator | maintains the dashboard as above | does NOT maintain it; skip the render step |
+| watcher emit | `--- dashboard ---` with the last put stamp | `--- status surface ---`: the page URL and the feed path, no put asked for |
+| `ng dashboard put` | as above | still works, prints a one-line note |
+| identity block, routing | unchanged | unchanged — `#1` stays the routing surface |
+
+Any other kind is refused by `config/load.sh --validate` (so the watcher will
+not start), by `ng dashboard put`, and is flagged as a `CONFIG ERROR` in the
+emit — never read as the default, since that would restore the nudges the
+operator opted out of. Read the effective value with
+`config/load.sh status_surface.kind overview-dashboard`. Appending to the feed
+is the operator's page's format, so the nexus names the file and does not
+write it.
+
 ## Consistency with the rest of the nexus
 
 - The identity block is **metadata, not content** — it does not
@@ -159,15 +249,23 @@ ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive-<date>
 
 ## Where the schema lives (for maintainers)
 
-`monitor/ng`: `DASH_REQUIRED_SECTIONS` (the section array), `DASH_MAX_*`
-(the size budget — total / per-section / entries / per-entry, all in one
-block beside the section array), `_dashboard_template` (scaffold),
-`_dashboard_missing_sections` and `_dashboard_oversize_report` (the two
-checkers shared by `validate` and the `put`/`get` warn paths),
+`monitor/ng`: `DASH_REQUIRED_SECTIONS` (the section array),
+`DASH_SECTION_ALIASES` (headings that also satisfy a required section),
+`IDENTITY_HEADING` (the identity block's H2, declared once and consumed
+by the generator, the scaffold's pointer prose and the validator),
+`DASH_MAX_*` (the size budget — total / per-section / entries / per-entry,
+all in one block beside the section array), `_dashboard_template`
+(scaffold), `_dashboard_missing_sections` and `_dashboard_oversize_report`
+(the two checkers shared by `validate` and the `put`/`get` warn paths),
 `_dashboard_oversize_advice` (the remedy text every breach prints),
 `_dashboard_stats_tsv` + `_dashboard_stat_render` (the `get --stat`
-breakdown), and `cmd_nexus_identity` (the identity generator + idempotent
-upsert). Tests: `monitor/watcher/test-ng-dashboard.sh` (scaffold +
-validate + put-warn + the size budget, one fixture per `DASH_MAX_*` rule)
-and `monitor/watcher/test-ng-nexus-identity.sh` (identity render +
-idempotent upsert).
+breakdown), and `cmd_nexus_identity` (the identity generator +
+idempotent upsert). Tests: `monitor/watcher/test-ng-dashboard.sh`
+(scaffold + validate + put-warn + the size budget, one fixture per
+`DASH_MAX_*` rule), `monitor/watcher/test-ng-nexus-identity.sh` (identity
+render + idempotent upsert), and
+`monitor/watcher/test-ng-identity-dashboard-sync.sh` — the cross-check
+(`#886`): the validator consumes the generator's output, and renaming
+`IDENTITY_HEADING` must move all three consumers together. **A generator
+and its validator have to be checked against EACH OTHER**, not
+separately; each was individually correct here and the pair was not.

@@ -27,7 +27,10 @@
 #
 # Storage:
 #   - Asset repo is maintained as a local clone at `assets/` under
-#     the nexus root (gitignored).
+#     the nexus root (gitignored). A destination that is NOT the root's
+#     own asset repo ($NEXUS_CONFIG, --asset-repo, $NEXUS_ASSET_REPO)
+#     gets its own clone at `assets.<owner>__<name>/`, never the generic
+#     one (your-org/nexus-code#1694).
 #   - Concurrency model (lock-free staging + flock-elected batch
 #     manager): every upload first publishes a snapshot of its file +
 #     a request marker into `<assets-dir>.staging/` with an atomic
@@ -50,9 +53,22 @@
 #                          [--repo-path <path>]         (override default placement, asset-repo-root-relative)
 #                          [--shape pin|latest]         (pin = blob/raw/<sha>/...; latest = blob/raw/main/...; default pin)
 #                          [--message <commit msg>]
+#                          [--replace]                  (overwrite a DIFFERENT asset already at the destination)
+#
+# Destination collisions (your-org/nexus-code#1639): the destination is derived
+# from the BASENAME, so two different files named `summary.md` for one issue
+# map to the same path. An existing destination holding DIFFERENT bytes at the
+# asset repo's synced HEAD is REFUSED (exit 5, no URL) unless --replace is
+# given. Identical bytes are not a collision (rc 0, the existing HEAD is
+# pinned). The check runs in the DRAIN, against the tree after the sync, and is
+# PER-REQUEST: a refused request is dropped from the batch; the others commit.
 #
 # Defaults:
-#   --repo       from config github.asset_repo, fallback github.repo (env: NEXUS_ASSET_REPO)
+#   --asset-repo from config github.asset_repo, fallback github.repo (env: NEXUS_ASSET_REPO)
+#   --repo       DEPRECATED SPELLING of --asset-repo. Accepted only when it
+#                RESTATES the configured asset repo; any other value is
+#                REFUSED (exit 7), because on every other `ng` verb the same
+#                flag means the ISSUE repo (your-org/nexus-code#1173)
 #   --shape      pin (SHA-pinned permalink)
 #   --repo-path  derived from --issue / source-path / basename (see "Asset tree layout")
 #   --message    "Add asset <basename> via upload-asset.sh"
@@ -62,41 +78,280 @@
 #   1  bad usage
 #   2  mint-token.sh failed
 #   3  asset-repo clone/pull/push failed
+#   5  REFUSED: the destination path already holds a DIFFERENT asset at the
+#      asset repo's HEAD, and --replace was not given (your-org/nexus-code#1639).
+#      Nothing of THIS request was committed and no URL is printed; the
+#      message on stderr names the path, the commit that last wrote it, and
+#      both remedies (--repo-path <unique path> to keep both, --replace to
+#      overwrite deliberately). Other requests in the same batch are unaffected.
+#   7  REFUSED: the DESTINATION repository is wrong — either `--repo` named
+#      something other than the configured asset repo (that flag means the
+#      ASSET repo here and the ISSUE repo on every other `ng` verb), or the
+#      destination is the repository this nexus checkout itself came from,
+#      or the destination is not an `owner/name` (#1694: no clone to key).
+#      Like 4, a 7 is decided BEFORE anything is staged or any git verb runs
+#      (your-org/nexus-code#1173).
+#   4  REFUSED: the nexus primary root could not be established, or
+#      `<root>/assets` is not a git repository rooted at itself
+#      (your-org/nexus-code#1077). Distinct from 3 on purpose — 3 means the
+#      asset repo was reached and the operation failed; 4 means the script
+#      declined to act because it could not prove WHERE it was acting.
+#
+#      A 4 is ATOMIC, and that is a guarantee about the STAGING AREA as much as
+#      about the asset repo: the request is un-staged on the way out, so no
+#      later upload can adopt and commit it. 3 deliberately does the OPPOSITE
+#      and leaves the marker for the next manager to re-drain — 3 is "retry
+#      this", 4 is "this must never happen". Do not unify them.
 
 set -euo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-_nexus_root=$(cd "$_script_dir/.." && pwd)
+
+# ---------------------------------------------------------------------------
+# ROOT RESOLUTION (your-org/nexus-code#1077) — read $NEXUS_ROOT, fail CLOSED.
+#
+# This used to be, in full:
+#
+#     _nexus_root=$(cd "$_script_dir/.." && pwd)
+#
+# — the script's own location, with ZERO references to $NEXUS_ROOT anywhere in
+# the file. `monitor/ng` resolves the primary correctly (`_nexus_primary_root`,
+# the #577 fix) and then handed the asset step to this script, which threw that
+# answer away. Run from a secondary clone — which is exactly what
+# `monitor/ng wrap-up` does from a clone's cwd — the asset tree became
+# `<clone>/assets`, INSIDE a live checkout. #577 pinned reports to the primary
+# and left assets unpinned; this is its residual.
+#
+# The resolver is the SHARED one, not a second implementation: two resolvers
+# disagreeing is the whole mechanism of this defect.
+#
+# FAIL CLOSED. An explicit $NEXUS_ROOT is AUTHORITATIVE — if it will not
+# resolve to a plausible nexus root, this refuses (exit 4) rather than quietly
+# falling back to its own location. Guessing where an asset write belongs is
+# what destroyed a checkout; a caller who set $NEXUS_ROOT and got the script
+# directory instead would be receiving precisely the silent substitution this
+# fix exists to end. The script-location fallback survives only for the case
+# where $NEXUS_ROOT is entirely unset (a standalone invocation), and even then
+# it is de-nested through the same resolver.
+# ---------------------------------------------------------------------------
+if [[ ! -r "$_script_dir/_nexus-root.sh" ]]; then
+    echo "upload-asset.sh: cannot read $_script_dir/_nexus-root.sh — the primary-root" >&2
+    echo "  resolver is missing. Refusing: without it this script cannot tell which" >&2
+    echo "  nexus an asset belongs to, and guessing is your-org/nexus-code#1077." >&2
+    exit 4
+fi
+# shellcheck source=monitor/_nexus-root.sh
+source "$_script_dir/_nexus-root.sh" || {
+    echo "upload-asset.sh: cannot source $_script_dir/_nexus-root.sh; refusing" >&2
+    exit 4
+}
+
+_root_origin=""
+if [[ -n "${NEXUS_ROOT:-}" ]]; then
+    _root_origin="\$NEXUS_ROOT=$NEXUS_ROOT"
+    _nexus_root=$(nexus_primary_root "$NEXUS_ROOT") || _nexus_root=""
+    # THE ONE-TREE RULE (your-org/nexus-code#1651). An explicit NEXUS_ROOT must
+    # still RESOLVE (the fail-closed check below), but it no longer decides
+    # WHICH nexus on its own: `ng` keys on its own tree, and this script used to
+    # key on $NEXUS_ROOT first, so with NEXUS_ROOT at a foreign nexus `ng`
+    # refused a write while `ng upload` pushed to the foreign asset repo at
+    # rc 0. `nexus_config_root` is the shared answer: this script's own tree,
+    # unless that tree has no config of its own (then NEXUS_ROOT's), and a
+    # REFUSAL when both trees name different identities. NEXUS_CONFIG is an
+    # explicit opt-in and keeps the NEXUS_ROOT-first behaviour.
+    if [[ -n "$_nexus_root" && -z "${NEXUS_CONFIG:-}" ]]; then
+        _crc=0; _croot=$(nexus_config_root "$_script_dir/..") || _crc=$?
+        if (( _crc == 3 )); then
+            {
+                echo "upload-asset.sh: REFUSING — the nexus this asset belongs to is ambiguous."
+                echo "  $_croot"
+                echo "  Run the upload-asset.sh (or ng) of the nexus you mean, or fix NEXUS_ROOT"
+                echo "  (your-org/nexus-code#1651). Nothing was written."
+            } >&2
+            exit 4
+        elif (( _crc == 2 )); then
+            # This script's OWN tree has a nexus.yml that cannot be read. Using
+            # $NEXUS_ROOT's nexus instead is the broken-read-as-absent collapse
+            # (your-org/nexus-code#1652 item 3): refuse by name.
+            {
+                echo "upload-asset.sh: REFUSING — this tool's own nexus config is unreadable."
+                echo "  $_croot"
+                echo "  Fix that config/nexus.yml, or run the upload-asset.sh (or ng) of the nexus"
+                echo "  you mean (your-org/nexus-code#1652). Nothing was written."
+            } >&2
+            exit 4
+        elif (( _crc == 0 )) && [[ -n "$_croot" ]]; then
+            _root_origin="one-tree rule (script tree $_script_dir/.., \$NEXUS_ROOT=$NEXUS_ROOT)"
+            _nexus_root="$_croot"
+        else
+            # FAIL CLOSED: an rc the resolver does not define (it crashed) is no
+            # licence to keep $NEXUS_ROOT's answer — that is the #1651 defect.
+            echo "upload-asset.sh: REFUSING — the one-tree resolver failed (rc $_crc); cannot tell which nexus this asset belongs to. Nothing was written." >&2
+            exit 4
+        fi
+        unset _crc _croot
+    fi
+else
+    _root_origin="script location ($_script_dir/..), \$NEXUS_ROOT unset"
+    _nexus_root=$(nexus_primary_root "$_script_dir/..") || _nexus_root=""
+fi
+if [[ -z "$_nexus_root" || ! -x "$_nexus_root/config/load.sh" ]]; then
+    {
+        echo "upload-asset.sh: REFUSING — cannot establish the nexus primary root."
+        echo "  resolved from : $_root_origin"
+        echo "  resolved to   : ${_nexus_root:-<nothing>}"
+        echo "  required      : an executable <root>/config/load.sh"
+        echo "  An asset write that cannot tell where it belongs must refuse, not guess."
+        echo "  Set NEXUS_ROOT to the PRIMARY nexus clone and retry (your-org/nexus-code#1077)."
+    } >&2
+    exit 4
+fi
 _cfg="$_nexus_root/config/load.sh"
+
+# EVERY CONFIG READ IS PINNED TO THE ROOT WE RESOLVED, not to the ambient
+# $NEXUS_ROOT (your-org/nexus-code#1173, the residual of #1077 on this path).
+#
+# `config/load.sh:48` is `nexus_root="${NEXUS_ROOT:-$(cd "$script_dir/.." && pwd)}"`
+# — the ENVIRONMENT wins over the script's own location. So pinning `$_cfg` to
+# the PRIMARY's copy, which is what #1077 did, is not enough: invoking it with
+# `NEXUS_ROOT` still pointing at a secondary clone makes the PRIMARY's own
+# load.sh read the CLONE's config, fall through to the tracked
+# `config/nexus.example.yml`, and answer with its PLACEHOLDER at rc 0. Measured,
+# same binary, only the env varying:
+#
+#   NEXUS_ROOT=<primary> ./config/load.sh github.repo -> your-org/your-nexus
+#   NEXUS_ROOT=<clone>   ./config/load.sh github.repo -> your-org/yourname-nexus-assets
+#   NEXUS_ROOT unset     ./config/load.sh github.repo -> your-org/your-nexus
+#
+# #1077 pinned WHICH SCRIPT; this pins WHICH TREE IT ANSWERS ABOUT. Resolving
+# the root correctly and then asking a question that answers about a different
+# root is the two-resolvers-disagreeing defect this file's header warns about,
+# one level down. $NEXUS_CONFIG is deliberately left alone: it is candidate 1 in
+# load.sh and an explicit caller opt-in, not an accident of inheritance.
+_cfg() { NEXUS_ROOT="$_nexus_root" "$_nexus_root/config/load.sh" "$@"; }
 
 # Asset repo: prefer github.asset_repo; fall back to github.repo for
 # back-compat with configs that haven't been split yet.
-REPO="${NEXUS_ASSET_REPO:-$("$_cfg" github.asset_repo "$("$_cfg" github.repo)")}"
+# DEFECT A's PRESCRIBED REMEDY IS NOT ADDED HERE, AND THE REASON IS MEASURED
+# (your-org/nexus-code#1173). The thread's agreed fix was to call
+# `config/load.sh --check-identity` before resolving $REPO, because a clone with
+# no (gitignored) `nexus.yml` falls through to the tracked
+# `config/nexus.example.yml` and returns its PLACEHOLDER at rc 0. The diagnosis
+# is right; the remedy is UNREACHABLE HERE, because `mint-token.sh` — called
+# above, and which already refuses the template outright — fires first on every
+# route that could produce it:
+#
+#   NEXUS_ROOT=<config-less root>                 -> mint-token rc 2, before this
+#   …with GH_TOKEN PRESET                         -> mint-token rc 2, identical
+#   NEXUS_ROOT unset                              -> mint-token resolves its own
+#                                                    script dir and refuses too
+#
+# Measured with the check present and with it mutated out: byte-identical
+# output, rc 2 both times. An unreachable guard is not defence in depth, it is a
+# claim nobody can falsify — so it is recorded here instead of added. The part
+# of Defect A that IS reachable is the config READ, pinned just above: a clone
+# carrying its OWN `nexus.yml` mints a token happily and then answers config
+# questions about the wrong nexus.
+
+REPO_CONFIGURED="$(_cfg github.asset_repo "$(_cfg github.repo)")"
+if [[ -n "${NEXUS_ASSET_REPO:-}" ]]; then
+    REPO="$NEXUS_ASSET_REPO"; REPO_SOURCE='$NEXUS_ASSET_REPO'
+else
+    REPO="$REPO_CONFIGURED";  REPO_SOURCE='config github.asset_repo/github.repo'
+fi
 LOCAL=""
 ISSUE=""
 REPO_PATH=""
 SHAPE="pin"
 MESSAGE=""
-ASSETS_DIR="$_nexus_root/assets"
+REPLACE=0
 
-usage() { awk '/^$/{exit}NR>1' "$0" >&2; exit "${1:-1}"; }
+# your-org/nexus-code#575. The full header block is a ~60-line design document.
+# Dumping it as the ERROR for a one-character flag typo reads as "something has
+# gone badly wrong inside the tool" rather than "that flag does not exist", and
+# it buries the one line that actually matters. Reserve it for an explicit
+# --help; on the error path print a one-line synopsis and name the exit-code
+# semantics, since misreading THOSE is what sends a reader off checking network
+# reachability and tokens when the real problem is on their command line.
+usage() {   # $1 = exit code (0 ⇒ explicit --help ⇒ full reference)
+    if [[ "${1:-1}" == 0 ]]; then
+        awk '/^$/{exit}NR>1' "$0" >&2
+    else
+        cat >&2 <<'EOU'
+usage: upload-asset.sh <local-path> [--issue N] [--repo-path <path>]
+                       [--shape pin|latest] [--message <msg>] [--asset-repo <owner/name>]
+                       [--replace]
+Run with --help for the full reference.
+Exit 1 is BAD USAGE — it is not an asset-repo failure (that is exit 3).
+Exit 5 is a DESTINATION COLLISION — pass --repo-path <unique path> or --replace.
+EOU
+    fi
+    exit "${1:-1}"
+}
 
-while (( $# > 0 )); do
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
-        --repo)        REPO="$2"; shift 2 ;;
+        --asset-repo)  REPO="$2"; REPO_SOURCE='--asset-repo'; shift 2 ;;
+        --repo)        REPO="$2"; REPO_SOURCE='--repo';       shift 2 ;;
         --issue)       ISSUE="$2"; shift 2 ;;
         --repo-path)   REPO_PATH="$2"; shift 2 ;;
         --shape)       SHAPE="$2"; shift 2 ;;
         --message)     MESSAGE="$2"; shift 2 ;;
+        --replace)     REPLACE=1; shift ;;
         -h|--help)     usage 0 ;;
         --)            shift; break ;;
         -*)            echo "unknown flag: $1" >&2; usage 1 ;;
+        # ---- your-org/nexus-code#858 A: exactly ONE positional ----------
+        #
+        # A second bare positional used to be bound to --repo-path. The
+        # usage advertises one positional, so that binding was
+        # undocumented — and it is the one failure in this file that
+        # SUCCEEDS while doing the wrong thing.
+        #
+        # A bare ISSUE NUMBER is the plausible second argument here,
+        # because `ng wrap-up`, `ng reply`, `ng comment`, `ng react` and
+        # `ng close` all take one in that slot. Observed:
+        # `ng upload <report> 846` wrote `assets/846` (a FILE where the
+        # issue's own asset DIRECTORY lives), printed a resolving URL,
+        # and exited 0 — while leaving the link an `ng wrap-up` comment
+        # already pointed at aimed at the superseded copy. A reader
+        # following the issue link read the stale report; the pane said
+        # the upload succeeded.
+        #
+        # Refuse, and name the flag the caller almost certainly wanted.
+        # An all-digits token gets the `--issue` diagnostic specifically:
+        # that is the mistake that was actually made, and "unexpected
+        # argument" alone would leave the caller to guess between
+        # --issue and --repo-path.
         *)             if [[ -z "$LOCAL" ]]; then
                            LOCAL="$1"
-                       elif [[ -z "$REPO_PATH" ]]; then
-                           REPO_PATH="$1"
+                       elif [[ "$1" =~ ^[0-9]+$ ]]; then
+                           {
+                             echo "upload-asset.sh: unexpected second positional argument: $1"
+                             echo "  This takes exactly ONE positional (the local path). Did you mean:"
+                             echo "      upload-asset.sh $LOCAL --issue $1"
+                             echo "  A bare number here used to be taken as --repo-path and upload to"
+                             echo "  assets/$1, exit 0, and print a URL (your-org/nexus-code#858)."
+                           } >&2
+                           usage 1
                        else
-                           echo "unknown positional: $1" >&2; usage 1
+                           {
+                             echo "upload-asset.sh: unexpected second positional argument: $1"
+                             echo "  This takes exactly ONE positional (the local path)."
+                             echo "  To override placement, pass it as a flag: --repo-path $1"
+                           } >&2
+                           usage 1
                        fi
                        shift ;;
     esac
@@ -129,10 +384,48 @@ case "$REPO_PATH" in
     *)        REPO_PATH="assets/$REPO_PATH" ;;
 esac
 
+[[ -n "$MESSAGE" ]] || MESSAGE="Add asset $BASENAME via upload-asset.sh"
+
+# WHICH LOCAL CLONE — keyed on the repo it caches (your-org/nexus-code#1694).
+# The clone, its `.staging/` and its `.lock` are a cache of ONE asset repo. With
+# $NEXUS_CONFIG (or --asset-repo / $NEXUS_ASSET_REPO) naming a repo that is not
+# this root's own, the generic `<root>/assets` used to host that OTHER repo's
+# clone: the `remote set-url origin` below re-points whatever clone is there at
+# $REPO, and a request staged under the shared `.staging/` can be drained by a
+# concurrent manager pushing to the root's own repo. So:
+#   * REPO is the root's OWN asset repo -> `<root>/assets`, exactly as before
+#     (no migration for the common case);
+#   * anything else                     -> `<root>/assets.<owner>__<name>`.
+# "Own" is the root's config read WITHOUT $NEXUS_CONFIG — the same
+# `github.asset_repo`, fallback `github.repo`, that REPO_CONFIGURED reads when
+# no NEXUS_CONFIG is set. GitHub names are case-insensitive, so the comparison
+# and the key are lowercased: two spellings of one repo share one clone.
+_own_cfg() { env -u NEXUS_CONFIG NEXUS_ROOT="$_nexus_root" "$_nexus_root/config/load.sh" "$@"; }
+if [[ -n "${NEXUS_CONFIG:-}" ]]; then
+    REPO_OWN="$(_own_cfg github.asset_repo "$(_own_cfg github.repo "")" 2>/dev/null)" || REPO_OWN=""
+else
+    REPO_OWN="$REPO_CONFIGURED"
+fi
+_repo_lc=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')
+if [[ "$_repo_lc" == "$(printf '%s' "$REPO_OWN" | tr '[:upper:]' '[:lower:]')" ]]; then
+    ASSETS_DIR="$_nexus_root/assets"
+elif [[ "$_repo_lc" =~ ^([a-z0-9_.-]+)/([a-z0-9_.-]+)$ \
+        && "${BASH_REMATCH[1]}" != . && "${BASH_REMATCH[1]}" != .. \
+        && "${BASH_REMATCH[2]}" != . && "${BASH_REMATCH[2]}" != .. ]]; then
+    ASSETS_DIR="$_nexus_root/assets.${BASH_REMATCH[1]}__${BASH_REMATCH[2]}"
+else
+    # Not `owner/name`: there is no clone path to key it on, and no GitHub repo
+    # it could name. Refused before anything is staged, like every other 7.
+    echo "upload-asset.sh: REFUSING — asset repo '$REPO' (from $REPO_SOURCE) is not an owner/name; cannot key its local clone (your-org/nexus-code#1694)." >&2
+    exit 7
+fi
+unset _repo_lc
+
 # REPO_PATH names a FILE. A trailing slash, or a path that is an existing
 # directory in the assets checkout, would make the drain's `cp` drop the
 # internal staging blob (req.XXXXXXXXXX.blob) into that directory and commit
-# it at exit 0 (#211). Refuse up front and name the path the caller meant.
+# it at exit 0 (#211). Refuse up front (after ASSETS_DIR, which keys the
+# clone, is resolved) and name the path the caller meant.
 _rp_dir="${REPO_PATH%/}"
 if [[ "$REPO_PATH" == */ || -d "$ASSETS_DIR/$REPO_PATH" ]]; then
     echo "upload-asset.sh: --repo-path $REPO_PATH names a directory, not a file." \
@@ -140,10 +433,11 @@ if [[ "$REPO_PATH" == */ || -d "$ASSETS_DIR/$REPO_PATH" ]]; then
     exit 1
 fi
 
-[[ -n "$MESSAGE" ]] || MESSAGE="Add asset $BASENAME via upload-asset.sh"
-
 TOKEN="$("$_script_dir/mint-token.sh")" || { echo "mint-token.sh failed" >&2; exit 2; }
-ASSET_URL_AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+# The token never enters a URL: a credentialed URL sits in the argv of `git
+# clone`, `git remote set-url` and every `git-remote-https` that a fetch or push
+# spawns, and argv is readable in /proc by every same-uid agent (#1840). It
+# reaches git through _git_hardened's credential helper instead.
 ASSET_URL_NOAUTH="https://github.com/${REPO}.git"
 
 # Git author identity for the asset commit. No hardcoded operator fallback:
@@ -152,9 +446,9 @@ ASSET_URL_NOAUTH="https://github.com/${REPO}.git"
 # convention from github.bot_login (which every operator sets). Fail loud if
 # none resolves — a wrong identity mis-attributes commits and breaks
 # notification routing.
-_bot_login="$("$_cfg" github.bot_login "")"
-BOT_NAME="$("$_cfg" github.bot_git_name "${_bot_login:+${_bot_login}[bot]}")"
-BOT_EMAIL="$("$_cfg" github.bot_git_email "${_bot_login:+${_bot_login}[bot]@users.noreply.github.com}")"
+_bot_login="$(_cfg github.bot_login "")"
+BOT_NAME="$(_cfg github.bot_git_name "${_bot_login:+${_bot_login}[bot]}")"
+BOT_EMAIL="$(_cfg github.bot_git_email "${_bot_login:+${_bot_login}[bot]@users.noreply.github.com}")"
 [[ -n "$BOT_NAME" && -n "$BOT_EMAIL" ]] || {
     echo "upload-asset.sh: cannot determine bot git identity — set github.bot_login (or github.bot_git_name/_email) in nexus config (see config/nexus.example.yml)" >&2
     exit 2
@@ -173,11 +467,15 @@ _LOCK_FD=9
 
 # _git_hardened — the ONLY way this script may invoke git.
 #
-#  1. `-c credential.helper=` (empty value RESETS the helper list). We embed a
-#     freshly-minted installation token in the remote URL, so a credential
-#     cache buys nothing — and costs everything: `git push` otherwise forks
-#     `git-credential-cache--daemon`, which is what leaked the lock. It would
-#     also cache an EXPIRED token and re-serve it. No helper, no daemon.
+#  1. `-c credential.helper=` (empty value RESETS the helper list), then ONE
+#     inline helper that answers `get` with the freshly-minted installation
+#     token from the environment. A credential cache buys nothing — and costs
+#     everything: `git push` otherwise forks `git-credential-cache--daemon`,
+#     which is what leaked the lock. It would also cache an EXPIRED token and
+#     re-serve it. The inline helper is a one-shot `sh -c`, not a daemon. The
+#     token rides in the environment (0400 in /proc, same uid only) and never
+#     in a URL or any argv (#1840); the helper's own argv names the variable,
+#     never its value.
 #
 #  2. `GIT_TERMINAL_PROMPT=0` — when the installation token expires mid-batch
 #     (~1 h TTL), git falls through to an interactive credential prompt. With
@@ -201,8 +499,11 @@ _LOCK_FD=9
 # (a pager, a filter, an askpass); guard 3 alone leaves an expired token
 # cached and re-served. Neither subsumes the other.
 _git_hardened() {
-    GIT_TERMINAL_PROMPT=0 \
-    git -c credential.helper= "$@" {_LOCK_FD}>&-
+    # Defined inside the function so a suite that lifts it verbatim
+    # (test-upload-asset-fd-leak.sh) gets the helper with it.
+    local helper='!f() { test "$1" = get || exit 0; printf "username=x-access-token\npassword=%s\n" "$NEXUS_ASSET_TOKEN"; }; f'
+    GIT_TERMINAL_PROMPT=0 NEXUS_ASSET_TOKEN="${TOKEN:-}" \
+    git -c credential.helper= -c "credential.helper=$helper" "$@" {_LOCK_FD}>&-
 }
 
 _git_assets() {
@@ -210,6 +511,156 @@ _git_assets() {
         -c "user.name=${BOT_NAME}" \
         -c "user.email=${BOT_EMAIL}" \
         "$@"
+}
+
+# ---------------------------------------------------------------------------
+# TERMINAL GUARD (your-org/nexus-code#1077): the asset tree must be a git
+# repository ROOTED AT ITSELF, or this script does not run a single git verb.
+#
+# This is the guard that makes the failure impossible rather than merely
+# unlikely, and it would have caught the incident even with the wrong root.
+#
+# The mechanism it closes, measured: `git -C <dir>` does not require <dir> to be
+# a repository. When <dir>/.git is absent OR PRESENT-BUT-INVALID, git DISCOVERY
+# WALKS UP and silently operates on the first real repository above it. The
+# observed precondition on `work/nexus-code-stubred-sk` was a HALF-CREATED asset
+# clone that left `<root>/assets/.git/` holding nothing but `objects/`. The old
+# bootstrap probe asked `[[ ! -d "$ASSETS_DIR/.git" ]]` — a test for a DIRECTORY
+# NAMED `.git`, not for a repository — so it concluded "already cloned", skipped
+# the clone, and handed every subsequent `_git_assets` call to the ENCLOSING
+# checkout: `checkout main`, `remote set-url origin <asset-repo>`,
+# `reset --hard origin/main`, `commit`. A nexus-code working tree became the
+# asset repo. The script exited 0 and printed a valid URL.
+#
+# Note what the root fix alone does NOT do: with $NEXUS_ROOT honoured, the same
+# stub under `<primary>/assets/.git` retargets the PRIMARY nexus checkout
+# instead of a clone's. Fixing the root without this guard relocates the
+# destruction, it does not remove it. Hence: guard first, root correctness
+# second.
+#
+# Refuse rather than repair. Clearing a `.git` we have just decided we do not
+# understand is another guess, and guessing is the defect. The one exception is
+# an EMPTY directory, which has no content to destroy and is proven empty by
+# `rmdir` succeeding rather than by a heuristic.
+# ---------------------------------------------------------------------------
+
+# Print the toplevel of the repository `git -C "$ASSETS_DIR"` would act on
+# (physical path), or nothing when that is no repository at all.
+_asset_tree_toplevel() {
+    local top
+    top=$(_git_hardened -C "$ASSETS_DIR" rev-parse --show-toplevel 2>/dev/null) || return 0
+    [[ -n "$top" ]] || return 0
+    (cd "$top" 2>/dev/null && pwd -P) || return 0
+}
+
+# Print the git dir `git -C "$ASSETS_DIR"` would use, or nothing.
+_asset_tree_gitdir() {
+    _git_hardened -C "$ASSETS_DIR" rev-parse --absolute-git-dir 2>/dev/null || return 0
+}
+
+# 0 when $ASSETS_DIR is a git repository whose toplevel is $ASSETS_DIR itself
+# AND whose ref store lives in $ASSETS_DIR/.git.
+#
+# BOTH halves are load-bearing. The toplevel test alone admits a LINKED
+# WORKTREE: measured on this host, `git worktree add ../assets` gives
+# `--show-toplevel` = `<…>/assets` (so it looks self-rooted) while
+# `--absolute-git-dir` = `<parent>/.git/worktrees/assets`. Its refs are the
+# PARENT repository's, so `checkout main` + `reset --hard origin/main` +
+# `commit` would move the parent's branch — the #1077 outcome reached by a
+# second road, and invisible to a toplevel-only check.
+_asset_tree_is_self_rooted() {
+    local top real gd
+    top=$(_asset_tree_toplevel)
+    [[ -n "$top" ]] || return 1
+    real=$(cd "$ASSETS_DIR" 2>/dev/null && pwd -P) || return 1
+    [[ "$top" == "$real" ]] || return 1
+    gd=$(_asset_tree_gitdir)
+    [[ -n "$gd" ]] || return 1
+    [[ "$gd" == "$real/.git" ]]
+}
+
+# Drop THIS request's staged files. Called on the refusal path only.
+#
+# your-org/nexus-code#1077 skeptic finding 2. STAGE runs BEFORE the guard, so a
+# refusal used to leave `req.XXXX.{req,blob}` in $STAGING_DIR — and the batch
+# manager of any LATER upload snapshots `"$STAGING_DIR"/*.req` and commits every
+# marker it finds. Measured: a refused upload, then an operator `rm -rf assets`,
+# then one unrelated upload of a different file — and the REFUSED payload landed
+# on a live asset path, in a commit the unrelated upload made. The refused caller
+# had been told `rc=4`, and the header had told it nothing was touched.
+#
+# A refusal that is not clean is worse than no refusal, because the caller reads
+# the refusal and stops looking.
+#
+# ONLY OUR OWN REQUEST IS REMOVED, AND THE REASON IS NOT THE OBVIOUS ONE. An
+# earlier version of this comment said the other markers "belong to callers still
+# blocked on the lock, each of which becomes manager, refuses, and un-stages
+# itself". That is FALSE, and a skeptic's control disproved it: a marker whose
+# owner died between the atomic `mv` that published it and its `flock` has NO
+# live caller at all, so nobody ever becomes its manager. Such an orphan survives
+# this refusal and is later adopted onto a live path.
+#
+# That adoption is NOT this guard's bug and NOT this fix's scope. The same orphan
+# is adopted by a plain SUCCESSFUL upload with no refusal anywhere in the picture
+# — it is the batch manager's PRE-EXISTING crash-recovery contract, stated in
+# this file's own header: "a dead manager leaves in-flight markers in place and
+# the new manager re-drains them". Adopting other callers' markers is the
+# mechanism that makes a dead manager survivable.
+#
+# So the scope is right for a reason worth writing down correctly: another
+# caller's marker is the CRASH-RECOVERY CONTRACT'S to re-drain, not ours to
+# delete — not because its owner is necessarily still alive to re-drain it. A
+# future reader who trusts the old wording could "fix" orphan adoption and
+# destroy crash recovery instead.
+_unstage_this_request() {
+    [[ -n "${REQ_BASE:-}" ]] || return 0        # refused before STAGE — nothing to undo
+    # The `.url` removal has a residual worth naming. REASONED, NOT MEASURED —
+    # deliberately left as a hypothesis rather than promoted to a finding: a
+    # `.url` for OUR request can only exist if a PRIOR manager already drained
+    # and PUSHED it while we were blocked on the lock. If that is reachable, this
+    # refusal both misreports (the upload did happen) and erases its own evidence
+    # (the result file that proves it). Not established, not fixed here.
+    rm -f "$REQ_BASE.req" "$REQ_BASE.req.tmp" "$REQ_BASE.blob" \
+          "$REQ_BASE.url" "$REQ_BASE.url.tmp" \
+          "$REQ_BASE.refused" "$REQ_BASE.refused.tmp" "$REQ_BASE.err" 2>/dev/null || true
+}
+
+# Hard assertion. $1 = phase label, quoted into the diagnostic.
+_assert_asset_tree_self_rooted() {
+    local phase="$1" top real
+    real=$(cd "$ASSETS_DIR" 2>/dev/null && pwd -P) || real="$ASSETS_DIR"
+    top=$(_asset_tree_toplevel)
+    _asset_tree_is_self_rooted && return 0
+    {
+        echo "upload-asset.sh: REFUSING to write — the asset tree is not its own repository."
+        echo "  phase       : $phase"
+        echo "  asset tree  : $real"
+        local gd; gd=$(_asset_tree_gitdir)
+        if [[ -z "$top" ]]; then
+            echo "  git-discovery target : <none found>"
+        elif [[ "$top" != "$real" ]]; then
+            echo "  git-discovery target : $top"
+            echo "                         ^^^ a DIFFERENT repository. Writing here would"
+            echo "                         check out, reset --hard and commit to IT."
+        fi
+        if [[ -n "$gd" && "$gd" != "$real/.git" && "$top" == "$real" ]]; then
+            echo "  ref store   : $gd"
+            echo "                ^^^ this tree is a LINKED WORKTREE or submodule. Its"
+            echo "                toplevel IS the asset tree, so it looks self-rooted,"
+            echo "                but its branches belong to another repository and a"
+            echo "                reset --hard here would move THAT repository's branch."
+        elif [[ -e "$ASSETS_DIR/.git" ]]; then
+            echo "  $ASSETS_DIR/.git exists but is not a valid repository —"
+            echo "  the signature of an interrupted clone. Remove it and retry:"
+            echo "      rm -rf $(printf '%q' "$ASSETS_DIR")"
+        fi
+        echo "  your-org/nexus-code#1077: this exact shape converted a nexus-code"
+        echo "  checkout into the asset repo and destroyed a worker's staged work."
+        echo "  Nothing was written, and this request has been un-staged — no later"
+        echo "  upload will adopt it."
+    } >&2
+    _unstage_this_request
+    exit 4
 }
 
 # ---------------------------------------------------------------------------
@@ -241,7 +692,9 @@ _git_assets() {
 #              would create. Then ONE push for the whole chain. Only AFTER
 #              the push succeeds, write each request's URL into its result
 #              file and remove its marker.
-#   4. COLLECT: read this request's own result file and print the URL.
+#   4. COLLECT: read this request's own result file and print the URL — or,
+#              if the manager REFUSED it (destination collision, exit 5), its
+#              `.refused` file, whose message goes to stderr.
 #
 # Reliability / failure modes:
 #   - Manager death (crash/SIGKILL/OOM) holding the lock: flock is
@@ -269,8 +722,9 @@ _git_assets() {
 # Dangling-SHA invariant: a URL is emitted only from a result file, a result
 # file is written only AFTER `git push` returns 0, and the SHA it pins is a
 # commit in the just-pushed chain. A URL can therefore never name a commit
-# absent from the remote. Worker-facing contract is unchanged:
-# `url=$(ng upload <file>)` — all coordination is internal, no new flags.
+# absent from the remote. Worker-facing contract: `url=$(ng upload <file>)` —
+# all coordination is internal. The one flag the staging model carries is
+# --replace (your-org/nexus-code#1639), recorded in the marker as `replace\t1`.
 # ---------------------------------------------------------------------------
 
 STAGING_DIR="${ASSETS_DIR}.staging"
@@ -301,7 +755,12 @@ build_url() {
 # must retry/fail, never silently short-circuit the sync.
 remote_has_main() {
     local out rc
-    out=$(_git_assets ls-remote --heads origin main 2>/dev/null); rc=$?
+    # `out=$(…) && rc=0 || rc=$?`, NEVER `out=$(…); rc=$?` (your-org/nexus-code#1403):
+    # this file runs under `set -e`, so a bare assignment whose substitution
+    # exits non-zero terminates the SHELL at the assignment — `rc=$?` never ran
+    # and the `return 2` (indeterminate, retry) below was unreachable for exactly
+    # the failures it exists to classify.
+    rc=0; out=$(_git_assets ls-remote --heads origin main 2>/dev/null) || rc=$?
     (( rc == 0 )) || return 2
     [[ -n "$out" ]] && return 0 || return 1
 }
@@ -339,6 +798,104 @@ sync_tree() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# DESTINATION GUARD (your-org/nexus-code#1173) — WHICH REMOTE, not which tree.
+#
+# THE MEASURED DEFECT. Five bot commits sit on `your-org/nexus-code`'s `main`,
+# each "Add asset <name> via upload-asset.sh", the newest 2026-09-01T17:56:49
+# -0700. They are the structural reason a `dev` -> `main` promotion can never be
+# a fast-forward, and they put one operator's report assets into the shared
+# implementation repo every operator clones.
+#
+# NEITHER FILED MECHANISM EXPLAINS THEM, and both were correctly refuted on the
+# thread before this fix: root resolution is right (`nexus_primary_root`
+# de-nests a `work/` clone to the primary), and the `nexus.example.yml`
+# placeholder resolves to a repo that 404s rather than to `nexus-code`. The
+# actual mechanism is one line below this block:
+#
+#     _git_assets remote set-url origin "$ASSET_URL_NOAUTH"   # built from $REPO
+#     _git_assets push --quiet origin main
+#
+# The asset tree can be perfectly self-rooted, correctly cloned, and pointed at
+# the right repo — and this REPOINTS ITS ORIGIN at whatever `$REPO` says, then
+# pushes to that repo's `main`. The `#1077` TERMINAL GUARD above asks which
+# local TREE git will act on; it cannot see a wrong REMOTE, so it passes
+# throughout. That is why every tree-based reproduction came back clean.
+#
+# WHY `$REPO` WAS WRONG: THE SAME FLAG MEANS TWO THINGS ON ONE CLI. Thirteen
+# `ng` verbs spell it `[--repo <owner/name>]` meaning the ISSUE/PR repo —
+# `reply`, `comment`, `close`, `react`, `show`, `issue`, `wrap-up`, … — and
+# here the identical spelling means the ASSET repo. A worker whose issue is on
+# the implementation repo types what every other verb taught them to type, and
+# the asset is pushed there. Confirmed against the action log: the same report
+# was uploaded CORRECTLY by `wrap-up` (which passes only `--issue`) to the
+# configured asset repo at 17:44:25, and a SECOND upload twelve minutes later
+# put it on `nexus-code`'s `main`.
+#
+# TWO RULES, BOTH DEFAULT-DENY, BOTH DERIVED — never a hardcoded repo name,
+# because this file is cloned by every operator and a literal here would hand
+# one operator's answer to somebody else.
+# ---------------------------------------------------------------------------
+
+# `owner/name` for the repository THIS NEXUS CHECKOUT itself came from, or
+# nothing when that cannot be established.
+_nexus_origin_repo() {
+    local u
+    # _git_hardened, not a bare `git`: this script has exactly ONE way to
+    # invoke git and test-upload-asset-fd-leak.sh asserts that structurally.
+    u=$(_git_hardened -C "$_nexus_root" config --get remote.origin.url 2>/dev/null) || return 1
+    [[ -n "$u" ]] || return 1
+    u=${u%.git}
+    case "$u" in
+        *github.com/*) printf '%s' "${u##*github.com/}" ;;
+        *github.com:*) printf '%s' "${u##*github.com:}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# RULE 1 — `--repo` may only restate the configured asset repo.
+# It is the spelling that carries the collision, so it is allowed to be a
+# no-op and nothing else. A genuinely different asset repo is `--asset-repo`
+# or $NEXUS_ASSET_REPO, both of which say what they mean.
+if [[ "$REPO_SOURCE" == '--repo' && "$REPO" != "$REPO_CONFIGURED" ]]; then
+    {
+        echo "upload-asset.sh: REFUSING — --repo '$REPO' is not this nexus's asset repo."
+        echo "  configured asset repo : $REPO_CONFIGURED"
+        echo "  ON THIS TOOL --repo MEANS THE ASSET REPO — the repository the file is"
+        echo "  PUSHED INTO. On ng reply/comment/close/react/show/issue/wrap-up the same"
+        echo "  flag means the ISSUE repo. If you meant the issue, drop the flag: the"
+        echo "  asset belongs in the asset repo whatever repo the issue lives in, and"
+        echo "  the URL this prints works from any repo's comments."
+        echo "  If you really do mean a different ASSET repo, say so: --asset-repo $REPO"
+        echo "  (your-org/nexus-code#1173)"
+    } >&2
+    exit 7
+fi
+
+# RULE 2 — the destination may not be the repository this nexus checkout came
+# from, whatever supplied it. That is the shared implementation repo, and an
+# asset pushed there is one operator's report in every operator's clone.
+_origin_repo=$(_nexus_origin_repo) || _origin_repo=""
+if [[ -z "$_origin_repo" ]]; then
+    # Say so rather than pass silently: this guard did not run, and a silence
+    # that means "could not check" must not read as "checked and fine".
+    echo "upload-asset.sh: NOTE — could not read $_nexus_root's origin, so the" \
+         "#1173 self-push guard did not evaluate. Destination: $REPO" >&2
+elif [[ "$_origin_repo" == "$REPO" && "${NEXUS_ALLOW_ORIGIN_ASSET_REPO:-0}" != 1 ]]; then
+    {
+        echo "upload-asset.sh: REFUSING — the asset destination is this nexus checkout's OWN origin."
+        echo "  destination   : $REPO   (from $REPO_SOURCE)"
+        echo "  checkout      : $_nexus_root"
+        echo "  its origin    : $_origin_repo"
+        echo "  That is the implementation repository every operator clones. Assets"
+        echo "  pushed there are one operator's reports in everybody else's tree, and"
+        echo "  they permanently prevent a fast-forward promotion (your-org/nexus-code#1173)."
+        echo "  Set NEXUS_ALLOW_ORIGIN_ASSET_REPO=1 only if this repo really is your"
+        echo "  asset repo."
+    } >&2
+    exit 7
+fi
+
 # --- 1. STAGE: publish this request (lock-free, atomic) --------------------
 mkdir -p "$STAGING_DIR"
 REQ_BASE="$(mktemp -u "$STAGING_DIR/req.XXXXXXXXXX")"
@@ -350,6 +907,7 @@ cp "$LOCAL" "$REQ_BASE.blob"
     printf 'repo_path\t%s\n' "$REPO_PATH"
     printf 'shape\t%s\n'     "$SHAPE"
     printf 'message\t%s\n'   "$MESSAGE"
+    printf 'replace\t%s\n'   "$REPLACE"
 } > "$REQ_BASE.req.tmp"
 mv -f "$REQ_BASE.req.tmp" "$REQ_BASE.req"
 RESULT="$REQ_BASE.url"
@@ -373,7 +931,6 @@ fi
 # holding this lock (your-org/nexus-code#468). Mint late, push soon after.
 if _fresh_token="$("$_script_dir/mint-token.sh")" && [[ -n "$_fresh_token" ]]; then
     TOKEN="$_fresh_token"
-    ASSET_URL_AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
 else
     # Non-fatal: the startup token may still be valid. Fail at push, loudly.
     echo "upload-asset.sh: re-mint under lock failed; proceeding with the" \
@@ -381,18 +938,37 @@ else
 fi
 
 # --- 3. DRAIN (manager, under lock) ----------------------------------------
-# First-run bootstrap: clone the asset repo if this tree has no .git yet.
+# First-run bootstrap: clone the asset repo if this tree is not already one.
 # Not _git_assets (no -C into a not-yet-existing dir) but the same hardening.
-if [[ ! -d "$ASSETS_DIR/.git" ]]; then
-    _git_hardened clone "$ASSET_URL_AUTH" "$ASSETS_DIR" >&2 \
+#
+# The predicate is "is $ASSETS_DIR a repository rooted at ITSELF", never
+# "does a directory named .git exist here" — see the TERMINAL GUARD block
+# above for why that distinction is the whole defect (#1077).
+if ! _asset_tree_is_self_rooted; then
+    if [[ -e "$ASSETS_DIR" ]]; then
+        # Occupied by something that is not the asset repo. An EMPTY directory
+        # is unambiguous debris — `rmdir` proves it empty and clears it. Any
+        # other content (notably an interrupted clone's `.git/objects` stub) is
+        # refused, not guessed at.
+        rmdir "$ASSETS_DIR" 2>/dev/null \
+            || _assert_asset_tree_self_rooted "pre-bootstrap: path occupied"
+    fi
+    _git_hardened clone "$ASSET_URL_NOAUTH" "$ASSETS_DIR" >&2 \
         || { echo "asset-repo clone failed" >&2; exit 3; }
+    # A clone that reported success but did not leave a self-rooted repository
+    # would put us straight back in #1077 with the guard bypassed. Assert it.
+    _assert_asset_tree_self_rooted "after bootstrap clone"
     # Empty asset repo → unborn HEAD on init.defaultBranch (often master);
     # pin to main so the first push lands on main (your-org/your-nexus#236 B8).
     if ! _git_assets rev-parse --verify -q HEAD >/dev/null 2>&1; then
         _git_assets symbolic-ref HEAD refs/heads/main
     fi
 fi
-_git_assets remote set-url origin "$ASSET_URL_AUTH" >/dev/null
+
+# Authoritative check on EVERY run, bootstrap or not, immediately before the
+# first mutating git verb (`remote set-url`, then sync_tree's checkout/reset).
+_assert_asset_tree_self_rooted "before asset-repo mutation"
+_git_assets remote set-url origin "$ASSET_URL_NOAUTH" >/dev/null
 sync_tree || { echo "asset-repo sync failed" >&2; exit 3; }
 
 # Snapshot the batch: every complete marker present now (ours is guaranteed
@@ -402,23 +978,25 @@ shopt -s nullglob
 batch=( "$STAGING_DIR"/*.req )
 shopt -u nullglob
 
-declare -A _sha _rp _shape
+declare -A _sha _rp _shape _refused
 processed=()
 attempt=0
 backoff=1
 while :; do
     (( attempt > 0 )) && { sync_tree || { echo "asset-repo re-sync failed" >&2; exit 3; }; }
     processed=()
+    _refused=()          # re-decided on every attempt, against that attempt's synced tree
     made_commit=0
     for marker in "${batch[@]}"; do
         [[ -f "$marker" ]] || continue          # already drained by a prior manager
         reqid="$(basename "${marker%.req}")"
-        rp=""; shp="pin"; msg=""
+        rp=""; shp="pin"; msg=""; rpl=0
         while IFS=$'\t' read -r k v; do
             case "$k" in
                 repo_path) rp="$v" ;;
                 shape)     shp="$v" ;;
                 message)   msg="$v" ;;
+                replace)   rpl="$v" ;;     # absent key ⇒ 0 ⇒ refuse (fail closed)
             esac
         done < "$marker"
         [[ -n "$rp" ]] || { echo "upload-asset.sh: marker $marker missing repo_path; skipping" >&2; continue; }
@@ -436,13 +1014,39 @@ while :; do
             continue
         fi
         mkdir -p "$(dirname "$dest")"
-        # Basename-collision warning (your-org/your-nexus#236 B8): a distinct
-        # source with the same basename overwrites at HEAD. Per-request commits
-        # mean prior SHA-pinned URLs still resolve to their own content.
-        if [[ -e "$dest" ]] && ! cmp -s "$blob" "$dest"; then
-            echo "upload-asset.sh: WARNING: $rp already holds a different asset;" \
-                 "overwriting at HEAD (prior SHA-pinned URLs still resolve)." \
-                 "Pass --repo-path <unique> to keep both." >&2
+        # DESTINATION COLLISION (your-org/nexus-code#1639; was a stderr WARNING
+        # since your-org/your-nexus#236 B8). The destination derives from the
+        # basename, so a second `summary.md` for one issue lands on the first's
+        # path. A warning followed by `cp` at rc 0 was silent in practice: the
+        # SHA-pinned URLs kept resolving, but HEAD — every `--shape latest` link
+        # and anyone browsing the asset repo — showed the wrong artefact.
+        #
+        # The predicate is "the path exists at the SYNCED HEAD (which includes
+        # this batch's earlier commits) and the bytes differ". HEAD, not the
+        # working tree: an untracked leftover is not an asset anyone links to.
+        # After `reset --hard` the tracked working-tree file IS HEAD's content,
+        # so `cmp` against it is the byte comparison. Identical bytes fall
+        # through to the unchanged/skip-commit path below — not a collision.
+        #
+        # PER-REQUEST: the manager drains OTHER callers' requests too, so a
+        # refusal must not abort the batch. It is recorded here and finalised
+        # (`.refused` written, marker cleared) only once the batch's fate is
+        # known — an exit 3 below leaves it staged for re-drain like any other.
+        if [[ "$rpl" != 1 ]] \
+           && _git_assets cat-file -e "HEAD:${rp}" 2>/dev/null \
+           && ! cmp -s "$blob" "$dest"; then
+            last=$(_git_assets log -1 --format='%h %cI "%s"' -- "$rp" 2>/dev/null) || last=""
+            _refused["$reqid"]="$(
+                printf 'upload-asset.sh: REFUSED (exit 5) — %s already holds a DIFFERENT asset\n' "$rp"
+                printf '  in the asset repo (%s)%s.\n' "$REPO" "${last:+, last written by $last}"
+                printf '  Overwriting it would change what HEAD, every --shape latest link and\n'
+                printf '  anyone browsing the asset repo show (your-org/nexus-code#1639).\n'
+                printf '  Nothing was uploaded. Either:\n'
+                printf '    keep both   : re-run with --repo-path <unique path>\n'
+                printf '    overwrite   : re-run with --replace   (SHA-pinned URLs to the old bytes keep resolving)\n'
+            )"
+            echo "upload-asset.sh: request $reqid refused: $rp holds a different asset (no --replace)" >&2
+            continue
         fi
         cp "$blob" "$dest"
         if _git_assets check-ignore -q -- "$rp"; then
@@ -527,9 +1131,19 @@ for reqid in "${processed[@]}"; do
     mv -f "$STAGING_DIR/$reqid.url.tmp" "$STAGING_DIR/$reqid.url"
     rm -f "$STAGING_DIR/$reqid.req" "$STAGING_DIR/$reqid.blob"
 done
+# Refused requests (your-org/nexus-code#1639): publish the refusal atomically
+# and clear the marker + blob so no later manager re-drains them. Their owners
+# read the `.refused` file in COLLECT and exit 5. `${!_refused[@]}` on an empty
+# associative array is empty (not unbound) under `set -u` in bash >= 4.4.
+for reqid in "${!_refused[@]}"; do
+    printf '%s\n' "${_refused[$reqid]}" > "$STAGING_DIR/$reqid.refused.tmp"
+    mv -f "$STAGING_DIR/$reqid.refused.tmp" "$STAGING_DIR/$reqid.refused"
+    rm -f "$STAGING_DIR/$reqid.req" "$STAGING_DIR/$reqid.blob"
+done
 
-# Strip the credential from the remote url, then release the lock so the next
-# waiter can proceed immediately.
+# Leave the remote url credential-free (it already is since #1840; this also
+# scrubs a token a pre-#1840 run left in .git/config), then release the lock so
+# the next waiter can proceed immediately.
 _git_assets remote set-url origin "$ASSET_URL_NOAUTH" >/dev/null
 flock -u "$_LOCK_FD" 2>/dev/null || true
 
@@ -541,10 +1155,24 @@ if [[ -f "$REQ_BASE.err" ]]; then
     rm -f "$REQ_BASE.err"
     exit 1
 fi
+# A REFUSAL is a result too (your-org/nexus-code#1639): message to stderr, NO
+# URL on stdout, exit 5.
+if [[ -f "$REQ_BASE.refused" ]]; then
+    cat "$REQ_BASE.refused" >&2
+    rm -f "$REQ_BASE.refused" "$RESULT"
+    exit 5
+fi
 [[ -f "$RESULT" ]] || {
     echo "upload-asset.sh: internal error — no result for $REQID after drain" >&2
     exit 3
 }
 url="$(< "$RESULT")"
 rm -f "$RESULT"
+# your-org/nexus-code#1856: github.com shows HTML as SOURCE, never rendered, so
+# an HTML asset alone does not reach a GitHub reader any better than a claude.ai
+# Artifact does. Say so on STDERR (stdout is the URL and callers parse it).
+case "$BASENAME" in
+    *.html|*.htm|*.HTML|*.HTM)
+        echo "upload-asset.sh: NOTE — GitHub does not render HTML; it shows the source. Upload an .md (or SVG/PNG images) beside it and link that for a GitHub reader (your-org/nexus-code#1856)." >&2 ;;
+esac
 printf '%s\n' "$url"

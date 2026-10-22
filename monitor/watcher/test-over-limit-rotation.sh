@@ -167,7 +167,11 @@ write_heartbeat() { # window session_id
 
 reset_state() {
     : > "$PASTE_LOG"; : > "$LOG_LOG"; : > "$LAST_BODY"
-    rm -f "$STATE_DIR/over-limit-state.tsv"
+    # Every over-limit TSV, not just the row file: the observation, flavour
+    # and liveness SIDECARS (upstream #592/#1488/#1141) persist per key, and
+    # a `resumed` liveness note left by one case suppresses the next case's
+    # record of the same key.
+    rm -f "$STATE_DIR"/over-limit-*.tsv
     rm -rf "$STATE_DIR/over-limit" "$STATE_DIR/heartbeat"
     rm -f "$STATE_DIR/orchestrator-session-id"
     unset PASTE_RC

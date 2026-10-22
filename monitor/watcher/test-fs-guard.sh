@@ -42,12 +42,22 @@ source "$_dir/_fs_guard.sh"
 WORK=$(mktemp -d)
 # 0555 fixtures must be made writable again before rm can recurse them.
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+# The degraded status file + paste lock live in a run dir OUTSIDE the tree
+# (your-org/nexus-code#1724); keep this suite's out of the operator's.
+export NEXUS_DEGRADED_RUNDIR="$WORK/degraded-run"
 
 # root ignores mode bits, so a 0555 dir is still writable for it.
 _can_test_ro=1
 [[ "$(id -u)" == "0" ]] && _can_test_ro=0
 if (( ! _can_test_ro )); then
-    echo "SKIP: running as root — 0555 fixtures cannot model a read-only mount" >&2
+    # `th_skip`, not a bare echo (your-org/nexus-code#783). The hand-rolled form
+    # printed `SKIP:` but bumped NO counter, so this path reached
+    # `th_summary_and_exit` with PASS=FAIL=SKIP=0 and announced an unqualified
+    # `=== summary: 0 passed, 0 failed ===` / `ALL TESTS PASSED` at rc 0 — a
+    # clean sweep over a suite that asserted nothing. Same defect class as the
+    # uncounted FAIL aborts, one counter over.
+    th_skip "read-only-mount fixtures" \
+            "running as root — root ignores mode bits, so a 0555 dir is still writable and cannot model a read-only mount"
     th_summary_and_exit
 fi
 
@@ -574,5 +584,95 @@ assert_contains "T12: explains the pidfile is impossible"        "$(cat "$LWORK/
 assert_file_exists "T12: log fell back to a writable mount" "$t12_tmp/nexus-watcher-degraded.log"
 assert_no_file     "T12: nothing was written into the read-only state dir" "$LPIDFILE"
 _cleanup_launcher_case
+
+# =============================================================================
+# T13 — the escalation PAGES the operator (Pushover via the REAL notify.sh)
+#       from a READ-ONLY tree, and a flapping tree cannot spam the page.
+#       RO7, 2026-10-12: 4 h 45 m read-only, escalated via
+#       [sandbox-notify,github-issue,tmux-display] — no leg ever called
+#       notify.sh, so nobody was paged. (Pre-fix: the curl stub sees nothing.)
+#       The fixture root carries a COPY of notify.sh + config/load.sh and is
+#       chmod a-w as a whole; curl is the STUB on PATH (STUB_BIN), so nothing
+#       reaches the network, and the email leg is disabled by empty overrides.
+# =============================================================================
+echo '=== T13: read-only tree still PAGES the operator; the page is rate-bounded ==='
+_reset_incident_state; FS_PUSH_LAST=0
+t13_root="$WORK/t13/nexus"; t13_state="$t13_root/monitor/.state"
+mkdir -p "$t13_state" "$t13_root/config" "$WORK/t13/keys"
+cp "$REPO_ROOT/monitor/notify.sh" "$REPO_ROOT/monitor/_nexus-root.sh" "$t13_root/monitor/"
+cp "$REPO_ROOT/config/load.sh" "$REPO_ROOT/config/nexus.example.yml" "$t13_root/config/"
+printf 'USERKEY1234567\n' > "$WORK/t13/keys/user"; printf 'APPTOKEN1234567\n' > "$WORK/t13/keys/app"
+chmod 600 "$WORK/t13/keys/user" "$WORK/t13/keys/app"
+cat > "$STUB_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CURL_CALLS:-/dev/null}"
+printf '200'
+EOF
+chmod +x "$STUB_BIN/curl"
+export CURL_CALLS="$WORK/t13-curl.log"; : > "$CURL_CALLS"
+export NOTIFY_LOG="$WORK/t13-notify.log"; : > "$NOTIFY_LOG"
+export GH_CALLS="$WORK/t13-gh.log";       : > "$GH_CALLS"
+export TMUX_CALLS="$WORK/t13-tmux.log";   : > "$TMUX_CALLS"
+export LOG_SINK="$WORK/t13-log.log";      : > "$LOG_SINK"
+t13_tmp="$WORK/t13-tmp"; mkdir -p "$t13_tmp"
+chmod -R a-w "$t13_root"
+# POSITIVE CONTROL: the fixture must really refuse writes for THIS uid, or a
+# green below says nothing about a read-only tree.
+t13_pc=0; ( : > "$t13_state/.pc" ) 2>/dev/null && t13_pc=1
+assert_eq "T13: positive control — the a-w state dir REFUSES a write" "$t13_pc" "0"
+before=$(_snapshot_tree "$t13_root")
+# Knobs a case varies: the push interval and the run dir (both read at call time).
+# The FIRST page runs with a run dir that can be neither written nor read, so it
+# also proves STATE NEVER SUPPRESSES THE PAGE (send is the safe direction), and
+# leaves the in-process memory as the ONLY store — which the next case isolates.
+t13_rd_ro="$WORK/t13-rundir-ro"; mkdir -p "$t13_rd_ro"; chmod 0555 "$t13_rd_ro"
+T13_IV=1800; T13_RD="$t13_rd_ro/sub"
+_t13_escalate() {
+    STATE_DIR="$t13_state" NEXUS_ROOT="$t13_root" TARGET=orchestrator TMPDIR="$t13_tmp" \
+    NEXUS_NOTIFY_QUIET=0 NEXUS_PUSHOVER_USER_KEY_FILE="$WORK/t13/keys/user" \
+    NEXUS_PUSHOVER_APP_TOKEN_FILE="$WORK/t13/keys/app" NEXUS_NOTIFY_TOKEN="$WORK/t13/keys/none" \
+    NEXUS_EMAIL_TO="" NEXUS_SMTP_HOST="" MONITOR_FS_PUSH_MIN_INTERVAL_SECONDS="$T13_IV" \
+    NEXUS_DEGRADED_RUNDIR="$T13_RD" _fs_escalate_once
+}
+_t13_escalate
+after=$(_snapshot_tree "$t13_root")
+assert_contains "T13: notify.sh reached the Pushover API (stub)" "$(cat "$CURL_CALLS")" "api.pushover.net"
+assert_contains "T13: the page is EMERGENCY priority"            "$(cat "$CURL_CALLS")" "priority=1"
+assert_contains "T13: the page carries the remedy"               "$(cat "$CURL_CALLS")" "RESTART THE SANDBOX"
+assert_contains "T13: push recorded as a delivered channel"      "$FS_CHANNELS" "push"
+assert_contains "T13: the log says the page was delivered"       "$(cat "$LOG_SINK")" "push page — delivered"
+assert_eq       "T13: NOT ONE file created under the RO root"    "$before" "$after"
+assert_no_file  "T13: the unwritable run dir got no stamp"       "$t13_rd_ro/sub"
+t13_n=$(grep -c 'api.pushover.net' "$CURL_CALLS")
+assert_eq       "T13: exactly one page so far"                   "$t13_n" "1"
+# THE BOUND: a recovery re-arms the fire-once latch; a flap back to RO inside
+# the interval must not page again. From MEMORY alone (no stamp exists)…
+FS_ESCALATED=0
+_t13_escalate
+assert_eq       "T13: a flap inside the interval does NOT re-page (memory only)" \
+    "$(grep -c 'api.pushover.net' "$CURL_CALLS")" "1"
+assert_contains "T13: the throttle is logged"                    "$(cat "$LOG_SINK")" "push page — throttled"
+# …past the interval it pages again, now with a WRITABLE run dir (stamp lands)…
+chmod 0755 "$t13_rd_ro"; T13_RD="$WORK/t13-rundir"
+FS_ESCALATED=0; T13_IV=0
+_t13_escalate
+T13_IV=1800
+assert_eq       "T13: past the interval it pages again" \
+    "$(grep -c 'api.pushover.net' "$CURL_CALLS")" "2"
+assert_file_exists "T13: the rate stamp landed in the run dir (outside the tree)" \
+    "$(NEXUS_DEGRADED_RUNDIR="$T13_RD" STATE_DIR="$t13_state" _fs_push_stamp_path)"
+# …and from the STAMP alone (a restarted watcher: memory gone).
+FS_ESCALATED=0; FS_PUSH_LAST=0
+_t13_escalate
+assert_eq       "T13: a flap inside the interval does NOT re-page (stamp only)" \
+    "$(grep -c 'api.pushover.net' "$CURL_CALLS")" "2"
+# NEXUS_NOTIFY_QUIET=1 (run-tests.sh's hard off) sends nothing.
+FS_ESCALATED=0; FS_PUSH_LAST=0
+STATE_DIR="$t13_state" NEXUS_ROOT="$t13_root" TARGET=orchestrator TMPDIR="$t13_tmp" \
+    NEXUS_DEGRADED_RUNDIR="$WORK/t13-quiet-rd" NEXUS_NOTIFY_QUIET=1 _fs_escalate_once
+assert_eq       "T13: NEXUS_NOTIFY_QUIET=1 pages nothing" \
+    "$(grep -c 'api.pushover.net' "$CURL_CALLS")" "2"
+chmod -R u+w "$t13_root"
+_reset_incident_state; FS_PUSH_LAST=0
 
 th_summary_and_exit

@@ -103,8 +103,9 @@ For a bug in an external-upstream lab tool:
   report and STOP for operator review** before anything lands
   upstream, and grep the draft for internal identifiers (study
   names, sample IDs, cell counts, internal-repo refs) and redact.
-  See the "GitHub writes — WHETHER, by repo tier" section of the
-  workspace `CLAUDE.md` and `skills/nexus.bot/SKILL.md`.
+  See the workspace `CLAUDE.md`, section "GitHub writes — identity and
+  authorization" and its **WHETHER — by repo tier** rule, plus
+  `skills/nexus.bot/SKILL.md`.
 
 ## Tool → owner → routing table
 

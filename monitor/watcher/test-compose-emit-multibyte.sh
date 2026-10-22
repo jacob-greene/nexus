@@ -32,7 +32,8 @@ FAIL=0
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -94,8 +95,8 @@ eval "$(_pluck_fn _gh_filter_dedup_pipeline_file "$_test_dir/main.sh")"
 # decoder never engages and these tests would be vacuous.
 AMBIENT_UTF8=""
 for _loc in en_US.UTF-8 en_US.utf8 C.UTF-8; do
-    if locale -a 2>/dev/null | grep -qixF "${_loc/UTF-8/utf8}" \
-       || locale -a 2>/dev/null | grep -qixF "$_loc"; then
+    if grep -qixF "${_loc/UTF-8/utf8}" <<<"$(locale -a 2>/dev/null)" \
+       || grep -qixF "$_loc" <<<"$(locale -a 2>/dev/null)"; then
         AMBIENT_UTF8="$_loc"; break
     fi
 done

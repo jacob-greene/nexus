@@ -10,6 +10,9 @@ TRIGGER when: an orchestrator emit carries a
 watcher's `service_health` task surfaced a `grace`, `recovering`,
 `emit-only`, `flapping`, or `recovered` condition.
 
+Registering, changing or removing a service (the row, its healthcheck,
+its URL) is `skills/nexus.services/SKILL.md`, not this skill.
+
 ## Why this protocol exists
 
 A user-facing service going down is an availability-and-trust
@@ -59,6 +62,14 @@ the policy and exactly which path fired:
 - **`flapping`** — the auto-restart **gave up** after hitting the
   flap ceiling. **The actionable failure case — run the full
   protocol below.**
+
+A service someone stopped with `monitor/svc.sh stop <svc>` produces **no
+emit at all** (<your-org>/nexus-code#1827): the stop writes a
+`.state/services/<svc>.stop-requested` sentinel, the watcher records one
+`stopped-by-request` event instead of an incident and never auto-restarts it,
+and `svc.sh status` shows `STOPPED`. An incident open when the stop landed is
+closed. If a stopped service should be running, `svc.sh start <svc>` is the
+whole remedy; do not treat its silence as an outage.
 
 The emit cites the per-service incident state file
 (`monitor/.state/service-health/<svc>.state`) and event history
@@ -129,40 +140,6 @@ recovery procedure everywhere. **Leave that opening in** when you
 file — it is the audience-first lead, deliberately ahead of the
 machine facts.
 
-## The project filesystem went read-only
-
-First: run `monitor/svc.sh status` and read the **top** row. `fs
-READ-ONLY` (exit 1) means the project tree cannot be written and
-**every row below it is stale** — services report `UP` from
-pidfiles nobody can update. Do not chase them.
-
-There is **nothing to fix from inside**. The sandbox mount
-namespace is kernel-enforced; the remedy is a restart from
-OUTSIDE (detach the inner tmux with `Ctrl-a` `d`, then
-`agent-sandbox tmux new-session ./watcher --continue`). **Never**
-remount, re-bind, or `unshare` around it, and never advise an
-operator to.
-
-It is **not** a storage outage. The signature is a mount that is
-`ro` while its superblock is still `rw`, with the project's
-read-write bind missing from `/proc/self/mountinfo`. The filer is
-healthy and has free space — check before anyone pages storage-support.
-
-The watcher does not die on this any more (<your-org>/nexus-code#473).
-It enters read-only **degraded mode**: it suspends project-tree
-writes, keeps its loop alive, refuses to self-restart (a
-`--replace` would kill the one working watcher — its successor
-cannot even open its own log), and escalates **once** via
-`sandbox-notify` + a `cc-incident:` GitHub issue. On recovery it
-appends the incident to `monitor/.state/fs-incidents.jsonl` and
-comments the resolution on that issue. If you are diagnosing a
-past outage, read that file first.
-
-Two incidents so far, 2026-06-29 and 2026-07-09, both opening
-seconds after a `launcher.sh --replace` self-restart. The
-association is strong; the **root cause is not established**. Do
-not present it as one.
-
 Below the human lead it carries the five required sections —
 **Failure report** (what went down, when, the failing
 healthcheck, user-facing impact), **Immediate response** (the
@@ -214,6 +191,41 @@ confirmed. A `flapping` incident is not done until the service has
 been healthy long enough that the watcher closed its incident
 state (the emit stops re-surfacing).
 
+## The project filesystem went read-only
+
+First: run `monitor/svc.sh status` and read the **top** row. `fs
+READ-ONLY` (exit 1) means the project tree cannot be written and
+**every row below it is stale** — services report `UP` from
+pidfiles nobody can update. Do not chase them.
+
+There is **nothing to fix from inside**. The sandbox mount
+namespace is kernel-enforced; the remedy is a restart from
+OUTSIDE (detach the inner tmux with `Ctrl-a` `d`, then
+`agent-sandbox tmux new-session ./watcher --continue`). **Never**
+remount, re-bind, or `unshare` around it, and never advise an
+operator to.
+
+It is **not** a storage outage. The signature is a mount that is
+`ro` while its superblock is still `rw`, with the project's
+read-write bind missing from `/proc/self/mountinfo`. The filer is
+healthy and has free space — check before anyone pages storage-support.
+
+The watcher does not die on this any more (<your-org>/nexus-code#473).
+It enters read-only **degraded mode**: it suspends project-tree
+writes, keeps its loop alive, refuses to self-restart (a
+`--replace` would kill the one working watcher — its successor
+cannot even open its own log), and escalates **once** via
+`sandbox-notify` (ATTENTION only — the bell carries no text,
+<your-org>/nexus-code#1533) + a `cc-incident:` GitHub issue (the TEXT). On recovery it
+appends the incident to `monitor/.state/fs-incidents.jsonl` and
+comments the resolution on that issue. If you are diagnosing a
+past outage, read that file first.
+
+Two incidents so far, 2026-06-29 and 2026-07-09, both opening
+seconds after a `launcher.sh --replace` self-restart. The
+association is strong; the **root cause is not established**. Do
+not present it as one.
+
 ## Tuning knobs (surface, don't silently retune)
 
 The watcher defaults are sensible; if an incident reveals they are
@@ -237,18 +249,68 @@ operator can retune (`config/nexus.yml`, `monitor:` block):
   within one incident before the watcher gives up and escalates.
 - `monitor.service_health.enabled` (default true) — master switch.
 
-## Arming the watcher-supervisor Monitor (mutual-liveness)
+## Arming the watcher supervisor (mutual-liveness)
 
 The watcher revives the orchestrator; the orchestrator revives the
-watcher. The orchestrator's half is a persistent `Monitor` IT owns —
-the external always-on loop a crashed watcher needs (no daemon). Arm
-it once per orchestrator session, and re-arm whenever a watcher emit
-carries **`--- arm watcher supervisor ---`** (the supervisor heartbeat
-went stale — e.g. you were just (re)started):
+watcher. The orchestrator's half is a supervisor IT owns — the external
+loop a crashed watcher needs (no daemon). Arm it at session start, and
+whenever a watcher emit carries **`--- arm watcher supervisor ---`** (the
+supervisor heartbeat went stale — e.g. you were just (re)started):
+
+```
+<NEXUS_ROOT>/monitor/arm-watcher-supervisor.sh   # idempotent; exit 0 armed, 3 NOT ARMED
+```
+
+**Primary form — a persistent longjob watch (<your-org>/nexus-code#1532).**
+The script adds `monitor/watcher-supervise-probe.sh` as a `--persistent`,
+TTL-less, uncapped `cmd:` watch to your session's plugin dispatcher
+(`skills/nexus.longjob/SKILL.md`), polled every 30 s. Measured 2026-09-25
+on 2.1.280: the orchestrator's dispatcher had run 257,521 s (~71.5 h)
+without a lapse, so the plugin monitor is NOT bound by the 30-minute
+`Monitor` cap; and a persistent cmd watch delivered down, up, and a SECOND
+down, so it survives its own fire. The dispatcher is a child of your
+claude PROCESS, not of your turns, so it keeps polling while you are
+logged out, over-limit or mid-long-turn — the 7 h 13 m gap measured on
+2026-09-17 is exactly what it closes. That is only true because the probe
+**revives the watcher itself** (detached `revive-watcher.sh`, one per
+outage, output in `monitor/.state/watcher-supervisor-revive.log`): you
+are woken twice per outage (`FAILED …` down, `RUNNING …` back up) for the
+record, not to do the revival. On a wake, read the revive log and
+`monitor/svc.sh status`; act only if the watcher is still not UP.
+It revives ONCE per state change, never once per poll: an intentional stop
+(`watcher-stop-requested`) is never revived; a crash-loop refusal (revive
+exit 3) or a read-only state dir (exit 4) LATCHES automatic revival off
+(`monitor/.state/watcher-supervisor-revive.latched`) until the watcher is
+seen alive again, and reaches you as exactly ONE wake,
+`longjob-watch: DONE watcher-supervisor … LATCHED … ORCHESTRATOR MUST ACT` —
+that DONE is the latch, not a recovery, and it is your cue to act; any other
+refusal, including exit 5 (revive saw the watcher alive and advancing while
+the tick said down), backs off 600 s and is retried, since revive re-checks
+progress on every run. It dies
+with your process, which is why a respawn re-arms it first.
+
+**Fallback — the 30-minute `Monitor` lease.** Only when the script exits
+3 (the plugin dispatcher is not armed in this session; see
+`ng longjob status`) arm the lease it prints, and re-arm it on every
+expiry notice:
 
 ```
 Monitor({command: 'until ! <NEXUS_ROOT>/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
 ```
+
+Under the lease the gap is real and stated: while you cannot take a turn
+there is NO turn-independent watcher revival, and the operator alert for
+a logged-out orchestrator carries the supervisor's arm state so the
+exposure is visible off-terminal.
+
+This loop's condition is a **script's exit status**, which is why it is safe
+to copy. The shape it teaches is not: `until ! pgrep -f <name>` can never
+become true, because the waiting shell's own argv contains the pattern, so the
+match finds the waiter and the loop hangs SILENTLY while reading as healthy
+background work (<your-org>/nexus-code#927 — 5h20m, 191 CPU-seconds, and the
+window it belonged to could not be retired). In a `Monitor` or a backgrounded
+`Bash` wait-loop, the condition must be a **sentinel file, an exit status, or
+a recorded pid** (`job & pid=$!`), never a process NAME.
 
 Each tick touches the supervisor heartbeat (clearing the watcher's
 reminder) and reports watcher liveness — the UP/BUSY/WEDGED/DOWN
@@ -257,8 +319,9 @@ than nominal) never fires the Monitor and never warrants a restart** —
 under load the measured loop period legitimately reaches many minutes;
 note the period from `monitor/svc.sh status` and move on. Only WEDGED
 (alive but nothing advancing past the measured-period cutoffs) and
-DOWN (process gone) exit the until-loop. When the Monitor **fires**,
-run the revive, then **re-arm**:
+DOWN (process gone) fire. Under the persistent watch the probe runs the
+revive itself; under the fallback lease, when the Monitor **fires**, run
+the revive, then **re-arm**:
 
 ```
 <NEXUS_ROOT>/monitor/revive-watcher.sh      # loop-guarded; reuses `svc.sh restart watcher`
@@ -298,3 +361,39 @@ liveness/progress split and interim guidance for pre-fix trees).
   **registry healthcheck**, never by tmux/window heuristics.
 - Keep consistent with `nexus.window-cleanup`, `nexus.tmux-spawn`,
   and `nexus.report`.
+
+## Operator alerts — what reaches a human when the orchestrator cannot
+
+`monitor/watcher/_operator_alert.sh` (<your-org>/nexus-code#1548, #1533,
+#1534) is the watcher's text-carrying, turn-independent operator
+channel. It is raised when the watcher alone knows the operator must
+act: a **logged-out orchestrator** (key `auth-expired`, from the pane
+render OR from the typed `StopFailure` marker, #1520), and an
+**emit-only / flapping service** down while the emit route is known
+unavailable (key `service-health:<name>`). Four legs, every one
+fail-open, so telling can never break the thing it reports on:
+
+| leg | reaches | evidence |
+|---|---|---|
+| `monitor/.state/operator-alerts.jsonl` | whoever reads the state dir | durable, one JSON row per raise/reminder/clear/leg outcome — `grep` it first when asking "was the operator told?" |
+| `_watcher_alert` (`watcher ALERT:` bell + `watcher-alerts.log`) | the terminal | measured to RING through the notify wrapper's `critical` arm |
+| `monitor/notify.sh --priority emergency` | phone/email | a `pushover ok` proves API acceptance, NOT that a device rendered it — unverified as delivery |
+| a bot-authored `operator-alert: <key>` issue on `github.repo` | GitHub push, @-pinging `user_login` | the one channel with observed delivery; one open issue per key, closed on clear |
+
+Cadence: one announcement, reminders hourly
+(`monitor.watcher.operator_alert.reminder_seconds`), one clear — and a
+clear finalises only after a 300 s hold-down
+(`operator_alert.clear_holddown_seconds`), so a flapping condition is
+recorded as `flap` rows rather than re-rung or re-filed; a condition that
+returns after its issue closed REOPENS that issue, and comments are capped
+at one per key per hour.
+`NEXUS_NOTIFY_QUIET=1` disables both network legs, so a suite driving
+the real callers can never page you. The reminders, the crossing line
+and the `healthy reason=auth-*` liveness verdict are all logged at a
+backoff, never per poll: the 2026-09-17 outage's 3364-line flood is the
+reason.
+
+**The bell is one bit.** Everywhere this skill says `sandbox-notify`,
+read *attention*; the words live in `watcher-alerts.log`,
+`operator-alerts.jsonl`, the push, and the issue.
+

@@ -232,8 +232,11 @@ _watcher_pid_is_live_watcher() {
     if [[ -r "/proc/$pid/cmdline" ]]; then
         # cmdline is NUL-delimited; read each argument as an element.
         local arg
-        while IFS= read -r -d '' arg; do argv+=("$arg"); done \
-            < "/proc/$pid/cmdline" 2>/dev/null
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        # The `-r` test above narrows the window; it does not close it, because
+        # the pid can exit between the test and the read.
+        { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+            < "/proc/$pid/cmdline"; } 2>/dev/null
     elif command -v ps >/dev/null 2>&1; then
         # ps space-joins argv (we lose exact tokenisation, but ps is
         # only the non-Linux fallback). Word-split on whitespace.
@@ -1328,8 +1331,10 @@ _watcher_heartbeat_ticker_loop() {
 
 # _supervisor_monitor_command [nexus_root]
 #
-# THE single source of truth for the exact persistent-`Monitor` command
-# the orchestrator arms (and re-arms) to supervise the watcher. Emitted
+# THE single source of truth for the exact `Monitor` command the
+# orchestrator arms (and RE-ARMS — since Claude Code 2.1.271 a Monitor is
+# deadline-bounded at 30 min, so this is a lease, not a persistent loop;
+# your-org/nexus-code#1532) to supervise the watcher. Emitted
 # verbatim by all three recovery surfaces — the `--- arm watcher
 # supervisor ---` reminder (_supervisor_arm_emit_section), the
 # supervise-tick DOWN message (_supervisor_down_recovery_message), and
@@ -1339,6 +1344,23 @@ _supervisor_monitor_command() {
     local nexus_root="${1:-${NEXUS_ROOT:-}}"
     printf 'Monitor({command: "until ! %smonitor/watcher-supervise-tick.sh; do sleep 15; done"})' \
         "${nexus_root:+$nexus_root/}"
+}
+
+# _supervisor_arm_instruction [nexus_root]
+#
+# THE single source of truth for how the orchestrator (re-)arms the watcher
+# supervisor (your-org/nexus-code#1532). The primary form is
+# monitor/arm-watcher-supervisor.sh: a PERSISTENT longjob watch run by the
+# session's plugin dispatcher, which is not bound by the 30-minute Monitor
+# cap, polls independently of the orchestrator's turns, and revives a dead
+# watcher itself. Only when that script exits 3 (the plugin dispatcher is
+# NOT ARMED in this session) does the orchestrator fall back to the
+# 30-minute Monitor lease of _supervisor_monitor_command. One line; always
+# returns 0.
+_supervisor_arm_instruction() {
+    local nexus_root="${1:-${NEXUS_ROOT:-}}"
+    printf 'run %smonitor/arm-watcher-supervisor.sh (persistent longjob watch; no re-arm lease). Only if it exits 3 (plugin dispatcher NOT ARMED), arm the fallback lease and re-arm it on every expiry: %s' \
+        "${nexus_root:+$nexus_root/}" "$(_supervisor_monitor_command "$nexus_root")"
 }
 
 # _supervisor_down_recovery_message <reason> [nexus_root]
@@ -1358,7 +1380,7 @@ _supervisor_down_recovery_message() {
     printf 'watcher DOWN: %s — the mutual-liveness supervisor must recover it now.\n' "$reason"
     printf 'Recover (mutual-liveness contract; see skills/nexus.service-recovery):\n'
     printf '  1. Revive — converges to EXACTLY ONE live watcher (idempotent; safe if already up): %smonitor/revive-watcher.sh\n' "$p"
-    printf '  2. Re-arm the supervisor Monitor: %s\n' "$(_supervisor_monitor_command "$nexus_root")"
+    printf '  2. Re-arm the supervisor: %s\n' "$(_supervisor_arm_instruction "$nexus_root")"
 }
 
 # _nexus_dir_writable <dir>
@@ -1420,6 +1442,27 @@ fi
 
 # Historical name, kept for every existing caller. ONE implementation.
 _nexus_dir_writable() { nexus_dir_writable "$@"; }
+
+# Where Claude Code transcripts live (your-org/nexus-code#1720). The
+# orchestrator freshness / unresponsiveness probes below look under every
+# root `cc_transcript_roots` prints — $CLAUDE_CONFIG_DIR/projects as well as
+# <home>/.claude/projects — never at a hardcoded `$HOME/.claude/projects`.
+# Sourced the way `_fs_probe.sh` is above, with the same partial-tree
+# fallback: the same roots in the same order, minus the realpath dedup,
+# which only saves a repeated stat since every caller asks "under ANY root".
+if ! declare -F cc_transcript_roots >/dev/null 2>&1 \
+   && [[ -r "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh" ]]; then
+    # shellcheck source=monitor/_cc_transcript_roots.sh
+    source "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh"
+fi
+if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
+    cc_transcript_roots() {
+        [[ -n "${NEXUS_CC_HOME:-}" ]]     && printf '%s\n' "$NEXUS_CC_HOME/projects"
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && printf '%s\n' "$CLAUDE_CONFIG_DIR/projects"
+        [[ -n "${1:-${HOME:-}}" ]]        && printf '%s\n' "${1:-$HOME}/.claude/projects"
+        return 0
+    }
+fi
 
 # _nexus_fs_evidence <path> [project_dir]
 #
@@ -1483,8 +1526,26 @@ _nexus_fs_evidence() {
     printf 'project_dir=%s\n' "${project:-unset}"
 
     # Filer capacity — proves this is not an ENOSPC / storage outage.
-    local dfline
-    if dfline=$(df -Ph "$path" 2>/dev/null | tail -1); then
+    #
+    # Capture `df`'s OWN status, never the pipeline's. `if dfout=$(df … |
+    # tail -1)` reads `tail`'s status, and `tail` essentially always
+    # succeeds — so on a failing `df` the success arm ran with an EMPTY
+    # dfline and printed `fs_source=` / `fs_avail=` (blank), which a reader
+    # cannot tell from a filer that answered. This file is deliberately
+    # side-effect-free and sets no shell options of its own (see the header),
+    # so the status must be CAPTURED rather than the option changed. See
+    # your-org/nexus-code#1056, and #928 for the class.
+    #
+    # The option is named here only by description, never by its literal
+    # token: `early-exit-readers.sh`'s axis predicate greps whole files for
+    # that string with no comment stripping, so a COMMENT saying this file
+    # does not set it enrols the file onto the axis. Measured — see the
+    # follow-up issue filed with #1056.
+    local dfout dfline=''
+    if dfout=$(df -Ph "$path" 2>/dev/null); then
+        dfline=$(printf '%s\n' "$dfout" | tail -1)
+    fi
+    if [[ -n "$dfline" ]]; then
         printf 'fs_source=%s\n' "$(printf '%s' "$dfline" | awk '{print $1}')"
         printf 'fs_avail=%s\n'  "$(printf '%s' "$dfline" | awk '{print $4" avail of "$2" ("$5" used)"}')"
     else
@@ -1933,8 +1994,9 @@ _nexus_github_incident_escalate() {
 #
 # Emit body for the `--- arm watcher supervisor ---` reminder (your-org/
 # your-nexus watcher-supervision, mutual-liveness design). The
-# orchestrator arms a persistent Monitor that revives a crashed watcher
-# and TOUCHES the supervisor heartbeat each tick. If that heartbeat is
+# orchestrator arms a Monitor — deadline-bounded at 30 min since 2.1.271,
+# so re-armed on every expiry (your-org/nexus-code#1532) — that revives a
+# crashed watcher and TOUCHES the supervisor heartbeat each tick. If that heartbeat is
 # stale/absent the supervisor is NOT armed → the watcher nudges the
 # (possibly freshly-restarted) orchestrator to (re)arm it. A STANDING
 # condition, not a one-shot: it reflects the live heartbeat freshness on
@@ -1954,11 +2016,11 @@ _supervisor_arm_emit_section() {
     # Body is intentionally STABLE (no live age number) so the emit
     # content-hash dedup collapses repeats — the reminder surfaces once
     # per genuine emit while unarmed, never spamming a quiet workspace.
-    printf 'No fresh watcher-supervisor heartbeat (%s) — the supervisor Monitor is NOT armed.\n' \
+    printf 'No fresh watcher-supervisor heartbeat (%s) — the watcher supervisor is NOT armed.\n' \
         "$hb"
     printf 'Without it a watcher CRASH has no turn-independent revival. (Re)arm it now (mutual-liveness contract):\n'
-    printf '  %s\n' "$(_supervisor_monitor_command "$nexus_root")"
-    printf '  On exit (watcher down) run %smonitor/revive-watcher.sh, then re-arm. See skills/nexus.service-recovery.\n' \
+    printf '  %s\n' "$(_supervisor_arm_instruction "$nexus_root")"
+    printf '  The persistent watch revives a dead watcher itself; under the fallback lease, on its exit run %smonitor/revive-watcher.sh, then re-arm. See skills/nexus.service-recovery.\n' \
         "${nexus_root:+$nexus_root/}"
     return 0
 }
@@ -1977,29 +2039,66 @@ _supervisor_arm_emit_section() {
 # mark → stall-nag suppressed and retire held until staleness.
 #
 # `<src>` is the injector-identity hint (orchestrator-followup,
-# skeptic-nudge, unstick-permission, unstick-api-error,
-# unstick-ratelimit, over-limit-wake, …). Consumers key on columns
-# 1–2 only and ignore the src token, so it is purely additive
-# audit/debug provenance.
+# skeptic-nudge, unstick-permission,
+# unstick-ratelimit, over-limit-wake, …).
 #
-# Path precedence: MACHINE_INPUT_TSV global (set by main.sh) →
-# ACTION_LOG-sibling fallback → STATE_DIR-sibling fallback (matching
-# _idle_probe.sh's `_machine_input_path`). Silent no-op when none is
-# available (standalone harnesses that don't care). Never flips the
-# caller's exit code — a failed stamp must not abort a recovery paste.
+# THE SRC TOKEN IS LOAD-BEARING, NOT PROVENANCE. This comment used to say
+# "Consumers key on columns 1–2 only and ignore the src token, so it is
+# purely additive audit/debug provenance." That is FALSE and has been for
+# as long as the consumer has existed: `_idle_probe.sh:1360` selects on
+# `$3 == "paste-followup"` — an EXACT match — so the src token decides
+# whether a row is visible to the `paste-unconfirmed` detector at all.
+# Rows stamped `unstick-permission`, `over-limit-wake`, `skeptic-answer`
+# or `skeptic-await-ack` are invisible to it; only `paste-followup` is
+# consulted. `skeptic-channel.sh:1084-1088` depends on exactly this and
+# says so, deliberately NOT overriding the src so its nudge stays subject
+# to the check.
+#
+# Corrected because the false version is the document an agent enumerating
+# this hazard would trust — your-org/nexus-code#683 instructs its
+# implementer to "enumerate from the hazard, not from one call site", and
+# this comment told them the axis they must enumerate does not matter.
+# A comment asserting a proxy for the property it names, in the file the
+# next three issues will edit. Found by the #687 skeptic (F4).
+#
+# Path precedence: an explicit MACHINE_INPUT_TSV override → the ledger
+# resolver (monitor/_ledger_path.sh, your-org/nexus-code#1724) for the
+# ACTION_LOG's dir → for STATE_DIR (matching _idle_probe.sh's
+# `_machine_input_path`). Resolved PER CALL: main.sh no longer pins
+# MACHINE_INPUT_TSV at startup, because a path fixed when the watcher started
+# would keep stamping the tree after `ng degraded enter` relocated the ledger
+# the guard reads. Silent no-op when none is available (standalone harnesses
+# that don't care), or when the relocation pointer is unusable. Never flips
+# the caller's exit code — a failed stamp must not abort a recovery paste.
 _machine_input_stamp() {
     local window="$1" src="${2:-machine}"
     [[ -n "$window" ]] || return 0
     local path="${MACHINE_INPUT_TSV:-}"
-    if [[ -z "$path" && -n "${ACTION_LOG:-}" ]]; then
-        path="$(dirname "$ACTION_LOG")/machine-input.tsv"
-    fi
-    if [[ -z "$path" && -n "${STATE_DIR:-}" ]]; then
-        path="${STATE_DIR}/machine-input.tsv"
+    if [[ -z "$path" ]] && { [[ -n "${ACTION_LOG:-}" ]] || [[ -n "${STATE_DIR:-}" ]]; }; then
+        local sd="${STATE_DIR:-}"
+        [[ -n "${ACTION_LOG:-}" ]] && sd=$(dirname "$ACTION_LOG")
+        if declare -F nexus_ledger_path >/dev/null 2>&1 \
+           || source "${BASH_SOURCE[0]%/*}/../_ledger_path.sh" 2>/dev/null; then
+            path=$(nexus_ledger_path "$sd" 2>/dev/null) || return 0
+        else
+            path="$sd/machine-input.tsv"   # ledger-resolver-absent: a fixture that copied this file without monitor/_ledger_path.sh, where no pointer can name its state dir (#1724)
+        fi
     fi
     [[ -n "$path" ]] || return 0
     mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
-    printf '%s\t%s\t%s\n' "$window" "$(date +%s)" "$src" >> "$path" 2>/dev/null || true
+    # Column 2 is MICROSECONDS since your-org/nexus-code#679, matching
+    # paste-followup.sh:453. Kept identical here even though the
+    # `paste-unconfirmed` detector filters this writer's src tokens out
+    # today (`$3 == "paste-followup"`, exact): two units in one column
+    # of a shared append-only ledger is a trap for whoever widens either
+    # side, which is `#676` skeptic F5 and the same shape as the stale
+    # "consumers key on columns 1-2 only" contract `#690` had to correct.
+    # Readers normalise by magnitude anyway (_paste_epoch_seconds), so
+    # legacy seconds rows keep working; this keeps NEW rows uniform.
+    local _mi_epoch
+    _mi_epoch=$(date +%s%6N 2>/dev/null)
+    [[ "$_mi_epoch" =~ ^[0-9]{16,}$ ]] || _mi_epoch=$(( $(date +%s) * 1000000 ))
+    printf '%s\t%s\t%s\n' "$window" "$_mi_epoch" "$src" >> "$path" 2>/dev/null || true
 }
 
 # _classify_diff <diff_file>
@@ -2124,17 +2223,65 @@ _classify_diff() {
 
 # _target_window_present <target>
 #
-# Classify the watcher's paste target by tmux window presence. Lifted
-# out of main.sh so the fast-respawn vs slow-respawn branching logic
-# can be unit-tested without spinning up the whole poll loop. Three
-# buckets, by exit code:
+# Classify the watcher's paste target by whether a LIVE AGENT occupies
+# that tmux window. Lifted out of main.sh so the fast-respawn vs
+# slow-respawn branching logic can be unit-tested without spinning up
+# the whole poll loop. Three buckets, by exit code:
 #
-#   0  target window is present in the current tmux server
+#   0  target window is present AND holds at least one pane that is
+#      not provably dead
 #   1  CAN'T CLASSIFY — tmux is not installed/not on PATH, OR the
-#      `tmux list-windows` query itself failed (no server running, or
-#      a client/server protocol-version mismatch). The window's
+#      tmux query itself failed (no server running, or a
+#      client/server protocol-version mismatch). The window's
 #      presence is genuinely unknown.
-#   2  tmux query SUCCEEDED and the target window is absent from it
+#   2  tmux query SUCCEEDED and the target is absent from it — either
+#      no window carries the name, or every pane under that name is
+#      PROVABLY dead (`#{pane_dead}` == 1), i.e. the window is a
+#      `remain-on-exit` corpse
+#
+# THE NAME IS NOT THE QUESTION (your-org/nexus-code#741). This probe
+# used to answer "does a window with that name appear in the list?",
+# which is a different question from the one every caller asks: "is a
+# live agent there?". `_respawn.sh:_respawn_spawn_window` sets
+# `remain-on-exit on` DELIBERATELY — a crashed orchestrator's output
+# is the diagnosis, so the window must survive its process. The
+# consequence was that the very respawn path that sets the option
+# could not see through it: the spawned agent died, the window stayed
+# LISTED with a dead pane, the probe answered PRESENT, and the absent
+# branch never fired a second time. One respawn, one crash, and a
+# crash-loop guard that needs three — the guard could not trip, and a
+# dead orchestrator stayed dead with the board unmonitored.
+# `test-respawn-loop-integration.sh` (#738) is that, measured.
+#
+# THE DISCRIMINATOR is `#{pane_dead}`, and it is read as an ALLOWLIST
+# with a default-DENY arm — the `bk_pane_kill_authorized` shape, for
+# the same reason. ONLY the literal string `1` counts as dead. `0`, an
+# empty field (a tmux too old to know `pane_dead` expands it to
+# nothing), a garbled row, a diagnostic line: all count as LIVE, i.e.
+# all keep the pre-#741 verdict. So the new rc=2 arm can be reached
+# only by positively observing a corpse, never by failing to observe a
+# live one, and an unsupported format degrades to exactly the old
+# behaviour rather than to a respawn.
+#
+# WHICH WAY THIS ERRS, and why. The two failure modes are NOT
+# symmetric. A false ABSENT respawns a live orchestrator — the
+# decapitation-duplicate state, two agents on one jsonl, expensive and
+# manual to unpick. A false PRESENT misses a respawn — the board goes
+# unmonitored until an operator notices, which is bad but recoverable
+# and leaves no wreckage. This function therefore errs toward PRESENT
+# everywhere the evidence is short: unknown field, unreadable row,
+# failed query, no tmux. The corpse verdict is not a guess — tmux sets
+# `pane_dead` when and only when the pane's child has exited, so
+# `pane_dead == 1` cannot describe a running agent.
+#
+# WHY `list-panes -s` AND NOT `list-windows`. `-s` scopes to the
+# session, which is exactly the scope `list-windows` had (verified on
+# tmux 2.6: with two sessions, both list only the current one; `-a`
+# would have silently WIDENED the probe to the whole server and let a
+# same-named window in another session read as present). One query
+# answers both halves — a window with no panes does not exist, so
+# "no row" IS "no window", with no window-killed-between-two-queries
+# race to reason about.
 #
 # The two failure modes the watcher cares about map to different
 # treatments in main.sh:
@@ -2164,17 +2311,37 @@ _classify_diff() {
 # working tmux anyway, so the safe verdict is "can't classify, hold"
 # (rc=1) — never "absent" (rc=2). We therefore capture tmux's rc
 # separately from grep's and only fall through to the absent verdict
-# when the query genuinely succeeded.
+# when the query genuinely succeeded. That property is preserved
+# verbatim below: the rc is still captured on its own line, before
+# anything can mask it.
 #
 # Prints nothing. Exit code IS the answer.
 _target_window_present() {
     local target="${1:?target required}"
     command -v tmux >/dev/null 2>&1 || return 1
-    local windows tmux_rc
-    windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+    local panes tmux_rc
+    # DELIMITER `|`, NOT TAB, and the repo's own lint is what caught the
+    # first draft of this line (test-tmux-window-resolver.sh F1). tmux
+    # REWRITES a TAB in a format string to `_` when `$TMUX` is unset AND
+    # the locale is non-UTF-8 — both conditions, measured. Rows would
+    # then read `orchestrator_1`, no name would ever match, and EVERY
+    # window would classify as absent: the duplicate-respawn direction,
+    # arrived at silently. `validate_window_name` forbids `|` in a
+    # window name, so the split stays unambiguous.
+    panes=$(tmux list-panes -s -F '#{window_name}|#{pane_dead}' 2>/dev/null)
     tmux_rc=$?
     (( tmux_rc == 0 )) || return 1
-    grep -qxF "$target" <<<"$windows" && return 0
+    # The while body must run in THIS shell, not a subshell, or its
+    # `return 0` would exit the subshell and the function would fall
+    # through to the absent verdict — a false ABSENT, the expensive
+    # direction. A here-string keeps it in-shell; a pipe would not.
+    local _twp_name _twp_dead
+    while IFS='|' read -r _twp_name _twp_dead; do
+        [[ "$_twp_name" == "$target" ]] || continue
+        # Allowlist, default-deny: ONLY a literal `1` is dead. Anything
+        # else — `0`, empty (pane_dead unsupported), junk — is live.
+        [[ "$_twp_dead" == "1" ]] || return 0
+    done <<<"$panes"
     return 2
 }
 
@@ -2446,20 +2613,26 @@ _orchestrator_unresponsive() {
     # unparseable pin / jsonl ⇒ fall through to "unresponsive" — at
     # this point we KNOW a paste landed > threshold ago AND we have
     # no evidence the orch processed it.
-    local sid slug jsonl jsonl_mtime
+    # Every transcript root is consulted (your-org/nexus-code#1720): a
+    # missing jsonl falls through to UNRESPONSIVE, so a lookup blind to
+    # $CLAUDE_CONFIG_DIR/projects is the false-DEAD direction. `home_dir`
+    # stays the fake-home seam: it replaces $HOME as the third root.
+    local sid slug jsonl jsonl_mtime root
     if [[ -s "$pin_file" ]]; then
         sid=$(head -n 1 "$pin_file" 2>/dev/null | tr -d '[:space:]')
     fi
     if [[ -n "${sid:-}" ]] \
        && [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-        jsonl="$home_dir/.claude/projects/$slug/$sid.jsonl"
-        if [[ -f "$jsonl" ]]; then
+        while IFS= read -r root; do
+            [[ -n "$root" ]] || continue
+            jsonl="$root/$slug/$sid.jsonl"
+            [[ -f "$jsonl" ]] || continue
             jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
             if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
                 return 1
             fi
-        fi
+        done < <(cc_transcript_roots "$home_dir")
     fi
 
     printf 'unresponsive_age=%ds threshold=%ds last_paste_ts=%d' \
@@ -2578,9 +2751,11 @@ _orchestrator_refresh_pin() {
 
 # _orchestrator_jsonl_fresh <session_id> <freshness_s> <nexus_root> [home_dir]
 #
-# Returns 0 (fresh) when ~/.claude/projects/<slug>/<session_id>.jsonl
-# exists and has been written within `freshness_s`. Returns 1 (stale,
-# missing, or unreadable) otherwise.
+# Returns 0 (fresh) when <root>/<slug>/<session_id>.jsonl exists under
+# ANY root `cc_transcript_roots` prints ($CLAUDE_CONFIG_DIR/projects,
+# then <home_dir>/.claude/projects — your-org/nexus-code#1720) and has
+# been written within `freshness_s`. Returns 1 (stale, missing, or
+# unreadable) otherwise.
 #
 # `<slug>` is the Claude-Code project-slug encoding of `<nexus_root>`:
 # leading slash kept as '-', every non-alphanumeric (including '_'
@@ -2614,15 +2789,22 @@ _orchestrator_jsonl_fresh() {
     # UUID-shape guard mirrors orchestrator-session-pin.sh — protects
     # against a torn pin write seeding a path like .../.jsonl.
     [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
-    local slug jsonl mtime now
+    # Fresh under ANY transcript root is fresh (your-org/nexus-code#1720);
+    # `home_dir` replaces $HOME as the third root, so the fake-home seam
+    # still works.
+    local slug jsonl mtime now root
     slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-    jsonl="$home_dir/.claude/projects/$slug/$sid.jsonl"
-    [[ -f "$jsonl" ]] || return 1
-    mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
-    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
-    (( mtime > 0 )) || return 1
     now=$(date +%s)
-    (( now - mtime <= freshness_s ))
+    while IFS= read -r root; do
+        [[ -n "$root" ]] || continue
+        jsonl="$root/$slug/$sid.jsonl"
+        [[ -f "$jsonl" ]] || continue
+        mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
+        [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+        (( mtime > 0 )) || continue
+        (( now - mtime <= freshness_s )) && return 0
+    done < <(cc_transcript_roots "$home_dir")
+    return 1
 }
 
 # _orchestrator_poll_refresh_pin <pin_file> <freshness_s> <nexus_root>
@@ -2704,11 +2886,30 @@ _nexus_pid_is_ancestor() {
 #
 # If $TMUX_PANE names a live pane whose pane_pid hosts THIS process
 # (is the process itself or an ancestor), print
-# "<window_id>\t<window_name>" and return 0. Return 1 otherwise —
+# "<window_id>|<window_name>" and return 0. Return 1 otherwise —
 # including the inherited-TMUX_PANE case (headless watcher, Bash-tool
 # grandchildren of another window's claude are still "hosted": claude
 # IS an ancestor — callers wanting to exclude that combine this with
 # their own context, see the watcher guard's WATCHER_WINDOW check).
+#
+# THE DELIMITER WAS A TAB, AND THAT MADE A SAFETY GUARD FAIL OPEN
+# (your-org/nexus-code#701 item A). In a non-UTF-8 locale tmux rewrites every
+# byte outside printable ASCII to `_` — in `display-message -p` output exactly
+# as in `list-windows -F` (measured, tmux 2.6). The row `@0<TAB>orchestrator`
+# came back as `@0_orchestrator`, both consumers' `%%$'\t'*` / `#*$'\t'` split
+# yielded the WHOLE mangled string for BOTH fields, the
+# `[[ "$win_name" == "$TARGET" ]]` test was false, and the "a cockpit/watcher
+# is squatting the orchestrator's window" guard silently did not fire.
+#
+# The fix is NOT a safer delimiter — it is HAVING NO DELIMITER TO DEFEAT.
+# Each field is queried on its own, so there is no row to mis-split, and the
+# joined form below is well-shaped by construction rather than by hope. That
+# matters here more than at the `#699` sites: this function's failure arm is
+# `return 1` and both consumers read that as "not applicable, carry on", so a
+# refusing belt would ALSO fail open — while making it fail CLOSED would let a
+# tmux hiccup block the cockpit and the watcher from launching at all. Neither
+# arm is safe, so the parse must not be fallible. `@N` can never contain `|`,
+# so splitting on the FIRST `|` is exact even for a name that contains one.
 _nexus_self_pane_window() {
     [[ -n "${TMUX_PANE:-}" ]] || return 1
     command -v tmux >/dev/null 2>&1 || return 1
@@ -2716,10 +2917,11 @@ _nexus_self_pane_window() {
     pane_pid=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_pid}' 2>/dev/null)
     [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
     _nexus_pid_is_ancestor "$pane_pid" "$$" || return 1
-    local info
-    info=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}'$'\t''#{window_name}' 2>/dev/null)
-    [[ -n "$info" ]] || return 1
-    printf '%s\n' "$info"
+    local win_id win_name
+    win_id=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)
+    win_name=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null)
+    [[ "$win_id" =~ ^@[0-9]+$ && -n "$win_name" ]] || return 1
+    printf '%s|%s\n' "$win_id" "$win_name"
     return 0
 }
 
@@ -2732,13 +2934,53 @@ _nexus_self_pane_window() {
 # no-mass-kill rule. Mirrors _respawn_pid_tree_is_orchestrator
 # (_respawn.sh) generically so svc.sh / entry.sh need not source the
 # respawn module.
+# CAPTURE-THEN-MATCH, never `tr … | grep -q` (your-org/nexus-code#622,
+# found live here by the #680 skeptic).
+#
+# This function is sourced into shells that set `pipefail` (svc.sh:90),
+# and `#622`'s site table only enumerates files that SET pipefail — so
+# every library that INHERITS it, including this one, was invisible to
+# that audit. Under `pipefail`, `tr … | grep -qxF` returns a FALSE
+# NEGATIVE whenever `grep -q` exits on a match before `tr` has finished
+# writing: `tr` takes SIGPIPE, `PIPESTATUS[0]=141`, and `pipefail`
+# promotes that to the pipeline's status. The pipeline reports failure
+# at the exact moment the thing it tested turned out TRUE.
+#
+# The boundary is `tr`'s 4 KB stdio buffer, NOT the 64 KB pipe capacity
+# — pipe capacity bounds whether the WRITER BLOCKS, not whether the
+# READER EXITS FIRST. `strace` on a 6.4 KB environ shows two writes
+# (4096 + 2295); a match inside the first chunk lets `grep -q` exit
+# while the second write is still to come.
+#
+# So reachability is POSITION-dependent, which is why two honest
+# measurements disagreed: marker inside the first 4 KB with more than
+# 4 KB after it → 15/3000 (0.50%); marker in the trailing chunk → a
+# deterministic 0/3000, because `grep` must drain everything to find
+# it. Real orchestrators on this host currently sit at byte 4637 of
+# ~5.4 KB — safe, but by 541 bytes of accident, not design: shortening
+# anything ahead of the marker slides it under the boundary.
+#
+# A false negative here is not cosmetic. `_nexus_window_has_orchestrator`
+# gates whether a wrongly occupied target window is renamed OUT FROM
+# UNDER a live orchestrator, and a mutation test (this probe forced to
+# `return 1`) reproduces `test-svc.sh`'s reported CI failure
+# byte-identically: `live-orch rename protection: rc=4 renames=1`.
+#
+# The remedy is the pattern already used 570 lines above in this file
+# (`_target_window_present`): capture to a variable, match with a
+# here-string. No pipeline, so no SIGPIPE and no status to invert.
+# Measured 0/3000 with the marker deliberately placed in the FIRST
+# chunk — the layout that yields 15/3000 with the pipeline form.
 _nexus_pid_tree_has_env_marker() {
     local pid="$1" marker="$2" depth="${3:-3}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    if [[ -r "/proc/$pid/environ" ]] \
-       && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-          | grep -qxF "$marker"; then
-        return 0
+    local _env_data
+    if [[ -r "/proc/$pid/environ" ]]; then
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        _env_data=$( { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null ) || _env_data=""
+        if [[ -n "$_env_data" ]] && grep -qxF "$marker" <<<"$_env_data"; then
+            return 0
+        fi
     fi
     (( depth <= 0 )) && return 1
     local child
@@ -2778,6 +3020,12 @@ _nexus_window_has_orchestrator() {
 # <= 2. Verb invocations (`svc.sh status`, `svc.sh restart watcher`)
 # carry more arguments and never match; a claude whose PROMPT quotes
 # svc.sh has argc >> 2 and never matches either.
+#
+# ONE trailing `--show-secrets` is stripped first (your-org/nexus-code#1821):
+# every cockpit launcher passes it, so without this a flagged cockpit was
+# invisible here and the duplicate-cockpit guards (svc.sh's peer check,
+# entry.sh) would start a second one. Only that exact flag, only once, only
+# LAST — `svc.sh --show-secrets status` still ends in a verb and never matches.
 _nexus_pid_is_cockpit() {
     local pid="${1:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -2785,8 +3033,12 @@ _nexus_pid_is_cockpit() {
     [[ -r "/proc/$pid/cmdline" ]] || return 1
     local -a argv=()
     local arg
-    while IFS= read -r -d '' arg; do argv+=("$arg"); done \
-        < "/proc/$pid/cmdline" 2>/dev/null
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+        < "/proc/$pid/cmdline"; } 2>/dev/null
+    if (( ${#argv[@]} >= 2 )) && [[ "${argv[${#argv[@]}-1]}" == --show-secrets ]]; then
+        unset 'argv[${#argv[@]}-1]'
+    fi
     (( ${#argv[@]} >= 1 && ${#argv[@]} <= 2 )) || return 1
     case "${argv[${#argv[@]}-1]}" in
         */svc.sh|svc.sh) return 0 ;;
@@ -2821,5 +3073,151 @@ _nexus_find_live_cockpit_pane() {
             fi
         done
     done < <(tmux list-panes -a -F '#{pane_id}|#{pane_pid}|#{window_id}|#{window_name}' 2>/dev/null)
+    return 1
+}
+
+# --- window agent-liveness (your-org/nexus-code#651) -------------------------
+#
+# "Does a live agent run in this tmux window?" — NOT "does a window of that
+# name exist". `_respawn.sh` sets `remain-on-exit on`, so a claude that
+# segfaults, OOMs, is `/exit`ed, or wedges-then-dies leaves its window LISTED
+# with a dead pane. Reading that corpse as a running agent is what made
+# `./watcher` skip the boot reconciliation entirely and resurrect a whole
+# worker board; the same misreading would file a dead worker under "still
+# running" in the cold-boot manifest. Same class as `#643`: a pane's rendered
+# existence is not liveness.
+#
+# ONE definition, shared by `entry.sh` (is this a boot?) and
+# `bootstrap-recover.sh` (was this worker really dropped?), so the two can
+# never drift into disagreeing about what "alive" means.
+
+# Does this pid's argv name a Claude Code process?
+_nexus_pid_is_claude() {
+    local p="$1" cmd
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    cmd=$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null ) || return 1
+    [[ -n "$cmd" && "$cmd" == *claude* ]]
+}
+
+# Is this pid a respawn launcher that has not `exec`ed claude YET?
+#
+# `_respawn_compose_launcher` writes /tmp/nexus-respawn-launch-XXXXXX.sh and
+# tmux runs it as the pane command; it ends in `exec claude`, so the pane
+# process BECOMES claude. Between `tmux new-window` and that exec the pane is
+# alive and hosts no claude. Calling that DEAD is a false negative,
+#
+# HOW WIDE THAT WINDOW IS — AND WHY NO NUMBER BELONGS IN THIS COMMENT.
+# It used to read "a ~1.7 s window on this host, dominated by
+# `assert-shims-wrapped.sh` (~2.2 s)" — a whole smaller than the part said
+# to dominate it, which is the tell that neither figure was re-measured
+# together. The real width is not a property of this host at all: it depends
+# on whether the launcher runs with a CONTROLLING TTY, and a tmux pane always
+# does. Measured 2026-09-10 on clusterk87, guard invoked inside a real tmux
+# pane, 1 rep per cell (`monitor/assert-shims-wrapped.sh`, wall clock):
+#
+#   dev b87192b9   respawn shape  42149 ms   worker shape  44092 ms
+#   PR#1498 head    respawn shape   3135 ms   worker shape   3064 ms
+#
+# Pre-#1497, GNU `timeout` puts the probe shell in a BACKGROUND PROCESS GROUP
+# and it then cannot make progress against the controlling terminal. THE FORM
+# IS SHELL-DEPENDENT and the difference decides whether the bound works at all
+# (measured 2026-09-10 under a pty on this host, from /proc/<pid>/status):
+#
+#   zsh 5.4.2  -lic : SPINS. stat=R, pcpu=100, CPU time tracking wall time 1:1
+#                     for the whole bound. SigBlk 0x380000 blocks TSTP/TTIN/
+#                     TTOU, so `tcsetpgrp` errors instead of stopping and zsh
+#                     retries. No handlers installed, so `timeout`'s SIGTERM
+#                     does kill it: 40 s, empty surface, one core pinned.
+#   bash 4.4   -lic : STOPS, and NEVER RETURNS. SigIgn 0x280004 IGNORES SIGTTOU,
+#                     so the stop is SIGTTIN (default disposition). SigCgt has
+#                     bit 14: it CATCHES SIGTERM, which cannot be delivered to a
+#                     stopped process — measured, ShdPnd 0x4000 pending after a
+#                     SIGTERM that did not move it, and SIGCONT only let it
+#                     re-stop. Without `-k` there is NO bound: one such pair was
+#                     observed at 4909 s against a 10 s bound (491x).
+#
+# So SIGKILL — i.e. `timeout -k` — is the only thing that ends the bash case,
+# and `setsid` cures both by removing the controlling terminal. Do not write
+# this up as "SIGTTOU": that was the first account and bash's own SigIgn
+# refutes it. Either way the guard resolves NOTHING — 5 `did not resolve at
+# all (empty)` warnings per run, against 0 post-fix.
+#
+# THE RECOGNITION BELOW IS A NAME MATCH WITH NO TIME BOUND, which is why a
+# 42 s window is survivable here and why this correction changes no
+# behaviour: nothing keys a deadline off the figure that was wrong. Do not
+# reintroduce one. If you need a number, re-measure it — and say which tree
+# and whether there was a tty, because without both it is not a measurement.
+# and the trigger is CORRELATED rather than random: the operator reaches for
+# `./watcher` precisely when the orchestrator has just died, which is precisely
+# when the watcher is respawning it. Recognising the launcher closes the window
+# exactly, with no polling: `exec` is atomic, so there is no gap between "the
+# launcher is running" and "claude is running".
+_nexus_pid_is_spawning_agent() {
+    local p="$1" cmd
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    cmd=$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null ) || return 1
+    [[ -n "$cmd" && "$cmd" == *nexus-respawn-launch-* ]]
+}
+
+_nexus_pid_hosts_agent() {
+    local p="$1"
+    _nexus_pid_is_claude "$p" || _nexus_pid_is_spawning_agent "$p"
+}
+
+# Walk a pane's process tree looking for an agent. Depth 2 covers both real
+# shapes: the orchestrator's launcher `exec`s claude so the pane process IS
+# claude at depth 0; workers sit at depth 2 under `-zsh` -> launcher.
+#
+# Undeterminable reads as LIVE — a garbage pid, an unreadable /proc, or a
+# missing pgrep tells us nothing, and "we don't know" must never authorise
+# dropping a board or declaring a worker dead. A pane process that is
+# positively GONE is the one case that reads dead.
+_nexus_pid_tree_has_agent() {
+    local pid="$1" child grand
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 0
+    _nexus_pid_hosts_agent "$pid" && return 0
+    command -v pgrep >/dev/null 2>&1 || return 0
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        _nexus_pid_hosts_agent "$child" && return 0
+        for grand in $(pgrep -P "$child" 2>/dev/null); do
+            _nexus_pid_hosts_agent "$grand" && return 0
+        done
+    done
+    return 1
+}
+
+# Does the named window host a live agent?
+#
+# CONTRACT: only ever call this for a window you have already established
+# EXISTS. Its fail-safe direction is LIVE, so "no pane rows for that name" —
+# which is also what a nonexistent window looks like — deliberately answers
+# LIVE. Callers compose it as `window_exists && has_live_agent`; asking it
+# about a window that is gone inverts the answer you want.
+_nexus_window_has_live_agent() {
+    local target="$1"
+    command -v tmux >/dev/null 2>&1 || return 0
+    local rows
+    rows=$(tmux list-panes -a -F '#{window_name}|#{pane_dead}|#{pane_pid}' 2>/dev/null) || return 0
+    local name dead pid saw=0
+    while IFS='|' read -r name dead pid; do
+        [[ "$name" == "$target" ]] || continue
+        saw=1
+        # tmux's own verdict that the pane's command exited. Authoritative and
+        # checked FIRST: a corpse's pane pid can still resolve to a live
+        # process (pid reuse, a lingering child), and without this the tree
+        # walk would read that as an agent.
+        [[ "$dead" == "1" ]] && continue
+        _nexus_pid_tree_has_agent "$pid" && return 0
+    done <<<"$rows"
+    # Saw no pane row for it at all -> cannot judge -> LIVE (see contract).
+    # NOTE: there is deliberately no separate empty-`$rows` early return. An
+    # empty string still yields one iteration whose name cannot match, leaving
+    # saw=0, so this single arm covers both shapes. A previous version had
+    # both and claimed they pinned distinct lines; deleting the redundant one
+    # reddened nothing, which is how that accounting error was caught
+    # (your-org/nexus-code#651 skeptic r2, finding 3).
+    (( saw == 1 )) || return 0
     return 1
 }

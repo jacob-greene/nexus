@@ -305,4 +305,89 @@ assert_eq "(k) stop-file → clean exit 143" "$RC" "143"
 assert_empty "(k) stop-file exit emits nothing on stdout" "$kout"
 assert_no_file "(k) stop-file consumed" "$stopf"
 
+# ── (m) THE ONCE-ONLY SENTINEL IS A REPORTABLE RESULT, NOT A SILENCE ───
+# Re-watching a consumed id used to exit 0 with EMPTY stdout — byte-identical to
+# what a LOST reply looks like, so an agent retrying a watch concluded the reply
+# had vanished. A success signal shaped exactly like a loss signal. This pins the
+# replacement contract; without it the exit-4 path and --re-emit ship untested.
+printf '0\t%s\n' "$reply_a_env" > "$WORK/steps_m"
+export STUB_RESULTS="$raw_a"; unset STUB_RESULTS_RC
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30
+assert_eq "(m) first watch delivers normally" "$RC" "0"
+assert_contains "(m) …and emits the body" "$OUT" "Here is your answer: 42."
+assert_file_exists "(m) …leaving the once-only sentinel" "$WORK/state/t-sent.emitted"
+
+# The re-watch: distinguishable by EXIT CODE and by STDOUT, not only by a log.
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30
+assert_eq "(m) re-watch exits 4, NOT 0" "$RC" "4"
+assert_contains "(m) …with a terminal state line on STDOUT" "$OUT" "state=already-emitted"
+assert_contains "(m) …naming the sentinel path" "$OUT" "sentinel=$WORK/state/t-sent.emitted"
+assert_not_contains "(m) …and does NOT re-emit the body" "$OUT" "--- reply-body "
+assert_contains "(m) …stderr says how to re-deliver" "$ERROUT" "--re-emit"
+# THE CONTROL that makes the above mean something: stdout must not be empty,
+# which is the exact shape the fix removed.
+if [[ -n "$OUT" ]]; then
+    _th_pass; echo "  PASS: (m) re-watch stdout is NON-empty (the pre-fix shape was empty)"
+else
+    _th_fail; echo "  FAIL: (m) re-watch stdout is empty — indistinguishable from a lost reply"
+fi
+
+# --re-emit deliberately re-delivers, re-reading the reply already on the
+# server; it never re-files the request.
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30 --re-emit
+assert_eq "(m) --re-emit delivers again, exit 0" "$RC" "0"
+assert_contains "(m) …re-emitting the body" "$OUT" "Here is your answer: 42."
+assert_contains "(m) …as a normal replied emit" "$OUT" "state=replied id=t-sent"
+
+# ---- (n) THE EXIT CODES HEADER IS THE CODE'S, NOT A MEMORY OF IT ------------
+#
+# your-org/nexus-code#1581. nexus-reply-watch's `EXIT CODES` block listed
+# 0/2/3/64 while the code also exits 4 (already-emitted) and 143 (stopped).
+# It is the block a client copies into a handler, and exit 4 exists precisely
+# so "already emitted" is not read as a new reply — a handler written from the
+# block could not see it. nexus-request's block had 4 and was missing 143.
+#
+# So the block is now DERIVED-CHECKED in both directions, for both front-ends:
+#   header codes  ==  `exit N` literals in the front-end  ∪  _nexus_watch_lib.sh
+#
+# THE PREDICATE AND ITS ERROR DIRECTION. It reads `exit <digits>` on
+# non-comment lines. A COMPUTED status (`exit "$rc"`) is invisible to it, so it
+# would UNDER-count — and an under-count on the code side reads as "the header
+# lists a code nothing emits", or worse hides a missing one. Hence (n0): there
+# must be NO computed exit in these files; the day one appears, this fails and
+# the predicate has to be extended rather than quietly trusted.
+echo "== (n) EXIT CODES header == reachable exit literals (#1581) =="
+_LIB="$MON_DIR/client/_nexus_watch_lib.sh"
+_codes_in_code() {   # files… -> sorted unique literal exit codes, one per line
+    local f
+    for f in "$@"; do
+        grep -vE '^[[:space:]]*#' "$f" \
+            | grep -oE '(^|[^[:alnum:]_.-])exit[[:space:]]+[0-9]+' | grep -oE '[0-9]+$'
+    done | sort -n | uniq | tr '\n' ' '
+}
+_codes_in_header() { # file -> the codes its EXIT CODES block lists
+    # The block runs from the `# EXIT CODES` line to the next `# USAGE` line; a
+    # code line is `#   <digits><space>`. Continuation lines are indented past
+    # the code column, so they cannot be mistaken for one.
+    sed -n '/^# EXIT CODES/,/^# USAGE/p' "$1" \
+        | grep -oE '^#   [0-9]+[[:space:]]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' '
+}
+_computed=$(grep -nE '(^|[^[:alnum:]_.-])exit[[:space:]]+"?\$' "$WATCH" "$MON_DIR/client/nexus-request" "$_LIB" \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+assert_eq "(n0) no COMPUTED exit status in the client helpers (the literal predicate would under-count one)" \
+    "$_computed" ""
+for _fe in nexus-reply-watch nexus-request; do
+    _hdr=$(_codes_in_header "$MON_DIR/client/$_fe")
+    _code=$(_codes_in_code "$MON_DIR/client/$_fe" "$_LIB")
+    # Non-vacuous on BOTH sides: an extraction that came back empty would make
+    # "" == "" a pass about nothing.
+    if [[ "$_hdr" != *"0 "* || "$_code" != *"64 "* ]]; then
+        _th_fail; echo "  FAIL: (n) $_fe — an extraction came back short (header='$_hdr' code='$_code'); the comparison would be vacuous"
+    else
+        assert_eq "(n) $_fe: the EXIT CODES block lists exactly the codes the code can exit with" "$_hdr" "$_code"
+    fi
+done
+assert_contains "(n) nexus-reply-watch's block names 4 …" "$(_codes_in_header "$WATCH")" "4 "
+assert_contains "(n) … and 143" "$(_codes_in_header "$WATCH")" "143 "
+
 th_summary_and_exit

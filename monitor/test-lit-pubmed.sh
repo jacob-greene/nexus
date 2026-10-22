@@ -237,14 +237,25 @@ expect "genuinely empty query -> exit 0" "$RC" "rc=$RC"
 expect "genuinely empty query -> count 0, no esummary call" $?
 
 echo "-- search: backend selection --"
+# The default is `--source all` (PubMed + S2 + ASTA + OpenAlex): a configured
+# S2 key ADDS S2, it no longer replaces PubMed. (This stub serves no
+# OpenAlex, so OpenAlex lands in failed_backends, not query_sources.)
 S2_API_KEY=x run search "GENCODE 2023"
-[ "$(calls eutils)" -eq 0 ] && [ "$(jq -c '.query_sources' <<<"$OUT")" = '["s2"]' ]
-expect "S2 key configured, no --source -> s2 only (compat)" $?
+[ "$(calls eutils)" -gt 0 ] && [ "$(jq -c '.query_sources' <<<"$OUT")" = '["pubmed","s2"]' ]
+expect "S2 key configured, no --source -> default all searches pubmed + s2" $?
 S2_API_KEY=x run search "GENCODE 2023" --source all
 [ "$(jq -c '.query_sources' <<<"$OUT")" = '["pubmed","s2"]' ]; expect "--source all -> pubmed + s2 (asta skipped, no key)" $?
 [ "$(jq '.count' <<<"$OUT")" -eq 3 ]; expect "cross-source dedupe: 2 pubmed + 3 s2 (1 same DOI, 1 same PMID only) -> 3" $?
-[ "$(jq -r '[.results[] | select(.pmid=="36420896")][0].source' <<<"$OUT")" = pubmed ]
-expect "dedupe keeps the first hit" $?
+# Rank fusion: a duplicate collapses to ONE record, the best-ranked copy that
+# carries a DOI (s2 rank 1 beats pubmed rank 2 here), credited to both.
+jq -e '[.results[] | select(.pmid=="36420896")] | length == 1
+       and .[0].source == "s2" and .[0].sources == ["pubmed","s2"] and .[0].found_by == 2' <<<"$OUT" >/dev/null
+expect "dedupe keeps the best-ranked copy and credits both backends" $?
+# The PMID-only join: S2's copy has no DOI, so only the PMID links it to
+# PubMed's record, which is kept (it carries the DOI).
+jq -e '[.results[] | select(.pmid=="37248244")] | length == 1
+       and .[0].source == "pubmed" and .[0].sources == ["pubmed","s2"]' <<<"$OUT" >/dev/null
+expect "PMID-only duplicate joins the PubMed record" $?
 run search "GENCODE 2023" --source s2
 [ "$RC" -eq 3 ]; expect "--source s2 without a key -> exit 3 (rc=$RC)" $?
 run search "GENCODE 2023" --source bogus
@@ -289,8 +300,11 @@ run add CorpusId:123
 echo "-- status --"
 run status
 expect "status exit 0 with no key (PubMed is keyless)" "$RC" "rc=$RC"
-jq -e '.pubmed.configured and .default_source=="pubmed" and .pubmed.rate_limit=="3/s" and .configured' <<<"$OUT" >/dev/null
-expect "status JSON: pubmed configured, default pubmed, 3/s" $?
+# `configured` means "an S2/ASTA key is set" (false here); `search_available`
+# is the keyless answer, and the default is `all`.
+jq -e '.pubmed.configured and .default_source=="all" and .pubmed.rate_limit=="3/s"
+       and .search_available and (.configured == false)' <<<"$OUT" >/dev/null
+expect "status JSON: pubmed configured, default all, 3/s, search available without keys" $?
 NCBI_API_KEY=k3y-SECRET run status
 jq -e '.pubmed.api_key and .pubmed.origin=="env:NCBI_API_KEY" and .pubmed.rate_limit=="10/s"' <<<"$OUT" >/dev/null
 expect "status with NCBI_API_KEY: origin env, 10/s" $?

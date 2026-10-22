@@ -22,7 +22,9 @@
 #        - emit a `wrap-up` action-log event for the window.
 #        - assert: `_idle_window_wrap_up_report` returns the basename
 #          (matcher CAN see the wrap-up in this lifecycle).
-#   2. Kill the window; assert `state=absent`.
+#   2. Kill the window; assert it is gone from `list-windows`. (NOT via
+#      pane-state: `#140` makes it refuse to classify an unresolvable
+#      window rather than guess `absent`.)
 #   3. Second life of `recycle-worker` (same window name):
 #        - sleep > 1s so the new spawn ts > the stale wrap-up ts (the
 #          action log records `date -Is` at 1-second resolution),
@@ -78,11 +80,12 @@ harness_skip_if_disabled
 # uses jq for safe escaping. Without jq the test would silently fall
 # into the sed-fallback path that we don't intend to exercise here.
 if ! command -v jq >/dev/null 2>&1; then
-    echo "skipped: $(basename "${0}") (jq not on PATH)"
+    echo "skipped: $(basename "${0}") (jq not on PATH)"   # SKIP (#568 A6)
     exit 0
 fi
 
 harness_setup
+
 
 # Rename the harness session to "0" so `pane-state.sh <bare-index>`
 # resolves to our pane (pane-state.sh defaults a bare numeric target to
@@ -115,7 +118,44 @@ export MONITOR_IDLE_THRESHOLD_SECONDS=10
 mkdir -p "$HARNESS_DIR/monitor/watcher" \
          "$HARNESS_DIR/config"
 cp "$HARNESS_REPO_ROOT/monitor/ng"          "$HARNESS_DIR/monitor/ng"
+# `ng` REFUSES TO RUN WITHOUT `_bookkeeping.sh`, and that refusal is correct
+# (your-org/nexus-code#1094). `ng` sources it from its OWN script dir — here
+# `$HARNESS_DIR/monitor` — and fails CLOSED when it is missing, because the
+# guards it carries replace code that silently coerced bad input (#601), so
+# degrading to that behaviour is worse than refusing. Copying `ng` alone
+# therefore installs a binary that cannot run:
+#
+#   ng: cannot read .../monitor/_bookkeeping.sh — the bookkeeping-contract
+#       guards are missing. This is a broken install, not a supported
+#       configuration
+#
+# That is what has made this suite red on `dev`: the very first
+# `ng log-action` refused, no first-life spawn event was ever recorded, and
+# all five failures below cascade from that one line — including
+# `phase-1 matcher returns the wrap-up basename — got ''`, whose empty value
+# is the #1038 shape (a capture whose producer failed) rather than a matcher
+# defect.
+#
+# `ng`s own comment states the convention this restores: its fixtures "build a
+# fake tree containing `ng` and `_bookkeeping.sh` and nothing else". Same shape
+# as #764, which added `_claude-bin.sh` to this harness for the same reason —
+# the harness exports NEXUS_ROOT=$HARNESS_DIR, so every file production code
+# resolves through that root has to be installed here or the scenario fails for
+# a reason unrelated to what it tests.
+# BOTH of ng's hard preconditions, ENUMERATED FROM THE SOURCE rather than
+# discovered one CI round at a time — `grep -n 'if \[\[ ! -r "\$_script_dir/'
+# monitor/ng` returns exactly these two at d2f4415e. `_nexus-root.sh` is the
+# second (#577, #1077): without it reports and asset uploads silently un-pin
+# from the primary clone, so it refuses too.
+cp "$HARNESS_REPO_ROOT/monitor/_bookkeeping.sh" "$HARNESS_DIR/monitor/_bookkeeping.sh"
+cp "$HARNESS_REPO_ROOT/monitor/_nexus-root.sh"  "$HARNESS_DIR/monitor/_nexus-root.sh"
 cp "$HARNESS_REPO_ROOT/monitor/pane-state.sh" "$HARNESS_DIR/monitor/pane-state.sh"
+# AND THE RESOLVER IT NOW REQUIRES (your-org/nexus-code#1281). pane-state.sh
+# refuses to classify when `_tmux-window.sh` is not beside it — the ambiguity
+# check cannot run, and a wrong-window answer here can authorise a kill. This
+# scenario drives `_idle_pane_state_line` with a BARE INDEX, so the refusal
+# lands on the production path and the idle set comes back EMPTY.
+cp "$HARNESS_REPO_ROOT/monitor/_tmux-window.sh" "$HARNESS_DIR/monitor/_tmux-window.sh"
 chmod +x "$HARNESS_DIR/monitor/ng" "$HARNESS_DIR/monitor/pane-state.sh"
 # `ng log-action` only touches the action log; it doesn't shell out to
 # `config/load.sh`. A no-op stub keeps the resolver chain inert without
@@ -125,6 +165,26 @@ cat > "$HARNESS_DIR/config/load.sh" <<'CFG'
 exit 2
 CFG
 chmod +x "$HARNESS_DIR/config/load.sh"
+
+# HARNESS SELF-TEST — fail LOUD here rather than as a cascade of empty
+# captures forty lines down (your-org/nexus-code#1094). A fake nexus that
+# cannot run `ng` makes every assertion in this file meaningless, and that is
+# exactly how this suite read on `dev`: `ng` refused for a missing helper, no
+# spawn event was ever written, and five assertions failed downstream — one of
+# them (`phase-1 matcher returns the wrap-up basename — got ''`) looking
+# precisely like a matcher defect. The empty value was the #1038 shape: a
+# capture whose producer failed.
+#
+# Placed AFTER config/load.sh because ng sources it, and written in the same
+# call shape the suite uses (`--event` / `--extra`, no `--window` flag) so the
+# probe exercises the real path rather than a spelling ng does not accept.
+if ! NEXUS_ROOT="$HARNESS_DIR" "$HARNESS_DIR/monitor/ng" log-action monitor \
+        --event harness-selftest --extra "window=harness-selftest" >/dev/null 2>&1; then
+    echo "FAIL: the fake nexus cannot run ng — every assertion below would be a cascade" >&2
+    NEXUS_ROOT="$HARNESS_DIR" "$HARNESS_DIR/monitor/ng" log-action monitor \
+        --event harness-selftest --extra "window=harness-selftest" >&2
+    exit 1
+fi
 
 # Source the real `_idle_probe.sh`. The matcher and the
 # `list_really_idle_workers` gate run from this in-process source —
@@ -209,10 +269,7 @@ assert_eq "first-life spawn event recorded" \
 win1=$(harness_spawn_worker "$WORKER_NAME" \
     "STUB_CLAUDE_BUSY_SECONDS=0" \
     "STUB_CLAUDE_HOLD_SECONDS=60")
-[[ "$win1" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: phase-1 spawn returned non-numeric window index: $win1" >&2
-    th_summary_and_exit
-}
+[[ "$win1" =~ ^[0-9]+$ ]] || th_abort "phase-1 spawn returned non-numeric window index: $win1"
 echo "  first-life tmux window=$win1"
 
 # pane-state.sh takes <window-index> or <session>:<window-index> — NOT
@@ -241,15 +298,30 @@ assert_eq "phase-1 matcher returns the wrap-up basename" \
     "$match_basename" "$STALE_REPORT_BASENAME"
 
 # ===========================================================================
-# Phase 2: kill the window. Pane-state must flip to absent — that's
-# the regression PR #55 was supposed to keep stable. Validates the
-# precondition the recycle relies on (window genuinely went away).
+# Phase 2: kill the window. Validates the precondition the recycle
+# relies on — the first-life window genuinely went away.
+#
+# your-org/nexus-code#568: this phase used to assert `pane-state` reports
+# `state=absent` here, which is why it had been red on this host and was
+# written off as an environmental tmux limitation. It is not. Every other
+# assertion in this scenario passed; only this one failed. `pane-state.sh`
+# deliberately REFUSES to classify a window it cannot resolve — issue
+# `#140` — because tmux 3.x otherwise falls back to the session's active
+# window and answers confidently about the WRONG one. "The window is gone"
+# is a question for `list-windows`, which is how
+# `test-wrapup-retain-close.sh` phase 6 asks it. The genuine `absent`
+# transition (claude exits, window retained by `remain-on-exit`) belongs
+# to a live window and is covered by `test-spawn-busy-idle-absent.sh` and
+# `test-graceful-exit-relaunch.sh`.
 # ===========================================================================
 echo
 echo "=== phase 2: kill first-life window ==="
 harness_tmux kill-window -t "${HARNESS_SESSION}:${win1}"
 
-wait_for "pane-state reports absent after first-life kill" 3 -- pane_state_is "$win1" absent
+win1_gone() {
+    ! grep -qx "$win1" <<<"$(harness_tmux list-windows -t "$HARNESS_SESSION" -F '#{window_index}' 2>/dev/null)"
+}
+wait_for "first-life window gone from tmux list-windows" 3 -- win1_gone
 
 # ===========================================================================
 # Phase 3: second life — fresh spawn anchor, re-spawn the stub, assert
@@ -296,10 +368,7 @@ fi
 win2=$(harness_spawn_worker "$WORKER_NAME" \
     "STUB_CLAUDE_BUSY_SECONDS=0" \
     "STUB_CLAUDE_HOLD_SECONDS=60")
-[[ "$win2" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: phase-3 re-spawn returned non-numeric window index: $win2" >&2
-    th_summary_and_exit
-}
+[[ "$win2" =~ ^[0-9]+$ ]] || th_abort "phase-3 re-spawn returned non-numeric window index: $win2"
 echo "  second-life tmux window=$win2"
 
 # (b) lifecycle-scoped matcher drops the stale wrap-up. Note: the
@@ -310,7 +379,7 @@ assert_empty "phase-3 matcher drops stale wrap-up after recycle" "$match2"
 
 # Sanity: the wrap-up event is still in the log — the matcher chose
 # to skip it, not magically deleted it.
-wrap_event_count=$(grep -c '"event":"wrap-up"' "$ACTION_LOG" 2>/dev/null || echo 0)
+wrap_event_count=$(grep -c '"event":"wrap-up"' "$ACTION_LOG" 2>/dev/null) || wrap_event_count=0
 assert_eq "wrap-up event still on disk (matcher skipped, did not erase)" \
     "$wrap_event_count" "1"
 

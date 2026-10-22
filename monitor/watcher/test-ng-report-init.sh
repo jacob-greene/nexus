@@ -25,8 +25,13 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    else printf '  FAIL: %s\n           expected: %s\n' "$label" "$needle" >&2; FAIL=$(( FAIL + 1 )); fi
+    # Dump the ACTUAL haystack on failure, not just the expected needle:
+    # when this exact assertion reddened dev under fork pressure
+    # (your-org/nexus-code#638), the missing `actual:` line hid WHICH wrong
+    # project slug was emitted, costing a debugging cycle.
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else printf '  FAIL: %s\n           expected: %s\n           actual:   %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
@@ -47,6 +52,12 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config" "$FAKE_NEXUS/reports"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
@@ -95,6 +106,7 @@ run_ng_home() {
     local _stdout _stderr _rc _out_tmp _err_tmp
     _out_tmp=$(mktemp); _err_tmp=$(mktemp)
     ( cd "$_cwd" && HOME="$_home" CLAUDE_PROJECT_DIR="" CLAUDE_CODE_SESSION_ID="" \
+        CLAUDE_CONFIG_DIR="${_RNH_CFG:-}" NEXUS_CC_HOME="" \
         NEXUS_WORKER_WINDOW="" NEXUS_ROOT="$FAKE_NEXUS" \
         "$NG" "$@" >"$_out_tmp" 2>"$_err_tmp" )
     _rc=$?
@@ -285,8 +297,14 @@ touch "$TARGET"
 # source. This is an integration test; we'll trust the unit at
 # this point.
 true
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two writes sharing one line read
+# as 1. On no match grep prints nothing and exits 1, yielding 0 — a replacement,
+# never an appended second value (your-org/nexus-code#725).
+_occurrences() { grep -oE -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
 assert_eq        "collision-guard probe (source-level)" \
-                 "$(grep -c 'refusing to overwrite existing file' "$NG")" "1"
+                 "$(_occurrences 'refusing to overwrite existing file' "$NG")" "1"
 
 # ---- Test 8: session-id slug matches Claude Code's path normalisation --
 #
@@ -350,6 +368,23 @@ assert_contains  "session-id resolves via tail fallback"  "$body" \
                  "session-id: $SESSION_UUID2"
 assert_contains  "stderr warns about fallback firing"     "$err" \
                  "falling back to '$TAIL_DIR'"
+
+# ---- Test 9b (#1720 residual): the transcript lives ONLY under ------------
+# $CLAUDE_CONFIG_DIR/projects (the agent-sandbox layout when ~/.claude/projects
+# did not exist at the first launch); HOME has no projects dir at all.
+echo '=== session-id: transcript only under $CLAUDE_CONFIG_DIR/projects ==='
+FAKE_HOME9="$WORK/home-cfgonly"; mkdir -p "$FAKE_HOME9"
+CFG9="$WORK/cfg-only"
+CWD_PATH9="$WORK/cfgonly-test/work/proj9"; mkdir -p "$CWD_PATH9"
+SLUG9=$(printf '%s' "$CWD_PATH9" | sed 's|[^a-zA-Z0-9]|-|g')
+SESSION_UUID9="99999999-8888-7777-6666-555555555555"
+mkdir -p "$CFG9/projects/$SLUG9"; touch "$CFG9/projects/$SLUG9/$SESSION_UUID9.jsonl"
+_RNH_CFG="$CFG9" run_ng_home path err rc "$CWD_PATH9" "$FAKE_HOME9" \
+    report-init cfgonly --reports-dir "$FAKE_NEXUS/reports"
+assert_eq       "exit 0 with a config-dir-only transcript" "$rc" "0"
+body=$(<"$path")
+assert_contains "session-id resolves from \$CLAUDE_CONFIG_DIR/projects" "$body" \
+                "session-id: $SESSION_UUID9"
 
 # ---- Test 10: session-id absent → frontmatter says 'unknown' ----------
 
@@ -477,12 +512,19 @@ PY
 # Assert the frontmatter really was left alone.
 assert_eq "frontmatter untouched by the body fill" \
           "$(awk 'NR==1&&/^---$/{f=1;next} f&&/^---$/{exit} f' "$path" | md5sum | cut -d' ' -f1)" \
-          "$(printf 'project: sample\ndate: %s\nsession-id: %s\nwindow: %s\ntrigger:\nstatus: partial\n' \
+          "$(printf 'project: sample\ndate: %s\nsession-id: %s\nwindow: %s\ntrigger:\nstatus: partial\ndisposition: TODO\n' \
                  "$TODAY" \
                  "$(awk -F': ' '/^session-id:/{print $2;exit}' "$path")" \
                  "$(awk -F': ' '/^window:/{print $2;exit}' "$path")" \
              | md5sum | cut -d' ' -f1)"
 
+# `disposition: TODO` is a deliberate sentinel (your-org/nexus-code#1095):
+# report-check refuses it until the author states a disposition. Merged in
+# the 2026-10-22 upstream sync, so the round trip now has ONE frontmatter
+# edit, and it is the one the sentinel asks for.
+run_ng out err rc "$FAKE_NEXUS" report-check "$path"
+assert_eq        "round trip: the TODO disposition sentinel is refused" "$rc" "1"
+sed -i 's/^disposition: TODO$/disposition: no-further-pass/' "$path"
 run_ng out err rc "$FAKE_NEXUS" report-check "$path"
 assert_eq        "round trip: report-check exits 0"    "$rc" "0"
 assert_contains  "round trip: reports OK"              "$out" "OK ("

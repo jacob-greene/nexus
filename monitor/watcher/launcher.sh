@@ -235,7 +235,8 @@ _launch_caller() {
     if [[ -n "${WATCHER_LAUNCH_CALLER:-}" ]]; then
         printf '%s' "$WATCHER_LAUNCH_CALLER"
     else
-        tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null | head -c 120 || printf 'ppid=%s' "$PPID"
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        { tr '\0' ' ' < "/proc/$PPID/cmdline"; } 2>/dev/null | head -c 120 || printf 'ppid=%s' "$PPID"
     fi
 }
 _launch_audit() {
@@ -588,7 +589,7 @@ fi
 # ensured no live pidfile-owning watcher exists, so at most the window
 # holds a dead pane or an unregistered orphan whose HUP trap exits it
 # cleanly). Kill it so the stack converges on headless.
-if tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$WINDOW"; then
+if grep -qxF "$WINDOW" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
     echo "launcher.sh: removing legacy '$WINDOW' window (watcher runs headless now)" >&2
     tmux kill-window -t "$WINDOW" 2>/dev/null || true
 fi

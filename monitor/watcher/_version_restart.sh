@@ -96,6 +96,28 @@ source "$_VERSION_MODULE_DIR/../_log-mode.sh"
 # Log through the host's `log` when one is defined (the watcher's
 # stderr logger), else fall back to plain stderr so the module stays
 # usable from bootstrap-recover.sh / tests without ceremony.
+# THE NEGATION IS DEFEATED ON A COMPOUND COMMAND, so this predicate is a
+# FUNCTION and callers write `if ! <fn>`. Measured, bash 4.4.20:
+#     : 2>/dev/null < UNREADABLE        rc 1     ! : … < UNREADABLE        rc 0
+#     { : ; } 2>/dev/null < UNREADABLE  rc 1     ! { : ; } … < UNREADABLE  rc 1   <-- ! IGNORED
+#     ( : ) 2>/dev/null < UNREADABLE    rc 1     ! ( : ) … < UNREADABLE    rc 1   <-- ! IGNORED
+# A failed redirection on a COMPOUND command is a redirection ERROR, and the
+# `!` does not invert it; on a SIMPLE command it does. So `! : < f` works,
+# `! { :; } < f` silently never fires, and testing the first and generalising
+# walks you into the second. `cmd … || arm` is unaffected and is what the body
+# below uses. AND ZSH DISAGREES: the same `! { :; } < UNREADABLE` is rc 0 under
+# zsh 5.4.2 — so probing this at an interactive zsh prompt CONFIRMS the broken
+# form. This nexus is zsh-default, which is exactly how it would arrive.
+# A guard that parses, reads correctly, and never fires is the very defect
+# class your-org/nexus-code#1266 is about; it was caught here only because the
+# suite asserts this function's rc directly.
+_version_registry_readable() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    { : ; } 2>/dev/null < "$f" || return 1
+    return 0
+}
+
 _version_log() {
     if declare -F log >/dev/null 2>&1; then
         log "version: $*"
@@ -137,25 +159,117 @@ _version_hash_files() {
 
 # _version_watcher_source_set <main_sh>
 #
-# The watcher's source set: main.sh itself plus every module it loads
-# via the canonical `source "$_script_dir/<rel>"` pattern (including
-# `../_cc-version.sh`). Parsed from the ON-DISK main.sh so a pull that
-# adds a new module both changes main.sh (hash bump now) and extends
-# the set (tracked from then on). rc 1 when main.sh is absent.
+# The watcher's source set: main.sh plus the TRANSITIVE closure of every
+# module it loads (your-org/nexus-code#1746). Parsed from the ON-DISK files
+# so a pull that adds a module both changes its parent (hash bump now) and
+# extends the set (tracked from then on). rc 1 when main.sh is absent.
+#
+# This used to be depth-1: only main.sh's own `source "$_script_dir/…"` lines.
+# A module reached through a LIBRARY (`_lib.sh` -> `_fs_probe.sh`,
+# `_lib.sh`/`_respawn.sh` -> `_cc_transcript_roots.sh`, `_unstick.sh` ->
+# `_pane-live.sh`) was invisible, so a pull that changed only it left the
+# running watcher on stale code with no drift ever detected. main.sh's
+# comments record the workaround that was needed instead: re-sourcing such
+# modules from main.sh just to put them in the set.
+#
+# THE GRAMMAR, stated so it can be disagreed with. For each file in the set,
+# every non-comment line that is a `source`/`.` statement — or an assignment
+# to a variable that the SAME file later sources (`_ib_sh=…`, `lib=…`,
+# `: "${X:=…}"`) — contributes each `/<name>.sh` path suffix it carries
+# (`/../<name>.sh` included). The suffix is resolved against the file's own
+# directory and against its parent, the two anchors every loader here uses
+# (`$_script_dir`, `${BASH_SOURCE[0]%/*}`, `$_monitor_dir`,
+# `$NEXUS_ROOT/monitor`). Every candidate that EXISTS as a regular file
+# inside the monitor tree joins the set. Errors are in the SAFE direction:
+#   * over-inclusion (a heredoc that writes a `. "$X/foo.sh"` line for a
+#     generated script, a file resolved under both anchors) costs at most one
+#     unneeded self-restart when that file changes;
+#   * a DEEPER candidate that does not exist is DROPPED — a missing file makes
+#     `_version_hash_files` answer TORN, and a reference that never resolves
+#     (a guarded optional module, a generated script's text) would otherwise
+#     disable the self-restart for good. A mid-pull rename at depth >= 2 is
+#     still covered by the settle window: drift must hold still before acting.
+#   * main.sh's OWN `source "$_script_dir/…"` modules keep the original
+#     contract: listed even when missing, so a torn pull reads TORN and the
+#     watcher does nothing until the tree is whole.
+# A path with directories (a variable, then `watcher/_lib.sh`) is tried by
+# each of its suffixes (`watcher/_lib.sh`, `_lib.sh`) under both anchors.
+# NOT covered: a path assembled at runtime from parts with no `.sh` literal.
 _version_watcher_source_set() {
     local main_sh="${1:?main_sh required}"
     [[ -f "$main_sh" ]] || return 1
-    local dir
+    local dir monitor_dir
     dir=$(cd "$(dirname "$main_sh")" && pwd) || return 1
-    {
-        printf '%s\n' "$dir/$(basename "$main_sh")"
-        # shellcheck disable=SC2016
-        sed -nE 's|^[[:space:]]*source[[:space:]]+"\$_script_dir/([^"]+)".*|\1|p' \
-            "$main_sh" \
-            | while IFS= read -r rel; do
-                  [[ -n "$rel" ]] && printf '%s/%s\n' "$dir" "$rel"
-              done
-    } | sort -u
+    monitor_dir=$(cd "$dir/.." && pwd) || return 1
+    local -A seen=()
+    local -a queue=("$dir/$(basename "$main_sh")")
+    local f fdir rel cand base sfx
+    # main.sh's direct modules, on the original contract (listed if missing).
+    # shellcheck disable=SC2016
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        cand="$dir/$rel"
+        if [[ -f "$cand" ]]; then
+            cand=$(cd "${cand%/*}" 2>/dev/null && printf '%s/%s' "$(pwd)" "${cand##*/}") || cand="$dir/$rel"
+            queue+=("$cand")
+        else
+            seen[$cand]=1
+        fi
+    done < <(sed -nE 's|^[[:space:]]*source[[:space:]]+"\$_script_dir/([^"]+)".*|\1|p' "$main_sh")
+    while (( ${#queue[@]} > 0 )); do
+        f="${queue[0]}"; queue=("${queue[@]:1}")
+        [[ -n "${seen[$f]:-}" ]] && continue
+        seen[$f]=1
+        fdir="${f%/*}"
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            sfx="$rel"
+            while :; do
+                for base in "$fdir" "${fdir%/*}"; do
+                    cand="$base/$sfx"
+                    [[ -f "$cand" ]] || continue
+                    cand=$(cd "${cand%/*}" 2>/dev/null && printf '%s/%s' "$(pwd)" "${cand##*/}") || continue
+                    case "$cand" in "$monitor_dir"/*) ;; *) continue ;; esac
+                    [[ -n "${seen[$cand]:-}" ]] || queue+=("$cand")
+                done
+                [[ "$sfx" == */* && "${sfx%%/*}" != .. ]] || break
+                sfx="${sfx#*/}"
+            done
+        done < <(_version_source_refs "$f")
+    done
+    printf '%s\n' "${!seen[@]}" | sort -u
+}
+
+# _version_source_refs <file> — the `<rel>.sh` suffixes <file> sources, one
+# per line, per the grammar above. Comment lines are skipped.
+_version_source_refs() {
+    awk '
+        function emit(line,   m) {
+            while (match(line, /\/(\.\.\/)*([A-Za-z0-9_][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.sh/)) {
+                print substr(line, RSTART + 1, RLENGTH - 1)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+        /^[[:space:]]*#/ { next }
+        { lines[NR] = $0 }
+        # A source statement: `source X` / `. X`, at line start or after ; && || then do {
+        $0 ~ /(^|[;&|{[:space:]])(source|\.)[[:space:]]+["$]/ {
+            emit($0)
+            # Variables this file sources: `source "$v"` / `. "${v}"`.
+            s = $0
+            while (match(s, /(source|\.)[[:space:]]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+                v = substr(s, RSTART, RLENGTH); sub(/^(source|\.)[[:space:]]+"?\$\{?/, "", v)
+                vars[v] = 1; s = substr(s, RSTART + RLENGTH)
+            }
+        }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (!(i in lines)) continue
+                for (v in vars) {
+                    if (lines[i] ~ ("(^|[^A-Za-z0-9_])" v "(=|:=)")) { emit(lines[i]); break }
+                }
+            }
+        }' "$1" 2>/dev/null
 }
 
 # _version_cockpit_source_set <monitor_dir>
@@ -417,6 +531,71 @@ _version_restart_self() {
     return 0
 }
 
+
+# _version_pull_restart_advisory <nexus_root> <branch>
+#
+# Name the registered services a deploy pull will restart
+# (your-org/nexus-code#1456). Every version-tracked service — a registry row
+# whose launch command resolves to a script file — is restarted by this module
+# when that script's hash drifts, exactly as the watcher restarts itself. So a
+# pull that rewrites a launch script IS a service restart, and the advisory
+# that prescribes the pull must say which ones.
+#
+# TWO ARMS, and the difference between them is stated on the line:
+#   EXACT   — when `origin/<branch>` resolves in the local object store, the
+#             incoming diff `HEAD..origin/<branch>` is intersected with the
+#             launch scripts. This is the diff THE CLONE WILL RECEIVE — not the
+#             promotion diff, which over-predicts (measured: `main...dev` named
+#             three services including one under a do-not-restart constraint;
+#             the pull touched one). It is only as fresh as the last fetch, and
+#             the line says so.
+#   GENERIC — otherwise, the version-tracked services are listed so the
+#             deployer knows the population that CAN restart.
+# Never silent: a readable registry with no trackable service says that too.
+_version_pull_restart_advisory() {
+    local nexus_root="${1:-.}" branch="${2:-dev}"
+    local registry="${NEXUS_SERVICES_REGISTRY:-$nexus_root/monitor/services.registry}"
+    [[ -e "$registry" ]] || return 0
+    _version_registry_readable "$registry" 2>/dev/null || return 0
+    local name workdir launch health logfile script rel
+    local -a tracked=() rels=()
+    while IFS=$'\t' read -r name workdir launch health logfile; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        workdir="${workdir/#\~/$HOME}"
+        workdir="${workdir//\$NEXUS_ROOT/$nexus_root}"
+        script=$(_version_service_script "$workdir" "$launch" 2>/dev/null) || continue
+        rel=$(realpath --relative-to="$nexus_root" "$script" 2>/dev/null) || rel="$script"
+        tracked+=("$name"); rels+=("$rel")
+    done < "$registry"
+    if (( ${#tracked[@]} == 0 )); then
+        printf 'A pull restarts no registered service: no registry row has a file-backed launch script to track.\n'
+        return 0
+    fi
+    local origin_sha="" i
+    origin_sha=$(git -C "$nexus_root" rev-parse --verify -q "origin/$branch" 2>/dev/null) || origin_sha=""
+    if [[ -n "$origin_sha" ]]; then
+        local incoming hits=0
+        incoming=$(git -C "$nexus_root" diff --name-only "HEAD..origin/$branch" -- 2>/dev/null || true)
+        printf 'A pull ALSO RESTARTS every version-tracked service whose launch script it rewrites (the same drift restart the watcher applies to itself). Against origin/%s as LAST FETCHED (%.12s — `git fetch` first for the exact set):\n' \
+            "$branch" "$origin_sha"
+        for i in "${!tracked[@]}"; do
+            if grep -qxF -- "${rels[$i]}" <<<"$incoming"; then
+                printf '  WILL RESTART: %s (%s)\n' "${tracked[$i]}" "${rels[$i]}"
+                hits=$(( hits + 1 ))
+            fi
+        done
+        if (( hits == 0 )); then
+            printf '  none — no registered launch script is in that diff; the tracked ones are:'
+            for i in "${!tracked[@]}"; do printf ' %s (%s)' "${tracked[$i]}" "${rels[$i]}"; done
+            printf '\n'
+        fi
+    else
+        printf 'A pull ALSO RESTARTS every version-tracked service whose launch script it rewrites — the incoming diff is not readable locally (origin/%s unresolved; `git fetch` to see it), so the population that CAN restart is:' "$branch"
+        for i in "${!tracked[@]}"; do printf ' %s (%s)' "${tracked[$i]}" "${rels[$i]}"; done
+        printf '\n'
+    fi
+}
+
 # _version_write_drift_record <version_state_dir> <comp> <old> <new> <note> [window]
 #
 # Persist an ask record at drift-<comp> (key=value, cc-update style).
@@ -449,26 +628,56 @@ _version_write_drift_record() {
 _version_window_exists() {
     local name="${1:?}"
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$name"
+    grep -qxF "$name" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"
 }
 
 # _version_window_id <name> — resolve the named window's immutable
-# tmux window ID (@N); empty + rc 1 when absent. The 2026-06-11
-# incident root cause: the cockpit-drift advisory's restart recipe
-# targeted the cockpit BY NAME, and the orchestrator — one window
-# index away from the cockpit — executed a kill that destroyed its
-# own window instead. Surfacing the ID makes the recipe typo-proof
-# (an ID never matches another window) and dangling-safe (a recipe
-# whose window was since recreated fails the kill harmlessly, and
-# the && stops the duplicate-cockpit spawn). Overridable in tests.
+# tmux window ID (@N). The 2026-06-11 incident root cause: the
+# cockpit-drift advisory's restart recipe targeted the cockpit BY
+# NAME, and the orchestrator — one window index away from the
+# cockpit — executed a kill that destroyed its own window instead.
+# Surfacing the ID makes the recipe typo-proof (an ID never matches
+# another window) and dangling-safe (a recipe whose window was since
+# recreated fails the kill harmlessly, and the && stops the
+# duplicate-cockpit spawn). Overridable in tests.
+#
+# THREE-STATE, same contract as monitor/_tmux-window.sh's resolvers
+# (your-org/nexus-code#699, extended here by `#701` item B):
+#
+#   rc 0  @id on stdout — present
+#   rc 1  tmux answered, no window by that name — genuinely absent
+#   rc 3  could NOT look: no tmux binary, `list-windows` failed, or a row
+#         came back in a shape we cannot parse
+#
+# It was two-valued — rc 1 for absent, for no tmux, and for a failed
+# `list-windows` alike — and `#699`'s manifest could not see it, because that
+# manifest discovers by NAME shape and this name matches none of the
+# conventions it knows. The manifest now also discovers on behaviour (calls
+# `list-windows` AND references window_id/window_index), which is what finds
+# this one; see test-tmux-window-resolver.sh Part D.
+#
+# The rc matters because the CONSUMER is permissive: an empty id degrades the
+# surfaced recipe from an ID-targeted `kill-window` to a NAME-targeted one —
+# the exact failure this function exists to prevent. That degradation is now
+# closed at the emit site as well (see _version_emit_section), so neither the
+# resolver's answer nor the record's contents can reintroduce a bare
+# name-targeted kill.
 _version_window_id() {
-    local name="${1:?}"
-    command -v tmux >/dev/null 2>&1 || return 1
-    local id
-    id=$(tmux list-windows -F '#{window_id}|#{window_name}' 2>/dev/null \
-         | awk -F'|' -v n="$name" '$2==n {print $1; exit}')
-    [[ -n "$id" ]] || return 1
-    printf '%s' "$id"
+    local name="${1:?}" rows rc=0 row rid rname
+    command -v tmux >/dev/null 2>&1 || return 3
+    rows=$(tmux list-windows -F '#{window_id}|#{window_name}' 2>/dev/null) || rc=$?
+    (( rc == 0 )) || return 3
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        rid="${row%%|*}"; rname="${row#*|}"
+        if [[ "$row" != *'|'* || ! "$rid" =~ ^@[0-9]+$ || -z "$rname" ]]; then
+            return 3
+        fi
+        [[ "$rname" == "$name" ]] || continue
+        printf '%s' "$rid"
+        return 0
+    done <<<"$rows"
+    return 1
 }
 
 # ---- emit surfacing -----------------------------------------------------------
@@ -503,18 +712,38 @@ _version_emit_section() {
                 printf 'The cockpit TUI in tmux window %s is orchestrator-owned; the watcher will NOT touch it.\n' \
                     "'${window:-services}'"
                 printf 'Restart it yourself to load the new code:\n'
-                # Kill by immutable window ID when known (2026-06-11
-                # incident: a name/index-targeted kill executed by the
-                # orchestrator destroyed the orchestrator's own window;
-                # an ID can never resolve to another window, and a
-                # recipe whose window was since recreated fails the
-                # kill harmlessly — the && then stops the spawn).
-                printf '  tmux kill-window -t %s && tmux new-window -dn %s %q\n' \
-                    "${window_id:-${window:-services}}" "${window:-services}" \
-                    "${nexus_root:+$nexus_root/}monitor/svc.sh"
+                # Kill by immutable window ID (2026-06-11 incident: a
+                # name/index-targeted kill executed by the orchestrator
+                # destroyed the orchestrator's own window; an ID can never
+                # resolve to another window, and a recipe whose window was
+                # since recreated fails the kill harmlessly — the && then
+                # stops the spawn).
+                #
+                # THE EMPTY-ID ARM USED TO UNDO EXACTLY THAT
+                # (your-org/nexus-code#701 item B). `${window_id:-${window:-services}}`
+                # silently fell back to targeting BY NAME whenever the id was
+                # missing — a `list-windows` that failed, no tmux, an older
+                # record written before ids were captured — so the guard
+                # degraded into the incident it was built to prevent, and did
+                # it most readily in the degraded conditions where a mis-aim
+                # is likeliest. A recipe that cannot be ID-targeted must
+                # RESOLVE the id at paste time, never fall back to the name:
+                # if the resolve comes back empty the `&&` chain stops and
+                # nothing is killed, which is the correct outcome.
                 if [[ -n "$window_id" ]]; then
+                    printf '  tmux kill-window -t %s && tmux new-window -dn %s %q --show-secrets\n' \
+                        "$window_id" "${window:-services}" \
+                        "${nexus_root:+$nexus_root/}monitor/svc.sh"
                     printf '(%s is the window ID of %s, resolved at detection — ID-targeted so a mis-aim cannot hit another window.)\n' \
                         "$window_id" "'${window:-services}'"
+                else
+                    printf '  wid=$(tmux list-windows -F "#{window_id}|#{window_name}" | awk -F"|" -v n=%q "\$2==n {print \$1; exit}")\n' \
+                        "${window:-services}"
+                    printf '  [ -n "$wid" ] && tmux kill-window -t "$wid" && tmux new-window -dn %s %q --show-secrets\n' \
+                        "${window:-services}" \
+                        "${nexus_root:+$nexus_root/}monitor/svc.sh"
+                    printf '(The window ID could not be resolved at detection, so the recipe resolves it at paste time. It is deliberately NOT name-targeted: `tmux kill-window -t %s` can resolve to a DIFFERENT window, which is the 2026-06-11 incident. If $wid comes back empty nothing is killed.)\n' \
+                        "'${window:-services}'"
                 fi
                 printf 'Ack/clear: rm %s\n' "$f"
                 ;;
@@ -532,6 +761,60 @@ _version_emit_section() {
                 printf 'Restart it to load the new code:\n'
                 printf '  %smonitor/svc.sh restart %s\n' \
                     "${nexus_root:+$nexus_root/}" "${comp#service-}"
+                printf 'Ack/clear: rm %s\n' "$f"
+                ;;
+            clone)
+                # your-org/nexus-code#614. `note` is a packed record:
+                #   behind|<commits>|<hours>|<branch>|<why>
+                #   could-not-determine|<reason>|<detail>|<branch>
+                local _cd_kind _cd_a _cd_b _cd_branch _cd_why _cd_head
+                IFS='|' read -r _cd_kind _cd_a _cd_b _cd_branch _cd_why <<<"$note"
+                if [[ "$_cd_kind" == "could-not-determine" ]]; then
+                    # NEVER phrase this as healthy. An undetermined
+                    # deployment state is an alarm in its own right.
+                    printf 'DEPLOYMENT STATE UNKNOWN: could not determine whether this clone is behind origin/%s.\n' \
+                        "${_cd_branch:-dev}"
+                    printf 'reason=%s detail=%s\n' "${_cd_a:-?}" "${_cd_b:-?}"
+                    printf 'Treat this as a possible stale deployment, NOT a clean bill of health: the check could not see, so the running code may be arbitrarily far behind.\n'
+                    printf 'Diagnose by hand:\n'
+                    printf '  git -C %s ls-remote origin refs/heads/%s\n' \
+                        "${nexus_root:-.}" "${_cd_branch:-dev}"
+                else
+                    printf 'The PRIMARY CLONE is BEHIND origin/%s: %s.\n' \
+                        "${_cd_branch:-dev}" "${_cd_why:-drift detected}"
+                    printf 'running %.12s -> remote %.12s (detected %s).\n' \
+                        "${old:-?}" "$new" "$detected"
+                    printf 'Merged code is NOT running code: the watcher, spawner and every `ng` verb execute what is checked out here, not what is on %s.\n' \
+                        "${_cd_branch:-dev}"
+                    # THE COMMAND NAMES THE SAME REF THE DRIFT WAS MEASURED
+                    # AGAINST — the configured integration branch, a
+                    # VARIABLE, never a literal (your-org/nexus-code#1529,
+                    # w241sk F3: a hard-coded `main` was a no-op pull on a
+                    # dev-tracking primary plus a prescribed checkout that
+                    # would have regressed the running watcher). Which branch
+                    # operators deploy from is `monitor.integration_branch`,
+                    # an operator configuration decision; the default is left
+                    # alone here. Nothing here pulls: this is text for a
+                    # human, and it never prescribes a checkout on this clone.
+                    # The variable form is pinned by
+                    # test-cc-update-no-remote-code.sh.
+                    printf 'Deploy when no worker is mid-flight (this is deliberately a human-timed action — a pull swaps helper libraries under the running watcher and in-flight workers). The deployment branch is monitor.integration_branch (%s, the ref measured above); never check out a different branch on this clone to deploy:\n' \
+                        "${_cd_branch:-dev}"
+                    printf '  git -C %s pull --ff-only origin %s\n' \
+                        "${nexus_root:-.}" "${_cd_branch:-dev}"
+                    _cd_head=$(git -C "${nexus_root:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+                    if [[ -n "$_cd_head" && "$_cd_head" != "HEAD" && "$_cd_head" != "${_cd_branch:-dev}" ]]; then
+                        printf 'NOTE: this clone is checked out on %s, not %s — align monitor.integration_branch with the branch you deploy from before pulling; a pull into a different branch is not a deploy.\n' \
+                            "$_cd_head" "${_cd_branch:-dev}"
+                    fi
+                    printf 'The version-aware watcher self-restarts on the resulting source-set drift; no manual restart needed.\n'
+                    # The pull also restarts version-tracked SERVICES whose
+                    # launch script changes, and until your-org/nexus-code#1456
+                    # this advisory never said so — a restart then arrived as a
+                    # surprise health emit rather than as the predicted
+                    # consequence of the action just prescribed.
+                    _version_pull_restart_advisory "${nexus_root:-.}" "${_cd_branch:-dev}"
+                fi
                 printf 'Ack/clear: rm %s\n' "$f"
                 ;;
             *)
@@ -640,8 +923,17 @@ _version_check_tick() {
                     # restart recipe can't be mis-aimed (2026-06-11:
                     # a name/index-targeted kill from the orchestrator
                     # destroyed the orchestrator's own window).
-                    local cockpit_win_id
-                    cockpit_win_id=$(_version_window_id "$cockpit_win" 2>/dev/null) || cockpit_win_id=""
+                    local cockpit_win_id cockpit_id_rc=0
+                    cockpit_win_id=$(_version_window_id "$cockpit_win" 2>/dev/null) \
+                        || { cockpit_id_rc=$?; cockpit_win_id=""; }
+                    # An empty id no longer degrades the recipe to a
+                    # name-targeted kill (your-org/nexus-code#701 item B), but
+                    # WHY it is empty is still worth saying: rc 3 means we
+                    # never got to look, which is not the same as a window
+                    # that is not there, and only one of those is a fact.
+                    if (( cockpit_id_rc >= 2 )); then
+                        _version_log "cockpit window '$cockpit_win' id could NOT be resolved (rc $cockpit_id_rc — tmux unavailable or an unparseable row); the surfaced recipe will resolve it at paste time"
+                    fi
                     _version_write_drift_record "$state_dir" cockpit "$old" "$hash" \
                         "cockpit running old code" "$cockpit_win" "$cockpit_win_id"
                     _version_log "cockpit drifted; asked the orchestrator to restart window '$cockpit_win'${cockpit_win_id:+ ($cockpit_win_id)} (no direct kill)"
@@ -661,7 +953,19 @@ _version_check_tick() {
 
     # ---- registered services ------------------------------------------
     local registry="${NEXUS_SERVICES_REGISTRY:-$nexus_root/monitor/services.registry}"
-    [[ -f "$registry" ]] || return 0
+    # your-org/nexus-code#1266. `[[ -f ]]` is TRUE for a file that exists and
+    # cannot be READ, so this guard did not cover the parse below: an
+    # unreadable registry yielded zero rows and every registered service
+    # silently dropped out of drift detection — the launch scripts stopped
+    # being version-checked with no artefact saying so. This module is loaded
+    # into the watcher and does not source bootstrap-recover.sh at load time,
+    # so the predicate is re-derived here; the CONTRACT is the one documented
+    # in bootstrap-recover.sh ("registry READABILITY: three states, not two").
+    [[ -e "$registry" ]] || return 0
+    if ! _version_registry_readable "$registry"; then
+        _version_log "services registry at $registry exists but is NOT READABLE; no service drift check this pass (rc 79)"
+        return 79
+    fi
     # Subshell on purpose: bootstrap-recover.sh sets globals (STATE_DIR,
     # INTERVAL, …) on source; isolating it keeps the watcher's own
     # globals pristine. All version state is on-disk, so nothing needs
@@ -717,11 +1021,23 @@ _version_check_tick() {
                         # start, or when this module runs outside the watcher,
                         # e.g. under test — where the plain call is correct).
                         svc_rc=0
+                        # SVC_RESTART_ACTOR names THIS module in the restart
+                        # marker svc.sh stamps (your-org/nexus-code#1456): the
+                        # health monitor reads that marker to attribute the
+                        # recovery, and its default `operator` made a
+                        # source-drift restart read as "RESTORED by operator
+                        # intervention" when no operator acted.
+                        # SVC_RESTART_MODE=replace: the service is being
+                        # REPLACED onto new code, not stopped, so a labsh
+                        # supervisor may hand its healthy server to its
+                        # successor instead of bouncing it (#1693).
                         if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                            SVC_RESTART_ACTOR=version-restart SVC_RESTART_MODE=replace \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 {INSTANCE_LOCK_FD}>&- || svc_rc=$?
                         else
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                            SVC_RESTART_ACTOR=version-restart SVC_RESTART_MODE=replace \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 || svc_rc=$?
                         fi
                         if (( svc_rc == 0 )); then

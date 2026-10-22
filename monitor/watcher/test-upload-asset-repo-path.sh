@@ -97,6 +97,9 @@ setup_fake_nexus() {
     # resolves to $FAKE_NEXUS rather than the real repo root.
     cp "$_real_script" "$FAKE_NEXUS/monitor/upload-asset.sh"
     chmod +x "$FAKE_NEXUS/monitor/upload-asset.sh"
+    # upload-asset.sh sources the shared primary-root resolver and REFUSES
+    # (exit 4) without it (your-org/nexus-code#1077), so the fake nexus ships it.
+    cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 
     # Stub mint-token.sh: prints a deterministic fake token.
     cat > "$FAKE_NEXUS/monitor/mint-token.sh" <<'STUB'
@@ -203,9 +206,13 @@ left=$(find "$FAKE_NEXUS/assets.staging" -maxdepth 1 -name 'req.*' 2>/dev/null)
 assert_eq "no request files left in staging" "$left" ""
 
 echo '=== a file path in the same directory still uploads ==='
-run_upload "$PAYLOAD" --repo-path 88/report.md
+# A NEW file name: assets/88/report.md already holds the seed's bytes, and a
+# differing upload onto it is now refused as a clobber (exit 5,
+# your-org/nexus-code#1639) — a different guard from the one tested here.
+run_upload "$PAYLOAD" --repo-path 88/notes.md
 assert_eq "exit 0" "$rc" "0"
-assert_contains "URL names the file" "$stdout" "assets/88/report.md"
+assert_contains "URL names the file" "$stdout" "assets/88/notes.md"
+assert_contains "the file landed in the directory" "$(tree)" "assets/88/notes.md"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="
