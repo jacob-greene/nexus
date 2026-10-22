@@ -371,7 +371,7 @@ assert_contains "safe=0"            "$OUT" "safe=0"
 assert_contains "reason cites fresh submit" "$OUT" "fresh operator submit"
 
 # ── 12. GO: self-activity submit — session-id == own spawn session-id ─────
-#     The coembed-283-followup false positive (2026-07-17). A fresh
+#     The proj-x-followup false positive (2026-07-17). A fresh
 #     user-prompt with NO covering machine input used to read as a fresh
 #     operator submit → safe=0, pinning a wrapped window open. But when
 #     the submit carries the window's OWN spawn session-id it is provably

@@ -25,7 +25,7 @@
 #                                             as one-line JSON.
 #
 # Examples (from a worker):
-#   monitor/declare-wait.sh slurm 52527284_4 "bulk-edger retry"
+#   monitor/declare-wait.sh slurm 52527284_4 "proj-x retry"
 #   monitor/declare-wait.sh ci    "your-org/nexus-code/runs/26304173692" "PR #182"
 #   monitor/declare-wait.sh --remove slurm 52527284_4
 #

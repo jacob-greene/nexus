@@ -186,7 +186,7 @@ Three pieces:
        `window_activity` without representing real
        engagement. The empirical motivation is documented
        inline at the top of `monitor/watcher/_idle_probe.sh`
-       (issue #111: `echo-density` retain consumed inside 30
+       (issue #111: `proj-density` retain consumed inside 30
        min despite no human or agent interaction).
 
      `wrapped-but-stub`, `idle-too-long`, `pane-absent`, and

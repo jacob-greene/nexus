@@ -61,7 +61,7 @@
 # `#{window_activity}` on any output change in the pane —
 # autosuggest re-renders, cursor blinks, spinner glyph swaps, the
 # status-bar token counter ticking. None of those are engagement.
-# Empirical confirmation on `echo-density` (issue #111): retain.ts
+# Empirical confirmation on `proj-density` (issue #111): retain.ts
 # at 12:43:01, no human/agent input for 18 minutes, yet
 # `#{window_activity}` advanced to 13:00:50 — pane-state at that
 # moment was `autosuggest-only`. So `window_activity > retain.ts`
@@ -1024,7 +1024,7 @@ _openg_window_own_session() {
 # operator. The operator drives a DIFFERENT Claude Code session and
 # never types into a spawned worker's pane, so a submit carrying the
 # worker's own session-id is autosuggest / post-wrap typing / the
-# worker's own tool loop (the coembed-283-followup false positive,
+# worker's own tool loop (the proj-x-followup false positive,
 # 2026-07-17). Requires BOTH ids present AND equal — any doubt (a
 # missing stamp session-id, an unknown own session-id) returns FALSE,
 # so the pre-existing attribution stays in force and a genuine operator
@@ -1667,7 +1667,7 @@ _openg_observe() {
             since=0; last=0; reminded=0; src="machine"
             prompt_seen="$prompt_epoch"; changed=1
         elif _openg_prompt_is_self "$window"; then
-            # SELF-attributed (your-org/your-nexus, coembed-283-followup
+            # SELF-attributed (your-org/your-nexus, proj-x-followup
             # 2026-07-17). No covering machine-input stamp, yet the submit
             # carries the window's OWN spawn session-id — so it is the
             # worker's own pane self-activity (autosuggest, post-wrap

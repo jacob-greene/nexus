@@ -1640,7 +1640,7 @@ _skeptic_cfg_int() {
 # landed on a name that already carried a verdict, and six of them went
 # on to open a REAL round (`skeptic-request decision=required` really was
 # logged) that the unfloored guard would have suppressed — five under
-# `bmmc-k27me3-int` / `nucleation-sites`, one under `mouse-bm` whose
+# `proj-a` / `proj-b`, one under `proj-c` whose
 # skeptic came back `check`. All six were `auto` workers that DECIDED
 # `require`, so it overrides the responsible-default heuristic too.
 #
