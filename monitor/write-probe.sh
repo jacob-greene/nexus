@@ -3,7 +3,7 @@
 # committing compute to it.
 #
 # The agent-sandbox mounts only the project root + `~/.claude`
-# writable; shared lab dirs, `/hpc/temp`, and scratch are read-only
+# writable; shared lab dirs, cluster temp space, and scratch are read-only
 # inside the bwrap re-wrap — and Slurm jobs inherit the same
 # re-wrap, so even an `sbatch`-submitted job sees the target dir
 # read-only. A worker that stages a multi-hour result to such a
