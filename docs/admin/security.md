@@ -336,6 +336,40 @@ The orchestrator's worker prompts for external-public targets include
 this redaction step as a checklist item. Workers default to "draft
 and STOP for review" on external-public; nothing auto-submits.
 
+### A leak on a fork reaches the whole fork network
+
+Most operators run a nexus from a fork of the implementation repo.
+GitHub gives a fork, its parent, and every sibling fork one shared
+object store. That set is the fork network.
+
+So the parent serves every commit that you push to your fork. Any
+caller can ask the parent for a fork-only commit by its hash, with no
+account. The parent then returns the file content at HTTP 200. Branch
+names and `refs/pull/*` names do not cross repos. Commit hashes do.
+
+| Action on your fork | Does it stop the parent from serving the commit? |
+|---|---|
+| Delete the file in a new commit | No. The old commit stays addressable. |
+| Delete the branch | No. `refs/pull/<n>/head` and the parent still serve it. |
+| Close the pull request | No. |
+| Rewrite history and force-push | No. The old objects stay in the shared store. |
+| Delete the fork | No. The parent keeps the objects. |
+| A GitHub Support request that names the fork network | It is the only route that removes objects. |
+
+Two rules follow:
+
+- Treat your first push to a public fork as publication to the
+  parent's repo too. Run the leak gate
+  (`monitor/public-mirror/leak-gate.sh`) before each push.
+- If a leak lands, plan the remedy for the fork network. A remedy
+  that touches only your fork removes nothing that was served. Bytes
+  that a caller already fetched cannot be recalled by any route.
+
+When you test whether a URL still serves content, read the HTTP
+status code. Do not use the body size. One `github.com/.../raw/...`
+form returns a 404 with an HTML body of about 267 KB, which a size
+check reads as a success.
+
 ## Reporting a vulnerability
 
 **Do not open a public issue for security vulnerabilities.**
