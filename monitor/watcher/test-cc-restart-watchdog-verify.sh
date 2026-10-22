@@ -87,6 +87,7 @@ make_root() {
     local root="$1" baseline_jsonl="$2"
     mkdir -p "$root/config" "$root/monitor/.state" "$root/node_modules/.bin"
     cp "$NEXUS_SRC/config/load.sh" "$root/config/load.sh"
+    cp "$NEXUS_SRC/monitor/_claude-bin.sh" "$root/monitor/_claude-bin.sh"
     printf 'monitor:\n  target_window: %s\n' "$TARGET" > "$root/config/nexus.yml"
     cat > "$root/node_modules/.bin/claude" <<EOF
 #!/usr/bin/env bash
