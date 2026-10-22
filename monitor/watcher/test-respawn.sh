@@ -259,46 +259,114 @@ else
 fi
 
 # --- Test 3: prompt-file delivery ---------------------------------------
-
-echo '=== --prompt-file: helper paste-buffers the prompt and sends Enter ==='
-: > "$TMUX_LOG"
-touch "$WORK/tmux-target-absent"   # absent-path premise (#203)
+#
+# jacob-greene/nexus#230 Defect A: a COLD (fresh) spawn hands the prompt
+# to claude as its positional argv prompt, the same way spawn-worker.sh
+# starts workers, and never pastes it. A resume spawn, a prompt over
+# RESPAWN_PROMPT_ARG_MAX_BYTES, and RESPAWN_PROMPT_DELIVERY=paste keep
+# the paste-buffer path.
 
 PROMPT="$WORK/test-prompt.txt"
 cat > "$PROMPT" <<'EOF'
 test recovery prompt body
 EOF
 
-(
-    NEXUS_ROOT="$FAKE_NEXUS"
-    export NEXUS_ROOT
-    PATH="$TMUX_STUB_BIN:$PATH"
-    export PATH
-    PANE_STATE_BIN="$PANE_STATE_STUB"
-    export PANE_STATE_BIN
-    FRESH_SPAWN_READINESS_BUDGET_SECONDS=2
-    export FRESH_SPAWN_READINESS_BUDGET_SECONDS
-    FRESH_SPAWN_READINESS_POLL_SECONDS=0
-    export FRESH_SPAWN_READINESS_POLL_SECONDS
-    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1
-    export FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS
+# Run one --prompt-file spawn. Args: <stderr-tag> [extra helper args...].
+# Extra env (RESPAWN_PROMPT_DELIVERY, RESPAWN_PROMPT_ARG_MAX_BYTES) is
+# inherited from the caller. Sets $rc, $tmux_log and $body (launcher).
+_t3_run() {
+    local tag="$1"; shift
+    : > "$TMUX_LOG"
+    touch "$WORK/tmux-target-absent"   # absent-path premise (#203)
+    local before after launcher
+    before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
+    (
+        NEXUS_ROOT="$FAKE_NEXUS"
+        export NEXUS_ROOT
+        PATH="$TMUX_STUB_BIN:$PATH"
+        export PATH
+        PANE_STATE_BIN="$PANE_STATE_STUB"
+        export PANE_STATE_BIN
+        FRESH_SPAWN_READINESS_BUDGET_SECONDS=2
+        export FRESH_SPAWN_READINESS_BUDGET_SECONDS
+        FRESH_SPAWN_READINESS_POLL_SECONDS=0
+        export FRESH_SPAWN_READINESS_POLL_SECONDS
+        FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1
+        export FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS
 
-    # shellcheck source=_respawn.sh
-    . "$_test_dir/_respawn.sh"
+        # shellcheck source=_respawn.sh
+        . "$_test_dir/_respawn.sh"
 
-    _respawn_orchestrator orchestrator --prompt-file "$PROMPT"
-) 2>"$WORK/stderr-3.log"
-rc=$?
-assert_eq "exit 0 when prompt-file delivery succeeds" "$rc" "0"
-rm -f "$WORK/tmux-target-absent"
+        _respawn_orchestrator orchestrator --prompt-file "$PROMPT" "$@"
+    ) 2>"$WORK/stderr-3-$tag.log"
+    rc=$?
+    rm -f "$WORK/tmux-target-absent"
+    tmux_log=$(cat "$TMUX_LOG")
+    after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
+    launcher=$(comm -13 <(printf '%s\n' "$before" | sort -u) \
+                        <(printf '%s\n' "$after"  | sort -u) | head -1)
+    body=""
+    [[ -n "$launcher" && -f "$launcher" ]] && body=$(cat "$launcher")
+}
 
-tmux_log=$(cat "$TMUX_LOG")
-assert_contains "load-buffer received the prompt file" \
-                "$tmux_log" "load-buffer -b nexus-respawn"
-assert_contains "paste-buffer targeted the new window" \
-                "$tmux_log" "paste-buffer -b nexus-respawn"
-assert_contains "send-keys submitted Enter after paste" \
-                "$tmux_log" "send-keys -t orchestrator Enter"
+_t3_assert_pasted() {
+    local what="$1"
+    assert_eq "exit 0 ($what)" "$rc" "0"
+    assert_contains "load-buffer received the prompt file ($what)" \
+                    "$tmux_log" "load-buffer -b nexus-respawn"
+    assert_contains "paste-buffer targeted the new window ($what)" \
+                    "$tmux_log" "paste-buffer -b nexus-respawn"
+    assert_contains "send-keys submitted Enter after paste ($what)" \
+                    "$tmux_log" "send-keys -t orchestrator Enter"
+    assert_not_contains "launcher passes no positional prompt ($what)" \
+                        "$body" '"$prompt"'
+}
+
+echo '=== #230: COLD --prompt-file is claude argv, never pasted ==='
+_t3_run argv
+assert_eq "exit 0 when prompt-file delivery succeeds (argv)" "$rc" "0"
+assert_not_contains "cold spawn does NOT load-buffer the prompt" \
+                    "$tmux_log" "load-buffer"
+assert_not_contains "cold spawn does NOT paste-buffer the prompt" \
+                    "$tmux_log" "paste-buffer"
+assert_contains "cold launcher still execs claude with --dangerously-skip-permissions" \
+                "$body" '--dangerously-skip-permissions'
+exec_line=$(grep '^exec ' <<<"$body" || true)
+if [[ "$exec_line" == *' "$prompt"' ]]; then
+    pass "exec line ends with the quoted \"\$prompt\" argv"
+else
+    fail "exec line does not end with \"\$prompt\": $exec_line"
+fi
+arg_file=$(sed -n 's/^prompt=$(<"\(.*\)")$/\1/p' <<<"$body" | head -1)
+if [[ "$arg_file" == "$RESPAWN_TMPDIR"/nexus-respawn-prompt-* && -f "$arg_file" ]]; then
+    pass "launcher reads a nexus-respawn-prompt-* copy of the prompt"
+    assert_eq "argv prompt copy matches the prompt file" \
+              "$(cat "$arg_file")" "$(cat "$PROMPT")"
+    assert_contains "launcher deletes the prompt copy after reading it" \
+                    "$body" "rm -f \"$arg_file\""
+    # Execute the launcher's read step for real: the prompt must reach
+    # claude as ONE argv string, intact.
+    stub_out=$(bash -c "$(grep -v '^rm -f \"'"${RESPAWN_TMPDIR}"'/nexus-respawn-launch' <<<"$body" \
+                       | sed 's/^exec .*/printf "%s" "$prompt"/')" 2>/dev/null)
+    assert_eq "launcher hands the prompt body to claude intact" \
+              "$stub_out" "$(cat "$PROMPT")"
+else
+    fail "launcher carries no nexus-respawn-prompt-* read step (got '$arg_file')"
+fi
+
+echo '=== #230: RESPAWN_PROMPT_DELIVERY=paste forces the paste path ==='
+RESPAWN_PROMPT_DELIVERY=paste _t3_run forced-paste
+_t3_assert_pasted "forced paste"
+
+echo '=== #230: prompt over RESPAWN_PROMPT_ARG_MAX_BYTES falls back to paste ==='
+RESPAWN_PROMPT_ARG_MAX_BYTES=5 _t3_run oversize
+_t3_assert_pasted "oversize prompt"
+
+echo '=== #230: RESUME spawn keeps the paste path ==='
+_t3_run resume --resume-sid "11112222-3333-4444-5555-666677778888"
+_t3_assert_pasted "resume spawn"
+assert_contains "resume launcher carries --resume" \
+                "$body" "--resume 11112222-3333-4444-5555-666677778888"
 
 # --- Test 4: settings absent → launcher omits --settings ---------------
 
@@ -731,6 +799,15 @@ case "\$1" in
         # Args: load-buffer -b <buf> <file>
         cp "\$4" "$WORK/prompt-captured.txt" 2>/dev/null || true
         ;;
+    new-window)
+        # #230: a COLD spawn hands the prompt to claude as argv. The
+        # launcher (last arg) reads it from a nexus-respawn-prompt-*
+        # file; capture that file the way load-buffer is captured.
+        launcher="\${!#}"
+        pf=\$(sed -n 's/^prompt=\$(<"\(.*\)")\$/\1/p' "\$launcher" 2>/dev/null | head -1)
+        [[ -n "\$pf" ]] && cp "\$pf" "$WORK/prompt-captured.txt" 2>/dev/null
+        exit 0
+        ;;
     *) exit 0 ;;
 esac
 STUB
@@ -913,7 +990,7 @@ if [[ -f "$WORK/prompt-captured.txt" ]]; then
         fail "cold-path arm step ordering wrong (standdown@${standdown_pos:-?} arm@${arm_pos:-?})"
     fi
 else
-    fail "respawn_agent did not paste a prompt body on the cold path"
+    fail "respawn_agent did not deliver a prompt body on the cold path"
 fi
 rm -f "$WORK/prompt-captured.txt"
 
@@ -1479,7 +1556,7 @@ if [[ -f "$WORK/prompt-captured.txt" ]]; then
     assert_contains "cold prompt scopes stand-down to the duplicate's own window" \
                     "$prompt_body" "your-own-window-id"
 else
-    fail "respawn_agent did not paste a prompt body (cold flavour, prompt-safety run)"
+    fail "respawn_agent did not deliver a prompt body (cold flavour, prompt-safety run)"
 fi
 rm -f "$WORK/prompt-captured.txt"
 
