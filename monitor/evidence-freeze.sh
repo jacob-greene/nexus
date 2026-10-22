@@ -430,6 +430,10 @@ _freeze_lock_acquire() {
     # every failure message silently dropped. Wrapping the `exec` in a
     # group scopes the `2>/dev/null` to the group; the fd the `exec`
     # opens still outlives it, which is the point.
+    # flock-fd: deliberate hold for the whole freeze. Every child spawned
+    # while held (cp, md5sum, chmod, awk, date) is a short-lived
+    # foreground process; nothing is backgrounded or daemonised, so no
+    # inheritor can outlive this script and pin the lock.
     if ! { exec {FREEZE_LOCK_FD}>>"$lock"; } 2>/dev/null; then
         FREEZE_LOCK_FD=""
         FREEZE_LOCK_HELD=0

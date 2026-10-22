@@ -270,6 +270,14 @@ export MONITOR_SKEPTIC_AWAIT_HANG_SECONDS=600
 # shellcheck source=_idle_probe.sh
 . "$_test_dir/_idle_probe.sh"
 
+# Hermetic tmux: skeptic liveness is tri-state (#31) and a host with no
+# tmux server answers rc 2 ("could not ask") -> not parked. Pin a live
+# reviewer so the parked path does not depend on the runner's tmux.
+tmux() {
+    [[ "${1:-}" == list-windows ]] && { printf '%s\n' sweeper-skeptic; return 0; }
+    return 1
+}
+
 # Override the classifier: the test scripts each cycle's idle set.
 MOCK_IDLE_SET=""
 list_really_idle_workers() { printf '%s\n' "$MOCK_IDLE_SET"; }

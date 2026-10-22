@@ -453,7 +453,8 @@ assert_eq "no trailing whitespace after the key" \
 # anything was broken.
 
 echo '=== round trip: report-init → fill body only → report-check passes ==='
-run_ng path err rc "$FAKE_NEXUS" report-init acceptance --project sample \
+CLAUDE_CODE_SESSION_ID=0f9c1a2b-3d4e-5f60-8712-9a3b4c5d6e7f \
+    run_ng path err rc "$FAKE_NEXUS" report-init acceptance --project sample \
        --reports-dir "$FAKE_NEXUS/reports"
 assert_eq        "report-init exits 0"                 "$rc" "0"
 
