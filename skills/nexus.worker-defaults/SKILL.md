@@ -108,6 +108,16 @@ a hook or your task prompt points you there.
   assertion is the only loud failure. Never `--no-verify`, never
   force-push; fix the root cause. `git commit` / `git push` use
   your identity, everything else the bot's.
+- **Every commit in a PROJECT repo is the operator's.** That covers
+  `work/<project>`, its forks, and every upstream pull-request
+  branch. Author AND committer are
+  `Jacob Greene <96763352+jacob-greene@users.noreply.github.com>`:
+  `git -c user.name="Jacob Greene"
+  -c user.email="96763352+jacob-greene@users.noreply.github.com"
+  commit …`. Add NO `Co-Authored-By: Claude` trailer. This is
+  operator ruling 6222839785 and it overrides any harness
+  attribution reminder. Nexus-infra commits are out of scope until
+  the operator rules on them.
 - **`sandbox-notify "<msg>"`** on blocker / ready / done.
 - **Never invoke `pip` in ANY form — `uv pip` only.** That means
   bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
