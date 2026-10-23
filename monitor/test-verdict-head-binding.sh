@@ -50,7 +50,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then ok "$label"
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then ok "$label"
     else bad "$label" "missing $(printf %q "$needle") in <<$hay>>"; fi
 }
 assert_not_contains() {
@@ -185,14 +186,14 @@ assert_eq "T1.4c control — and it yields the head" "$(cut -f2 <<<"$got")" "999
 # length, CommonMark-style.
 nested=$'````\n```\nSkeptic-Verdict: credible head=9999999\n````\n'
 got=$(printf '%s' "$nested" | _verdict_parse); rc=$?
-assert_eq "T1.4e a nested ``` inside a ```` block does not close it" "$rc" "3"
+assert_eq 'T1.4e a nested ``` inside a ```` block does not close it' "$rc" "3"
 nested_t=$'~~~~\n~~~\nSkeptic-Verdict: credible head=9999999\n~~~~\n'
 got=$(printf '%s' "$nested_t" | _verdict_parse); rc=$?
 assert_eq "T1.4f same for a nested ~~~ inside a ~~~~ block" "$rc" "3"
 # A tilde line does not close a backtick fence.
 mixed=$'```\n~~~\nSkeptic-Verdict: credible head=9999999\n```\n'
 got=$(printf '%s' "$mixed" | _verdict_parse); rc=$?
-assert_eq "T1.4g a ~~~ line does not close a ``` fence" "$rc" "3"
+assert_eq 'T1.4g a ~~~ line does not close a ``` fence' "$rc" "3"
 # Positive control: a same-character, same-length fence DOES close, so the
 # trailer after it is found. Without this the three 3s above could all come
 # from a parser that never finds anything.

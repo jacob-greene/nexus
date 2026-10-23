@@ -289,7 +289,8 @@ SHIM_MODE=doi run add 10.1093/nar/gkac1071
 expect "add same paper by DOI (no S2 key, via PubMed) -> not duplicated" $?
 grep -q 'term="10.1093/nar/gkac1071"\[doi\]' "$CURL_LOG"; expect "DOI resolved with a [doi] field query" $?
 run add PMID:36420896
-[ "$(grep -c '' "$LIB")" -eq 1 ]; expect "add PMID:<n> form -> dedupe by PMID" $?
+# LINES are the right unit here: refs.jsonl holds one record per line.
+[ "$(grep -c '' "$LIB")" -eq 1 ]; expect "add PMID:<n> form -> dedupe by PMID" $?  # refs.jsonl: 1 line = 1 record
 printf '%s\n' '{"id":"y","doi":"","pmid":"37248244","title":"t"}' >>"$LIB"
 run add 37248244
 [ "$(grep -c '' "$LIB")" -eq 2 ] && grep -q 'already in library (pmid:37248244)' <<<"$ERR"

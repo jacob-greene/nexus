@@ -316,6 +316,7 @@ assert_eq "the jq population is non-empty (a zero here would vacuously green eve
 jq_loud=(
     monitor/cc-floor.sh
     monitor/ci-run-execution.sh
+    monitor/context-usage.sh        # fork: one top-level gate, `fail jq-missing` + exit 1, before any selector
     monitor/declare-no-wait.sh
     monitor/declare-wait.sh
     monitor/ensure-workdir-trusted.sh
@@ -419,6 +420,7 @@ jq_fallback=(
     # else: `sed -n '1s/…/'` extracts the same scalar fields (recovery, category,
     # ts, last_msg) — the same fallback shape `_idle_turn_failure_field` uses.
     monitor/watcher/_auth_hold.sh
+    monitor/watcher/_over_limit.sh  # fork: else: sed-extracts the same string field (_over_limit_json_field)
 )
 # DEGRADES — the manifest. Derived by SUBTRACTION from the measured population
 # rather than re-listed, so the two can never disagree: anything not declared

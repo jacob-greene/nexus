@@ -2558,10 +2558,10 @@ that only print it) before you trust it. Check: run
 `<candidate> --version` and confirm both the leading `N.N.N` and the
 first field still parse.
 
-### 2k. Folder trust for a NESTED git repository
+### 2k. Folder trust for a NESTED Git repository
 
 Claude Code asks for folder trust per project directory, and 2.1.232
-changed the rule for a directory that is a git repository nested inside
+changed the rule for a directory that is a Git repository nested inside
 another. That release broke this nexus: every spawned worker stopped at
 a trust dialog. The gate covers it
 (`test-realmodel-nested-trust.sh`, driven from
@@ -2611,7 +2611,7 @@ is untouched), then:
      on the real autosuggest renderer bytes (**2a** `_detect_autosuggest`),
      anchored to a live pid + the liveness-gated `absent` degrade.
    - `test-realmodel-nested-trust.sh` → exercises **2k**, folder trust
-     for a git repository nested inside another.
+     for a Git repository nested inside another.
    - `test-realmodel-vipaste.sh` → exercises **2c**: boots with
      `editorMode: "vim"`, drops the box to normal mode, and drives the
      respawn paste helper and `monitor/paste-followup.sh` (bracketed

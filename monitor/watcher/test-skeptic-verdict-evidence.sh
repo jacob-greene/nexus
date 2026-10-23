@@ -506,7 +506,8 @@ assert_file_exists "the idle probe is readable" "$IDLE_PROBE"
 _ORPH_EXEMPT="awk '/^# skeptic-pending marker resolved/|an awk PARSER reading the marker-resolved comment out of a rationale file; emits no advice
 printf '# skeptic-pending marker resolved via|WRITES that comment INTO the rationale file; a record, not operator-facing advice
 printf 'resolved skeptic-pending marker for %s|a success CONFIRMATION after the fact, not advice about what to do next
-printf 'NO skeptic-pending marker was written (no source window|states that THIS wrap-up wrote no marker because no window resolved (#1719); a fact about this run, not advice about an existing marker"
+printf 'NO skeptic-pending marker was written (no source window|states that THIS wrap-up wrote no marker because no window resolved (#1719); a fact about this run, not advice about an existing marker
+spawn-skeptic request is filed, no skeptic-pending marker is|the re-wrap-up ALREADY-VALIDATED notice (jacob-greene/nexus fork, rewrapup-idempotence) stating THIS run filed no request and armed no marker because a verdict already returned; a fact about this run, not advice about an existing marker"
 
 # ── NO WINDOW, NO ROUTER INDIRECTION ──────────────────────────────────────
 #
@@ -1277,7 +1278,7 @@ _w_comp=$(printf '%s' "$_ev_comp" | sed -n 's/.*standing_stale_why=\([^ ]*\).*/\
 assert_eq "COMPOSITION CONTROL: the two reference cases report DIFFERENT reasons" \
     "$([[ "$_w_plain" != "$_w_comp" ]] && echo distinct || echo same)" "distinct"
 
-EXPECTED=153   # 146 +3: the #1207 reversal of the no-ledger control (record, detail, class); +1 #1719: the new exemption's "key still matches a real line" assertion
+EXPECTED=154   # +1 fork sync (jacob-greene/nexus): the ALREADY-VALIDATED notice's exemption "key still matches a real line" assertion;  146 +3: the #1207 reversal of the no-ledger control (record, detail, class); +1 #1719: the new exemption's "key still matches a real line" assertion
                #     +3: #1199 — the no-arm control INVERTED from a pinned `0` to `?`,
                #         plus the never-a-0 assertion and the indistinguishability pair
 if (( PASS + FAIL != EXPECTED )); then

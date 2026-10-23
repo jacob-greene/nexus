@@ -1423,8 +1423,8 @@ _fetch_openalex_ref() {
 # Refuse a record already in the library by DOI or PMID. $1=doi $2=pmid.
 _lib_has() {
     local doi="${1,,}" pmid="$2"
-    [[ -n "$doi"  ]] && _lib_dois  | grep -qxF -- "$doi"  && { printf 'doi:%s' "$doi"; return 0; }
-    [[ -n "$pmid" ]] && _lib_pmids | grep -qxF -- "$pmid" && { printf 'pmid:%s' "$pmid"; return 0; }
+    [[ -n "$doi"  ]] && grep -qxF -- "$doi" <<<"$(_lib_dois)" && { printf 'doi:%s' "$doi"; return 0; }
+    [[ -n "$pmid" ]] && grep -qxF -- "$pmid" <<<"$(_lib_pmids)" && { printf 'pmid:%s' "$pmid"; return 0; }
     return 1
 }
 

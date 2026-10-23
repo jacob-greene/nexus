@@ -383,8 +383,15 @@ _pre1047_ok() {   # <spawn-worker source> -> 0 if it emits no --name when the ga
 }
 PRE="$WORK/spawn-worker-pre1047.sh"
 _PRE_PROV=""
+# HEAD~1 is skipped when HEAD is a MERGE commit. A merge's first parent is only
+# ONE of the two histories it joins: a downstream fork's sync merge has the
+# fork's pre-merge file there, which lacks every OTHER launcher change the
+# merge brought in (e.g. #1334's CLAUDE_CODE_SANDBOXED=1 prefix). It passes the
+# --name gate, and the byte comparison then measures the merge, not #1047.
+_head_parents=$(git -C "$REPO_ROOT" rev-list --parents -n 1 HEAD 2>/dev/null | wc -w)
 for _ref in "$(git -C "$REPO_ROOT" merge-base origin/dev HEAD 2>/dev/null)" origin/dev HEAD~1; do
     [[ -n "$_ref" ]] || continue
+    if [[ "$_ref" == "HEAD~1" ]] && (( _head_parents > 2 )); then continue; fi
     git -C "$REPO_ROOT" show "${_ref}:monitor/spawn-worker.sh" > "$PRE" 2>/dev/null || continue
     [[ -s "$PRE" ]] || continue
     if _pre1047_ok "$PRE"; then _PRE_PROV="git:${_ref}"; break; fi

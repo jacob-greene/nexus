@@ -45,7 +45,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if [[ "$hay" == *"$needle"* ]]; then pass "$label"
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$hay" == *"$needle"* ]]; then pass "$label"
     else
         fail "$label"
         printf '         expected to find: %s\n' "$needle" >&2

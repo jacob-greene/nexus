@@ -59,7 +59,7 @@ ORIG_PATH="$PATH"
 # absence mechanism, not a stub pretending to be one.
 farm() {
     local d="$1" t p; mkdir -p "$d"
-    for t in grep sed awk date cat touch rm mkdir env bash; do
+    for t in grep sed awk date cat touch rm mkdir env bash dirname; do
         p=$(PATH="$ORIG_PATH" command -v "$t" 2>/dev/null) || continue
         ln -sf "$p" "$d/$t"
     done
@@ -265,6 +265,12 @@ mkdir -p "$DECOY/monitor/watcher"
 revert_fix "$OWN_TREE/monitor/watcher/_idle_probe.sh" \
            "$DECOY/monitor/watcher/_idle_probe.sh" "$WORK/decoy.count"
 DECOY_EDITS=$(cat "$WORK/decoy.count")
+# _idle_probe.sh sources its window-key encoder from ../_bookkeeping.sh and
+# REFUSES to load without it. The decoy is a tree, so it carries that lib
+# verbatim — otherwise the fresh `bash -c` below fails to load the decoy at
+# all (rc 127) and the "differs only by the fix" check measures a missing
+# file, not the reverted capture.
+cp "$OWN_TREE/monitor/_bookkeeping.sh" "$DECOY/monitor/_bookkeeping.sh"
 
 # Run <fn> <args…> as a BARE simple command under `set -euo pipefail`,
 # against the libs in <tree>. Echoes "reached <rc>" iff control returned

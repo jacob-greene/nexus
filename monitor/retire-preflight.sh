@@ -1186,7 +1186,7 @@ if [[ -f "$sk_pending" ]]; then
         # this branch is reached whenever the marker is not CHECKED-orphaned,
         # including when tmux could not be asked at all, so the reason names
         # the marker as UNRESOLVED and does not assert a live reviewer.
-        emit 0 "$pane_state" "required skeptic marker is LIVE — refusing kill; if a verdict exists, use \`ng skeptic resolve <window> --reason …\` (skeptic-pending marker unresolved; reviewer liveness not asserted)$(_sk_ev_clause)"
+        emit 0 "$pane_state" "required skeptic marker is LIVE — refusing kill; if a verdict exists, use \`ng skeptic resolve <window> --reason …\` (skeptic-pending marker unresolved; reviewer liveness not asserted; ask \`ng skeptic-evidence <window>\` what the ledger holds)$(_sk_ev_clause)"
         exit 1
     fi
 fi

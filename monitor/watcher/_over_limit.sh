@@ -652,8 +652,12 @@ _over_limit_json_field() {
     if command -v jq >/dev/null 2>&1; then
         v=$(jq -r --arg f "$field" '.[$f] // ""' "$file" 2>/dev/null) || v=""
     else
+        # First match taken by parameter expansion, not `| head -n1`: an
+        # early-exit reader under pipefail can SIGPIPE sed and blank a
+        # real value through the `|| v=""` (early-exit-readers.manifest).
         v=$(sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
-            "$file" 2>/dev/null | head -n1) || v=""
+            "$file" 2>/dev/null) || v=""
+        v=${v%%$'\n'*}
     fi
     [[ "$v" != "null" ]] || v=""
     printf '%s' "$v"

@@ -2118,8 +2118,13 @@ RTASK=renumber-probe
 _rdir="$NEXUS_STATE_DIR/skeptic/$RTASK"
 # The reset archive lives either inside the channel (`.stale-archive-*`) or,
 # since your-org/nexus-code#1434, beside it under `skeptic/.archive/`.
-_arch=$(ls -d "$_rdir"/.stale-archive-*/req-001-first-q.answered.md \
-    "$NEXUS_STATE_DIR/skeptic/.archive/$RTASK".reset-*/req-001-first-q.answered.md 2>/dev/null | head -1)
+# A glob loop, not `ls -d <glob> | head -1`: under nullglob two unmatched
+# globs make bare `ls -d` print `.` (nullglob-bare-form.manifest).
+_arch=""
+for _a in "$_rdir"/.stale-archive-*/req-001-first-q.answered.md \
+          "$NEXUS_STATE_DIR/skeptic/.archive/$RTASK".reset-*/req-001-first-q.answered.md; do
+    [[ -f "$_a" ]] && { _arch="$_a"; break; }
+done
 assert_file "reset archived the round-1 request" "$_arch"
 _rp=$("$CHAN" ask "$RTASK" second-q --message "round 2 question")
 assert_contains "ask after reset allocates req-002, not req-001" "$_rp" "req-002-second-q.open.md"

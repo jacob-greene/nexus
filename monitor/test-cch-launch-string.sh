@@ -64,6 +64,26 @@ BASELINE_PATH="monitor/cc-harness/_lib.sh"
 # BASELINE_REF: the settings shape is measured, not transcribed.
 SETTINGS_REF="d079074f0edc7a71408a691addcf7425e11810c2"
 
+# The whitelist scan's ENUMERATOR, shared by the scan below and by the
+# `--population` protocol (your-org/nexus-code#803): one walk, two needles,
+# so the declared population cannot drift from the walked set.
+# Use `command grep -r`: the bundled `grep` shell function honours
+# .gitignore and would return an empty, exit-1 result that reads
+# identically to a true negative.
+_launch_scan() {   # <needle> -> every monitor/**/*.sh carrying it, sorted
+    command grep -rl --include='*.sh' -- "$1" "$REPO_ROOT/monitor" 2>/dev/null | sort
+}
+
+# ---- the `--population` protocol (your-org/nexus-code#803) ---------------
+# Placed above the first output because `gp_handle` EXITS when it handles
+# the flag. The empty needle matches every non-empty *.sh the scan reads.
+. "$_test_dir/_guard_population.sh"
+gp_population() {
+    _launch_scan ''
+    printf '%s\n' "$LIB"
+}
+gp_handle "$@"
+
 PASS=0
 FAIL=0
 assert_eq() {
@@ -122,13 +142,9 @@ echo "=== no scenario rebuilds the launch string ==="
 # demo.sh writes `printf -v LAUNCH` (upper case) and does not source
 # _lib.sh at all; it is a standalone human-facing demo.
 #
-# Use `command grep -r`: the bundled `grep` shell function honours
-# .gitignore and would return an empty, exit-1 result that reads
-# identically to a true negative.
-mapfile -t builders < <(
-    command grep -rl --include='*.sh' -- 'printf -v launch' \
-        "$REPO_ROOT/monitor" 2>/dev/null | sort
-)
+# The walk is `_launch_scan`, defined at the top (see its note on
+# `command grep -r`).
+mapfile -t builders < <(_launch_scan 'printf -v launch')
 expected=(
     "$_test_dir/cc-harness/_lib.sh"
     "$_test_dir/test-cch-launch-string.sh"

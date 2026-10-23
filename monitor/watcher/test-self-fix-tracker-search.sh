@@ -45,15 +45,23 @@ skill_txt=$(<"$SKILL")
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# ---- §1 the gate says five, everywhere it says a number ------------------
+# ---- §1 the gate says six, everywhere it says a number -------------------
 #
 # An amended list whose lead-in still says "four" is worse than no amendment:
 # the reader counts four, stops, and the fifth reads as an appendix.
+#
+# SIX SINCE THE UPSTREAM SYNC (jacob-greene/nexus issue 162). Upstream added
+# this check as item 5 ("Search the tracker by PATH"); the fork had added
+# "Sweep the tracker in every state" as ITS item 5. The merge keeps both, so
+# the sweep is item 6 and the lead-in says six. A surviving "five" is now the
+# stale count, so it joins the "four" spellings below.
 echo "=== §1 the check count agrees with the list ==="
-assert_eq "the lead-in asks for five checks" \
-    "$(grep -c 'Run these five checks' <<<"$skill_txt")" "1"
-assert_eq "no 'four checks' / 'all four' survives in this skill" \
-    "$(grep -cE 'these four checks|Pass all four|the four checks pass' <<<"$skill_txt")" "0"
+assert_eq "the lead-in asks for six checks" \
+    "$(grep -c 'Run these six checks' <<<"$skill_txt")" "1"
+assert_eq "no 'four'/'five checks' / 'all four'/'all five' survives in this skill" \
+    "$(grep -cE 'these (four|five) checks|Pass all (four|five)|the (four|five) checks pass' <<<"$skill_txt")" "0"
+assert_eq "a numbered item 6 exists under the gate (the fork's sweep check)" \
+    "$(grep -c '^6\. \*\*Sweep the tracker in every state' <<<"$skill_txt")" "1"
 assert_eq "a numbered item 5 exists under the gate" \
     "$(grep -c '^5\. \*\*Search the tracker by PATH' <<<"$skill_txt")" "1"
 
@@ -224,7 +232,7 @@ assert_eq "…and the already-merged branch is excluded either way (by the empty
 assert_contains "the snippet fetches before reading refs/remotes" "$snippet" 'git fetch --prune origin'
 
 # ---- assertion-count guard ----------------------------------------------
-EXPECTED_ASSERTIONS=27
+EXPECTED_ASSERTIONS=28
 TOTAL=$(( PASS + FAIL ))
 if (( TOTAL != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \

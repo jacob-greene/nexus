@@ -120,7 +120,7 @@ wait_for "candidate booted to idle" 60 -- cch_state_is "$WIN" idle \
 # indicator goes away. If a release stops honouring the key, BOTH
 # assertions below go red and say so — the scenario can never quietly
 # degrade into the non-pinning version it replaced.
-_in_insert()  { cch_capture "$WIN" | command grep -qF -- '-- INSERT --'; }
+_in_insert()  { command grep -qF -- '-- INSERT --' <<<"$(cch_capture "$WIN")"; }
 _in_normal()  { ! _in_insert; }
 
 wait_for "candidate honours editorMode=vim (-- INSERT -- indicator)" 30 -- _in_insert \
@@ -132,7 +132,7 @@ wait_for "Escape left insert mode (pane is in VI NORMAL mode)" 15 -- _in_normal 
 
 PROMPT="$CCH_DIR/vipaste-prompt.txt"
 printf '%s' "$MARKER" > "$PROMPT"      # no trailing newline — see header
-_marker_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER"; }
+_marker_rendered() { command grep -qF "$MARKER" <<<"$(cch_capture "$WIN")"; }
 
 # ---- negative control: the marker rule, PROVEN, not asserted in a comment
 # The comment above says the marker carries no character that enters
@@ -196,7 +196,7 @@ else
 fi
 
 # Negative control: a marker that was never pasted must not appear.
-if cch_capture "$WIN" | command grep -qF "$NEVER"; then
+if command grep -qF "$NEVER" <<<"$(cch_capture "$WIN")"; then
     bad "control: an unpasted marker appeared — the assertion is not specific"
 else
     ok "control: an unpasted marker does not appear"
@@ -233,7 +233,7 @@ else
     ok "paste-followup.sh completed the bracketed paste (rc $fu_rc)"
 fi
 
-_bkt_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER_BKT"; }
+_bkt_rendered() { command grep -qF "$MARKER_BKT" <<<"$(cch_capture "$WIN")"; }
 wait_for "bracketed paste (paste-buffer -p -d -b) reached the live TUI" 30 -- _bkt_rendered \
     || cch_capture "$WIN" | tail -15 >&2
 
@@ -258,7 +258,7 @@ wait_for "pane is in VI NORMAL mode for the unguarded bracketed probe" 15 -- _in
     || cch_capture "$WIN" | tail -6 >&2
 cch_tmux set-buffer -b "$CCH_SESSION-lit" -- "$MARKER_LIT"
 cch_tmux paste-buffer -p -d -b "$CCH_SESSION-lit" -t "$CCH_SESSION:$WIN"
-_lit_rendered() { cch_capture "$WIN" | command grep -qF "$MARKER_LIT"; }
+_lit_rendered() { command grep -qF "$MARKER_LIT" <<<"$(cch_capture "$WIN")"; }
 wait_for "a bracketed paste lands as literal text with NO insert-mode guard" 30 -- _lit_rendered \
     || { echo "    the guard in monitor/paste-followup.sh is now LOAD-BEARING — re-check surface 2c" >&2
          cch_capture "$WIN" | tail -12 >&2; }

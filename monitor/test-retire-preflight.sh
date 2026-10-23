@@ -114,16 +114,6 @@ _selfcheck_assert_helpers() {
 }
 _selfcheck_assert_helpers
 
-assert_not_contains() {
-    local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
-        printf '  FAIL: %s — unexpectedly found %q\n' "$label" "$needle" >&2
-        FAIL=$(( FAIL + 1 ))
-    else
-        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    fi
-}
-
 # ---- harness -------------------------------------------------------------
 # Pin the checkout under test to THIS one. retire-preflight.sh resolves its
 # helper lib as "$NEXUS_ROOT/monitor/watcher/_idle_probe.sh else

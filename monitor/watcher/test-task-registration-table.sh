@@ -73,9 +73,11 @@ _schedule_task idle_section 30 _v2_task_idle_section --class expensive --async
 _schedule_task over_limit_scan 60 _v2_task_over_limit_scan --class expensive --async
 _schedule_task orphan_async_scan 60 _v2_task_orphan_async_scan --class expensive --async
 _schedule_task api_hold_probe 30 _v2_task_api_hold_probe --class medium --async
+_schedule_task context_probe $MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS _v2_task_context_probe --class expensive --async
+_schedule_task context_scan $MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS _v2_task_context_scan --class expensive --async
 _schedule_task deliveries_poll 15 _v2_task_deliveries_poll --class medium --async
 _schedule_task github_poll 600 _v2_task_github_poll --class expensive --async
-_schedule_task full_state_snap 600 _v2_task_full_state_snap --class expensive --async
+_schedule_task full_state_snap $MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS _v2_task_full_state_snap --class expensive --async
 _schedule_task reports_roll $MONITOR_REPORTS_ROLL_INTERVAL_SECONDS _v2_task_reports_roll --class medium --async
 _schedule_task functional_check 600 _v2_task_functional_check --class expensive --async
 _schedule_task cc_version_check $MONITOR_CC_UPDATE_INTERVAL_SECONDS _v2_task_cc_version_check --class expensive --async
@@ -132,7 +134,19 @@ n_tasks=$(grep -c . <<<"$actual")
 # medium --async because its curl probe can block on a resolver timeout for up
 # to ~15 s, which must never hold the synchronous slot; it is a no-op unless a
 # hold is open.
-[[ "$n_tasks" == 30 ]] && ok "30 tasks registered" || bad "task count" "got $n_tasks, want 30"
+# 32 since the jacob-greene/nexus fork sync (upstream-sync merge, fork issue
+# 162): the fork's context-budget rotation adds TWO tasks, split like the
+# other probe/scan pairs. `context_probe` (fork issue 1) measures the
+# orchestrator's own context from its transcript (a bounded tail+jq over the
+# largest transcript, ~0.6-1.7 s), and `context_scan` (fork issue 2) measures
+# every worker's. Both are `expensive --async` because they read transcripts
+# and must never hold the synchronous slot. Both are registered only when
+# MONITOR_CONTEXT_ROTATION_ENABLED is true and their interval is > 0, so the
+# static table shows them unconditionally. The same sync also moved
+# `full_state_snap` from a fixed 600 s to MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS
+# (fork issue 14): default 0 = derived, emit_interval / 4 with a 30 s floor,
+# so the staged snapshot is at most ~1/4 period old when compose_emit reads it.
+[[ "$n_tasks" == 32 ]] && ok "32 tasks registered" || bad "task count" "got $n_tasks, want 32"
 
 # Every task must declare a cost class — the scheduler's whole priority model
 # reads it, and an unclassified task silently lands in the default bucket.
@@ -181,6 +195,11 @@ if [[ -r "$CONFIG_SH" ]]; then
     check_default MONITOR_REPORTS_ROLL_INTERVAL_SECONDS 3600
     check_default MONITOR_CC_UPDATE_INTERVAL_SECONDS 86400
     check_default MONITOR_CC_AUTO_UPDATE_CHECK_INTERVAL_SECONDS 300
+    check_default MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS 120
+    check_default MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS 300
+    # 0 is the "derive it" sentinel (emit_interval / 4, floor 30 s), resolved
+    # in _config.sh right below the line this pins.
+    check_default MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS 0
 else
     bad "config defaults" "$CONFIG_SH unreadable"
 fi

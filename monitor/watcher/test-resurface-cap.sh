@@ -197,8 +197,9 @@ assert_eq "unprocessed comment emits at most max_repeats times, then stops" \
 # be announced exactly ONCE, not on every cycle after the cap.
 assert_eq "dropped section announced exactly once across 12 cycles" \
     "$SECTIONS_RENDERED" "1"
+_unstick_rows=$(grep -c '5147150803' "$STATE_DIR/watcher-unstick.log" 2>/dev/null) || _unstick_rows=0
 assert_eq "unstick log written exactly once" \
-    "$(grep -c '5147150803' "$STATE_DIR/watcher-unstick.log" 2>/dev/null || echo 0)" "1"
+    "$_unstick_rows" "1"
 assert_contains "capped comment recorded as dropped" \
     "$(cat "$STATE_DIR/resurface-dropped.tsv" 2>/dev/null)" "5147150803"
 

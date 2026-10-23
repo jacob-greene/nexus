@@ -415,8 +415,10 @@ _t3_run() {
     local tag="$1"; shift
     : > "$TMUX_LOG"
     touch "$WORK/tmux-target-absent"   # absent-path premise (#203)
-    local before after launcher
-    before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
+    local before after launcher _l
+    # Enumerated by a glob loop, not bare `ls <glob>`: under nullglob an
+    # unmatched glob makes `ls` list the CWD (nullglob-bare-form.manifest).
+    before=$(for _l in "$RESPAWN_TMPDIR"/nexus-respawn-launch-*; do [[ -e "$_l" ]] && printf '%s\n' "$_l"; done)
     (
         NEXUS_ROOT="$FAKE_NEXUS"
         export NEXUS_ROOT
@@ -439,7 +441,7 @@ _t3_run() {
     rc=$?
     rm -f "$WORK/tmux-target-absent"
     tmux_log=$(cat "$TMUX_LOG")
-    after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)
+    after=$(for _l in "$RESPAWN_TMPDIR"/nexus-respawn-launch-*; do [[ -e "$_l" ]] && printf '%s\n' "$_l"; done)
     launcher=$(comm -13 <(printf '%s\n' "$before" | sort -u) \
                         <(printf '%s\n' "$after"  | sort -u) | head -1)
     body=""
@@ -1396,21 +1398,26 @@ case "\$1" in
         # backticked word in a COMMENT is command-substituted when the
         # fixture is written -- measured at HEAD: six command-not-found
         # lines per run, from this very comment (your-org/nexus-code#1157).
+        #
+        # jacob-greene/nexus#230: a COLD spawn hands the prompt to claude as
+        # argv. The launcher (last arg) reads it from a nexus-respawn-prompt-*
+        # file; capture that file the way load-buffer is captured. This used
+        # to be a SECOND new-window arm below; case takes the FIRST match, so
+        # it never ran. Builtins only (read and =~), so the gate-3 lint can
+        # PROVE this stub a mock -- sed is outside its allowlist.
+        launcher="\${!#}"
+        pf=""
+        re='^prompt=\\\$\(<"(.*)"\)\$'
+        while IFS= read -r l; do
+            [[ "\$l" =~ \$re ]] && { pf="\${BASH_REMATCH[1]}"; break; }
+        done < "\$launcher" 2>/dev/null
+        [[ -n "\$pf" ]] && cp "\$pf" "$WORK/prompt-captured.txt" 2>/dev/null
         printf '@7\n'
         exit 0
         ;;
     load-buffer)
         # Args: load-buffer -b <buf> <file>
         cp "\$4" "$WORK/prompt-captured.txt" 2>/dev/null || true
-        ;;
-    new-window)
-        # #230: a COLD spawn hands the prompt to claude as argv. The
-        # launcher (last arg) reads it from a nexus-respawn-prompt-*
-        # file; capture that file the way load-buffer is captured.
-        launcher="\${!#}"
-        pf=\$(sed -n 's/^prompt=\$(<"\(.*\)")\$/\1/p' "\$launcher" 2>/dev/null | head -1)
-        [[ -n "\$pf" ]] && cp "\$pf" "$WORK/prompt-captured.txt" 2>/dev/null
-        exit 0
         ;;
     *) exit 0 ;;
 esac

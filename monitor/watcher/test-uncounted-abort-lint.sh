@@ -539,11 +539,18 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # parser could not be read out of pane-state.sh, and the worker window never
 # appeared. Found by `ng guards-for-diff --run` on bundle-1017b (got 17/75/20).
 # `neither` is still 0.
-assert_eq "manifest: 17 realmodel files are enumerated"  "$_nfiles"          "17"
-assert_eq "manifest: 75 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "75"
+# 17 -> 21 files, 75 -> 79 announcements, 20 by-exit unchanged, 55 -> 59
+# by-count: the jacob-greene/nexus fork sync (upstream-sync merge, fork issue
+# 162) brings four fork realmodel scenarios: test-realmodel-hooks.sh,
+# -nested-trust.sh, -permission-dialog.sh and -vipaste.sh. Re-derived by this
+# block's census on the merged tree (got 21 / 79 20 59 0): each file has ONE
+# announcement, its `bad()` helper, and each `bad()` bumps `FAIL=$((FAIL+1))`
+# on the same line, so it is disposed by a counter bump. `neither` is still 0.
+assert_eq "manifest: 21 realmodel files are enumerated"  "$_nfiles"          "21"
+assert_eq "manifest: 79 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "79"
 assert_eq "manifest: 20 are disposed by \`exit\`, NOT by a counter" \
     "$(echo "$_c" | cut -d' ' -f2)" "20"
-assert_eq "manifest: 55 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "55"
+assert_eq "manifest: 59 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "59"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \
     "$(echo "$_c" | cut -d' ' -f4)" "0"

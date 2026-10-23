@@ -1864,7 +1864,7 @@ enable_responsive_pane() {
                 [[ "$a" == "-t" ]] && _next_is_target=1
             done
             if [[ "${target#:=}" == "$RESPONSIVE_WIN" ]] \
-               && printf '%s\n' "$@" | grep -qx 'Down'; then
+               && grep -qx 'Down' <<<"$(printf '%s\n' "$@")"; then
                 "$RESPONSIVE_FIXTURE" > "$PANES_DIR/$RESPONSIVE_WIN"
             fi
         fi

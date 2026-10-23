@@ -22,13 +22,25 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$_test_dir/../.." && pwd)
 
+# ---- the `--population` protocol (your-org/nexus-code#803) ---------------
+# What this guard reads: the git INDEX under assets/ (any tracked file there
+# is the finding, so it is the population) and .gitignore. `_tracked_assets`
+# is the one enumerator, shared with the check below.
+_tracked_assets() { git -C "$ROOT" ls-files -- assets; }
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _tracked_assets 2>/dev/null | sed "s|^|$ROOT/|"
+    printf '%s\n' "$ROOT/.gitignore"
+}
+gp_handle "$@"
+
 if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "SKIP: $ROOT is not a git checkout"
     echo "ALL TESTS PASSED"
     exit 0
 fi
 
-tracked=$(git -C "$ROOT" ls-files -- assets)
+tracked=$(_tracked_assets)
 pass=0
 fail=0
 if [[ -z "$tracked" ]]; then

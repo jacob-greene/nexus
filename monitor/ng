@@ -13189,7 +13189,7 @@ cmd_pr_verdict_set() {
     _help_check "$@"
     local n=""
     local verdict="" head="" depth="" findings="" skeptic="" issue="" repo_arg=""
-    while (( $# > 0 )); do
+    _argloop_prev_39=-1; while (( $# > 0 )); do (( $# != _argloop_prev_39 )) || _argloop_stuck "$1"; _argloop_prev_39=$#
         case "$1" in
             # Every value flag is guarded: `shift 2` with one argument left
             # fails and shifts nothing, which spins the loop forever.
@@ -13274,7 +13274,7 @@ cmd_pr_verdict_set() {
 cmd_pr_verdict_get() {
     _help_check "$@"
     local n="" repo_arg="" field=""
-    while (( $# > 0 )); do
+    _argloop_prev_40=-1; while (( $# > 0 )); do (( $# != _argloop_prev_40 )) || _argloop_stuck "$1"; _argloop_prev_40=$#
         case "$1" in
             --repo)  _need_val --repo "$#" "${2:-}"; repo_arg="$2"; shift 2 ;;
             --field) _need_val --field "$#" "${2:-}"; field="$2"; shift 2 ;;
@@ -14825,7 +14825,7 @@ _dashboard_fetch_middle() {
 cmd_dashboard_get() {
     _help_check "$@"
     local stat_only=0
-    while (( $# > 0 )); do
+    _argloop_prev_41=-1; while (( $# > 0 )); do (( $# != _argloop_prev_41 )) || _argloop_stuck "$1"; _argloop_prev_41=$#
         case "$1" in
             --stat) stat_only=1; shift ;;
             *)      die "unknown flag: $(_arg_excerpt "$1")" ;;

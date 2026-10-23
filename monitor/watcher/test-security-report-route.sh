@@ -17,12 +17,20 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$_test_dir/../.." && pwd)
 
+# The two copies of the route, named ONCE and read by both the check loop
+# and the `--population` protocol (your-org/nexus-code#803), so the
+# declared population is the checked set.
+ROUTE_DOCS=(SECURITY.md docs/admin/security.md)
+. "$_test_dir/../_guard_population.sh"
+gp_population() { printf '%s\n' "${ROUTE_DOCS[@]/#/$ROOT/}"; }
+gp_handle "$@"
+
 pass=0
 fail=0
 ok()  { pass=$((pass + 1)); printf '  PASS: %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL: %s\n' "$1"; }
 
-for rel in SECURITY.md docs/admin/security.md; do
+for rel in "${ROUTE_DOCS[@]}"; do
     f="$ROOT/$rel"
     if [[ ! -f "$f" ]]; then
         bad "$rel exists"
@@ -43,7 +51,7 @@ for rel in SECURITY.md docs/admin/security.md; do
             bad "$rel: link holds a template placeholder ($link)"
         fi
     done <<< "$links"
-    if tr '\n' ' ' < "$f" | grep -q 'asks for a private contact'; then
+    if grep -q 'asks for a private contact' <<<"$(tr '\n' ' ' < "$f")"; then
         ok "$rel: states the fallback when private reporting is off"
     else
         bad "$rel: states the fallback when private reporting is off"

@@ -81,6 +81,16 @@ usage() {
 
 die() { echo "context-usage: $*" >&2; exit 2; }
 
+# Argument-loop progress backstop (the repo-wide loop invariant, see
+# monitor/ng `_argloop_stuck`): an iteration that consumed no argument
+# exits EX_USAGE (64) instead of spinning. Every arm below guards its
+# own value first, so this is a backstop, not the usual error path.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 transcript=""
 session=""
 window=""
@@ -89,7 +99,7 @@ limit=""
 format="kv"
 quiet=0
 
-while [[ $# -gt 0 ]]; do
+_argloop_prev=-1; while [[ $# -gt 0 ]]; do (( $# != _argloop_prev )) || _argloop_stuck "$1"; _argloop_prev=$#
     case "$1" in
         --transcript) [[ -n "${2:-}" ]] || die "--transcript needs a value"; transcript="$2"; shift 2 ;;
         --session)    [[ -n "${2:-}" ]] || die "--session needs a value";    session="$2";    shift 2 ;;
@@ -153,8 +163,18 @@ _transcript_for_session() {
     local sid="$1" root
     root=$(_projects_root)
     [[ -n "$sid" && -d "$root" ]] || return 1
-    local match
-    match=$(ls -t "$root"/*/"$sid".jsonl 2>/dev/null | head -1) || return 1
+    # The newest candidate is picked with `-nt` over a glob ARRAY, never
+    # `ls -t <glob> | head -1`. Two hazards that form carried: under a
+    # caller's nullglob an unmatched glob VANISHES and bare `ls` lists the
+    # CWD, so `head -1` returns a cwd entry as the "transcript"
+    # (nullglob-bare-form.manifest); and under pipefail `head` closing
+    # early can SIGPIPE `ls` and turn a real match into `return 1`
+    # (early-exit-readers.manifest). `-f` drops the literal unmatched glob.
+    local match="" cand
+    for cand in "$root"/*/"$sid".jsonl; do
+        [[ -f "$cand" ]] || continue
+        if [[ -z "$match" || "$cand" -nt "$match" ]]; then match="$cand"; fi
+    done
     [[ -n "$match" ]] || return 1
     printf '%s' "$match"
 }
@@ -174,7 +194,10 @@ _session_for_window() {
         [[ -n "$sid" ]] && { printf '%s' "$sid"; return 0; }
     fi
     rec="$state/windows/$win.json"
-    if [[ -f "$rec" ]] && command -v jq >/dev/null 2>&1; then
+    # jq is guaranteed here: the top-level `jq-missing` refusal runs
+    # before any selector is resolved, so this is the LOUD gate's
+    # dependant, not a second (silently degrading) jq gate.
+    if [[ -f "$rec" ]]; then
         sid=$(jq -r '.session_id // ""' "$rec" 2>/dev/null)
         [[ "$sid" == "null" ]] && sid=""
         [[ -n "$sid" ]] && { printf '%s' "$sid"; return 0; }
@@ -212,6 +235,17 @@ fail() {
     exit 1
 }
 
+# jq is REQUIRED (the usage read below and the window->session lookup
+# both parse JSON). Refuse up front, before resolving any selector, so a
+# missing jq says `jq-missing` rather than a misleading
+# `no-session-for-window:<w>` from a lookup that silently could not run.
+# `fail` already exits 1; the explicit `exit 1` keeps the refusal visible
+# AT the gate (test-guard-closure-boundary.sh machine-checks LOUD gates).
+if ! command -v jq >/dev/null 2>&1; then
+    fail "jq-missing"
+    exit 1
+fi
+
 if [[ -z "$transcript" ]]; then
     if [[ -n "$session" ]]; then
         :
@@ -224,7 +258,6 @@ if [[ -z "$transcript" ]]; then
 fi
 
 [[ -f "$transcript" ]] || fail "transcript-missing"
-command -v jq >/dev/null 2>&1 || fail "jq-missing"
 
 # ---- read the last main-chain assistant usage ---------------------------
 # One jq program, applied to a bounded tail first. `select(.isSidechain

@@ -1290,7 +1290,16 @@ if [[ "$discovered" == "$recorded" ]]; then
     # added, ZERO removed. Selection rate over the last 120 first-parent commits
     # of 2a5c2146 (0 empty), with the bundle-1015b method: 98/120 base, 98/120
     # head.
-    _TGFD_POP_EXPECTED=330
+    # +6 for the jacob-greene/nexus fork sync (upstream-sync merge, fork
+    # issue 162): three fork suites now declare a population —
+    # test-cch-launch-string.sh, test-no-tracked-assets.sh and
+    # test-security-report-route.sh — bringing their three suite paths and
+    # three sentinels no other row named (SECURITY.md, docs/admin/security.md,
+    # test-integration/test-realmodel-apispoof.sh). MEASURED as a SET
+    # DIFFERENCE (`comm -3` of the manifest's suite+sentinel columns) against
+    # the unedited merge commit 4b668ec, which gives 330: SIX added, ZERO
+    # removed. Selection rate not re-measured for this change.
+    _TGFD_POP_EXPECTED=336
     _n_pop=$( gp_render "" 2>/dev/null | sort -u | "$REAL_GREP" -c . )
     _n_nosent=$(
         gp_population() { printf '%s\n' "$INDEX" "$PROTO" "$MANIFEST"

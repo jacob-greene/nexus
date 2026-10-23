@@ -664,6 +664,16 @@ _cc_pin="${_cc_pin%"${_cc_pin##*[![:space:]]}"}"
 if [[ -n "$_cc_pin" && "$_cc_pin" != "$NEXUS_ROOT/node_modules/"* ]]; then
     CC_NATIVE_PINNED=1
 fi
+# Resolver came back empty (no binary found, or a root without
+# monitor/_claude-bin.sh) AND no `nexus.claude_bin` pin is configured:
+# measure the npm-tree path, the resolver's own no-pin default. A missing
+# binary there reads as an unreadable version, which every verb already
+# refuses on (LIVE TREE DRIFT, rc 9). A CONFIGURED pin that failed to
+# resolve stays empty: falling back to the npm tree is exactly what
+# _claude-bin.sh refuses to do silently.
+if [[ -z "$CLAUDE_BIN" && -z "$_cc_pin" ]]; then
+    CLAUDE_BIN="$NEXUS_ROOT/node_modules/.bin/claude"
+fi
 TMUX_CMD="${CC_AUTO_TMUX:-tmux}"
 GH_CMD="${CC_AUTO_GH:-gh}"
 MINT_CMD="${CC_AUTO_MINT_CMD:-$NEXUS_ROOT/monitor/mint-token.sh}"
