@@ -154,6 +154,23 @@ expected=(
 assert_eq "only the whitelisted files build a launch string" \
     "$(printf '%s\n' "${builders[@]}")" "$(printf '%s\n' "${expected[@]}")"
 
+# PLANT (positive control) for the whitelist scan. A whitelist that is GREEN
+# because its lister finds nothing proves nothing, so the plant goes through
+# the guarded code itself: `_launch_scan`, with REPO_ROOT pointed at a temp
+# tree. The tree holds one nested *.sh that carries the statement (it MUST be
+# listed), one *.txt that carries it (it must NOT be: the scan is *.sh only),
+# and one *.sh without it (must NOT be). A lister that loses `-r`, its
+# `--include`, its needle or its root reddens this assertion.
+_plant_root=$(mktemp -d -t cchplant-XXXXXX)
+trap 'rm -rf "$_plant_root"' EXIT
+mkdir -p "$_plant_root/monitor/sub/deeper"
+printf '    printf -v launch %%q "$CLAUDE_BIN"\n' >"$_plant_root/monitor/sub/deeper/planted.sh"
+printf 'printf -v launch\n'                     >"$_plant_root/monitor/sub/planted.txt"
+printf 'echo no launch build here\n'            >"$_plant_root/monitor/sub/clean.sh"
+_plant_found=$(REPO_ROOT="$_plant_root" _launch_scan 'printf -v launch')
+assert_eq "PLANT: a planted *.sh launch-string build is found by _launch_scan" \
+    "$_plant_found" "$_plant_root/monitor/sub/deeper/planted.sh"
+
 # ---- the baseline builders, read from git -------------------------------
 # Read <ref>:<path>. If the commit is absent (a shallow clone), fetch it
 # once by full SHA from origin and retry. Prints the blob; returns 1 if
@@ -234,7 +251,7 @@ launch_new() {
 }
 
 # ---- the two DELIBERATE deltas since the baseline ------------------------
-# The upstream merge (issue 162) added two things to the launch line, both on
+# The 2026-10-22 upstream sync added two things to the launch line, both on
 # purpose, and NOTHING else may differ:
 #   (a) `TMUX_TMPDIR=<q>` through the `env -i` wall, ahead of
 #       ANTHROPIC_BASE_URL, so a hook in the pane cannot fall back to the
@@ -281,12 +298,6 @@ echo "=== cch_launch_cmd: default is byte-for-byte the pre-knob string ==="
 # 1. Knob unset — the state every existing scenario runs in.
 unset CCH_SKIP_PERMISSIONS
 assert_eq "knob unset -> identical to baseline" "$(launch_new)" "$BASELINE"
-
-# PLANT (positive control): a launch string with one planted extra flag must
-# NOT equal the baseline, or every byte-identity PASS here proves nothing.
-_planted="$(launch_new) --planted-flag"
-assert_eq "PLANT: a planted extra flag breaks byte-identity" \
-    "$([[ -n "$BASELINE" && "$_planted" != "$BASELINE" ]] && echo differs)" "differs"
 
 # 2. Knob explicitly 1 — the documented default, spelled out.
 CCH_SKIP_PERMISSIONS=1

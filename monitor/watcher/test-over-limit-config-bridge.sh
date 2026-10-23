@@ -374,8 +374,10 @@ exported_set=$(sed -n '/^export /,/^[^ ]/p' "$CONFIG_SH" \
 # probe that returned a confident answer about a population it never read.
 assert_eq "extraction is non-vacuous: the read set is non-empty" \
     "$([[ -n "$read_set" ]] && echo yes || echo no)" "yes"
-assert_eq "extraction is non-vacuous: 9 knobs are read (sanity-checked total)" \
-    "$(printf '%s\n' "$read_set" | grep -c .)" "9"
+# 10 knobs: the tenth, MONITOR_OVER_LIMIT_STALE_GRACE_SECONDS, was added by
+# the 2026-10-22 upstream sync (it is bridged and exported like the other nine).
+assert_eq "extraction is non-vacuous: 10 knobs are read (sanity-checked total)" \
+    "$(printf '%s\n' "$read_set" | grep -c .)" "10"
 
 assert_eq "every knob _over_limit.sh reads is resolved by _config.sh" \
     "$(comm -23 <(printf '%s\n' "$read_set") <(printf '%s\n' "$bridged_set") | tr '\n' ' ')" ""

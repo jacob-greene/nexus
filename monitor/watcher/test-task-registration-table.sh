@@ -134,17 +134,17 @@ n_tasks=$(grep -c . <<<"$actual")
 # medium --async because its curl probe can block on a resolver timeout for up
 # to ~15 s, which must never hold the synchronous slot; it is a no-op unless a
 # hold is open.
-# 32 since the jacob-greene/nexus fork sync (upstream-sync merge, fork issue
-# 162): the fork's context-budget rotation adds TWO tasks, split like the
-# other probe/scan pairs. `context_probe` (fork issue 1) measures the
+# 32 since the 2026-10-22 upstream sync: the fork's context-budget
+# rotation adds TWO tasks, split like the
+# other probe/scan pairs. `context_probe` (a fork addition) measures the
 # orchestrator's own context from its transcript (a bounded tail+jq over the
-# largest transcript, ~0.6-1.7 s), and `context_scan` (fork issue 2) measures
+# largest transcript, ~0.6-1.7 s), and `context_scan` (a fork addition) measures
 # every worker's. Both are `expensive --async` because they read transcripts
 # and must never hold the synchronous slot. Both are registered only when
 # MONITOR_CONTEXT_ROTATION_ENABLED is true and their interval is > 0, so the
 # static table shows them unconditionally. The same sync also moved
 # `full_state_snap` from a fixed 600 s to MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS
-# (fork issue 14): default 0 = derived, emit_interval / 4 with a 30 s floor,
+# (a fork change): default 0 = derived, emit_interval / 4 with a 30 s floor,
 # so the staged snapshot is at most ~1/4 period old when compose_emit reads it.
 [[ "$n_tasks" == 32 ]] && ok "32 tasks registered" || bad "task count" "got $n_tasks, want 32"
 

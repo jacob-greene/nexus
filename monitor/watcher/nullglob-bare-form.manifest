@@ -132,7 +132,7 @@
 #
 # 73 sites are enumerated: FOUR carry a reviewed `defect` verdict, FIVE a
 # reviewed `safe` one (three on ground (a), two on ground (b)), and the
-# remaining SIXTY-FOUR are `unreviewed` (re-counted at the issue-162 upstream
+# remaining SIXTY-FOUR are `unreviewed` (re-counted at the 2026-10-22 upstream
 # sync, which added the four test-evidence-freeze.sh rows). Census, checkable:
 #     cut -f6 monitor/watcher/nullglob-bare-form.manifest | grep -v '^#' | sort | uniq -c
 # `unreviewed` is deliberate and it is not a claim that those sites are safe —

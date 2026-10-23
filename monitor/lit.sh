@@ -398,11 +398,16 @@ _ncbi_get() {
     local kv; for kv in "$@"; do args+=(--data-urlencode "$kv"); done
     args+=(--data-urlencode "tool=$_NCBI_TOOL")
     [[ -n "$_NCBI_EMAIL" ]] && args+=(--data-urlencode "email=$_NCBI_EMAIL")
-    [[ -n "$_NCBI_KEY" ]]   && args+=(--data-urlencode "api_key=$_NCBI_KEY")
+    # The key goes through curl's config on stdin, never argv: argv sits in
+    # /proc/<pid>/cmdline, readable by every same-uid process (`ps`). printf
+    # and the here-string are builtins, so the value reaches no execve. A curl
+    # config double-quoted string treats \ and " as escapes, so both are escaped.
+    local cfg="" k="${_NCBI_KEY//\\/\\\\}"; k="${k//\"/\\\"}"
+    [[ -n "$_NCBI_KEY" ]] && printf -v cfg 'data-urlencode = "api_key=%s"\n' "$k"
     local attempt out code body
     for attempt in 1 2 3; do
         _ncbi_pace
-        out=$(curl "${args[@]}" 2>/dev/null) || { note "PubMed: $util request failed (network?)"; return 1; }
+        out=$(curl "${args[@]}" --config - <<<"$cfg" 2>/dev/null) || { note "PubMed: $util request failed (network?)"; return 1; }
         code="${out##*$'\n'}"; body="${out%$'\n'*}"
         [[ "$code" == 429 ]] || break
         (( attempt < 3 )) && sleep "$attempt"   # no wait after the last try

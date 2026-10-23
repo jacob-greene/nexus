@@ -1290,8 +1290,8 @@ if [[ "$discovered" == "$recorded" ]]; then
     # added, ZERO removed. Selection rate over the last 120 first-parent commits
     # of 2a5c2146 (0 empty), with the bundle-1015b method: 98/120 base, 98/120
     # head.
-    # +6 for the jacob-greene/nexus fork sync (upstream-sync merge, fork
-    # issue 162): three fork suites now declare a population —
+    # +6 for the 2026-10-22 upstream sync: three fork suites now declare
+    # a population —
     # test-cch-launch-string.sh, test-no-tracked-assets.sh and
     # test-security-report-route.sh — bringing their three suite paths and
     # three sentinels no other row named (SECURITY.md, docs/admin/security.md,

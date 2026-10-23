@@ -61,7 +61,16 @@ EOF
 # millisecond timestamp and its full argv (one line per call).
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s %s\n' "$(( $(date +%s%N) / 1000000 ))" "$*" >>"$CURL_LOG"
+# lit.sh sends the NCBI key as curl config on stdin (`--config -`), not in
+# argv. The stub appends that config after a ` CONFIG: ` marker, so a grep
+# on the log sees both; the argv-only part (before the marker) is what
+# /proc/<pid>/cmdline would show.
+cfg="" prev=""
+for a in "$@"; do
+  [ "$prev" = --config ] || [ "$prev" = -K ] && [ "$a" = - ] && cfg=$(tr '\n' ' ')
+  prev="$a"
+done
+printf '%s %s CONFIG: %s\n' "$(( $(date +%s%N) / 1000000 ))" "$*" "$cfg" >>"$CURL_LOG"
 url="" w=0
 for a in "$@"; do
   case "$a" in http*) url="$a" ;; -w) w=1 ;; esac
@@ -156,6 +165,7 @@ else
 fi
 NCBI_API_KEY=k3y-SECRET run search "GENCODE 2023"
 grep -q 'api_key=k3y-SECRET' "$CURL_LOG"; expect "api_key= from NCBI_API_KEY" $?
+! grep -q 'k3y-SECRET' <<<"$(sed 's/ CONFIG: .*//' "$CURL_LOG")"; expect "the key is NOT in curl argv (it goes via --config on stdin)" $?
 ! grep -q 'k3y-SECRET' <<<"$OUT$ERR"; expect "key never printed" $?
 run search "GENCODE 2023" --year 2020:2023
 grep -q 'mindate=2020' "$CURL_LOG" && grep -q 'maxdate=2023' "$CURL_LOG"; expect "--year maps to mindate/maxdate" $?

@@ -32,13 +32,21 @@ is configured, so a plain `git push` to an HTTPS remote dies with
 fatal: could not read Username for 'https://github.com'
 ```
 
-Push through the bot's installation token in the URL form instead:
+Push with the bot's installation token through a one-shot credential helper:
 
 ```bash
 TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
-git -C <clone> push \
-  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+TOK="$TOK" GIT_TERMINAL_PROMPT=0 git -C <clone> -c credential.helper= \
+  -c 'credential.helper=!f() { test "$1" = get || return 0; echo username=x-access-token; echo "password=$TOK"; }; f' \
+  push https://github.com/<owner>/<repo>.git <branch>
 ```
+
+The helper text names the VARIABLE, never its value. git runs it with
+`sh`, and `echo` is a builtin, so the token reaches no process argv.
+Do not put the token in the URL (`https://x-access-token:$TOK@…`):
+`git` and `git-remote-https` then carry it in `/proc/<pid>/cmdline`,
+which every same-uid process can read with `ps`. The lint
+`monitor/watcher/test-argv-credential-lint.sh` flags that form.
 
 This does **not** violate the rule above, because it separates two
 things that are easy to conflate:
@@ -67,10 +75,12 @@ so in your report. Configuring an operator git identity in the sandbox
 is the real fix; until then, bot-authored self-fix commits are the
 expected state, not a violation to be corrected in passing.
 
-Keep the token inline — never `git remote set-url` it into `.git/config`,
-and filter it out of any captured output. The URL form itself is
-documented in `<yourlab>.sandbox-gotchas` rule 3; this note only records
-which identity it carries and why it is legitimate here.
+Keep the token out of config — never `git remote set-url` it into
+`.git/config`, and filter it out of any captured output.
+`<yourlab>.sandbox-gotchas` rule 3 documents an older token-in-URL
+form. Prefer the helper form above: it keeps the token out of argv.
+This note only records which identity it carries and why it is
+legitimate here.
 
 ## The bot is the DEFAULT — the `gh` wrapper is a BACKSTOP
 
@@ -461,7 +471,7 @@ If you hit either on a <your-org> repo, the bot is not yet installed
 there. Surface it as a blocker:
 
 1. Push your branch so the work isn't lost (`git push`; in the
-   sandbox, via the token URL form — see "Sandbox exception" above).
+   sandbox, via the token credential helper — see "Sandbox exception" above).
 2. Record it in your final report's `## Infrastructure Issues`
    section with the repo name and command that failed.
 3. The user / org admin expands the App's repo scope (one click in

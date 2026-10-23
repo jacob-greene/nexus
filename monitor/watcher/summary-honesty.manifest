@@ -454,7 +454,7 @@ monitor/watcher/test-longjob-watch-ledger.sh::ledger=no::count=none
 monitor/watcher/test-longjob-watch.sh::ledger=no::count=none
 monitor/watcher/test-pane-state-longjob-discount.sh::ledger=no::count=none
 # ARRIVED BY MERGE (jacob-greene/nexus fork suites, joined to upstream by the
-# fork-162 upstream-sync merge 4b668ec): recorded at their measured protection
+# 2026-10-22 upstream sync merge 4b668ec): recorded at their measured protection
 # level so the corpus and this record agree; their fork authors raise them.
 monitor/test-cch-launch-string.sh::ledger=no::count=none
 monitor/test-cch-permission-dialog.sh::ledger=no::count=none

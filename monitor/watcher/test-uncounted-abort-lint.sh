@@ -540,8 +540,8 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # appeared. Found by `ng guards-for-diff --run` on bundle-1017b (got 17/75/20).
 # `neither` is still 0.
 # 17 -> 21 files, 75 -> 79 announcements, 20 by-exit unchanged, 55 -> 59
-# by-count: the jacob-greene/nexus fork sync (upstream-sync merge, fork issue
-# 162) brings four fork realmodel scenarios: test-realmodel-hooks.sh,
+# by-count: the 2026-10-22 upstream sync brings four fork realmodel
+# scenarios: test-realmodel-hooks.sh,
 # -nested-trust.sh, -permission-dialog.sh and -vipaste.sh. Re-derived by this
 # block's census on the merged tree (got 21 / 79 20 59 0): each file has ONE
 # announcement, its `bad()` helper, and each `bad()` bumps `FAIL=$((FAIL+1))`

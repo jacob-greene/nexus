@@ -285,16 +285,24 @@ configured, and `gh` is not logged in. The push dies with
 fatal: could not read Username for 'https://github.com': No such device or address
 ```
 
-Push through the bot's installation token in the URL instead:
+Push with the bot's installation token through a one-shot credential helper:
 
 ```bash
 TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
-git -C <clone> push \
-  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+TOK="$TOK" GIT_TERMINAL_PROMPT=0 git -C <clone> -c credential.helper= \
+  -c 'credential.helper=!f() { test "$1" = get || return 0; echo username=x-access-token; echo "password=$TOK"; }; f' \
+  push https://github.com/<owner>/<repo>.git <branch>
 ```
 
-Keep the token inline. Never `git remote set-url` it into
-`.git/config`, and filter it out of any output you capture.
+The helper text names the VARIABLE, never its value. git runs it with
+`sh`, and `echo` is a builtin, so the token reaches no process argv.
+Do not put the token in the URL (`https://x-access-token:$TOK@…`):
+`git` and `git-remote-https` then carry it in `/proc/<pid>/cmdline`,
+which every same-uid process can read with `ps`. The lint
+`monitor/watcher/test-argv-credential-lint.sh` flags that form.
+
+Never `git remote set-url` the token into `.git/config`, and
+filter it out of any output you capture.
 
 The token is the **transport** only. Commit authorship comes from
 `user.name` and `user.email` at `git commit` time, so the token does

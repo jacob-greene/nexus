@@ -50,7 +50,7 @@ trap 'rm -rf "$WORK"' EXIT
 # An amended list whose lead-in still says "four" is worse than no amendment:
 # the reader counts four, stops, and the fifth reads as an appendix.
 #
-# SIX SINCE THE UPSTREAM SYNC (jacob-greene/nexus issue 162). Upstream added
+# SIX SINCE THE 2026-10-22 UPSTREAM SYNC. Upstream added
 # this check as item 5 ("Search the tracker by PATH"); the fork had added
 # "Sweep the tracker in every state" as ITS item 5. The merge keeps both, so
 # the sweep is item 6 and the lead-in says six. A surviving "five" is now the
