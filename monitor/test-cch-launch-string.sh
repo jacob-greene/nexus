@@ -64,6 +64,26 @@ BASELINE_PATH="monitor/cc-harness/_lib.sh"
 # BASELINE_REF: the settings shape is measured, not transcribed.
 SETTINGS_REF="d079074f0edc7a71408a691addcf7425e11810c2"
 
+# The whitelist scan's ENUMERATOR, shared by the scan below and by the
+# `--population` protocol (your-org/nexus-code#803): one walk, two needles,
+# so the declared population cannot drift from the walked set.
+# Use `command grep -r`: the bundled `grep` shell function honours
+# .gitignore and would return an empty, exit-1 result that reads
+# identically to a true negative.
+_launch_scan() {   # <needle> -> every monitor/**/*.sh carrying it, sorted
+    command grep -rl --include='*.sh' -- "$1" "$REPO_ROOT/monitor" 2>/dev/null | sort
+}
+
+# ---- the `--population` protocol (your-org/nexus-code#803) ---------------
+# Placed above the first output because `gp_handle` EXITS when it handles
+# the flag. The empty needle matches every non-empty *.sh the scan reads.
+. "$_test_dir/_guard_population.sh"
+gp_population() {
+    _launch_scan ''
+    printf '%s\n' "$LIB"
+}
+gp_handle "$@"
+
 PASS=0
 FAIL=0
 assert_eq() {
@@ -122,13 +142,9 @@ echo "=== no scenario rebuilds the launch string ==="
 # demo.sh writes `printf -v LAUNCH` (upper case) and does not source
 # _lib.sh at all; it is a standalone human-facing demo.
 #
-# Use `command grep -r`: the bundled `grep` shell function honours
-# .gitignore and would return an empty, exit-1 result that reads
-# identically to a true negative.
-mapfile -t builders < <(
-    command grep -rl --include='*.sh' -- 'printf -v launch' \
-        "$REPO_ROOT/monitor" 2>/dev/null | sort
-)
+# The walk is `_launch_scan`, defined at the top (see its note on
+# `command grep -r`).
+mapfile -t builders < <(_launch_scan 'printf -v launch')
 expected=(
     "$_test_dir/cc-harness/_lib.sh"
     "$_test_dir/test-cch-launch-string.sh"
@@ -137,6 +153,23 @@ expected=(
 )
 assert_eq "only the whitelisted files build a launch string" \
     "$(printf '%s\n' "${builders[@]}")" "$(printf '%s\n' "${expected[@]}")"
+
+# PLANT (positive control) for the whitelist scan. A whitelist that is GREEN
+# because its lister finds nothing proves nothing, so the plant goes through
+# the guarded code itself: `_launch_scan`, with REPO_ROOT pointed at a temp
+# tree. The tree holds one nested *.sh that carries the statement (it MUST be
+# listed), one *.txt that carries it (it must NOT be: the scan is *.sh only),
+# and one *.sh without it (must NOT be). A lister that loses `-r`, its
+# `--include`, its needle or its root reddens this assertion.
+_plant_root=$(mktemp -d -t cchplant-XXXXXX)
+trap 'rm -rf "$_plant_root"' EXIT
+mkdir -p "$_plant_root/monitor/sub/deeper"
+printf '    printf -v launch %%q "$CLAUDE_BIN"\n' >"$_plant_root/monitor/sub/deeper/planted.sh"
+printf 'printf -v launch\n'                     >"$_plant_root/monitor/sub/planted.txt"
+printf 'echo no launch build here\n'            >"$_plant_root/monitor/sub/clean.sh"
+_plant_found=$(REPO_ROOT="$_plant_root" _launch_scan 'printf -v launch')
+assert_eq "PLANT: a planted *.sh launch-string build is found by _launch_scan" \
+    "$_plant_found" "$_plant_root/monitor/sub/deeper/planted.sh"
 
 # ---- the baseline builders, read from git -------------------------------
 # Read <ref>:<path>. If the commit is absent (a shallow clone), fetch it
@@ -217,7 +250,47 @@ launch_new() {
     cch_launch_cmd
 }
 
-BASELINE=$(launch_baseline)
+# ---- the two DELIBERATE deltas since the baseline ------------------------
+# The 2026-10-22 upstream sync added two things to the launch line, both on
+# purpose, and NOTHING else may differ:
+#   (a) `TMUX_TMPDIR=<q>` through the `env -i` wall, ahead of
+#       ANTHROPIC_BASE_URL, so a hook in the pane cannot fall back to the
+#       PRODUCTION tmux socket (your-org/nexus-code#1042);
+#   (b) the CCH_EXTRA_ENV `%s` splice ahead of TERM=, which leaves ONE extra
+#       space when empty.
+# Rather than re-pin a new literal, the expected string is the git-read
+# baseline with exactly these two edits applied — each must hit exactly
+# once, or the derivation itself fails (a drifted anchor must not turn every
+# comparison below into baseline-vs-baseline).
+CCH_TMUX_TMPDIR='/tmp/cc harness/tmux "sock"'
+CCH_EXTRA_ENV=''
+export CCH_TMUX_TMPDIR CCH_EXTRA_ENV
+with_deltas() {   # <baseline-shaped launch string> -> the expected new string
+    local in="$1" q a='
+ANTHROPIC_BASE_URL=' t='
+TERM='
+    printf -v q '%q' "$CCH_TMUX_TMPDIR"
+    local n_a n_t
+    n_a=$(grep -c '^ANTHROPIC_BASE_URL=' <<<"$in"); n_t=$(grep -c '^TERM=' <<<"$in")
+    if [[ "$n_a" != 1 || "$n_t" != 1 ]]; then
+        printf 'DELTA-ANCHOR-MISSING(a=%s t=%s)' "$n_a" "$n_t"; return 1
+    fi
+    # The variable NAME is held apart from its `=`: this is string data being
+    # built, not a tmux call, and a literal `NAME=` here reads to
+    # lint-no-tmux-server-kill.sh as a TMUX_TMPDIR-scoped invocation.
+    local pin_name='TMUX_TMPDIR'
+    in="${in/"$a"/$'\n'"${pin_name}=$q ANTHROPIC_BASE_URL="}"
+    in="${in/"$t"/$'\n'"${CCH_EXTRA_ENV} TERM="}"
+    printf '%s' "$in"
+}
+
+BASELINE_RAW=$(launch_baseline)
+BASELINE=$(with_deltas "$BASELINE_RAW")
+if [[ "$BASELINE" == DELTA-ANCHOR-MISSING* || "$BASELINE" == "$BASELINE_RAW" ]]; then
+    printf '  FAIL: could not apply the two documented deltas to the baseline (%s)\n' "${BASELINE:0:60}" >&2
+    FAIL=$(( FAIL + 1 ))
+    summary
+fi
 
 echo
 echo "=== cch_launch_cmd: default is byte-for-byte the pre-knob string ==="
@@ -282,7 +355,7 @@ else
         eval "$SETTINGS_BLOCK"
         printf '%s' "$launch"
     }
-    SETTINGS_MAIN=$(launch_settings_main)
+    SETTINGS_MAIN=$(with_deltas "$(launch_settings_main)")
     unset CCH_SKIP_PERMISSIONS
     assert_eq "settings file -> identical to main's settings form" \
         "$(PATH="$FAKE_PATH" cch_launch_cmd "$SETTINGS_FILE")" "$SETTINGS_MAIN"
@@ -290,6 +363,14 @@ else
     assert_eq "empty settings argument -> identical to baseline" \
         "$(PATH="$FAKE_PATH" cch_launch_cmd "")" "$BASELINE"
 fi
+
+echo
+echo "=== cch_launch_cmd: the CCH_EXTRA_ENV splice lands where (b) says ==="
+# 8. A non-empty CCH_EXTRA_ENV fills the splice and changes nothing else.
+CCH_EXTRA_ENV='NEXUS_ROOT=/x'
+assert_eq "CCH_EXTRA_ENV set -> baseline with the assignment before TERM=" \
+    "$(launch_new)" "$(with_deltas "$BASELINE_RAW")"
+CCH_EXTRA_ENV=''
 
 # ---- summary -------------------------------------------------------------
 summary

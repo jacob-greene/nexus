@@ -133,7 +133,7 @@ root and ~/.claude/. Without it, the bootstrap agent runs with
 --dangerously-skip-permissions in an unconfined shell — refused.
 
 If you don't have agent-sandbox installed yet:
-  brew tap operator/tools && brew install agent-sandbox
+  brew tap katosh/tools && brew install agent-sandbox
 ERR
     exit 2
 fi

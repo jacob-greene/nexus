@@ -1,0 +1,290 @@
+# pane-state-fixtures.manifest — the expected classification of every
+# `monitor/watcher/fixtures/*.ansi` capture, held as DATA rather than derived
+# from the capture's FILENAME. your-org/nexus-code#1176.
+#
+# Enforced by:  bash monitor/watcher/test-pane-state.sh
+# Subject:      monitor/pane-state.sh
+#
+# ── WHY THIS FILE EXISTS ────────────────────────────────────────────────
+#
+# `test-pane-state.sh` used to derive each fixture's expected state from a
+# FILENAME PREFIX (`busy-` -> busy, `idle-` -> idle, …). Every assertion in
+# the corpus was therefore a function of the name of the file it asserted on,
+# and the suite could not disagree with the classifier about anything
+# nameable. The shape it structurally could not express is the most valuable
+# one this corpus holds:
+#
+#     "this capture LOOKS LIKE X and must nevertheless classify as Y."
+#
+# Under the prefix scheme that case has no honest spelling. Name the file for
+# what the pane LOOKS like and the suite asserts the wrong state; name it for
+# what it must CLASSIFY as and the filename lies about the capture. `#1171`
+# hit exactly that and got a confident wrong answer: a fixture landed whose
+# name asserted the opposite of its purpose, and the suite agreed with the
+# name.
+#
+# `#896` closed only the adjacent half — fixtures matching NO prefix arm,
+# which SKIPped and asserted nothing. A SKIP counter cannot see a well-formed
+# WRONG expectation, because a wrong expectation is not silent: it passes.
+#
+# The prefix arms are gone. A fixture's name is now free to DESCRIBE the
+# capture; this file says what it must classify as, and why. The `why` column
+# is required, and for the look-like-X-classify-as-Y rows it is the whole
+# point of the row.
+#
+# ── WHAT A NAMING LINT WOULD HAVE DONE, AND WHY THERE ISN'T ONE ─────────
+#
+# The obvious cheaper fix — lint that each file's prefix agrees with what the
+# classifier returns for it — is circular. It derives the expectation from the
+# behaviour it is meant to check, so it pins CURRENT behaviour as correct by
+# construction and would have rubber-stamped `#1171`. Rejected on `#1176`.
+#
+# ── FAIL-CLOSED, BOTH DIRECTIONS ────────────────────────────────────────
+#
+#   * a fixture with NO row makes the suite RED. It never SKIPs. Adding a
+#     capture without ruling on it is the `#1171` shape and must cost.
+#   * a row naming a fixture that does not exist makes the suite RED. Stale
+#     rows are the same rot pointed the other way: an expectation that no
+#     longer measures anything, still reading as coverage.
+#   * every fixture must carry exactly ONE bare row (env `-`, args `-`) —
+#     its unconditional reading. Zero is an unasserted capture; two is two
+#     answers to one question.
+#   * `expect` must be a member of `monitor/pane-state.sh --states`. A typo
+#     is a row that can never pass and never explains itself.
+#   * `why` is required. A row with no rationale is a number nobody can check.
+#
+# ── COLUMNS (TAB-separated) ─────────────────────────────────────────────
+#
+#   1 fixture   basename under monitor/watcher/fixtures/
+#   2 expect    required `state=` value; must be in `pane-state.sh --states`
+#   3 env       `-`, or space-separated K=V passed in the helper's environment
+#   4 args      `-`, or space-separated extra helper flags
+#   5 why       required rationale — what the capture LOOKS like, and why the
+#               verdict is what it is
+#
+# Columns 3 and 4 make a capture reusable across SCENARIOS: the same bytes,
+# read under different process-tree/ledger conditions, are different
+# questions. A fixture may carry more than one row for that reason; exactly
+# one of them must be bare.
+#
+# Placeholders expanded in columns 3 and 4 (an unrecognised `@NAME@` is RED,
+# never passed through as a literal):
+#
+#   @ASYNC_STATE@      a per-run temp NEXUS_STATE_DIR holding a synthesized
+#                      async-run ledger whose one token has verdict `died`
+#   @ASYNC_WIN@        that ledger's window key
+#   @ASYNC_TOKEN@      that token
+#   @BG_WAIT_PANE_PID@ pid of a live process tree built by the suite:
+#                      `claude` -> a background wait shell whose argv is the
+#                      `until [ -s "$T/status" ]; do sleep …; done` loop the
+#                      `#1208` incident left behind, token and all
+#
+# The two `#1208` rows below share ONE tree and differ only in whether the
+# ledger is reachable. Varying one axis is the only shape whose green means
+# what it says.
+#
+# fixture<TAB>expect<TAB>env<TAB>args<TAB>why
+# ── absent ─────────────────────────────────────────────────────────────
+absent-bash-watcher.ansi	absent	-	-	a bare shell running the watcher tail: no Claude Code chrome anywhere, which is what positively asserts a dead agent rather than a quiet one
+
+# ── autosuggest-only (ghost text, NOT an operator draft) ────────────────
+autosuggest-dim-box-border-synthetic.ansi	autosuggest-only	-	-	LOOKS LIKE user-typing: a boxed prompt with a full sentence after the chevron. The sentence is FAINT (SGR 2), so it is Claude Code's ghost suggestion, not a draft — the whole point of the input= discriminator (#626)
+autosuggest-merge-win3.ansi	autosuggest-only	-	-	real capture, win3: ghost text at the chevron; nineteen panes in this shape once all read `empty` and stalled the board (identifying text replaced by same-width synthetic stand-ins, #1763; chrome and escapes unchanged)
+autosuggest-review-win6.ansi	autosuggest-only	-	-	real capture, win6: same shape, different suggestion text — the pair guards against a classifier keyed on the suggestion's WORDS (identifying text replaced by same-width synthetic stand-ins, #1763; chrome and escapes unchanged)
+autosuggest-why-win4.ansi	autosuggest-only	-	-	real capture, win4: third live instance, retained because `#626` was a population failure, not a one-pane failure
+
+# ── blocked (a modal only a human clears) ───────────────────────────────
+blocked-askuq-synthetic.ansi	blocked	-	-	the AskUserQuestion overlay, whose option list runs past a horizontal rule — the rule must not terminate the overlay scan
+blocked-bypass-permissions-synthetic.ansi	blocked	-	-	the LIVE bypass-permissions modal. Its quoted twin idle-bypass-modal-quoted-synthetic.ansi is the negative control; the two differ only in whether the pane is rendering the dialog or discussing it
+blocked-permission-synthetic.ansi	blocked	-	-	the per-tool permission prompt, the ordinary case the channel exists for
+blocked-ratelimit-synthetic.ansi	blocked	-	-	the rate-limit menu. Also the NON-VACUITY control for the `_unstick.sh` arm assertions further down the suite: the only fixture that must select an arm
+blocked-unnamed-dialog-synthetic.ansi	blocked	-	-	a dialog with wording no arm enumerates ("Reticulating splines requires elevated access"). It must still be blocked — the overlay detector keys on the SHAPE (numbered options + `Enter to confirm · Esc to cancel`), not on a known literal
+blocked-workspace-trust-realmodel.ansi	blocked	-	-	the LIVE workspace-trust dialog, real capture. Paired against idle-trust-dialog-quoted-synthetic.ansi, which quotes this same text in scrollback and must NOT be blocked
+
+# ── busy (a turn is running) ────────────────────────────────────────────
+busy-dialog-quoted-midrender-synthetic.ansi	busy	-	-	LOOKS LIKE blocked: the pane is displaying the full trust dialog, options and all. It is a BUSY pane quoting the dialog mid-render — the live spinner outranks the quoted overlay. Under the old prefix scheme this file's name had to assert `busy`, so nothing recorded that its VALUE is the blocked-shaped body
+busy-dialog-quoted-queued-synthetic.ansi	busy	-	-	LOOKS LIKE blocked, same dialog text, but the chevron row reads `Press up to edit queued messages` — input is already waiting behind a running turn, so the pane is being driven forward and no operator is needed
+busy-encode-win5.ansi	busy	-	-	real capture, win5: an ordinary running turn with a live spinner — the positive control the quoted-dialog fixtures above are measured against (identifying text replaced by same-width synthetic stand-ins, #1763; chrome and escapes unchanged)
+busy-esc-to-interrupt-menu-synthetic.ansi	busy	-	-	LOOKS LIKE blocked: a numbered option list with a chevron on option 1. The footer says `esc to interrupt`, so the list is the model's own prose, not a modal
+busy-footer-plain-list-synthetic.ansi	busy	-	-	LOOKS LIKE blocked: a plain numbered list ending in `Enter to confirm · Esc to cancel`, quoted inside model output while a turn runs
+busy-footer-single-option-synthetic.ansi	busy	-	-	LOOKS LIKE blocked with a one-option dialog — the degenerate overlay shape, quoted while a turn runs
+busy-menu-no-footer-synthetic.ansi	busy	-	-	LOOKS LIKE blocked: a chevroned numbered menu with NO confirm/cancel footer. Absence of the footer is what keeps it out of the overlay arm; the spinner is what puts it in busy
+busy-mid-render-no-chevron-synthetic.ansi	busy	-	-	a half-painted frame with no chevron row at all: the classifier must not read a missing prompt as `empty` while a turn is demonstrably in flight (identifying text replaced by same-width synthetic stand-ins, #1763; chrome and escapes unchanged)
+busy-orchestrator-win1.ansi	busy	-	-	real capture of the orchestrator pane mid-turn — the busy shape as it occurs on the window every consumer of this helper watches most (identifying text replaced by same-width synthetic stand-ins, #1763; chrome and escapes unchanged)
+busy-overlimit-banner-live-spinner-synthetic.ansi	busy	-	-	LOOKS LIKE over-limit: it carries the verbatim `You've hit your limit · resets 3am` banner. A LIVE spinner is running underneath it, so the banner is stale scrollback and the session is not actually suspended
+busy-overlimit-weekly-banner-live-spinner-synthetic.ansi	busy	-	-	the WEEKLY wording of the same trap, kept separate because the weekly banner is a different literal and a fix for one spelling has silently missed the other before
+
+# ── busy / THROTTLED (your-org/nexus-code#1340) ────────────────────────
+throttled-low-priority-first-attempt-synthetic.ansi	busy	-	-	LOOKS LIKE idle and MEASURED AS idle before your-org/nexus-code#1340: an empty input box under a spinner row carrying NO token counter, which is what `_detect_busy` keyed on. The pane is mid-turn under Claude Code's `/low-priority` mode — throttled, so precisely the turn that is not generating. It is the FIRST-ATTEMPT regime: no `attempt N`, no `next try in Ns`, because no retry has happened yet. That is why the detector keys on the CONDITION phrase and not on the retry counter — keying on the counter would cover the retries and miss the opening window, which is active and would read `idle`, and `idle` is on `_BK_KILL_OK_STATES`
+throttled-low-priority-capitalised-synthetic.ansi	busy	-	-	the retry render with the vendor strings CAPITALISED and NOTHING else changed — `Waiting For Capacity`, `Esc to Interrupt`. Against the first cut of the detector, which used `grep -qF`/`grep -qE`, this classified `idle` and was therefore KILL-AUTHORISED: a fix that a vendor capitalisation silently undoes has not closed the hazard, it has postponed it, and the failure is invisible because the pane just goes back to reading retirable. Found by the skeptic pass on your-org/nexus-code#1379, not by me. The detector matches case-insensitively now and this row is what stops that regressing
+throttled-low-priority-retry-synthetic.ansi	busy	-	-	the render measured on this board on two windows independently, 2026-09-02, verbatim including the retry counter: `✻ Working at lower priority · waiting for capacity · next try in 3s · attempt 2 · esc to interrupt`. Against the pre-#1340 classifier this fixture returns `state=idle active=0 input=blank` — byte-for-byte the reading the issue reports for a live worker — so it is the REGRESSION PIN, not an illustration. Carries `throttled=1`, a FIELD rather than a new state token, for the reason `_detect_queued_message` states about `queued=1`: a brand-new token can be dropped by a permissive default arm, which is the very mechanism that retired a live worker on 2026-06-15
+
+# ── busy / COMPACTION (your-org/nexus-code#1670 item 3) ─────────────────
+# `/compact` runs a turn that paints its own spinner. Whether that spinner
+# carries a TOKEN COUNTER is a property of the RELEASE, and `_detect_busy`'s
+# arm (a) is the only thing that reads a compacting pane as working — so a
+# release that drops the counter silently returns every compacting pane to
+# `idle`, which is on the KILL ALLOWLIST. That has ALREADY HAPPENED once, in
+# the other direction: 2.1.281 paints a `▰▱… 5%` progress bar with no counter
+# and reads idle; 2.1.283 and 2.1.284 count tokens and read busy. Both renders
+# are pinned so a regression toward the 2.1.281 shape is VISIBLE. Captures by
+# another operator's cc-auto-update evaluator via monitor/cc-harness (mock
+# backend; the only transcript is the harness's `say hello` / `warm-up reply`),
+# harness path in the header row replaced by `~/proj`.
+busy-compacting-spinner-realmodel-284.ansi	busy	-	-	REAL capture, 2.1.284, a pane MID-`/compact`: `* Compacting conversation… (0s · ↓ 3 tokens)`. Busy ONLY because of the token counter — no `esc to interrupt`, no throttle or retry chrome — so this row is the regression pin for #1670 item 3: a release (or a classifier change) that stops reading the counter turns it red instead of silently making a compacting orchestrator kill- and paste-authorised
+idle-compacting-progressbar-knownlimit-realmodel-281.ansi	idle	-	-	KNOWN LIMIT, NOT A DESIRED STATE. REAL capture, 2.1.281, the SAME moment of the same `/compact`: `✻ Compacting conversation…` over a `▰▰▱▱… 5%` bar, NO token counter. The pane IS working and reads `idle` (26 of 26 polls on the reporting operator's clone), because nothing in `_detect_busy` keys on the compaction bar. Pinned as `idle` so the current behaviour is RECORDED rather than implied; it is the defect #1670 describes, encoded here only because 2.1.281 is below the pin. If the classifier learns this render, flip this row to `busy` in the same commit — a change of this row is the intended signal, not a breakage
+
+# ── idle (waiting for input; nothing is driving it) ─────────────────────
+idle-bypass-modal-quoted-boundary-synthetic.ansi	idle	-	-	the quoted bypass modal pushed to the exact row where the bottom-rows window begins — the off-by-one boundary of the quoted-overlay exclusion
+idle-bypass-modal-quoted-synthetic.ansi	idle	-	-	LOOKS LIKE blocked: the complete bypass-permissions modal, options and confirm/cancel footer. It is being DISCUSSED in scrollback (an empty chevron sits below it), so no human decision is pending
+idle-empty-adjacent-dim-border-synthetic.ansi	idle	-	-	an empty prompt inside a DOUBLED box border (`││ ❯ ││`) — border glyphs adjacent to the chevron must not be mistaken for typed input
+idle-empty-dim-box-border-synthetic.ansi	idle	-	-	an empty prompt inside a single dim box border; the negative control for autosuggest-dim-box-border-synthetic.ansi, which is byte-similar but carries faint TEXT
+idle-empty-post-turn-realmodel.ansi	idle	-	-	real capture immediately after a turn ended: the canonical idle, and the fixture the heartbeat tests below use as their passive substrate
+idle-empty-synthetic.ansi	idle	-	-	the minimal idle. Load-bearing beyond its own row: the heartbeat, over-limit-file and orchestrator-heartbeat sections all drive this fixture so that any fall-through emits `idle` and an override is visible as an override
+idle-osc8-prbadge-nocounts-synthetic.ansi	idle	-	-	an OSC 8 hyperlink (a PR badge) in the footer with NO handle counts. The URL carries digits and `·` separators, so a CSI-only strip could FAKE a handle count out of the link payload; this is the negative half of that pair
+idle-overlimit-blank-separated-scrollback-synthetic.ansi	idle	-	-	LOOKS LIKE over-limit: the banner is present but separated from the live rows by blank lines, i.e. it is scrollback. The session is idle and usable
+idle-overlimit-quoted-relay-bottomrows-synthetic.ansi	idle	-	-	LOOKS LIKE over-limit: an agent RELAYING the banner text into the bottom rows. Quoting a suspension is not being suspended
+idle-overlimit-text-in-scrollback-synthetic.ansi	idle	-	-	LOOKS LIKE over-limit: banner text far up in scrollback, sixteen padding rows above the prompt — the distance case
+idle-trust-dialog-quoted-boundary-synthetic.ansi	idle	-	-	the quoted trust dialog at the bottom-rows boundary row; the trust-dialog twin of the bypass boundary fixture above
+idle-trust-dialog-quoted-synthetic.ansi	idle	-	-	LOOKS LIKE blocked: the complete workspace-trust dialog. The pane is a post-mortem DISCUSSING it ("pane-state read it as `empty`, so nothing unstuck it"). Auto-answering this pane would be answering a dialog that is not there
+idle-wrapped-bare-chevron-657.ansi	idle	-	-	half of the `#657` differential PAIR. Byte-for-byte identical to working-background-bare-chevron-657.ansi except that its footer carries NO handle tokens. The pair is what proves the verdict turns on the footer counts and not on the wrapped-up prose above them
+
+# ── over-limit (quota suspended; no human can shorten it) ───────────────
+over-limit-apierror-midline-synthetic.ansi	over-limit	-	-	the banner arriving MID-LINE inside an `API Error: Request rejected (429)` row rather than on its own line
+over-limit-canonical-synthetic.ansi	over-limit	-	-	the plain banner in the live bottom rows: the canonical suspension
+over-limit-fullscreen-padded-synthetic.ansi	over-limit	-	-	the banner in a full-height pane padded out to the terminal height, so the banner sits far from the prompt but still inside the live region
+over-limit-stale-counter-above-banner-synthetic.ansi	over-limit	-	-	LOOKS LIKE busy: a spinner row (`✻ Smooshing… (16s · ↓ 3 tokens)`) sits directly ABOVE the banner. The spinner is the frozen last paint; the banner below it is current. The inverse of busy-overlimit-banner-live-spinner-synthetic.ansi, and the reason both must exist
+over-limit-terse-synthetic.ansi	over-limit	-	-	the short banner form (`resets 11pm`, no timezone) — a different literal for the same suspension
+over-limit-weekly-stale-counter-above-banner-synthetic.ansi	over-limit	-	-	the weekly wording of the stale-counter trap above
+over-limit-weekly-synthetic.ansi	over-limit	-	-	the weekly banner in its plain form
+
+# ── user-typing (a human is demonstrably at this keyboard) ──────────────
+user-typing-synthetic.ansi	user-typing	-	-	the plain draft: bright-white (SGR 38;5;231) text at the chevron
+user-typing-vim-adjacent-dim-border-synthetic.ansi	user-typing	-	-	a draft inside a doubled box border — the typed twin of idle-empty-adjacent-dim-border-synthetic.ansi
+user-typing-vim-dim-box-border-synthetic.ansi	user-typing	-	-	a draft inside a single dim box border; typed twin of autosuggest-dim-box-border-synthetic.ansi, which differs only in SGR weight
+user-typing-vim-tripled-dim-border-synthetic.ansi	user-typing	-	-	a draft inside a TRIPLED border (`│││ ❯ … ││`) — the pathological nesting, retained because border-stripping fixes have regressed on depth before
+user-typing-with-autosuggest-tail-synthetic.ansi	user-typing	-	-	LOOKS LIKE autosuggest-only: the row ends in ghost text. It BEGINS in typed text, and a draft with a suggestion appended is still a draft — treating it as a ghost would paste over a human's half-written message
+
+# ── working-background (a handle or child process is driving it) ────────
+working-background-bare-chevron-657.ansi	working-background	-	-	the other half of the `#657` pair: identical to idle-wrapped-bare-chevron-657.ansi except for `· 1 shell, 1 monitor ·` in the footer. LOOKS LIKE a wrapped-up idle — the prose above says "Report filed and wrap-up posted; nothing further pending"
+idle-longjob-dispatcher-armed-realmodel-272.ansi	working-background	-	-	REAL capture (2.1.272, hermetic control C0 of your-org/nexus-code#1535): an idle REPL one turn in, whose ONLY handle is the host-armed longjob-watch dispatcher plugin monitor (`· 1 monitor ·`, `1 monitor still running`). Read BARE — no heartbeat, hence no dispatcher ledger — the handle is a real handle and the verdict is working-background; test-pane-state-longjob-discount.sh reads the SAME bytes with a fresh idle ledger and expects `idle`, which is the discount this fixture exists to pin
+working-background-bgbash-synthetic.ansi	working-background	-	-	the `2 background bashes` footer spelling, which is a different literal from `2 shells` and has been missed by a regex written for only one
+working-background-monitor-synthetic.ansi	working-background	-	-	a MONITOR handle and no shell. Monitor handles run inside claude's node process, so the tree can never see them and the footer is their only source — and they are self-waking, so they must never be aged out
+working-background-osc8-prbadge-synthetic.ansi	working-background	-	-	the handle count `2 shells` is wrapped in an OSC 8 hyperlink. A CSI-only ANSI strip leaves the escape bytes inline and breaks the ` · ` boundary the footer regex needs, HIDING a real count. Positive half of the pair whose negative half is idle-osc8-prbadge-nocounts-synthetic.ansi
+working-background-shell-realfooter.ansi	working-background	-	-	a real footer carrying a real shell count — the ground truth the synthetic footer spellings are modelled on
+working-background-shell-eol-realmodel-302.ansi	working-background	-	-	REAL capture (2.1.302 under the cc-harness mock, vim INSERT, your-org/nexus-code#1866): past the 10 s window the `← for agents` hint is gone and the footer ENDS at `· 1 shell`. Up to 2.1.301 the hint supplied the right-hand ` · ` the parser needed; read on the footer channel alone this capture was `idle`. The process tree rescues a live shell, a Monitor has no such channel
+working-background-monitor-eol-derived-302.ansi	working-background	-	-	the Monitor half of #1866, DERIVED: the real 2.1.302 capture with the hint stripped and `1 shell` rewritten to `1 monitor` on the FOOTER ROW only (the spinner row still says `1 shell still running`, so the spinner's `N monitor still running` arm cannot be what classifies it). A real Monitor cannot be armed under the mock (GrowthBook-gated), so this rendering is derived, not observed
+idle-nopill-eol-derived-302.ansi	idle	-	-	the NEGATIVE beside the two rows above: the same 2.1.302 screen with the pill removed from the footer row. `Ran 1 shell command` and `1 shell still running` remain in the transcript and must not be read as a handle
+working-background-monitor-shifttab-derived-657.ansi	working-background	-	-	the Monitor half of #1870 item 1, DERIVED: working-background-bare-chevron-657.ansi (a real v2.1.220 capture) with `1 shell, 1 monitor` rewritten to `1 monitor` on the footer row only, so the row reads `· 1 monitor (shift+tab to cycle) · ← for agents`. The `(` after the count is what the parser missed: the base parser reads `0 0` here and classifies it idle, which is on the kill allowlist. Derived, not observed: no capture holds a Monitor-only pill followed by that hint
+idle-prose-monitors-eol-synthetic-1866.ansi	idle	-	-	LOOKS LIKE an end-of-row pill: a TRANSCRIPT row ending `· 2 monitors`, above the input box. The #1866 end-of-row boundary is read on FOOTER rows only (after the last input-box rule), because a false monitor count is never aged out; an unrestricted end-of-row match classifies this working-background
+working-background-spurious-shell-footer-synthetic.ansi	working-background	-	-	the footer FALLBACK path: `2 shells` with no process tree to check it against. Reliable-tree readings override this both up and down; here there is no tree, so the footer stands
+
+# ── your-org/nexus-code#1208 — a background shell is not a running job ──
+#
+# THE ROW THE OLD SCHEME COULD NOT WRITE. The capture is a real
+# `olayingestsk2` pane, taken 2026-08-30T11:30 while the incident was live.
+# It LOOKS like a wrapped-up worker with one surviving background shell, and
+# that is exactly what its name says. Read bare it IS that, and
+# `working-background` is right.
+#
+# The second row reads the SAME bytes against a process tree whose one
+# background shell is an `until [ -s "$T/status" ]` wait on an async-run token
+# that `async-run --status-line` calls `died` — the pid is gone and no status
+# file was ever written, because the job was SIGKILLed. No future event can
+# clear that signal, so `working-background` makes the window permanently
+# unretireable (`retire-preflight` reads this helper).
+#
+# THE ROW ASSERTS `idle`, NOT `idle-orphan-async`, AND THAT IS DELIBERATE
+# (your-org/nexus-code#1214 skeptic F1). An earlier draft of this block argued
+# that `idle-orphan-async` is "the vocabulary member for precisely this" while
+# the row below asserted `idle` and the classifier produced `idle` — prose and
+# assertion disagreeing, inside the file built to stop exactly that. The prose
+# was the wrong half.
+#
+# `idle-orphan-async` is reachable ONLY from the heartbeat's declared
+# `external_waits`, never from the process-tree path this scenario exercises,
+# and that array is invisible past a 60 s staleness (`#1220`) — measured on the
+# live window at 68071 s of quiet against 10 declared waits. So it is not
+# reachable here and asserting it would pin a state the code cannot produce.
+#
+# It does not matter for RETIREMENT either way: `idle` and `idle-orphan-async`
+# are BOTH in `_BK_KILL_OK_STATES` and both yield `safe=1` — measured. The
+# window became retirable the moment it stopped reading `working-background`,
+# whichever of the two it landed on.
+#
+# THIS ROW IS RED AGAINST `monitor/pane-state.sh` @ 50c36ef, AND THAT IS THE
+# DEFECT, NOT A BROKEN TEST. pane-state.sh consults the process tree and the
+# footer and never asks async-run, so it answers `working-background`. The
+# `@BG_WAIT_PANE_PID@` row directly above is the non-vacuity control: the same
+# tree with NO ledger behind it must still read `working-background`, so a
+# green on the row below can never come from a harness that stopped building
+# a tree at all.
+wrapped-up-one-shell-dead-async-1208.ansi	working-background	-	-	read BARE: a real capture of a wrapped-up worker whose footer reports `1 shell`. With nothing known about that shell, a live background child IS live work
+wrapped-up-one-shell-dead-async-1208.ansi	working-background	-	--pane-pid @BG_RUN_PANE_PID@	NON-VACUITY CONTROL for the row below, and the SAME tree shape: a shell -> claude -> wait-shell whose argv names an async-run token. The ONLY difference is the ledger VERDICT -- this token's pid is alive with a matching start-time, so async-run says `running` and the exemption is kept. If this row ever goes green for the wrong reason the row below proves nothing.
+wrapped-up-one-shell-dead-async-1208.ansi	idle	-	--pane-pid @BG_WAIT_PANE_PID@	your-org/nexus-code#1208. Same tree, one axis changed: this token's ledger says `died` (pid gone, NO status file), so no future event can clear the wait and the shell is not work in flight. NOTE the env column is `-`: resolution comes from the ABSOLUTE token path in the wrapper's ARGV, not from NEXUS_STATE_DIR -- which is why the live incident resolved from a watcher that had never heard of the window.
+blocked-workspace-trust-realmodel-248.ansi	blocked	-	-	your-org/nexus-code#1112. A GENUINE CAPTURE from a real 2.1.248 binary (one sequential harness boot), not a transcription. 2.1.248 dropped the `N.` ordinals from this dialog and reordered its options, so the ordinal-keyed form of condition (b) stopped matching and a LIVE trust dialog classified `empty`. LOOKS LIKE nothing in particular; it must classify as `blocked` because a pane awaiting a human is in the ACTIVE set, and `empty` would make it invisible to the unstick machinery. Committed ALONGSIDE the 2.1.246 capture, not instead of it: the operator pin is 2.1.246 and the candidate stream is >=2.1.248, so a fix that trades one rendering for the other is not a fix.
+busy-footer-aligned-list-no-cursor-synthetic.ansi	busy	-	-	NEAR-MISS CONTROL for #1112. Widening condition (b) from `chevron + ordinal` to `chevron + column-aligned sibling` makes the dialog frame EASIER to match, so the shapes that must still be REFUSED carry more weight than before. This one has the Enter/Esc footer AND a column-aligned list, and NO cursor row -- so it is a notice, not a decision, and must not become `blocked`.
+idle-trust-dialog-248-quoted-synthetic.ansi	idle	-	-	LIVE-vs-QUOTED control for the UNNUMBERED rendering (#1112). The 2.1.248 dialog text appears inside a `Read(...)` transcript with the REPL row still painted BELOW the footer, so condition (c) is what does the rejecting. LOOKS LIKE a trust dialog and must classify as `idle` with NO `overlay=` claim -- the exact shape the filename scheme this manifest replaced could not express honestly.
+blocked-login-method-realmodel-268.ansi	blocked	-	-	real capture, claude 2.1.268 via monitor/cc-harness against the auth-free mock backend: step ONE of the /login flow (Select login method). your-org/nexus-code#1518. It classifies `blocked` from the select-dialog FRAME, not from the word `Login` — that structural fact is what the watcher's emit hold rests on, so this row is the standing guard that a vendor reword cannot turn the operator's login into a pasteable pane
+blocked-login-signin-realmodel-268.ansi	blocked	-	-	same flow, step TWO (Anthropic Console account / How do you want to sign in?). Committed separately from step one because the two frames carry DIFFERENT question text and only the frame is shared — a reword that breaks one and not the other is the failure this pair can see and a single fixture cannot
+blocked-auto-mode-default-offer-realmodel-285.ansi	blocked	-	-	real capture, claude 2.1.285 via monitor/cc-harness against the auth-free mock (user settings.json permissions.defaultMode=acceptEdits, no --settings): the one-time "Make auto mode your default permission mode?" select, which has NO Enter/Esc footer. Read `empty` before your-org/nexus-code#1687, and a paste + Enter then ACCEPTED it and rewrote the user-scope defaultMode to auto. Classifies `blocked` from the footerless-menu arm (the menu terminates the pane), so paste-followup refuses it. Its quoted twin idle-auto-mode-offer-quoted-realmodel-285.ansi is the negative control
+idle-auto-mode-offer-quoted-realmodel-285.ansi	idle	-	-	LOOKS LIKE the auto-mode default offer: real capture, claude 2.1.285, the mock model replying with the dialog's title and both option rows (a `❯ ` row plus a column-aligned sibling). It must stay `idle`: the REPL input box and status row are painted BELOW the quoted menu, so the menu does not terminate the pane — the negative control for the footerless-menu arm (your-org/nexus-code#1687)
+idle-agent-teams-footer-one-mate-synthetic.ansi	idle	-	-	LOOKS LIKE a footerless select dialog — your-org/nexus-code#1785, MEASURED AS `blocked overlay=dialog` before the fix. SYNTHETIC: idle-empty-post-turn-realmodel.ansi (empty `❯<NBSP>` box, status row) with the agent-teams teammate list appended below it, in the shape reported from 2.1.293: `  ● main` then `❯ ◯ w1-helper  <desc>  idle`. The `❯ ` cursor plus a column sibling terminating the pane is exactly (a')'s menu shape; the trailing `● main`-anchored teammate run is stripped before the dialog frame is judged
+idle-agent-teams-footer-two-mates-synthetic.ansi	idle	-	-	same as the one-mate row with a second teammate BELOW the cursor (`  ◯ w2-helper … running`), so the menu has siblings on both sides of the cursor — the other half of (a')'s sibling count (#1785)
+blocked-auto-mode-offer-agent-teams-footer-synthetic.ansi	blocked	-	-	MUST-NOT-FLIP control for #1785: the real 2.1.285 FOOTERLESS auto-mode offer with the teammate list appended under it, including a `❯ ◯` cursor row that would otherwise be the last chevron. Stripping the list must leave the offer's menu terminating the frame, so it stays blocked (and keeps its kind)
+blocked-workspace-trust-agent-teams-footer-synthetic.ansi	blocked	-	-	MUST-NOT-FLIP control for #1785, the FOOTERED half: the real 2.1.248 trust dialog (`Enter to confirm · Esc to cancel`) with the teammate list appended. Unstripped, the list pushes the footer out of (a)'s last-3-rows window; stripped, (a)-(c) judge the dialog exactly as without the list
+blocked-radio-glyph-menu-no-main-synthetic.ansi	blocked	-	-	NEAR-MISS control for #1785: a footerless select dialog whose options carry `◯`/`●` radio glyphs (`❯ ◯ Yes…` / `  ● No…`) but NO `● main` row. The teammate-list exclusion is anchored on the leader's `● main` row precisely so a glyph-styled real dialog is not stripped; it must stay blocked
+blocked-radio-glyph-menu-above-agent-teams-footer-synthetic.ansi	blocked	-	-	MUST-STAY-BLOCKED for #1785 (skeptic F3 on #1799): the radio-glyph dialog above with the teammate list (`  ● main` / `❯ ◯ w1-helper … idle`) DIRECTLY under its last option, no blank row. The glyph options continue the teammate-row run upward, so a strip anchored only at the BOTTOM ate the dialog too and the pane read empty/absent (paste-followup does not refuse those: the #1687 shape). The strip is anchored at the `● main` row: only it and the rows below it are removed
+auth-expired-retrying-realmodel-268.ansi	busy	-	-	real capture, 2.1.268: a LOGGED-OUT session MID-RETRY (`401 OAuth token has expired … Retrying in 16s · attempt 6/10`). MEASURED AS `idle` until your-org/nexus-code#1552, and that reading was asserted here deliberately as the dangerous one: no token counter and no `esc to interrupt`, so neither arm of `_detect_busy` fired. It is the same render family as the connection-refused retry one HTTP layer up, and `#1552` keys on what they SHARE — the harness's own `Retrying in <t> · attempt <k>/<N>` chrome on a spinner row — so this pane is now `busy retrying=6/10`, and STILL carries `auth=expired`, which rides on whatever verdict the pane produces. `_auth_hold.sh` and orchestrator-liveness key on that FIELD, never on the state, so #1518's gate is unchanged; what changes is that a pane the harness is still re-sending for is no longer kill- and paste-authorised. The terminal render below stays `idle`.
+auth-expired-terminal-realmodel-268.ansi	idle	-	-	the same failure once retries exhaust (`● Please run /login · API Error: 401 …`), reached with CLAUDE_CODE_MAX_RETRIES=1. Also `idle`. Paired with the mid-retry capture because the two renders share no wording except `/login`: disjunct (c) of _detect_auth_expired keys on the API's text and (a) on the TUI's, so they rot on different schedules
+auth-expired-terminal-quoted-above-realmodel-284.ansi	idle	-	-	REAL capture, claude 2.1.284 via monitor/cc-harness (mock 401 authentication_error, CLAUDE_CODE_MAX_RETRIES=1; harness path in the header row replaced by `~/proj`). The TRUE POSITIVE for your-org/nexus-code#1659 on the current build: the terminal `● Please run /login · API Error: 401 …` row, glyph AND text in ONE non-default fg, sitting BELOW assistant prose, a fenced code block and a user message that QUOTE all three detector strings. `auth=expired` must come from the harness row, and the suite asserts it does
+auth-expired-retrying-realmodel-284.ansi	busy	-	-	REAL capture, 2.1.284, same harness run with CLAUDE_CODE_MAX_RETRIES=10: the mid-retry render (`✻ 401 OAuth token has expired … · Retrying in 19s · attempt 7/10`), glyph and text both fg 211. `busy retrying=7/10` for #1552's reason, and still `auth=expired` for #1659's: the quoted transcript above it is not what raises the label
+idle-auth-quoted-prose-realmodel-284.ansi	idle	-	-	LOOKS LIKE auth-expired to a string match: three assistant replies whose paragraphs BEGIN with `Please run /login`, `Login expired` and `401 OAuth token has expired` — the anchored worst case, real 2.1.284 render. Assistant prose paints its `●` in fg 231 and its TEXT in the default fg, so it is not the harness's error row. Must carry NO `auth=` (your-org/nexus-code#1659: the orchestrator discussing an expiry emailed the operator twice on 2026-09-27)
+idle-auth-quoted-code-block-realmodel-284.ansi	idle	-	-	LOOKS LIKE auth-expired: the three strings inside a fenced code block (real 2.1.284 render: indented, fg 153, NO leading glyph). Must carry NO `auth=` (#1659)
+idle-auth-quoted-user-msg-realmodel-284.ansi	idle	-	-	LOOKS LIKE auth-expired: three USER messages that are exactly the three strings (real 2.1.284: `❯` in fg 239 on bg 237, text fg 231 — glyph and text differ). Must carry NO `auth=` (#1659)
+busy-auth-quoted-spinner-todo-synthetic.ansi	busy	-	-	SYNTHETIC, derived from a real 2.1.284 busy frame by replacing ONE word: the spinner verb `Frolicking` became `Login expired detector fix`, which is how an in-progress todo's activeForm renders in that slot (see busy-encode-win5.ansi). The spinner is the one HARNESS row that carries model text in the glyph's own colour, so it is the live-vs-quoted discriminator's near miss; the live-spinner suffix (`… (22s · ↓ 1.1k tokens)`) is what refuses it. Must carry NO `auth=` (#1659)
+blocked-login-codepaste-realmodel-268.ansi	absent	-	-	real capture, claude 2.1.268 via monitor/cc-harness: the /login flow's BROWSER-AUTH / CODE-PASTE step (`Use the url below to sign in` + `Paste code here if prompted >` + `Esc to cancel`), reached by selecting method 1 from the menu. OAuth query-string material REDACTED — an inert PKCE challenge for a login that never completed, removed because a committed string shaped like a live auth link is poor hygiene; the detector keys on the prose literals, not the URL. your-org/nexus-code#1518 skeptic w237sk F2. EXPECTATION NOTE, because this row's value is a FIXTURE-MODE artefact and not the production answer: `absent` is what `--fixture` with no `--pane-pid` yields via the declared-no-process door. On the LIVE pane it classifies `state=empty` — measured through cch_pane_state — because the frame has no `❯ ` option rows, so `_has_menu_dialog_frame` declines and `state=` never reaches `blocked`. That is exactly why the watcher's emit hold is a DISJUNCTION (`state=blocked` OR `auth=login`) and why this capture's load-bearing assertion is the `auth=login` token, which both modes agree on
+
+# ── the transport-retry family (your-org/nexus-code#1552) ────────────────
+transport-retry-connrefused-realmodel-273.ansi	busy	-	-	REAL capture (`capture-pane -e`), claude 2.1.273 via monitor/cc-harness, mock backend KILLED mid-stream: `✻ Connection refused — a firewall or proxy may be blocking it (ConnectionRefused) · Retrying in 3s · attempt 3/10` over an empty box. LOOKS LIKE idle and MEASURED AS idle at d5874b26 — `bk_pane_kill_authorized` rc 0 — because the row carries no token counter and no `esc to interrupt`. The harness re-sends by itself, so this IS a turn in flight: `busy retrying=3/10`. It is the pane every agent shows at once during a backend outage.
+transport-retry-connrefused-plaincapture-273.ansi	busy	-	-	the bytes linked from your-org/nexus-code#1552 itself (sha256 5b23d26d…, 1706 B). Kept beside the `-e` capture because it is NOT what the issue calls it: it holds ZERO escape bytes (the harness's `cch_capture` omits `-e`), so it exercises the detector and the blank-box reading on PLAIN text — the only form an operator pasting a pane into an issue can supply.
+transport-retry-exhausted-realmodel-273.ansi	idle	-	-	NEGATIVE CONTROL, REAL capture, the SAME pane 183 s later once the 10-attempt budget is spent: `● API Error: Connection refused …` then `✻ Cogitated for 3m 11s · done 2:41 PM`. Past tense, no retry construct, nothing in flight — the turn is lost and the pane is genuinely retirable. If this ever reads `busy` the detector has started matching the FAILURE's words instead of the RETRY's chrome, and a board that has recovered from an outage never retires anything.
+transport-retry-quoted-synthetic.ansi	idle	-	-	LOOKS LIKE a retry: the construct appears twice within ten rows of the prompt — inside a `●`-headed logical row (assistant prose) and on an indented row with no head. Neither is a column-0 spinner row, so this is an idle pane DISCUSSING an outage. It is the live-vs-quoted control: every agent that reads #1552, this manifest or pane-state.sh's own comments has these strings on screen.
+transport-retry-capitalised-synthetic.ansi	busy	-	-	the live row with the vendor strings re-capitalised and NOTHING else changed (`Retrying In 3s · Attempt 3/10`). `#1340` measured exactly this regression on its own first cut: a capitalisation-only reword silently returned the pane to the kill allowlist. Case-insensitive matching removes the axis; this row is what keeps it removed.
+transport-retry-wrapped-synthetic.ansi	busy	-	-	the live row WRAPPED so `Retrying in` and `38s · attempt 7/10` sit on different physical rows under one spinner head (a long `529 Overloaded` message in a narrow pane). A detector matching per physical row reads this `idle`; the logical row is joined first. Also the row that shows the detector is keyed on the retry CHROME and not on `Connection refused`.
+
+# ── content in the box that carries no typed marker ─────────────────────
+pasted-multiline-chip-realmodel-273.ansi	user-typing	-	-	REAL capture, claude 2.1.273: a 4-line BRACKETED paste (`paste-buffer -p`) stranded un-submitted, which Claude Code collapses to `❯ [Pasted text #1 +3 lines]`. LOOKS LIKE an empty box to every marker this classifier had — no bright-white typed SGR, no dim run, and a reverse-video cursor cell that satisfies the empty-box arm — and MEASURED AS `state=idle input=blank` at d5874b26: a pane holding an unsubmitted brief was paste-authorised AND kill-authorised (your-org/nexus-code#1527 had measured only the `input=` half). The chip is content somebody placed: `user-typing input=typed`, exactly as a single-line paste already reads.
+queued-vim-insert-realmodel-273.ansi	busy	-	-	REAL capture, claude 2.1.273, vim INSERT mode: a second message submitted behind a running turn. At this version the `Press up to edit queued messages` placeholder sits on the REAL `❯<NBSP>` row with its first glyph UNDER the cursor cell (`\x1b[7m\x1b[39mP\x1b[0;2mress up …`), and the colour reset between the reverse-video introducer and the glyph defeated the byte-exact ghost cut, so the lone `P` read as operator-typed text: `state=user-typing input=typed` and NO `queued=1` (your-org/nexus-code#1531, second mechanism). Must read `busy` and carry `queued=1`; test-pane-state.sh asserts the field.
+codex-blocked-folder-trust.ansi	blocked	-	-	real capture, codex-cli 0.156.1 (your-org/nexus-code#1640): the `Trust this folder?` dialog every new workdir raises until trust is PERSISTED in $CODEX_HOME/config.toml (a -c projects.… override was measured NOT to suppress it). No composer row, a reverse-video selector: the agent is waiting on the operator, never idle
+codex-blocked-hooks-review.ansi	blocked	-	-	real capture (#1640): `Hooks need review`, raised for session-flag hooks until their sha256 is trusted. Same shape as the trust dialog; blocked, not idle
+codex-blocked-login.ansi	blocked	-	-	real capture (#1640): the TUI login chooser (the TUI reads neither OPENAI_API_KEY nor CODEX_API_KEY, measured). Its menu is a plain `> 1.`, no reverse-video selector and no banner, so it is identified by its heading's tail; blocked with auth=login
+codex-blocked-model-migration.ansi	blocked	-	-	real capture (#1640): the `Meet GPT-6 Sol … Use existing model` notice codex raises once for a model with an upgrade path. A modal, so blocked
+codex-blocked-update-prompt.ansi	blocked	-	-	real capture (#1640): `Update available` on first start, before check_for_update_on_startup=false was passed. A modal that would hold a worker forever; blocked
+codex-busy-background-terminal.ansi	busy	-	-	real capture against the mock backend (#1640): `• Working (2s • esc to interrupt) · 1 background terminal running` while a tool call sleeps. The composer below shows the idle PLACEHOLDER, which is why busy is decided before the composer is read
+codex-busy-queued-steer.ansi	busy	-	-	real capture (#1640): a message steered in mid-turn, `Messages to be submitted after next tool call`. busy with queued=1: do not paste again. Measured: codex fires UserPromptSubmit when it CONSUMES the steer, so unlike #1099 the submit-stamp receipt does arrive on this path
+codex-busy-running-hook.ansi	busy	-	-	real capture (#1640): `◦ Working (1s • esc to interrupt) · Running hook` — the spinner bullet alternates • / ◦, so the arm matches both
+codex-busy-typing-ahead.ansi	busy	-	-	LOOKS LIKE user-typing: the composer holds operator text (`a follow-up while busy`, footer `tab to queue message`). But a turn is running above it, and the spinner is decided first, so busy — the draft is typed-ahead into a live turn
+codex-busy-working-real-api.ansi	busy	-	-	real capture against the REAL OpenAI API (#1640), 0 s into a turn: `• Working (0s • esc to interrupt)` with a braille spinner in the status line
+codex-idle-after-quota-error.ansi	idle	-	-	real capture against the REAL API (#1640): the turn failed with `■ Quota exceeded. Check your plan and billing details.` and the composer returned to its placeholder. The agent is waiting for input, which is idle; the failure is a transcript fact, not a pane state
+codex-idle-history-user-lines.ansi	idle	-	-	LOOKS LIKE typed input: two `› …` user messages sit in the scrollback. Those are drawn bold+DIM (ESC[1;2m›), the composer bold only (ESC[1m›), and only the LAST composer row is read — it holds the dim placeholder, so idle
+codex-idle-real-api.ansi	idle	-	-	real capture (#1640), GPT-6-Astra banner: the idle composer `› Ask Codex to do anything` whose text is the DIM placeholder (ESC[2m), i.e. an empty input box
+codex-typed-draft-real-api.ansi	user-typing	-	-	real capture (#1640): `› say PONG` typed and not submitted — composer text in normal intensity, no spinner. An operator draft, never idle
+codex-busy-streaming-answer.ansi	busy	-	-	LOOKS LIKE idle — skeptic F1 (#1640), real capture: the final answer STREAMING (`• w1 … w23`) with NO `Working (…)` line over the idle placeholder composer. The only on-screen tell is the braille spinner in the status line (`… · ⠋`); before the fix this read idle, which is kill-authorised
+codex-working-background-after-turn.ansi	working-background	-	-	LOOKS LIKE idle — skeptic F2 (#1640), real capture: the turn ENDED (Stop fired) but the footer says `1 background terminal running`; the job runs outside the pane's session, so only this line shows it, and a retire would kill it. working-background is never-kill
+codex-busy-spinner-after-esc.ansi	busy	-	-	real capture 3 s after Esc interrupted a hung turn: `■ Conversation interrupted` is on screen but the status-line spinner lingers (measured ≥10 s, gone by 30 s). Reads busy briefly — the safe direction, self-clearing
+codex-idle-after-esc-interrupt.ansi	idle	-	-	real capture 60 s after Esc: spinner gone, `■ Conversation interrupted` after the last user message. The heartbeat stays `user_prompt` forever after an Esc (no Stop, measured), so the `■` line is what keeps the open-turn arm from wedging this pane busy
+codex-idle-after-streamed-answer.ansi	idle	-	-	real capture after the streamed answer completed: all 60 words, no spinner, Stop fired. The rest state the streaming fixture must return to
+working-background-narrow45-realmodel-302.ansi	working-background	-	-	real tail (last 5 non-blank rows, plain text) from the #1873 N5 width sweep: claude 2.1.302 via monitor/cc-harness, two background Bash shells, vim INSERT, no statusLine (https://github.com/your-org/your-nexus/blob/b3fae33a137fd7b5018857f8c36ed9941c6fd879/assets/general/n5-footer-width-sweep.md). At 45 columns the footer ends `bypass permissions on · 2`: the pill's noun is dropped. LOOKS LIKE an idle pane with no handle token; must classify working-background (your-org/nexus-code#1876). Read `idle`, on the kill allowlist, before pass 3
+working-background-narrow35-realmodel-302.ansi	working-background	-	-	real tail (last 5 non-blank rows, plain text) from the #1873 N5 width sweep: claude 2.1.302 via monitor/cc-harness, two background Bash shells, vim INSERT, no statusLine (https://github.com/your-org/your-nexus/blob/b3fae33a137fd7b5018857f8c36ed9941c6fd879/assets/general/n5-footer-width-sweep.md). At 35 columns the mode text is also cut, leaving `bypass      · 2`: a column gap, then the bare count at end of row. Same verdict and reason as the 45-column row (#1876)
+idle-narrow30-realmodel-302.ansi	idle	-	-	real tail (last 5 non-blank rows, plain text) from the #1873 N5 width sweep: claude 2.1.302 via monitor/cc-harness, two background Bash shells, vim INSERT, no statusLine (https://github.com/your-org/your-nexus/blob/b3fae33a137fd7b5018857f8c36ed9941c6fd879/assets/general/n5-footer-width-sweep.md). At 30 columns the pill is GONE from the footer; the only count left is the spinner row, wrapped above the input box as `  · 2 shells still running`. LOOKS LIKE a pane with two live shells and classifies `idle` on this FIXTURE path, which has no process tree. KNOWN RESIDUAL, pinned so a change is visible (#1876): the phrase is deliberately not read (idle-nopill-eol-derived-302.ansi pins it as not-a-handle); in production the reliable process tree supplies the shells (#455), and a Monitor is still read through `N monitors still running`
+auth-expired-revoked-derived-302.ansi	idle	-	-	DERIVED from auth-expired-terminal-realmodel-268.ansi with only the message text replaced by the 2.1.302 binary's revoked-login string, `OAuth token revoked · Please run /login` (built by the same authentication_failed constructor as the expired render). LOOKS LIKE a logged-out pane and is `idle` like its parent; test-auth-hold.sh asserts `auth=expired` on it (your-org/nexus-code#1844 item 3)
+idle-effort-session-realmodel-302.ansi	idle	-	-	real capture, claude 2.1.302 (sha256 60d7eb7f…) via monitor/cc-harness against the mock backend: `/effort`, Right, `s` (high, this session only). The effort badge renders as its OWN right-aligned row ABOVE the input box (`● high · /effort`), not on the footer row; the footer stays one row. LOOKS LIKE a footer-pill row with a `·` item and must stay `idle` (your-org/nexus-code#1844 item 1, the 2.1.251 /effort footer-row split, driven: no detector keys on that row and none misreads it). Project path replaced with /data/proj-x
+autosuggest-bare-dim-cc2.1.220.ansi	autosuggest-only	-	-	real frame from cc 2.1.220 (jacob-greene/nexus#50): a BARE `\x1b[2m` dim ghost with no reverse-video cursor; must read as a ghost, not `empty`
+blocked-trust-numbered-cc2.1.220.ansi	blocked	-	-	real frame from cc 2.1.220: the folder-trust dialog with numbered options and the chevron on the accept option
+blocked-trust-unnumbered-cc2.1.260.ansi	blocked	-	-	real frame from cc 2.1.260: the same trust dialog after the numbering was dropped and the default chevron moved to `No, exit`
+idle-empty-with-dim-chrome-synthetic.ansi	idle	-	-	an empty input box whose row carries dim chrome only; dim with no ghost CONTENT must not read as a suggestion
+idle-overlimit-quoted-source-in-window-synthetic.ansi	idle	-	-	LOOKS like over-limit: the notice text is inside the scan window but as QUOTED SOURCE (gutter/quote); a real false 20.7h hold came from this shape (jacob-greene/nexus#79)
+input-text-bare-dim-synthetic.ansi	autosuggest-only	-	-	a bare-dim ghost carrying text; its input_text= disclosure is asserted by its own block, this row is the unconditional reading
+over-limit-bottom-pinned-input-cc2.1.260.ansi	over-limit	-	-	real frame from cc 2.1.260, which pins the input box to the BOTTOM: the notice sits behind blank padding that grows with the terminal (`capture-pane -p`, no `-e`)
+over-limit-shared-budget-cc2.1.268-synthetic.ansi	over-limit	-	-	the cc 2.1.268 budget-exhaustion notice: noun `budget`, flavor token `team's`, no reset time; admitted by the sentence-final full stop (jacob-greene/nexus#173)

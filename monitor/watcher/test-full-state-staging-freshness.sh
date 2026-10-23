@@ -45,7 +45,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if [[ "$hay" == *"$needle"* ]]; then pass "$label"
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$hay" == *"$needle"* ]]; then pass "$label"
     else
         fail "$label"
         printf '         expected to find: %s\n' "$needle" >&2
@@ -90,7 +91,16 @@ mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-    list-windows) printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
+    # Honour a NAME-only format: `-F '#{window_name}'` (no `|`) is what the
+    # restat and the reconcile note ask for, and echoing the full
+    # `name|activity|index` rows there makes every row read as a dead window.
+    # Any other format gets the full rows, as before.
+    list-windows)
+        if [[ "$*" == *'#{window_name}'* && "$*" != *'|'* ]]; then
+            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" | cut -d'|' -f1
+        else
+            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}"
+        fi ;;
     *)            : ;;
 esac
 exit 0
@@ -536,7 +546,11 @@ assert_contains "...labelled PARTIAL" "$out" "PARTIAL"
 assert_contains "...and the log says why" \
     "$(cat "$WORK/err.9")" "nothing staged to fall back to"
 counts=$(printf '%s\n' "$out" | grep '^workspace:')
-assert_contains "counts line still reports the live worker" "$counts" "1 busy"
+# The live worker is still COUNTED. Since upstream #1698 the prelude is told
+# its render budget, and a probe it cannot afford inside it (this case's
+# stub hangs past the 1s budget) is counted as `unprobed`, never as busy or
+# idle — so the counts line reports it there rather than as `1 busy`.
+assert_contains "counts line still reports the live worker (as unprobed, #1698)" "$counts" "1 unprobed"
 
 # The UNKNOWN row must not be mistaken for a window row by the row counter.
 rows=$(printf '%s\n' "$out" | grep -c '^  - ')

@@ -49,7 +49,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -97,7 +98,17 @@ cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
     list-windows)
-        printf '%s\n' "${MOCK_TMUX_WINDOWS:-}"
+        # your-org/nexus-code#845: honour `-F '#{window_name}'` — production
+        # asks for BARE names to build `live_windows`, and the stub used to
+        # return `name|activity` for that too, so `_idle_skeptic_live_window`
+        # (a whole-line `grep -qxF`) could never find a reviewer in this
+        # suite: the join was unguardable by construction. Any other format
+        # keeps the full `name|activity[|index]` rows.
+        if [[ "${2:-}" == -F && "${3:-}" == '#{window_name}' ]]; then
+            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" | cut -d'|' -f1
+        else
+            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}"
+        fi
         ;;
     display)
         # Not used in these tests; the probe consults list-windows
@@ -133,6 +144,11 @@ bgcpu_key="MOCK_BG_CPU_${win//[^a-zA-Z0-9_]/_}"
 bgshells_key="MOCK_BG_SHELLS_${win//[^a-zA-Z0-9_]/_}"
 bgrel_key="MOCK_BG_RELIABLE_${win//[^a-zA-Z0-9_]/_}"
 bgold_key="MOCK_BG_OLDEST_START_${win//[^a-zA-Z0-9_]/_}"
+bginfra_key="MOCK_BG_INFRA_${win//[^a-zA-Z0-9_]/_}"
+bgcmd_key="MOCK_BG_CMD_${win//[^a-zA-Z0-9_]/_}"
+bgwedged_key="MOCK_BG_WEDGED_${win//[^a-zA-Z0-9_]/_}"
+bgmembers_key="MOCK_BG_MEMBERS_${win//[^a-zA-Z0-9_]/_}"
+bgljkept_key="MOCK_BG_LJKEPT_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
 orphan_kinds="${!orphan_key:-}"
@@ -141,6 +157,11 @@ bg_cpu="${!bgcpu_key:-}"
 bg_shells="${!bgshells_key:-}"
 bg_reliable="${!bgrel_key:-}"
 bg_oldest_start="${!bgold_key:-}"
+bg_infra="${!bginfra_key:-}"
+bg_cmd="${!bgcmd_key:-}"
+bg_wedged="${!bgwedged_key:-}"
+bg_members="${!bgmembers_key:-}"
+bg_ljkept="${!bgljkept_key:-}"
 extras=""
 [[ -n "$reset_at" ]]      && extras+=" reset_at=$reset_at"
 [[ -n "$orphan_kinds" ]]  && extras+=" orphan_kinds=$orphan_kinds"
@@ -149,6 +170,11 @@ extras=""
 [[ -n "$bg_reliable" ]]   && extras+=" bg_reliable=$bg_reliable"
 [[ -n "$bg_cpu" ]]        && extras+=" bg_cpu=$bg_cpu"
 [[ -n "$bg_oldest_start" ]] && extras+=" bg_oldest_start=$bg_oldest_start"
+[[ -n "$bg_infra" ]]      && extras+=" bg_infra=$bg_infra"
+[[ -n "$bg_cmd" ]]        && extras+=" bg_cmd=$bg_cmd"
+[[ -n "$bg_wedged" ]]     && extras+=" bg_cpu_bp=2 bg_wedged=$bg_wedged"
+[[ -n "$bg_members" ]]    && extras+=" bg_members=$bg_members"
+[[ -n "$bg_ljkept" ]]     && extras+=" bg_longjob_kept=$bg_ljkept"
 printf 'state=%s%s\n' "$state" "$extras"
 exit 0
 STUB
@@ -692,12 +718,12 @@ LOG="$STATE_DIR/action-log.jsonl"
 export MOCK_TMUX_WINDOWS="$(printf 'orphw|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_orphw=idle-orphan-async
-export MOCK_ORPHAN_KINDS_orphw="slurm:12345284_4,ci:abc/runs/9"
+export MOCK_ORPHAN_KINDS_orphw="slurm:12345678_4,ci:abc/runs/9"
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains "orphan-async → row emitted" "$out" \
     $'orphw\tidle-orphan-async'
 assert_contains "orphan-async row carries orphan_kinds csv as detail" "$out" \
-    "slurm:12345284_4,ci:abc/runs/9"
+    "slurm:12345678_4,ci:abc/runs/9"
 
 # window-retain MUST NOT suppress idle-orphan-async.
 rm -f "$STATE_DIR/idle-state.tsv"
@@ -773,7 +799,14 @@ unset MOCK_PANE_STATE_wbgorph MOCK_BG_CPU_wbgorph
 export MOCK_TMUX_WINDOWS="$(printf 'wbgfresh|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
 mkdir -p "$STATE_DIR/background-progress"
-printf '%s\t%s\n' 700 "$(( NOW - 10 ))" > "$STATE_DIR/background-progress/wbgfresh"
+# Anchor the freeze-start to the CURRENT clock, not to the suite-start `NOW`.
+# The case asserts "frozen, but the freeze began INSIDE the grace" and the grace
+# in force here is 60s (set above), so anchoring to a `NOW` captured minutes
+# earlier made the assertion depend on how long the preceding suite took to run:
+# it passed at ~19s of elapsed suite time and failed at ~65s. That is a fixture
+# encoding a wrong assumption, not a real behaviour boundary — the assertion
+# itself is unchanged and still exercises exactly the within-grace branch.
+printf '%s\t%s\n' 700 "$(( $(date +%s) - 10 ))" > "$STATE_DIR/background-progress/wbgfresh"
 export MOCK_PANE_STATE_wbgfresh=working-background
 export MOCK_BG_CPU_wbgfresh=700   # frozen, but stored epoch only 10s old
 run_probe_capture out rc 'list_really_idle_workers'
@@ -874,7 +907,7 @@ seed_engagement_log_matching_activity
 seed_frozen_child bgc4 120 500
 mkdir -p "$STATE_DIR/worker-health"
 cat > "$STATE_DIR/worker-health/bgc4.json" <<EOF
-{"window":"bgc4","job_kind":"slurm","job_id":"12345284","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
+{"window":"bgc4","job_kind":"slurm","job_id":"12345678","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
 EOF
 export MOCK_PANE_STATE_bgc4=working-background
 export MOCK_BG_SHELLS_bgc4=1 MOCK_BG_RELIABLE_bgc4=1 MOCK_BG_CPU_bgc4=500
@@ -1076,6 +1109,239 @@ rm -f "$STATE_DIR/skeptic/pending/bgw5"
 unset MOCK_PANE_STATE_bgw5 MOCK_BG_SHELLS_bgw5 MOCK_BG_RELIABLE_bgw5 MOCK_BG_CPU_bgw5
 : > "$LOG"
 
+# ---- (b6)-(b9): protocol-wait children are not an inconsistency (#590) ----
+#
+# The wrapped-with-children emit fired on EVERY skeptic-gated worker. Sequence:
+# `ng wrap-up` tells the worker to hold a `skeptic-channel await` re-check loop
+# in a background shell; the skeptic returns a verdict, which CLEARS the pending
+# marker; the prescribed await child keeps polling until its own timeout. So the
+# `parked-awaiting-skeptic` exemption (b4) lapses while the prescribed child is
+# still alive, and the window resurfaced as an "inconsistency" demanding a
+# decision. Firing routinely trains the operator to dismiss it — and then a
+# genuine orphaned `sbatch` arrives looking like the twenty false ones before it.
+# Reproduced live on 2026-07-29: two emits, both ~11-14 min AFTER the verdict
+# that cleared the marker.
+
+# (b6) Wrapped, marker already cleared, the ONLY child is a protocol await loop
+#      → must NOT surface as an inconsistency.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"12","window":"bgw6","report":"bgw6_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw6|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw6 120 500
+export MOCK_PANE_STATE_bgw6=working-background
+export MOCK_BG_SHELLS_bgw6=1 MOCK_BG_RELIABLE_bgw6=1 MOCK_BG_CPU_bgw6=500
+export MOCK_BG_OLDEST_START_bgw6="$(( NOW - 120 ))"   # young episode
+export MOCK_BG_INFRA_bgw6=1
+export MOCK_BG_CMD_bgw6='zsh:./monitor/skeptic-channel.sh_await_bgw6'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "protocol await loop only → NOT wrapped-with-children (#590)" "$out" \
+    "wrapped-with-children"
+unset MOCK_PANE_STATE_bgw6 MOCK_BG_SHELLS_bgw6 MOCK_BG_RELIABLE_bgw6 \
+      MOCK_BG_CPU_bgw6 MOCK_BG_OLDEST_START_bgw6 MOCK_BG_INFRA_bgw6 MOCK_BG_CMD_bgw6
+
+# (b7) NEGATIVE CONTROL for (b6): the same shape with a NON-protocol child
+#      (a real orphaned job) MUST still surface. Without this, (b6) could be
+#      passing because the detector was switched off wholesale.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"13","window":"bgw7","report":"bgw7_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw7|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw7 120 500
+export MOCK_PANE_STATE_bgw7=working-background
+export MOCK_BG_SHELLS_bgw7=1 MOCK_BG_RELIABLE_bgw7=1 MOCK_BG_CPU_bgw7=500
+export MOCK_BG_OLDEST_START_bgw7="$(( NOW - 120 ))"
+export MOCK_BG_INFRA_bgw7=0
+export MOCK_BG_CMD_bgw7='zsh:sbatch_--mem_64G_run_pipeline.sh'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "real orphaned job still surfaces (#590 negative control)" "$out" \
+    $'bgw7\twrapped-with-children'
+# and it NAMES the child — the whole point of #590's minimum ask.
+assert_contains "the emit NAMES the offending child" "$out" \
+    "sbatch_--mem_64G_run_pipeline.sh"
+unset MOCK_PANE_STATE_bgw7 MOCK_BG_SHELLS_bgw7 MOCK_BG_RELIABLE_bgw7 \
+      MOCK_BG_CPU_bgw7 MOCK_BG_OLDEST_START_bgw7 MOCK_BG_INFRA_bgw7 MOCK_BG_CMD_bgw7
+
+# (b8) MIXED set: one protocol await loop + one real job → still surfaces, and
+#      reports the count of children that need a DECISION (1), not the raw 2.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"14","window":"bgw8","report":"bgw8_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw8|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw8 120 500
+export MOCK_PANE_STATE_bgw8=working-background
+export MOCK_BG_SHELLS_bgw8=2 MOCK_BG_RELIABLE_bgw8=1 MOCK_BG_CPU_bgw8=500
+export MOCK_BG_OLDEST_START_bgw8="$(( NOW - 120 ))"
+export MOCK_BG_INFRA_bgw8=1
+export MOCK_BG_CMD_bgw8='zsh:nohup_train.py'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "mixed set → still surfaces the real child" "$out" \
+    $'bgw8\twrapped-with-children'
+assert_contains "mixed set → counts only the decision-worthy child" "$out" \
+    "1 live child"
+unset MOCK_PANE_STATE_bgw8 MOCK_BG_SHELLS_bgw8 MOCK_BG_RELIABLE_bgw8 \
+      MOCK_BG_CPU_bgw8 MOCK_BG_OLDEST_START_bgw8 MOCK_BG_INFRA_bgw8 MOCK_BG_CMD_bgw8
+
+# (b9) The (b6) exemption is BOUNDED, never a permanent mute. A single `await`
+#      is self-limiting, but a worker that wraps it in an `until` loop would
+#      otherwise hold the window exempt forever. Past the ABSOLUTE ceiling the
+#      window surfaces again, with the loop named.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"15","window":"bgw9","report":"bgw9_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw9|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw9 120 500
+# SAVE/RESTORE, never unset: line ~815 exports a section-wide ceiling of 3600
+# that later cases (c3) depend on, so clearing it here would silently break them.
+_saved_ceiling="${MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS:-}"
+export MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS=600
+export MOCK_PANE_STATE_bgw9=working-background
+export MOCK_BG_SHELLS_bgw9=1 MOCK_BG_RELIABLE_bgw9=1 MOCK_BG_CPU_bgw9=500
+export MOCK_BG_OLDEST_START_bgw9="$(( NOW - 5000 ))"   # far past the ceiling
+export MOCK_BG_INFRA_bgw9=1
+export MOCK_BG_CMD_bgw9='zsh:./monitor/skeptic-channel.sh_await_bgw9'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "protocol-only exemption is bounded by the absolute ceiling" "$out" \
+    $'bgw9\twrapped-with-children'
+assert_contains "past-ceiling emit names the protocol loop" "$out" \
+    "skeptic-channel.sh_await_bgw9"
+if [[ -n "$_saved_ceiling" ]]; then
+    export MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS="$_saved_ceiling"
+else
+    unset MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS
+fi
+unset _saved_ceiling
+unset MOCK_PANE_STATE_bgw9 MOCK_BG_SHELLS_bgw9 MOCK_BG_RELIABLE_bgw9 \
+      MOCK_BG_CPU_bgw9 MOCK_BG_OLDEST_START_bgw9 MOCK_BG_INFRA_bgw9 MOCK_BG_CMD_bgw9
+: > "$LOG"
+
+# (b10)/(b11) The FULL-STATE snapshot classifies INDEPENDENTLY of
+# list_really_idle_workers, so it needs the same exclusion — otherwise the false
+# positive fixed above simply reappears at the full-state cadence (which is
+# exactly where the two 2026-07-29 emits were recorded: `*_full-state.md` and
+# `*_resurface.md` under monitor/.state/diffs).
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"16","window":"bgs1","report":"bgs1_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs1|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs1=working-background
+export MOCK_BG_SHELLS_bgs1=1 MOCK_BG_RELIABLE_bgs1=1 MOCK_BG_CPU_bgs1=500
+export MOCK_BG_INFRA_bgs1=1
+export MOCK_BG_CMD_bgs1='zsh:./monitor/skeptic-channel.sh_await_bgs1'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_not_contains "snapshot: protocol-only child is NOT an inconsistency" "$out" \
+    "wrapped-with-children"
+assert_contains "snapshot: reported as the benign prescribed state" "$out" \
+    "wrapped-awaiting-protocol"
+unset MOCK_PANE_STATE_bgs1 MOCK_BG_SHELLS_bgs1 MOCK_BG_RELIABLE_bgs1 \
+      MOCK_BG_CPU_bgs1 MOCK_BG_INFRA_bgs1 MOCK_BG_CMD_bgs1
+
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"17","window":"bgs2","report":"bgs2_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs2|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs2=working-background
+export MOCK_BG_SHELLS_bgs2=1 MOCK_BG_RELIABLE_bgs2=1 MOCK_BG_CPU_bgs2=500
+export MOCK_BG_INFRA_bgs2=0
+export MOCK_BG_CMD_bgs2='zsh:sbatch_--mem_64G_run_pipeline.sh'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot: a real orphaned job still surfaces" "$out" \
+    "wrapped-with-children"
+assert_contains "snapshot: and names the child" "$out" \
+    "sbatch_--mem_64G_run_pipeline.sh"
+unset MOCK_PANE_STATE_bgs2 MOCK_BG_SHELLS_bgs2 MOCK_BG_RELIABLE_bgs2 \
+      MOCK_BG_CPU_bgs2 MOCK_BG_INFRA_bgs2 MOCK_BG_CMD_bgs2
+: > "$LOG"
+
+# (b12) your-org/nexus-code#1446: a child whose elapsed dwarfs its CPU is
+#       BLOCKED, and the snapshot must NAME it — three >5h stalls read as
+#       healthy-with-a-job here. The stub passes `bg_wedged=1 bg_cpu_bp=2`.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"18","window":"bgs3","report":"bgs3_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs3|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs3=working-background
+export MOCK_BG_SHELLS_bgs3=1 MOCK_BG_RELIABLE_bgs3=1 MOCK_BG_CPU_bgs3=428
+export MOCK_BG_INFRA_bgs3=0
+export MOCK_BG_CMD_bgs3='zsh:grep_-raIl_SAMPLE_X'
+export MOCK_BG_WEDGED_bgs3=1
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot: a wedged child is NAMED as such (#1446)" "$out" \
+    "WEDGED? child at 2 bp CPU"
+# CONTROL: the same window with bg_wedged=0 carries no such note.
+export MOCK_BG_WEDGED_bgs3=0
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_not_contains "snapshot: bg_wedged=0 → no WEDGED note (control)" "$out" \
+    "WEDGED?"
+unset MOCK_PANE_STATE_bgs3 MOCK_BG_SHELLS_bgs3 MOCK_BG_RELIABLE_bgs3 \
+      MOCK_BG_CPU_bgs3 MOCK_BG_INFRA_bgs3 MOCK_BG_CMD_bgs3 MOCK_BG_WEDGED_bgs3
+: > "$LOG"
+
+# (b13) your-org/nexus-code#1460: lifetime CPU cannot tell a wedge from a
+#       sequential driver blocked in wait(); MEMBERSHIP TURNOVER can. With a
+#       `bg_members` digest on the line, the note is decided across ticks:
+#       first sight -> recorded, not yet WEDGED; same digest again -> WEDGED
+#       with the static age; a different digest -> a driver, not a wedge.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state; rm -rf "$STATE_DIR/bg-members"
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"18","window":"bgs4","report":"bgs4_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs4|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs4=working-background
+export MOCK_BG_SHELLS_bgs4=1 MOCK_BG_RELIABLE_bgs4=1 MOCK_BG_CPU_bgs4=53
+export MOCK_BG_INFRA_bgs4=0
+export MOCK_BG_CMD_bgs4='bash:guards-for-diff.sh_--run'
+export MOCK_BG_WEDGED_bgs4=1
+export MOCK_BG_MEMBERS_bgs4=1111111111
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_not_contains "snapshot (#1460): first sight of a digest is NOT yet called WEDGED" "$out" "WEDGED?"
+assert_contains "snapshot (#1460): …it says the membership is recorded for the next tick" "$out" \
+    "compared next tick"
+assert_file_exists "snapshot (#1460): the digest is recorded per window" "$STATE_DIR/bg-members/bgs4"
+# Same digest on the next tick: static membership — the wedge signature.
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1460): a STATIC membership across ticks is WEDGED" "$out" "WEDGED? child at 2 bp CPU"
+assert_contains "snapshot (#1460): …and the note names the static membership" "$out" \
+    "membership has been STATIC for"
+# A different digest: a descendant started or exited — a driver, never a wedge.
+export MOCK_BG_MEMBERS_bgs4=2222222222
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_not_contains "snapshot (#1460): membership TURNOVER suppresses the WEDGED note" "$out" "WEDGED?"
+assert_contains "snapshot (#1460): …and says why — a driver blocked in wait(), a wedge cannot produce an exit" "$out" \
+    "cannot produce an exit"
+# CONTROL: the b12 shape (no digest on the line) keeps the pre-#1460 reading.
+unset MOCK_BG_MEMBERS_bgs4
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1460 control): no digest on the line -> the pre-#1460 WEDGED note, marked unmeasured" "$out" \
+    "WEDGED? child at 2 bp CPU (0.01%=1) over its whole episode (membership not measured)"
+unset MOCK_PANE_STATE_bgs4 MOCK_BG_SHELLS_bgs4 MOCK_BG_RELIABLE_bgs4 \
+      MOCK_BG_CPU_bgs4 MOCK_BG_INFRA_bgs4 MOCK_BG_CMD_bgs4 MOCK_BG_WEDGED_bgs4
+rm -rf "$STATE_DIR/bg-members"
+: > "$LOG"
+
+# (b14) your-org/nexus-code#1851: the idle-awaiting-job row NAMES its child.
+#       #1851 was filed against the longjob dispatcher because this row
+#       printed a bare count; the counted child was an MCP helper shell.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state; : > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs5|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs5=working-background
+export MOCK_BG_SHELLS_bgs5=1 MOCK_BG_RELIABLE_bgs5=1 MOCK_BG_CPU_bgs5=0
+export MOCK_BG_INFRA_bgs5=0 MOCK_BG_CMD_bgs5='sh:sh_-c_mcp-server-x' MOCK_BG_WEDGED_bgs5=1
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1851): the idle-awaiting-job row names its child" "$out" \
+    "idle-awaiting-job (state=working-background; 1 live background child(ren) [child: sh:sh_-c_mcp-server-x]"
+assert_not_contains "snapshot (#1851) CONTROL: no kept dispatcher → no dead-wake note" "$out" "longjob DISPATCHER"
+# (b15) a counted root holding the dispatcher means its ledger is NOT armed:
+#       a stale or dead dispatcher is a LOST WAKE, and the row says so.
+export MOCK_BG_LJKEPT_bgs5=1 MOCK_BG_CMD_bgs5='bash:bash_longjob-watch.sh_dispatch'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot (#1851): a kept (stale/dead) dispatcher is named as a DOWN wake" "$out" \
+    "hold the longjob DISPATCHER and its ledger is NOT armed"
+assert_contains "snapshot (#1851): …and still flags WEDGED? (a stale dispatcher is not exempt)" "$out" "WEDGED?"
+unset MOCK_PANE_STATE_bgs5 MOCK_BG_SHELLS_bgs5 MOCK_BG_RELIABLE_bgs5 MOCK_BG_CPU_bgs5 \
+      MOCK_BG_INFRA_bgs5 MOCK_BG_CMD_bgs5 MOCK_BG_WEDGED_bgs5 MOCK_BG_LJKEPT_bgs5
+: > "$LOG"
+
 # ---- inverted priority: the exemption is BOUNDED (#455 follow-up) ---------
 #
 # "We'd rather misclassify and consider retiring a worker rather than having
@@ -1175,6 +1441,53 @@ assert_not_contains "advancing child within ceiling → still silent exempt" "$o
     "bgcap4"
 unset MOCK_PANE_STATE_bgcap4 MOCK_BG_SHELLS_bgcap4 MOCK_BG_RELIABLE_bgcap4 \
       MOCK_BG_CPU_bgcap4 MOCK_BG_OLDEST_START_bgcap4
+
+# (c6) your-org/nexus-code#1221 — THE PROPERTY, and the coverage hole it fills.
+#      ONE jiffy of advance annihilates an arbitrarily old freeze clock: a stamp
+#      5000s stale (base=60 here) is reset to zero by bg_cpu 500 -> 501. That is
+#      the mechanism which makes `bg_stall_age >= bg_base` unreachable for any
+#      child advancing even once per base — measured, a bare `sleep N` poll loop
+#      advances ~1 jiffy per 51*N seconds, so every poll period under ~70s
+#      defeats it. The EPISODE ceiling is the only bound that binds such a child.
+#
+#      Worth pinning because every OTHER children-path case pre-seeds the stamp
+#      by hand via seed_frozen_child, so no assertion above depends on
+#      _bg_progress_check's freeze/advance decision at all: it could be replaced
+#      with `printf '%s' "$now"` and only the orphan-path case would notice.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgpoll|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgpoll 5000 500                            # freeze clock 5000s >> base 60
+export MOCK_PANE_STATE_bgpoll=working-background
+export MOCK_BG_SHELLS_bgpoll=1 MOCK_BG_RELIABLE_bgpoll=1
+export MOCK_BG_CPU_bgpoll=501                                # ONE jiffy of advance
+export MOCK_BG_OLDEST_START_bgpoll=$(( $(date +%s) - 100 ))  # episode YOUNG: ceiling cannot fire
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "one jiffy of advance annihilates a 5000s freeze clock (#1221)" \
+    "$out" "bgpoll"
+
+# (c6b) THE PAIRED POSITIVE CONTROL, and it is the point rather than (c6).
+#       (c6) alone is an ABSENCE assertion and could pass for the wrong reason —
+#       any unrelated exemption silencing the row would satisfy it, which is this
+#       workspace's dominant defect class. (c6b) holds every variable constant
+#       except the CPU delta and demands the row APPEAR. Together they assert the
+#       property; separately, neither does.
+#
+#       It is also the grace's LIVE CONSTITUENCY, which is why #1221 resolves to
+#       DOC rather than DROP: a child that forks nothing (`sbatch --wait`, bare
+#       `wait`, `read` on a fifo) measured 0 jiffies over 90s, so the freeze
+#       clock is the operative bound for that shape and fires 47 hours before
+#       the ceiling would.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgpoll|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgpoll 5000 500
+export MOCK_BG_CPU_bgpoll=500                                # UNCHANGED: frozen
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "…and a FROZEN clock at the same age DOES surface (#1221)" \
+    "$out" $'bgpoll\t'
+unset MOCK_PANE_STATE_bgpoll MOCK_BG_SHELLS_bgpoll MOCK_BG_RELIABLE_bgpoll \
+      MOCK_BG_CPU_bgpoll MOCK_BG_OLDEST_START_bgpoll
 
 # (c5) CHURN in the child COUNT must NOT reset the ceiling. Background shells
 #      come and go routinely; an earlier cut keyed the episode clock on the
@@ -1286,16 +1599,582 @@ out=$(PATH="$STUB_DIR:$PATH" bash -c "
     NEXUS_ROOT='$NEXUS_ROOT'
     source '$PROBE'
     list_really_idle_workers() {
-        printf 'orphw\tidle-orphan-async\t120\tslurm:12345284_4\n'
+        printf 'orphw\tidle-orphan-async\t120\tslurm:12345678_4\n'
     }
     render_idle_section
 " 2>/dev/null)
 assert_contains  "orphan-async advisory line"           "$out" \
                  "orphw idle-orphan-async"
 assert_contains  "advisory quotes the offending job"    "$out" \
-                 "slurm:12345284_4"
+                 "slurm:12345678_4"
 assert_contains  "advisory points at the contract"      "$out" \
                  "worker-defaults"
+
+echo '=== the orphan-async advisory BRANCHES on wait class (your-org/nexus-code#1240) ==='
+#
+# THE PROPERTY: a wait whose job has already reached `terminal` must NOT be
+# told "a wait you have not confirmed dead must not be cleared". That sentence
+# is correct for `running` and `died` and unsatisfiable for a job that exited
+# normally — the reader can never confirm a finished job DEAD, so the guidance
+# forbids the one correct action and the worker has no exit. Seven recorded
+# instances, all rc=0, one stale for sixteen hours.
+#
+# Both branches are asserted in BOTH directions (present AND absent), because a
+# branch that renders the right words while ALSO rendering the wrong ones is
+# the failure this is guarding against.
+
+render_orphan_row() {   # $1 = the detail column ($4)
+    rm -f "$STATE_DIR/idle-state.tsv"
+    PATH="$STUB_DIR:$PATH" bash -c "
+        set -uo pipefail
+        STATE_DIR='$STATE_DIR'
+        NEXUS_ROOT='$NEXUS_ROOT'
+        source '$PROBE'
+        list_really_idle_workers() {
+            printf 'orphw\tidle-orphan-async\t120\t%s\n' '$1'
+        }
+        render_idle_section
+    " 2>/dev/null
+}
+
+out=$(render_orphan_row 'terminal|asyncrun:ar-deadbeefcafe')
+assert_contains     "terminal branch: says the jobs have FINISHED" "$out" "ALREADY FINISHED"
+assert_contains     "terminal branch: orders --status-line first"  "$out" "--status-line"
+assert_contains     "terminal branch: names the sanctioned verb"   "$out" "declare-no-wait asyncrun"
+assert_contains     "terminal branch: warns an empty rc is uncorroborated" "$out" "UNCORROBORATED"
+assert_not_contains "terminal branch: does NOT forbid clearing"    "$out" "must not be cleared"
+assert_not_contains "terminal branch: does NOT prescribe a poller" "$out" "background poller"
+
+out=$(render_orphan_row 'unresolved|asyncrun:ar-0123456789ab')
+assert_contains     "unresolved branch: keeps the do-not-clear rule" "$out" "must not be cleared"
+assert_not_contains "unresolved branch: does NOT offer the verb"     "$out" "declare-no-wait"
+
+# The legacy 4th-column shape (no class prefix) must degrade to the SAFE arm.
+out=$(render_orphan_row 'slurm:12345678_4')
+assert_contains     "legacy detail degrades to the do-not-clear text" "$out" "must not be cleared"
+assert_contains     "legacy detail still quotes the job"              "$out" "slurm:12345678_4"
+
+echo '=== _idle_orphan_wait_class resolves fail-CLOSED ==='
+#
+# The classifier is where the safety lives: everything not POSITIVELY
+# established terminal must return `unresolved`. Asserted by planting real
+# status files under a real STATE_DIR, not by reading the source.
+# The classifier now returns `<class>|<counts>`. These arms assert the CLASS;
+# the counts are asserted by the cardinality block below, which is where they
+# carry meaning.
+wc_class() { printf '%s' "${1%%|*}"; }
+wc_probe() {   # $1 = window, $2 = kinds
+    PATH="$STUB_DIR:$PATH" bash -c "
+        set -uo pipefail
+        STATE_DIR='$STATE_DIR'
+        NEXUS_ROOT='$NEXUS_ROOT'
+        source '$PROBE'
+        _idle_orphan_wait_class '$1' '$2'
+    " 2>/dev/null
+}
+_wc_enc=$(bash -c "source '$NEXUS_ROOT/monitor/_bookkeeping.sh' 2>/dev/null; wk_encode wcw" 2>/dev/null)
+[[ -n "$_wc_enc" ]] || _wc_enc=wcw
+_wc_root="$STATE_DIR/async-run/$_wc_enc"
+mkdir -p "$_wc_root/ar-aaaaaaaaaaaa" "$_wc_root/ar-bbbbbbbbbbbb" "$_wc_root/ar-cccccccccccc"
+printf 'rc=0\n' > "$_wc_root/ar-aaaaaaaaaaaa/status"
+printf 'rc=0\n' > "$_wc_root/ar-bbbbbbbbbbbb/status"
+# ar-cccccccccccc deliberately has NO status file — the `died`/`running` shape.
+
+assert_eq "one terminal token → terminal" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa')")" terminal
+assert_eq "two terminal tokens → terminal" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-bbbbbbbbbbbb')")" terminal
+# THE ARM THAT MATTERS: one unfinished job among finished ones must not be
+# reported as finished. `all terminal` is a conjunction, not a majority.
+assert_eq "one token WITHOUT a status file → unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-cccccccccccc')")" unresolved
+assert_eq "a non-asyncrun kind → untracked" \
+    "$(wc_class "$(wc_probe wcw 'slurm:12345678_4')")" untracked
+# RE-BASELINED, NOT DECIDED (your-org/nexus-code#1311). `git log -G` shows this
+# was written `→ unresolved` at cbf61b0a and flipped to `→ untracked` 4.5h later
+# at 002f1138, the commit that CREATED the untracked class, in a block edit whose
+# rationale argues only the HOMOGENEOUS case. Do not cite it as evidence that the
+# mixed case was deliberated — it froze the behaviour. #1311 is dispositioned on
+# the issue own argument instead, and shipped as a PROSE fix.
+assert_eq "a MIXED list with a slurm wait → untracked" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,slurm:1')")" untracked
+# A truncated list cannot support an all-terminal claim: the waits the 80-char
+# cap removed are unknown, and unknown is not terminal.
+assert_eq "a TRUNCATED list → unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-bbbbb…')")" unresolved
+assert_eq "an empty list → unresolved"   "$(wc_class "$(wc_probe wcw '')")" unresolved
+assert_eq "the literal unknown → unresolved" "$(wc_class "$(wc_probe wcw 'unknown')")" unresolved
+assert_eq "a malformed token → untracked" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:not-a-token')")" untracked
+# A window with no async-run dir at all — the ordinary case for most windows.
+assert_eq "a window with no async-run state → untracked" \
+    "$(wc_class "$(wc_probe wcw-absent 'asyncrun:ar-aaaaaaaaaaaa')")" untracked
+
+echo '=== your-org/nexus-code#1292 — RUNNING is a THIRD state, resolved by (pid, pidstart) ==='
+# 11 of 13 listed waits on this board had a terminal rc on disk (stale 5 to 304
+# min); the two that did NOT are the only ones the warning exists for, and they
+# were invisible among the stale ones. Two states could not express that.
+#
+# THE PID-REUSE ARM IS THE POINT. A recorded pid can still be present in /proc
+# as a DIFFERENT process — measured on this board, starttime 911215293 against
+# a recorded 910769323. A check on the pid alone says ALIVE; a kill on it hits
+# a stranger. So `running` requires BOTH pid and start-time to match, which is
+# delegated to monitor/proc-exists-authorized rather than re-derived.
+_wc_live_root="$STATE_DIR/async-run/$_wc_enc"
+mkdir -p "$_wc_live_root/ar-dddddddddddd" "$_wc_live_root/ar-eeeeeeeeeeee"
+# A REAL live process we own, with its REAL start-time — no status file.
+sleep 120 &
+_wc_livepid=$!
+_wc_livest=$(awk '{n=split($0,a,") "); split(a[n],f," "); print f[20]}' "/proc/$_wc_livepid/stat" 2>/dev/null)
+printf '%s\n' "$_wc_livepid" > "$_wc_live_root/ar-dddddddddddd/pid"
+printf '%s\n' "$_wc_livest" > "$_wc_live_root/ar-dddddddddddd/pidstart"
+# POSITIVE CONTROL on the fixture itself: without a real start-time every arm
+# below would be satisfied by the fail-closed path for the wrong reason.
+if [[ -n "$_wc_livest" && "$_wc_livest" =~ ^[0-9]+$ ]]; then
+    printf '  PASS: fixture planted a live pid with a readable start-time\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture could not read a start-time for pid %s\n' "$_wc_livepid" >&2; FAIL=$(( FAIL + 1 ))
+fi
+assert_eq "a live (pid,pidstart) with no status → running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-dddddddddddd')")" running
+# SAME pid, WRONG start-time: the recycled-pid case. Must NOT be running.
+printf '%s\n' "$(( _wc_livest + 987654 ))" > "$_wc_live_root/ar-dddddddddddd/pidstart"
+assert_eq "same pid, WRONG start-time (RECYCLED) → unresolved, not running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-dddddddddddd')")" unresolved
+printf '%s\n' "$_wc_livest" > "$_wc_live_root/ar-dddddddddddd/pidstart"
+# No status and no pid files at all: the genuinely indeterminate case.
+assert_eq "no status and no recorded pid → unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-eeeeeeeeeeee')")" unresolved
+# A live job MIXED with a finished one is still work in flight.
+assert_eq "one terminal + one live → running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-dddddddddddd')")" running
+# ALL terminal still wins over running — the arm order must not regress.
+assert_eq "all terminal (no live) → terminal, not running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-aaaaaaaaaaaa,asyncrun:ar-bbbbbbbbbbbb')")" terminal
+kill "$_wc_livepid" 2>/dev/null; wait "$_wc_livepid" 2>/dev/null
+# With the process GONE and still no status, the same token must fall to
+# unresolved — this is the `died` shape, and the arm that proves the running
+# verdict was about the PROCESS and not about the files being present.
+assert_eq "…and once that process EXITS, the same token → unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-dddddddddddd')")" unresolved
+
+# The emit must SAY which of the three it is, or the third state changes nothing.
+out=$(render_orphan_row 'running|asyncrun:ar-dddddddddddd')
+assert_contains     "running branch: says a job is still RUNNING"      "$out" "still RUNNING"
+assert_contains     "running branch: keeps the do-not-clear rule"      "$out" "must not be cleared"
+assert_not_contains "running branch: does NOT offer the verb"          "$out" "declare-no-wait"
+out=$(render_orphan_row 'unresolved|asyncrun:ar-eeeeeeeeeeee')
+assert_contains     "unresolved branch: says it is NOT verifiable"     "$out" "NOT verifiable"
+assert_not_contains "unresolved branch: does not claim a live process" "$out" "still RUNNING"
+
+echo '=== #1292 review: the classifier must FIRE AT REAL CARDINALITY, not just at 2 ==='
+# THE DEFECT THIS PINS. `orphan_kinds` is capped at 80 chars for DISPLAY, and
+# `asyncrun:ar-xxxxxxxxxxxx` is 24 chars plus a comma — so the cap truncates at
+# FOUR waits. The first cut of the classifier fail-closed on truncation, which
+# made it INERT for every window with >= 4 waits: measured, it reached 1 of the
+# 4 windows in #1292 own evidence table, and 0 of the 13- and 11-wait windows
+# an operator then had to sort BY HAND.
+#
+# A guard that does not fire at the cardinality its defect occurs at is not a
+# guard, so these cases are sized from the REAL population — 4, 11, 13, 15 —
+# and the classifier now reads the UNCAPPED list from the heartbeat.
+_card_win=cardw
+_card_hb="$STATE_DIR/heartbeat"; mkdir -p "$_card_hb"
+# $1 terminal, $2 nohup-untracked, $3 died  -> writes heartbeat + async-run dirs
+plant_waits() {
+    local nt="$1" nu="$2" nd="$3" i t w=""
+    rm -rf "$STATE_DIR/async-run/$_card_win"; mkdir -p "$STATE_DIR/async-run/$_card_win"
+    for (( i=1; i<=nt; i++ )); do
+        t=$(printf 'ar-t%011d' "$i"); mkdir -p "$STATE_DIR/async-run/$_card_win/$t"
+        printf 'rc=0\n' > "$STATE_DIR/async-run/$_card_win/$t/status"
+        w="$w{\"kind\":\"asyncrun\",\"id\":\"$t\"},"
+    done
+    for (( i=1; i<=nu; i++ )); do w="$w{\"kind\":\"nohup\",\"id\":\"nh-$i\"},"; done
+    for (( i=1; i<=nd; i++ )); do
+        t=$(printf 'ar-d%011d' "$i"); mkdir -p "$STATE_DIR/async-run/$_card_win/$t"
+        printf '999999\n' > "$STATE_DIR/async-run/$_card_win/$t/pid"
+        printf '1\n'      > "$STATE_DIR/async-run/$_card_win/$t/pidstart"
+        w="$w{\"kind\":\"asyncrun\",\"id\":\"$t\"},"
+    done
+    printf '{"last_activity":%s,"external_waits":[%s]}' "$(date +%s)" "${w%,}" \
+        > "$_card_hb/$_card_win.json"
+}
+# The capped string EXACTLY as pane-state hands it over, ellipsis and all — so
+# the arms below are driven through the same truncation the defect rode in on.
+capped_of() {
+    local csv; csv=$(python3 - "$_card_hb/$_card_win.json" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+s=",".join("%s:%s"%(w["kind"],w["id"]) for w in d["external_waits"])
+print(s[:79]+"…" if len(s)>80 else s)
+PY
+); printf '%s' "$csv"
+}
+card_probe() {
+    PATH="$STUB_DIR:$PATH" bash -c "
+        set -uo pipefail
+        STATE_DIR='$STATE_DIR'
+        NEXUS_ROOT='$NEXUS_ROOT'
+        source '$PROBE'
+        _idle_orphan_wait_class '$_card_win' \"\$1\"
+    " _ "$1" 2>/dev/null
+}
+
+# POSITIVE CONTROL on the fixture: the cap must actually be truncating at 4, or
+# every assertion below passes for the wrong reason.
+plant_waits 4 0 0
+_cap4=$(capped_of)
+if [[ "$_cap4" == *…* ]]; then
+    printf '  PASS: fixture confirms the 80-char cap TRUNCATES at 4 waits\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: 4 waits did not truncate (len=%s) — the cardinality arms would be vacuous\n' "${#_cap4}" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+assert_eq "4 terminal waits (TRUNCATED display) → terminal" \
+    "$(card_probe "$_cap4")" 'terminal|t=4 r=0 d=0 u=0 c=0 n=4 b=0 x=0'
+
+# projui2 live shape, measured on this board: 15 waits, every one terminal.
+plant_waits 15 0 0
+assert_eq "15 terminal waits → terminal (projui2 live shape)" \
+    "$(card_probe "$(capped_of)")" 'terminal|t=15 r=0 d=0 u=0 c=0 n=15 b=0 x=0'
+
+# guardkey hand-sorted shape: 2 finished, 9 nohup, 2 genuinely indeterminate.
+plant_waits 2 9 2
+assert_eq "13 mixed waits → unresolved, and the tally names all four classes" \
+    "$(card_probe "$(capped_of)")" 'unresolved|t=2 r=0 d=2 u=9 c=0 n=13 b=0 x=0'
+
+# excc shape: 11 of 11 unresolvable BY CONSTRUCTION — the fourth state.
+plant_waits 0 11 0
+assert_eq "11 nohup waits → untracked, not unresolved" \
+    "$(card_probe "$(capped_of)")" 'untracked|t=0 r=0 d=0 u=11 c=0 n=11 b=0 x=0'
+
+# NON-VACUITY: the classifier must still DISCRIMINATE at high cardinality, not
+# merely always answer terminal now that truncation no longer stops it.
+plant_waits 14 0 1
+assert_eq "14 terminal + 1 died → unresolved, NOT terminal" \
+    "$(card_probe "$(capped_of)")" 'unresolved|t=14 r=0 d=1 u=0 c=0 n=15 b=0 x=0'
+
+# The heartbeat is AUTHORITATIVE: a caller passing a wrong/empty display string
+# must still get the right answer, because the cap is a display artefact.
+assert_eq "an EMPTY display string still resolves from the heartbeat" \
+    "$(card_probe '')" 'unresolved|t=14 r=0 d=1 u=0 c=0 n=15 b=0 x=0'
+rm -rf "$STATE_DIR/async-run" "$_card_hb/$_card_win.json"
+
+# The emit must SURFACE the tally — a 13-wait window is unreadable as a list.
+out=$(render_orphan_row 'unresolved|t=2 r=0 d=2 u=9 c=0 n=13|asyncrun:ar-x,nohup:nh-1')
+assert_contains "emit carries the tally at high cardinality" "$out" "t=2 r=0 d=2 u=9 c=0 n=13"
+out=$(render_orphan_row 'untracked|t=0 r=0 d=0 u=11 c=0 n=11|nohup:nh-1')
+assert_contains     "untracked branch: says UNTRACKED"            "$out" "UNTRACKED"
+assert_contains     "untracked branch: says nothing to poll"      "$out" "nothing to poll"
+assert_not_contains "untracked branch: does NOT claim a live job"  "$out" "still RUNNING"
+
+# ── #1311: the UNTRACKED arm fires on ANY, the prose claimed EVERY ──────────
+# The arm is `n_untr > 0` (existential); the sentence asserted ALL. On a mixed
+# window that instructed the operator to clear waits whose rc is on disk,
+# unread. Prose only — the classifier is right and an existing assertion above
+# pins that a mixed list still CLASSIFIES untracked.
+out=$(render_orphan_row 'untracked|t=2 r=0 d=0 u=1 c=0 n=3|nohup:syn-1,asyncrun:ar-a,asyncrun:ar-b')
+assert_not_contains "#1311 MIXED: does NOT claim EVERY wait is untracked" "$out" "every wait here is UNTRACKED"
+assert_contains     "#1311 MIXED: names the split"                        "$out" "1 of 3 waits are UNTRACKED"
+assert_contains     "#1311 MIXED: routes to the status line FIRST"        "$out" "--status-line"
+# #1333 coupling: cancelled waits are resolvable too, so t+c is the count.
+out=$(render_orphan_row 'untracked|t=1 r=0 d=0 u=1 c=1 n=3|nohup:syn-1,asyncrun:ar-a,asyncrun:ar-b')
+assert_contains     "#1311 MIXED: resolvable count is t+c, not t alone"   "$out" "The other 2 have POSITIVE EVIDENCE"
+# NON-VACUITY: the HOMOGENEOUS case must still print the original sentence, or
+# the assertion above is satisfied by simply deleting the branch.
+out=$(render_orphan_row 'untracked|t=0 r=0 d=0 u=11 c=0 n=11|nohup:nh-1')
+assert_contains     "#1311 ALL-untracked: keeps the every-wait wording (it is TRUE)" "$out" "every wait here is UNTRACKED"
+assert_not_contains "#1311 ALL-untracked: does not claim a terminal status exists"   "$out" "--status-line"
+
+# ── #1183: an ARMED skeptic await is not an orphan ──────────────────────────
+# `skeptic-channel.sh await` IS the resume mechanism. The running arm told the
+# operator to install a Monitor for a recorded command that is already a poller
+# — and acting on that stacks a second await, which SIGTERMs the older one
+# (#1178), leaving the window with NONE armed while believing it is parked.
+_a83="$STATE_DIR/async-run/$_wc_enc/ar-await000001"
+mkdir -p "$_a83"
+# A REAL await-shaped process: a stub whose cmdline IS
+# `bash <path>/skeptic-channel.sh await projcsk`, because since the #1183
+# reopen the classifier ALSO asks the channel's own record — `.await-owner`
+# must name a live pid whose cmdline is this await (read off /proc by the same
+# property parser) and `.await-heartbeat` must be fresh. A bare `sleep` would
+# fail that check, correctly.
+printf '#!/usr/bin/env bash\nsleep 120\n' > "$WORK/monitor/skeptic-channel.sh"
+chmod +x "$WORK/monitor/skeptic-channel.sh"
+bash "$WORK/monitor/skeptic-channel.sh" await projcsk &
+_a83pid=$!
+_a83st=$(awk '{n=split($0,a,") "); split(a[n],f," "); print f[20]}' "/proc/$_a83pid/stat" 2>/dev/null)
+_a83chan_enc=$(bash -c "source '$NEXUS_ROOT/monitor/_bookkeeping.sh' 2>/dev/null; wk_encode projcsk" 2>/dev/null)
+[[ -n "$_a83chan_enc" ]] || _a83chan_enc=projcsk
+_a83chan="$STATE_DIR/skeptic/$_a83chan_enc"
+mkdir -p "$_a83chan"
+_a83_arm() {   # the channel's own record: owner pid + fresh heartbeat
+    printf '%s\n' "$_a83pid" > "$_a83chan/.await-owner"
+    date +%s > "$_a83chan/.await-heartbeat"
+}
+_a83_arm
+printf '%s\n' "$_a83pid" > "$_a83/pid"
+printf '%s\n' "$_a83st"  > "$_a83/pidstart"
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
+assert_eq "#1183 a live SKEPTIC AWAIT -> skeptic-await, not running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+# THE REOPEN (2026-09-03): argv[0] had to BE the script, which missed the form
+# the skill PRESCRIBES. Measured on the primary: 7 of 27 live awaits missed —
+# six `bash <path>/skeptic-channel.sh await …`, one `bash -c '<;-list>'` — and
+# every one was told to install a second listener.
+printf 'bash\0/shared/x/monitor/skeptic-channel.sh\0await\0projcsk\0--timeout\021600\0' > "$_a83/argv"
+assert_eq "#1183 REOPEN: \`bash <path>/skeptic-channel.sh await …\` -> skeptic-await" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+printf 'bash\0monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
+assert_eq "#1183 REOPEN: \`bash monitor/skeptic-channel.sh await …\` (relative) -> skeptic-await" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+printf 'bash\0-c\0monitor/skeptic-channel.sh await projcsk; rc=$?; echo "await rc=$rc"; exit $rc\0' > "$_a83/argv"
+assert_eq "#1183 REOPEN: the SKILL-prescribed \`bash -c '<list>'\` form -> skeptic-await" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+printf 'bash\0-c\0cd /x && timeout 550 monitor/skeptic-channel.sh await projcsk --timeout 600\0' > "$_a83/argv"
+assert_eq "#1183 REOPEN: an await behind \`cd … &&\` and a \`timeout\` wrapper -> skeptic-await" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+# >>> NEGATIVE CONTROL (the issue's own): a `bash -c` that merely MENTIONS the
+# script must NOT be classified skeptic-await — that over-match is exactly what
+# a substring predicate (`_await_pid_is_ours`-style) would commit, and it would
+# suppress the poller advice for real work.
+printf 'bash\0-c\0echo "skeptic-channel.sh await projcsk is armed"; sleep 5\0' > "$_a83/argv"
+assert_eq "#1183 NEG CONTROL: a \`bash -c\` that only MENTIONS \`skeptic-channel.sh await\` -> running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+printf 'bash\0-c\0grep -c "skeptic-channel.sh await" notes.md\0' > "$_a83/argv"
+assert_eq "#1183 NEG CONTROL: a grep FOR the phrase -> running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+printf 'bash\0-c\0monitor/skeptic-channel.sh status projcsk\0' > "$_a83/argv"
+assert_eq "#1183 NEG CONTROL: the script with a verb other than await -> running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+# >>> STALENESS, FAIL CLOSED (the issue's ask, previously prose only): the
+# channel record decides. Owner dead, heartbeat past the hang threshold, or
+# either file missing -> a STALE await is an orphan and keeps `running`.
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
+printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$_a83chan/.await-heartbeat"
+assert_eq "#1183 STALE: heartbeat past the hang threshold -> running (fail closed)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+_a83_arm; printf '999999\n' > "$_a83chan/.await-owner"
+assert_eq "#1183 STALE: .await-owner names a DEAD pid -> running (fail closed)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+_a83_arm; printf '%s\n' "$$" > "$_a83chan/.await-owner"
+assert_eq "#1183 STALE: .await-owner names a LIVE pid that is NOT an await -> running (recycled pid)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+_a83_arm; rm -f "$_a83chan/.await-owner"
+assert_eq "#1183 STALE: no .await-owner at all -> running (fail closed)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+# POTENCY: re-arm and the SAME token returns to skeptic-await.
+_a83_arm
+assert_eq "#1183 …re-armed channel, same token -> skeptic-await again (the plant is potent)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" skeptic-await
+out=$(render_orphan_row 'skeptic-await|t=0 r=1 d=0 u=0 c=0 n=1|asyncrun:ar-await000001')
+assert_not_contains "#1183 skeptic-await: does NOT tell the operator to install a Monitor" \
+    "$out" "install a Monitor"
+assert_contains     "#1183 skeptic-await: says it is ARMED" "$out" "ARMED"
+# NON-VACUITY: strip the argv record and the SAME live token returns to running.
+rm -f "$_a83/argv"
+assert_eq "#1183 …without the argv record, the same live token is plain running" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" running
+# `== n_run`, not `> 0`: an await ALONGSIDE a live compute job still needs the
+# poller advice, so the mixed window must NOT take the skeptic-await arm.
+printf './monitor/skeptic-channel.sh\0await\0projcsk\0' > "$_a83/argv"
+_a83b="$STATE_DIR/async-run/$_wc_enc/ar-await000002"
+mkdir -p "$_a83b"
+printf '%s\n' "$_a83pid" > "$_a83b/pid"
+printf '%s\n' "$_a83st"  > "$_a83b/pidstart"
+printf 'python3\0train.py\0' > "$_a83b/argv"
+assert_eq "#1183 an await ALONGSIDE a live compute job -> running, not skeptic-await" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001,asyncrun:ar-await000002')")" running
+# FAIL CLOSED: a DEAD await keeps the current treatment, never skeptic-await.
+kill "$_a83pid" 2>/dev/null; wait "$_a83pid" 2>/dev/null
+assert_eq "#1183 a DEAD skeptic await -> unresolved, not skeptic-await (fail closed)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-await000001')")" unresolved
+rm -rf "$_a83" "$_a83b" "$_a83chan" "$WORK/monitor/skeptic-channel.sh"
+
+echo '=== #1355: restate async-run.sh _evidence FAITHFULLY — scoped to rc=0, redirect clause carried, no "not a result" ==='
+# The emit used to say "an rc with 0 B out and 0 B err is UNCORROBORATED, not a
+# result" at three arms: it DROPPED the source redirect clause and ADDED a
+# phrase the source never says. 7 of 7 false alarms on one window whose driver
+# redirected per-suite output to files; and rc=2 (REFUSED) / rc=124 (TIMEOUT)
+# with empty streams were labelled "not a result" though each IS a status.
+_p55root="$STATE_DIR/async-run/$_wc_enc"
+_p55() {   # <token> <rc> <out-bytes|-> <err-bytes|-> <argv-words…>
+    local t="$1" rc="$2" ob="$3" eb="$4"; shift 4
+    mkdir -p "$_p55root/$t"
+    printf 'rc=%s\nended=1\n' "$rc" > "$_p55root/$t/status"
+    rm -f "$_p55root/$t/out" "$_p55root/$t/err"
+    [[ "$ob" == - ]] || printf '%*s' "$ob" '' > "$_p55root/$t/out"
+    [[ "$eb" == - ]] || printf '%*s' "$eb" '' > "$_p55root/$t/err"
+    : > "$_p55root/$t/argv"; local a; for a in "$@"; do printf '%s\0' "$a" >> "$_p55root/$t/argv"; done
+}
+wc_counts() { printf '%s' "${1#*|}"; }
+# (a) wgate shape: rc=0, 0 B / 0 B, driver `bash run3.sh` — NO redirect in the ARGV
+_p55 ar-p55a 0 0 0 bash .w213-out/run3.sh
+assert_eq "#1355 rc=0 with 0 B/0 B, no redirect in argv -> b=1 x=0" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55a')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=1 x=0'
+# (b) the argv itself redirects -> x counts it
+_p55 ar-p55b 0 0 0 bash -c 'bash run3.sh > .out/run3.log 2>&1'
+assert_eq "#1355 rc=0 with 0 B/0 B and a redirect in argv -> b=1 x=1" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55b')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=1 x=1'
+_p55 ar-p55t 0 0 0 bash -c 'run.sh | tee log.txt'
+assert_eq "#1355 …a tee pipe counts as a redirect too" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55t')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=1 x=1'
+# (c) SCOPED TO rc=0: a non-zero rc with empty streams is a STATUS, not blank
+_p55 ar-p55c 2 0 0 monitor/ng guards-for-diff --run
+assert_eq "#1355 rc=2 (REFUSED) with 0 B/0 B -> NOT counted blank (b=0)" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55c')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=0 x=0'
+_p55 ar-p55d 124 0 0 timeout 5 sleep 99
+assert_eq "#1355 rc=124 (TIMEOUT) with 0 B/0 B -> NOT counted blank (b=0)" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55d')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=0 x=0'
+# (d) corroborated rc=0, and a MISSING capture file (async-run says `?`, not 0)
+_p55 ar-p55e 0 4615 0 python3 train.py
+assert_eq "#1355 rc=0 with 4615 B out -> corroborated, b=0" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55e')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=0 x=0'
+_p55 ar-p55f 0 - - python3 train.py
+assert_eq "#1355 rc=0 with NO capture files -> a missing capture is not a zero, b=0" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55f')")" 't=1 r=0 d=0 u=0 c=0 n=1 b=0 x=0'
+# (e) the window-level tally sums across tokens
+assert_eq "#1355 tally sums: two blank, one of them redirecting" \
+    "$(wc_counts "$(wc_probe wcw 'asyncrun:ar-p55a,asyncrun:ar-p55b,asyncrun:ar-p55c')")" 't=3 r=0 d=0 u=0 c=0 n=3 b=2 x=1'
+# --- the PROSE, per shape ---
+out=$(render_orphan_row 'terminal|t=1 r=0 d=0 u=0 c=0 n=1 b=0 x=0|asyncrun:ar-p55c')
+assert_not_contains "#1355 b=0: the empty-streams WARNING does not fire"        "$out" "UNCORROBORATED"
+assert_contains     "#1355 b=0: a non-zero rc with empty streams is a STATUS"  "$out" "is a STATUS"
+assert_not_contains "#1355 b=0: never says not a result"                       "$out" "not a result"
+out=$(render_orphan_row 'terminal|t=1 r=0 d=0 u=0 c=0 n=1 b=1 x=1|asyncrun:ar-p55b')
+assert_contains     "#1355 x==b: says EMPTY BY DESIGN"                          "$out" "EMPTY BY DESIGN"
+assert_contains     "#1355 x==b: carries the redirect clause (find the own log)" "$out" "find the payload own log"
+assert_not_contains "#1355 x==b: never says not a result"                      "$out" "not a result"
+out=$(render_orphan_row 'terminal|t=1 r=0 d=0 u=0 c=0 n=1 b=1 x=0|asyncrun:ar-p55a')
+assert_contains     "#1355 b>0 x=0: UNCORROBORATED as a verdict on the WORK"   "$out" "UNCORROBORATED as a verdict on the work"
+assert_contains     "#1355 b>0 x=0: carries the redirect clause"               "$out" "redirects its own output"
+assert_contains     "#1355 b>0 x=0: non-zero rc is a STATUS"                   "$out" "NON-ZERO rc with empty streams is a STATUS"
+assert_not_contains "#1355 b>0 x=0: never says not a result"                   "$out" "not a result"
+out=$(render_orphan_row 'terminal|t=3 r=0 d=0 u=0 c=0 n=3 b=2 x=1|asyncrun:ar-p55a,asyncrun:ar-p55b,asyncrun:ar-p55c')
+assert_contains     "#1355 mixed b=2 x=1: names the split"                     "$out" "1 of those redirect their own output"
+assert_contains     "#1355 mixed b=2 x=1: the other 1 is UNCORROBORATED"       "$out" "the other 1 are UNCORROBORATED"
+# the SAME sentence is what the cancelled-mixed and untracked-mixed arms carry
+out=$(render_orphan_row 'cancelled|t=2 r=0 d=0 u=0 c=1 n=3 b=0 x=0|asyncrun:ar-a,asyncrun:ar-b,asyncrun:ar-c')
+assert_not_contains "#1355 cancelled-mixed arm: no not-a-result"               "$out" "not a result"
+assert_contains     "#1355 cancelled-mixed arm: scoped sentence (b=0)"          "$out" "is a STATUS"
+out=$(render_orphan_row 'untracked|t=1 r=0 d=0 u=1 c=0 n=2 b=1 x=1|nohup:syn-1,asyncrun:ar-b')
+assert_not_contains "#1355 untracked-mixed arm: no not-a-result"               "$out" "not a result"
+assert_contains     "#1355 untracked-mixed arm: EMPTY BY DESIGN when x==b"      "$out" "EMPTY BY DESIGN"
+# LEGACY counts (no b=): the FULL faithful sentence, never silence
+out=$(render_orphan_row 'terminal|t=1 r=0 d=0 u=0 c=0 n=1|asyncrun:ar-old')
+assert_contains     "#1355 legacy counts: still warns UNCORROBORATED"          "$out" "UNCORROBORATED"
+assert_contains     "#1355 legacy counts: carries the redirect clause"         "$out" "redirects its own output"
+assert_not_contains "#1355 legacy counts: never says not a result"             "$out" "not a result"
+# >>> NEGATIVE CONTROL (the issue's): #1201's genuinely-dead shape — no status,
+# pid gone, nothing captured — must STILL warn. That is the `died` shape and
+# it lands in the unresolved arm, whose warning is untouched.
+mkdir -p "$_p55root/ar-p55dead"
+printf '999999\n' > "$_p55root/ar-p55dead/pid"; printf '1\n' > "$_p55root/ar-p55dead/pidstart"
+: > "$_p55root/ar-p55dead/out"; : > "$_p55root/ar-p55dead/err"
+_p55cls=$(wc_probe wcw 'asyncrun:ar-p55dead')
+assert_eq "#1355 NEG CONTROL: a job that died leaving nothing -> unresolved" "$(wc_class "$_p55cls")" unresolved
+out=$(render_orphan_row "$_p55cls|asyncrun:ar-p55dead")
+assert_contains "#1355 NEG CONTROL: …and the warning still fires (NOT verifiable)" "$out" "NOT verifiable"
+# and the rc=0 blank NON-redirecting shape (wgate driver, redirect INSIDE the
+# script) is still flagged — the issue asks for argv-level redirect only, and
+# a refinement that silenced this would be #1201 reopened.
+out=$(render_orphan_row "$(wc_probe wcw 'asyncrun:ar-p55a')|asyncrun:ar-p55a")
+assert_contains "#1355 NEG CONTROL: rc=0 blank with no argv redirect is still UNCORROBORATED" "$out" "UNCORROBORATED"
+rm -rf "$_p55root"/ar-p55*
+
+echo '=== #1333: cancelled is NOT died — ask async-run.sh _verdict, do not restate it ==='
+# The classifier used to test `[[ -s status ]]` and nothing else, so a job
+# CANCELLED BY ITS OWNER and a job that DIED UNATTENDED produced byte-identical
+# rows — and those have opposite operator responses. `status` is written by the
+# runner at exit, so a SIGNALLED job never reaches that line and the cancel
+# marker is the only terminal evidence on disk.
+#
+# SELF-CONTAINED BY CONSTRUCTION. The first draft of this block reused the
+# #1292 fixtures and sat below the `rm -rf "$STATE_DIR/async-run"` that clears
+# them, so three assertions read a tree that had been deleted and failed for a
+# reason that had nothing to do with the code. Every fixture below is planted
+# here and torn down here.
+_c33root="$STATE_DIR/async-run/$_wc_enc"
+mkdir -p "$_c33root/ar-c33canc" "$_c33root/ar-c33dead" "$_c33root/ar-c33live"
+# A REAL live process we own, with its REAL start-time.
+sleep 120 &
+_c33pid=$!
+_c33st=$(awk '{n=split($0,a,") "); split(a[n],f," "); print f[20]}' "/proc/$_c33pid/stat" 2>/dev/null)
+if [[ -n "$_c33st" && "$_c33st" =~ ^[0-9]+$ ]]; then
+    printf '  PASS: #1333 fixture planted a live pid with a readable start-time\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: #1333 fixture could not read a start-time for pid %s\n' "$_c33pid" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# cancelled + pid gone
+printf '999999\n' > "$_c33root/ar-c33canc/pid"
+printf '1\n'      > "$_c33root/ar-c33canc/pidstart"
+printf 'by=sess-xyz\nat=1788373387\nsignalled=yes\n' > "$_c33root/ar-c33canc/cancelled"
+# died: tracked, no status, no marker, pid gone
+printf '999999\n' > "$_c33root/ar-c33dead/pid"
+printf '1\n'      > "$_c33root/ar-c33dead/pidstart"
+# cancel marker on a LIVE pid -> cancel-requested
+printf '%s\n' "$_c33pid" > "$_c33root/ar-c33live/pid"
+printf '%s\n' "$_c33st"  > "$_c33root/ar-c33live/pidstart"
+printf 'by=sess-xyz\nat=1788373387\nsignalled=yes\n' > "$_c33root/ar-c33live/cancelled"
+
+assert_eq "#1333 a CANCELLED wait (marker, pid gone) -> cancelled, not unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-c33canc')")" cancelled
+
+# >>> THE MANDATORY NEGATIVE CONTROL. Without it, `cancelled` is satisfiable by
+# relabelling every dead wait — the fix being strictly WORSE than the bug,
+# because it converts a stuck window into a lost one.
+assert_eq "#1333 NEG CONTROL: a wait that DIED with NO marker -> still unresolved" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-c33dead')")" unresolved
+
+# `cancel-requested`: marker present AND PID ALIVE. Must count as RUNNING —
+# "marker => settled" would retire a window whose job is still working.
+assert_eq "#1333 a cancel marker on a LIVE pid -> running (cancel-requested), NOT cancelled" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-c33live')")" running
+
+# ALL-arm, not existential: #1311's shape must not arrive in the arm next door.
+assert_eq "#1333 cancelled + died -> unresolved, not cancelled (fail closed)" \
+    "$(wc_class "$(wc_probe wcw 'asyncrun:ar-c33canc,asyncrun:ar-c33dead')")" unresolved
+
+# THE FAST PATH IS A CACHE OF _verdict, NOT A SECOND DEFINITION. `[[ -s status ]]`
+# survives above the ask; these two assert the authority agrees with it on BOTH
+# arms, so the shortcut stays equivalent rather than becoming a second opinion.
+printf 'rc=0\nended=1\n' > "$_c33root/ar-c33canc/status"
+_v33=$(NEXUS_ASYNC_RUN_WINDOW=wcw NEXUS_STATE_DIR="$STATE_DIR" \
+       timeout 10 bash "$_test_dir/../async-run.sh" --status-line ar-c33canc 2>/dev/null)
+assert_eq "#1333 AUTHORITY: status file + cancel marker -> terminal (arm order, #1121)" \
+    "${_v33%%|*}" terminal
+rm -f "$_c33root/ar-c33canc/cancelled"
+_v33=$(NEXUS_ASYNC_RUN_WINDOW=wcw NEXUS_STATE_DIR="$STATE_DIR" \
+       timeout 10 bash "$_test_dir/../async-run.sh" --status-line ar-c33canc 2>/dev/null)
+assert_eq "#1333 AUTHORITY: status file alone -> terminal (the fast path is equivalent)" \
+    "${_v33%%|*}" terminal
+
+# MIXED terminal + cancelled. The gate is an ALL-arm over the UNION
+# (`n_canc + n_term == n`), so it legitimately fires here — and the FIRST
+# version of this arm then asserted a universal over the set, telling the
+# operator that two jobs which COMPLETED WITH A REAL RC had output "truncated by
+# design … not evidence of anything". That is #1311's defect committed in the
+# arm directly above #1311's fix, and it was caught in review, not by this
+# suite. These assertions are why it cannot come back.
+out=$(render_orphan_row 'cancelled|t=2 r=0 d=0 u=0 c=1 n=3|asyncrun:ar-a,asyncrun:ar-b,asyncrun:ar-c')
+assert_not_contains "#1333 MIXED: does NOT claim ALL of them were cancelled" \
+    "$out" "these jobs were CANCELLED ON REQUEST"
+assert_contains     "#1333 MIXED: names the split" "$out" "1 of 3 were CANCELLED ON REQUEST"
+assert_contains     "#1333 MIXED: says the others COMPLETED with a real rc" "$out" "The other 2 COMPLETED"
+# …and it must not contradict the terminal arm three arms up, which warns that
+# an rc with 0 B out and 0 B err is UNCORROBORATED rather than a result.
+assert_contains     "#1333 MIXED: keeps the UNCORROBORATED warning for the terminal ones" \
+    "$out" "UNCORROBORATED"
+
+# NON-VACUITY: the HOMOGENEOUS case must still print the universal sentence, or
+# the assertions above are satisfied by deleting the branch outright.
+out=$(render_orphan_row 'cancelled|t=0 r=0 d=0 u=0 c=1 n=1|asyncrun:ar-c33canc')
+assert_contains     "#1333 cancelled branch: says CANCELLED ON REQUEST"       "$out" "CANCELLED ON REQUEST"
+assert_contains     "#1333 cancelled branch: says output is truncated"        "$out" "TRUNCATED BY DESIGN"
+assert_not_contains "#1333 cancelled branch: does NOT say it died unattended" "$out" "NOT verifiable"
+
+kill "$_c33pid" 2>/dev/null; wait "$_c33pid" 2>/dev/null
+rm -rf "$_c33root/ar-c33canc" "$_c33root/ar-c33dead" "$_c33root/ar-c33live"
 
 echo '=== prelude carries orphan-async axis ==='
 rm -f "$STATE_DIR/idle-state.tsv"
@@ -1387,6 +2266,10 @@ LOG="$STATE_DIR/action-log.jsonl"
 FAKE_NEXUS_14="$WORK/fake-nexus-14"
 mkdir -p "$FAKE_NEXUS_14/monitor" "$FAKE_NEXUS_14/reports"
 cp "$FAKE_NEXUS_8/monitor/ng" "$FAKE_NEXUS_14/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$FAKE_NEXUS_8/monitor/ng")/_bookkeeping.sh" "$FAKE_NEXUS_14/monitor/_bookkeeping.sh"
 cp "$STUB_DIR/pane-state.sh" "$FAKE_NEXUS_14/monitor/pane-state.sh"
 echo "stub content" > "$FAKE_NEXUS_14/reports/stubworker_2026-05-10_120000_partial.md"
 RETAIN_TS=$(date -Is -d "@$(( OLD_TS + 10 ))")
@@ -1772,6 +2655,14 @@ assert_contains  "absent pane-state → pane-absent"                "$out" \
                  $'crashed\tpane-absent'
 assert_contains  "pane-absent carries advisory detail"            "$out" \
                  "claude process gone or unresponsive"
+# The negative control for your-org/nexus-code#808's split: `absent` must keep
+# the relaunch advisory. Without this, "make blocked say something else" could
+# be satisfied by making EVERY pane-absent row say the blocked thing — which
+# would tell an operator to answer an overlay on a pane whose process is gone.
+assert_contains  "absent keeps the relaunch advisory"             "$out" \
+                 "relaunch or close"
+assert_not_contains "absent is NOT given the blocked advisory"    "$out" \
+                    "ANSWER it in the pane"
 # Even with a wrap-up event present, pane-absent still wins.
 echo '{"event":"wrap-up","issue":"77","window":"crashed","report":"crashed_2026-05-11_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' >> "$LOG"
 run_probe_capture out rc 'list_really_idle_workers'
@@ -1796,6 +2687,28 @@ export MOCK_PANE_STATE_stalled=blocked
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains  "blocked pane-state → pane-absent"               "$out" \
                  $'stalled\tpane-absent'
+# your-org/nexus-code#808 — THE ADVISORY, not just the class. `blocked` means
+# the agent is ALIVE and rendering a modal only a human can clear; it shares
+# the `pane-absent` surface with `absent` because both need the operator, but
+# the two need OPPOSITE actions. Observed in production 2026-08-07 against a
+# worker displaying an AskUserQuestion: the operator was told the process was
+# gone and to relaunch it.
+#
+# The class assertion above passed throughout that incident. That is the point
+# of these two lines: the string is what an operator reads and acts on, and
+# nothing asserted it.
+#
+# The negative asserts the ABSENT advisory is absent, NOT the bare phrase
+# "relaunch or close" — the blocked advisory ends "do NOT relaunch or close",
+# which CONTAINS that phrase. A substring test on it fires on the corrected
+# wording and reports the fix as the bug. (It did, on the first draft of this
+# very assertion.) So the discriminator is the unnegated advisory itself.
+assert_not_contains "blocked is NOT told the process is gone"     "$out" \
+                    "claude process gone or unresponsive"
+assert_contains  "blocked is told to ANSWER the overlay"          "$out" \
+                 "ANSWER it in the pane"
+assert_contains  "blocked advisory NEGATES the relaunch"          "$out" \
+                 "do NOT relaunch or close"
 
 # ---- Test 28: state=empty → skip (no row) -----------------------------
 #
@@ -1881,6 +2794,61 @@ assert_contains  "pane-absent row renders advisory"               "$out" \
                  "- docs-merge-and-polish pane-absent"
 assert_contains  "pane-absent row includes relaunch hint"         "$out" \
                  "relaunch or close"
+
+# ---- Test 31a: the pane-absent renderer honours the ROW's advisory ------
+#
+# your-org/nexus-code#808, the second half. The classifier computes a
+# per-state advisory into column 4; this awk arm used to print a FIXED string
+# and discard it. So the advisory was decided in one file and overwritten in
+# another, and the fix in `list_really_idle_workers` alone would have been
+# invisible to every operator.
+#
+# Two rows, one render, because the failure this guards is "print one string
+# for everything" — which a single-row test cannot distinguish from "print
+# the right string". Each row must show its OWN advisory and NOT the other's.
+echo '=== render_idle_section honours the per-row pane-absent advisory (#808) ==='
+rm -f "$STATE_DIR/idle-state.tsv"
+out=$(PATH="$STUB_DIR:$PATH" bash -c "
+    set -uo pipefail
+    STATE_DIR='$STATE_DIR'
+    NEXUS_ROOT='$NEXUS_ROOT'
+    source '$PROBE'
+    list_really_idle_workers() {
+        printf 'crashedwin\tpane-absent\t900\tclaude process gone or unresponsive; relaunch or close\n'
+        printf 'askuqwin\tpane-absent\t900\toverlay awaiting the operator (blocked) — ANSWER it in the pane; do NOT relaunch or close\n'
+    }
+    render_idle_section
+" 2>/dev/null)
+assert_contains  "blocked row renders its own advisory"           "$out" \
+                 "askuqwin pane-absent (overlay awaiting the operator (blocked) — ANSWER it in the pane"
+assert_contains  "absent row still renders the relaunch advisory" "$out" \
+                 "crashedwin pane-absent (claude process gone or unresponsive; relaunch or close)"
+# The load-bearing negative: the blocked row must not carry the ABSENT
+# advisory anywhere on its line. Asserted per-LINE, because that advisory
+# legitimately appears on the OTHER row in the same output — a whole-output
+# assertion here would be vacuous.
+#
+# The probe is "claude process gone or unresponsive", not "relaunch or
+# close": the corrected blocked wording ends "do NOT relaunch or close" and
+# so CONTAINS the latter. Testing for it would flag the fix as the defect.
+askuq_line=$(printf '%s\n' "$out" | grep -F 'askuqwin' || true)
+assert_not_contains "blocked LINE never claims the process is gone" "$askuq_line" \
+                    "claude process gone"
+assert_contains  "blocked LINE negates the relaunch"              "$askuq_line" \
+                 "do NOT relaunch or close"
+# …and an empty detail column falls back to the historical wording rather
+# than rendering an empty parenthesis, so a row from an older producer still
+# says something actionable.
+out=$(PATH="$STUB_DIR:$PATH" bash -c "
+    set -uo pipefail
+    STATE_DIR='$STATE_DIR'
+    NEXUS_ROOT='$NEXUS_ROOT'
+    source '$PROBE'
+    list_really_idle_workers() { printf 'legacywin\tpane-absent\t900\t\n'; }
+    render_idle_section
+" 2>/dev/null)
+assert_contains  "empty detail falls back, never renders blank"   "$out" \
+                 "legacywin pane-absent (claude process gone or unresponsive; relaunch or close)"
 
 # ---- Tests 31b: over-limit classification + rendering (issue #87) -------
 
@@ -2532,19 +3500,31 @@ export MOCK_TMUX_WINDOWS="$(printf 'alpha|%s\nbeta|%s' "$OLD_TS" "$OLD_TS")"
 seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_alpha=busy
 export MOCK_PANE_STATE_beta=busy
-# A cold-start with stamp absent counts only rows newer than 0; with
-# stale rows in the file at PRE_TS this would over-report. The probe
-# guards against that by treating "missing stamp" as "no scope yet"
-# only after stamping NOW — so the second call sees 0 unless new rows
-# arrived. Verify: first call should be 0 awaiting-input (since the
-# stamp absent → epoch 0 means everything counts on the very first
-# pass). Documented trade-off; the assertion below pins the behavior.
+# Missing stamp = no scope yet ⇒ the count is SKIPPED, not taken since 0
+# (your-org/nexus-code#1765). This assertion used to pin "2" — the since=0
+# fallback that rendered "2516 awaiting-input" on a live board.
 run_probe_capture out rc 'render_idle_prelude'
-# First-call semantics: stamp epoch defaults to 0 → all rows in file
-# are "newer than 0" → count both windows. The doc-comment in
-# render_idle_prelude calls this out as the documented trade-off; we
-# expect exactly 2 here.
-assert_contains  "first call counts pre-existing rows"   "$out" "2 awaiting-input"
+assert_contains  "#1765 first call (no stamp) skips the count → 0 awaiting-input" \
+                 "$out" "0 awaiting-input"
+assert_contains  "#1765 first call writes a parseable stamp" \
+                 "$(cat "$STATE_DIR/last-prelude.ts" 2>/dev/null)" "."
+assert_eq        "#1765 stamp write leaves no tmp file behind" \
+                 "$(bash -c 'shopt -s nullglob; f=( "$1"/last-prelude.ts.*.tmp ); echo ${#f[@]}' _ "$STATE_DIR")" "0"
+
+# A torn / empty / unparseable / truncated-prefix stamp is NOT a scope
+# either (#1765): each must skip, never count every row since epoch 0.
+for _torn in '' '   ' 'garbage' '1759' '17.5'; do
+    printf '%s' "$_torn" > "$STATE_DIR/last-prelude.ts"
+    run_probe_capture out_t rc 'render_idle_prelude'
+    assert_contains  "#1765 torn stamp [${_torn}] → 0 awaiting-input" \
+                     "$out_t" "0 awaiting-input"
+done
+# Positive control: a REAL stamp before the rows still counts them, so the
+# zeros above are the guard, not a dead counter.
+printf '%s' "$(( PRE_TS - 1 ))" > "$STATE_DIR/last-prelude.ts"
+run_probe_capture out_pc rc 'render_idle_prelude'
+assert_contains  "#1765 positive control: valid stamp before rows → 2 awaiting-input" \
+                 "$out_pc" "2 awaiting-input"
 
 # Second render right after, no new rows: stamp from the first render
 # is now in place, count drops to 0.
@@ -2956,7 +3936,7 @@ PASTE_TS=$(date -Is -d "@$_at_now")
 cat >> "$LOG" <<EOF
 {"ts":"$PASTE_TS","agent":"monitor","event":"paste-followup","note":"please wrap up","window":"pasted"}
 EOF
-printf 'nudged\t%s\tunstick-api-error\n' "$_at_now" > "$STATE_DIR/machine-input.tsv"
+printf 'nudged\t%s\tunstick-ratelimit\n' "$_at_now" > "$STATE_DIR/machine-input.tsv"
 # Both pastes land and fire the workers' UserPromptSubmit hooks.
 stamp_user_prompt pasted "$_at_now"
 stamp_user_prompt nudged "$_at_now"
@@ -3221,6 +4201,152 @@ unset MOCK_PANE_STATE_coex_w MONITOR_SKEPTIC_AWAIT_HANG_SECONDS MONITOR_IDLE_CLO
 # ---- summary ------------------------------------------------------------
 
 echo
+# ── your-org/nexus-code#845: the JOIN — parked-awaiting-skeptic names the
+# resolved skeptic and its idle age; the deadlock shape is flagged only on
+# positive evidence ────────────────────────────────────────────────────────
+echo '=== #845: parked-awaiting-skeptic carries the resolved skeptic NAME and IDLE AGE ==='
+# The issue's own paneclass numbers: target parked 23m, skeptic idle 4h06m.
+# Before: the row read `skeptic reviewing; exempt from idle/close` and was
+# BYTE-IDENTICAL at skeptic idle 10s, 14760s and 360000s (measured on the
+# 2026-09-02 re-derivation). `_idle_skeptic_live_window` computed the name and
+# discarded it; nothing read the skeptic's activity.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state 2>/dev/null || true
+LOG="$STATE_DIR/action-log.jsonl"; : > "$LOG"
+_j45now=$(date +%s)
+mkdir -p "$STATE_DIR/skeptic/pending"
+echo 1 > "$STATE_DIR/skeptic/pending/paneclass"      # fresh marker -> parked
+j45_windows() {   # <skeptic-window-name|-> <skeptic-idle-seconds>
+    # NO index column: the pane-state stub keys MOCK_PANE_STATE_<arg> on its
+    # first argument, and with an index present the probe passes the INDEX.
+    if [[ "$1" == - ]]; then
+        printf 'paneclass|%s' "$(( _j45now - 1380 ))"
+    else
+        printf 'paneclass|%s\n%s|%s' "$(( _j45now - 1380 ))" "$1" "$(( _j45now - $2 ))"
+    fi
+}
+export MOCK_TMUX_WINDOWS="$(j45_windows paneclass-skeptic 14760)"
+seed_engagement_log_matching_activity
+# The TARGET pane must be IDLE here: list_really_idle_workers filters on the
+# idle pool BEFORE the park check (a busy pane is never in the pool). The
+# snapshot renderer, by contrast, asks the park question for every window.
+export MOCK_PANE_STATE_paneclass=idle MOCK_PANE_STATE_paneclass_skeptic=autosuggest-only
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains "#845 the parked row exists (positive control)"            "$row" "parked-awaiting-skeptic"
+assert_contains "#845 …names the resolved skeptic"                          "$row" "skeptic=paneclass-skeptic idle "
+_j45age=$(printf '%s' "$row" | sed -n 's/.*skeptic=paneclass-skeptic idle \([0-9]*\)s.*/\1/p')
+if [[ "$_j45age" =~ ^[0-9]+$ ]] && (( _j45age >= 14760 && _j45age < 14760 + 300 )); then
+    printf '  PASS: #845 …carries the skeptic IDLE AGE from tmux activity (%ss)\n' "$_j45age"; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: #845 …skeptic idle age not carried (got %q from row %q)\n' "$_j45age" "$row" >&2; FAIL=$(( FAIL + 1 ))
+fi
+assert_contains "#845 4h06m idle, un-retained -> DEADLOCK SHAPE flagged"   "$row" "DEADLOCK SHAPE (#845)"
+assert_contains "#845 …the flag names the release verbs"                     "$row" "notify-delta"
+# the rendered idle section carries it too
+rm -f "$STATE_DIR/idle-state.tsv"
+run_probe_capture out rc 'render_idle_section'
+assert_contains "#845 render_idle_section: row carries skeptic name + age"  "$out" "skeptic=paneclass-skeptic idle "
+# and the full-state SNAPSHOT — where the orchestrator looks most
+run_probe_capture out rc 'render_full_state_snapshot'
+srow=$(printf '%s\n' "$out" | grep -F '  - paneclass parked-awaiting-skeptic' || true)
+assert_contains "#845 snapshot: parked row carries the join"                 "$srow" "skeptic=paneclass-skeptic idle "
+assert_contains "#845 snapshot: …and the deadlock flag"                      "$srow" "DEADLOCK SHAPE"
+
+# >>> ALLOWLIST, DEFAULT-DENY (the 2026-08-09 objection): the flag needs EVERY
+# condition. Drop one at a time; the JOIN (name + age) stays, the flag goes.
+# (1) skeptic idle 10s — below the threshold
+export MOCK_TMUX_WINDOWS="$(j45_windows paneclass-skeptic 10)"; seed_engagement_log_matching_activity
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains     "#845 NEG(1) skeptic idle 10s: join still present"       "$row" "skeptic=paneclass-skeptic idle "
+assert_not_contains "#845 NEG(1) skeptic idle 10s: NO deadlock flag"         "$row" "DEADLOCK SHAPE"
+# (2) skeptic RETAINED (declared hold, within TTL) — intent beats inference
+export MOCK_TMUX_WINDOWS="$(j45_windows paneclass-skeptic 14760)"; seed_engagement_log_matching_activity
+printf '{"ts":"%s","agent":"monitor","event":"window-retain","window":"paneclass-skeptic","reason":"held-for-delta"}\n' "$(date -Is -d "@$(( _j45now - 60 ))")" > "$LOG"
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains     "#845 NEG(2) retained skeptic: join still present"       "$row" "skeptic=paneclass-skeptic idle "
+assert_not_contains "#845 NEG(2) retained skeptic: NO deadlock flag"         "$row" "DEADLOCK SHAPE"
+# (2b) …but a retain older than the TTL has LAPSED, and the flag returns
+printf '{"ts":"%s","agent":"monitor","event":"window-retain","window":"paneclass-skeptic","reason":"held-for-delta"}\n' "$(date -Is -d "@$(( _j45now - 200000 ))")" > "$LOG"
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains     "#845 NEG(2b) retain past TTL: flag returns"             "$row" "DEADLOCK SHAPE"
+: > "$LOG"
+# (3) threshold is configurable: raise it above the age and the flag goes
+MONITOR_SKEPTIC_DEADLOCK_IDLE_SECONDS=20000 run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_not_contains "#845 NEG(3) threshold above the age: NO deadlock flag"  "$row" "DEADLOCK SHAPE"
+# (4) the resolved name comes from the skeptic-spawn LINKAGE when present,
+#     not from the `<name>-skeptic` convention
+printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"sk-pc","target-window":"paneclass","orig-window":"paneclass","depth":"1"}\n' "$(date -Is -d "@$(( _j45now - 1400 ))")" > "$LOG"
+export MOCK_TMUX_WINDOWS="$(j45_windows sk-pc 14760)"; seed_engagement_log_matching_activity
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains "#845 linkage record wins: skeptic=sk-pc"                    "$row" "skeptic=sk-pc idle "
+: > "$LOG"
+# (5) GRACE basis — no live skeptic yet: parked, and NO skeptic named (never a guess)
+export MOCK_TMUX_WINDOWS="$(j45_windows - 0)"; seed_engagement_log_matching_activity
+run_probe_capture out rc 'list_really_idle_workers'
+row=$(printf '%s\n' "$out" | grep -F $'paneclass\tparked-awaiting-skeptic' || true)
+assert_contains     "#845 NEG(5) grace basis: still parked"                  "$row" "parked-awaiting-skeptic"
+assert_not_contains "#845 NEG(5) grace basis: no skeptic named"              "$row" "skeptic="
+# (6) the boolean callers are unaffected: orphaned still refuses when a live
+#     skeptic exists (stdout of the resolver must not leak into a verdict)
+export MOCK_TMUX_WINDOWS="$(j45_windows paneclass-skeptic 14760)"; seed_engagement_log_matching_activity
+run_probe_capture out rc '_idle_skeptic_orphaned paneclass "$(date +%s)" "$(printf "paneclass\npaneclass-skeptic")"; echo "orphaned-rc=$?"'
+assert_contains "#845 _idle_skeptic_orphaned with a live skeptic -> rc 1, no leaked name" "$out" "orphaned-rc=1"
+assert_not_contains "#845 …stdout carries no window name"                     "$out" "paneclass-skeptic"
+rm -f "$STATE_DIR/skeptic/pending/paneclass"
+unset MOCK_PANE_STATE_paneclass MOCK_PANE_STATE_paneclass_skeptic
+
+# ---------------------------------------------------------------------------
+# your-org/nexus-code#1478 — the `N awaiting-input` scalar must not count the
+# ORCHESTRATOR's own idle_prompt. Its resting state (waiting for the operator)
+# rendered as a worker needing attention: `1` nearly always, a real worker as
+# `2`. Excluded by the watcher's paste-target identity ($TARGET), default
+# `orchestrator` like the window lister — never a hardcoded name.
+# ---------------------------------------------------------------------------
+echo "=== #1478: awaiting-input excludes the orchestrator (by \$TARGET) ==="
+NSTATE="$WORK/.state-1478"; mkdir -p "$NSTATE"
+printf '%s\n' \
+  '{"event":"Notification","notification_type":"idle_prompt","window":"orchestrator","ts":2000}' \
+  '{"event":"Notification","notification_type":"permission_prompt","window":"w7","ts":2001}' \
+  '{"event":"Notification","notification_type":"idle_prompt","window":"mission-control","ts":2002}' \
+  '{"event":"Notification","notification_type":"idle_prompt","window":"w7","ts":2003}' \
+  > "$NSTATE/worker-notifications.jsonl"
+_n1478() {  # _n1478 <TARGET-or-empty> <since>
+    bash -c "set -uo pipefail; STATE_DIR='$NSTATE'; export STATE_DIR; ${1:+TARGET='$1'; export TARGET;} source '$PROBE'; _notifications_count_distinct_since $2" 2>/dev/null
+}
+assert_eq "#1478 default target: orchestrator's idle_prompt is NOT counted (w7 + mission-control = 2)" "$(_n1478 '' 1000)" "2"
+assert_eq "#1478 TARGET=mission-control: THAT window is excluded instead (orchestrator + w7 = 2)" "$(_n1478 mission-control 1000)" "2"
+assert_eq "#1478 CONTROL: the since-epoch filter still applies (only rows after 2002 → w7 = 1)" "$(_n1478 '' 2002)" "1"
+assert_eq "#1478 nothing but the orchestrator since the stamp → 0 is REACHABLE" "$(bash -c "set -uo pipefail; STATE_DIR='$NSTATE'; export STATE_DIR; source '$PROBE'; printf '%s\n' '{\"event\":\"Notification\",\"notification_type\":\"idle_prompt\",\"window\":\"orchestrator\",\"ts\":3000}' >> '$NSTATE/worker-notifications.jsonl'; _notifications_count_distinct_since 2999" 2>/dev/null)" "0"
+# The sed fallback arm (no jq) must agree with the jq arm.
+# jq is resolved with `command -v`; shadowing `command` in the child makes it
+# report jq ABSENT so the awk fallback is what runs (a PATH without jq is not
+# constructible here — jq lives beside the coreutils).
+assert_eq "#1478 the no-jq (awk) arm excludes the same window (2)" \
+    "$(bash -c "set -uo pipefail; STATE_DIR='$NSTATE'; export STATE_DIR; source '$PROBE'; command() { if [[ \"\${1:-}\" == -v && \"\${2:-}\" == jq ]]; then return 1; fi; builtin command \"\$@\"; }; _notifications_count_distinct_since 1000" 2>/dev/null)" "2"
+
+# ---------------------------------------------------------------------------
+# your-org/nexus-code#1478 lead 2, verified: with STATE_DIR UNSET every state
+# path used to resolve to `.` — the checkout, when an agent ran a sourcer from
+# the repo root (four such files sat at the operator's repo root with one
+# mtime). Now a scratch fallback, announced once, never the cwd.
+# ---------------------------------------------------------------------------
+echo "=== #1478: STATE_DIR unset never resolves a state path into the CWD ==="
+CWD1478="$WORK/cwd-1478"; mkdir -p "$CWD1478"
+paths=$(cd "$CWD1478" && env -u STATE_DIR bash -c "set -uo pipefail; source '$PROBE'; _notifications_stamp_path; echo; _notifications_log_path; echo; _engagement_log_path 2>/dev/null || true" 2>/dev/null)
+case "$paths" in
+    *"$CWD1478"*|./*|*$'\n'./*) printf '  FAIL: #1478 a state path resolved into the CWD with STATE_DIR unset:\n%s\n' "$paths" >&2; FAIL=$(( FAIL + 1 )) ;;
+    *nexus-idle-probe-NOSTATE*) printf '  PASS: #1478 STATE_DIR unset → paths resolve to the announced scratch fallback, not the cwd\n'; PASS=$(( PASS + 1 )) ;;
+    *) printf '  FAIL: #1478 unexpected fallback paths:\n%s\n' "$paths" >&2; FAIL=$(( FAIL + 1 )) ;;
+esac
+warn=$(cd "$CWD1478" && env -u STATE_DIR bash -c "source '$PROBE'; _notifications_stamp_path >/dev/null; _notifications_log_path >/dev/null" 2>&1 >/dev/null)
+assert_eq "#1478 the fallback is announced exactly ONCE per process" "$(grep -c 'STATE_DIR is unset' <<<"$warn")" "1"
+assert_eq "#1478 …and the cwd stays empty" "$(find "$CWD1478" -mindepth 1 | wc -l)" "0"
+
 echo "=== summary: $PASS passed, $FAIL failed ==="
 if (( FAIL == 0 )); then
     echo "ALL TESTS PASSED"

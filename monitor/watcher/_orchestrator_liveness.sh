@@ -72,12 +72,14 @@
 #   - Otherwise the orchestrator is **pasted-without-response**.
 #     The state machine stamps an `unresponsive-since` marker on
 #     first entry and lets the watcher's standard
-#     `detect_and_unstick` loop probe cases A–D each cycle. Cases
-#     A (permission prompt Enter), C (api-error chip Enter), and
-#     D (AskUserQuestion chip-bar Escape + meta-paste) all
-#     terminate a stuck-but-alive orchestrator's wedge, after
-#     which the Stop hook fires and the heartbeat advances past
-#     the marker — state resets to healthy on the next cycle.
+#     `detect_and_unstick` loop probe its cases each cycle. Case
+#     D (AskUserQuestion chip-bar Escape + meta-paste) terminates
+#     a stuck-but-alive orchestrator's wedge, after which the Stop
+#     hook fires and the heartbeat advances past the marker —
+#     state resets to healthy on the next cycle. Case A surfaces a
+#     permission prompt as a decision and sends no key (#1599);
+#     the API-error Enter arm (Case C) was retired in #1670 — a
+#     failed turn is the StopFailure marker's to report.
 #
 #   - If `now - unresponsive_since >= unstick_window_seconds` —
 #     unstick has had its chance. Before escalating to a respawn,
@@ -132,6 +134,26 @@
 # Loaded by `monitor/watcher/main.sh` and by
 # `monitor/watcher/test-orchestrator-liveness.sh`. Side-effect-free
 # at load time — function definitions only.
+
+# Where Claude Code transcripts live (your-org/nexus-code#1720). Signals
+# 3 and 4 below look under every root `cc_transcript_roots` prints —
+# $CLAUDE_CONFIG_DIR/projects as well as <home>/.claude/projects. main.sh
+# has it already via _lib.sh; the suite sources this file alone, so load it
+# here too (definitions only). Partial-tree fallback: the same roots in the
+# same order, minus the realpath dedup, which only saves a repeated stat.
+if ! declare -F cc_transcript_roots >/dev/null 2>&1 \
+   && [[ -r "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh" ]]; then
+    # shellcheck source=monitor/_cc_transcript_roots.sh
+    source "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh"
+fi
+if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
+    cc_transcript_roots() {
+        [[ -n "${NEXUS_CC_HOME:-}" ]]     && printf '%s\n' "$NEXUS_CC_HOME/projects"
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && printf '%s\n' "$CLAUDE_CONFIG_DIR/projects"
+        [[ -n "${1:-${HOME:-}}" ]]        && printf '%s\n' "${1:-$HOME}/.claude/projects"
+        return 0
+    }
+fi
 
 # _orchestrator_heartbeat_age <heartbeat_file>
 #
@@ -255,48 +277,56 @@ _orchestrator_pasted_without_response() {
         sid=$(head -n 1 "$pin_file" 2>/dev/null | tr -d '[:space:]')
         if [[ -n "${sid:-}" ]] \
            && [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            local slug proj_dir jsonl jsonl_mtime
+            # Both signals are read under EVERY transcript root
+            # (your-org/nexus-code#1720): with CLAUDE_CONFIG_DIR set,
+            # Claude Code writes under IT, and a `$home_dir`-only lookup
+            # silently lost both witnesses. `home_dir` stays the fake-home
+            # seam — it replaces $HOME as the third root.
+            local slug proj_dir jsonl jsonl_mtime root
             slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-            proj_dir="$home_dir/.claude/projects/$slug"
+            while IFS= read -r root; do
+                [[ -n "$root" ]] || continue
+                proj_dir="$root/$slug"
 
-            # Signal 3: pinned session's jsonl mtime — fragile, fallback
-            # only. A session whose orchestrator-settings.json predates
-            # the new hooks will never bump either heartbeat or paste-
-            # received; any session log write post-paste is also positive
-            # evidence. Removed after the deprecation window — see the
-            # file header.
-            jsonl="$proj_dir/$sid.jsonl"
-            if [[ -f "$jsonl" ]]; then
-                jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
-                if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
-                    return 1
+                # Signal 3: pinned session's jsonl mtime — fragile, fallback
+                # only. A session whose orchestrator-settings.json predates
+                # the new hooks will never bump either heartbeat or paste-
+                # received; any session log write post-paste is also positive
+                # evidence. Removed after the deprecation window — see the
+                # file header.
+                jsonl="$proj_dir/$sid.jsonl"
+                if [[ -f "$jsonl" ]]; then
+                    jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
+                    if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
+                        return 1
+                    fi
                 fi
-            fi
 
-            # Signal 4: the session's tool-results/ dir mtime — an
-            # INDEPENDENT, watcher-side liveness witness that does NOT
-            # depend on any orchestrator-side hook being installed.
-            # Claude Code persists a file under
-            # `<projects>/<slug>/<sid>/tool-results/` for every tool
-            # call whose output is large enough to offload; the dir's
-            # mtime therefore advances the instant a live turn produces
-            # such output — regardless of WHO drove the orchestrator
-            # (operator-direct pane paste, bypassing watcher paste-
-            # tracking, or a watcher paste). This is precisely the
-            # witness the 2026-06-05 false-positive respawn ignored: a
-            # 1.6 MB tool-result landed 28 s before the kill while all
-            # of {heartbeat, paste-received, jsonl} lagged
-            # `last_paste_ts`. Strictly additive — a post-paste write
-            # here is positive evidence of life and short-circuits to
-            # healthy before the dead-threshold floor.
-            local tool_results_dir tr_mtime
-            tool_results_dir="$proj_dir/$sid/tool-results"
-            if [[ -d "$tool_results_dir" ]]; then
-                tr_mtime=$(date +%s -r "$tool_results_dir" 2>/dev/null || echo 0)
-                if [[ "$tr_mtime" =~ ^[0-9]+$ ]] && (( tr_mtime > last_paste_ts )); then
-                    return 1
+                # Signal 4: the session's tool-results/ dir mtime — an
+                # INDEPENDENT, watcher-side liveness witness that does NOT
+                # depend on any orchestrator-side hook being installed.
+                # Claude Code persists a file under
+                # `<projects>/<slug>/<sid>/tool-results/` for every tool
+                # call whose output is large enough to offload; the dir's
+                # mtime therefore advances the instant a live turn produces
+                # such output — regardless of WHO drove the orchestrator
+                # (operator-direct pane paste, bypassing watcher paste-
+                # tracking, or a watcher paste). This is precisely the
+                # witness the 2026-06-05 false-positive respawn ignored: a
+                # 1.6 MB tool-result landed 28 s before the kill while all
+                # of {heartbeat, paste-received, jsonl} lagged
+                # `last_paste_ts`. Strictly additive — a post-paste write
+                # here is positive evidence of life and short-circuits to
+                # healthy before the dead-threshold floor.
+                local tool_results_dir tr_mtime
+                tool_results_dir="$proj_dir/$sid/tool-results"
+                if [[ -d "$tool_results_dir" ]]; then
+                    tr_mtime=$(date +%s -r "$tool_results_dir" 2>/dev/null || echo 0)
+                    if [[ "$tr_mtime" =~ ^[0-9]+$ ]] && (( tr_mtime > last_paste_ts )); then
+                        return 1
+                    fi
                 fi
-            fi
+            done < <(cc_transcript_roots "$home_dir")
         fi
     fi
 
@@ -335,6 +365,61 @@ _orchestrator_pasted_without_response() {
 # Stateful pieces (the unresponsive-since file's mtime, the
 # resubmit marker) are managed by the caller / by
 # `_orchestrator_liveness_step`.
+# Is the orchestrator's pane showing a login surface? (your-org/nexus-code#1518)
+#
+# Sets `ORCH_AUTH_BLOCK_KIND` to `hold` (a `/login` dialog is up and emits are
+# being held) or `expired` (the session is logged out and saying so). rc 0 when
+# either obtains.
+#
+# DEGRADES TO "NOT BLOCKED" WHEN `_auth_hold.sh` IS ABSENT, and that direction
+# is the one to state: a test or tool sourcing this module alone keeps the
+# pre-#1518 behaviour exactly, rather than acquiring a gate whose substrate is
+# missing. The cost of the degradation is `#1517`'s behaviour — which is the
+# behaviour such a caller already had — not a new failure.
+#
+# The `hold` arm needs NO target: it reads the hold row, which only exists
+# because a cycle observed the dialog. The `expired` arm needs one, because
+# expiry must be answerable while no hold is active at all; `$TARGET` is
+# main.sh's global and an unset one simply skips that arm.
+_orchestrator_auth_blocked() {
+    ORCH_AUTH_BLOCK_KIND=""
+    declare -F _auth_hold_active >/dev/null 2>&1 || return 1
+    if _auth_hold_active; then
+        ORCH_AUTH_BLOCK_KIND=hold
+        return 0
+    fi
+    # THE TYPED SENSOR (your-org/nexus-code#1520, the transcript half of #1517).
+    # `turn-failure/<target>.json`, written by the orchestrator's own StopFailure
+    # hook ~1 s after a failed turn and typed `category=auth recovery=operator`
+    # by `_cause_classify.sh`. Checked BEFORE the pane arm because it is the
+    # fresher and the typed of the two; both raise ONE alert key. This arm is
+    # a GATE and nothing else — see the note above `_auth_hold_turn_failure_gate`
+    # on why it must never become a trigger: #1548 F2 measured that a liveness
+    # that "sees" the failure in the other direction reaches `respawn
+    # reason=resubmit-failed` at grace_s = 120 s with nothing to veto it. Here,
+    # after a resubmit fails, the fresh marker makes the NEXT tick `healthy
+    # reason=auth-turn-failure`, the step wrapper clears the resubmit marker,
+    # and the episode resets — this arm is the guard on the RESUBMIT-FAILED
+    # path. `dead-threshold` is closed by a different property of the sensor
+    # (skeptic oplivesk F3): it also holds while marker.ts >= last_paste_ts,
+    # i.e. while the watcher's latest poke was answered by an auth failure —
+    # a fixed freshness window alone respawned at +1385 s in the skeptic's rig.
+    # Both are bounded by the same `max_hold` ceiling as the pane arm (F5).
+    if [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_turn_failure_gate >/dev/null 2>&1 \
+        && _auth_hold_turn_failure_gate "$TARGET" "${_ORCH_AUTH_LAST_PASTE_TS:-}" >/dev/null; then
+        ORCH_AUTH_BLOCK_KIND=turn-failure
+        declare -F _auth_hold_turn_failure_alert >/dev/null 2>&1 \
+            && _auth_hold_turn_failure_alert "$TARGET"
+        return 0
+    fi
+    if [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_auth_expired >/dev/null 2>&1 \
+        && _auth_hold_auth_expired "$TARGET"; then
+        ORCH_AUTH_BLOCK_KIND=expired
+        return 0
+    fi
+    return 1
+}
+
 _orchestrator_liveness_decide() {
     local heartbeat_file="${1:?heartbeat file required}"
     local paste_received_file="${2:?paste-received file required}"
@@ -365,6 +450,69 @@ _orchestrator_liveness_decide() {
     # manifested yet — turn machinery legitimately takes this long.
     if (( age <= grace_s )); then
         printf 'healthy reason=within-grace age=%ds grace=%ds' "$age" "$grace_s"
+        return 1
+    fi
+
+    # AUTH GATE (your-org/nexus-code#1518, closing the liveness half of #1517).
+    #
+    # `#1517` measured 45 h of `Login expired · Please run /login` on this
+    # orchestrator drawing **8 resubmits** and **10 `recovered after …` lines**
+    # — and, over 1,648 watcher-log lines in the span, **0 lines mentioning
+    # login, auth or expiry**. The mechanism is this function's own premise: a
+    # paste with no answer past grace is read as a possibly-lost paste, whose
+    # remedies are a re-paste and then a respawn. **Neither can fix an expired
+    # credential**, and a respawn inherits it.
+    #
+    # Checked HERE — after grace, before `_orchestrator_pasted_without_response`
+    # — for a specific reason. That predicate decides health from the MTIME of a
+    # heartbeat / paste-received / session-jsonl / tool-results file newer than
+    # the paste, and reads no content. Under an expired login every input is
+    # answered within about a second by a synthetic error record written to the
+    # session jsonl, which is precisely a newer mtime; so that predicate is the
+    # thing producing the false `recovered`, and a gate placed after it would be
+    # adjudicating a verdict already corrupted. The ordering is the fix.
+    #
+    # `return 1` — no action — is the right verdict rather than a new escalation
+    # class, because there is no remedy in this module's vocabulary. The REMEDY
+    # is a human `/login`, and `_auth_hold.sh` is what asks for it, per kind:
+    # for `hold` the dialog hold's `_watcher_alert` bell (attention, no text,
+    # #1533); for `expired`/`turn-failure` the text-carrying operator alert,
+    # key `auth-expired` (#1548) — the `_auth_told` clause below names the same
+    # channel in the verdict. What this gate adds is the two things `#1517`
+    # found missing: the remedies do not fire, and the log says `auth`.
+    _ORCH_AUTH_LAST_PASTE_TS="$last_paste_ts"
+    if _orchestrator_auth_blocked; then
+        # NAME THE CHANNEL, per kind, so the sentence is checkable by grep
+        # (your-org/nexus-code#1548 P4a). The predecessor asserted "the operator
+        # has been notified out-of-band" for every kind, and for `expired` that
+        # was false: 0 alerts in 7 h 22 m. A verdict a reader consults to decide
+        # whether to trust the gate must not promise a channel that did not fire.
+        local _auth_told
+        case "$ORCH_AUTH_BLOCK_KIND" in
+            hold)
+                _auth_told="the dialog hold rang the watcher ALERT bell once when it engaged (attention only — the bell carries no text, #1533)" ;;
+            expired|turn-failure)
+                _auth_told="operator-alert key=auth-expired is RAISED on the text-carrying legs (record: ${STATE_DIR:-monitor/.state}/operator-alerts.jsonl; #1548)" ;;
+            *)
+                _auth_told="no channel is claimed for kind '${ORCH_AUTH_BLOCK_KIND}'" ;;
+        esac
+        printf 'healthy reason=auth-%s age=%ds (login surface on the orchestrator: no resubmit, no respawn — neither can fix an expired credential; %s; your-org/nexus-code#1518/#1517/#1548)' \
+            "$ORCH_AUTH_BLOCK_KIND" "$age" "$_auth_told"
+        return 1
+    fi
+
+    # API-UNREACHABLE GATE (your-org/nexus-code#1845). The same reasoning as the
+    # auth gate above, one cause over: while the API cannot be reached, a paste
+    # with no answer is not a lost paste and a silent orchestrator is not a dead
+    # one — a resubmit starts a turn that fails again, and a respawned session
+    # cannot reach the API either. Placed AFTER the auth gate (a logout is the
+    # nearer cause and has its own alert) and BEFORE the mtime predicate, for the
+    # auth gate's own reason: every failed turn writes an error record, which is
+    # a newer mtime. Degrades to "not blocked" when `_api_hold.sh` is absent.
+    # Bounded by that module's ceiling, past which `_api_hold_active` fails open.
+    if declare -F _api_hold_active >/dev/null 2>&1 && _api_hold_active; then
+        printf 'healthy reason=api-unreachable age=%ds (the Claude API is unreachable: no resubmit, no respawn — neither can reach it; the watcher resumes the orchestrator itself on recovery; operator-alert key=api-unreachable; your-org/nexus-code#1845)' \
+            "$age"
         return 1
     fi
 
@@ -695,6 +843,14 @@ _orchestrator_idle_pane_guard() {
     local pane_state="${2-}"
     local override_count="${3:-0}"
     local max_overrides="${4:-5}"
+    # The RAW pane-state line (your-org/nexus-code#1559). Since #1554 a
+    # transport- or auth-retry pane reads `busy retrying=<k>/<N>` — alive, the
+    # harness re-sending, the backend unreachable — and one state TOKEN cannot
+    # separate that from `busy` with a frozen spinner (a wedge). Those want
+    # opposite decisions: a respawn INTO an outage discards context and cannot
+    # reach the backend either. Bounded like the idle case, by the same
+    # override budget, so a session retrying forever is still escalated.
+    local pane_line="${5-}"
 
     # Gate ONLY the dead-threshold respawn (see SCOPE above); every other
     # verdict — including resubmit-failed respawns — passes through.
@@ -709,6 +865,23 @@ _orchestrator_idle_pane_guard() {
                 printf 'escalate'
             else
                 printf 'suppress'
+            fi
+            ;;
+        busy)
+            # A FIELD on the line decides, never the token alone: `retrying=`
+            # is emitted by pane-state.sh only for the live retry construct
+            # (#1554 keys on the harness's own `Retrying in Ns · attempt k/N`
+            # and ignores a pane QUOTING it), so this is the harness telling
+            # us the turn is in flight. Without the field, `busy` keeps its
+            # documented meaning: a frozen spinner is a wedge — proceed.
+            if [[ " $pane_line " == *" retrying="* ]]; then
+                if (( max_overrides > 0 )) && (( override_count >= max_overrides )); then
+                    printf 'escalate'
+                else
+                    printf 'suppress'
+                fi
+            else
+                printf 'proceed'
             fi
             ;;
         *)
@@ -749,6 +922,7 @@ _orchestrator_liveness_log_decide() {
     # Classify the verdict into a state for transition tracking.
     local state
     case "$verdict" in
+        healthy\ reason=auth-*)         state=auth ;;
         waiting*|blocked-by-cooldown*) state=waiting ;;
         resubmit*)                     state=resubmit ;;
         respawn*)                      state=respawn ;;
@@ -782,6 +956,32 @@ _orchestrator_liveness_log_decide() {
                 _ORCH_LIVENESS_LOG_SUPPRESSED=$(( ${_ORCH_LIVENESS_LOG_SUPPRESSED:-0} + 1 ))
             fi
             ;;
+        auth)
+            # `healthy reason=auth-*` is the ONE healthy that is not health
+            # (your-org/nexus-code#1548 P4b). Measured over 20 days of
+            # watcher.log: `reason=auth-` occurred 0 times against 236
+            # `orchestrator-liveness:` lines, because steady-state healthy is
+            # silent — so #1517's ask, "the log says auth", was met only by
+            # _auth_hold.sh's own lines. Logged on ENTRY, then at a DOUBLING
+            # backoff from throttle_s capped at 3600 s (~13 lines over the
+            # 7 h 22 m outage, not one per 5 s poll), and on EXIT below.
+            if [[ "$prev" != auth ]]; then
+                local _apfx=""
+                if [[ "$prev" == waiting || "$prev" == resubmit ]]; then
+                    _apfx="waiting ended after $(( now - ${_ORCH_LIVENESS_LOG_ENTERED_TS:-$now} ))s — "
+                fi
+                _ORCH_LIVENESS_AUTH_ENTERED_TS=$now
+                _ORCH_LIVENESS_AUTH_LAST_TS=$now
+                _ORCH_LIVENESS_AUTH_INTERVAL=$throttle_s
+                _ORCH_LIVENESS_LOG_LINE="${_apfx}$verdict (auth gate ENGAGED; notes at a backoff from ${throttle_s}s, capped at 3600s)"
+            elif (( now - ${_ORCH_LIVENESS_AUTH_LAST_TS:-0} >= ${_ORCH_LIVENESS_AUTH_INTERVAL:-$throttle_s} )); then
+                local _aheld=$(( now - ${_ORCH_LIVENESS_AUTH_ENTERED_TS:-$now} )) _aiv
+                _aiv=$(( ${_ORCH_LIVENESS_AUTH_INTERVAL:-$throttle_s} * 2 )); (( _aiv > 3600 )) && _aiv=3600
+                _ORCH_LIVENESS_AUTH_INTERVAL=$_aiv
+                _ORCH_LIVENESS_AUTH_LAST_TS=$now
+                _ORCH_LIVENESS_LOG_LINE="$verdict (auth gate held ${_aheld}s; next note in ${_aiv}s)"
+            fi
+            ;;
         healthy)
             # Steady state is silent. The one exception: exiting the
             # waiting/resubmit phase — emit the recovery summary so
@@ -789,6 +989,8 @@ _orchestrator_liveness_log_decide() {
             if [[ "$prev" == waiting || "$prev" == resubmit ]]; then
                 local dur=$(( now - ${_ORCH_LIVENESS_LOG_ENTERED_TS:-$now} ))
                 _ORCH_LIVENESS_LOG_LINE="recovered after ${dur}s ($verdict)"
+            elif [[ "$prev" == auth ]]; then
+                _ORCH_LIVENESS_LOG_LINE="auth gate RELEASED after $(( now - ${_ORCH_LIVENESS_AUTH_ENTERED_TS:-$now} ))s ($verdict)"
             fi
             ;;
         respawn)

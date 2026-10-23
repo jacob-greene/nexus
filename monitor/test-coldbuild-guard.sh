@@ -21,7 +21,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 # ── keep the suite OUT of live service state (your-org/your-nexus#273) ─────
-# `_coldbuild_stalled` persists a progress sample under
+# (Before #1676) `_coldbuild_stalled` persisted a progress sample under
 # $STATE_DIR/service-health/<name>.buildprogress, and the cases below use the
 # REAL service name `jupyterlab`. Round 2 "fixed" this by exporting STATE_DIR
 # before sourcing svc.sh — WHICH NEVER WORKED: svc.sh sources
@@ -51,6 +51,13 @@ LIVE_DIRS=("$PWD/.state/service-health")
 if [[ -n "${NEXUS_ROOT:-}" && -d "$NEXUS_ROOT/monitor/.state/service-health" ]]; then
     LIVE_DIRS+=("$NEXUS_ROOT/monitor/.state/service-health")
 fi
+# Since #1676 the sample lives with the build, in <workdir>/.jupyter — so the
+# LIVE service's workdir is a pollution vector too. Fingerprinted, never
+# asserted absent: the live service legitimately writes its own sample there.
+LIVE_SAMPLES=()
+if [[ -n "${NEXUS_ROOT:-}" && -d "$NEXUS_ROOT/work/.jupyter" ]]; then
+    LIVE_SAMPLES+=("$NEXUS_ROOT/work/.jupyter/labsh.buildprogress")
+fi
 # Fingerprint ONLY the *.buildprogress records, not the whole directory: the
 # live watcher and other workers write <svc>.events / <svc>.restart into this
 # same dir continuously, so a whole-dir snapshot is FLAKY (it failed on the very
@@ -63,6 +70,9 @@ live_fingerprint() {
         for f in "$d"/*.buildprogress; do
             [[ -e "$f" ]] && printf '%s %s\n' "$f" "$(cat "$f" 2>/dev/null)"
         done
+    done
+    for f in "${LIVE_SAMPLES[@]}"; do
+        [[ -e "$f" ]] && printf '%s %s\n' "$f" "$(cat "$f" 2>/dev/null)"
     done
     return 0
 }
@@ -106,6 +116,7 @@ cp /bin/bash "$TMP/uv"
 ( cd "$wd" && exec "$TMP/uv" -c 'sleep 120; :' \
     uv tool uvx --python 3.12 --from jupyterlab jupyter-lab --port 9705 --ip 0.0.0.0 ) &
 BUILD=$!
+BUILD_PID=$BUILD   # kept after BUILD is cleared: the hygiene check attributes by it
 sleep 1
 kill -0 "$BUILD" 2>/dev/null || { echo "FATAL: test double did not start"; exit 1; }
 echo "$BUILD" > "$wd/.jupyter/labsh.bg.pid"
@@ -119,7 +130,7 @@ fi
 
 SVC_FORCE=0
 _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "guard REFUSES stop during an in-flight build" "$?" "1"
+check "guard REFUSES stop during an in-flight build (rc 75, distinct from a failure)" "$?" "75"
 
 SVC_FORCE=1
 _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
@@ -134,42 +145,62 @@ echo "=== BOUNDS: the guard must never refuse a WEDGED build (your-org/your-nexu
 # the watcher would correctly decide to act past its ceiling, call `svc.sh restart`,
 # and be REFUSED -- automated recovery defeated, human required. Both bounds below
 # exist to make that impossible.
-# (1) AGE CAP. Shrink the watcher's ceiling so our seconds-old double is "past" it.
-SVC_FORCE=0
-MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 \
-    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "past the cold-build ceiling ⇒ presumed WEDGED ⇒ restart ALLOWED" "$?" "0"
-
-# The cap tracks the MINIMUM of the watcher ceiling and the reap budget, so the
-# guard can never outlast the layer that is about to act on the build.
-MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=9999 LABSH_COLD_BUILD_BUDGET=1 \
-    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "past the supervisor's reap budget (the smaller bound) ⇒ ALLOWED" "$?" "0"
+# ── your-org/nexus-code#1676: the verdict is the SHARED `labsh_build_release`.
+# The cap used to be absolute — "past the ceiling ⇒ pathological BY DEFINITION"
+# — and on 2026-09-29 a load-100 build was still progressing at 30 min, where
+# every layer killed it. Now: inside the SOFT ceiling (min of the watcher's
+# ceiling and the reap budget) a build is protected; past it, protected only
+# while MOVING; past the HARD cap, released. The progress sample lives with the
+# build, in <workdir>/.jupyter/labsh.buildprogress, shared by all three layers.
+SAMPLE="$wd/.jupyter/labsh.buildprogress"
 
 # ceiling 0 disables the watcher's cold-build defer entirely; the guard must
 # not defer either, or it would defer where the watcher does not.
+SVC_FORCE=0
 MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=0 \
     _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
 check "cold-build defer disabled (ceiling=0) ⇒ guard defers too ⇒ ALLOWED" "$?" "0"
 
-# (2) PROGRESS. Under the cap, a build that is MOVING is protected...
-rm -f "$STATE_DIR/service-health"/*.buildprogress
-MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=9999 LABSH_BUILD_STALL_SECONDS=1 \
+# (1) PAST the soft ceiling is NO LONGER enough. Shrink the ceiling so our
+# seconds-old double is past it; first sight has no stall evidence ⇒ protected.
+rm -f "$SAMPLE"
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 LABSH_BUILD_STALL_SECONDS=1 \
     _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "under the cap, first sight of a build ⇒ REFUSED (baseline taken)" "$?" "1"
+check "past the soft ceiling, no evidence of a stall ⇒ still REFUSED (#1676)" "$?" "75"
+# The soft ceiling is the MINIMUM of the two bounds: a tiny reap budget alone
+# puts the build past it — and it is still protected without a stall.
+rm -f "$SAMPLE"
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=9999 LABSH_COLD_BUILD_BUDGET=1 LABSH_BUILD_STALL_SECONDS=1 \
+    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
+check "past the reap budget (the smaller bound), no stall ⇒ still REFUSED" "$?" "75"
 
+# (2) PROGRESS past the ceiling keeps it protected…
+rm -f "$SAMPLE"
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 LABSH_BUILD_STALL_SECONDS=1 \
+    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
 printf 'materialising...\n' >> "$wd/.jupyter/labsh.bg.log"   # forward motion
 sleep 2
-MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=9999 LABSH_BUILD_STALL_SECONDS=1 \
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 LABSH_BUILD_STALL_SECONDS=1 \
     _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "build is PROGRESSING (log grew) ⇒ still REFUSED" "$?" "1"
-
-# ...but a build that stops moving for the whole stall window is released.
+check "past the ceiling but PROGRESSING (log grew) ⇒ still REFUSED" "$?" "75"
+# …and a build that stops moving for the whole stall window is released.
 # (Nothing advances the double's CPU/wchar/log from here on.)
 sleep 2
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 LABSH_BUILD_STALL_SECONDS=1 \
+    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
+check "past the ceiling AND no forward progress for the stall window ⇒ ALLOWED" "$?" "0"
+# Inside the ceiling the same stall does NOT release it: nothing to prove yet.
 MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=9999 LABSH_BUILD_STALL_SECONDS=1 \
     _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
-check "alive but NO forward progress for the stall window ⇒ presumed wedged ⇒ ALLOWED" "$?" "0"
+check "inside the soft ceiling a stalled build is still protected ⇒ REFUSED" "$?" "75"
+[[ -s "$SAMPLE" ]] && ok "the progress sample lives with the build ($SAMPLE)" \
+                   || bad "no progress sample at $SAMPLE — the three layers would not share one baseline"
+
+# (3) HARD CAP: the backstop releases even a build that looks alive.
+rm -f "$SAMPLE"
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1 LABSH_COLD_BUILD_HARD_CAP=1 \
+    _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
+check "past the HARD cap ⇒ ALLOWED regardless of progress" "$?" "0"
 
 # A healthy NFS build was measured frozen (no CPU, no wchar, no log) for 90+s
 # while legitimately progressing, so the default window must be far above that.
@@ -197,23 +228,25 @@ check "alive but NO forward progress for the stall window ⇒ presumed wedged �
 #     stall default  600→900  ⇒ RED 22/1
 # NEXUS_STATE_DIR, not STATE_DIR: bootstrap-recover.sh (sourced by svc.sh)
 # recomputes STATE_DIR from it and would otherwise clobber the sandbox.
-rm -f "$STATE_DIR/service-health"/*.buildprogress
+rm -f "$SAMPLE"
 msg=$(env -u LABSH_BUILD_STALL_SECONDS \
           -u MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS \
-          -u LABSH_COLD_BUILD_BUDGET \
+          -u LABSH_COLD_BUILD_BUDGET -u LABSH_COLD_BUILD_HARD_CAP \
           NEXUS_STATE_DIR="$STATE_DIR" \
       bash -c "SVC_FORCE=0; source ./svc.sh >/dev/null 2>&1 || true
                [[ \"\$STATE_DIR\" == '$STATE_DIR' ]] || { echo 'FATAL: subshell STATE_DIR escaped to live state'; exit 1; }
                _coldbuild_guard jupyterlab '$wd' /x/labsh-supervised.sh" 2>&1)
 check "the guard's OWN default stall window is 600s (read from its refusal text)" \
     "$(printf '%s' "$msg" | grep -oE 'for [0-9]+s' | grep -oE '[0-9]+' | head -1)" "600"
-check "the guard's OWN default age cap is 1800s (read from its refusal text)" \
-    "$(printf '%s' "$msg" | grep -oE 'build is [0-9]+s old' | grep -oE '[0-9]+' | head -1)" "1800"
+check "the guard's OWN default soft ceiling is 1800s (read from its refusal text)" \
+    "$(sed -nE 's/.*Past the ([0-9]+)s ceiling.*/\1/p' <<<"$msg")" "1800"
+check "the guard's OWN default hard cap is 7200s (read from its refusal text)" \
+    "$(sed -nE 's/.*is ([0-9]+)s old \(hard cap\).*/\1/p' <<<"$msg")" "7200"
 
 # The refusal must not leak raw shell errors at the operator (the first-sight
 # refusal used to emit "buildprogress: No such file or directory" — a redirect
 # failure bash reports itself, which `read`'s 2>/dev/null cannot suppress).
-if printf '%s' "$msg" | grep -qE 'No such file or directory|line [0-9]+:'; then
+if grep -qE 'No such file or directory|line [0-9]+:' <<<"$msg"; then
     bad "refusal text leaks a raw shell error to the operator"
 else
     ok "refusal text is clean (no raw shell error leaked)"
@@ -227,10 +260,39 @@ for fn in cmd_stop cmd_restart; do
     body=$(declare -f "$fn")
     w=$(printf '%s\n' "$body" | grep -n 'watcher)'        | head -1 | cut -d: -f1)
     g=$(printf '%s\n' "$body" | grep -n '_coldbuild_guard' | head -1 | cut -d: -f1)
-    if [[ -n "$w" && -n "$g" ]] && (( w < g )); then
-        ok "$fn dispatches watcher) before _coldbuild_guard (guard unreachable for the watcher)"
+    # `^[0-9]+$`, not `[[ -n ]]` (your-org/nexus-code#1016): an empty capture
+    # cannot arithmetic-evaluate, so `(( "" < "" ))` is a SILENT PASS — the
+    # structural check would certify an ordering it never measured. Structural
+    # by necessity here (running cmd_stop watcher would stop the LIVE watcher),
+    # and it pins ORDER only, never that the guard is unreachable at runtime.
+    if [[ "$w" =~ ^[0-9]+$ && "$g" =~ ^[0-9]+$ ]] && (( w < g )); then
+        ok "$fn dispatches watcher) before _coldbuild_guard (ORDER only — see the arm check below)"
     else
         bad "$fn: watcher dispatch (line ${w:-none}) does not precede the guard (line ${g:-none})"
+    fi
+    # ORDER IS NOT REACHABILITY, and the position check above cannot tell the
+    # difference (your-org/nexus-code#1016). Deleting one token — the `; return`
+    # in `watcher) _stop_watcher; return ;;` at monitor/svc.sh:1676 — leaves the
+    # `watcher)` token exactly where it was, so `(( w < g ))` still holds and the
+    # assertion above stays GREEN. But the case now FALLS OUT into `svc_require`
+    # + `_coldbuild_guard`, so the guard becomes REACHABLE for the watcher: the
+    # precise negation of the claim. Measured: position GREEN, this check RED,
+    # for both functions.
+    #
+    # `return` is what makes the dispatch a control-flow claim. This is a
+    # CONTAINMENT census over the arm's own region — the one question a text
+    # assertion can honestly answer here — because `declare -f` re-renders the
+    # arm across several lines, so a single-line match false-alarms on the
+    # shipped tree. It still does NOT prove unreachability at runtime; that
+    # would need to call cmd_stop watcher, which would stop the LIVE watcher.
+    if printf '%s\n' "$body" | awk '
+            /^[[:space:]]*watcher\)/            { inarm=1; next }
+            inarm && /^[[:space:]]*;;/           { inarm=0 }
+            inarm && /^[[:space:]]*return([[:space:]]|;|$)/ { found=1 }
+            END { exit(found?0:1) }'; then
+        ok "$fn's watcher) arm SHORT-CIRCUITS (carries return) — the guard is unreachable for it"
+    else
+        bad "$fn's watcher) arm does not return: the case falls out into _coldbuild_guard, which is reachable for the watcher"
     fi
 done
 
@@ -290,20 +352,33 @@ echo "=== HYGIENE: the suite must not touch LIVE service-health state ==="
 # Round 2 caught this, I reported it fixed, and round 3 found it AGAIN — a dead
 # test-double pid written into the real jupyterlab record. A fix that regressed
 # is worse than one never claimed, so it is now an ASSERTION, not a convention.
-if [[ "$(live_fingerprint)" == "$LIVE_BEFORE" ]]; then
-    ok "live .buildprogress records unchanged (${#LIVE_DIRS[@]} dir(s) watched, incl. \$NEXUS_ROOT's)"
+#
+# ATTRIBUTED, not merely compared (your-org/nexus-code#1680). The LIVE service
+# rewrites its own sample on every watcher/svc.sh/supervisor call while a
+# production build is in flight, so "unchanged" made this suite's verdict depend
+# on whether production happened to be building during the run — red for a
+# reason no diff under test can cause. Every sample the code under test writes
+# carries the pid it was asked about, and the only build this suite hands it is
+# its own test double, so a live record naming BUILD_PID is this suite's write,
+# and a live record that moved without it is the live service's.
+LIVE_AFTER=$(live_fingerprint)
+leaked=$(awk -v p="$BUILD_PID" '$2 == p' <<<"$LIVE_AFTER")
+if [[ -n "$leaked" ]]; then
+    bad "the suite WROTE its test double's pid ($BUILD_PID) into live build-progress state:"
+    printf '%s\n' "$leaked" >&2
 else
-    bad "the suite MODIFIED live service-health state:"
-    diff <(printf '%s\n' "$LIVE_BEFORE") <(live_fingerprint) >&2 || true
+    ok "no live .buildprogress record names this suite's test double (${#LIVE_DIRS[@]} dir(s) + ${#LIVE_SAMPLES[@]} live sample(s) watched, incl. \$NEXUS_ROOT's)"
 fi
-_leaked=0
-for _d in "${LIVE_DIRS[@]}"; do
-    compgen -G "$_d/*.buildprogress" >/dev/null 2>&1 && { _leaked=1; echo "    leaked into: $_d" >&2; }
-done
-if (( _leaked )); then
-    bad "a .buildprogress record exists in LIVE state — a fake build marker in production"
+if [[ "$LIVE_AFTER" != "$LIVE_BEFORE" && -z "$leaked" ]]; then
+    echo "  NOTE  a live record changed during the run WITHOUT this suite's pid — the live service's own write, not a verdict"
+fi
+# The legacy vector: before #1676 svc.sh wrote <STATE_DIR>/service-health/
+# <name>.buildprogress. Nothing may write there any more — asserted on the
+# SOURCE, because a pre-#1676 file can legitimately still sit in live state.
+if grep -q 'service-health/\$name.buildprogress' ./svc.sh; then
+    bad "svc.sh still writes the legacy per-name .buildprogress under STATE_DIR"
 else
-    ok "no .buildprogress record leaked into any live state dir"
+    ok "svc.sh no longer writes a .buildprogress under STATE_DIR (the sample lives with the build)"
 fi
 
 echo

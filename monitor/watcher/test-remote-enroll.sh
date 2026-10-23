@@ -80,7 +80,18 @@ assert_file_exists "authorized_keys written" "$ak"
 akline=$(cat "$ak")
 assert_contains "line carries forced command" "$akline" "remote-forced-command.sh alice"
 assert_contains "line carries restrict"        "$akline" "restrict"
-assert_contains "line carries the client key"   "$akline" "$(awk '{print $2}' "$WORK/client.pub")"
+# The needle below comes from a PROBE, and an EMPTY needle makes
+# `assert_contains` pass VACUOUSLY — it is `grep -qF -- "$needle"`, and
+# `grep -qF ""` matches every line of any non-empty haystack
+# (your-org/nexus-code `#1024`). This is reachable, not theoretical: the
+# `command -v ssh-keygen` skip-guard above proves ssh-keygen EXISTS, not that it
+# SUCCEEDED, and its rc is not checked at the keygen site — so a build without
+# ed25519, a FIPS policy, or an unwritable $WORK leaves no `client.pub`, `awk`
+# prints nothing, and the assertion certifies a key it never saw.
+_client_key=$(awk '{print $2}' "$WORK/client.pub" 2>/dev/null)
+assert_eq "client pubkey field is non-empty (else the next assert is vacuous)" \
+    "$([ -n "$_client_key" ] && echo yes || echo no)" "yes"
+assert_contains "line carries the client key"   "$akline" "$_client_key"
 assert_eq "token consumed (no pending records)" "$(ls "$PDIR/enroll/"*.token 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 echo "== 4. replay of consumed token fails closed (rc3) =="
@@ -141,11 +152,29 @@ assert_rc "revoke rc0" "$?" "0"
 assert_not_contains "alice's line removed" "$(cat "$ak")" "remote-forced-command.sh alice"
 assert_contains "dave's line retained" "$(cat "$ak")" "remote-forced-command.sh dave"
 
-echo "== 10. from_cidr pin in the authorized_keys line =="
+echo "== 10. from_cidr pin in the authorized_keys line, POSTURE-AWARE (#902) =="
+# sshd enforces `from=` at PUBLICKEY time — before the forced command runs — so
+# the carrier exemption in _remote_source_guard cannot rescue a LAN-only pin
+# under a loopback bind. Measured before the fix: a full pre-auth banner
+# followed by `Permission denied (publickey)` for a freshly enrolled key.
+# This fixture binds LOOPBACK, so the list must also permit loopback.
 tok6=$(MONITOR_REMOTE_FROM_CIDR="10.0.0.0/8" bash "$EN" issue-token --principal frank --ttl 900 2>/dev/null)
 MONITOR_REMOTE_FROM_CIDR="10.0.0.0/8" bash "$EN" enroll --pubkey "$WORK/client.pub" --token "$tok6" >/dev/null 2>&1
 frankline=$(grep 'frank@nexus-remote' "$ak")
-assert_contains "from= pin present" "$frankline" 'from="10.0.0.0/8"'
+assert_contains "from= carries the configured CIDR" "$frankline" 'from="10.0.0.0/8,'
+assert_contains "…and permits IPv4 loopback (this bind is loopback)" "$frankline" '127.0.0.1/32'
+assert_contains "…and IPv6 loopback"                                "$frankline" '::1/128'
+
+# THE NEGATIVE CONTROL, and the one that keeps this from silently widening every
+# deployment: on a ROUTABLE bind the pin must stay exactly as configured. Without
+# it, "loopback is in the list" would pass for a fix that always added it.
+tok6b=$(MONITOR_REMOTE_BIND_ADDRESS=203.0.113.7 MONITOR_REMOTE_FROM_CIDR="10.0.0.0/8" \
+    bash "$EN" issue-token --principal gina --ttl 900 2>/dev/null)
+MONITOR_REMOTE_BIND_ADDRESS=203.0.113.7 MONITOR_REMOTE_FROM_CIDR="10.0.0.0/8" \
+    bash "$EN" enroll --pubkey "$WORK/client.pub" --token "$tok6b" >/dev/null 2>&1
+ginaline=$(grep 'gina@nexus-remote' "$ak")
+assert_contains     "routable bind: pin is exactly the configured CIDR" "$ginaline" 'from="10.0.0.0/8"'
+assert_not_contains "routable bind: loopback is NOT added"              "$ginaline" '127.0.0.1/32'
 
 echo "== 10b. unfiltered policy: enroll writes a command=-less SHELL line =="
 toku=$(MONITOR_REMOTE_COMMAND_POLICY=unfiltered bash "$EN" issue-token --principal shellguy --ttl 900 2>/dev/null)

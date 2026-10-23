@@ -15,7 +15,7 @@ This skill is the nexus *service* layer. The labsh *primitives*
 (`start`/`stop`/`kernel add`/`kernel exec`/`kernel inspect`/`notebook
 attach`/`notebook append`, shared-node etiquette, networking, the
 Rust/AI-extension fallback chain) are documented in the **`<yourlab>.labsh`**
-skill (`~/.claude/<hpc-skills>/skills/<yourlab>.labsh/SKILL.md`) and
+skill (`~/.claude/hpc-skills/skills/<yourlab>.labsh/SKILL.md`) and
 `work/labsh/doc/labsh.md` — read those for anything kernel-level. Here:
 how a project's labsh JupyterLab becomes an activate-once, self-healing,
 boot-surviving nexus service, and what to do by default.
@@ -65,8 +65,14 @@ run it again). The activate path either way:
 3. **Start** — launches `monitor/labsh-supervised.sh` headless through
    recovery's own idempotent decision path (healthy / already
    supervised → leave alone; never a second server).
-4. **Report** — waits for the healthcheck, prints the tokenized URL,
-   the token path, and the agent quickstart.
+4. **Report** — waits for the healthcheck, prints the access URL with
+   its token REDACTED, the token path, and the agent quickstart. The
+   full tokened URL goes to `monitor/.state/services/<name>.url` (mode
+   0600), which the banner names — the same file `svc.sh status` writes
+   (<your-org>/nexus-code#1803). Never `cat` that file, `labsh url` or the
+   token file in an agent session: whatever a tool prints lands in the
+   transcript, and from there in reports and issue comments. Hand the
+   operator the file PATH.
 
 Then interact through labsh, exactly as `<yourlab>.labsh` documents:
 
@@ -95,7 +101,7 @@ notebook paths still resolve against the agent's cwd):
 cd work/myproj
 monitor/labsh-root.sh notebook attach analysis.ipynb --kernel-name proj-myproj
 monitor/labsh-root.sh kernel exec -n analysis.ipynb 'CODE'   # stateful
-monitor/labsh-root.sh url                                    # root server URL
+monitor/labsh-root.sh url                                    # root server URL — prints the TOKEN; operator use only
 ```
 
 The `--kernel-name proj-<project>` on the FIRST attach is what binds
@@ -148,7 +154,7 @@ report the ambiguity and refuse — disambiguate with `-k PID`.
   Default matches labsh: `0.0.0.0` + token auth — fine on the campus
   network, and the activation output warns like labsh does.
 - **Human + agent on the same kernel?** Built in: the human opens the
-  printed URL and works in the browser; the agent `labsh kernel exec`s
+  URL from the 0600 file the banner names and works in the browser; the agent `labsh kernel exec`s
   against the same kernel from the CLI. Same server, same namespace.
   If the human already started `labsh` by hand, activation ADOPTS that
   server rather than starting a second one.
@@ -159,8 +165,9 @@ report the ambiguity and refuse — disambiguate with `-k PID`.
   next start. Kernels do NOT survive a server bounce — long-lived
   state that must survive restarts belongs in files, not kernel memory.
 - **Token rotated?** (`labsh token --rotate`) The healthcheck fails,
-  the supervisor bounces the server, the new token applies. Re-fetch
-  the URL with `labsh url`. Running kernels are lost (above).
+  the supervisor bounces the server, the new token applies. Re-run
+  `jupyter-up.sh` (or `svc.sh status`) to refresh the 0600 URL file;
+  the operator reads it there. Running kernels are lost (above).
 - **Done with the project?** `monitor/jupyter-up.sh DIR --down` stops
   everything AND removes the registry row — otherwise boot recovery
   resurrects it. `svc.sh stop jupyter-<name>` stops WITHOUT
@@ -177,7 +184,7 @@ project dir; whether to use the root session (default — "interact via
 proj-<project>` then `labsh-root.sh kernel exec`") or per-project
 isolation ("activate with `monitor/jupyter-up.sh <dir>` (idempotent),
 interact via `labsh kernel exec/inspect` per `<yourlab>.labsh`"); and the
-shared-node etiquette line from `<yourlab>.labsh` if the target is <node>.
+shared-node etiquette line from `<yourlab>.labsh` if the target is <cluster>k1.
 Workers must NOT hand-edit `services.registry` — `jupyter-up.sh`
 owns those rows.
 
@@ -201,9 +208,13 @@ never sees. (Tests/fixtures override via `NEXUS_SERVICES_REGISTRY`
 | `<project>/.jupyter/labsh-service.opts` | persisted extra `labsh start` args (`--ip`, `--https`) |
 | `<project>/.jupyter/labsh-service.log` | supervisor log; jupyter's own stdout is `.jupyter/labsh.bg.log` — `svc.sh logs` tails both |
 | `monitor/services.registry` | the service row (operator-local, gitignored) |
+| `monitor/labsh-pin.sh` + `labsh-uvx-shim/uvx` | pins the SERVER env's resolution to the last env that served healthy, so a restart reuses the cached env instead of a >30-min cold rebuild (<your-org>/nexus-code#1676). `labsh-pin.sh status` shows it; `labsh-pin.sh refresh` builds the current release set in the background, smoke-tests it, and swaps the pin (the supervisor does this weekly, `LABSH_SVC_REPIN_DAYS`); the next restart picks it up warm. `LABSH_SVC_PIN=0` starts unpinned |
+| `<project>/.jupyter/labsh-server.pin` | the frozen server-env requirements; `.prev` = the pin a refresh replaced, `.bad` = a pin a start could not resolve against (quarantined) |
+| `_labsh_build_evidence.sh` `labsh_build_release` | the ONE verdict on whether a cold build in flight may be killed — used by svc.sh's guard, the watcher and the supervisor's reaper. Protected inside the ceiling (1800 s), then only while still making progress, released when stalled 600 s or past the 7200 s hard cap |
+| `monitor/uv-builds-gc.sh` | reaps the half-built `builds-v0/.tmp*` dirs a KILLED cold build leaves in the uv cache (<your-org>/nexus-code#1686; `uv cache prune` does not touch them). DRY RUN unless `--yes`; keeps anything younger than 24 h, newer than a live uv builder or cache-lock holder, held open (cwd/fd/map) by a live process, or targeted by `environments-v2`. Reports `du` (upper bound) and `freed` (link-count-1 bytes, lower bound) per dir. Slow on NFS: run under `ng longjob run` |
 
 Troubleshooting starts with `monitor/svc.sh logs <name>` (tails the
 supervisor log and jupyter's own stdout together); `monitor/svc.sh
-status` shows the tokened access URL in the `DETAIL` column while the
-service is UP. The full lifecycle is documented in
+status` shows the access URL, token redacted, in the `DETAIL` column while
+the service is UP, and names the 0600 file holding the full URL. The full lifecycle is documented in
 `monitor/README.md` ("JupyterLab as a service").

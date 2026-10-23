@@ -52,6 +52,22 @@ expect "model_not_found → respawn"        "model_not_found"  "There's an issue
 expect "authentication_error → operator"  "authentication_error" ""                                   "auth:operator"
 expect "rate_limit short-circuits"        "rate_limit"       "You've hit your limit"                  "rate_limit:none"
 
+echo "=== the REAL expired-login token (your-org/nexus-code#1520 / #1548) ==="
+# All 40 `authentication_failed` StopFailure captures on the primary (37
+# orchestrator, 2 cc-auto-update, 1 guardkey) carry exactly this
+# pair (monitor/.state/stopfailure-raw-captures.jsonl, 2026-08-19..21 and
+# 2026-09-17). The token is `authentication_failed`, NOT `authentication_error`;
+# at the base this pair classified unknown:paste, i.e. "re-paste it", the
+# remedy #1517 measured failing eight times over 45 h.
+expect "authentication_failed + 'Login expired · Please run /login' → operator" \
+    "authentication_failed" "Login expired · Please run /login" "auth:operator"
+expect "TOKEN-ONLY: authentication_failed with an empty message → operator (the token arm alone must carry it)" \
+    "authentication_failed" "" "auth:operator"
+expect "message-only: 'Login expired · Please run /login' → operator" \
+    "" "Login expired · Please run /login" "auth:operator"
+expect "message-only: 401 OAuth token has expired (the mid-retry render) → operator" \
+    "unknown" "API Error: 401 OAuth token has expired. Please obtain a new token or refresh your existing token." "auth:operator"
+
 echo "=== message-text fallback when token absent/unknown ==="
 expect "unknown token + 500 message"      "unknown" "API Error: 500 Internal server error. server-side issue" "transient:paste"
 expect "unknown token + 529 overloaded"   "unknown" "API Error: 529 Overloaded. This is a server-side issue"  "transient:paste"
@@ -74,6 +90,14 @@ got=$(cause_classify_error "model_not_found" ""); got="${got//$'\t'/:}"
 [[ "$got" != "config:paste" && "$got" == "config:respawn" ]] \
     && ok "model_not_found is respawn, never paste" \
     || bad "model_not_found mutation guard" "$got"
+# authentication_failed must NEVER be paste-recoverable: a re-paste into a
+# logged-out session fails again within a second and the false `recovered`
+# line follows (#1517). If someone drops the token from the auth arm, this
+# fails — and it fails on the exact production pair, not on a synonym.
+got=$(cause_classify_error "authentication_failed" "Login expired · Please run /login"); got="${got//$'\t'/:}"
+[[ "$got" == "auth:operator" ]] \
+    && ok "authentication_failed is operator, never paste (the measured production token)" \
+    || bad "authentication_failed mutation guard" "$got"
 # server_error must NOT escalate to operator (it's a transient blip).
 got=$(cause_classify_error "server_error" ""); got="${got//$'\t'/:}"
 [[ "$got" == "transient:paste" ]] \

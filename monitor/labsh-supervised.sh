@@ -39,7 +39,9 @@
 #
 # On SIGTERM/SIGINT (svc.sh stop sends TERM to the whole process
 # group): run `labsh stop` so kernels and the server shut down
-# gracefully, then exit 0.
+# gracefully, then exit 0. The one exception is a supervisor being
+# REPLACED by the version-aware restart, which may leave a healthy
+# server it owns for its successor to adopt (see `on_term`, #1693).
 #
 # Env knobs (production leaves unset):
 #   LABSH_SVC_INTERVAL  seconds between health probes      (default 15)
@@ -134,6 +136,24 @@ INTERVAL="${LABSH_SVC_INTERVAL:-15}"
 MAX_FAILS="${LABSH_SVC_FAILS:-3}"
 PORT_BASE="${LABSH_SVC_PORT_BASE:-9700}"
 PERIODIC_EVERY="${LABSH_SVC_PERIODIC_EVERY:-40}"
+# THE PERIODIC HOOK IS BOUNDED. It ran ASYNC behind an overlap guard and nothing
+# else, so a hook that genuinely HANGS would disable itself for good and say so
+# only as one quiet line per round.
+#
+# CORRECTED: this bound was first written as the fix for "a hook that hung ~14 h"
+# on the live service. THERE WAS NO HANG — see `_periodic_in_flight` below: the
+# hook had finished, its pid was recycled as a THREAD id, and the old `kill -0`
+# overlap guard skipped every round after. The bound stays because a hang is
+# still possible and an unbounded async child is still wrong; it is NOT what
+# fixes the incident that prompted it.
+#
+# WE CHOSE 3600 s. The hook fires every PERIODIC_EVERY x INTERVAL (40 x 15 s =
+# 10 min) and is a kernel crawl that may build a venv, so minutes are
+# legitimate and an hour is not. (It was first justified as "small beside the
+# 14 h it replaces"; there was no 14 h hang — see the correction above.)
+# `LABSH_SVC_PERIODIC_TIMEOUT=0` disables the bound.
+PERIODIC_TIMEOUT="${LABSH_SVC_PERIODIC_TIMEOUT:-3600}"
+[[ "$PERIODIC_TIMEOUT" =~ ^[0-9]+$ ]] || PERIODIC_TIMEOUT=3600
 # Seconds to wait for the server to become HEALTHY after `labsh start`
 # (NOT merely to expose a URL — see start_server). This window must cover a
 # *cold* ephemeral `uvx` build on the first start after a version drift or a
@@ -150,32 +170,162 @@ PERIODIC_EVERY="${LABSH_SVC_PERIODIC_EVERY:-40}"
 # seconds (config/nexus.yml) ≥ this so the WATCHER can't interrupt either.
 # Old value was 300s — too short for the reflink→copy fallback that caused #33.
 START_GRACE="${LABSH_SVC_START_GRACE:-900}"
+# A TOKEN ROTATED DURING THE START WAIT IS NOT "STILL COMING UP"
+# (your-org/nexus-code#1584). `start_server` waits up to START_GRACE for a
+# PASSING healthcheck and counts no strikes while it waits. That is right for a
+# warming server — and a warming server may legitimately answer 403 while it
+# imports extensions, which is the restart-flap test-jupyter-service.sh pins:
+# such a server is WAITED OUT, never bounced. This change does not touch that.
+#
+# What it adds is the one case where waiting can never help. jupyter-health.sh
+# re-reads `.jupyter/token` on every probe and exits 22 when the server answers
+# 4xx. If the token FILE has changed since this start began, the running server
+# holds the OLD token: the mismatch is certain, it is permanent, and the
+# watchdog that would fix it is not running because this loop has not returned.
+#
+# Measured 2026-09-19: a token rotated just after a bounce left the service
+# unhealthy for the whole wait — 403 on every probe for 300 s (the test's
+# ceiling; this loop would have held for 900), the supervisor log SILENT after
+# "serving at", where an ordinary server kill healed in 17 s. It is a RACE:
+# whoever polls the fresh server first wins, and if that is a caller who then
+# rotates the token, this loop never sees a green. It reddened
+# test-jupyter-service-real.sh in two consecutive full bands and ~1 isolated run
+# in 4, and was filed as a deadline that was too short.
+#
+# THE DISCRIMINATOR IS THE TOKEN, NOT THE STATUS CODE. rc 22 ALONE was the
+# first design and would have bounced the warming server above. rc 22 AND a
+# token that differs from the one this start began with cannot be a warm-up.
+#
+# BOTH NUMBERS ARE CHOSEN, not inherited:
+#   REJECT_PROBES  4 consecutive qualifying probes at the loop's 0.5 s step,
+#       ~2 s: enough that a rotation caught mid-write is not acted on.
+#   REJECT_BAILS   3, a backstop. A rotation cannot loop by itself — the
+#       bounced server reads the new token and the comparison resets — but a
+#       bound that costs one integer is cheaper than being wrong about that.
+#       After 3 fast bails in a row the loop waits the FULL grace, as before;
+#       any healthy probe restores the budget.
+REJECT_PROBES="${LABSH_SVC_REJECT_PROBES:-4}"
+REJECT_BAILS_MAX="${LABSH_SVC_REJECT_BAILS:-3}"
+# VALIDATED, with a FLOOR OF 1 (skeptic testinfra2sk F3 on PR 1593). `0` or a
+# non-number made `rejected >= REJECT_PROBES` true on the FIRST probe, and an
+# unset-looking knob then bounced a warming server at once — the restart flap,
+# reached through a typo. PERIODIC_TIMEOUT was validated and these were not.
+[[ "$REJECT_PROBES" =~ ^[0-9]+$ ]] && (( REJECT_PROBES >= 1 )) || REJECT_PROBES=4
+[[ "$REJECT_BAILS_MAX" =~ ^[0-9]+$ ]] || REJECT_BAILS_MAX=3
+REJECT_BAILS=0
 
 log() { echo "[$(date -Is)] labsh-svc: $*"; }
 
-# ── labsh self-heal (incident your-org/other-nexus#103) ────────────────────
-# labsh's runtime lives at ~/.local/lib/labsh/bin/labsh, reached via a thin
-# shim at ~/.local/bin/labsh. Per the sandbox bwrap mounts, ~/.local/bin is
-# bind-mounted (persistent) but ~/.local/lib rides the ephemeral --tmpfs HOME
-# overlay: a HOME-overlay reset wipes the lib target (binary + uv venv) and
-# leaves the persistent shim dangling. The running server survives in memory
-# until a node crunch kills it; every restart then fails rc=127 (missing
-# binary), so the watchdog cannot recover and flaps to the auto-restart
-# ceiling with no way out. These helpers detect the dangling/rc=127 condition
-# and reinstall the pinned release from the in-repo labsh source ONCE per start
-# cycle, so the watcher's auto-restart heals it with no human. Non-degrading:
-# reinstalls the SAME pinned version via `make install-lib`; never vendors or
-# bumps labsh. Reversible: `git revert` this commit removes only the self-heal.
+# ── labsh self-heal (incident your-org/other-nexus#103, extended) ──────────
+# labsh's runtime (binary + helper venv) and its shim can both disappear from
+# under the running supervisor. The #103 fix targeted the FIRST of two disjoint
+# wipe surfaces; this extension covers the second.
+#
+#   * dangling-shim wipe (#103):
+#     shim ~/.local/bin/labsh persists (bind-mounted from outside the sandbox)
+#     while lib target ~/.local/lib/labsh/bin/labsh rides the ephemeral
+#     --tmpfs HOME overlay and gets wiped on every sandbox restart.
+#     `labsh_dangling` catches this; `reinstall_labsh` used to write into
+#     ~/.local/lib via `make install-lib`.
+#   * shim-missing wipe (this fix):
+#     if the outside operator's ~/.local/bin/labsh is itself gone (never
+#     installed there, removed by a ~/.local cleanup between sandbox runs, or
+#     ~/.local shadowed at bwrap-mount time), `command -v labsh` returns
+#     empty at supervisor startup. There is no shim to dangle-detect, and
+#     the pre-#103 hard FATAL then killed the supervisor before any self-heal
+#     could run. Additionally, ~/.local/bin AND ~/.local/lib are both
+#     read-only from inside this sandbox (bwrap --ro-bind on ~/.local/bin, no
+#     writable overlay on ~/.local/lib), so `make install-lib` cannot repair
+#     either surface from in-sandbox — the #103 heal target itself is unreachable.
+#
+# `reinstall_labsh` therefore installs into $NEXUS_LOCALS/{bin,lib}/labsh
+# instead of ~/.local — the nexus-managed tool tree that is
+# WRITABLE from inside the sandbox, PERSISTENT across restarts (lives on
+# /shared, not $HOME), and already on PATH via monitor/locals-env.sh (which
+# this wrapper sources up top). Ephemeral-HOME wipes cannot touch it, so a
+# healed labsh survives the next sandbox restart without re-healing.
+#
+# We also force-front $NEXUS_LOCALS/bin in PATH so a stale dangling shim
+# lingering in ~/.local/bin (from a previous outside-sandbox install) cannot
+# shadow the fresh nexus copy — the sandbox typically has ~/.local/bin ahead
+# of $NEXUS_LOCALS/bin in PATH, and locals-env.sh's idempotent prepend is a
+# no-op when locals/bin already appears anywhere in PATH.
+#
+# Same #103 contract: non-degrading (reinstalls the SAME pinned source; never
+# vendors or bumps labsh), reversible (git revert of this commit removes only
+# the self-heal), loop-guarded (at most one reinstall attempt per start cycle).
 
 # NEXUS_ROOT = the parent of monitor/ (this wrapper is $NEXUS_ROOT/monitor/…).
 # locals-env.sh resolves but does not export it, so derive it from SCRIPT_DIR.
 NEXUS_ROOT=$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)
+NEXUS_LOCALS_DIR="${NEXUS_LOCALS:-$NEXUS_ROOT/locals}"
 
-# First labsh source tree (a operator/labsh checkout whose Makefile has an
-# install-lib target) among the operator's known locations. repos/labsh is
-# where this operator's manual clone + the incident recovery lived; work/labsh
-# is where monitor/install-labsh.sh clones, so it is the portable default for
-# operators without a repos/labsh. Prints the path; empty (rc 1) if none found.
+# Force-front NEXUS_LOCALS/bin so a stale ~/.local/bin/labsh shim (bind-mounted
+# read-only from outside the sandbox and pointing at a wiped ~/.local/lib
+# target) cannot shadow the fresh nexus install. locals-env.sh's own prepend
+# is idempotent — it no-ops when NEXUS_LOCALS/bin is already anywhere in PATH,
+# even if buried behind ~/.local/bin. This re-assertion is scoped to the
+# supervisor process; it does not leak into the operator's shells. Called
+# again by reinstall_labsh() after a fresh install so a first-time-created
+# NEXUS_LOCALS/bin (absent at supervisor startup) still front-loads.
+front_locals_bin() {
+    [[ -d "$NEXUS_LOCALS_DIR/bin" ]] || return 0
+    case ":$PATH:" in
+        ":$NEXUS_LOCALS_DIR/bin:"*) : ;;   # already at front
+        *)
+            local pruned=":${PATH}:"
+            pruned="${pruned//:$NEXUS_LOCALS_DIR\/bin:/:}"
+            pruned="${pruned#:}"
+            pruned="${pruned%:}"
+            export PATH="$NEXUS_LOCALS_DIR/bin:$pruned"
+            ;;
+    esac
+    front_pin_shim
+    hash -r 2>/dev/null || true
+}
+
+# ── server-env pin (your-org/nexus-code#1676) ──────────────────────────────
+# Every restart used to re-resolve labsh's UNPINNED `uvx --from jupyterlab …`
+# against the live index, so any upstream release forced a >30-min cold
+# rebuild of the server env on NFS. The uvx shim in labsh-uvx-shim/ pins that
+# ONE call to the env that last served healthy (rationale: _labsh_pin.sh). It
+# must sit AHEAD of locals/bin, so it is re-fronted whenever locals/bin is.
+# LABSH_SVC_PIN=0 keeps the shim recording the spec but never applies a pin.
+export LABSH_PIN_DIR="$PROJECT_DIR/.jupyter"
+PIN_SHIM_DIR="$SCRIPT_DIR/labsh-uvx-shim"
+PIN_TOOL="$SCRIPT_DIR/labsh-pin.sh"
+# `labsh start` under a CHAINING BASH_ENV. The nexus BASH_ENV prelude
+# (monitor/shellenv/bash_env.sh) re-fronts locals/bin in EVERY non-interactive
+# bash, and labsh is a bash script — so under it, labsh's bare `uvx` resolved to
+# locals/bin/uvx and the shim was never reached (measured while testing #1676:
+# a fake uvx fronted ahead of locals/bin was shadowed the same way).
+# labsh-uvx-shim/bash_env.sh sources the prelude UNCHANGED, then fronts only the
+# shim directory; the shim hands the original BASH_ENV back to the server's
+# process tree before it execs the real uvx. UV_* are plain exported variables
+# from locals-env.sh (sourced above) and are not touched by either file.
+labsh_start_pinned() {
+    if [[ -r "$PIN_SHIM_DIR/bash_env.sh" && -x "$PIN_SHIM_DIR/uvx" ]]; then
+        LABSH_SHIM_BASH_ENV="${BASH_ENV:-}" BASH_ENV="$PIN_SHIM_DIR/bash_env.sh" labsh start "$@"
+    else
+        labsh start "$@"
+    fi
+}
+front_pin_shim() {
+    [[ -x "$PIN_SHIM_DIR/uvx" ]] || return 0
+    local pruned=":${PATH}:"
+    pruned="${pruned//:$PIN_SHIM_DIR:/:}"
+    pruned="${pruned#:}"
+    pruned="${pruned%:}"
+    export PATH="$PIN_SHIM_DIR:$pruned"
+}
+front_locals_bin
+
+# First labsh source tree (a katosh/labsh checkout whose Makefile has the
+# install-lib target we replay inline) among the operator's known locations.
+# repos/labsh is where this operator's manual clone + the incident recovery
+# lived; work/labsh is where monitor/install-labsh.sh clones, so it is the
+# portable default for operators without a repos/labsh. Prints the path;
+# empty (rc 1) if none found.
 labsh_src_dir() {
     local d
     for d in "$NEXUS_ROOT/repos/labsh" \
@@ -189,15 +339,19 @@ labsh_src_dir() {
     return 1
 }
 
-# Resolve the lib target the `labsh` shim execs to (the ~/.local/lib/labsh/bin
-# path). Empty when labsh is not a thin exec-shim (e.g. a brew-installed real
-# binary) — in that case we never second-guess its presence.
+# Resolve the lib target the `labsh` shim execs to (an ~/.local/lib/labsh/bin
+# or $NEXUS_LOCALS/lib/labsh/bin path). Empty when labsh is not a thin
+# exec-shim (e.g. a brew-installed real binary) — in that case we never
+# second-guess its presence.
 labsh_lib_target() {
     local shim
     shim=$(command -v labsh 2>/dev/null) || return 1
     [[ -r "$shim" ]] || return 1
     sed -nE 's/^[[:space:]]*exec[[:space:]]+"?([^"[:space:]]+)"?.*/\1/p' "$shim" | head -1
 }
+
+# True iff labsh is entirely absent from PATH (no shim, no binary).
+labsh_missing() { ! command -v labsh >/dev/null 2>&1; }
 
 # True iff labsh is a DANGLING shim: the shim resolves on PATH but the lib
 # target it execs is gone (the #103 wipe). A non-shim labsh (no parseable
@@ -208,9 +362,18 @@ labsh_dangling() {
     [[ -n "$tgt" && ! -x "$tgt" ]]
 }
 
-# Reinstall the pinned labsh from source via `make install-lib`. Guarded to at
-# most one attempt per start cycle (REINSTALL_ATTEMPTED, reset in start_server)
-# so a persistently-failing reinstall can never spin. Returns 0 on success.
+# True iff labsh needs a self-heal reinstall this cycle — either entirely
+# missing or a dangling shim. Distinct from labsh_dangling so start_server can
+# still log the two conditions separately.
+labsh_needs_install() { labsh_missing || labsh_dangling; }
+
+# Reinstall the pinned labsh from source into $NEXUS_LOCALS/{bin,lib}/labsh.
+# Replays the Makefile's install-lib + install-bin targets inline so the
+# destination is nexus-controlled (writable from inside the sandbox, on PATH,
+# persistent across HOME overlay resets) rather than the ~/.local prefix the
+# Makefile bakes in via PREFIX. Guarded to at most one attempt per start
+# cycle (REINSTALL_ATTEMPTED, reset in start_server) so a persistently-failing
+# reinstall can never spin. Returns 0 on success.
 REINSTALL_ATTEMPTED=0
 reinstall_labsh() {
     if (( REINSTALL_ATTEMPTED )); then
@@ -218,28 +381,228 @@ reinstall_labsh() {
         return 1
     fi
     REINSTALL_ATTEMPTED=1
-    local src out rc _l
+    local src out rc _l lib bin
     src=$(labsh_src_dir) || {
         log "ERROR: cannot self-heal labsh — no labsh source tree found (looked under $NEXUS_ROOT/repos/labsh, work/labsh)"
         return 1
     }
-    log "self-heal: reinstalling labsh from $src (make install-lib)"
-    out=$(make -C "$src" install-lib 2>&1); rc=$?
-    while IFS= read -r _l; do [[ -n "$_l" ]] && log "  install-lib: $_l"; done <<<"$out"
-    if (( rc == 0 )); then
-        log "self-heal: labsh reinstall OK ($(command -v labsh 2>/dev/null))"
+    lib="$NEXUS_LOCALS_DIR/lib/labsh"
+    bin="$NEXUS_LOCALS_DIR/bin"
+    log "self-heal: reinstalling labsh from $src into $NEXUS_LOCALS_DIR (bin+lib)"
+    out=$(
+        set -e
+        install -d "$lib/bin" "$bin"
+        install -m 755 "$src/bin/labsh"           "$lib/bin/labsh"
+        install -m 755 "$src/bin/_labsh_kernel.py" "$lib/bin/_labsh_kernel.py"
+        install -m 644 "$src/VERSION"             "$lib/VERSION"
+        # Shim mirrors the Makefile's install-bin: exec into the lib target so
+        # SCRIPT_DIR resolves to $lib/bin, independent of how the shim was found.
+        printf '#!/bin/sh\nexec "%s/bin/labsh" "$@"\n' "$lib" > "$bin/labsh"
+        chmod 755 "$bin/labsh"
+    ) 2>&1
+    rc=$?
+    while IFS= read -r _l; do [[ -n "$_l" ]] && log "  install: $_l"; done <<<"$out"
+    # Ensure the freshly-created $NEXUS_LOCALS/bin fronts PATH — supervisor
+    # startup may have skipped that when the dir did not yet exist.
+    front_locals_bin
+    if (( rc == 0 )) && command -v labsh >/dev/null 2>&1; then
+        log "self-heal: labsh reinstall OK ($(command -v labsh))"
         return 0
     fi
-    log "ERROR: self-heal labsh reinstall FAILED rc=$rc (make -C $src install-lib)"
+    log "ERROR: self-heal labsh reinstall FAILED rc=$rc"
     return 1
 }
 
+# If labsh isn't on PATH at supervisor startup, try the self-heal ONCE before
+# FATAL'ing. Covers the shim-missing wipe (see block comment above) — the
+# pre-#103 hard FATAL here killed the supervisor before the pre-start
+# dangle-check in start_server got a chance to run, so a missing shim was
+# unrecoverable without a human. Post-heal, re-check PATH so a self-heal that
+# claimed success but did not actually produce a callable labsh still fails
+# loud instead of silently proceeding to a broken start_server.
+if labsh_missing; then
+    log "labsh not on PATH — self-healing before supervisor start (extends your-org/other-nexus#103)"
+    reinstall_labsh || true
+fi
 command -v labsh >/dev/null 2>&1 || {
-    log "FATAL: labsh not on PATH — install via 'brew install operator/tools/labsh' or monitor/install-labsh.sh"
+    log "FATAL: labsh not on PATH — self-heal did not produce a callable binary; install via 'brew install katosh/tools/labsh' or monitor/install-labsh.sh"
     exit 1
 }
 
+# THE PERIODIC HOOK'S PROCESS GROUP IS REAPED ON TERM (skeptic testinfra2sk F1
+# on PR 1593, MEASURED). `svc.sh stop` — and so every restart, including the
+# source-drift one — TERMs THIS supervisor's process group. But `timeout` makes
+# ITSELF a process-group leader, so a bounded hook LEAVES that group: measured,
+# after a group TERM the old unbounded form's hook died and the bounded form's
+# `timeout` + hook SURVIVED, reparented to init, for up to the whole bound —
+# holding `.crawl.lock`, so the NEW supervisor's crawls exit "another crawl
+# holds". The bound then also stopped a restart from curing the very hang it
+# exists for. It is your-org/nexus-code#1585's defect, reintroduced by the fix
+# for a neighbouring one.
+#
+# IDENTITY BEFORE SIGNAL. The pid comes from a file, and pids recycle: it must
+# still be a `timeout`, still lead its OWN group, and still sit in THIS project
+# directory. Not its ppid — the group TERM kills the wrapping subshell first, so
+# by the time this runs the `timeout` is already reparented to init.
+PERIODIC_PGID_FILE=".jupyter/labsh-periodic.pgid"
+_reap_periodic_group() {
+    local t st pg
+    t=$(cat "$PERIODIC_PGID_FILE" 2>/dev/null) || return 0
+    [[ "$t" =~ ^[0-9]+$ ]] || return 0
+    [[ "$(cat "/proc/$t/comm" 2>/dev/null)" == timeout ]] || return 0
+    # PHYSICAL against PHYSICAL: /proc/<pid>/cwd is always resolved, while
+    # $PROJECT_DIR came from a logical `pwd`. Compared as written, a project
+    # reached through a symlink would fail this check and the hook would
+    # survive — fail-safe, and a silent defeat of the fix on exactly such hosts.
+    [[ "$(readlink "/proc/$t/cwd" 2>/dev/null)" == "$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)" ]] || return 0
+    { IFS= read -r st < "/proc/$t/stat"; } 2>/dev/null || return 0
+    st=${st##*) }; read -r _ _ pg _ <<<"$st"
+    [[ "$pg" == "$t" ]] || return 0
+    log "stopping ${1:-the in-flight periodic hook} (process group $t) — it is outside this supervisor's group and would outlive it"
+    kill -TERM -- "-$t" 2>/dev/null || true
+    rm -f "$PERIODIC_PGID_FILE"
+}
+# ── replacement hand-off (your-org/nexus-code#1693) ────────────────────────
+# A supervisor that is being REPLACED (its launch script drifted, so the
+# version-aware restart runs `svc.sh restart` with SVC_RESTART_MODE=replace)
+# used to take a healthy lab down with it: kernels and sessions lost, ~5 min
+# warm or ~30 min cold. Now it may leave the server running for its successor,
+# whose bring-up probe finds it healthy and adopts it without a `labsh start`.
+#
+# STOP IS THE DEFAULT; THE HAND-OFF NEEDS FOUR POSITIVE FACTS, each of which
+# fails closed to today's `labsh stop`:
+#   1. a one-shot REPLACE MARK naming THIS supervisor's pid, written by svc.sh
+#      just before it TERMs us (and never by `svc.sh stop`), younger than
+#      LABSH_SVC_REPLACE_MAX_AGE seconds (default 60);
+#   2. the server is HEALTHY (the same jupyter-health.sh every probe uses);
+#   3. OWNERSHIP: the server answering on our persisted PORT is the one the
+#      OWNER record names — the record this service writes after a start of
+#      its own (`_record_server_owner`), carried across hand-offs. A server
+#      this service did not start (hand-started, or started before this
+#      feature existed) has no such record, and is stopped;
+#   4. no server-env pin refresh is in flight: svc.sh signals only this pid on
+#      a replace, so a refresh's process tree would outlive us.
+# The successor then checks the fifth condition, the middle path: if the
+# server was launched with a different configuration than the successor would
+# use, it restarts it after all (see `_adopt_running_server`).
+REPLACE_MARK=".jupyter/labsh-supervisor.replace"
+HANDOFF_ACK=".jupyter/labsh-supervisor.handoff"
+OWNER_FILE=".jupyter/labsh-server.owner"
+REPLACE_MAX_AGE="${LABSH_SVC_REPLACE_MAX_AGE:-60}"
+[[ "$REPLACE_MAX_AGE" =~ ^[0-9]+$ ]] || REPLACE_MAX_AGE=60
+
+# First PORT= of the env file, with no `head` reader (#622).
+_env_port() { sed -n '/^PORT=/{s///p;q;}' "$ENV_FILE" 2>/dev/null; }
+# _kv_field <file> <key> — first `key=value` line's value.
+_kv_field() { sed -n "/^$2=/{s///p;q;}" "$1" 2>/dev/null; }
+
+# The pid of the runtime record whose port is <port>. Prints nothing (rc 1)
+# when no record carries that port.
+_record_pid_for_port() {
+    local port="$1" rt jf
+    rt=$(runtime_dir); [[ -d "$rt" ]] || return 1
+    for jf in "$rt"/jpserver-*.json; do
+        [[ -e "$jf" ]] || continue
+        [[ "$(record_field "$jf" port)" == "$port" ]] || continue
+        record_field "$jf" pid
+        return 0
+    done
+    return 1
+}
+
+# What shapes how the SERVER is launched, as this supervisor would launch it:
+# LABSH_WITH, the replayed opts, the uvx pin shim, and labsh itself. NOT the
+# pin file — a pin refresh is designed never to touch the running server.
+_launch_fingerprint() {
+    local f lb
+    read_opts
+    lb=$(labsh_lib_target 2>/dev/null) || lb=''
+    [[ -n "$lb" ]] || lb=$(command -v labsh 2>/dev/null)
+    {
+        printf 'LABSH_WITH=%s\n' "$LABSH_WITH"
+        printf 'opt=%s\n' ${OPTS[@]+"${OPTS[@]}"}
+        for f in "$PIN_SHIM_DIR/uvx" "$PIN_SHIM_DIR/bash_env.sh" "$lb"; do
+            printf '%s ' "${f##*/}"
+            cksum < "$f" 2>/dev/null || echo absent
+        done
+    } | cksum | awk '{print $1 "-" $2}'
+}
+
+# Written after a start THIS service made became healthy. Any failure to name
+# the server removes the record, so a stale one can never vouch for a new
+# server.
+_record_server_owner() {
+    local port spid
+    port=$(_env_port)
+    if [[ "$port" =~ ^[0-9]+$ ]] && spid=$(_record_pid_for_port "$port") \
+        && [[ "$spid" =~ ^[0-9]+$ ]] && kill -0 "$spid" 2>/dev/null; then
+        printf 'server_pid=%s\nport=%s\nfp=%s\nsupervisor=%s\nrecorded=%s\n' \
+            "$spid" "$port" "$(_launch_fingerprint)" "$$" "$(date -Is)" \
+            > "$OWNER_FILE.tmp.$$" && mv -f "$OWNER_FILE.tmp.$$" "$OWNER_FILE" && return 0
+    fi
+    rm -f "$OWNER_FILE" "$OWNER_FILE.tmp.$$"
+    return 1
+}
+
+# rc 0 (and the server pid on stdout) iff the server on our persisted PORT is
+# the one the owner record names, and it is alive.
+_server_owned() {
+    local opid oport port rpid
+    opid=$(_kv_field "$OWNER_FILE" server_pid)
+    oport=$(_kv_field "$OWNER_FILE" port)
+    port=$(_env_port)
+    [[ "$opid" =~ ^[0-9]+$ && "$oport" =~ ^[0-9]+$ && "$port" == "$oport" ]] || return 1
+    rpid=$(_record_pid_for_port "$port") || return 1
+    [[ "$rpid" == "$opid" ]] && kill -0 "$opid" 2>/dev/null || return 1
+    printf '%s\n' "$opid"
+}
+
+# rc 0 iff all four facts above hold; sets HANDOFF_SERVER. Every refusal says
+# why, because "it stopped the lab" must be explainable from the log alone.
+HANDOFF_SERVER=''
+_replacement_handoff_ok() {
+    local mpid mat now spid
+    [[ -e "$REPLACE_MARK" ]] || return 1
+    mpid=$(_kv_field "$REPLACE_MARK" pid)
+    mat=$(_kv_field "$REPLACE_MARK" at)
+    if [[ "$mpid" != "$$" ]]; then
+        log "a replace mark is present but names pid ${mpid:-?}, not this supervisor ($$) — not ours; stopping the server"
+        return 1
+    fi
+    rm -f "$REPLACE_MARK"          # one-shot: consumed whatever follows
+    now=$(date +%s)
+    if ! [[ "$mat" =~ ^[0-9]+$ ]] || (( now < mat || now - mat > REPLACE_MAX_AGE )); then
+        log "the replace mark is stale or undated (at=${mat:-?}, max age ${REPLACE_MAX_AGE}s) — stopping the server"
+        return 1
+    fi
+    if _refresh_in_flight; then
+        log "being replaced, but a server-env pin refresh (pid $REFRESH_PID) is in flight and would outlive this supervisor — stopping the server"
+        return 1
+    fi
+    if ! "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
+        log "being replaced, but the server is NOT healthy — stopping it, as on any stop"
+        return 1
+    fi
+    if ! spid=$(_server_owned); then
+        log "being replaced, but the server on port $(_env_port) is not the one $OWNER_FILE names (not started by this service, or the record is stale) — stopping it"
+        return 1
+    fi
+    HANDOFF_SERVER="$spid"
+    return 0
+}
+
 on_term() {
+    _reap_periodic_group
+    if _replacement_handoff_ok; then
+        local j
+        # svc.sh signalled this pid only: our own jobs (the probe-loop sleep,
+        # a finished hook's subshell) go with us. The server is not one.
+        for j in $(jobs -p); do kill "$j" 2>/dev/null; done
+        printf 'pid=%s\nserver=%s\nat=%s\n' "$$" "$HANDOFF_SERVER" "$(date +%s)" \
+            > "$HANDOFF_ACK.tmp.$$" && mv -f "$HANDOFF_ACK.tmp.$$" "$HANDOFF_ACK"
+        log "being REPLACED — leaving the healthy server (pid $HANDOFF_SERVER) running for the successor supervisor to adopt (your-org/nexus-code#1693); exiting"
+        exit 0
+    fi
     log "signal received — stopping labsh server, exiting"
     labsh stop >/dev/null 2>&1 || true
     exit 0
@@ -297,7 +660,8 @@ reap_port_orphan() {
     while IFS= read -r line; do
         pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null )
         case "$cmd" in
             *jupyter*)
                 log "reaping orphan jupyter (pid $pid) squatting port $port before start"
@@ -342,12 +706,20 @@ reap_port_orphan() {
 # runs while the service is already unhealthy (no live healthy server on this
 # port to hit). Reversible: `git revert` drops only this reaper. Best-effort;
 # missing tools are not fatal.
-# How long one of OUR cold builds may run before it counts as an orphan.
-# Mirrors the watcher's monitor.service_health.cold_build_ceiling_seconds
-# (default 1800) so the two layers agree on when a build stops being in-flight.
+# How long one of OUR cold builds is protected UNCONDITIONALLY. Mirrors the
+# watcher's monitor.service_health.cold_build_ceiling_seconds (default 1800).
 # Must exceed START_GRACE (900) or the supervisor's own MAX_FAILS bounce would
 # reap builds that are still legitimately materialising.
+#
+# PAST IT A BUILD IS NOT AN ORPHAN BY AGE ALONE (your-org/nexus-code#1676).
+# It stays protected while it is still MOVING, and is reaped only once it has
+# stalled for LABSH_BUILD_STALL_SECONDS or passed LABSH_COLD_BUILD_HARD_CAP —
+# the shared verdict `labsh_build_release`, which svc.sh's guard and the
+# watcher's defer consult too. Measured 2026-09-29 15:09:34, this reaper killed
+# build 13776 at 1816s ("stale", ">= 1800s budget") while it was still
+# progressing on a load-100 node; the replacement started from zero.
 COLD_BUILD_BUDGET="${LABSH_COLD_BUILD_BUDGET:-1800}"
+[[ "$COLD_BUILD_BUDGET" =~ ^[0-9]+$ ]] || COLD_BUILD_BUDGET=1800
 
 # The shared evidence predicate. Sourced, not reimplemented: the watcher's
 # `_sh_labsh_build_in_progress` asks the SAME question with opposite polarity,
@@ -359,15 +731,16 @@ _LABSH_EVIDENCE="$SCRIPT_DIR/_labsh_build_evidence.sh"
 
 _REAP_KILLED=0
 _reap_if_stale() {
-    local pid="$1" port="$2" src="$3" age
+    local pid="$1" port="$2" src="$3" age verdict
     declare -F labsh_build_is_ours >/dev/null || return 1   # helper absent → reap nothing
+    declare -F labsh_build_release >/dev/null || return 1   # verdict absent → reap nothing
     labsh_build_is_ours "$pid" "$PROJECT_DIR" "$port" || return 1   # not ours → silent
     age=$(labsh_build_age "$pid") || return 1
-    if (( age < COLD_BUILD_BUDGET )); then
-        log "NOT reaping pid $pid ($src): our labsh build for port $port, but only ${age}s old (< ${COLD_BUILD_BUDGET}s budget) — a build in flight, not an orphan"
+    if ! verdict=$(labsh_build_release "$pid" "$age" "$PROJECT_DIR" "$COLD_BUILD_BUDGET"); then
+        log "NOT reaping pid $pid ($src): our labsh build for port $port — ${verdict#* } — a build in flight, not an orphan"
         return 1
     fi
-    log "reaping stale labsh build (pid $pid, ${age}s >= ${COLD_BUILD_BUDGET}s budget, $src) before start — releases the uv lock"
+    log "reaping stale labsh build (pid $pid, $src): ${verdict#* } — before start; releases the uv lock"
     kill "$pid" 2>/dev/null && _REAP_KILLED=1
     return 0
 }
@@ -447,8 +820,49 @@ record_is_serving() {
         scheme=http
     fi
     curl -fsSk -o /dev/null --max-time "${LABSH_HEALTH_TIMEOUT:-3}" \
-        -H "Authorization: token $token" \
+        -H @<(printf 'Authorization: token %s\n' "$token") \
         "$scheme://127.0.0.1:$port/api/status"
+}
+
+# _token_mismatch_proven <file-token> — rc 0 iff some runtime record's server
+# answers /api/status WITH ITS OWN RECORDED TOKEN while that token differs from
+# the one in `.jupyter/token`. That is the mismatch proven from the SERVER's
+# side, and it is the sound discriminator for your-org/nexus-code#1584.
+#
+# WHY IT EXISTS BESIDE THE `tok0` SNAPSHOT (skeptic testinfra2sk F2, PR 1593).
+# `tok0` is read after `labsh start` RETURNS, but the server is measurably green
+# 40-205 ms BEFORE that (3 of 3). A rotation landing in that window makes
+# tok0 == the rotated token, the snapshot sees no change, and the 900 s wedge is
+# back. The snapshot can MISS; it can never false-fire, so it stays as a second
+# arm (it is also the only arm a record-less server offers). This one cannot
+# miss, because it asks the server rather than remembering the file.
+#
+# AND IT CANNOT FIRE ON A WARMING SERVER: that server answers 403 to EVERYTHING,
+# so `record_is_serving` is false for it and the restart-flap pin holds.
+#
+# ONLY OUR PORT'S RECORD (skeptic testinfra2sk F5, your-org/nexus-code#1594).
+# The runtime dir can hold a FOREIGN serving record — an operator-exported
+# JUPYTER_DATA_DIR, or a second server labsh's start guard missed. Unbound, that
+# record answered 200 with its own token while OUR server was merely warming
+# (403), every rc-22 probe counted, and the fast bail fired on a warming server:
+# the restart flap, through another door. So a record is consulted only when its
+# `port` is the PORT= this start persisted (the port our health probe asks). No
+# env file or no PORT = cannot tell, and cannot-tell never bails.
+_token_mismatch_proven() {
+    local ftok="$1" rt jf rtok ours
+    [[ -n "$ftok" ]] || return 1
+    # First PORT= only, with no `head` reader (the early-exit-reader ratchet, #622).
+    ours=$(sed -n '/^PORT=/{s///p;q;}' "$ENV_FILE" 2>/dev/null)
+    [[ "$ours" =~ ^[0-9]+$ ]] || return 1
+    rt=$(runtime_dir); [[ -d "$rt" ]] || return 1
+    for jf in "$rt"/jpserver-*.json; do
+        [[ -e "$jf" ]] || continue
+        [[ "$(record_field "$jf" port)" == "$ours" ]] || continue
+        rtok=$(record_field "$jf" token)
+        [[ -n "$rtok" && "$rtok" != "$ftok" ]] || continue
+        record_is_serving "$jf" && return 0
+    done
+    return 1
 }
 
 # Conservative pre-start prune: remove runtime records whose recorded pid is
@@ -526,7 +940,7 @@ start_server() {
 }
 
 _start_cycle() {
-    local port rc i tries url_seen=0
+    local port rc i tries url_seen=0 hrc=0 rejected=0 tok0='' tok1=''
     # Prune runtime records for verifiably-dead pids BEFORE start so labsh's
     # start-guard can't adopt a stale dead-pid record. Conservative (kill -0
     # only): a live pid, even a still-warming server, is never touched here.
@@ -537,15 +951,20 @@ _start_cycle() {
     reap_stale_builds "$port"       # kill unfinished builds holding the uv lock (#33)
     repair_uv_cache                 # recreate a purged uv cache target (#98)
     read_opts
-    # Self-heal a wiped labsh binary BEFORE starting (incident #103): if the
-    # persistent shim dangles because the ephemeral-HOME lib target is gone,
-    # reinstall the pinned release so the start below can actually succeed.
-    if labsh_dangling; then
+    # Self-heal a wiped labsh binary BEFORE starting (incident #103, extended):
+    # cover both the persistent-shim-with-missing-lib-target dangle case (#103)
+    # AND the entirely-missing case (shim itself gone after a HOME overlay
+    # reset that leaves no ~/.local/bin/labsh in place). Either way, reinstall
+    # into $NEXUS_LOCALS so the start below can actually succeed.
+    if labsh_missing; then
+        log "labsh not on PATH — self-healing before start (see your-org/other-nexus#103, extended)"
+        reinstall_labsh || true
+    elif labsh_dangling; then
         log "labsh shim dangles (lib target missing) — self-healing before start (see your-org/other-nexus#103)"
         reinstall_labsh || true
     fi
     log "starting labsh server (preferred port $port${OPTS[*]:+, opts: ${OPTS[*]}})"
-    labsh start --port "$port" ${OPTS[@]+"${OPTS[@]}"}
+    labsh_start_pinned --port "$port" ${OPTS[@]+"${OPTS[@]}"}
     rc=$?
     # rc=127 == the shell could not exec the shim's lib target (binary wiped) —
     # the same #103 failure, catching a wipe that raced in after the pre-start
@@ -553,7 +972,7 @@ _start_cycle() {
     if (( rc == 127 )); then
         log "labsh start rc=127 (binary missing) — self-healing and retrying start once"
         if reinstall_labsh; then
-            labsh start --port "$port" ${OPTS[@]+"${OPTS[@]}"}
+            labsh_start_pinned --port "$port" ${OPTS[@]+"${OPTS[@]}"}
             rc=$?
         fi
     fi
@@ -572,13 +991,39 @@ _start_cycle() {
     # window: the observed restart flap. So persist the port as soon as a URL
     # appears (once, to avoid log spam), but gate success on a PASSING
     # healthcheck against that port.
+    # The token THIS start began with, read after `labsh start` has written it.
+    # Empty (no file yet) means "cannot tell", and cannot-tell never bails.
+    tok0=$(cat .jupyter/token 2>/dev/null) || tok0=''
     tries=$(( START_GRACE * 2 ))
     for (( i = 0; i < tries; i++ )); do
         if (( ! url_seen )) && persist_env_from_url; then
             url_seen=1
         fi
-        if (( url_seen )) && "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
-            return 0
+        if (( url_seen )); then
+            # rc captured on the same line as the probe (#1202).
+            hrc=0; "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1 || hrc=$?
+            if (( hrc == 0 )); then
+                REJECT_BAILS=0
+                # Only a server THIS start launched gets an owner record; an
+                # adopted one (rc 1) keeps whatever record it already had.
+                (( rc == 0 )) && { _record_server_owner || log "could not name the server just started on port $(_env_port) — no owner record, so a later replacement stops it (#1693)"; }
+                return 0
+            fi
+            # 22 = answered and REJECTED our token — which a WARMING server may
+            # also do, so 22 alone proves nothing. 22 with a token that is no
+            # longer the one this start began with is a rotation: certain,
+            # permanent, and not curable by waiting.
+            tok1=$(cat .jupyter/token 2>/dev/null) || tok1=''
+            if (( hrc == 22 )) && { _token_mismatch_proven "$tok1" || [[ -n "$tok0" && -n "$tok1" && "$tok1" != "$tok0" ]]; }; then
+                rejected=$(( rejected + 1 ))
+            else
+                rejected=0
+            fi
+            if (( rejected >= REJECT_PROBES && REJECT_BAILS < REJECT_BAILS_MAX )); then
+                REJECT_BAILS=$(( REJECT_BAILS + 1 ))
+                log "the auth token was ROTATED during the start wait and the server REJECTS the new one ($rejected consecutive probes) — a certain mismatch, not a slow start; leaving the wait so the watchdog can bounce it (fast bail $REJECT_BAILS/$REJECT_BAILS_MAX, your-org/nexus-code#1584)"
+                return 1
+            fi
         fi
         sleep 0.5
     done
@@ -601,6 +1046,7 @@ _start_cycle() {
         fi
         log "phantom-adopt suspected (rc=1, unhealthy after ${START_GRACE}s) but every runtime record is serving or already gone — not retrying (will retry on the next unhealthy streak)"
     fi
+    _after_failed_start
     if (( url_seen )); then
         log "WARNING: server exposed a URL but did not pass the healthcheck within ${START_GRACE}s — will retry on the next unhealthy streak"
     else
@@ -613,25 +1059,238 @@ _start_cycle() {
 # the probe loop. Overlap guard: skip while a previous invocation is
 # still running.
 PERIODIC_PID=''
+# _periodic_in_flight — rc 0 iff the hook THIS supervisor launched is still
+# running. Asked of bash's OWN JOB TABLE, never of the kernel about a number.
+#
+# THE OVERLAP GUARD USED TO BE `kill -0 "$PERIODIC_PID"`, AND THAT IS A QUESTION
+# ABOUT A NUMBER. Once the hook ends and bash reaps it, the number is free, and
+# `kill -0` succeeds for WHATEVER holds it next — including a THREAD, since a
+# thread id is a valid `kill` target. Found on the LIVE service, 2026-09-19: the
+# log said "periodic hook still running (pid 10994) — skipping this round" 84
+# times over ~14 h and was read, by me too, as a hook that had HUNG. It had not.
+# /proc/10994 was `Bun Pool 35`, Tgid 36836 != Pid 10994 — a thread of an
+# unrelated process; `ps -p` does not list threads, so the pid looked gone while
+# `kill -0` kept answering 0. The hook had finished long before and was never
+# run again: a MISSED-RUN bug wearing a hang's log line. The 3600 s bound above
+# is still worth having and does nothing for this.
+#
+# The job table cannot be fooled that way: it lists only this shell's own
+# un-reaped children, so a recycled number that is not our job is not in it.
+# Measured: own live child -> in flight; the same child once ended -> not; an
+# UNRELATED live pid -> `kill -0` says alive, this says not in flight.
+_periodic_in_flight() {
+    local p
+    [[ -n "$PERIODIC_PID" ]] || return 1
+    for p in $(jobs -pr); do
+        if [[ "$p" == "$PERIODIC_PID" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 run_periodic() {
     [[ -f "$PERIODIC_FILE" ]] || return 0
-    if [[ -n "$PERIODIC_PID" ]] && kill -0 "$PERIODIC_PID" 2>/dev/null; then
+    if _periodic_in_flight; then
         log "periodic hook still running (pid $PERIODIC_PID) — skipping this round"
         return 0
     fi
     # Explicit mode at creation (your-org/nexus-code#484).
     _ensure_service_log "$PERIODIC_LOG"
-    bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 &
+    # A SUBSHELL, so the outcome can be LOGGED: the hook is async, and a bare
+    # `timeout … &` would kill a hang in silence — the round after it would
+    # simply stop saying "still running", which reads as the hook having
+    # finished. `$!` is the subshell, so the overlap guard above still covers
+    # the whole attempt. GNU `timeout` makes itself a process-group leader and
+    # signals the GROUP, so a hook's children (uv, a crawl) go with it.
+    #
+    # THE SET, NOT 124: `-k` escalates to KILL, which reports 137 (#1248).
+    (
+        _prc=0
+        if (( PERIODIC_TIMEOUT > 0 )); then
+            # Backgrounded + `wait`, so its pid — which IS its process group —
+            # can be recorded for `on_term` (see `_reap_periodic_group`).
+            timeout -k 30 "$PERIODIC_TIMEOUT" bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 &
+            _pt=$!
+            printf '%s\n' "$_pt" > "$PERIODIC_PGID_FILE.tmp" && mv -f "$PERIODIC_PGID_FILE.tmp" "$PERIODIC_PGID_FILE"
+            wait "$_pt" || _prc=$?
+            rm -f "$PERIODIC_PGID_FILE"
+        else
+            bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 || _prc=$?
+        fi
+        case "$_prc" in
+            124|137) log "periodic hook KILLED after ${PERIODIC_TIMEOUT}s (rc $_prc) — it did not return; the next round will launch it again (log $PROJECT_DIR/$PERIODIC_LOG)" ;;
+        esac
+    ) &
     PERIODIC_PID=$!
-    log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG)"
+    log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG, bound ${PERIODIC_TIMEOUT}s)"
+}
+
+# _build_protected — rc 0 iff OUR labsh build is in flight (no URL yet) AND the
+# shared verdict PROTECTS it (inside the ceiling, or past it but still moving).
+# The watchdog then neither counts a strike nor bounces. Before this, START_GRACE
+# (900 s) expiring was followed by three failed probes and a bounce whose
+# `reap_stale_builds` killed the still-progressing build at its 1800 s budget
+# (2026-09-29 15:09:34, pid 13776) — the same kill the watcher's layer made.
+# Logged on first sight and on each change of verdict, not on every probe.
+BUILD_WAIT_SEEN=''
+_build_protected() {
+    local ev pid age verdict
+    declare -F labsh_build_in_progress >/dev/null || return 1
+    declare -F labsh_build_release >/dev/null || return 1
+    if ! ev=$(labsh_build_in_progress "$PROJECT_DIR"); then
+        BUILD_WAIT_SEEN=''
+        return 1
+    fi
+    pid="${ev%% *}"; age="${ev##* }"
+    if verdict=$(labsh_build_release "$pid" "$age" "$PROJECT_DIR" "$COLD_BUILD_BUDGET"); then
+        log "our labsh build (pid $pid) is RELEASED: ${verdict#* } — resuming the ordinary bounce"
+        BUILD_WAIT_SEEN=''
+        return 1
+    fi
+    if [[ "$BUILD_WAIT_SEEN" != "$pid ${verdict%% *}" ]]; then
+        log "healthcheck failing while OUR labsh build (pid $pid) is in flight: ${verdict#* } — not bouncing (a bounce would discard it)"
+        BUILD_WAIT_SEEN="$pid ${verdict%% *}"
+    fi
+    return 0
+}
+
+# ── pin capture / refresh / quarantine (your-org/nexus-code#1676) ──────────
+# capture: once per server generation (keyed on the recorded build pid), from a
+# server that has just passed its healthcheck. Synchronous: it is one local
+# `uv pip freeze`, and labsh-pin.sh refuses (rc 3) rather than pin a server it
+# cannot prove is ours and healthy.
+PIN_CAPTURED_FOR=''
+_maybe_capture_pin() {
+    local bg
+    [[ -x "$PIN_TOOL" ]] || return 0
+    bg=$(cat "$BG_PID_FILE" 2>/dev/null) || bg=''
+    [[ -n "$bg" && "$bg" != "$PIN_CAPTURED_FOR" ]] || return 0
+    PIN_CAPTURED_FOR="$bg"
+    "$PIN_TOOL" capture "$PROJECT_DIR" >/dev/null 2>&1 || true
+}
+# refresh: WE CHOSE weekly (LABSH_SVC_REPIN_DAYS, default 7; 0 = never) — the
+# path by which security and feature releases reach the lab without anyone
+# asking. Runs ASYNC, only while healthy, and only swaps the pin after the
+# candidate env serves a smoke test; the running server is never touched. Owned
+# by bash's job table (see _periodic_in_flight for why never `kill -0`).
+#
+# A FAILED REFRESH MUST NOT BECOME A RETRY LOOP (skeptic labshcoldsk, #1677).
+# `refreshed_at` moves only on success, so gating on it alone relaunched a
+# failing refresh every PERIODIC_EVERY round (~10 min): a timed-out candidate
+# build became back-to-back cold builds on NFS, each leaving an orphaned
+# builds-v0/.tmp*, and a smoke failure a throwaway jupyter-lab every cycle. So
+# the SUPERVISOR stamps every attempt itself, before launch, in a file it owns
+# (a tool that refuses before taking its lock cannot then escape the backoff),
+# and a new attempt also waits LABSH_SVC_REPIN_RETRY_HOURS (WE CHOSE 24) after
+# the last one. The finished job's rc is reaped from the job table and logged.
+REPIN_DAYS="${LABSH_SVC_REPIN_DAYS:-7}"
+[[ "$REPIN_DAYS" =~ ^[0-9]+$ ]] || REPIN_DAYS=7
+REPIN_RETRY_HOURS="${LABSH_SVC_REPIN_RETRY_HOURS:-24}"
+[[ "$REPIN_RETRY_HOURS" =~ ^[0-9]+$ ]] || REPIN_RETRY_HOURS=24
+REFRESH_ATTEMPT_FILE=".jupyter/labsh-pin.refresh-attempt"
+REFRESH_PID=''
+_refresh_in_flight() {
+    local p
+    [[ -n "$REFRESH_PID" ]] || return 1
+    for p in $(jobs -pr); do [[ "$p" == "$REFRESH_PID" ]] && return 0; done
+    return 1
+}
+_maybe_refresh_pin() {
+    local last attempt now rrc
+    [[ -x "$PIN_TOOL" ]] || return 0
+    if [[ -n "$REFRESH_PID" ]] && ! _refresh_in_flight; then
+        rrc=0; wait "$REFRESH_PID" 2>/dev/null || rrc=$?
+        log "server-env pin refresh (pid $REFRESH_PID) finished rc=$rrc ($( (( rrc == 0 )) && echo 'swapped or already current' || echo 'NOT swapped')); next attempt no sooner than ${REPIN_RETRY_HOURS}h — see $PROJECT_DIR/.jupyter/labsh-pin.log"
+        REFRESH_PID=''
+    fi
+    (( REPIN_DAYS > 0 )) || return 0
+    [[ -s ".jupyter/labsh-server.pin" ]] || return 0        # nothing pinned ⇒ starts already float
+    _refresh_in_flight && return 0
+    now=$(date +%s)
+    last=$(sed -n 's/^refreshed_at=//p' ".jupyter/labsh-server.pin.meta" 2>/dev/null | tail -1)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= REPIN_DAYS * 86400 )) || return 0
+    attempt=$(cat "$REFRESH_ATTEMPT_FILE" 2>/dev/null) || attempt=0
+    [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+    (( now - attempt >= REPIN_RETRY_HOURS * 3600 )) || return 0
+    printf '%s\n' "$now" > "$REFRESH_ATTEMPT_FILE"
+    "$PIN_TOOL" refresh "$PROJECT_DIR" >/dev/null 2>&1 &
+    REFRESH_PID=$!
+    log "server-env pin is older than ${REPIN_DAYS}d — background refresh launched (pid $REFRESH_PID, log $PROJECT_DIR/.jupyter/labsh-pin.log); the running server is not touched"
+}
+# After a start that did not become healthy within START_GRACE:
+#   * a pin uv could not RESOLVE is quarantined at once (positive evidence in
+#     labsh.bg.log; labsh-pin.sh acts only on that);
+#   * a pin that RESOLVED but whose server still failed the healthcheck is
+#     DEMOTED after PINNED_FAIL_LIMIT consecutive such starts — rolled back to
+#     .prev, else quarantined (skeptic labshcoldsk, #1677: without this a bad
+#     pinned env was restarted identically until a human deleted the pin). Two,
+#     not one, WE CHOSE: a single failed start has transient causes (a port
+#     race, a token rotation) that are not the pin's; two in a row, with no
+#     healthy probe between them, is the pin's. The count resets on any healthy
+#     probe and is only incremented for a start labsh.bg.log shows was pinned.
+PINNED_FAIL_LIMIT=2
+PINNED_START_FAILS=0
+_after_failed_start() {
+    [[ -x "$PIN_TOOL" ]] || return 0
+    "$PIN_TOOL" quarantine "$PROJECT_DIR" >/dev/null 2>&1 || true
+    [[ -s ".jupyter/labsh-server.pin" ]] || { PINNED_START_FAILS=0; return 0; }
+    grep -q 'labsh-uvx-shim: resolving against the server-env pin' ".jupyter/labsh.bg.log" 2>/dev/null \
+        || return 0
+    PINNED_START_FAILS=$(( PINNED_START_FAILS + 1 ))
+    if (( PINNED_START_FAILS >= PINNED_FAIL_LIMIT )); then
+        log "$PINNED_START_FAILS consecutive PINNED starts failed their healthcheck — demoting the server-env pin (roll back to .prev, else quarantine)"
+        "$PIN_TOOL" demote "$PROJECT_DIR" >/dev/null 2>&1 || true
+        PINNED_START_FAILS=0
+    fi
 }
 
 log "supervisor up: project=$PROJECT_DIR interval=${INTERVAL}s threshold=$MAX_FAILS"
 
+# A PREDECESSOR'S ORPHANED HOOK IS REAPED BEFORE THE FIRST ROUND (skeptic
+# testinfra2sk F6, your-org/nexus-code#1594). `on_term` cannot cover two paths:
+# a TERM landing between `timeout … &` and the `mv` that publishes the pgid
+# file, and a supervisor KILLed (or OOM-killed), whose trap never runs. In both
+# the old hook survives, reparented to init, and our first `run_periodic` would
+# OVERWRITE its pgid file — losing the last handle on it. Same identity check as
+# on TERM, so a recycled or garbage pid is left alone. ITS STATED LIMIT: it
+# WOULD kill a foreign, self-grouped `timeout` whose cwd is this same project
+# directory. Nothing starts one today; it is the price of reaping by file.
+_reap_periodic_group "an orphaned periodic hook left by a previous supervisor"
+
+# _adopt_running_server — the bring-up probe found a healthy server. Adopt it,
+# UNLESS it is one this service started (owner record) under a different launch
+# configuration: then the change that replaced the previous supervisor cannot
+# take effect without a restart, and that is the restart that is really needed
+# (#1693's middle path). A server with no owner record is adopted as before —
+# its configuration is unknown, and adopting a hand-started lab is the
+# long-standing contract.
+_adopt_running_server() {
+    local spid ofp nfp
+    if ! spid=$(_server_owned); then
+        log "a healthy server is already running — adopted"
+        return 0
+    fi
+    ofp=$(_kv_field "$OWNER_FILE" fp)
+    nfp=$(_launch_fingerprint)
+    if [[ -n "$ofp" && "$ofp" == "$nfp" ]]; then
+        log "a healthy server (pid $spid) is already running with this supervisor's launch configuration — adopted, not restarted (#1693)"
+        return 0
+    fi
+    log "the running server (pid $spid) was launched with a DIFFERENT configuration (LABSH_WITH, opts, uvx shim or labsh changed: ${ofp:-?} -> $nfp) — restarting it so the change takes effect (#1693)"
+    labsh stop >/dev/null 2>&1 || true
+    sleep 1
+    start_server || true
+}
+
 # Immediate bring-up: don't make first activation wait out a failure
 # streak. Adopt-or-start covers both cold boot and an already-live
 # server whose env file is missing/stale.
-"$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1 || start_server
+if "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
+    _adopt_running_server
+else
+    start_server
+fi
 run_periodic
 
 fails=0
@@ -643,6 +1302,16 @@ while true; do
     ticks=$(( ticks + 1 ))
     (( ticks % PERIODIC_EVERY == 0 )) && run_periodic
     if "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
+        fails=0
+        REJECT_BAILS=0      # a healthy probe restores the fast-bail budget (#1584)
+        PINNED_START_FAILS=0
+        _maybe_capture_pin
+        (( ticks % PERIODIC_EVERY == 0 )) && _maybe_refresh_pin
+        continue
+    fi
+    # A failing healthcheck while OUR build is still materialising is bring-up,
+    # not a fault: a bounce here reaps the build and restarts it from zero.
+    if _build_protected; then
         fails=0
         continue
     fi

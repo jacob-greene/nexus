@@ -78,6 +78,24 @@ HARNESS_SESSION=0
 SCENARIO_INTERVAL_S=1
 SCENARIO_THRESHOLD_S=2
 WORKER_NAME=wrapup-worker
+# EMIT-VISIBILITY BUDGET. Every assertion below reads the ARCHIVED emit
+# bodies, and that body's `--- idle workers ---` section is NOT recomputed at
+# `monitor.interval_seconds`. It is served from `.state/scheduler-staging/
+# idle_section.out` (`main.sh:4396`), which only the `idle_section` scheduled
+# task refreshes — registered at a HARD-CODED 30 s
+# (`_schedule_task idle_section 30 …`, `main.sh:4841`; no config key, no env
+# override, so a fixture cannot lower it). `list_idle_transitions` is called
+# once per that task run, so an idle-pool RECLASSIFICATION reaches an archive
+# only on the next 30 s tick, no matter how fast the poll loop turns.
+#
+# The budgets here used to be `SCENARIO_INTERVAL_S * 6` (6 s) and `* 4` (4 s),
+# i.e. sized against the 1 s poll cadence — arithmetic against the wrong
+# producer. They passed only when the 30 s tick happened to land just after
+# the injection, which is exactly the 2-3-4-failure spread this suite has
+# shown every reporter (your-org/nexus-code#1102). This is not slack for a
+# loaded box; it is one full producer period plus a compose cycle, and it must
+# not be tuned back down to look faster.
+EMIT_VISIBILITY_BUDGET_S=45
 RETAIN_REASON="wrap-up-$(date -u +%Y-%m-%d)"
 
 echo "=== harness ==="
@@ -143,11 +161,31 @@ chmod +x "$HARNESS_BIN/gh"
 # $NEXUS_ROOT/monitor/pane-state.sh.
 # ---------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/monitor/watcher"
-for f in main.sh _lib.sh _github.sh _deliveries.sh _mentions.sh \
-         _unstick.sh _idle_probe.sh _over_limit.sh; do
-    cp "$HARNESS_REPO_ROOT/monitor/watcher/$f" \
-       "$HARNESS_DIR/monitor/watcher/$f"
+# Mirror EVERY watcher module, not a hand-maintained subset
+# (your-org/nexus-code#568 A8). main.sh sources its helpers from
+# `$_script_dir/`, and the enumerated list had drifted far behind the module
+# set: of 28 `_*.sh` modules only 8 were copied, so the spawned watcher died
+# at startup on `_target_absent.sh: No such file or directory` and then on
+# `INTERVAL: unbound variable` (the missing `_config.sh` never ran its
+# lookups). The scenario then waited out its deadline against a watcher that
+# had never been alive, and reported a failure that had nothing to do with the
+# behaviour under test. A glob cannot drift: every future extraction is
+# mirrored automatically.
+cp "$HARNESS_REPO_ROOT/monitor/watcher/main.sh" "$HARNESS_DIR/monitor/watcher/main.sh"
+for f in "$HARNESS_REPO_ROOT"/monitor/watcher/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/watcher/$(basename "$f")"
 done
+# ...and the SIBLING helpers the watcher sources from `monitor/` one level up
+# (`_log-mode.sh`, `_tmux-window.sh`, `_cc-version.sh`, `_channel_lib.sh`,
+# `_fs_probe.sh`), plus `reports-roll.sh`. Missing `_log-mode.sh` in particular
+# is not silent-but-harmless: `source` of an absent file returns non-zero
+# WITHOUT aborting, so the watcher ran on with `_ensure_service_log: command
+# not found` spraying from every scheduler tick and every alert. Same glob
+# discipline as above -- enumerate by pattern, never by hand.
+for f in "$HARNESS_REPO_ROOT"/monitor/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/$(basename "$f")"
+done
+cp "$HARNESS_REPO_ROOT/monitor/reports-roll.sh" "$HARNESS_DIR/monitor/reports-roll.sh" 2>/dev/null || true
 cp "$HARNESS_REPO_ROOT/monitor/pane-state.sh" "$HARNESS_DIR/monitor/pane-state.sh"
 
 # ---------------------------------------------------------------------------
@@ -170,11 +208,8 @@ echo
 echo "=== spawn worker ==="
 win=$(harness_spawn_worker "$WORKER_NAME" \
     "STUB_CLAUDE_BUSY_SECONDS=3" \
-    "STUB_CLAUDE_HOLD_SECONDS=60")
-[[ "$win" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: spawn returned non-numeric window index: $win" >&2
-    th_summary_and_exit
-}
+    "STUB_CLAUDE_HOLD_SECONDS=300")
+[[ "$win" =~ ^[0-9]+$ ]] || th_abort "spawn returned non-numeric window index: $win"
 echo "  worker at window=$win"
 
 # ---------------------------------------------------------------------------
@@ -249,8 +284,8 @@ emits_contain() {
 }
 
 worker_window_absent() {
-    ! "$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
-        -F '#{window_name}' 2>/dev/null | grep -qxF "$WORKER_NAME"
+    ! grep -qxF "$WORKER_NAME" <<<"$("$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
+        -F '#{window_name}' 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------------------
@@ -307,7 +342,7 @@ wait_for "pane-state reports idle after spinner clears" 8 -- pane_state_is idle
 echo
 echo "=== phase 3: idle-pool surfaces no-wrap-up ==="
 wait_for "watcher emits no-wrap-up row for $WORKER_NAME" \
-    $(( SCENARIO_THRESHOLD_S + 8 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME idle"
 
 # ---------------------------------------------------------------------------
@@ -318,7 +353,7 @@ echo
 echo "=== phase 4: inject wrap-up → 'wrapped' emit ==="
 inject_wrap_up
 wait_for "watcher emits wrapped row for $WORKER_NAME" \
-    $(( SCENARIO_INTERVAL_S * 6 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME wrapped up"
 
 # ---------------------------------------------------------------------------
@@ -332,10 +367,10 @@ echo
 echo "=== phase 5: inject window-retain → retained footer ==="
 inject_retain
 wait_for "watcher emits retained footer with $WORKER_NAME ($RETAIN_REASON)" \
-    $(( SCENARIO_INTERVAL_S * 6 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME ($RETAIN_REASON)"
 wait_for "retained footer header rendered" \
-    $(( SCENARIO_INTERVAL_S * 4 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "retained windows suppressed"
 
 # ---------------------------------------------------------------------------
@@ -360,7 +395,7 @@ engagement_row_pruned() {
         "$elog" >/dev/null 2>&1
 }
 wait_for "engagement-log row for $WORKER_NAME pruned after disappearance" \
-    $(( SCENARIO_INTERVAL_S * 4 )) -- engagement_row_pruned
+    "$EMIT_VISIBILITY_BUDGET_S" -- engagement_row_pruned
 
 # ---------------------------------------------------------------------------
 # Diagnostic dump on failure. Cheap when the test passes; precious on

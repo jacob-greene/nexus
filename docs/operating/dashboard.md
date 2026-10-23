@@ -39,7 +39,7 @@ The body has two auto-managed regions plus operator prose. The first is the **Ne
 <!-- text below the END marker also stays -->
 ```
 
-Six sections, in this fixed order. The set is the single source of truth in `DASH_REQUIRED_SECTIONS` (`monitor/ng`); change it there and it propagates to every operator nexus on the next `nexus-code` pull.
+Six sections, in this fixed order. `DASH_REQUIRED_SECTIONS` (`monitor/ng`) is what `validate` checks against; `scaffold` emits its own literal skeleton from `_dashboard_template`, and the two are held in agreement by `monitor/watcher/test-ng-dashboard.sh` (Test 15 asserts every required section appears in the scaffold; Test 18 asserts the scaffold passes `validate`). So a rename must touch BOTH, and the suite goes red if it touches only one. Once both are updated it propagates to every operator nexus on the next `nexus-code` pull.
 
 | Section | What's in it |
 |---|---|
@@ -63,7 +63,11 @@ The orchestrator decides on every wake whether the dashboard needs a refresh. Tr
 
 For trivial deltas (single dirty/clean flip, no other change) the orchestrator skips the refresh — the dashboard isn't a log, and noise edits inflate the `<!-- NEXUS_DASHBOARD_END -->` revision history.
 
-The `--- dashboard ---` last-updated timestamp at the end of each watcher report is a gentle reminder, not a hard rule; if state hasn't moved since the timestamp the orchestrator declines to rewrite.
+The `--- dashboard ---` last-updated timestamp at the end of each watcher report (absent under `status_surface.kind: external`; see below) is a gentle reminder, not a hard rule; if state hasn't moved since the timestamp the orchestrator declines to rewrite.
+
+## Running your own status page instead
+
+The dashboard is the default status surface. If you run your own status page, set `status_surface.kind: external` in `config/nexus.yml` (optionally `url_file`, a file whose first line is the page URL, and `feed`, the landings file the page reads). Then the orchestrator stops maintaining the dashboard, the watcher report shows `--- status surface ---` (your page and feed) in place of the put timestamp, and `ng dashboard put` still works but notes that the dashboard is not the configured surface. The overview issue stays the routing channel. With the key absent, nothing changes. Any other `kind` is refused, never read as the default. Details and the full table: [`skills/nexus.dashboard/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.dashboard/SKILL.md) ("Two modes").
 
 ## The identity block (`ng nexus-identity`)
 
@@ -97,7 +101,7 @@ monitor/ng dashboard validate [--body-file new-dashboard-middle.md]
 monitor/ng dashboard put --body-file new-dashboard-middle.md
 ```
 
-`scaffold` and `validate` share their section check (`_dashboard_missing_sections` in `monitor/ng`) with the same source of truth as `DASH_REQUIRED_SECTIONS`. The split is deliberate: `validate` is the hard gate (exit 1 on drift), while `put` runs the *same* checks in warn-only mode — it prints what is wrong to stderr but still pushes, so the operator can update the dashboard in a hurry without a footgun-y hard block. Seed a fresh dashboard by piping `scaffold` into `put`.
+`validate` and `put` share their section check — `_dashboard_missing_sections` in `monitor/ng`, reading `DASH_REQUIRED_SECTIONS`. (`scaffold` runs no check at all; it just prints `_dashboard_template`.) The split is deliberate: `validate` is the hard gate (exit 1 on a missing required section, and also on an exactly-duplicated one), while `put` runs the *same* missing-section check, plus the size-budget check below, in warn-only mode — it prints what is wrong to stderr but still pushes, so the operator can update the dashboard in a hurry without a footgun-y hard block. Seed a fresh dashboard by piping `scaffold` into `put`.
 
 ### The dashboard is size-bounded
 
@@ -162,9 +166,11 @@ Use the log when the dashboard summary feels off ("when did that worker actually
 The GitHub dashboard answers "what is the nexus *doing*?"; the local cockpit answers "is the nexus *running*?". `./watcher` leaves it open in the `services` tmux window after boot, and you can open it anywhere:
 
 ```bash
-monitor/svc.sh            # live auto-refreshing cockpit (read-only)
-monitor/svc.sh status     # one status table, then exit (scriptable)
+monitor/svc.sh --show-secrets   # live auto-refreshing cockpit (read-only), URLs unredacted
+monitor/svc.sh status           # one status table, then exit (scriptable); secrets redacted
 ```
+
+`--show-secrets` (or `SVC_SHOW_SECRETS=1`) shows a URL's secret query parameters, such as the JupyterLab `?token=`, so the link can be copied straight from the cockpit. Every cockpit launcher passes it. Without it, a bare `svc.sh` and `svc.sh status` redact the value and name the mode-0600 `monitor/.state/services/<name>.url` file that holds the full URL (<your-org>/nexus-code#1821).
 
 One row per piece of the stack — the **watcher** (headless service; tri-state liveness from its heartbeat) and the **orchestrator** (watcher-managed; window presence + turn-end heartbeat age) pinned on top, then every service registered in `monitor/services.registry`. Single-key controls:
 

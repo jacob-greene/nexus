@@ -30,6 +30,10 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC_ROOT=$(cd "$_test_dir/../.." && pwd)
 STUB_DIR="$_test_dir/fixtures/stubs"
+# Sourced for `th_tmux_fixture_conf` (Case E's hermetic tmux config). The
+# suite keeps its own assert_* and PASS/FAIL tally, defined BELOW so they win.
+# shellcheck source=/dev/null
+. "$_test_dir/_test_helpers.sh"
 
 PASS=0
 FAIL=0
@@ -40,7 +44,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s — needle %q absent\n' "$label" "$needle" >&2
         printf '    haystack head: %s\n' "${haystack:0:400}" >&2
         FAIL=$(( FAIL + 1 )); fi
@@ -50,7 +55,8 @@ skip() {
 }
 
 WORK=$(mktemp -d -t nexus-bootstrap-stub-XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+# Chains the helper library's own EXIT reaper, which this trap replaces.
+trap 'rm -rf "$WORK" ${TMX_DIR:+"$TMX_DIR"}; _th_reap_own_tmp' EXIT
 
 # Fake nexus-clone shape — the script's pre-flight markers + helpers.
 NEXUS="$WORK/nexus"
@@ -140,8 +146,22 @@ assert_contains "install-prompt body present: Phase 4 smoke tests header" \
     "$record" "## Phase 4 — smoke tests"
 assert_contains "install-prompt body present: Phase 5 overview seed header" \
     "$record" "## Phase 5 — seed the overview issue"
-assert_contains "install-prompt body present: Phase 6 Lab-specific addons" \
-    "$record" "## Phase 6 — Lab-specific addons"
+# Phase 6 is the ONE phase whose title is forked by the public-mirror
+# overlay (`monitor/public-mirror/overlay/install-prompt.phase6.md`
+# reframes the lab addons as general HPC skills), and this suite ships
+# to the mirror, so pinning the source title failed 1 on every built
+# tree (your-org/nexus-code#979 defect 1). Pin the phase MARKER, which
+# no variant may change, and recover the lost strength from the three
+# subsection headings — the overlay preserves 6.1/6.2/6.3, so an
+# actually-truncated Phase 6 still fails here.
+assert_contains "install-prompt body present: Phase 6 header" \
+    "$record" "## Phase 6 — "
+assert_contains "install-prompt body present: Phase 6.1 subsection" \
+    "$record" "### 6.1 — "
+assert_contains "install-prompt body present: Phase 6.2 subsection" \
+    "$record" "### 6.2 — "
+assert_contains "install-prompt body present: Phase 6.3 subsection" \
+    "$record" "### 6.3 — "
 assert_contains "install-prompt body present: Phase 7 hand-off header" \
     "$record" "## Phase 7 — hand off to the watcher"
 assert_contains "install-prompt body present: Recovery routines section" \
@@ -186,7 +206,16 @@ echo '=== Case E: real-tmux window rename ==='
 if ! command -v tmux >/dev/null 2>&1; then
     skip "tmux not on PATH; window-rename assertion skipped"
 else
-    TMX_SOCK="$WORK/tmux.sock"
+    # A SHORT socket dir (#991): `$WORK` is under `$TMPDIR`, which in an
+    # agent session is over the 107-byte sun_path ceiling before any suffix,
+    # and new-session then failed into the SKIP below. The precondition is
+    # CALLED (the §8 ratchet in test-tmux-socket-ceiling.sh): it measures
+    # `$TMX_DIR/tmux-<uid>/s`, strictly longer than the `-S` path `$TMX_DIR/s`
+    # used here, so it bounds it.
+    TMX_DIR=$(tmux_socket_short_tmpdir "bss$$")
+    mkdir -p "$TMX_DIR" && chmod 700 "$TMX_DIR"
+    th_require_tmux_socket s "$TMX_DIR"
+    TMX_SOCK="$TMX_DIR/s"
     SESS="nexus-bootstrap-test"
     INITIAL_NAME="initial"
     # Clean tmux server state to keep test repeatable on a worktree
@@ -204,7 +233,20 @@ else
     # $SHELL which on some images (busybox-ish CI shims, locked-down
     # sandboxes) drops to a non-interactive shell that ignores
     # send-keys.
-    tmux -S "$TMX_SOCK" new-session -d -s "$SESS" -n "$INITIAL_NAME" \
+    #
+    # `-f` WITH THE FIXTURE CONFIG IS LOAD-BEARING, not hygiene. Without it
+    # the private server loads the invoking user's ~/.tmux.conf. If that file
+    # has ANY error, tmux 2.6 shows the error list by putting the pane into
+    # COPY MODE, and with no client attached a copy-mode key binding (`e`,
+    # `h`, `b`, space, Enter, C-m — the first key of the send-keys below is
+    # `e`) crashes the server: send-keys reports "lost server" and the case
+    # fails for a reason that lives in a dotfile. Measured on tmux 2.6 with a
+    # planted one-line error (`set-option -g mouse om`): 4/4 crash without a
+    # fixture config, 0/4 with it. Guarded corpus-wide by
+    # test-tmux-fixture-conf-lint.sh.
+    TMX_CONF="$WORK/tmux.conf"
+    th_tmux_fixture_conf "$TMX_CONF"
+    env -u TMUX tmux -S "$TMX_SOCK" -f "$TMX_CONF" new-session -d -s "$SESS" -n "$INITIAL_NAME" \
         -x 200 -y 50 bash --norc --noprofile 2>"$WORK/tmux-spawn.err"
     tmux_rc=$?
 

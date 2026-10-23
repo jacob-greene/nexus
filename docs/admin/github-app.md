@@ -133,7 +133,7 @@ the rest ungranted keeps the bot's blast radius small.
 |---|---|---|---|
 | Repository → **Metadata** | Read | Implicit — every `gh api /repos/:r/...` resolves through it; `monitor/mint-token.sh`'s output is unusable without it | Required by every GitHub App. |
 | Repository → **Issues** | Read & Write | `monitor/ng process\|react\|reply\|close\|dashboard ...`; `monitor/watcher/_github.sh:snapshot_github` (GraphQL `search(type: ISSUE)` + comment-reactions fetch) | The dashboard is issue-body content; the eligibility filter reads comment bodies and reactions; every directive turn reacts 👀/🚀, posts replies, closes threads, or patches the overview body between the `<!-- NEXUS_DASHBOARD_START -->` markers. |
-| Repository → **Contents** | Read & Write | `monitor/upload-asset.sh`: `git clone` / `git fetch` / `git push` against `https://x-access-token:<TOKEN>@github.com/<asset-repo>.git` | Pushing to the asset repo's `main` branch under `assets/...` requires Contents write. Without it `git push origin main` returns 403. |
+| Repository → **Contents** | Read & Write | `monitor/upload-asset.sh`: `git clone` / `git fetch` / `git push` against `https://github.com/<asset-repo>.git` (the installation token reaches git through an inline credential helper, never the URL, #1840) | Pushing to the asset repo's `main` branch under `assets/...` requires Contents write. Without it `git push origin main` returns 403. |
 | Repository → **Pull requests** | Read & Write | `monitor/ng pr create\|edit\|merge\|view ...`; worker invocations of `GH_TOKEN=$(./monitor/mint-token.sh) gh pr ...` | Bot-authored PR operations 403 without this scope. Used by worker agents that open PRs on their feature branches. |
 | Organization → **Members** | Read | `gh pr edit` invoked as the bot against a PR in an org-owned head repo | `gh pr edit` validates the authenticated identity's edit rights by checking org membership before issuing the REST call. Without this scope the CLI errors out client-side. |
 
@@ -246,19 +246,21 @@ Run each command in order from the nexus root. Each step is
 independently re-runnable; fix the cause and re-run before moving on.
 
 ```bash
-# 1. Mint an installation token. Should print a JWT-shaped value.
+# 1. Mint an INSTALLATION token (a `ghs_...` value, not a JWT).
 ./monitor/mint-token.sh
 
-# 2. App-JWT smoke (used by the deliveries probe).
+# 2. App-JWT smoke — this one IS a JWT (three dot-separated segments).
+#    Used by the deliveries probe.
 ./monitor/mint-token.sh --jwt-only
 
-# 3. Resolve an issue via the bot token. Both "ok" and "ng: not found"
-#    prove the token mints and the App can read the repo.
+# 3. Resolve an issue via the bot token. Both `#1 state=OPEN|CLOSED title=...`
+#    and `ng: issue 1: fetch failed` (an empty repo) prove the token
+#    mints and the App can read the repo.
 ./monitor/ng issue 1
 
 # 4. Bot install scope.
 ./monitor/ng preflight "$(./config/load.sh github.repo)"
-# expected: "bot installed yes"
+# expected: "bot installed: yes (<repo>) — repository_selection=..."
 
 # 5. End-to-end asset upload. Commits one file to the asset repo's
 #    main branch and prints the SHA-pinned URL.
@@ -274,8 +276,9 @@ watcher.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `private key not found` | `bot_pem_path` is wrong or the file moved | `ls -l "$(./config/load.sh github.bot_pem_path)"` must show `-rw-------`. Re-`chmod 600`. |
+| `REFUSING to sign … verdict=exposed` (exit 4) | the key is world-accessible **and** every ancestor directory is world-traversable, so other local users can read it (<your-org>/nexus-code#1501) | `chmod 600 "$(./config/load.sh github.bot_pem_path)"`, then **rotate** — a chmod does not un-expose a key that was readable. `./monitor/mint-token.sh --check-key` reports the verdict without minting. |
 | `Bad credentials` on the deliveries probe | `bot_app_id` doesn't match the pem you downloaded | Recheck the App page; the App ID is at the top. |
-| `ng preflight` returns `bot installed no` | App is not installed on the asset+issue repo | Re-do [Step 7](#step-7-install-the-app-on-your-assetissue-repo). |
+| `ng preflight` returns `bot installed: NO` | App is not installed on the asset+issue repo | Re-do [Step 7](#step-7-install-the-app-on-your-assetissue-repo). |
 | `ng upload` 403 on push | Contents permission granted on the App but not installed on the asset repo | Same — re-do Step 7. |
 | `ng upload` 404 cloning the asset repo | The repo doesn't exist on GitHub, or `github.repo` is misspelled | `gh repo view "$(./config/load.sh github.repo)"`. |
 | `gh pr edit` fails with `Resource not accessible by integration` or `could not look up members of organisation` | Missing Organization → Members: read permission | Add it via App settings, accept the new-permission request on the installation. |
@@ -294,7 +297,7 @@ Then re-run the deliveries probe:
 ```bash
 JWT=$(./monitor/mint-token.sh --jwt-only)
 curl -sS \
-    -H "Authorization: Bearer $JWT" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$JWT") \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/app/hook/deliveries?per_page=3" \
   | jq '.[].event, .[].status_code'
@@ -377,7 +380,9 @@ If the `.pem` leaks or you suspect compromise:
 2. Replace the file at `github.bot_pem_path` with the new one
    (`chmod 600`).
 3. Mint a token to confirm: `./monitor/mint-token.sh` should print a
-   fresh JWT-shaped value.
+   fresh installation token (`ghs_...`). Note the token cache at
+   `github.bot_token_cache` may still hold a valid token from the old
+   key — delete it if you want to prove the new key signs.
 4. On the App settings page, **delete the old key** to invalidate
    any in-flight JWT signed with it.
 5. The next watcher cycle picks up the new key automatically — no

@@ -158,12 +158,15 @@ github:
 
 lit:
   # Literature-research tool (`ng lit`). Content-relevance paper discovery
-  # over PubMed (NCBI E-utilities), Semantic Scholar (S2) and ASTA, deduped
-  # against the reference library. PubMed needs NO key and is the default
-  # backend when neither S2 nor ASTA is configured, so `ng lit search` works
-  # out of the box. The S2/ASTA keys are OPTIONAL: an unconfigured keyed
-  # backend is skipped with a note (never a hang). Full setup +
-  # key-acquisition walkthrough: docs/reference/literature.md.
+  # over PubMed (NCBI E-utilities), Semantic Scholar (S2), ASTA, and
+  # OpenAlex, deduped against the reference library. The four backends are
+  # COMPLEMENTARY (different papers, different metadata), not alternatives —
+  # `--source all` (the default) queries every usable one and fuses the
+  # dedup'd results. S2/ASTA keys are OPTIONAL: an unconfigured keyed
+  # backend is skipped with a note (never a hang). PubMed and OpenAlex need
+  # NO key at all, so they are never "unconfigured" and `ng lit search`
+  # works out of the box. Full setup + key-acquisition walkthrough:
+  # docs/reference/literature.md.
   #
   # config/nexus.yml is gitignored, so inlining the keys here is safe; you
   # may also export S2_API_KEY / ASTA_API_KEY in the environment (env wins).
@@ -181,9 +184,34 @@ lit:
   ncbi_email: ""
   # Sent as `tool=` (NCBI_TOOL). Default: nexus-lit.
   # ncbi_tool: nexus-lit
+  # OpenAlex "polite pool" contact email — no key, just good etiquette
+  # (higher, more reliable rate limit; see https://docs.openalex.org).
+  # Falls back to notifications.email.address if left blank.
+  openalex_mailto: ""
   # Reference library (JSONL). Default: <nexus.root>/.bipartite/refs.jsonl.
   # Point this at a path inside your asset repo to version the library.
   # library_path: ~/path/to/refs.jsonl
+
+status_surface:
+  # Where the operator reads "the state of everything" (<your-org>/nexus-code#1839).
+  #   overview-dashboard  the default, and what an ABSENT block means: the
+  #                       overview issue's dashboard, kept current with
+  #                       `ng dashboard put` (skills/nexus.dashboard/SKILL.md).
+  #   external            you run your own status page. The watcher emit stops
+  #                       reporting dashboard puts and points at your page;
+  #                       the orchestrator stops maintaining the dashboard.
+  #                       `ng dashboard put` still works, with a note.
+  # Any other value is REFUSED (`config/load.sh --validate`, and so watcher
+  # start), never read as the default.
+  kind: overview-dashboard
+  # external only, both optional; relative paths resolve against nexus.root.
+  # url_file: a file whose first line is the page's URL (a service's
+  #   `.deploy/endpoint`, skills/nexus.services/SKILL.md) — never a
+  #   hardcoded host.
+  # url_file: work/status-page/.deploy/endpoint
+  # feed: the append-only landings file your page reads; the emit names it so
+  #   the orchestrator knows where landings go.
+  # feed: work/status-page/landings.tsv
 
 notifications:
   # Phone push: Pushover is preferred, ntfy is the fallback. Both are
@@ -221,6 +249,26 @@ notifications:
 monitor:
   # Seconds between watcher snapshots.
   interval_seconds: 60
+  # The branch merged fixes land on (nexus-code#763). A REPO-WIDE
+  # property with two consumers — the clone-drift detector (`#620`) and
+  # the cc-auto-update deployment gate (`#754`) — resolved for both by
+  # the single resolver monitor/_integration_branch.sh. Set this when
+  # your fork integrates somewhere other than `dev`.
+  #
+  # Left COMMENTED deliberately: during the migration window an active
+  # key here would out-rank a deprecated `monitor.clone_drift.branch` in
+  # a copied config and report a conflict the operator never created.
+  #
+  # Resolution: $MONITOR_INTEGRATION_BRANCH → monitor.integration_branch
+  #   → monitor.clone_drift.branch (DEPRECATED) → `dev`.
+  #
+  # MIGRATION — if your config/nexus.yml still carries
+  # `monitor.clone_drift.branch`, rename it to `integration_branch` here.
+  # The old key is honoured (with a one-line note on stderr) until
+  # **2026-11-07**; after that date an unrenamed key silently becomes
+  # `dev`, which is exactly the invisible failure the read-both
+  # transition exists to prevent.
+  # integration_branch: dev
   # tmux window the continuous watcher pastes reports into. Default
   # "orchestrator" matches the workspace convention: the watcher's
   # spawn paths create the window under this name and the
@@ -458,14 +506,81 @@ monitor:
     # backoff STRETCHES the effective floor the longer the canonical stays
     # continuously unchanged — each time sustained idle crosses the next
     # power-of-two multiple of the base it doubles, capped at max_seconds
-    # (900→1800 after ~30 min idle→3600 after ~60 min, ≈1 wake/hour on a
-    # still night). It SNAPS BACK to the base the instant the canonical
-    # changes, so a genuine transition is never delayed. Set enabled=false
-    # (or max_seconds<=safety_floor_seconds) to restore the fixed-floor
-    # behaviour. Env: MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED /
+    # (900→1800 after ~30 min idle→3600 after ~60 min→7200 after ~2 h,
+    # ≈1 wake / 2 h on a still night). It SNAPS BACK to the base the instant
+    # the canonical changes, so a genuine transition is never delayed. Set
+    # enabled=false (or max_seconds<=safety_floor_seconds) to restore the
+    # fixed-floor behaviour. Env: MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED /
     # MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS.
+    #
+    # max_seconds is a TRUE CAP: any positive value is honoured exactly,
+    # not only the rungs base*2^k (<your-org>/nexus-code#659). It used to be
+    # a ladder TERMINATOR — a non-rung value silently rounded DOWN to the
+    # previous rung with no warning, so `43200` delivered `28800` for ever
+    # while the config file, the loader and the suppression log all agreed
+    # 43200 was in force. The RUNGS below the cap are still powers of two
+    # of the base; only the ceiling is exact. So with base=900 the floor
+    # steps …→28800 and then goes to max the next time idle doubles.
+    #
+    # Default raised 3600 → 7200 (watcher-emit-noise): once the
+    # discriminating emit-noise fixes below remove the misleading /
+    # redundant / no-op emit classes, the residual deep-idle heartbeat is a
+    # pure liveness proof — halving its overnight rate is the intended noise
+    # reduction. CLAMP-SAFE: the dead-threshold clamp is derived from the
+    # BASE safety_floor + full_state_emit_interval, NOT this max, so the
+    # startup clamp arithmetic is unchanged. The stale_paste_ceiling is
+    # deliberately NOT raised in lockstep (raising it would ARM the wedge
+    # probe longer — the opposite of the deep-idle stand-down this backoff
+    # wants); the only trade is a longer wedge-detection stand-down window
+    # on a deep-idle night (~1 h → ~2 h worst case).
+    #
+    # Default raised 7200 → 86400 (<your-org>/nexus-code#1736): a calm board
+    # should cost no tokens. Rungs …→28800→57600, then the 86400 cap once
+    # the board has been actionably unchanged for 32 h. "Unchanged" means
+    # the ACTIONABLE projection: worker busy/idle flips do not reset it.
+    # Same clamp argument; the trade is that wedge detection on a board
+    # calm for a day waits for the next heartbeat (up to 24 h) or event.
     idle_backoff_enabled: true
-    idle_backoff_max_seconds: 3600
+    idle_backoff_max_seconds: 86400
+    # A pane-state READ FAILED row ("could not determine") that persists
+    # this many CONSECUTIVE full-state polls (one per
+    # full_state_emit_interval, 600 s) emits at once and snaps the backoff
+    # back (<your-org>/nexus-code#1738). Fewer polls is churn and does not
+    # reset the backoff. Default 3, chosen: ~20-30 min. Env:
+    # MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS.
+    read_failed_persist_polls: 3
+    # Discriminating emit-noise reduction (watcher-emit-noise). Three
+    # narrowly-scoped, individually-reversible suppressions of emit CLASSES
+    # that wake the orchestrator with nothing actionable. Each defaults ON
+    # and is a pure rarefaction/dedup — none removes the liveness heartbeat.
+    #
+    #   restat_windows — re-stat the periodic `--- workspace snapshot ---`
+    #     against the CURRENT tmux window set at compose time and drop rows
+    #     for windows killed since the async render captured them (a stale
+    #     snapshot otherwise presents a retired window as live). Env:
+    #     MONITOR_FULL_STATE_RESTAT_WINDOWS.
+    #   reset_stamp_on_emit — restart the full-state DUE clock from ANY
+    #     successful paste, not only a full-state emit, so a change/resurface
+    #     poll defers the next periodic full-state instead of being shadowed
+    #     by one moments later. Moves only the DUE cadence; the timeout
+    #     heartbeat (canonical mtime + floor) is untouched. Env:
+    #     MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT.
+    restat_windows: true
+    reset_stamp_on_emit: true
+
+  # Pending-decisions emit (issue #129) — operator-facing surface for a
+  # worker window that hit a prompt (permission_prompt / idle_prompt / …).
+  pending_decisions:
+    # skip_dead_windows (watcher-emit-noise, Class 3) — a decision is only
+    # actionable in a LIVE window (the operator answers the prompt IN the
+    # window). When true, render_pending_decisions drops rows for windows
+    # no longer present in tmux, so a killed worker's lingering decision
+    # file stops re-nagging the orchestrator every cooldown (the 2026-07-21
+    # 00:33/00:34 pubfork-skills[-skeptic] re-nags, both kill-window'd
+    # ~00:34 with the skeptic-park suppression already lapsed). Pass-through
+    # when the live query is empty (tmux transient) so a real decision is
+    # never lost. Env: MONITOR_PENDING_SKIP_DEAD_WINDOWS.
+    skip_dead_windows: true
 
   # Bounded comment resurfacing (issue #3). `emit_cooldown_seconds`
   # above is a RATE, not a cap: an eligible-but-unprocessed comment
@@ -653,18 +768,30 @@ monitor:
   # (base dev) and holds for operator approval. Gate RED or any
   # residual uncertainty -> block, surface, no bump.
   cc_auto_update:
-    # Master enable. DEFAULT TRUE — paired with cc_update.emit_enabled:
-    # false above, the autonomous gated routine is the STANDARD cc-update
-    # path and the manual nag it replaces is silenced (<your-org>/<operator>-
-    # nexus#229, operator decision 2026-06-16 — option (a): emit silent +
-    # auto-update on). The autonomy is bounded, not blind: a bump happens
+    # Master enable. TWO DEFAULTS, AND THEY DIFFER (<your-org>/nexus-code#1476):
+    # code default off, shipped template on.
+    #   * the CODE fallback (monitor/watcher/_config.sh, key ABSENT from
+    #     the config file in use) is FALSE — an auto-bump routine must
+    #     never go live as a silent side effect of `git pull` into an
+    #     existing install whose nexus.yml never gained this key;
+    #   * THIS TEMPLATE sets it TRUE, per the operator decision of
+    #     2026-06-16 (<your-org>/<your-nexus>#229, option (a): emit silent +
+    #     auto-update on). config/load.sh picks ONE file whole
+    #     ($NEXUS_CONFIG, else config/nexus.yml, else this file), so a
+    #     tree with NO config/nexus.yml (fresh clone, CI, a copied
+    #     template) runs with it ON, while an existing nexus.yml that
+    #     lacks the key runs with it OFF.
+    # Paired with cc_update.emit_enabled: false above, the autonomous
+    # gated routine is the STANDARD cc-update path and the manual nag it
+    # replaces is silenced. The autonomy is bounded, not blind: a bump happens
     # ONLY behind a cc-harness GREEN gate — monitor/cc-auto-update-apply.sh
     # refuses any verdict whose evidence does not contain `GATE GREEN`, so
     # a RED gate never bumps; a candidate needing a nexus-code compat
     # change is held on a `cc-compat` PR for operator approval, never
-    # auto-bumped. NOTE the cross-operator implication of this default: a
-    # fresh install now grants the stack autonomy to self-update Claude
-    # Code at `fire_time` out of the box. To opt OUT, set this false (and,
+    # auto-bumped. NOTE the cross-operator implication of the template
+    # value: a fresh install (this file copied, or no nexus.yml at all)
+    # grants the stack autonomy to self-update Claude Code at `fire_time`
+    # out of the box. To opt OUT, set this false (and,
     # if you also want the manual "update available" nag back, set
     # cc_update.emit_enabled: true above). Env:
     # MONITOR_CC_AUTO_UPDATE_ENABLED.
@@ -679,29 +806,67 @@ monitor:
     # 0 disables the task. Env:
     # MONITOR_CC_AUTO_UPDATE_CHECK_INTERVAL_SECONDS.
     check_interval_seconds: 300
-    # Tracking issue number on the IMPLEMENTATION repo
-    # <your-org>/nexus-code (NOT this asset repo) the evaluator wraps up
-    # against on a surfaced verdict (review/compat/block). A SAFE
-    # auto-update is silent — no issue anywhere. cc-update notices must
-    # NEVER land in the operator's asset repo. Empty = no standing
-    # issue; the evaluator opens a fresh nexus-code issue if it must
-    # surface a block. Env: MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE.
+    # Tracking issue the evaluator wraps up against on a surfaced verdict
+    # (review/compat/block). A SAFE auto-update is silent — no issue
+    # anywhere.
+    #
+    # MUST be a QUALIFIED reference, "owner/repo#N" — never a bare number.
+    # `#N` is repo-relative, and this repo is cloned by every operator, so
+    # the same number names different things in your asset repo and in the
+    # shared implementation repo. A bare number is REFUSED (the evaluator
+    # declines to fire and says so) rather than resolved against a repo
+    # nobody wrote down: <your-org>/nexus-code#866 is a month of evaluations
+    # that posted successfully to an unrelated closed PR because the number
+    # was read in a repo it was not written for. Nothing errored; the
+    # operator simply never saw them.
+    #
+    # Correcting the NUMBER is not the fix — a corrected bare number is
+    # right until the next reader supplies a different repo. Only a
+    # reference that carries its repo is stable.
+    #
+    #   tracking_issue: "<your-org>/nexus-code#229"   # qualified
+    #   tracking_issue: 229                         # REFUSED
+    #
+    # cc-update notices belong on the IMPLEMENTATION repo, not your asset
+    # repo, so this normally names <your-org>/nexus-code (or your fork).
+    # Empty = no standing issue; the evaluator opens a fresh one on the
+    # surface repo if it must surface a block.
+    # Env: MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE.
     tracking_issue: ""
     # Deployment gate (nexus-code#512): the release gate vets the Claude
-    # Code BINARY; this vets the ACT of deploying it — restarting the
-    # watcher under N mid-flight agents is a different risk from
-    # restarting an idle nexus. When more than this many live tmux
-    # windows count as agents-at-risk (everything except the
-    # orchestrator, the evaluator + restart-watchdog windows and
-    # `services`), the apply is DEFERRED — nothing bumped, verdict
-    # recorded, retried at the next daily fire. 0 disables the window
-    # gate (the count is still logged in every apply record). The gate
-    # also defers while any open <your-org>/nexus-code PR touches the
-    # watcher restart path, and records how far the clone lags
-    # origin/main (`behind_main=`) in decisions.tsv. Read by
+    # Code BINARY; this vets the ACT of deploying it. It defers while any
+    # open <your-org>/nexus-code PR touches the watcher restart path or is
+    # under active review (both bounded — see defer_streak_cap below).
+    #
+    # RETIRED 2026-09-12 — `max_live_windows` IS NO LONGER READ. The
+    # live-window COUNT arm and the board-quiet arm were removed by
+    # operator decision, in these words: "a cc-update will not kill the
+    # worker, and if they, for whatever reason, would crash, then the
+    # orchestrator can continue them with no context lost." The premise
+    # was measured first (monitor/cc-auto-update-apply.sh, deployment-
+    # gate knob block). The live-window count is still ENUMERATED and
+    # written to every apply record (`live_windows=`, `unquiet_windows=`);
+    # a value for this key is inert. Left here, commented out, so an
+    # existing nexus.yml that carries it is understood rather than
+    # silently ignored. The gate still records how far the clone lags the
+    # INTEGRATION branch — `monitor.integration_branch` (`#763`; was
+    # `monitor.clone_drift.branch`), the branch merged fixes actually
+    # land on, not `main` (`#754`) — as
+    # `behind_integration=` / `integration_branch=` / `drift=` in
+    # decisions.tsv. Pre-`#754` rows carry `behind_main=` and
+    # under-report, so the two are not comparable. Read by
     # monitor/cc-auto-update-apply.sh at run time (not a watcher env).
-    # Env: CC_AUTO_MAX_LIVE_WINDOWS.
-    max_live_windows: 8
+    # (was: Env CC_AUTO_MAX_LIVE_WINDOWS — also no longer read.)
+    # max_live_windows: 8
+    # How long an open PR touching the watcher RESTART PATH counts as
+    # "under repair" after its last update (<your-org>/nexus-code#1414).
+    # The arm used to have NO recency bound, so a stalled cosmetic PR on
+    # monitor/svc.sh blocked the routine forever while the broader
+    # active-review arm (pr_active_seconds, default 7200) aged it out.
+    # Deliberately much longer than pr_active_seconds — a restart-path PR
+    # is categorically more dangerous — and independently tunable.
+    # Env: CC_AUTO_GATE_RESTART_PR_ACTIVE_SECONDS.
+    restart_pr_active_seconds: 604800
     # NOTE — `enabled` above is REGISTRATION-TIME ONLY (nexus-code#513):
     # a running watcher never re-reads it, so flipping it cannot stop an
     # armed orchestrator restart. The runtime off switch is the durable
@@ -709,6 +874,59 @@ monitor:
     #     monitor/cc-auto-update-apply.sh hold --reason "…" \
     #         [--until-version X.Y.Z | --ttl-seconds N]
     #     monitor/cc-auto-update-apply.sh unhold
+
+  # Over-limit wake loop and emit gate (issue #87, #592, #593, #976).
+  # When the orchestrator's pane renders the weekly-budget notice, the
+  # WATCHER owns the resume — the orchestrator cannot schedule its own
+  # wake while suspended. The same module also gates the operator emit,
+  # which is why the visibility knobs live here and not in a log file:
+  # withholding the operator channel silently is a strictly worse outage
+  # than the hold itself. See monitor/watcher/_over_limit.sh.
+  #
+  # Every key below is optional; the value shown IS the in-code default,
+  # so deleting the whole block changes nothing. It is spelled out because
+  # `over_limit` was previously advertised as a namespace with no example
+  # and three of its eight keys were not wired at all (#976).
+  over_limit:
+    # Seconds of margin added to the parsed reset epoch before the first
+    # wake attempt — clock skew plus the rate-limit bucket not refilling
+    # exactly on the dot. Env: MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS.
+    wake_margin_seconds: 300
+    # Delay before the first retry when a wake attempt finds the pane
+    # still suspended. Env: MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS.
+    initial_backoff_seconds: 60
+    # Cap on the exponential backoff between retries. Env:
+    # MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS.
+    max_backoff_seconds: 300
+    # Fail OPEN (paste the resume brief, drop the row) after this many
+    # still-over-limit wake attempts. 4 ≈ 7 min of grace past the reset
+    # margin. Env: MONITOR_OVER_LIMIT_MAX_ATTEMPTS.
+    max_attempts: 4
+    # Absolute per-row hold ceiling (25h). Env:
+    # MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS.
+    max_hold_seconds: 90000
+    # How long an OBSERVED over-limit sighting keeps the orchestrator
+    # emit gate suppressed. The scan refreshes it every ~60s during a
+    # genuine hold, so 600 tolerates ten consecutive missed cycles before
+    # the gate OPENS. The polarity is deliberate: absent evidence of
+    # suspension, emit. A wrong reset epoch once severed the
+    # operator↔orchestrator channel for fifteen hours in silence.
+    # RAISING this lengthens that worst case. Env:
+    # MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS.
+    observation_staleness_seconds: 600
+    # How long a hold must last before the FIRST out-of-band announcement
+    # that the orchestrator's emit channel is being withheld. 0 disables
+    # the announcement entirely (the hold then remains visible only in
+    # watcher.log, which is what made a 15h blackout pass unnoticed). Env:
+    # MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS.
+    suppression_alert_seconds: 900
+    # Cadence of the reminders AFTER that first announcement. Separate
+    # from the announcement delay on purpose: a legitimate 5h hold fired
+    # 20 critical-class bells when both used the same 15-min interval,
+    # which trains the operator to ignore exactly the signal this exists
+    # to send. Raise it if the default is still too loud for your site.
+    # Env: MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS.
+    suppression_reminder_seconds: 3600
 
   # Continuous service-health watch (service-health-watch). The
   # `service_health` watcher task runs every registered infra service's
@@ -786,7 +1004,11 @@ monitor:
   # orchestrator (orchestrator-liveness), so the orchestrator's own
   # always-on agent loop is the external supervisor the watcher needs —
   # closing the circularity by MUTUALITY, not a new process. The
-  # orchestrator arms a persistent Monitor:
+  # orchestrator runs monitor/arm-watcher-supervisor.sh, a PERSISTENT
+  # longjob watch on its plugin dispatcher (not bound by the 30-min Monitor
+  # cap, polled independently of its turns) whose probe revives a dead
+  # watcher itself (<your-org>/nexus-code#1532). Only when the dispatcher is
+  # NOT ARMED does it fall back to a Monitor lease re-armed every 30 min:
   #     Monitor({command:
   #       'until ! /ABS/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
   # Each tick TOUCHES a supervisor heartbeat (proving it is armed) and
@@ -876,6 +1098,70 @@ monitor:
     # the whole point; set false to disable the GitHub half (the terminal
     # alarm always remains). Env: MONITOR_ROFS_GITHUB_ESCALATION_ENABLED.
     github_escalation_enabled: true
+
+  # longjob-watch dispatcher (<your-org>/nexus-code#1535): ONE host-armed
+  # plugin monitor per session (`claude --plugin-dir monitor/longjob-plugin`)
+  # that polls the session's watch spool and WAKES the agent when a Slurm
+  # job / async-run token / pid / file predicate / command probe reaches
+  # ANY terminal state. Tool: monitor/longjob-watch.sh (`ng longjob`).
+  longjob:
+    # THE kill switch, and its own — not shared with any other feature (a
+    # field that selects is not a label, #1050). false = no launcher passes
+    # --plugin-dir, no session has a dispatcher, and every `longjob-watch.sh
+    # add` says so on stdout (rc 3). Default true. Env: MONITOR_LONGJOB_ENABLED.
+    enabled: true
+    # Auto-arm a watch for every `sbatch` / `srun --no-block` the PostToolUse
+    # launch hook (monitor/hooks/async-launch-detect.sh) detects, so a worker
+    # is woken on the job's terminal state with NO extra command. Jobs
+    # dismissed via declare-no-wait.sh are not watched. Default true. Env:
+    # MONITOR_LONGJOB_AUTO_WATCH.
+    auto_watch_launches: true
+    # Dispatcher loop cadence (seconds) — how often the spool is scanned and
+    # the ledger rewritten. Watches poll no more often than this, and the
+    # ledger is FRESH for 3×poll+30 s. Minimum 5. Env: MONITOR_LONGJOB_POLL_SECONDS.
+    poll_seconds: 20
+    # Per-watch probe interval (seconds) when `add` gives none. 60 keeps
+    # `sacct` load at one call per watch per minute. Env:
+    # MONITOR_LONGJOB_DEFAULT_INTERVAL_SECONDS.
+    default_interval_seconds: 60
+    # Event caps. Every delivered line costs a wake PLUS whatever work the turn
+    # decides to do (measured: 3m26s and $1.53 for one line). After
+    # session_max_events the dispatcher prints ONE final MUTED line and
+    # logs the rest (`longjob-watch.sh unmute` resumes); after
+    # watch_max_events a single watch is retired. Envs:
+    # MONITOR_LONGJOB_SESSION_MAX_EVENTS / MONITOR_LONGJOB_WATCH_MAX_EVENTS.
+    session_max_events: 60
+    watch_max_events: 8
+    # `unknown` is the probe's fifth answer ("could not tell"). After this many
+    # CONSECUTIVE unknown probes the watch emits UNKNOWN and is parked — never
+    # silence, never assumed running. Env: MONITOR_LONGJOB_UNKNOWN_MAX.
+    unknown_max: 5
+    # A watch that reaches no terminal state within this many seconds emits
+    # EXPIRED and retires (7 days). 0 = never. Env: MONITOR_LONGJOB_TTL_SECONDS.
+    ttl_seconds: 604800
+    # Bound on a single probe run (`sacct`, a `cmd:` command, …); a probe that
+    # exceeds it answers `unknown`. RELATION GUARD: must be ≤ 2×poll_seconds+30
+    # (the ledger's freshness window minus one poll), because one probe is
+    # uninterruptible and the mid-pass heartbeat fires only between probes;
+    # `dispatch` refuses a config that breaks it (stays alive, service=disabled,
+    # says so on stderr). Env: MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS.
+    probe_timeout_seconds: 30
+    # Slurm backoff (<your-org>/nexus-code#1728): when a slurm probe cannot reach
+    # Slurm (a chaperon error, or a probe timeout), slurm probes pause for
+    # base·2^k s (k = consecutive failures, capped at 900 s) and those unknowns
+    # do not count toward unknown_max — until limit seconds of continuous
+    # backoff, after which they count again and the watch parks and EMITS.
+    # Envs: MONITOR_LONGJOB_SLURM_BACKOFF_BASE_SECONDS /
+    # MONITOR_LONGJOB_SLURM_BACKOFF_LIMIT_SECONDS.
+    slurm_backoff_base_seconds: 60
+    slurm_backoff_limit_seconds: 1800
+    # Minimum gap between two delivered lines (ms). The host's per-monitor
+    # rate limiter (2.1.272: 10 batches, refill one per 2000 ms) DISCARDS a
+    # burst and delivers only a count — invisible to this side — so the
+    # dispatcher never presents one: keep this ABOVE the host's refill
+    # interval. Costs latency (N events ≈ N × gap), never content. Env:
+    # MONITOR_LONGJOB_EMIT_MIN_GAP_MS.
+    emit_min_gap_ms: 2500
 
   # Content-hash dedup gate (issue #190 follow-up; ring + shared
   # strip in emit-gate-recover). After compose_emit assembles the
@@ -1000,6 +1286,12 @@ monitor:
   # 66s startup stall). Past the budget each aborts LOUDLY and continues with
   # a partial render. Env: MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS.
   startup_render_timeout_seconds: 20
+  # Per-window allowance ADDED to that budget for the per-emit workspace
+  # renders (render_idle_prelude / the inline full-state render), which probe
+  # every worker pane and so cost O(windows): measured ~1.3 s per live window
+  # at loadavg ~40 (<your-org>/nexus-code#1406). budget = base + windows × this.
+  # 0 restores the constant budget. Env: MONITOR_RENDER_SECONDS_PER_WINDOW.
+  render_seconds_per_window: 2
 
   # Worker notifications log size cap in bytes (issue #76). The
   # default `Notification` hook (see "## Worker hooks" in
@@ -1162,7 +1454,7 @@ monitor:
   # jsonl-mtime fallback) is past the last-paste epoch, the
   # orchestrator reacted; healthy. Otherwise the state machine
   # waits out `paste_response_grace_seconds` (120), then gives
-  # `unstick_window_seconds` (150) for cases A-D in `_unstick.sh`
+  # `unstick_window_seconds` (150) for the cases in `_unstick.sh`
   # to recover the wedge, then re-pastes the pending emit body
   # once (re-submit rescue — a dropped Enter on an alive pane is
   # rescued by a re-paste, not a respawn), and only escalates to
@@ -1388,6 +1680,14 @@ monitor:
   #
   # See `snapshot_bot_mentions` in `monitor/watcher/_mentions.sh`.
   bot_mentions_enabled: true
+  # OpenAI Codex as a co-worker / alternative harness (<your-org>/nexus-code#1640).
+  # model: the model `ng codex` and Codex workers use when none is given.
+  # CHOSEN default, not an upstream one: gpt-6-astra is the bundled
+  # catalogue's frontier model ("the most demanding work"); gpt-6-sol is its
+  # cheaper "workhorse model for coding". List what the installed CLI knows:
+  #   codex-cli/node_modules/.bin/codex debug models </dev/null
+  codex:
+    model: gpt-6-astra
   mentions:
     connect_timeout_seconds: 5
     max_time_seconds: 20
@@ -1608,12 +1908,82 @@ monitor:
     #     confines; this relaxes ONLY the command filter, never the sandbox.
     # Env: MONITOR_REMOTE_COMMAND_POLICY.
     command_policy: channel-only
-    # Bind interface for the in-sandbox sshd. LAN/host-only — NEVER
-    # 0.0.0.0 on a public NIC (§4.3). Tighten to a Wireguard/host-only
-    # address if the LAN is untrusted. Env: MONITOR_REMOTE_BIND_ADDRESS.
+    # Bind interface for the in-sandbox sshd.
+    #
+    # POSTURE 2 (loopback) IS THE DEFAULT, and it is the right default: it has
+    # zero LAN exposure, and an off-host client reaches it through an SSH
+    # forward (a carrier login or a forward-only key) — see
+    # skills/nexus.remote-access. A routable LAN bind (Posture 1) is a
+    # first-class, supported posture, but it is an EXPLICIT opt-in: it puts an
+    # SSH listener on a shared cluster node's LAN address, which is the posture
+    # that draws host-security attention. If you set a routable address you MUST
+    # also set from_cidr (an empty from_cidr on a routable bind is refused,
+    # fail-closed), and NEVER 0.0.0.0 on a public NIC (§4.3, wildcard refused).
+    #
+    # Note that loopback is NOT isolation: the sandbox shares the HOST network
+    # namespace, so 127.0.0.1 is host-global and every operator nexus on the
+    # machine sees the same one. Loopback removes LAN exposure; it does not
+    # remove port contention (see `port` below).
+    # Env: MONITOR_REMOTE_BIND_ADDRESS.
     bind_address: 127.0.0.1
-    # Port for the in-sandbox sshd (high, unprivileged). Env: MONITOR_REMOTE_PORT.
-    port: 22022
+    # PREFERRED port for the in-sandbox sshd (high, unprivileged).
+    #
+    # LEAVE THIS UNSET (as it is here) UNLESS YOU MEAN TO PIN IT. Unset, the
+    # default is DERIVED PER-OPERATOR: 22100 + cksum($USER) % 900, i.e. a stable
+    # point in [22100, 22999] that differs between any two operators on a shared
+    # host — the unix account is used precisely because two operators on one node
+    # necessarily have distinct ones (<your-org>/nexus-code#893). It used to be the
+    # constant 22022 in every clone, so two operators on one node collided by
+    # construction: first-to-bind won and the loser's supervisor could never
+    # start — measured, 1,753 failed restarts. Deterministic rather than random
+    # because a client is pinned to host:port OUT OF BAND, so the port must be
+    # stable across restarts and recomputable by anyone who knows the operator.
+    # `monitor/remote-up.sh --port` prints it, with the identity it derived from.
+    #
+    # Whatever it resolves to, this is a PREFERENCE, not necessarily the port in
+    # force: at enable time `monitor/remote-up.sh` picks an OPEN port (starting
+    # from this preference) and RECORDS its choice under principals_dir/port, and
+    # every component binds/probes the recorded port thereafter
+    # (<your-org>/nexus-code#637). If setup must MOVE off an occupied preferred
+    # port it alerts loudly and durably (a client pinned to the old port must be
+    # re-informed). Derivation makes a collision RARE; it never makes one silent.
+    # An explicit MONITOR_REMOTE_PORT env OVERRIDES selection (deliberate pin).
+    # Env: MONITOR_REMOTE_PORT.
+    # port: 22022      # ← a pin; omit to use the per-operator derived default
+    # WHERE A PORT CHANGE IS ANNOUNCED (<your-org>/nexus-code#757). The issue
+    # number of YOUR endpoint tracking thread. When `remote-up.sh` has to move
+    # the endpoint, monitor/remote-port-change-notify.sh posts a bot comment
+    # there carrying the exact text to forward to your client agent (new
+    # host:port + the fingerprint to re-pin + whether a re-enroll is owed).
+    #
+    # There is deliberately NO DEFAULT. nexus-code is cloned by every operator,
+    # so a hard-coded number would post one operator's endpoint into somebody
+    # else's thread. Leaving it empty is NOT a silent skip either: the emitter
+    # reports the GitHub surface as FAILED, and if no other durable surface
+    # accepted the notice it exits nonzero and leaves an UNDELIVERED marker that
+    # `remote-up.sh --status` surfaces until it is resolved.
+    #
+    # Why an issue and not just a bell: a tmux notification is ephemeral and a
+    # reboot-time bring-up has no audience for it — and that particular message
+    # classifies as `task` in monitor/notifywrap/sandbox-notify, the catch-all
+    # highest-traffic class, so a 300 s cooldown batches it away entirely.
+    # Env: MONITOR_REMOTE_ENDPOINT_ISSUE.
+    endpoint_issue: ""
+    # Repo the issue above lives on. EMPTY = your nexus asset+issue repo
+    # (github.repo), which is where an endpoint thread belongs — `ng` resolves
+    # that itself, so empty is the normal, correct value. Set it only if you
+    # track the endpoint somewhere else.
+    #
+    # NOTE (<your-org>/nexus-code#866): this field is why a bare
+    # `endpoint_issue` is not the same hazard as a bare
+    # `cc_auto_update.tracking_issue` — here the repo is a stated field, so
+    # the pair is unambiguous even when it is left at its default. But the
+    # two defaults point at DIFFERENT repos: an empty repo here means YOUR
+    # ASSET repo, while cc-update's surface is the IMPLEMENTATION repo. Do
+    # not carry a convention learned from one field over to the other; when
+    # in doubt, state the repo explicitly.
+    # Env: MONITOR_REMOTE_ENDPOINT_ISSUE_REPO.
+    endpoint_issue_repo: ""
     # Banner-read budget (integer seconds ≥1) for the remote-ssh-health.sh
     # probe. Generous by design: a live sshd banners in ~0.03s even on a
     # loaded host, so the HEALTHY path never waits this long — the budget
@@ -1623,6 +1993,29 @@ monitor:
     # Env: MONITOR_REMOTE_HEALTH_TIMEOUT (legacy REMOTE_HEALTH_TIMEOUT
     # still wins if set).
     health_timeout: 10
+    # Require the healthcheck to prove the endpoint is OURS, not merely that
+    # something on bind:port speaks SSH. Default TRUE — leave it true.
+    #
+    # The bind:port is a HOST-GLOBAL resource: the sandbox shares the host
+    # network namespace, so every operator nexus on the machine competes for
+    # the same address (127.0.0.1 included — it is NOT private to a sandbox).
+    # Whoever binds first wins, and the LOSER's healthcheck used to read green
+    # off the WINNER's daemon. That is not hypothetical: on 2026-07-29
+    # nexus-remote-ssh died with a container restart, another operator's
+    # instance took the port, and every surface reported healthy for 2h30m
+    # (<your-org>/nexus-code#609). The check now compares the HOST KEY the live
+    # endpoint PROVES POSSESSION of against ours. The probe is a real `ssh`
+    # client with our public key as the only pinned known_hosts entry, so
+    # OpenSSH verifies the server's signature over the exchange hash; auth is
+    # offered as `none`, so it can never open a session. A key READ is NOT
+    # enough: ssh-keyscan records the key a server CLAIMS and skips the
+    # signature, and our public host key is non-secret by design.
+    #
+    # Setting this FALSE accepts protocol-only evidence when identity cannot be
+    # DETERMINED (no ssh-keyscan on the host). It can NEVER green an endpoint
+    # verified to be foreign — a confirmed collision is always unhealthy.
+    # Env: MONITOR_REMOTE_HEALTH_REQUIRE_IDENTITY.
+    health_require_identity: true
     # Read-only `tmux attach -r` opt-in (§4.2). Default false = request-only
     # (the tighter posture: the client can file requests + read its own
     # replies, but cannot observe the session). Enabling lets a remote
@@ -1692,14 +2085,27 @@ monitor:
     #   # default — substitute your own CIDR.
     #   from_cidr: "198.51.0.0/16"
     #
-    #   # single client — MAX security: only this one host may reach the
-    #   # pre-auth stage. Swap in the client's IP.
+    #   # single client — one address only. This is "max security" ONLY IF that
+    #   # address is the CLIENT's own. See the box below before relying on it.
     #   # from_cidr: "10.0.0.5/32"
     #
-    #   # bastion-proxy users: if you reach this host by ProxyJump
-    #   # through a bastion, the SOURCE IP the host sees is the BASTION's, not
-    #   # your laptop's — pin the bastion. Example (an institutional bastion hop):
-    #   # from_cidr: "198.51.100.84/32"
+    #   # ── THE PIN CONSTRAINS THE LAST HOP, NOT THE CLIENT ──────────────
+    #   # If you reach this host through a bastion / jump host / VPN
+    #   # concentrator / NAT, the SOURCE ADDRESS the host sees is that SHARED
+    #   # DEVICE's, not your laptop's. Pinning it authenticates infrastructure
+    #   # every user of that device shares, and constrains NOTHING about which
+    #   # client sits behind it — while reading in authorized_keys as though it
+    #   # were a client restriction. A /32 naming an institutional bastion is
+    #   # among the WEAKEST pins you can write, precisely because it reads like
+    #   # the strongest. Determine which case you are in: the peer address the
+    #   # server actually sees is the ground truth (not this file), and
+    #   # `ssh -G <target>` on the client shows the route it takes.
+    #   #
+    #   # What confines this endpoint UNCONDITIONALLY, on any topology: the
+    #   # pinned host key, public-key-only auth, the forced command, and the
+    #   # kernel sandbox. from_cidr shrinks the pre-auth surface — worth having,
+    #   # but not what makes a routable bind acceptable.
+    #   # `monitor/remote-up.sh` prints the effective meaning on every run.
     #
     #   # ANY source — conscious opt-in: exposes the SSH PRE-AUTH surface to the
     #   # whole reachable network. Auth stays pubkey-only + forced-command +
@@ -1708,6 +2114,17 @@ monitor:
     #   # against. Type it on purpose, not by accident.
     #   # from_cidr: "0.0.0.0/0"
     #
+    # jump_hosts — OPTIONAL comma-separated CHAIN of ssh hops the rendered client
+    # connect lines should carry (`-J hop1,hop2`, applied IN ORDER). Empty = none.
+    # There is deliberately no default: nexus-code is cloned by every operator, so
+    # a hop name here would hand one site's topology to somebody else.
+    #
+    # Use a CHAIN, not a single hop, when the endpoint host is not directly
+    # reachable from your first bastion — off-site that is the common case, and a
+    # single -J silently assumes otherwise.
+    #
+    #   jump_hosts: "bastion.example.org,gateway.internal.example.org"
+    #
     # A malformed CIDR is REFUSED (a typo must never silently degrade to
     # no-pin). Env: MONITOR_REMOTE_FROM_CIDR.
     from_cidr: ""
@@ -1715,20 +2132,20 @@ monitor:
   watcher:
     # Auto-unstick stalled agent prompts. The watcher captures every
     # non-watcher tmux pane each cycle; if a permission prompt
-    # ("Do you want to proceed?") is showing, the watcher sends
-    # Enter to accept the default-highlighted option and resume
-    # automation. Action and pre-action pane capture are recorded
+    # ("Do you want to proceed?") is showing, the watcher does NOT
+    # answer it: it sends no key and surfaces the prompt as a pending
+    # decision for the operator (<your-org>/nexus-code#1599 — in bypass
+    # mode the prompts that still render are the dangerous-operation
+    # guards a human is meant to answer). Action and pane capture are recorded
     # under monitor/.state/watcher-unstick.log and
     # monitor/.state/unstick/ for post-hoc audit. The rate-limit
     # prompt is also handled: every stuck non-watcher window gets
     # an Enter + "please continue" follow-up once the limit has
     # reset, and the orchestrator gets a separate heads-up paste.
-    # The transient API-error chip (case C — Claude Code's per-turn
-    # `"Internal server error"` wedge) is handled too: a single Enter
-    # nudges the failed turn into retry, with a per-fingerprint
-    # backoff (api_error_backoff_minutes) so a chronically broken
-    # endpoint isn't hammered. Set to false to opt out of all three
-    # branches and require manual confirmation.
+    # (Case C, an API-error Enter-nudge, was retired in
+    # <your-org>/nexus-code#1670 together with api_error_backoff_minutes;
+    # a turn killed by an API error is reported by the StopFailure
+    # hook.) Set to false to opt out of these branches.
     auto_unstick: true
 
     # Worker-blocked-question relay (case W — <your-org>/<your-nexus>
@@ -1768,19 +2185,6 @@ monitor:
     # poll-interval round-trip plus a small margin.
     ratelimit_ack_timeout_s: 60
 
-    # Case C (transient API-error wedge) backoff window in minutes.
-    # When Claude Code's input prompt wedges on a per-turn API failure
-    # — most commonly an `"Internal server error"` / `type=api_error`
-    # response — the watcher sends Enter to nudge the failed turn
-    # into retry. The same fingerprint (request_id + message)
-    # reappearing within this many minutes is logged as
-    # `case=C action=skip-backoff` and skipped, so a chronically
-    # broken endpoint isn't hammered. Distinct fingerprints and
-    # same-fingerprint reappearances after the window elapses re-fire
-    # the Enter. Default 30. Set to 0 to disable backoff (every
-    # detection acts).
-    api_error_backoff_minutes: 30
-
     # Orchestrator-liveness state machine (issue #164). Replaces
     # the binary `unresponsive_age > threshold` rule from #157
     # with a three-knob model — see the
@@ -1798,9 +2202,9 @@ monitor:
     #     the response window granted to the re-submit rescue.
     #
     #   unstick_window_seconds — once in the pasted-without-
-    #     response state, total budget for cases A-D in
-    #     `monitor/watcher/_unstick.sh` (permission Enter, rate-
-    #     limit cascade, api-error Enter, AskUQ chip-bar Escape)
+    #     response state, total budget for the cases in
+    #     `monitor/watcher/_unstick.sh` (permission prompt surfaced,
+    #     rate-limit cascade, AskUQ chip-bar Escape)
     #     to bump the heartbeat before the state machine fires the
     #     one-shot re-submit rescue (re-paste of the pending emit
     #     body). Default 150 — lowered from 180 alongside the
@@ -1865,6 +2269,47 @@ monitor:
     dead_threshold_floor_margin_seconds: 60
     idle_pane_override_max: 5
     liveness_log_throttle_seconds: 30
+    # How long a fresh `turn-failure/<target>.json` marker with
+    # recovery=operator (an expired login, typed by the StopFailure hook ~1 s
+    # after the failed turn) gates orchestrator-liveness: no resubmit, no
+    # respawn, the operator alerted (<your-org>/nexus-code#1520, #1517). The
+    # marker is refreshed by every failed turn, so a wedged pane that stops
+    # producing them releases the gate after this window. Env:
+    # MONITOR_ORCH_TURN_FAILURE_GATE_SECONDS.
+    turn_failure_gate_seconds: 600
+    # The text-carrying, turn-independent OPERATOR ALERT (<your-org>/nexus-code
+    # #1548, #1533, #1534): raised when the watcher alone knows the operator
+    # must act — a logged-out orchestrator, an emit-only service down while
+    # the emit route is unavailable. Legs: a durable record in
+    # monitor/.state/operator-alerts.jsonl (always), the `watcher ALERT:`
+    # bell (always, attention only), a push through monitor/notify.sh, and
+    # one bot-authored `operator-alert: <key>` issue on github.repo that
+    # @-pings user_login and is closed when the condition clears.
+    operator_alert:
+      # The monitor/notify.sh leg (Pushover → ntfy → SMTP). `pushover ok`
+      # proves API acceptance, not that a device rendered it. Env:
+      # MONITOR_OPERATOR_ALERT_PUSH_ENABLED.
+      push_enabled: true
+      # The GitHub issue leg — the one channel with observed delivery (the
+      # operator answers bot comments daily). Env:
+      # MONITOR_OPERATOR_ALERT_GITHUB_ENABLED.
+      github_enabled: true
+      # A standing condition re-alerts (bell + push + a comment on its
+      # issue) at this cadence; never a second issue. Env:
+      # MONITOR_OPERATOR_ALERT_REMINDER_SECONDS.
+      reminder_seconds: 3600
+      # A `clear` finalises (push, close the issue) only after the condition
+      # has been absent this long; a raise inside the hold-down is a FLAP —
+      # recorded, but no re-ring, no re-file. Env:
+      # MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS.
+      clear_holddown_seconds: 300
+      # At most one GitHub COMMENT per key per interval (reminders, re-opens,
+      # the clear note). Open/close state changes are never capped. Env:
+      # MONITOR_OPERATOR_ALERT_COMMENT_INTERVAL_SECONDS.
+      comment_interval_seconds: 3600
+      # Bound on each network leg; they run detached from the watcher loop.
+      # Env: MONITOR_OPERATOR_ALERT_NET_TIMEOUT_SECONDS.
+      net_timeout_seconds: 60
     # ---- silent-watcher hardening (nexus-code#236) ----
     # Emit-FUNCTIONAL liveness is the HEARTBEAT itself — no knob. The watcher
     # bumps its heartbeat ONLY at the end of a correct compose cycle, so a
@@ -1891,3 +2336,15 @@ recover:
   # the cap are skipped with a loud log line — a corrupt snapshot or
   # action log must never fan out into an unbounded claude swarm.
   max_workers: 12
+
+  # How long (seconds) a `monitor/.state/boot-intent` record written by
+  # `./watcher` stays honourable (<your-org>/nexus-code#651). The record
+  # carries the operator's fresh-vs-continue intent across the hop from
+  # entry.sh to bootstrap-recover.sh's worker walk; a genuine boot covers
+  # that hop in seconds, so anything older is an intent whose boot never
+  # reached the walk (bring-up aborted, instance guard refused). Such a
+  # record is archived and IGNORED rather than fired against an unrelated
+  # mid-life recovery days later — the failure mode being a cold-boot
+  # intent that quietly wipes a live worker board.
+  # Env: RECOVER_BOOT_INTENT_TTL.
+  boot_intent_ttl_seconds: 900

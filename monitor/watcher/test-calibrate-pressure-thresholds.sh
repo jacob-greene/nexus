@@ -106,6 +106,9 @@ gen_prelude_line() {
         _notifications_rotate_if_oversized() { :; }
         _notifications_stamp_path() { printf "%s/last-prelude.ts" "$STATE_DIR"; }
         _notifications_count_distinct_since() { printf "%s" '"$_awa"'; }
+        # A readable stamp scopes the count: with none, the prelude SKIPS it
+        # (your-org/nexus-code#1765) and the stubbed count never surfaces.
+        printf "%s" "$(date +%s)" > "$STATE_DIR/last-prelude.ts"
         render_idle_prelude
     '
     local rc=$?

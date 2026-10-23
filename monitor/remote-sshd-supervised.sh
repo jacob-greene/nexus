@@ -124,6 +124,50 @@ SSHD=$(locate_sshd) || {
 [[ -f "$HOST_KEY" ]] || { log "FATAL: host key absent: $HOST_KEY (run: ng remote gen-host-key)"; exit 1; }
 [[ -f "$AUTH_KEYS" ]] || { log "WARNING: no authorized_keys at $AUTH_KEYS — no client can connect until 'ng remote enroll' adds one"; }
 
+# THE CREDENTIAL STORE MUST OUTLIVE THE DAEMON, OR THE DAEMON MUST NOT OUTLIVE
+# THE STORE (your-org/nexus-code#1034 recommendation 4). The orphan #1034
+# found was a live sshd whose AuthorizedKeysFile pointed into a directory that
+# had been reaped — a listening endpoint that could authenticate nobody, and
+# that stopped being reachable only because an unrelated cleanup happened to
+# take its keys. Had the directory survived, so would an auth surface nobody
+# was accountable for. So on EVERY supervision tick this supervisor re-checks
+# that the store it handed sshd still exists, and if it does not it stops sshd
+# and EXITS rather than serving on. Two conditions, each stated:
+#   * the principals directory is gone — the whole store was reaped;
+#   * authorized_keys existed when sshd was launched and is gone now — an
+#     absent file at LAUNCH is the ordinary pre-enrolment state (warned above,
+#     allowed), so absence only counts once presence has been observed.
+# Exit 78 (EX_CONFIG), the same code the bind-blocked arm uses for "an operator
+# must resolve this": the recovery sweep relaunches, and on relaunch
+# `_remote_principals_guard` refuses a missing store with its own reason.
+AUTH_KEYS_SEEN=0
+[[ -f "$AUTH_KEYS" ]] && AUTH_KEYS_SEEN=1
+_AUTH_STORE_REASON=""
+auth_store_intact() {
+    if [[ ! -d "$PRINCIPALS_DIR" ]]; then
+        _AUTH_STORE_REASON="principals_dir $PRINCIPALS_DIR is GONE (the whole credential store was removed)"
+        return 1
+    fi
+    if [[ -f "$AUTH_KEYS" ]]; then
+        AUTH_KEYS_SEEN=1
+    elif (( AUTH_KEYS_SEEN )); then
+        _AUTH_STORE_REASON="AuthorizedKeysFile $AUTH_KEYS existed at launch and is GONE"
+        return 1
+    fi
+    return 0
+}
+stop_on_missing_store() {   # call after auth_store_intact returned 1
+    log "STOPPING: $_AUTH_STORE_REASON — an sshd whose AuthorizedKeysFile is gone can authenticate"
+    log "  nobody and serves an endpoint no one is accountable for (your-org/nexus-code#1034 rec. 4)."
+    log "  Not relaunching from here; exiting 78. Restore the store (or 'ng remote gen-host-key' +"
+    log "  'ng remote enroll'), then 'monitor/remote-up.sh' relaunches it."
+    if [[ -n "${SSHD_CHILD:-}" ]]; then
+        kill -TERM "$SSHD_CHILD" 2>/dev/null
+        wait "$SSHD_CHILD" 2>/dev/null
+    fi
+    exit 78
+}
+
 # Hardened, self-contained sshd argv. -f /dev/null => ignore the system
 # sshd_config entirely; every policy is an explicit -o (§4.3). No global
 # ForceCommand (per-key command= is authoritative — see the header).
@@ -246,6 +290,55 @@ trap on_term TERM INT
 log "supervisor up: sshd=$SSHD bind=$BIND port=$PORT principals_dir=$PRINCIPALS_DIR"
 log "  (read-only attach: $(_remote_allow_attach && echo enabled || echo disabled))"
 
+# ── PERMANENT-FAILURE HANDLING (your-org/nexus-code#894) ─────────────────
+# A retry loop is right for a transient failure and wrong for a permanent one.
+# This supervisor used to have only the transient policy, so an address another
+# operator owns was retried 1,753 times and never escalated. These two functions
+# are the classification the loop was missing.
+
+PROBE_HOST=$(_remote_probe_host "$BIND")
+
+# Stop, durably and loudly. Called only on a DEFINITE foreign holder.
+enter_bind_blocked() {
+    local reason="$1"
+    log "PERMANENT FAILURE — NOT retrying."
+    log "  $reason"
+    log "  $(_remote_attribute_listener "$PORT")"
+    if _remote_record_bind_blocked "$PROBE_HOST" "$PORT" "$reason"; then
+        log "  recorded: $(_remote_bind_blocked_marker)"
+    else
+        log "  WARNING: could not write the bind-blocked marker (stopping anyway)"
+    fi
+    log "  This cannot clear by waiting. Do NOT signal the holder — a uid with no pid"
+    log "  attribution is another operator's process, outside this user+pid namespace."
+    log "  Operator remedy: move OUR port —"
+    log "    monitor/remote-up.sh --down && monitor/remote-up.sh   # re-selects + re-records"
+    log "  then re-inform every pinned client of the new host:port. Incident:"
+    log "    monitor/ng service-incident $REMOTE_SERVICE_NAME"
+    if command -v sandbox-notify >/dev/null 2>&1; then
+        sandbox-notify "CRITICAL: $REMOTE_SERVICE_NAME STOPPED — $PROBE_HOST:$PORT is held by a FOREIGN sshd (permanent; not retrying)" \
+            || log "  (the terminal bell failed — the marker + this log are the durable surfaces)"
+    fi
+}
+
+# Honour a marker from a previous run: re-verify rather than trust it. Still
+# permanent ⇒ exit WITHOUT spawning sshd (one bind probe per recovery sweep,
+# not a process spawn per minute). Cleared ⇒ delete it and run normally, so the
+# service revives on its own the moment the foreign holder goes away.
+if _remote_bind_blocked; then
+    # Called DIRECTLY — a `$( )` capture would discard the reason globals.
+    if _remote_bind_failure_class "$PROBE_HOST" "$PORT" 5; then
+        if _remote_bind_blocked_should_log; then
+            log "still BIND-BLOCKED on $PROBE_HOST:$PORT — not launching sshd."
+            log "  $_REMOTE_BINDFAIL_REASON"
+            log "  (this notice is rate-limited; the marker is $(_remote_bind_blocked_marker))"
+        fi
+        exit 78          # EX_CONFIG: a condition an operator must resolve
+    fi
+    log "bind-blocked marker CLEARED — $PROBE_HOST:$PORT is usable again; resuming normal operation"
+    _remote_clear_bind_blocked
+fi
+
 delay="$RESTART_DELAY"
 while true; do
     # Re-check the gate each loop: a `remote-up.sh --down` (row removed)
@@ -254,6 +347,7 @@ while true; do
         log "service '$REMOTE_SERVICE_NAME' deregistered — exiting 0 (no relaunch)."
         exit 0
     fi
+    auth_store_intact || stop_on_missing_store      # #1034 rec. 4 (outer loop)
     # HIGH gate (defense-in-depth; remote-up.sh checks this too): never listen
     # on a wildcard bind, nor a routable LAN bind without a from_cidr pin. This
     # sensitive endpoint is fail-closed on exposure — surface unhealthy, don't
@@ -309,10 +403,23 @@ while true; do
             wait "$SSHD_CHILD" 2>/dev/null
             exit 0
         fi
+        auth_store_intact || stop_on_missing_store  # #1034 rec. 4 (every tick, sshd up)
     done
     wait "$SSHD_CHILD"; rc=$?
     SSHD_CHILD=''
     if (( rc == 0 )); then delay="$RESTART_DELAY"; fi   # clean exit → reset backoff
+    # CLASSIFY BEFORE RETRYING (your-org/nexus-code#894). Only a non-zero exit
+    # can be a bind failure; a clean exit is a stop, not a collision. `permanent`
+    # requires EADDRINUSE *and* a DEFINITE not-ours identity — an INDETERMINATE
+    # verdict stays in the retry policy, because a don't-know is not a verdict.
+    if (( rc != 0 )); then
+        # Called DIRECTLY — a `$( )` capture would discard the reason globals.
+        if _remote_bind_failure_class "$PROBE_HOST" "$PORT" 5; then
+            log "sshd exited rc=$rc"
+            enter_bind_blocked "$_REMOTE_BINDFAIL_REASON"
+            exit 78
+        fi
+    fi
     log "sshd exited rc=$rc — restarting in ${delay}s"
     sleep "$delay" & wait $! 2>/dev/null
     # capped exponential backoff so a persistently-failing sshd (port taken,

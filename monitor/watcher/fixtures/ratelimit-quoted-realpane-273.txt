@@ -1,0 +1,22 @@
+● Status: the reading phase is done; I'm now pinning down what positive evidence exists for the rate-limit menu (pane-state's overlay=rate-limit), which
+  decides the #1598 design.
+
+  Read 1 file, ran 3 shell commands
+
+● The rate-limit menu is modelled only synthetically in this repo. Before I design a gate around its shape, I'll check what the real bundle renders.
+
+● Searching the 2.1.273 bundle for the rate-limit menu source
+  ⎿  $ bash -c 'B=/path/to/nexus/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+     for pat in "Stop and wait for limit to reset" "What do you want to do?"; do
+     n=$(LC_ALL=C command grep -acF -- "$pat" "$B"); rc=$?
+     echo "pattern=[$pat] matching_lines=$n grep_rc=$rc"
+     done
+     LC_ALL=C co…
+
+· Transmogrifying… (1m 25s · ↓ 5.9k tokens)
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── pastefu ─
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ◉ Fable 5.1 │ v2.1.273⬆ 2.1.278 │ █▉░░░░░░░▓ 192K/1.0M │ ⚡100% │ $4.09
+  -- INSERT -- ⏵⏵ bypass permissions on · 1 monitor · ← for agents

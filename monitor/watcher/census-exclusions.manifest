@@ -1,0 +1,28 @@
+# census-exclusions.manifest — TRACKED `test-*.sh` files that NO selection root
+# walks ON PURPOSE (your-org/nexus-code#1620).
+#
+# Read by:   monitor/watcher/run-tests.sh (`_rt_census`) on every root-walking run.
+# Enforced:  bash monitor/watcher/test-run-tests-shape-census.sh (§B3).
+#
+# The runner's census names every tracked `test-*.sh` no root in
+# `_RT_SUITE_ROOTS` walks and reddens the run, because a suite nothing selects
+# appears ZERO times in any band log. Some such files are not suites: a fixture
+# or stub that a suite EXECUTES may need a `test-*.sh` name. Declare each one
+# here — ONE PATH PER ROW, never a directory or a pattern, because a structural
+# rule ("everything under fixtures/") would admit a real suite misplaced there
+# without a line anywhere saying so, which is the invisible exclusion #1078 and
+# #1620 are about.
+#
+# FORMAT:  <repo-relative path>|<reason>
+#   The reason is REQUIRED (why the file is never run, and which suite uses it).
+#   Blank lines and lines starting with `#` are ignored.
+#
+# EVERY ROW IS RE-CHECKED ON EVERY CENSUS, and each of these is RED:
+#   - no `|`, an empty path, an empty reason, or a path already listed (REFUSED);
+#   - a path that is not a tracked `test-*.sh`, or one a root already walks
+#     (STALE — delete the row in the PR that moved or removed the file);
+#   - this file present but untracked (its rows would not exist on CI).
+# Every applied exclusion is printed as `EXCLUDED: <path> — <reason>` under the
+# census line, which carries `excluded=N`, on every run, green or red.
+#
+# Empty at creation (2026-09-22): no tracked `test-*.sh` lives outside a root.

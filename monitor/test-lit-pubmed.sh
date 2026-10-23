@@ -61,7 +61,16 @@ EOF
 # millisecond timestamp and its full argv (one line per call).
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s %s\n' "$(( $(date +%s%N) / 1000000 ))" "$*" >>"$CURL_LOG"
+# lit.sh sends the NCBI key as curl config on stdin (`--config -`), not in
+# argv. The stub appends that config after a ` CONFIG: ` marker, so a grep
+# on the log sees both; the argv-only part (before the marker) is what
+# /proc/<pid>/cmdline would show.
+cfg="" prev=""
+for a in "$@"; do
+  [ "$prev" = --config ] || [ "$prev" = -K ] && [ "$a" = - ] && cfg=$(tr '\n' ' ')
+  prev="$a"
+done
+printf '%s %s CONFIG: %s\n' "$(( $(date +%s%N) / 1000000 ))" "$*" "$cfg" >>"$CURL_LOG"
 url="" w=0
 for a in "$@"; do
   case "$a" in http*) url="$a" ;; -w) w=1 ;; esac
@@ -156,6 +165,7 @@ else
 fi
 NCBI_API_KEY=k3y-SECRET run search "GENCODE 2023"
 grep -q 'api_key=k3y-SECRET' "$CURL_LOG"; expect "api_key= from NCBI_API_KEY" $?
+! grep -q 'k3y-SECRET' <<<"$(sed 's/ CONFIG: .*//' "$CURL_LOG")"; expect "the key is NOT in curl argv (it goes via --config on stdin)" $?
 ! grep -q 'k3y-SECRET' <<<"$OUT$ERR"; expect "key never printed" $?
 run search "GENCODE 2023" --year 2020:2023
 grep -q 'mindate=2020' "$CURL_LOG" && grep -q 'maxdate=2023' "$CURL_LOG"; expect "--year maps to mindate/maxdate" $?
@@ -237,14 +247,25 @@ expect "genuinely empty query -> exit 0" "$RC" "rc=$RC"
 expect "genuinely empty query -> count 0, no esummary call" $?
 
 echo "-- search: backend selection --"
+# The default is `--source all` (PubMed + S2 + ASTA + OpenAlex): a configured
+# S2 key ADDS S2, it no longer replaces PubMed. (This stub serves no
+# OpenAlex, so OpenAlex lands in failed_backends, not query_sources.)
 S2_API_KEY=x run search "GENCODE 2023"
-[ "$(calls eutils)" -eq 0 ] && [ "$(jq -c '.query_sources' <<<"$OUT")" = '["s2"]' ]
-expect "S2 key configured, no --source -> s2 only (compat)" $?
+[ "$(calls eutils)" -gt 0 ] && [ "$(jq -c '.query_sources' <<<"$OUT")" = '["pubmed","s2"]' ]
+expect "S2 key configured, no --source -> default all searches pubmed + s2" $?
 S2_API_KEY=x run search "GENCODE 2023" --source all
 [ "$(jq -c '.query_sources' <<<"$OUT")" = '["pubmed","s2"]' ]; expect "--source all -> pubmed + s2 (asta skipped, no key)" $?
 [ "$(jq '.count' <<<"$OUT")" -eq 3 ]; expect "cross-source dedupe: 2 pubmed + 3 s2 (1 same DOI, 1 same PMID only) -> 3" $?
-[ "$(jq -r '[.results[] | select(.pmid=="36420896")][0].source' <<<"$OUT")" = pubmed ]
-expect "dedupe keeps the first hit" $?
+# Rank fusion: a duplicate collapses to ONE record, the best-ranked copy that
+# carries a DOI (s2 rank 1 beats pubmed rank 2 here), credited to both.
+jq -e '[.results[] | select(.pmid=="36420896")] | length == 1
+       and .[0].source == "s2" and .[0].sources == ["pubmed","s2"] and .[0].found_by == 2' <<<"$OUT" >/dev/null
+expect "dedupe keeps the best-ranked copy and credits both backends" $?
+# The PMID-only join: S2's copy has no DOI, so only the PMID links it to
+# PubMed's record, which is kept (it carries the DOI).
+jq -e '[.results[] | select(.pmid=="37248244")] | length == 1
+       and .[0].source == "pubmed" and .[0].sources == ["pubmed","s2"]' <<<"$OUT" >/dev/null
+expect "PMID-only duplicate joins the PubMed record" $?
 run search "GENCODE 2023" --source s2
 [ "$RC" -eq 3 ]; expect "--source s2 without a key -> exit 3 (rc=$RC)" $?
 run search "GENCODE 2023" --source bogus
@@ -278,7 +299,8 @@ SHIM_MODE=doi run add 10.1093/nar/gkac1071
 expect "add same paper by DOI (no S2 key, via PubMed) -> not duplicated" $?
 grep -q 'term="10.1093/nar/gkac1071"\[doi\]' "$CURL_LOG"; expect "DOI resolved with a [doi] field query" $?
 run add PMID:36420896
-[ "$(grep -c '' "$LIB")" -eq 1 ]; expect "add PMID:<n> form -> dedupe by PMID" $?
+# LINES are the right unit here: refs.jsonl holds one record per line.
+[ "$(grep -c '' "$LIB")" -eq 1 ]; expect "add PMID:<n> form -> dedupe by PMID" $?  # refs.jsonl: 1 line = 1 record
 printf '%s\n' '{"id":"y","doi":"","pmid":"37248244","title":"t"}' >>"$LIB"
 run add 37248244
 [ "$(grep -c '' "$LIB")" -eq 2 ] && grep -q 'already in library (pmid:37248244)' <<<"$ERR"
@@ -289,8 +311,11 @@ run add CorpusId:123
 echo "-- status --"
 run status
 expect "status exit 0 with no key (PubMed is keyless)" "$RC" "rc=$RC"
-jq -e '.pubmed.configured and .default_source=="pubmed" and .pubmed.rate_limit=="3/s" and .configured' <<<"$OUT" >/dev/null
-expect "status JSON: pubmed configured, default pubmed, 3/s" $?
+# `configured` means "an S2/ASTA key is set" (false here); `search_available`
+# is the keyless answer, and the default is `all`.
+jq -e '.pubmed.configured and .default_source=="all" and .pubmed.rate_limit=="3/s"
+       and .search_available and (.configured == false)' <<<"$OUT" >/dev/null
+expect "status JSON: pubmed configured, default all, 3/s, search available without keys" $?
 NCBI_API_KEY=k3y-SECRET run status
 jq -e '.pubmed.api_key and .pubmed.origin=="env:NCBI_API_KEY" and .pubmed.rate_limit=="10/s"' <<<"$OUT" >/dev/null
 expect "status with NCBI_API_KEY: origin env, 10/s" $?

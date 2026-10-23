@@ -13,7 +13,9 @@
 #      $NEXUS_ROOT expanded, 5th <logfile> field carried separately.
 #   2. svc_logfile — default <workdir>/serve.log, relative resolved
 #      under workdir, absolute kept.
-#   3. svc_endpoint — URL for curl checks, pid for pgrep -f, '-' else;
+#   3. svc_endpoint — URL for curl checks, else the service's own
+#      <workdir>/.deploy/endpoint declaration (#1144), else pid for
+#      pgrep -f, else '-';
 #      localhost URLs rewritten to the FQDN iff the port's live listener
 #      binds beyond loopback (stubbed ss/hostname), untouched for
 #      loopback-only binds and down services.
@@ -44,8 +46,8 @@
 #      bootstrap-recover never sees/auto-starts it; verbs redirect
 #      to activation.
 #  13. DETAIL column — an UP labsh service renders its reachable
-#      tokened URL (FQDN on external bind, ?token= from .jupyter/
-#      token, bare URL without a token, fallback when DOWN); the
+#      URL (FQDN on external bind, ?token= REDACTED to a 0600 file,
+#      bare URL without a token, fallback when DOWN); the
 #      WINDOW column is gone.
 #  14. height-aware priority rendering — in dashboard mode (INPLACE=1)
 #      the frame is budgeted to the pane height: core + DOWN rows are
@@ -58,6 +60,13 @@
 #      healthy `UP`: STATUS degrades to `DEGRADED`, SUPERVISOR reads
 #      `orphan`, and a legend explains it + names the reconcile action. A
 #      DOWN service with the same dead record keeps the honest `stale`.
+# 16b. a healthcheck that does not finish within SVC_STATUS_HEALTH_TIMEOUT
+#      renders UNKNOWN with the bound named, and status returns; a check's
+#      own rc 124 inside the bound stays DOWN (your-org/nexus-code#1601).
+#  18. stop request (your-org/nexus-code#1827) — `stop` writes
+#      .state/services/<name>.stop-requested; status reads STOPPED; an
+#      automated restart (SVC_RESTART_ACTOR=watcher) is refused rc 76 and
+#      the `up` sweep skips it; an explicit start/restart clears it.
 #
 # Run: bash monitor/watcher/test-svc.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -91,6 +100,8 @@ build_case() {
     cp "$REAL_RECOVER" "$ROOT/monitor/bootstrap-recover.sh"
     cp "$REAL_LIB" "$ROOT/monitor/watcher/_lib.sh"
     cp "$REAL_FS_PROBE" "$ROOT/monitor/_fs_probe.sh"
+    # The logged-out predicate the orchestrator row reads (#1548 row E).
+    cp "$_real_test_dir/_auth_hold.sh" "$ROOT/monitor/watcher/_auth_hold.sh"
     chmod +x "$ROOT/monitor/svc.sh" "$ROOT/monitor/bootstrap-recover.sh"
     SVC="$ROOT/monitor/svc.sh"
     REG="$ROOT/monitor/services.registry"
@@ -201,7 +212,7 @@ parsed=$(svc_parse_registry "$REG")
 [[ "$(printf '%s\n' "$parsed" | wc -l)" == 2 ]] \
     && pass "parse: 2 valid records (comment/blank/malformed dropped)" \
     || fail "parse: expected 2 records, got: $parsed"
-printf '%s\n' "$parsed" | grep -qF "$HOME/wd-a" \
+grep -qF "$HOME/wd-a" <<<"$parsed" \
     && pass "parse: ~ expanded in workdir" || fail "parse: ~ not expanded"
 b_health=$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="svcB"{print $4}')
 b_log=$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="svcB"{print $5}')
@@ -231,7 +242,7 @@ touch "$ROOT/monitor/.state/watcher.log"
 touch "$ROOT/monitor/.state/watcher-scheduler.jsonl"
 wlf=$(watcher_log_files)
 if [[ "$(printf '%s\n' "$wlf" | wc -l)" == 2 ]] \
-   && printf '%s\n' "$wlf" | grep -qx "$ROOT/monitor/.state/watcher-scheduler.jsonl"; then
+   && grep -qx "$ROOT/monitor/.state/watcher-scheduler.jsonl" <<<"$wlf"; then
     pass "watcher logs: scheduler jsonl joins the resolved set"
 else
     fail "watcher logs dual: [$wlf]"
@@ -275,6 +286,75 @@ ep=$(svc_endpoint 'curl -fsS http://localhost:8765/')
     || fail "endpoint port-mismatch: [$ep]"
 rm -f "$ROOT/ss.out"
 SVC_LISTEN_FRESH=0
+
+# --- #1144: the DETAIL cell stops being a property of how a healthcheck is
+# --- SPELLED, and becomes a property of the SERVICE.
+#
+# Before this, svc_endpoint derived the cell ENTIRELY from the healthcheck
+# COMMAND TEXT, so the better probe lost: an inline `curl … http://…` rendered a
+# copy-pasteable URL while a SCRIPT healthcheck — the one you must write when the
+# endpoint is auth-gated, or when one probe asserts several properties — rendered
+# `-`, indistinguishable from a service that has no endpoint at all. Both arms
+# are asserted here: the URL case must not regress, and the script case must work.
+EPWD="$ROOT/epsvc"; mkdir -p "$EPWD/.deploy"
+
+# (a) the pre-fix state, preserved where there is genuinely nothing to show.
+[[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] \
+    && pass "endpoint: script healthcheck with NO declaration still shows '-'" \
+    || fail "endpoint script-nodecl: [$(svc_endpoint './tools/healthcheck.sh' "$EPWD")]"
+
+# (b) the fix: the service declares its own endpoint and the script probe keeps it.
+printf 'https://example.org:8443/app/\n' > "$EPWD/.deploy/endpoint"
+ep=$(svc_endpoint './tools/healthcheck.sh' "$EPWD")
+[[ "$ep" == 'https://example.org:8443/app/' ]] \
+    && pass "endpoint: script healthcheck reads <workdir>/.deploy/endpoint" \
+    || fail "endpoint declared: [$ep]"
+
+# (c) NO REGRESSION. A healthcheck that already names a URL still wins, so every
+#     cell that rendered correctly before this change is byte-identical after it.
+ep=$(svc_endpoint 'curl -fsS http://localhost:8765/' "$EPWD")
+[[ "$ep" == 'http://localhost:8765/' ]] \
+    && pass "endpoint: a healthcheck URL still wins over the declaration" \
+    || fail "endpoint precedence: [$ep]"
+
+# (d) the declaration goes through the SAME external-bind rewrite, or the cell is
+#     not copy-pasteable — which is the only reason the cell is worth anything.
+printf 'http://localhost:8767/ui\n' > "$EPWD/.deploy/endpoint"
+printf 'LISTEN 0 4096 0.0.0.0:8767 0.0.0.0:*\n' > "$ROOT/ss.out"
+SVC_LISTEN_FRESH=0
+ep=$(svc_endpoint './tools/healthcheck.sh' "$EPWD")
+[[ "$ep" == 'http://host.example.org:8767/ui' ]] \
+    && pass "endpoint: a declared endpoint gets the external-bind FQDN rewrite" \
+    || fail "endpoint declared-rewrite: [$ep]"
+rm -f "$ROOT/ss.out"; SVC_LISTEN_FRESH=0
+
+# (e) SHAPE, not non-emptiness. These bytes come from a file outside this repo
+#     and land in a terminal render; an emptiness check would pass ANSI escapes.
+bad_ok=1
+for bad in "$(printf '\033[31mEVIL\033[0m')" 'ftp://example.org/x' 'not a url' '' '   '; do
+    printf '%s\n' "$bad" > "$EPWD/.deploy/endpoint"
+    [[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] || { bad_ok=0; break; }
+done
+(( bad_ok )) \
+    && pass "endpoint: a declaration that is not URL-shaped is REFUSED, not printed" \
+    || fail "endpoint bad-declaration accepted: [$bad]"
+
+# (f) read from the SERVICE's workdir, never the cockpit's cwd — a future
+#     refactor that reaches for \$PWD would render one service's URL for another.
+printf 'https://wrong.example.org/\n' > "$ROOT/.deploy-cwd-decoy"
+mkdir -p "$ROOT/.deploy" && printf 'https://cwd.example.org/\n' > "$ROOT/.deploy/endpoint"
+( cd "$ROOT" && [[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] ) \
+    && pass "endpoint: the declaration is the SERVICE's, not the cockpit's cwd" \
+    || fail "endpoint cwd-leak: cockpit cwd .deploy/endpoint was used"
+rm -rf "$ROOT/.deploy" "$ROOT/.deploy-cwd-decoy"
+rm -f "$EPWD/.deploy/endpoint"
+
+# (g) the one-argument call form still behaves exactly as it did — the workdir
+#     parameter is additive, so nothing that calls svc_endpoint the old way moves.
+[[ "$(svc_endpoint 'curl -fsS http://localhost:8765/')" == 'http://localhost:8765/' ]] \
+ && [[ "$(svc_endpoint 'test -f x')" == '-' ]] \
+    && pass "endpoint: the 1-arg call form is unchanged (workdir is additive)" \
+    || fail "endpoint 1-arg regression"
 
 [[ "$(svc_supervisor ghost 'echo x')" == '-' ]] \
     && pass "supervisor: no pidfile -> '-'" \
@@ -349,6 +429,21 @@ grep -qE '^ 0  watcher .*UP' "$ROOT/out" \
 grep -qE '^ -  orchestrator .*UP .*watcher' "$ROOT/out" \
     && pass "orchestrator pinned, UP, supervised-by-watcher" \
     || fail "orchestrator row: $(grep orchestrator "$ROOT/out")"
+# your-org/nexus-code#1548 row E: a FRESH expiry row turns the orchestrator row
+# LOGGED-OUT with the remedy in the detail; a STALE row (the watcher stopped
+# looking) does not — the same staleness the liveness gate applies.
+_now=$(date +%s)
+printf '%s\t%s\n' "$(( _now - 3000 ))" "$_now" > "$ROOT/monitor/.state/auth-expired.tsv"
+run_svc status
+grep -qE '^ -  orchestrator .*LOGGED-OUT .*run /login' "$ROOT/out" \
+    && pass "a fresh auth-expired row renders LOGGED-OUT with the remedy (was: green UP for 7 h on 2026-09-17)" \
+    || fail "logged-out row: $(grep orchestrator "$ROOT/out")"
+printf '%s\t%s\n' "$(( _now - 3000 ))" "$(( _now - 1200 ))" > "$ROOT/monitor/.state/auth-expired.tsv"
+run_svc status
+grep -qE '^ -  orchestrator .*UP .*watcher' "$ROOT/out" \
+    && pass "a STALE auth-expired row (last observed 1200 s ago > 600 s) does not paint LOGGED-OUT" \
+    || fail "stale row: $(grep orchestrator "$ROOT/out")"
+rm -f "$ROOT/monitor/.state/auth-expired.tsv"
 grep -qE 'svc-up .*UP' "$ROOT/out" && grep -qE 'svc-down .*DOWN' "$ROOT/out" \
     && pass "registry rows show UP/DOWN per healthcheck" \
     || fail "service rows: $(cat "$ROOT/out")"
@@ -626,8 +721,13 @@ printf 'LISTEN 0 4096 0.0.0.0:9755 0.0.0.0:*\n' > "$ROOT/ss.out"
 reg_line jupyterlab "$ROOT/wd-j" './w.sh' 'true' > "$REG"
 
 run_svc status
-grep -qE 'jupyterlab +UP .*http://host\.example\.org:9755/lab\?token=sekrit-token$' "$ROOT/out" \
-    && pass "detail: UP labsh service shows the full tokened FQDN URL" \
+# The token itself is NEVER rendered (2026-10-12: it was copied into every
+# agent transcript that ran status); the cell names the 0600 file that keeps
+# the full URL. test-svc-url-redact.sh owns that contract in depth.
+grep -qE 'jupyterlab +UP .*http://host\.example\.org:9755/lab\?token=<redacted: see .*/services/jupyterlab\.url>$' "$ROOT/out" \
+    && ! grep -q 'sekrit-token' "$ROOT/out" "$ROOT/err" \
+    && grep -qF 'http://host.example.org:9755/lab?token=sekrit-token' "$ROOT/monitor/.state/services/jupyterlab.url" \
+    && pass "detail: UP labsh service shows the FQDN URL, token redacted to its 0600 file" \
     || fail "tokened detail: $(grep jupyterlab "$ROOT/out")"
 grep -q 'WINDOW' "$ROOT/out" \
     && fail "WINDOW column still rendered" \
@@ -639,7 +739,7 @@ grep -q 'DETAIL' "$ROOT/out" \
 # Loopback-only bind keeps localhost in the URL (token still shown).
 printf 'LISTEN 0 4096 127.0.0.1:9755 0.0.0.0:*\n' > "$ROOT/ss.out"
 run_svc status
-grep -q 'http://localhost:9755/lab?token=sekrit-token' "$ROOT/out" \
+grep -q 'http://localhost:9755/lab?token=<redacted: see ' "$ROOT/out" \
     && pass "detail: loopback bind keeps localhost host" \
     || fail "loopback detail: $(grep jupyterlab "$ROOT/out")"
 
@@ -767,7 +867,8 @@ last=$(grep -oE 'page [0-9]+/[0-9]+' <<<"$frame3" | head -1)
     || fail "clamp: [$last]"
 # The tokened URL lives on the last page, full and untruncated.
 grep -q 'token=' <<<"$frame3" \
-    && grep -qF "http://localhost:58888/lab?token=$(cat "$ROOT/wd-jl/.jupyter/token")" <<<"$frame3" \
+    && grep -qF "http://localhost:58888/lab?token=<redacted: see $STATE_DIR/services/jupyterlab.url>" <<<"$frame3" \
+    && ! grep -qF "$(cat "$ROOT/wd-jl/.jupyter/token")" <<<"$frame3" \
     && pass "paging: full tokened URL untruncated on its page" \
     || fail "tokened URL truncated/missing on last page"
 
@@ -833,7 +934,14 @@ build_case guard
 PANES_ALL="$ROOT/panes-all.txt"        # pane_id|pane_pid|win_id|win_name
 PANES_OWN="$ROOT/panes-own.txt"        # pane pids of the own window
 OWN_PANE_PID_FILE="$ROOT/own-pane-pid"
-OWN_WINDOW_FILE="$ROOT/own-window"     # "<win_id>\t<win_name>"
+# "<win_id>|<win_name>" — ONE source of truth for both single-field queries
+# below. _nexus_self_pane_window asks for '#{window_id}' and '#{window_name}'
+# separately (your-org/nexus-code#701 item A: a single multi-field format is
+# what a non-UTF-8 locale mangles), so the stub must answer each on its own.
+# Deriving both from this one file rather than hardcoding a parallel copy is
+# deliberate — a stub that hardcodes what it claims to serve is the same
+# defect class as the code under test.
+OWN_WINDOW_FILE="$ROOT/own-window"
 TMUX_GUARD_LOG="$ROOT/tmux-guard.log"
 cat > "$BIN/tmux" <<TM
 #!/usr/bin/env bash
@@ -851,9 +959,12 @@ case "\$1" in
               *)  fmt="\$1"; shift ;;
           esac
       done
+      _ow=\$(cat "$OWN_WINDOW_FILE" 2>/dev/null)
       case "\$fmt" in
-          '#{pane_pid}') cat "$OWN_PANE_PID_FILE" 2>/dev/null ;;
-          *)             cat "$OWN_WINDOW_FILE" 2>/dev/null ;;
+          '#{pane_pid}')    cat "$OWN_PANE_PID_FILE" 2>/dev/null ;;
+          '#{window_id}')   printf '%s\n' "\${_ow%%|*}" ;;
+          '#{window_name}') printf '%s\n' "\${_ow#*|}" ;;
+          *)                printf '%s\n' "\$_ow" ;;
       esac
       ;;
   list-panes)
@@ -876,7 +987,7 @@ run_svc ""
 # must HOST the process: pane_pid is this test shell ($$), an ancestor
 # of the run_svc child.
 printf '%s\n' "$$" > "$OWN_PANE_PID_FILE"
-printf '@9\torchestrator\n' > "$OWN_WINDOW_FILE"
+printf '@9|orchestrator\n' > "$OWN_WINDOW_FILE"
 : > "$PANES_OWN"          # no orchestrator process in the window
 : > "$TMUX_GUARD_LOG"
 TMUX=/tmp/fake,1,1 TMUX_PANE=%0 PATH="$BIN:$PATH" NEXUS_ROOT="$ROOT" \
@@ -890,10 +1001,79 @@ fi
 
 # (b2) same, but a live orchestrator shares the window → still refused,
 # but the name is the orchestrator's — NO rename.
+#
+# THE PRECONDITION MUST BE THE PROPERTY, NOT A PROXY (#675).
+#
+# This case used to be `sleep 0.1` then `[[ -r /proc/<pid>/environ ]]`,
+# and it failed intermittently in CI on `dev` and on unrelated branches,
+# on a different cell each time, never reproducibly in a local run:
+#
+#     FAIL: live-orch rename protection: rc=4 renames=1
+#
+# `rc=4 renames=1` says the guard REFUSED correctly but renamed anyway —
+# so what broke was live-orchestrator DETECTION, not the refusal.
+#
+# The mechanism, measured rather than guessed. `VAR=1 sleep 30 &` forks
+# first and `execve`s second, and `/proc/<pid>/environ` is materialised
+# from the process image at EXEC. In the window between the two it is a
+# perfectly readable snapshot of the forked *bash* — which does not
+# carry the marker. So `-r` answers YES while the content answers NO.
+# With no sleep at all, that window is open 258 times in 300 on this
+# host (86%); `sleep 0.1` merely narrows it, and under CI load 0.1s is
+# sometimes not enough. The production probe
+# (`_nexus_pid_tree_has_env_marker`) requires the marker to be PRESENT,
+# so it correctly reports "no orchestrator in this window", the rename
+# proceeds, and the assertion fails — on whichever cell loses the race.
+#
+# A fixed sleep used as a synchronisation primitive is the shape that
+# passes locally and fails under load. So: poll the ACTUAL property,
+# with the SAME predicate production uses, bounded — and keep the
+# pre-existing skip when it never becomes true, since an environ that
+# is unreadable (or a kernel without /proc) is a legitimate skip and
+# never a failure.
+#
+# Ruled OUT while diagnosing, recorded so it is not re-investigated:
+# the `tr … | grep -qxF` in the production probe runs under svc.sh's
+# `pipefail`, which is `#622`'s inversion shape — but a real environ is
+# ~6 KB, well inside the 64 KB pipe buffer, so `tr` completes its write
+# before `grep -q` exits and there is no SIGPIPE. Measured 0 inversions
+# in 400 runs. `#622` is real; this site is not one of its victims.
+# THE EXEC MUST HAVE LANDED (#680 skeptic F3). `/proc/<pid>/environ` is
+# pre-exec a COW snapshot of the PARENT bash's initial-stack environment.
+# `_respawn.sh:581` does `export NEXUS_IS_ORCHESTRATOR=1`, so when this
+# suite is run BY an agent under a live orchestrator — the one context
+# the operator actually runs it in — every bash it spawns already
+# carries the marker, and a naive content check answers YES off the
+# parent's env 35% of the time, before the child has exec'd at all.
+# That would make "poll the actual property" vacuous exactly where it
+# matters, replacing one proxy with another.
+#
+# `/proc/<pid>/comm` discriminates cleanly: immediately after fork it
+# reads `bash` (pre-exec) and after exec it reads the target program.
+# Requiring BOTH — comm has flipped AND the marker is present — is the
+# property this case actually depends on. Capture-then-match rather
+# than `tr | grep -q`, per #622 (see _lib.sh).
+_orch_marker_visible() {
+    local pid="$1" comm="" data=""
+    [[ -r "/proc/$pid/environ" ]] || return 1
+    read -r comm < "/proc/$pid/comm" 2>/dev/null || return 1
+    [[ "$comm" == "sleep" ]] || return 1
+    data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || return 1
+    [[ -n "$data" ]] || return 1
+    grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$data"
+}
+
 NEXUS_IS_ORCHESTRATOR=1 sleep 30 &
 GUARD_ORCH_PID=$!
-sleep 0.1
-if [[ -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
+# Bounded wait for the exec to land: ~5s at 0.05s granularity. Two
+# orders of magnitude more headroom than the old fixed 0.1s, and it
+# exits the instant the property holds, so the fast path stays fast.
+_orch_wait=0
+while (( _orch_wait < 100 )) && ! _orch_marker_visible "$GUARD_ORCH_PID"; do
+    sleep 0.05
+    _orch_wait=$(( _orch_wait + 1 ))
+done
+if _orch_marker_visible "$GUARD_ORCH_PID"; then
     printf '%s\n' "$GUARD_ORCH_PID" > "$PANES_OWN"
     : > "$TMUX_GUARD_LOG"
     TMUX=/tmp/fake,1,1 TMUX_PANE=%0 PATH="$BIN:$PATH" NEXUS_ROOT="$ROOT" \
@@ -901,15 +1081,35 @@ if [[ -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
     if [[ $RC == 4 ]] && ! grep -q "rename-window" "$TMUX_GUARD_LOG"; then
         pass "cockpit in target window with live orchestrator: refused, name untouched"
     else
-        fail "live-orch rename protection: rc=$RC renames=$(grep -c rename-window "$TMUX_GUARD_LOG")"
+        # The precondition held when we checked it (the marker was
+        # visible), so a failure here is no longer the #675 race —
+        # report the marker's state at failure time so the next reader
+        # can tell a real regression from a precondition that lapsed.
+        fail "live-orch rename protection: rc=$RC renames=$(grep -c rename-window "$TMUX_GUARD_LOG") marker_still_visible=$(_orch_marker_visible "$GUARD_ORCH_PID" && echo yes || echo no)"
     fi
-else
+elif [[ ! -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
+    # The ONLY legitimate skip: no /proc to read (a platform without it,
+    # or a permissions regime that hides it). Asserts nothing about the
+    # guard, and never could.
     pass "(b2) skipped: /proc environ unreadable"
+else
+    # TIMEOUT IS A FAILURE, NOT A SKIP (#680 skeptic F2). The first
+    # version of this bounded wait fell through to `pass` when the
+    # 5s budget expired — so a change that made the precondition never
+    # hold would have shown up as a green suite with the case silently
+    # not running, which is the same "silence read as health" defect
+    # this whole PR is about, reintroduced by the fix for it.
+    #
+    # /proc IS readable here, so the environment is capable of
+    # answering; the marker simply never became visible in 5s. That is
+    # either a real regression in how the marker is set, or a bound
+    # that has become too tight — both want a human, neither is a pass.
+    fail "(b2) precondition never held: /proc readable but NEXUS_IS_ORCHESTRATOR absent from $GUARD_ORCH_PID after 5s (comm=$(cat "/proc/$GUARD_ORCH_PID/comm" 2>/dev/null || echo '?'))"
 fi
 kill "$GUARD_ORCH_PID" 2>/dev/null; wait "$GUARD_ORCH_PID" 2>/dev/null
 
 # (c) live peer cockpit elsewhere → refused (exit 4), peer untouched.
-printf '@1\tmywindow\n' > "$OWN_WINDOW_FILE"   # own window NOT the target
+printf '@1|mywindow\n' > "$OWN_WINDOW_FILE"   # own window NOT the target
 mkdir -p "$ROOT/fakecockpit"
 printf '#!/usr/bin/env bash\nsleep 60\n' > "$ROOT/fakecockpit/svc.sh"
 bash "$ROOT/fakecockpit/svc.sh" &
@@ -980,6 +1180,47 @@ grep -q 'svc.sh restart <name>' "$ROOT/out" \
 unset NEXUS_ROOT
 cleanup_case
 
+# --- Case 16b: a healthcheck that does not finish renders UNKNOWN ------------
+# your-org/nexus-code#1601: `tmpfs-guard.sh --check` walking a 15k-entry /tmp
+# made `svc.sh status` print ZERO lines in 180 s. The readout is now bounded
+# per row and says it does not know. `exit 124` is the negative control: a
+# callee's OWN 124 inside the bound is a failing check (DOWN), not a timeout.
+echo '=== case 16b: a hung healthcheck renders UNKNOWN within the bound, never nothing ==='
+build_case hungcheck
+mkdir -p "$ROOT/wd"
+{
+    reg_line svchung "$ROOT/wd" 'echo noop' 'sleep 30'   # never finishes in time
+    reg_line svc124  "$ROOT/wd" 'echo noop' 'exit 124'   # fast, says 124 itself
+    reg_line svcok   "$ROOT/wd" 'echo noop' 'true'
+} > "$REG"
+# _hto=4 is CHOSEN, not measured-optimal (your-org/nexus-code#1738 item 4).
+# svc.sh decides "timed out" by `rc==124 && SECONDS - t0 >= bound`, and bash's
+# SECONDS is whole-second wall time: at a bound of 1 the svc124 control reads
+# UNKNOWN whenever its fork+exec merely CROSSES a second boundary, which a
+# CPU-stalled runner made happen (run 37245333580, bash 4.4 band, 76.88%
+# CPU-stall PSI). At 4 the control is misread only if `exit 124` takes > 3 s of
+# real time. Detection is preserved: svchung sleeps 30 s, so an unenforced
+# timeout still blows the elapsed ceiling below (bound + 14 s kill-grace/load
+# headroom = 18 s, the same 14 s headroom the 1 s bound had) and never renders
+# UNKNOWN. Keep `sleep` well above the ceiling if either number moves.
+_hto=4
+_t0=$SECONDS
+SVC_STATUS_HEALTH_TIMEOUT=$_hto run_svc status
+_el=$(( SECONDS - _t0 ))
+(( _el < _hto + 14 )) \
+    && pass "hung check: status returned within the bound (${_hto}s + kill grace), not after the 30 s check" \
+    || fail "hung check: status took ${_el}s — the row is not bounded"
+grep -qE "svchung +UNKNOWN .*did not finish within ${_hto}s" "$ROOT/out" \
+    && pass "hung check: row renders UNKNOWN and names the bound" \
+    || fail "hung row: $(grep svchung "$ROOT/out")"
+grep -qE 'svc124 +DOWN' "$ROOT/out" \
+    && pass "a check's OWN rc 124 inside the bound stays DOWN (the clock, not the code, decides timeout)" \
+    || fail "svc124 row: $(grep svc124 "$ROOT/out")"
+grep -qE 'svcok +UP' "$ROOT/out" \
+    && pass "hung check: a healthy row beside it still renders UP" \
+    || fail "svcok row: $(grep svcok "$ROOT/out")"
+cleanup_case
+
 # --- Case 17: `stop` on an orphan must NOT read as an all-clear -------------
 # Deleting a stale pidfile does not stop an orphaned daemon and is not
 # supervision. `stop` removed the RECORD, not the process; if it says nothing,
@@ -995,34 +1236,112 @@ bash -c 'exit 0' & GHOST=$!; wait "$GHOST" 2>/dev/null
 echo "$GHOST" > "$ROOT/monitor/.state/services/svcorph.pid"   # dead record => orphan
 
 run_svc stop svcorph
-[[ $RC == 0 ]] && pass "stop-orphan: exits 0" || fail "stop rc=$RC"
-grep -q 'no live supervisor' "$ROOT/err" \
-    && pass "stop-orphan: reports there was no supervisor to stop" \
-    || fail "no supervisor line: $(cat "$ROOT/err")"
-[[ ! -f "$ROOT/monitor/.state/services/svcorph.pid" ]] \
-    && pass "stop-orphan: the stale record is removed" \
-    || fail "pidfile survived"
+# CONTRACT CHANGED (your-org/nexus-code#606). `stop` used to exit 0 and delete
+# the record here, which read as "service stopped" while the daemon kept
+# serving — and threw away the record of the supervisor that died. It now
+# refuses and fails loudly. These assertions previously pinned the defect.
+[[ $RC != 0 ]] && pass "stop-orphan: exits NON-ZERO (it could not stop the daemon)" \
+    || fail "stop-orphan: exited 0 though nothing was stopped"
+grep -q 'REFUSING to drop the pid record' "$ROOT/err" \
+    && pass "stop-orphan: refuses to destroy the record, and says so" \
+    || fail "no refusal line: $(cat "$ROOT/err")"
+[[ -f "$ROOT/monitor/.state/services/svcorph.pid" ]] \
+    && pass "stop-orphan: the record is PRESERVED as evidence" \
+    || fail "pidfile destroyed on an orphan"
 # The load-bearing assertion: a still-passing healthcheck after `stop` means an
 # orphaned daemon is serving. Silence here is the false all-clear.
-grep -q 'WARNING' "$ROOT/err" \
+grep -q 'SERVING UNSUPERVISED' "$ROOT/err" \
     && pass "stop-orphan: WARNS that the daemon is still serving" \
     || fail "stop-orphan: silent all-clear! err=$(cat "$ROOT/err")"
-grep -q 'removed the record, not the daemon' "$ROOT/err" \
-    && pass "stop-orphan: says the record was removed, not the daemon" \
+grep -q 'cannot stop what it does not track' "$ROOT/err" \
+    && pass "stop-orphan: distinguishes the record from the daemon" \
     || fail "no record-vs-daemon warning"
 grep -q "svc.sh restart svcorph" "$ROOT/err" \
     && pass "stop-orphan: names the reconcile action" \
     || fail "no reconcile guidance"
 
 # A genuinely-down service with a dead record must stay quiet: nothing survives,
-# so there is nothing to warn about.
+# so there is nothing to warn about — and the consistent litter IS cleaned up.
 reg_line svcdown "$ROOT/wd" 'echo noop' 'false' > "$REG"
 echo "$GHOST" > "$ROOT/monitor/.state/services/svcdown.pid"
 run_svc stop svcdown
-grep -q 'WARNING' "$ROOT/err" \
+grep -qE 'SERVING UNSUPERVISED|REFUSING' "$ROOT/err" \
     && fail "stop-orphan: warned about a genuinely DOWN service" \
     || pass "stop-orphan: a truly down service triggers no orphan warning"
+[[ $RC == 0 ]] \
+    && pass "stop-orphan: a truly down service exits 0" \
+    || fail "stop-orphan: down service exited $RC"
+[[ ! -f "$ROOT/monitor/.state/services/svcdown.pid" ]] \
+    && pass "stop-orphan: a down service's stale record IS removed" \
+    || fail "stop-orphan: stale record kept for a down service"
 unset NEXUS_ROOT
+cleanup_case
+
+# --- Case 18: stop records operator intent (your-org/nexus-code#1827) -----------
+# `stop` used to leave no trace of WHY a service was down, so the watcher's
+# service-health auto-restart read the dead supervisor as an outage and brought
+# the service back within minutes. The sentinel is the record; every automatic
+# start path honours it and only an explicit start/restart withdraws it.
+echo '=== case 18: stop writes a stop request; automation honours it; start/restart clear it ==='
+build_case stopreq
+mkdir -p "$ROOT/wd-s"
+make_fake_wrapper "$ROOT/wd-s" wrapper.sh "$ROOT/wd-s/marker"
+hc="kill -0 \$(awk '{print \$2}' marker 2>/dev/null)"
+reg_line5 svc-s "$ROOT/wd-s" './wrapper.sh' "$hc" "$ROOT/wd-s/s.log" > "$REG"
+SENT="$ROOT/monitor/.state/services/svc-s.stop-requested"
+pf=$(svc_pidfile svc-s)
+sup_live() { local p; [[ -f "$pf" ]] && read -r p < "$pf" && [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null; }
+
+run_svc start svc-s; sleep 1
+sup_live && pass "stopreq: PRECONDITION service running" || fail "stopreq: start failed: $(cat "$ROOT/err")"
+NEXUS_WORKER_WINDOW=w1 run_svc stop svc-s
+[[ $RC == 0 ]] && pass "stopreq: stop rc 0" || fail "stopreq: stop rc=$RC err=$(cat "$ROOT/err")"
+[[ -f "$SENT" ]] && pass "stopreq: stop wrote the sentinel beside the pidfile" \
+    || fail "stopreq: no sentinel at $SENT"
+grep -q '^at=[0-9]' "$SENT" 2>/dev/null && grep -q '^iso=.' "$SENT" && grep -qx 'by=w1' "$SENT" \
+    && pass "stopreq: sentinel records at/iso/by" || fail "stopreq: sentinel body: $(cat "$SENT" 2>/dev/null)"
+
+run_svc status
+grep -E '^ *[0-9]+ +svc-s +STOPPED' "$ROOT/out" >/dev/null \
+    && pass "stopreq: status row reads STOPPED, not DOWN" \
+    || fail "stopreq: status row: $(grep svc-s "$ROOT/out")"
+grep -q 'stopped by request since ' "$ROOT/out" \
+    && pass "stopreq: status says 'stopped by request since <ts>'" \
+    || fail "stopreq: no stopped-by-request detail: $(grep svc-s "$ROOT/out")"
+
+SVC_RESTART_ACTOR=watcher run_svc restart svc-s; sleep 0.5
+[[ $RC == 76 ]] && pass "stopreq: an automated restart is REFUSED (rc 76)" \
+    || fail "stopreq: watcher restart rc=$RC err=$(cat "$ROOT/err")"
+sup_live && fail "stopreq: the refused restart relaunched the service" \
+    || pass "stopreq: the service stays down"
+[[ -f "$SENT" ]] && pass "stopreq: the refusal leaves the request standing" \
+    || fail "stopreq: an automated restart cleared the request"
+
+run_svc up --no-workers; sleep 0.5
+sup_live && fail "stopreq: the recovery sweep relaunched a stopped service" \
+    || pass "stopreq: the recovery sweep (up) leaves it down"
+grep -q "svc-s': stopped by request" "$ROOT/err" \
+    && pass "stopreq: the sweep says why it skipped" \
+    || fail "stopreq: sweep silent: $(grep svc-s "$ROOT/err")"
+
+run_svc start svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: an explicit start clears the request" \
+    || fail "stopreq: start left the sentinel"
+sup_live && pass "stopreq: …and the service runs again" || fail "stopreq: start did not relaunch: $(cat "$ROOT/err")"
+
+run_svc stop svc-s
+[[ -f "$SENT" ]] || fail "stopreq: PRECONDITION second stop wrote no sentinel"
+run_svc restart svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: an explicit restart clears the request" \
+    || fail "stopreq: restart left the sentinel"
+sup_live && pass "stopreq: …and the service runs again" || fail "stopreq: restart did not relaunch: $(cat "$ROOT/err")"
+
+run_svc restart svc-s; sleep 1
+[[ ! -e "$SENT" ]] && pass "stopreq: a restart of a running service leaves no request behind" \
+    || fail "stopreq: restart's internal stop wrote a sentinel"
+SVC_RESTART_ACTOR=watcher run_svc restart svc-s; sleep 1
+[[ $RC == 0 ]] && sup_live && pass "stopreq: CONTROL — an automated restart with no request proceeds" \
+    || fail "stopreq: automated restart without a request: rc=$RC err=$(cat "$ROOT/err")"
 cleanup_case
 
 # --- summary ---------------------------------------------------------------------

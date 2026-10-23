@@ -91,6 +91,13 @@ key="MOCK_PANE_STATE_${win//[^a-zA-Z0-9_]/_}"
 reset_key="MOCK_PANE_RESET_AT_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
+# THE REAL PRECEDENCE (pane-state.sh step 1b): an unexpired hook stamp
+# `$STATE_DIR/over-limit/<window-name>.json` answers `over-limit` BEFORE the
+# pane is read. Opt-in per index via MOCK_PANE_NAME_<idx> (#1741 S2 rows).
+name_key="MOCK_PANE_NAME_${win//[^a-zA-Z0-9_]/_}"
+if [[ -n "${!name_key:-}" && -f "${STATE_DIR:-.}/over-limit/${!name_key}.json" ]]; then
+    state=over-limit
+fi
 if [[ -n "$reset_at" ]]; then
     printf 'state=%s active=0 window=%s name=stub reset_at=%s\n' \
         "$state" "$win" "$reset_at"
@@ -151,14 +158,28 @@ reset_state() {
     : > "$PASTE_LOG"
     : > "$LOG_LOG"
     rm -f "$STATE_DIR/over-limit-state.tsv"
+    # The post-resume suppression sidecar (your-org/nexus-code#1141) is state
+    # too: a resume actioned by an earlier scenario would otherwise sit here
+    # and refuse the next scenario's fresh stamp — which is the gate working
+    # as designed, in a helper whose whole job is to make scenarios
+    # independent.
+    rm -f "$STATE_DIR/over-limit-liveness.tsv"
     unset PASTE_RC
 }
 
 # Helper: synthesize a stamp row directly (bypass _over_limit_record
 # so we can pin specific timestamps for the wake-loop tests).
+#
+# The row stays EIGHT fields (your-org/nexus-code#592 keeps the observation
+# epoch in a sidecar so an older watcher can still parse this file). Arg 9 is
+# the OBSERVATION, written to that sidecar, and defaults to NOW because every
+# caller here simulates a hold still in progress — which is by definition one
+# the 60s scan is observing continuously. Tests wanting a STALE observation
+# pass an explicit older epoch; see test-over-limit-reset-clock.sh.
 synth_row() {
     local key="$1" window="$2" role="$3" token="$4"
     local reset_epoch="$5" first_seen="$6" next_attempt="$7" attempts="$8"
+    local observed="${9:-$(date +%s)}"
     local path
     path=$(_over_limit_state_path)
     mkdir -p "$(dirname "$path")"
@@ -166,6 +187,7 @@ synth_row() {
         "$key" "$window" "$role" "$token" \
         "$reset_epoch" "$first_seen" "$next_attempt" "$attempts" \
         >> "$path"
+    _over_limit_observation_set "$key" "$observed"
 }
 
 NOW=$(date +%s)
@@ -259,6 +281,41 @@ _over_limit_tz_resolves 'America/Los_Angeles"' \
 _over_limit_tz_resolves "../../etc/passwd" \
     && assert_eq "tz_resolves rejects path traversal" accepted rejected \
     || assert_eq "tz_resolves rejects path traversal" rejected rejected
+
+# ---- your-org/nexus-code#574: a malformed TZ must not resolve SILENTLY ----
+# GNU `date` does not fail on an invalid TZ — it falls back to UTC and exits 0.
+# So the pre-existing `[[ $epoch =~ ^[0-9]+$ ]]` guard passes and the 6h safety
+# net never engages: the hold expires hours off, with no error anywhere. The
+# live token that produced this carried a trailing ANSI reset plus a stray
+# quote on the timezone half; measured skew was 17 hours at rc=0.
+_esc=$(printf '\033')
+epoch=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles${_esc}[0m\"" "$NOW")
+assert_eq "ANSI-tainted tz → +6h fallback, not a silent 17h skew" "$epoch" "$expected"
+
+# The exact observed production token, byte for byte.
+epoch=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles${_esc}[0m" "$NOW")
+assert_eq "observed live token → +6h fallback" "$epoch" "$expected"
+
+# A zone that is charset-clean but simply does not exist must also fall back
+# rather than resolve as UTC.
+epoch=$(_over_limit_reset_at_to_epoch "3am_Not/AZone" "$NOW")
+assert_eq "nonexistent zone → +6h fallback" "$epoch" "$expected"
+
+# NEGATIVE CONTROL for the guard itself: the sanitiser must not become so
+# eager that it rejects legitimate zones. These must still resolve normally
+# (a future epoch within 26h), NOT hit the fallback — otherwise the fix would
+# have "passed" by disabling timezone handling altogether.
+for _tz in "America/Los_Angeles" "UTC" "Europe/Berlin" "Asia/Tokyo"; do
+    epoch=$(_over_limit_reset_at_to_epoch "3am_${_tz}" "$NOW")
+    if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch >= NOW )) && (( epoch <= NOW + 26*3600 )) \
+       && (( epoch != expected )); then
+        printf '  PASS: valid zone %s still resolves (not fallback)\n' "$_tz"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: valid zone %s no longer resolves (got %s)\n' "$_tz" "$epoch" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
 
 # ---- stamp lifecycle ------------------------------------------------------
 
@@ -354,6 +411,72 @@ _over_limit_load "worker-b" >/dev/null \
 _over_limit_load "_orchestrator" >/dev/null \
     && { printf '  FAIL: busy orchestrator wrongly stamped\n' >&2; FAIL=$(( FAIL + 1 )); } \
     || { printf '  PASS: busy orchestrator not stamped\n'; PASS=$(( PASS + 1 )); }
+
+echo '=== scan_panes: reconciles a stamped pane that reads ALIVE (#592) ==='
+# End-to-end for the 15-hour emit blackout. The scan probes every pane every
+# 60s; before #592 it discarded the answer unless the pane read over-limit, so
+# a row parked at a miscomputed instant kept the suppression gate shut while
+# the scan watched a live pane every minute. Now the scan expedites the wake,
+# and the 5s wake loop resumes the pane on its next tick.
+for _alive in idle busy empty working-background; do
+    reset_state
+    export MOCK_TMUX_WINDOWS="$(printf 'orchestrator|2\nworker-a|3')"
+    export MOCK_PANE_STATE_2="$_alive"
+    export MOCK_PANE_STATE_3="$_alive"
+    # Both parked a full day out, as the production rows were.
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+        $(( NOW + 86400 )) $(( NOW - 43200 )) $(( NOW + 86700 )) 0 $(( NOW - 43200 ))
+    synth_row "worker-a" "worker-a" "worker" "3am_America/Los_Angeles" \
+        $(( NOW + 86400 )) $(( NOW - 43200 )) $(( NOW + 86700 )) 0 $(( NOW - 43200 ))
+    # Sample the clock adjacent to the call: reconcile stamps the real `now`,
+    # and NOW is captured once at file top, so wall-clock drift across this
+    # loop would otherwise make the tolerance flaky (it did).
+    t_scan=$(date +%s)
+    _over_limit_scan_panes "orchestrator"
+    orch_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load _orchestrator)")
+    wrk_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load worker-a)")
+    if (( orch_next >= t_scan - 2 && orch_next <= t_scan + 10 )) \
+       && (( wrk_next >= t_scan - 2 && wrk_next <= t_scan + 10 )); then
+        printf '  PASS: state=%s expedites both parked wakes to ~now\n' "$_alive"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: state=%s left wakes parked (orch=%s worker=%s, t_scan=%s, was %s)\n' \
+            "$_alive" "$orch_next" "$wrk_next" "$t_scan" "$(( NOW + 86700 ))" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # …and the wake loop then actually resumes them, clearing the gate.
+    _over_limit_process_wakes "orchestrator"
+    if _over_limit_orchestrator_paused; then
+        printf '  FAIL: state=%s — gate still suppressed after reconcile+wake\n' "$_alive" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: state=%s — reconcile+wake reopened the emit gate\n' "$_alive"
+        PASS=$(( PASS + 1 ))
+    fi
+    unset MOCK_PANE_STATE_2 MOCK_PANE_STATE_3
+done
+
+echo '=== scan_panes: a still-over-limit pane is NOT expedited ==='
+# Polarity guard: reconcile must not undo a legitimate parked wake.
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='3am_America/Los_Angeles'
+# The horizon must be the one the parser derives from first_seen, or the
+# self-heal correctly rewrites it (it is an exact re-derivation test now, not
+# a threshold — skeptic finding B on #582). An arbitrary fixture value here
+# would exercise the heal rather than the polarity guard this test is for.
+_genuine_first=$(( NOW - 60 ))
+_genuine_reset=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles" "$_genuine_first")
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    "$_genuine_reset" "$_genuine_first" "$(( _genuine_reset + 300 ))" 0 "$_genuine_first"
+_over_limit_scan_panes "orchestrator"
+orch_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load _orchestrator)")
+assert_eq "genuine hold keeps its parked wake" "$orch_next" "$(( _genuine_reset + 300 ))"
+_over_limit_orchestrator_paused \
+    && { printf '  PASS: genuine hold still suppresses emits\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: genuine hold stopped suppressing\n' >&2; FAIL=$(( FAIL + 1 )); }
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2
 unset MOCK_PANE_STATE_2 MOCK_PANE_STATE_3 MOCK_PANE_STATE_4 MOCK_PANE_RESET_AT_3
 
 # ---- process_wakes state machine ------------------------------------------
@@ -1195,13 +1318,13 @@ grep -q "hold began" "$held" 2>/dev/null \
     || { printf '  FAIL: off-time log header missing\n' >&2; FAIL=$(( FAIL + 1 )); }
 _over_limit_record_held "2026-07-15_11-00-00_abc123.md" "poll-resurface"
 _over_limit_record_held "2026-07-15_11-01-00_def456.md" "poll-full-state"
-n=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+n=$(grep -c $'\theld\t' "$held" 2>/dev/null) || n=0
 [[ "$n" == "2" ]] \
     && { printf '  PASS: two held emits recorded (n=%s)\n' "$n"; PASS=$(( PASS + 1 )); } \
     || { printf '  FAIL: expected 2 held records, got %s\n' "$n" >&2; FAIL=$(( FAIL + 1 )); }
 # A REFRESH of the same hold must NOT truncate the log (progress preserved).
 _over_limit_record "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles"
-n2=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+n2=$(grep -c $'\theld\t' "$held" 2>/dev/null) || n2=0
 [[ "$n2" == "2" ]] \
     && { printf '  PASS: hold refresh preserves the off-time log\n'; PASS=$(( PASS + 1 )); } \
     || { printf '  FAIL: hold refresh clobbered the log (n=%s)\n' "$n2" >&2; FAIL=$(( FAIL + 1 )); }
@@ -1225,5 +1348,141 @@ assert_contains "brief points at snapshot path"    "$brief" "monitor/.state"
 
 brief=$(_over_limit_compose_resume_brief "3am" 120 "")
 assert_contains "no-workers brief omits queue line" "$brief" "No workers were suspended"
+
+WORK_OL_SIDECAR=$(mktemp -d)
+trap 'rm -rf "$WORK_OL_SIDECAR"' EXIT
+
+# ---- your-org/nexus-code#1488: the limit is READ, never assumed ------------
+echo '=== #1488: the wake brief names the REAL limit and never asserts an unknown reset ==='
+# MEASURED 2026-09-07. A worker hit its FABLE limit. The watcher classified it
+# as "weekly Opus limit hit", scheduled a resume against an Opus reset, and
+# pasted "Watcher resume: weekly Opus limit reset (unknown)" — asserting a
+# reset in the same sentence that admitted the time was unknown. The worker was
+# refused again on arrival: 2 resume pastes, 3 rejections. Nothing in that path
+# read the pane message naming the real limit, so it could not learn from the
+# refusal.
+brief=$(_over_limit_compose_worker_brief "3am_America/Los_Angeles" "weekly_Fable")
+assert_contains     "the brief names the limit the PANE named"            "$brief" "weekly Fable limit"
+assert_not_contains "…and does not assert Opus for a Fable limit"         "$brief" "Opus"
+assert_contains     "…and states the reset it was actually given"         "$brief" "3am (America/Los_Angeles)"
+
+# AN UNKNOWN RESET IS A PROBE, NOT A RESET. The wake paste is legitimately a
+# probe — _over_limit_bump_or_failopen says so — so the wording must not tell a
+# still-limited recipient that they are back.
+brief=$(_over_limit_compose_worker_brief "unknown" "weekly_Fable")
+assert_contains     "an UNKNOWN reset is announced as a PROBE"            "$brief" "PROBE"
+assert_not_contains "…and never claims the limit 'reset'"                 "$brief" "limit reset"
+assert_contains     "…while still naming the real limit"                  "$brief" "weekly Fable"
+assert_contains     "…and telling a still-limited worker what to do"      "$brief" "still limited, ignore this"
+
+# An unmeasured flavour renders as `usage`, never as a model tier nobody read.
+brief=$(_over_limit_compose_worker_brief "3am" "")
+assert_contains     "an unmeasured flavour degrades to 'usage'"           "$brief" "your usage limit"
+assert_not_contains "…never to an invented model name"                    "$brief" "Opus"
+brief=$(_over_limit_compose_worker_brief "3am" "unknown")
+assert_contains     "…and the literal token 'unknown' degrades the same way" "$brief" "your usage limit"
+
+# The sidecar round-trips, and refuses to store the absence of knowledge as if
+# it were knowledge.
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_set "wkey" "weekly_Fable"
+assert_eq "the flavour sidecar round-trips" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get wkey)" "weekly_Fable"
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_set "ukey" "unknown"
+assert_eq "…and NEVER stores 'unknown' — an absent row and a stored unknown would be two spellings of one fact" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get ukey)" ""
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_drop "wkey"
+assert_eq "…and drops cleanly, so dead keys cannot accumulate" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get wkey)" ""
+
+# ---- RESET EVENTS (your-org/nexus-code#1739) --------------------------------
+echo '=== #1739/#1741 S2: a credential change releases EVERY row; any other source touches NONE ==='
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 21835 )) 0
+synth_row "w1" "w1" "worker" "3am_America/Los_Angeles" \
+    $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 600 )) 1
+synth_row "w2" "w2" "worker" "3am_America/Los_Angeles" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 5 )) 2
+before=$(cat "$(_over_limit_state_path)")
+n=$(_over_limit_expedite_all over-limit-resumed:x)
+assert_eq "R39-ol.other.count: a non-credential event changes no row" "$n" "0"
+assert_eq "R39-ol.other.bytes: the state file is byte-identical" "$(cat "$(_over_limit_state_path)")" "$before"
+n=$(_over_limit_expedite_all credential-change)
+assert_eq "R39-ol.count: all three rows released (2 clocks moved, 3 attempt caps)" "$n" "3"
+na_o=$(_over_limit_load_next_attempt "_orchestrator"); na_1=$(_over_limit_load_next_attempt "w1"); na_2=$(_over_limit_load_next_attempt "w2")
+assert_eq "R39-ol.now: the 21835 s orchestrator wake is now due" "$(( na_o <= $(date +%s) ))" "1"
+assert_eq "R39-ol.worker: the worker wake is now due" "$(( na_1 <= $(date +%s) ))" "1"
+assert_eq "R39-ol.due: the already-due row kept its own next_attempt" "$na_2" "$(( NOW - 5 ))"
+assert_eq "R39-ol.attempts: every row sits one short of the cap" \
+    "$(awk -F'\t' '{print $8}' "$(_over_limit_state_path)" | sort -u | paste -sd, -)" "3"
+assert_contains "R39-ol.log: each expedite is logged with its source" "$(cat "$LOG_LOG")" "wake expedited by reset event (credential-change)"
+
+echo '=== #1739: a BUSY resumption raises a reset event; an IDLE one does not ==='
+r39_signals=()
+_unstick_reset_event_signal() { r39_signals+=("$1"); }
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=busy MOCK_PANE_RESET_AT_2=''
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 600 )) $(( NOW - 1800 )) $(( NOW - 1 )) 1
+_over_limit_process_wakes "orchestrator"
+assert_eq "R39-ol.busy: busy resumption signalled once, naming the window" "${r39_signals[*]:-}" "over-limit-resumed:orchestrator"
+r39_signals=()
+reset_state
+export MOCK_PANE_STATE_2=idle
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 600 )) $(( NOW - 1800 )) $(( NOW - 1 )) 1
+_over_limit_process_wakes "orchestrator"
+assert_eq "R39-ol.idle: an idle resumption is not evidence of quota" "${r39_signals[*]:-}" ""
+unset -f _unstick_reset_event_signal
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2 MOCK_TMUX_WINDOWS
+
+
+# ---- #1741 S2: a credential change must RESUME the row, not just move its clock --
+s2_setup() { # <pane-state behind the stamp>
+    reset_state
+    rm -rf "$STATE_DIR/over-limit"; mkdir -p "$STATE_DIR/over-limit"
+    printf '{"reset_at":"3am_America/Los_Angeles"}\n' > "$STATE_DIR/over-limit/w1.json"
+    export MOCK_TMUX_WINDOWS="orchestrator|2"$'\n'"w1|7"
+    export MOCK_PANE_NAME_7=w1 MOCK_PANE_STATE_7="$1" MOCK_PANE_RESET_AT_7=''
+    export MOCK_PANE_STATE_2=idle
+    synth_row "w1" "w1" "worker" "3am_America/Los_Angeles" \
+        $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 21835 )) 0
+}
+s2_paste() { awk -F'\t' '$1=="w1"' "$PASTE_LOG" | wc -l | tr -d ' '; }
+s2_row()   { _over_limit_load "w1" >/dev/null && echo present || echo dropped; }
+
+echo '=== #1741 S2: credential change, live pane behind the stamp → RESUMED in one wake ==='
+s2_setup idle
+_over_limit_expedite_all credential-change >/dev/null
+_over_limit_process_wakes "orchestrator"
+assert_eq "S2-live.resumed: brief pasted once" "$(s2_paste)" "1"
+assert_eq "S2-live.dropped: row dropped" "$(s2_row)" "dropped"
+assert_contains "S2-live.path: through the RESUME path, not a fail-open" "$(cat "$LOG_LOG")" "over-limit: 'w1' resumed"
+assert_eq "S2-live.audit: the stamp is kept, renamed" \
+    "$(ls "$STATE_DIR/over-limit" | grep -c '^w1\.json\.released-credential-change\.')" "1"
+
+echo '=== #1741 S2: credential change, banner STILL rendered → fails open on THIS wake, no 7-min backoff ==='
+s2_setup over-limit
+_over_limit_expedite_all credential-change >/dev/null
+_over_limit_process_wakes "orchestrator"
+assert_eq "S2-banner.pasted: the wake brief is pasted now" "$(s2_paste)" "1"
+assert_eq "S2-banner.dropped: row dropped" "$(s2_row)" "dropped"
+assert_contains "S2-banner.path: via the fail-open probe" "$(cat "$LOG_LOG")" "max wake attempts"
+
+echo '=== #1741 S2: a NON-credential event never burns a valid stamp toward an early fail-open ==='
+s2_setup idle
+_over_limit_expedite_all over-limit-resumed:orchestrator >/dev/null
+for _ in 1 2 3 4 5; do _over_limit_process_wakes "orchestrator"; done   # five wakes: the old burn-down needed four
+assert_eq "S2-false.stamp: the valid stamp is still in place" \
+    "$([[ -f "$STATE_DIR/over-limit/w1.json" ]] && echo kept || echo gone)" "kept"
+assert_eq "S2-false.nopaste: nothing pasted" "$(s2_paste)" "0"
+assert_eq "S2-false.held: the row is held, not dropped" "$(s2_row)" "present"
+assert_eq "S2-false.clock: its wake is still the original, hours out" \
+    "$(_over_limit_load_next_attempt w1)" "$(( NOW + 21835 ))"
+assert_eq "S2-false.attempts: no attempt consumed" \
+    "$(_over_limit_load w1 | awk -F'\t' '{print $8}')" "0"
+unset MOCK_PANE_NAME_7 MOCK_PANE_STATE_7 MOCK_PANE_RESET_AT_7 MOCK_PANE_STATE_2 MOCK_TMUX_WINDOWS
+rm -rf "$STATE_DIR/over-limit"
 
 th_summary_and_exit

@@ -1,5 +1,5 @@
 ---
-description: "nexus bot identity for all GitHub writes: monitor/ng for nexus repo, GH_TOKEN=$(mint-token.sh) gh for cross-repo. Never plain gh."
+description: "nexus bot identity for all GitHub writes: monitor/ng for nexus repo, GH_TOKEN=$(mint-token.sh) gh for cross-repo. Never plain gh. Also: which real `gh` client the wrapper selects and why the floor is a capability rather than a version boundary, the per-attempt job-log trap (`gh run view --job` serves the LATEST attempt regardless of the job id — use `gh api .../jobs/<id>/logs`), and reading a user-pasted `user-attachments` asset, which poisons the session if fetched directly."
 ---
 
 # nexus.bot — GitHub identity for spawned agents
@@ -32,13 +32,21 @@ is configured, so a plain `git push` to an HTTPS remote dies with
 fatal: could not read Username for 'https://github.com'
 ```
 
-Push through the bot's installation token in the URL form instead:
+Push with the bot's installation token through a one-shot credential helper:
 
 ```bash
 TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
-git -C <clone> push \
-  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+TOK="$TOK" GIT_TERMINAL_PROMPT=0 git -C <clone> -c credential.helper= \
+  -c 'credential.helper=!f() { test "$1" = get || return 0; echo username=x-access-token; echo "password=$TOK"; }; f' \
+  push https://github.com/<owner>/<repo>.git <branch>
 ```
+
+The helper text names the VARIABLE, never its value. git runs it with
+`sh`, and `echo` is a builtin, so the token reaches no process argv.
+Do not put the token in the URL (`https://x-access-token:$TOK@…`):
+`git` and `git-remote-https` then carry it in `/proc/<pid>/cmdline`,
+which every same-uid process can read with `ps`. The lint
+`monitor/watcher/test-argv-credential-lint.sh` flags that form.
 
 This does **not** violate the rule above, because it separates two
 things that are easy to conflate:
@@ -67,32 +75,88 @@ so in your report. Configuring an operator git identity in the sandbox
 is the real fix; until then, bot-authored self-fix commits are the
 expected state, not a violation to be corrected in passing.
 
-Keep the token inline — never `git remote set-url` it into `.git/config`,
-and filter it out of any captured output. The URL form itself is
-documented in `<yourlab>.sandbox-gotchas` rule 3; this note only records
-which identity it carries and why it is legitimate here.
+Keep the token out of config — never `git remote set-url` it into
+`.git/config`, and filter it out of any captured output.
+`<yourlab>.sandbox-gotchas` rule 3 documents an older token-in-URL
+form. Prefer the helper form above: it keeps the token out of argv.
+This note only records which identity it carries and why it is
+legitimate here.
 
-## The bot is the DEFAULT — the `gh` wrapper
+## The bot is the DEFAULT — the `gh` wrapper is a BACKSTOP
 
-You do not have to remember the rule for the common case: a bare
-`gh <write>` already runs as the bot. A PATH-FRONT `gh` wrapper
-(`monitor/ghwrap/gh`) is prepended to the front of `PATH` for every
-agent process: process-wide by `monitor/locals-env.sh` (full mode),
-and re-asserted to the FRONT per-command by
-`monitor/shellenv/.zshenv` (reached via
-`ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front
-is the load-bearing bit — `~/.zshenv` re-prepends linuxbrew (where
-the real `gh` lives) on every `zsh -c`, so the wrapper dir is pushed
-back to the front AFTER that, winning the race (<your-org>/nexus-code
-PR #349, operator request comment 4795415597).
+A bare `gh <write>` normally runs as the bot. **Do not rely on that.**
+Lead with `GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh) gh <write> …`
+and then assert the identity with
+`"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url>`. The wrapper has been
+observed broken on a live clone — five operator-authored writes in one
+day (`#497`) — and the failure is silent by construction: the write
+succeeds, GitHub mutes the operator's self-notification, and the thread
+goes dark. The assertion is the only loud check, and it is independent
+of whether the wrapper is healthy — so lead with the explicit mint +
+`assert-bot-author` REGARDLESS. The wrapper is what catches the quick
+ack you fire off without thinking; it is not the mechanism you design
+around. A PATH-FRONT `gh` wrapper (`monitor/ghwrap/gh`) is prepended to
+the front of `PATH` for every agent process: process-wide by
+`monitor/locals-env.sh` (full mode), and re-asserted to the FRONT
+per-command by a shared snippet (`monitor/shellenv/front-path.zsh`)
+sourced from `.zshenv` AND the interactive/login proxies
+`.zshrc`/`.zprofile`/`.zlogin` (reached via
+`ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front is
+the load-bearing bit — `~/.zshenv`/`~/.zshrc` re-prepend linuxbrew (where
+the real `gh` lives) on every shell, so the wrapper dir is pushed back to
+the front AFTER that, winning the race (<your-org>/nexus-code PR #349,
+operator request comment 4795415597).
+
+`#578` closed the specific hole behind the `#497` breakage — the
+Claude Code Bash tool sources a PATH SNAPSHOT captured by a
+LOGIN+INTERACTIVE shell, and the `.zshrc` proxy re-prepended linuxbrew
+without re-fronting, so the snapshot buried the wrapper — by re-fronting
+in all four proxies, AND made wrapper reachability a fail-CLOSED
+spawn-time precondition (`monitor/assert-shims-wrapped.sh`, run by every
+agent launcher). So the bare-`gh` backstop is now RELIABLE rather than
+silently broken.
+
+`#589` generalised that precondition. The PATH root cause is not
+`gh`-specific — it buries EVERY PATH-front shim at once — and the other
+shims fail in the opposite direction: an unwrapped `gh` is fail-SAFE by
+accident (the scoped `GH_CONFIG_DIR` leaves it with no credentials),
+whereas an unwrapped `pip` is fail-OPEN and takes the node down
+(`#487`). So the guard now enumerates the shim set from the shim
+DIRECTORIES (`monitor/*wrap` → `gh`, `pip`, `pip3`, `sandbox-notify`, …)
+rather than a hand-maintained list, refuses if any is unresolved or
+shadowed by an alias, and additionally OBSERVES that the worker's soft
+`RLIMIT_NPROC` ceiling reaches a spawned child and grandchild (the
+launcher's `ulimit -Su … || true` swallows its own failure, so the
+ceiling cannot be inferred from the source). `monitor/assert-gh-wrapped.sh`
+survives as a deprecated forwarding shim for stale launchers and forks.
+
+`#612` gave it a THIRD outcome. When the guard cannot examine its subject at
+all — `NEXUS_ROOT` unset, no shim dirs, no probe shell — it exits **79 "NOT
+CHECKED"** rather than `0`, because a guard that did not run must not be
+indistinguishable from one that passed. 79 still allows the spawn, but the
+launcher records it as a durable row in
+`monitor/.state/guard-unverified.log`, so "this agent started unverified" is
+establishable after the fact; `NEXUS_REQUIRE_SHIM_CHECK=1` turns it into a
+refusal. If you see that row for your own window, the bare-`gh` backstop was
+NOT verified for your spawn — lead with the explicit mint and assert the
+author, which you should be doing anyway.
+
+That does NOT demote the lead-with-explicit rule: the
+`assert-bot-author` loud check remains the only thing that catches an
+identity slip from ANY cause, and in a spawn context with no operator
+ambient auth the explicit bot-token mint is also what makes even READS
+resolve. Explicit mint + assert stays the default; the reliable wrapper
+is the safety net under it.
 
 A real **executable** — not the earlier zsh *function* — because a
 function only shadows `gh` inside the zsh shells that source it; the
 wrapper, being on PATH, is inherited by EVERY child an agent spawns
 (bash subshells, `python subprocess`, Makefiles). The classification
 + token logic is single-sourced in `monitor/gh-shim.sh`, which the
-wrapper sources after resolving the real `gh` (first on PATH that is
-not itself — recursion-safe).
+wrapper sources after resolving the real `gh` — the first candidate on
+`PATH` that is not itself AND meets the declared capability floor (see
+"Which `gh` client the wrapper runs" below). Passing the resolved
+ABSOLUTE path into the shim is what makes it recursion-safe.
 
 What it does, per invocation:
 
@@ -102,27 +166,61 @@ What it does, per invocation:
   mint (refuses the call) rather than letting `GH_TOKEN=""` fall
   through to the operator's ambient auth (the security-boundary
   rule below).
-- **READ + `gh auth …` → pass through untouched.** Reads don't
-  notify; `gh auth token` is the user-PAT path `ng fetch-asset`
-  needs.
+- **READ + `gh auth …` → run as the OPERATOR, on the operator's own
+  credentials.** Not "untouched": `locals-env` scopes the ambient
+  `GH_CONFIG_DIR` to a credential-free dir (so an unwrapped `gh` fails
+  CLOSED), and the wrapper RE-SUPPLIES the operator's real config for
+  reads. So a read — including of a PRIVATE repo — succeeds with NO
+  caller-supplied token; do NOT hand-roll
+  `GH_TOKEN=$(./monitor/mint-token.sh) gh …` for a read. `gh auth token`
+  is the user-PAT path `ng fetch-asset` needs.
 - **`GH_TOKEN` already set → pass through unchanged.** The watcher
   and correct callers (incl. `GH_TOKEN=$(./monitor/mint-token.sh)
   gh …`) set it explicitly; the wrapper never double-injects.
 
-Verb classification (err toward WRITE on ambiguity):
+Verb classification is **FAIL-CLOSED, and the table below is the READ
+side** (`monitor/gh-shim.sh` branch 3, `<your-org>/nexus-code#568` A3). The
+classifier does not enumerate writes: it enumerates the reads and
+defaults **everything else to WRITE** — an unenumerated subcommand, a
+subcommand a future `gh` adds, a command group the shim has never heard
+of. This document enumerates the same side the code does, so the two
+cannot disagree about what the DEFAULT is. It used to list the WRITE
+side, and that list went stale the moment an arm was added: `gh project
+item-create`, `gh codespace create`, `gh release delete-asset`, `gh repo
+deploy-key add` and `gh agent-task create` all posted as the OPERATOR
+until the polarity was inverted.
 
-| Group | Classified WRITE when subcommand / form is… |
+| Group | Classified READ (runs as the operator) when the subcommand is… |
 |---|---|
-| `pr` | create·edit·merge·comment·close·reopen·ready·review |
-| `issue` | create·edit·comment·close·reopen·lock·unlock·delete·transfer·pin·unpin·develop |
-| `release` | create·edit·delete·upload |
-| `repo` | create·edit·delete·archive·unarchive·rename·fork·sync·set-default |
-| `label` | create·edit·delete·clone |
-| `gist` | create·edit·delete·rename |
-| `secret`/`variable` | set·delete·remove |
-| `workflow`/`run`/`cache`/`gpg-key`/`ssh-key` | run·enable·disable / cancel·rerun·delete / delete / add·delete |
-| `api` | `--method`/`-X` in {POST,PATCH,PUT,DELETE}; OR a request body (`-f/-F/--field/--raw-field`, or `--input <file>`) with no explicit GET (gh defaults those to POST); OR **`api graphql`** (mutations are hard to tell from queries — graphql defaults to the bot) |
-| everything else (reads, `gh auth`, `status`, `search`, …) | pass through |
+| whole groups | `auth` · `alias` · `config` · `extension` · `completion` · `help` · `version` · `status` · `search` · `browse` — read-only, or purely local `gh` state. `gh auth token` is load-bearing: it is the user-PAT path `ng fetch-asset` depends on. |
+| `pr` | list · view · diff · checks · status · checkout |
+| `issue` | list · view · status |
+| `release` | list · view · download |
+| `repo` | list · view · clone · license · gitignore; `deploy-key`/`autolink` → list · view |
+| `label` · `secret` · `variable` · `cache` · `gpg-key` · `ssh-key` · `org` | list |
+| `gist` | list · view · clone |
+| `workflow` · `agent-task` | list · view |
+| `run` | list · view · watch · download |
+| `codespace` | list · view · logs · ports · code · ssh · jupyter |
+| `project` | list · view · item-list · field-list |
+| `ruleset` | list · view · check |
+| `attestation` | verify · download · trusted-root |
+| `api` | a plain GET: no `--method`/`-X` in {POST,PATCH,PUT,DELETE}, not `graphql`, and no request body (`-f`/`-F`/`--field`/`--raw-field`/`--input`). **`api graphql` is a WRITE** — mutations are hard to tell from queries, so graphql defaults to the bot. |
+| no group token | `gh` bare, or flags only (`gh --version`, `gh --help`). An UNRECOGNISED group is a WRITE. |
+
+`gh <group>` with no subcommand prints help and is a read. Everything
+not in that table is a WRITE and runs on the bot token.
+
+**A fail-closed WRITE verdict announces itself on stderr** — `gh-shim:
+\`gh <group> <sub>\` is not on any read allowlist — classified WRITE
+(fail-closed), using the BOT identity.` — except for the long-familiar
+writes (`pr create`, `issue comment`, `release upload`, …), which stay
+quiet. Set `GH_SHIM_QUIET=1` if you parse stderr. The cost of the
+inversion, stated honestly: a READ mis-classified as a WRITE runs under
+the bot's installation token and can 404 on a repo where the bot is not
+installed. That failure is LOUD and immediate; the one it replaced was
+silent by construction (the `#497` signature). The remedy for both is
+`GH_IMPERSONATE=1 GH_IMPERSONATE_REASON='…'`.
 
 Scope: the wrapper is **inert for the watcher** (it runs with
 `WATCHER_WINDOW` set and presets `GH_TOKEN` inline, so its
@@ -147,8 +245,9 @@ GH_IMPERSONATE=1 GH_IMPERSONATE_REASON="external repo, no bot install; operator 
   gh issue comment -R TrigosTeam/foo 5 --body-file note.md
 ```
 
-A reason is **required** (the shim refuses without one), and every
-impersonated call is appended to `monitor/.state/impersonate.log`.
+A reason is **required** — without `GH_IMPERSONATE_REASON` the shim
+refuses at **exit 3** and never reaches `gh` — and every impersonated
+call is appended to `monitor/.state/impersonate.log`.
 A `--dangerously-impersonate` pseudo-flag is an equivalent trigger
 (stripped before `gh` sees it). Note the auto-inject already makes
 this case self-correcting: a bot token 404s on a repo it can't see,
@@ -177,7 +276,7 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 |------------|---------|-------------------|
 | `ng pr create --head <branch> [--base main] --title "…" --body-file b.md` | Open a PR | PR URL |
 | `ng pr edit <n> [--title "…"] [--body-file b.md]` | Edit a PR | PR URL |
-| `ng pr merge <n> [--squash\|--merge\|--rebase] [--delete-branch]` | Merge a PR, unless a recorded verdict covers a different head | merge SHA |
+| `ng pr merge <n> [--squash\|--merge\|--rebase] [--sha <head>] [--base-sha <base>\|--verify-base] [--delete-branch]` | Merge a PR, unless a recorded verdict covers a different head. `--sha` pins the head you verified (#628); `--verify-base` re-checks the BASE inside the verb, ms before the PUT — prefer it, the verdict→merge window has been measured at 4s (#880) | merge SHA |
 | `ng pr merge <n> --verdict-override "<reason>"` | Merge past that refusal; the reason is mandatory and audited | merge SHA |
 | `ng pr view <n>` | Brief PR summary | `#<n> state=… author=… title=…` |
 | `ng pr verdict set <n> --verdict credible [--head <sha>]` | Record a verdict and the commit it covers, on the PR body | the trailer, then the PR URL |
@@ -191,32 +290,37 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 | `ng process <comment-id>` | Eligibility check + eyes + fetch body | `issue=<n>` / `author=<login>` / `body<<EOF` … |
 | `ng dashboard get` | Fetch overview-issue dashboard middle | dashboard markdown |
 | `ng dashboard put [--body-file <path>]` | Splice + PATCH dashboard | issue URL |
-| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>]` | Commit a file to the nexus asset repo's `main` and print a SHA-pinned URL that renders in any logged-in browser | asset URL pinned to the post-push SHA |
+| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>] [--replace]` | Commit a file to the nexus asset repo's `main` and print a SHA-pinned URL that renders in any logged-in browser. A destination already holding DIFFERENT content is REFUSED at exit 5 (<your-org>/nexus-code#1639): pass `--repo-path <unique>` to keep both, or `--replace` to overwrite deliberately | asset URL pinned to the post-push SHA |
 | `ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]` | Download a `github.com/user-attachments/...` asset via the user's PAT (the bot's installation token 404s on this surface). Default `--out` is `monitor/.state/assets/<asset-id>.<ext>` | `path=…` / `content_type=…` / `bytes=…` |
 | `ng watcher-status` | One-shot watcher liveness summary | key=value block |
 | `ng log-action <agent> --event <name> [--note <t>] [--extra k=v]…` | Append one JSONL action-trace line | (silent) |
 | `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--retain <reason>\|--no-retain]` | Universal end-of-task hand-off: uploads the report, posts a templated link comment, rockets the trigger comment, logs the wrap-up, AND auto-logs a `window-retain` event for the source tmux window (reason `wrap-up-<YYYY-MM-DD>` unless `--retain` overrides; `--no-retain` opts out). The retain mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) so the orchestrator can `claude --continue` against a follow-up user comment instead of spawning a fresh worker every time. | per-step status lines on stdout |
 
-### `react` silence
+### `react` confirmation
 
-`ng react` exits 0 on success but prints nothing on the happy path —
-trust the exit code. There's a documented friction request to add a
-`reacted <content> on comment <id>` confirmation; until then, scripts
-must check `$?` rather than parsing stdout.
+`ng react` prints `reacted <content> on comment <id>` on the happy path
+(`ng react-issue` prints `reacted <content> on issue <n>`) and exits 0.
+The POST failing is a `die`, so `$?` remains the thing to branch on;
+the line is for a human reading the pane.
 
-### Verbs landing soon (`<operator>/ng-omnibus`, not yet merged)
+### Cross-repo verbs — shipped
 
-- `ng preflight <repo>` — hits `/installation/repositories` and prints
-  whether the bot is installed on the target repo. Lets cross-repo
-  writes fail fast instead of returning a confusing GraphQL 403.
-- `ng show <comment-id>` — read-only fetch that bypasses the eligibility
-  filter, so an agent can quote a prior bot-authored comment.
-- `--repo OWNER/NAME` flag on `ng pr ...` and `ng issue ...` —
-  retargets the verb at a sibling <your-org> repo without falling back
-  to raw `gh api`.
+These three are merged and available; the `GH_TOKEN=…` escape hatch
+below is now only for verbs `ng` genuinely does not cover:
 
-Until these merge, cross-repo writes use the `GH_TOKEN=…` escape
-hatch below.
+- `ng preflight <owner/repo>` — prints
+  `bot installed: yes|NO (<repo>) — repository_selection=<…>`. Lets a
+  cross-repo write fail fast instead of returning a confusing GraphQL
+  403.
+- `ng show <comment-id> [--meta]` — read-only fetch that bypasses the
+  eligibility filter, so an agent can quote a prior bot-authored
+  comment. `--meta` adds the `updated_at` CAS snapshot that
+  `ng comment-edit --expect-updated-at` consumes.
+- `--repo OWNER/NAME` on most `pr`/`issue`/`show` verbs — retargets at
+  a sibling repo. Unset, a WRITE verb prefers `github.repo` from config
+  and **refuses** (rather than misroutes) when the cwd's git origin is
+  a different github repo; a READ verb prefers the cwd's origin with a
+  one-line stderr warning.
 
 ## Embedding local files (the asset-repo rule)
 
@@ -259,6 +363,19 @@ Three defaults worth knowing:
 Override the default destination with `--repo-path foo/bar.png` for
 fine control. The push always lands under `assets/`; the loader
 prepends if you omit it.
+
+**A claude.ai Artifact is never the GitHub copy** (<your-org>/nexus-code#1856).
+The operator reading a thread on GitHub cannot open `claude.ai/artifact/…` or
+`claude.ai/code/artifact/…` links, so a deliverable posted only as an Artifact
+link is missing for its reader, and nothing errors. Anything meant for a GitHub
+reader goes up with `ng upload` and the asset link goes in the body. md, SVG
+and PNG render on github.com; raw HTML does NOT, so ship an `.md` (or images)
+beside any HTML. An Artifact link may sit beside the asset as an optional
+extra. `ng reply`/`comment`/`issue create`/`issue comment`/`pr create`/`pr
+edit`/`comment-edit`/`wrap-up` and the `gh` shim print a WARNING (stderr only,
+never a refusal) for a body carrying an Artifact link and no `…/assets/…`
+link; `monitor/artifact-link-check.sh <file>` runs the same check before you
+post (rc 3 = flagged). A body arriving on stdin to raw `gh` is not inspected.
 
 What **not** to use: `raw.githubusercontent.com/...` (wrong-domain
 cookies on private repos), `data:` URIs in `<img>` (sanitiser strips
@@ -354,7 +471,7 @@ If you hit either on a <your-org> repo, the bot is not yet installed
 there. Surface it as a blocker:
 
 1. Push your branch so the work isn't lost (`git push`; in the
-   sandbox, via the token URL form — see "Sandbox exception" above).
+   sandbox, via the token credential helper — see "Sandbox exception" above).
 2. Record it in your final report's `## Infrastructure Issues`
    section with the repo name and command that failed.
 3. The user / org admin expands the App's repo scope (one click in
@@ -548,6 +665,118 @@ Don't pipe `mint-token.sh` straight into `GH_TOKEN=$(...)` without
 checking — the script is also CWD-sensitive, and a silent empty
 return from a non-nexus-root cwd is the most-cited security-relevant
 foot-gun in the workspace report corpus.
+
+## Reading and editing comments safely
+
+Three traps that have each produced a wrong action (a duplicate post, a
+"not addressed" complaint, a live-on-GitHub contradiction):
+
+- **`.../issues/<N>/comments` returns only the OLDEST 30 without
+  `--paginate`.** So `jq '.[-1]'` gives the 30th-oldest comment, not the
+  newest — on a long thread it reads a months-old comment as current and
+  makes "did the worker post yet? / race-check before I post" answer
+  backwards (it caused a duplicate figure-post that had to be deleted).
+  For "latest comment" / "did X post" / pre-takeover checks, always
+  `gh api --paginate .../issues/<N>/comments --jq '.[] | …' | tail`, or
+  fetch a specific comment by id (`.../issues/comments/<id>`, unaffected).
+  Corollary: don't infer "worker didn't deliver" from missing on-disk
+  artifacts (a worker can upload figures inline from the notebook,
+  leaving no local PNG) — check the actual paginated thread.
+
+- **Addressing an operator's question needs a visible REPLY COMMENT — a
+  body edit + 🚀 is invisible to the human.** A rocket/👀 clears the
+  watcher's eligible-comment loop but does NOT show the operator the
+  answer; an edit buried in a long issue body doesn't appear in the
+  comment timeline, so the operator scanning the thread sees their
+  question "followed by nothing" and asks why it wasn't addressed. When a
+  worker or the orchestrator answers an operator comment, the deliverable
+  MUST include a reply comment on that thread carrying (or linking +
+  summarizing) the answer. Bake it into worker prompts that answer an
+  operator comment.
+
+- **Editing a shared consolidated comment is last-writer-wins, and every
+  agent posts as the same bot — so a clobber is unattributable and
+  silent.** A PATCH that verified clean at T can be overwritten by a
+  concurrent agent at T+10 min, leaving a refuted claim live while
+  another record says the opposite. Defenses: **verify the ARTIFACT, not
+  the 200** (re-fetch and grep for what you added *and* the phrases you
+  removed); **splice into the CURRENT body, never a stale local copy**
+  (re-fetch → splice → PATCH → prove); **re-verify LATER on a contended
+  record** (a passing grep has a shelf life — arm a background re-check
+  if `updated_at`/edit-count shows active editing); and **prefer
+  appending your own comment** over mutating a shared one when the
+  content can stand alone.
+
+- **A backticked `#N` in a PR body or comment creates NO cross-reference
+  event on the issue — an owned issue then reads as UNOWNED**
+  (<your-org>/nexus-code#1396). This workspace's citation style writes
+  `` `#1329` `` to stop `#N` becoming a list marker, and that is right in
+  `CLAUDE.md` and in prose *about* a number; it is wrong in the one place
+  that establishes ownership. Two-sided control on live PRs: a body with
+  eleven backticked `#N` and one bare left ZERO `cross-referenced` events
+  on the two issues it fixed; a body writing `**#N**` in bold left one on
+  each. The TITLE is not a cross-reference source at all (bare `#N` there:
+  nothing). So write at least one issue number BARE or bold in every PR
+  body and every comment that claims or discharges an issue, and never
+  rely on the title. If an ownership check is ever automated, key it on
+  `gh pr list --search <N>` — which sees backticked PRs — not on the
+  issue's cross-reference list, which does not. (`ng wrap-up`'s templated
+  link comment writes no `#N` of its own: it quotes the report's H1 and
+  `## Summary`, so a bare `#N` in your Summary is what reaches the issue.)
+
+- **The watcher-emit `body` field is TRUNCATED — re-fetch before quoting
+  an operator comment into a worker brief.** The `--- eligible github
+  comments ---` snippet cuts multi-paragraph asks with `…`; quoting it
+  verbatim silently drops load-bearing later paragraphs (a second ask, a
+  breadcrumb reminder). Treat the emitted body as a *pointer* and fetch
+  the full text — `gh api repos/<owner>/<repo>/issues/comments/<id> --jq
+  '.body'` — before pasting it into a prompt. If you must shorten, label
+  the truncation so the worker knows to re-fetch.
+
+## Which `gh` client the wrapper runs, and the job-log traps
+
+The wrapper picks the real client by **capability, not identity** — the first
+candidate on `PATH` meeting a declared version floor
+(`NEXUS_GH_MIN_VERSION`, default `2.86.0`; `monitor/gh-capable.sh`), not merely
+the first one that is not itself.
+
+It used to be the latter, which silently selected the agent-sandbox's
+`/app/bin/gh` **1.13.0 (2021)** over an installed 2.89.0 whenever `PATH`
+ordered them that way (`<your-org>/nexus-code#755`). At 1.13.0,
+`gh run view --job <id> --log` returns **ZERO lines at rc 0**,
+`gh run view <run> --log` returns two of ten jobs, and `gh pr checks` prints
+`pass` for a check whose REST conclusion is `skipped`. Five `gh` clients are
+installed on the reporting host, and the truncation is **not** 1.x-only —
+`2.14.7` also returns two of ten — which is why the floor sits at the oldest
+version measured correct rather than at the major-version boundary.
+
+`gh api` is byte-identical across clients, which is why it is the right call
+shape whenever an empty answer would be meaningful.
+
+**And `gh api` is the only shape that is per-ATTEMPT correct:
+`gh run view --job <id> --log` IGNORES the job id and serves the run's LATEST
+attempt** (`#1408`). Measured on 2.89.0: a job whose own API conclusion is
+`failure` read `397 tests; 0 failed`, 143,369 B, byte-identical across two job
+ids of one run, while the REST form returned distinct payloads matching each
+job's conclusion. So read a job log with:
+
+```zsh
+GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh) \
+    gh api repos/OWNER/REPO/actions/jobs/<job-id>/logs
+```
+
+never `gh run view --job … --log`, on ANY client. It is invisible on
+single-attempt runs, which is why it survives until a re-run — the moment the
+attempts disagree.
+
+Two corollaries for anything that screens job logs:
+
+- **A `log_bytes >= 20 KB` floor screens only the EMPTY tail** (`#755`'s
+  zero-line client). It cannot see a large, well-formed, WRONG-ATTEMPT log, so
+  do not describe it as a check that the log is the right one.
+- **A log byte count is METHOD-DEPENDENT** — `gh run view` prefixes every line
+  with job and step names, ~80% larger — so a published count carries its
+  method beside it or is not checkable.
 
 ## See Also
 

@@ -1,0 +1,62 @@
+# sync-log.tsv — one row per published public-mirror sync, newest LAST.
+#
+# WHY THIS FILE EXISTS (your-org/nexus-code#979 §5). Reconstructing the mirror
+# as a three-way merge is sound, but the MERGE BASE decides correctness and
+# fails silently in the LEAKIER direction. The correct base is
+# `scrub_old(source_old)` — the artifact the previous sync actually produced —
+# and computing that requires knowing which source commit the previous sync
+# shipped from. That fact lived in a report, or in somebody's memory.
+#
+# Measured on the sync this file was added for: the wrong base produced 2
+# conflicts and silently carried a denied token plus 19 occurrences of a URL for
+# a repository that does not exist. The right base produced 18 conflicts — the
+# extra 16 being exactly the decisions that would otherwise have been made
+# silently, in the direction of the older, leakier value.
+#
+# The dictionary is versioned in the same repository as the source, which is
+# what makes the correct base cheap to compute: `scrub_old(source_old)` is just
+# "check out source_old — dictionary and all — and run build.sh". You do not
+# need to reconstruct an old dictionary by hand; you need to not accidentally
+# use the CURRENT one. `sync-base.sh` does exactly that, reading the last row
+# here for the sha.
+#
+# Columns (TAB-separated):
+#   sync <TAB> ISO_DATE <TAB> SOURCE_SHA <TAB> MIRROR_HEAD_AFTER <TAB> NOTE
+#
+#     SOURCE_SHA         the source commit that sync was built from. This is
+#                        the one `sync-base.sh` needs; get it wrong and the
+#                        merge silently reverts every dictionary improvement
+#                        made since.
+#     MIRROR_HEAD_AFTER  the mirror commit the sync produced, so the base can
+#                        be checked against what actually landed.
+#     NOTE               free text; no internal identifiers (this file ships
+#                        nowhere, but the habit is cheap and the cost of the
+#                        exception is not).
+#
+# APPEND a row as part of every sync, before you consider it done. A sync that
+# did not record itself has handed the next one a guess.
+# CORRECTION (2026-09-18). The row below shipped with MIRROR_HEAD_AFTER =
+# c696071, which is WRONG: c696071e is the mirror head BEFORE that sync, i.e.
+# the PARENT of the commit it produced. The correct value is 7e132e36.
+#
+# How it was established: the mirror tip at the time of this correction was
+# 7e132e36, and `git rev-parse 7e132e36^` is c696071e exactly -- so the
+# recorded value is that commit's parent, not the commit. The SOURCE_SHA
+# column (e256d4a) was NOT affected and is independently corroborated by the
+# mirror commit's own subject, "Sync public mirror to dev e256d4a".
+#
+# The off-by-one entered through the row's own stated provenance -- the
+# anchors were RECOVERED FROM A REPORT rather than read off the mirror. That
+# provenance can recur, so it is named here rather than quietly fixed:
+# a recovered anchor should be checked against the mirror before it is
+# written down. Only column 4 is corrected; nothing else in the row changed.
+sync	2026-08-25	e256d4a	7e132e36	first sync recorded here; anchors recovered from the sync report (MIRROR_HEAD_AFTER corrected 2026-09-18 from c696071, which was that commit's parent)
+sync	2026-09-17	4825e3e1	a76b8b8c	promotion sync: main fast-forwarded to this source sha the same night; MIRROR_HEAD_AFTER read off the live mirror after the push, not recovered from a report
+# 2026-09-27 correction: the first push of this sync (db6283b8) carried a neutral
+# commit identity. By operator decision it was replaced, via force-with-lease pinned
+# to db6283b8, with 2038899c: same tree 541c7988, same parent cb9b546d, operator
+# identity. The fork had not fetched db6283b8. Column 4 and the note changed.
+sync	2026-09-27	739e76b5	2038899c	sync of source 739e76b5 (ports mirror fix cb9b546d as f40921e9, genericizes review-flagged example values); merge base scrub_old(4825e3e1), 0 conflicts; operator commit identity; MIRROR_HEAD_AFTER read off the live mirror after the push (MIRROR_HEAD_AFTER corrected 2026-09-27 from db6283b8, see comment above)
+sync	2026-10-07	2dbca2db	defa4cf8	sync of source 2dbca2db (main after #1758, carrying bundle 18 #1756 redaction + deny rows); merge base scrub_old(739e76b5)=159bdf96, 0 conflicts; operator commit identity; skeptic nxrelease-sk CREDIBLE; tree-only, mirror history not rewritten; MIRROR_HEAD_AFTER read off the live mirror after the push
+sync	2026-10-13	bf3160d4	151e2d04	sync of source bf3160d4 (main after #1819, carrying #1814 binary pass-through + verify-build); merge base scrub_old(2dbca2db)=c4cc5bb1, 6 conflicts resolved by work/nxrelease2/resolve.sh; operator commit identity; skeptic nxrelease2-sk CREDIBLE; tree-only, mirror history not rewritten; MIRROR_HEAD_AFTER read off the live mirror after the push
+sync	2026-10-14	0ef50c59	dd198cff	sync of source 0ef50c59 (main after #1831, carrying #1829 composite-aware deny rows and a synthetic wrap-up fixture); merge base scrub_old(bf3160d4)=419cba6e, 0 conflicts; mirror-only divergences unchanged (34); leak gate PASS on built, merged and --commit; operator commit identity; tree-only, mirror history not rewritten; MIRROR_HEAD_AFTER read off the live mirror after the push

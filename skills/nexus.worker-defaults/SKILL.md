@@ -1,5 +1,5 @@
 ---
-description: "Always-applies workspace defaults for any nexus-spawned worker: bot identity for GitHub writes, no --no-verify/force-push, sandbox-notify, report convention. The ## Worker floor section is injected verbatim into every spawn prompt by monitor/spawn-worker.sh."
+description: "Always-applies workspace defaults for any nexus-spawned worker: bot identity for GitHub writes, no --no-verify, no force-push to a shared branch, sandbox-notify, report convention. The ## Worker floor section is injected verbatim into every spawn prompt by monitor/spawn-worker.sh."
 ---
 
 # nexus.worker-defaults — every-worker safety floor
@@ -48,12 +48,125 @@ wrap time rather than front-loading it. See `## Just-in-time hooks`
 below for the mechanisms and `reports/nexus-code-workerfloor_*.md`
 for the full taxonomy + research.
 
+**Worked example of that split — the force-push rule
+(<your-org>/nexus-code#835).** The floor used to say *"never
+force-push"*, flat. That contradicted the merge gate, which
+*requires* a rebase onto the current base before merge: a
+`pull_request` run is computed against a merge ref built at run
+creation, and `rerun-failed-jobs` reuses that same stale ref — so a
+later green can describe a base that has moved, and rebasing onto the
+current base makes the push non-fast-forward.
+
+**Do not say "only a new head re-evaluates" — that was REFUTED by
+experiment.** The merge ref is **demand-triggered**: `refs/pull/N/merge`
+is recomputed when something asks GitHub for the PR's mergeability, and
+not otherwise. Measured: two refs sat stale for **26 and 36 hours**
+across many base advances, while one refreshed to the base's current tip
+**within two minutes of a single `GET /pulls/{n}`** and an untouched
+control did not move. (A model, not a mechanism: a `GET` has since been
+measured refreshing `mergeable` while the ref's base stayed put, n=2 —
+see `monitor/_merge_ref_base.sh` and `#923` before leaning on "one GET
+refreshes it".) Two consequences, and the second is the sharp one:
+"it has been a while, it must have refreshed" is false; and **querying
+the PR refreshes it, so the act of checking changes what you are
+checking.** Never read a green, then query the PR, then treat that green
+as describing what you just queried. Safe order: **GET the PR** to force
+the refresh, **then create a new run**, **then enumerate** it. `#823` merged on a green
+computed against a stale merge ref and turned `dev` red. The floor
+now carries only the **boundary** (shared branch vs your own PR
+branch, one sentence); the checkable precondition, the
+`--force-with-lease` caveat, and the merge-ref rationale live in the
+`force-push` rows of `bash-footgun-patterns.conf`, delivered by
+`bash-footgun-guard.sh` at the instant the worker runs `git push`.
+Don't restore the blanket ban here: it reads as correct, and it
+tells every worker to refuse a rebase the merge gate demands.
+
+**And do not re-key the boundary on AUTHORSHIP.** The first version of
+this rule shipped `git log --format='%an' origin/dev..HEAD | sort -u`
+as the precondition, glossed as "if this lists only you, no other agent
+has commits here". That is **false in this workspace, and this very
+floor is why** — it mandates *"`git commit` / `git push` use your
+identity"*, so every agent commits as the operator and the author check
+can never see a sibling. Measured on a purpose-built two-agent branch,
+it returned one name and read SAFE while a sibling's commit sat on the
+branch; the force-push then destroyed that commit and its file.
+`--force-with-lease` did **not** save it, because the lease is satisfied
+by the very `git fetch` that rebasing onto current `dev` requires.
+The boundary must key on the **property** — commits on the remote you
+would destroy. Caught by the `#835` skeptic pass; it is the workspace's
+dominant defect class (a proxy asserted in place of the property)
+re-instantiated inside the fix.
+
+**And the property check must FAIL CLOSED, which the first correction
+did not.** Shipped as prose — *"`git fetch origin <branch>`, then
+`git log --oneline <branch>..origin/<branch>`"* — it was right whenever
+it could look and **silently safe whenever it could not**. Three states
+print empty: the branch is not on the remote yet, the fetch **failed**,
+or the tracking ref is stale because the fetch was skipped. The first
+two are byte-identical at the terminal (same empty stdout, same
+`rc 128`), so the failure renders as the clearance. It is now one
+command that fetches and compares together and cannot be half-run —
+`monitor/force-push-check.sh`, exit codes `0` safe / `1` UNSAFE / `2`
+REFUSED / `3` no such remote branch, mirroring `guards-for-diff.sh`'s
+`#803` shape where "could not check" and "nothing found" are separate
+codes and neither is a pass.
+
+**And its `1` is a claim to reconcile, not a verdict to obey**
+(`#835`, `#898`). The check matches commits by patch-id, so a rebase
+whose replay needed conflict resolution, a content-changing `--amend`,
+and a rebase that flattens a merge all report UNSAFE — byte-identical
+to a real loss — while destroying nothing. The `force-push` conf rows
+now say so at the push, name the per-file patch-id reconciliation
+that separates the two, and mark the one PERMANENT `2` (a multi-URL
+remote, `#930`) with its per-URL next step. The posture is not
+weakened: a false UNSAFE costs one reconciliation, a false SAFE costs
+a sibling their commit.
+
+**And it must compare the ref the push MOVES, not `HEAD`** — the third
+correction, and a false SAFE rather than a refusal. A push updates
+`refs/heads/<dst>` on the remote from `<src>` locally, and neither is
+necessarily the checked-out branch. Measured: local `feature` lacking a
+sibling commit while HEAD sat on `integration` which contained it
+printed `SAFE rc 0`, and the push then reported `(forced update)` with
+the sibling gone. The script now resolves `<branch>` / `<src>:<dst>` /
+`push.default` the way git does, and refuses (never guesses) for
+`matching`, `nothing`, and a detached HEAD with no ref given.
+
+**And a fourth: it compared the wrong REMOTE.** `remote.pushDefault` and
+`branch.<n>.pushRemote` select the push remote; the check assumed
+`origin`, said SAFE, and the push destroyed a commit on the other remote.
+
+Four false clearances on four distinct axes — authorship, cannot-tell-
+failure-from-clearance, wrong ref, wrong remote — and **every one found
+by BUILDING the failing case, never by reading the code**. The diagnosis
+that ended it is not any of the four fixes: each round was
+**re-implementing a piece of git's own push-target resolution**, and that
+surface (`push.default`, `remote.pushDefault`, `branch.<n>.remote`,
+`branch.<n>.merge`, `branch.<n>.pushRemote`, explicit refspecs, `+`
+markers, `--all`, `--mirror`, per-remote push refspecs) is larger than
+anyone enumerates in advance. Fixing one axis per round only relocates
+the hole.
+
+So the check now **asks git instead of modelling it** —
+`git push --dry-run --porcelain --force <your args>` reports exactly
+which refs move on which remote, authoritative by construction because it
+IS the resolution. That deleted the class rather than adding a fifth
+axis, and as a side effect multi-ref pushes became answerable instead of
+refused.
+
+Two transferable rules: **an answer you cannot vouch for must not look
+like a good one**, and **when a check keeps re-deriving something a tool
+already computes, stop deriving and ask the tool.**
+
 ## How injection works
 
-`monitor/spawn-worker.sh` resolves `NEXUS_ROOT` from its own
-`dirname` (so it works in forks and fresh clones), reads this
-file, extracts the `## Worker floor` section body via awk
-(`/^## Worker floor$/` to the next `## ` H2 or EOF; per-spawn
+`monitor/spawn-worker.sh` resolves `NEXUS_ROOT` — an inherited,
+valid `$NEXUS_ROOT` wins, else its own `dirname`, except that a
+script-relative root sitting under another nexus's `work/` is
+re-rooted to that primary (`#577`), so state never forks into a
+secondary clone — reads this file, extracts the `## Worker floor`
+section body via awk
+(`/^## Worker floor[[:space:]]*$/` to the next `## ` H2 or EOF; per-spawn
 Claude Code settings come from the dedicated
 `monitor/worker-settings.json` file — see `## Worker settings`
 below), and composes the worker's prompt as three blocks
@@ -72,9 +185,30 @@ Then `claude` launches in a tmux window. Missing file or empty
 section → exit non-zero with a clear error; the spawn never
 proceeds without the floor.
 
+**Conditional fourth block — `--reply-to`.** When (and only when) the
+spawn carries `--reply-to <request-id>`, the launcher extracts the
+`## Reply-to wrap-up override` section the same awk way, substitutes
+the literal `<REQUEST_ID>` token with the validated id, and inserts it
+between block 2 and block 3. Without the flag the section is never
+read and the composed prompt is byte-identical to the pre-flag
+behaviour — regression-pinned in
+`monitor/watcher/test-spawn-worker-reply-to.sh` T1, which compares the
+no-flag prompt against an independent reference composition rather
+than a checked-in golden (a golden churns on every legitimate floor
+edit and gets rubber-stamped). This is the
+orchestrator's dispatch-time choice of delivery surface — channel vs
+GitHub — never something parsed out of a remote client's prose. See
+`## Reply-to wrap-up override` below for the injected text and
+`skills/nexus.remote-access` for the channel itself.
+
 H2 boundaries are load-bearing for the awk extraction. Don't
 introduce H2s inside the floor section, and don't use level-1
 headers anywhere except the document title above.
+
+`## Reply-to wrap-up override` is, like `## Worker floor`, a
+**pure injectable body** — every byte of it lands in the worker's
+prompt, so keep orchestrator-facing meta-prose out of it (it
+belongs here instead).
 
 `--print-prompt` emits the composed prompt to stdout and exits
 without spawning a tmux window — useful when validating that
@@ -105,10 +239,128 @@ a hook or your task prompt points you there.
   `"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url-of-your-write>`
   — an operator-authored write SUCCEEDS but GitHub mutes
   self-notifications, so the thread silently goes dark; the
-  assertion is the only loud failure. Never `--no-verify`, never
-  force-push; fix the root cause. `git commit` / `git push` use
-  your identity, everything else the bot's.
-- **`sandbox-notify "<msg>"`** on blocker / ready / done.
+  assertion is the only loud failure. Never `--no-verify`; never
+  force-push a **shared** branch (`dev`, `main`, or any branch
+  someone else has pushed commits to) — force-pushing your **own**
+  PR branch after rebasing it onto the current base is expected.
+  `git commit` / `git push` use your identity, everything else
+  the bot's.
+- **A negative claim about a repository is only as old as its
+  last fetch.** `git branch -a`, `git log --all`, `git cat-file
+  -e` and friends read the LOCAL object store — a commit that was
+  never fetched is not "absent from the repo", it is absent from
+  your copy, and every follow-up check agrees with the wrong
+  answer. `## Worker environment` above prints your clone's
+  remote-tracking date; if a `no such branch / no newer design /
+  nobody has done this` answer is going into a report or a
+  comment, `git fetch` first or scope the claim to a sha and a
+  date. Same family as the `grep -r … reports/` and `git ls-tree`
+  glob silent zeros (`#618`, `#707`, `#770`, `#814`).
+
+  **The trap is that LOCAL operations advance REMOTE-knowledge
+  indicators.** Two measured instances, both of which read *fresher*
+  than your clone actually is:
+  - a **FAILED** `git fetch` truncates `.git/FETCH_HEAD` to zero
+    bytes and updates its mtime;
+  - **your own `git push`** writes `refs/remotes/origin/<branch>`
+    locally without fetching anything, so any date derived from
+    remote-tracking refs jumps to *now* — and pushing your branch is
+    something this floor tells you to do.
+
+  Neither is a fetch time. The only thing that makes a negative claim
+  current is an actual successful `git fetch`.
+- **Three hazards that used to live in every brief now have TOOLS.**
+  Reach for the tool; the refusal it prints IS the explanation, with
+  the measured number in it.
+  - **A tmux socket path holds 107 bytes** — `sun_path` is 108
+    INCLUDING the NUL. tmux composes
+    `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<socket-name>`, and a session
+    scratchpad `TMUX_TMPDIR` (~124 bytes here) is over the limit
+    before the suffix. Every real-tmux suite then fails `File name
+    too long` and reports it as a defect in the code under test —
+    and it reproduces on EVERY tree, so "clean `dev` fails too"
+    answers YES and means the opposite of what it is read to mean.
+    Five wrong attributions and one retracted finding (`#991`).
+    `monitor/watcher/run-tests.sh` now REFUSES such a run (exit 2)
+    rather than dispatching doomed suites. Check a path yourself
+    with `monitor/tmux-socket-fits.sh --socket <name>` (exit 3 =
+    too long, naming the measured length); `--suggest` prints a
+    dir that fits. Keep it short: `/tmp/<brief>`, never the
+    scratchpad — **for the SOCKET DIRECTORY ONLY.** `/tmp/c$(id -u)` and
+    any short `TMUX_TMPDIR` you pick hold tmux sockets and nothing
+    else; everything else you write goes under `$TMPDIR` (see the
+    `/tmp/c$(id -u)` bullet below for why it is safe to name now) or inside
+    your clone. Measured 2026-09-03: workers who
+    read "put scratch in `/tmp/c$(id -u)`" literally left **16.5 GiB** of
+    per-window payload in a directory whose short name exists for the
+    108-byte `sun_path` limit, and `monitor/tmpfs-guard.sh --check`
+    now goes UNHEALTHY above `monitor.tmpfs.max_socket_root_payload_mib`
+    (<your-org>/nexus-code#1422).
+  - **Never hand-roll a mutation gate** — `monitor/mutation-gate.sh
+    --suite <f> --list`, then `--line N`. **That form mutates the SUITE
+    and answers only "is this assertion REACHED". To ask "would my suite
+    CATCH A DEFECT", add `--subject <code-under-test>`** — the tracked
+    file is never edited, an inert mutant is refused rather than reported
+    `survived`, and `--mode if-true|if-false|subst` weakens a guard you
+    cannot delete. Write the flip set to a `--predict` file FIRST, with a
+    case that must NOT flip (`#1519`). Commenting a line that
+    does not END a logical line does not delete it, it PROMOTES the
+    next line to a standalone command; one such mutant executed
+    `yes yes` and filled the sandbox-wide 378 GB `/tmp` to 8 KB
+    free (`#1032`). The tool refuses such a line AND, independently,
+    bounds every mutant with `timeout` + `ulimit -f` + a free-space
+    floor — the second is what saves you, because the first is a
+    predicate that can be wrong.
+  - **`monitor/public-mirror/build.sh` destroys the checkout it is
+    invoked from.** DRY RUN by default (exit 6); `--yes` is the
+    opt-in, and a dirty tree is refused (exit 7) unless
+    `--allow-dirty` (`#1001`). Throwaway clones only.
+- **`ng send` returning `UNKNOWN` is not a licence to re-send** (a fallback fires only on rc 4);
+  resolve it after the fact with `ng send <window> --check --last` (or `--list`, then `--check --nonce <hex>`).
+- **When the project tree goes READ-ONLY, stop and wait; do not fight it**
+  (<your-org>/nexus-code`#1724`). On the operator's host the sandbox's rw
+  bind detached from the filer every few days in 2026-09/10 (minutes to
+  18 h). The signs: `EROFS` / `Read-only
+  file system` on a write, a watcher note `The project tree is READ-ONLY`,
+  `ng send` exiting **4** with `DEGRADED — the delivery ledger cannot be
+  written … NOTHING WAS SENT`, or `ng longjob add` refusing. Then: stop
+  starting work that writes to the tree (commits, pushes, reports, suites,
+  `sbatch`), record your resume point in your context, reach the
+  orchestrator with `SendMessage` (rc 4 means nothing was sent, so that
+  fallback cannot double-deliver), and wait. Continue when EITHER the
+  watcher's `RESUME` note arrives OR your session is resumed after a
+  sandbox restart: that is how outages usually end, and a restarted
+  watcher cannot send RESUME. `monitor/ng degraded status` says which mode you are in. Nothing
+  inside the sandbox can repair it; never remount, bind or unshare around it.
+  On RESUME, redo the writes that failed.
+- **A GitHub reader cannot open claude.ai Artifacts** (<your-org>/nexus-code`#1856`).
+  Anything you post on GitHub for the operator to read (a plan, a figure, a
+  schematic) goes up with `monitor/ng upload <file>` and you link THAT. md,
+  SVG and PNG render there; raw HTML does not, so ship an `.md` or images
+  beside it. An Artifact link is an optional extra, never the only copy;
+  `ng` and the `gh` shim warn on a body that breaks this.
+- **`sandbox-notify "<msg>"`** on blocker / ready / done. It delivers
+  ATTENTION, not content: the real tool discards its argument and emits
+  a bare BEL, so the operator learns that *something* happened, never
+  *what* (<your-org>/nexus-code`#1533`; measured: the tool assigns `msg`
+  once and never reads it). Your words reach only the notify wrapper's
+  decision log. Anything a human must READ goes in your report, on the
+  thread, or through `SendMessage`.
+- **You can reach the orchestrator mid-task — `SendMessage`.** Use it
+  for a blocker, a scope question, or a finding that should not wait
+  for your report; `sandbox-notify` has been observed missed, and
+  nothing else reaches the orchestrator before you wrap up. Address it
+  by the name **`ListAgents` prints** — read that name, do not
+  construct it: it is normally your tmux window name, but an older
+  Claude Code pin degrades to a workdir-derived one. **Never follow a
+  `success:false` did-you-mean hint blind**: it proposes
+  near-neighbour names, and with siblings like `overlay` beside
+  `overlay-sk` a blind retry delivers your message to the wrong agent
+  — re-read `ListAgents` instead. **Upward only.** A raw `SendMessage`
+  to another WORKER writes no `machine-input.tsv` stamp, so the
+  watcher cannot see the re-task: that worker never supersedes its
+  last wrap-up and can be reported `wrapped` for work it never did.
+  The orchestrator is exempt because nothing retires it on idle-age.
 - **Never invoke `pip` in ANY form — `uv pip` only.** That means
   bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
   `download`, …). The sandbox's wrapped pip fork-storms without
@@ -120,11 +372,267 @@ a hook or your task prompt points you there.
   `sc-dandelion`, not `dandelion`. Same rule generalized: bound
   any command whose process tree can grow without a named bound
   (`ulimit -u`, hard `timeout`, capped `--jobs`) before you run it.
-- **Own your async work.** If you `sbatch` / `srun --no-block` /
+- **Own your async work, and launch it with something that KEEPS
+  THE EXIT STATUS.** If you `sbatch` / `srun --no-block` /
   `nohup &` a job, you OWN the wake — don't end your turn with a
   job in flight and no resume mechanism armed. A hook spells out
   the three acceptable mechanisms the moment you launch one; act
-  on it then.
+  on it then. For a local background job use
+  `monitor/async-run.sh --desc "<what>" -- <cmd> …` and read it
+  back with `--status <token>`: a bare `nohup … &` destroys the
+  exit status (the child survives, reparented to init — the
+  parent shell that would reap it does not), so "finished
+  cleanly" and "SIGKILLed" both read as simply absent, and a
+  producer killed mid-write leaves a TRUNCATED, plausible
+  intermediate that passes every emptiness check. **A job at 0% CPU
+  for hours is BLOCKED, not long-running** — read its `wchan`, `fd/0`
+  and `cmdline` in `/proc` before waiting on it; a command-less
+  `> file` typed into a zsh tool call is one way there
+  (<your-org>/nexus-code`#1393`: 7 h 30 m, a child `cat` with no
+  arguments). If you idle
+  anyway the watcher resolves your waits and pastes the verdict
+  — that is a BACKSTOP, not your resume mechanism.
+  **A retained exit status is not an armed wake**
+  (<your-org>/nexus-code`#1523`). `async-run.sh` keeps the rc for you
+  to READ; it never RE-INVOKES you, so it is not a parking mechanism.
+  Exactly two things re-invoke this agent when a wait ends: the Bash
+  tool's `run_in_background` option (the harness re-invokes you when
+  the job exits, which is what makes a typed rc actionable) and a
+  `Monitor` until-loop (for a condition rather than a job). **Since
+  Claude Code 2.1.271 a `Monitor` re-invokes you on its condition OR
+  on its deadline, whichever comes first — at most 30 minutes (10 in
+  `-p` runs), enforced at arm time and at runtime. An expiry notice
+  means RE-ARM, not "done": it is an answer about the clock, never
+  about the condition** (<your-org>/nexus-code`#1540`, `#1549`). A wait
+  expected to outlive 30 minutes belongs to `ng longjob` (next bullet),
+  which survives the cap. **A `run_in_background` call has the same kind
+  of clock** (2.1.285+, <your-org>/nexus-code`#1685`): the harness stops it
+  at the call's own `timeout` (default 30 min, max 2 h), so set that
+  `timeout` above any wait's own `--timeout`, and read a stop notice
+  (`<status>killed</status>`, "background time limit") as RE-ARM, never
+  as a verdict; past 2 h only `ng longjob` survives. A parked
+  agent must be able to name what will RE-INVOKE it; if the answer is
+  a status file, it is not parked — it is asleep. Measured: a skeptic
+  `await` launched through `async-run.sh` expired cleanly (rc 4,
+  retained) and the agent sat idle 809 s until the watcher backstop
+  pasted. Wherever the skeptic contract says to run `await`
+  BACKGROUNDED, it means `run_in_background`, never `async-run.sh`.
+- **A job that will outlive the 30-minute `Monitor` cap gets a
+  longjob WATCH, and you end your turn** (<your-org>/nexus-code`#1535`).
+  Every nexus session carries ONE host-armed plugin monitor (the
+  longjob-watch dispatcher) that wakes you with a task notification on
+  ANY terminal state of a watched subject. Three shapes, cheapest first:
+  an `sbatch` / `srun --no-block` is auto-watched by the launch hook
+  (nothing to do); a long LOCAL command is
+  `monitor/ng longjob run --desc "<what>" -- <cmd …>` (launched via
+  `async-run.sh`, rc retained, watch armed, one line); anything else is
+  `monitor/ng longjob add slurm:<id>|asyncrun:<token>|pid:<pid>|file:<path>|cmd:'<probe>'`.
+  **READ `add`'s LAST LINE.** `dispatcher: ARMED` means end your turn.
+  `NOT ARMED` (rc 3) means nothing in this session will wake you: run
+  the `await` line `add` prints, with the Bash `timeout` it prints, under
+  `run_in_background: true` instead, then `ng longjob status` says why.
+  A watch that cannot tell emits `UNKNOWN … PARKED` after 5 blind polls
+  rather than sleeping you forever; every delivered line costs a wake
+  PLUS whatever work you then do, so default watches print only their
+  terminal state. This closes `#1523`'s shape: `async-run.sh` retains
+  an rc and re-invokes nobody, and `asyncrun:<token>` is the wake it
+  lacked. `skills/nexus.longjob/SKILL.md` for the rest.
+  **A wait that matches only the SUCCESS line never wakes on an abort.**
+  Measured 2026-10-08: a wait on a deploy's version-stamp line slept
+  ~2 h while the deploy ABORTed. Prefer a subject with its own failure
+  state (`asyncrun:`, `slurm:`) over a file the producer writes.
+  `add file:<log> --when match` now carries a default FAILURE arm
+  (ABORT…, FATAL, ERROR, FAILED, Traceback, `error:`, `fatal:` on lines
+  written after the add); `add` prints it, and `--fail-pattern <ERE>`
+  replaces it. A `Monitor` until-loop or a `cmd:` probe gets no such
+  default: give it a failure arm yourself
+  (`grep -qE 'stamp|ABORT|ERROR' log`), then read which line matched.
+- **An in-process sub-agent is NOT woken by its own Monitor or background
+  notification while you, its lead, are idle** (<your-org>/nexus-code`#1794`,
+  Claude Code 2.1.293). Measured 2026-10-09: a run finished green at 17:07
+  and its helper idled 3 h 41 min until a nudge. So a sub-agent never ENDS
+  ITS TURN waiting on a notification. **The LEAD owns the wake**: a
+  sub-agent shares its lead's `CLAUDE_CODE_SESSION_ID`, so
+  `ng longjob run|add … --for-lead <its SendMessage name>` lands in the
+  lead's spool and wakes the LEAD with a line naming whom to `SendMessage`;
+  the sub-agent hands the watch id to the lead and ends its turn, and the
+  lead re-tasks it on the wake. A shorter wait, or `add` answering NOT
+  ARMED (rc 3), stays in the sub-agent as a FOREGROUND bounded call:
+  `ng longjob await <id> --timeout 540` with Bash timeout 600000, re-entered
+  on rc 4. Put this rule in every sub-agent brief.
+- **Never pass a large file as an `sbatch` ARGUMENT to a shell
+  script, and never block an agent shell on Slurm**
+  (<your-org>/nexus-code`#1778`, `#1728`). MEASURED 2026-10-08: the
+  sandbox job wrapper runs a shell script as `/bin/bash -s -- <args>`
+  with the script on stdin, and that `execve` blocks in the kernel
+  reading the FIRST POSITIONAL as if it were the script. A 7.8 GB data
+  file there stalls the job before line 1, at 100% CPU, plateaued near
+  3.5 GB read, and it IGNORES SIGKILL. The reader is an endpoint-security
+  LSM, attributed BY INFERENCE (not measured) to CrowdStrike Falcon.
+  Nothing errors: the job sits RUNNING with only the sandbox banner in
+  its log, and four builds were lost blaming the node, the staging and
+  `--mem`. Remedy, both forms measured: put the paths in a FILE (a small
+  manifest or config) and pass that, or make the job a python-shebang
+  script FILE (the wrapper runs those from a temp file; `python3 -`
+  with the script on stdin stalled too). **Do not reach for the environment instead: the sandbox
+  sbatch wrapper silently DROPS the submitting shell's exported
+  variables** (measured: a job ignored the exported version-override
+  variables and ran its default build), and `--export` through the wrapper
+  is UNVERIFIED — do not rely on it until someone measures it.
+  Separately, `sbatch --wait` and a foreground `srun` hold the shared
+  Slurm chaperon for the whole wait: one 42 s hold seeded a 22-minute
+  jam that blocked every agent's `sbatch`/`squeue`/`sacct`. Submit
+  with `--parsable` and let the longjob watch wake you.
+- **A Slurm job must not read or write the session scratchpad or
+  `$TMPDIR`, and its wrapper must end with the real step's exit code**
+  (<your-org>/nexus-code`#1778`). `/tmp` on the login node is invisible to
+  compute nodes. A wrapper whose last command is an `echo` then reports
+  `COMPLETED 0:0` for a job that produced nothing (measured on a real
+  job). Put job I/O under the project tree, cluster temp space or
+  `/loc/scratch/$SLURM_JOB_ID`, and end the script with `exit $rc` of
+  the step that did the work. **`--time` is not a bound either**
+  (<your-org>/nexus-code#1841): `scontrol show config | grep -E
+  'OverTimeLimit|EnforcePartLimits'` read `2160 min` and `NO` here, so Slurm
+  runs a job up to 36 h past its `--time` (a 6 h build ran 13 h 52 m); other
+  clusters differ, so read yours. Wrap the real step in its own bound,
+  `timeout -k 60 <N> <cmd>; rc=$?`, write the rc to a file the watch can
+  read (`echo "$rc" > "$RCFILE"`, then `ng longjob add slurm:<id>
+  --payload-rc "$RCFILE"`, which merges into the launch hook's
+  `auto-slurm-<id>` watch rather than creating a second: a node with a DNS
+  fault held jobs RUNNING after their payload exited), and `exit "$rc"`. Classify that rc as a WRAPPER
+  status by the set 124/125/126/127/137/143, never by one value.
+- **On this cluster `--mem` is NOT enforced: size a job by its CORE share**
+  (measured 2026-10-09). `scontrol show config` reports
+  `SelectTypeParameters=CR_CORE` (memory is not a consumable resource) and
+  `ConstrainRAMSpace=no`, so the cgroup does not cap RAM. A 16-CPU job with
+  `--mem 400G` used ~680 GB of a shared node and was not killed; the node's
+  `AllocMem` stayed 0. The jobs that pay are your neighbours'. Treat `--mem`
+  as documentation. Read your own cluster before trusting this:
+  `scontrol show config | grep -E 'SelectTypeParameters|ConstrainRAMSpace'`.
+  When those say CR_CORE and `no`, request CPUs for the memory you need:
+  a node's `RealMemory / CPUTot` from `scontrol show node <node>` is the
+  per-core share (about 19 GB per core on the 36-core, 700 GB nodes measured
+  here). Otherwise use `--exclusive`, or restructure the job to stream or
+  chunk. Measure the peak first with `/usr/bin/time -v <cmd>` (Maximum
+  resident set size) on a small input.
+- **Do read-only aggregation in Python or a script FILE, never in a
+  `bash -c '<script>'`** (nexus-code bundle 22). Claude Code's own
+  removal check flags a `-c` script it cannot parse as one that "runs
+  rm", even with no `rm` in it, and the flag is a PERMISSION DIALOG: an
+  unattended agent stalls until the operator approves it or it
+  auto-denies (once 37 s from auto-deny, 2026-10-09). The nexus cannot
+  change that check. Measured over this host's transcripts, 2026-09-30
+  to 10-09: 11 denials, all on `bash -c`/`sh -c` calls (11 of 940), and
+  0 of 30,564 other Bash calls, including 1,283 `bash <file>` and 3,937
+  Python heredocs. None of the 11 contained `rm`, and 6 had no `awk`
+  (`git show … | sha256sum` tripped it). Approved dialogs leave no
+  error behind, so 11 is a FLOOR. A skeptic's wider census found ONE more,
+  on no `-c` at all: a heredoc whose BODY quoted `bash -c`. So a brief
+  or report that quotes this rule goes through the Write tool, never an
+  unquoted heredoc in a Bash call. Instead: run the pipeline directly,
+  use `python3 - <<'EOF'`, or write the script with `mktemp` and run
+  `bash "$f"`; that last form is what "run it under bash" means
+  wherever CLAUDE.md says so. **Put this rule in every in-process
+  sub-agent's prompt**: sub-agents do not receive this floor.
+- **Never `| head` an existence query over a large tree, never
+  recurse into `reports/`, and route anything that might run long
+  through `async-run.sh`** (<your-org>/nexus-code`#1446`). `grep -r … |
+  head -5` reads as "stop after 5 hits" and behaves as "scan
+  everything" when the hits run out: `head` exits, the producer only
+  learns via SIGPIPE on its NEXT write, and with no further matches it
+  walks the whole tree in silence — so the hang is specific to the
+  answer "no", which is the one you were hunting. Three workers wedged
+  49m, 1h54m and 2h48m in one session, each pane reading
+  `working-background`. `-m1` bounds per FILE, not overall. Bound the
+  WALK: `find DIR -maxdepth N -type f -print0 | xargs -0 grep -l PAT`.
+  `reports/` is gitignored, so a recursive `grep` there returns a
+  confident zero (`#618`): use `monitor/ng report-grep PAT`, which exits
+  3 rather than vouch for a zero it cannot see. And a child at ~0% CPU
+  for an hour is BLOCKED on the filesystem, not computing —
+  `pane-state` now says so (`bg_wedged=1`).
+- **`/tmp/c$(id -u)` holds SOCKETS ONLY** (<your-org>/nexus-code`#1422`).
+  Its short name exists for the 107-byte `sun_path` limit and nothing
+  else; it held 16.5 GiB of per-worker scratch because briefs handed it
+  out as general scratch. Scratch goes under `$TMPDIR`, the directory
+  your brief names, or inside your clone —
+  never under `/tmp/c$(id -u)`, which the tmpfs reaper deliberately never
+  touches because live sockets are exactly what it must not delete.
+  **`$TMPDIR` is set for you, and you check it once** (<your-org>/nexus-code`#1628`):
+  Claude Code leaves TMPDIR UNSET, so `$TMPDIR/x` used to be `/x` at the
+  sandbox ROOT, at rc 0 (three stray writes in one session), and
+  `rm -rf $TMPDIR/foo` is `rm -rf /foo`. The nexus shell prelude now sets a
+  private directory (mode 0700) in every agent shell whose TMPDIR is unset
+  or empty, and warns on stderr when it cannot. Run `echo "TMPDIR=[$TMPDIR]"`
+  once; if it prints `[]`, stop and say so rather than writing through it.
+  In anything destructive, write `"${TMPDIR:?}/<path>"`, which fails LOUD
+  when empty. **It is PER AGENT only if a launcher set it**: a spawned
+  agent gets `/tmp/claude-<uid>/tmp/agent-<window>`; a hand-launched
+  session, or one started before this change, shares
+  `/tmp/claude-<uid>/tmp` with every agent of this uid, and in-process
+  sub-agents always share their parent's. Measured 2026-10-08: a skeptic
+  and its lead both wrote `$TMPDIR/wrap2.out` at once, and the merged file
+  showed the skeptic posting the lead's comment. Name scratch with
+  `mktemp` (`mktemp "${TMPDIR:?}/<what>.XXXXXX"`), never a bare generic
+  name, and quote the authoritative record (`wrap-up-output/<window>/last`),
+  not a scratch copy.
+- **An orphan left by your OWN backgrounded Bash call is stopped
+  with `TaskStop`, not with a signal — and the guard that refuses
+  it is right.** Backgrounding makes that shell its own SESSION
+  LEADER, so it sits OUTSIDE your session and
+  `proc-kill-authorized` refuses it `not-owned`. That refusal is
+  CORRECT and it is also AMBIGUOUS: *"another agent's"* and
+  *"yours, but it left your session"* read identically, and nothing
+  downstream disagrees. One orphan ran **twelve hours** because its
+  own launcher hit that refusal at ten minutes old and took the
+  sibling reading; a second was measured at **28 hours**, still
+  looping on a sentinel that could never appear
+  (<your-org>/nexus-code`#1235`). The refusal now prints
+  `NOT-A-SIBLING` whenever it can establish the parent is yours —
+  when you see it, the answer is the harness-native **`TaskStop
+  <task-id>`**: the harness launched the task, so the harness can
+  stop it. `svc.sh` stops `setsid`-detached services; nothing
+  stops a default-deny refusal by hand-rolling a signal past it.
+- **OpenAI Codex is a CO-WORKER you supervise, never a delegate you
+  forward** (<your-org>/nexus-code`#1640`). For a bounded subtask
+  (a second implementation, a review, a refactor you will check) use
+  `monitor/ng codex run --cd <git-root> --prompt-file <task>`, never a
+  raw `codex exec`: the raw call reads your inherited stdin and appends
+  it to the task, puts the prompt in argv where sibling `/proc` scans
+  ingest it, cannot authenticate from `OPENAI_API_KEY`, and gives you
+  no diff and no list of what it wrote. Read the exit code (0 completed, 3 turn-failed,
+  4 timeout, 5 unavailable, 6 workdir, **7 indeterminate: neither**),
+  then READ `diff.patch`, `writes-outside-diff.txt` and `last-message.txt` before you keep a byte
+  of it. You own the report, the wrap-up and the skeptic contract, so
+  Codex's claims get the same verification as anyone's. Longer than
+  ~20 minutes: add `--background` (it arms `ng longjob`). Skill:
+  `skills/nexus.codex/SKILL.md`.
+- **Label a parameter you CHOSE as chosen, never as upstream
+  convention** (<your-org>/nexus-code`#970`). If you pick a value the
+  tool does not default for you — a bin width, a threshold, a seed, a
+  filter cutoff — say so plainly in BOTH the script comment and the
+  report: *"we chose N because Y"*. Do not write *"the default per
+  common usage"* or similar unless you have verified it against the
+  tool's own source or docs AND can cite where. Measured: a 40 kb bin
+  width annotated as *"the default per common ATAClone usage"* — where
+  the argument is REQUIRED and the package ships no default and no
+  vignette call supplying one — survived an OOM, a memory patch and
+  three failed runs unexamined, because every review of the run treated
+  the bin width as settled. That is what the mislabelling buys: a value
+  presented as convention is re-derived by nobody downstream, human or
+  agent, so the one number nobody chose deliberately is also the one
+  number nobody checks.
+- **Test fixtures use SYNTHETIC stand-ins, written in while you write the
+  test** (<your-org>/nexus-code`#1762`). A captured `.ansi` pane, a log
+  excerpt or a reproduced command line carries the REAL identifiers of the
+  incident it came from. Replace them at the moment you paste:
+  sample IDs → `SAMPLE_A`; project paths and names → `/data/proj-x/`,
+  `proj-x`; window names → `w1`, `w1-sk`; Slurm job ids → `1234567`;
+  UIDs → `1000`; hostnames → `node01`; IPs → `192.0.2.x` (RFC 5737).
+  Keep the SHAPE the test asserts on, change the VALUE. Measured
+  2026-10-07: a real sample ID and a project folder name, pasted into two
+  fixtures, reached the public mirror. The leak gate only knows categories
+  someone has written down, so a new real identifier ships until it is
+  noticed, and a public disclosure cannot be recalled.
 - **Stop at ~250k context** (`monitor/ng context`; exit 10 = past
   it). Every message re-reads the whole conversation, so a worker
   at 600k pays ~6x per tool call for identical work. Finish the
@@ -152,8 +660,15 @@ a hook or your task prompt points you there.
   you through anything else that applies at that moment (skeptic
   validation if your spawn required it, finalisation reminders).
   Do task-specific finalisation — build, tests, branch push, PR
-  — BEFORE wrap-up. End your turn on exit 0; on non-zero, retry
-  only the failed step(s) named on stderr.
+  — BEFORE wrap-up. End your turn on exit 0; on **1**, retry only
+  the failed step(s) named on stderr. **Exit 3 is not a failure and
+  retrying cannot clear it**: every step did what it was asked and
+  your correction still reached nobody — the report changed, the
+  link comment is composed from `## Summary` alone, and yours is
+  byte-identical to the one already posted. Re-running reproduces
+  it exactly. Do what stderr says instead: edit `## Summary` in
+  place so the correction is IN the composed body and re-run, or
+  pass `--comment-body-file`, or say it on the thread yourself.
 
 Deeper skills, consulted only when the above is insufficient:
 `skills/nexus.bot/SKILL.md` (verb table, cross-repo `GH_TOKEN`,
@@ -164,6 +679,69 @@ rules behind the writing bullet, the shared `GLOSSARY.md` of
 approved definitions, required table columns). Resolve by
 absolute path via the spawn prompt.
 
+## Codex worker addendum
+
+Injected, after the floor, into the prompt of a worker spawned with
+`monitor/spawn-worker.sh --harness codex` (<your-org>/nexus-code#1640), and
+into no other. Everything above is still binding; this section says what
+changes because you are running in the OpenAI Codex CLI, not in Claude Code.
+
+- **Read `$NEXUS_ROOT/CLAUDE.md` before acting.** It is this workspace's
+  contract. Claude Code loads it automatically; Codex does not (measured:
+  Codex loads instruction files only from your workdir's own repository, so
+  a workdir in a separate repo under `work/` never sees the nexus one). The
+  launcher lets Codex read `CLAUDE.md` files inside your workdir's
+  repository as if they were `AGENTS.md`. **Never create an `AGENTS.md` (or a
+  `CLAUDE.md`) anywhere under `work/`.**
+- **Tools the floor names that you do NOT have**, and what to use instead:
+  - `SendMessage` / `ListAgents` — reach the orchestrator with
+    `monitor/ng request file --origin "$NEXUS_WORKER_WINDOW" --kind question
+    --slug <s> --file <f>` (durable, watcher-mediated).
+  - `Monitor`, `run_in_background`, the `ng longjob` wake — nothing
+    re-invokes you after your turn ends. Keep a wait inside your turn with a
+    hard bound, or start the job with `monitor/ng longjob run …`, record the
+    token in your report, and end the turn saying what is in flight: the
+    orchestrator sees your pane go idle and follows up.
+  - `TaskStop` — stop what you started by the pid you recorded, through
+    `monitor/proc-kill-authorized --filter`.
+- **No just-in-time GUARDS.** Codex has hooks, `PreToolUse` included, but
+  the nexus wires them only to keep the heartbeat and the submit-stamp
+  receipt current. The Claude PreToolUse guard scripts (footgun guard, `gh`
+  write guard) do not run for you. The rules they would inject are in the
+  floor above, and the PATH-front shims (`gh`, `pip`, `tmux`) still apply.
+- **Your shell commands are not sandboxed by Codex** (`danger-full-access`:
+  Codex's own sandbox cannot start inside this nexus's kernel sandbox). The
+  kernel sandbox still binds every write. Never try to weaken it.
+- **Session id** is `$CODEX_THREAD_ID`; `monitor/ng report-init` reads it.
+  Report, `report-check`, `ng wrap-up` and the skeptic contract are
+  unchanged.
+
+## Reply-to wrap-up override
+
+**Wrap-up override — this spawn answers a CHANNEL request, not a
+GitHub issue.** Request `<REQUEST_ID>` sits in the nexus request inbox
+and its author is blocked on the channel waiting for your answer. The
+floor's `ng wrap-up <issue> <report-path>` form does NOT apply to you.
+Write your `reports/` report exactly as the floor describes (it is
+still your crash-resumption surface), then hand off with:
+
+    monitor/ng wrap-up --reply-to <REQUEST_ID> <report-path>
+
+That delivers your answer over the request/reply channel: no GitHub
+issue is opened, no issue comment is posted, no trigger is rocketed.
+
+**The answer that reaches the requester is your report's `## Summary`
+section, verbatim.** Write `## Summary` as the ANSWER to the request —
+the finding, the number, the recommendation — not as a narration of
+your process. If the answer is an artifact that does not belong in
+`## Summary` (a table, a dataset, a code listing, a diff), write it to
+a file and pass `--answer-file <path>` instead; that file's bytes
+become the reply body.
+
+If the orchestrator ALSO gave you a GitHub issue number for this task,
+add `--issue <n>` — wrap-up then does both (channel reply AND the
+normal upload + link comment).
+
 ## Just-in-time hooks
 
 These hooks (wired in `monitor/worker-settings.json`) deliver the
@@ -173,10 +751,26 @@ session** (per-window dedup) so it informs without nagging.
 
 | Hook (PreToolUse/PostToolUse) | Fires when… | Delivers |
 |---|---|---|
-| `hooks/bash-footgun-guard.sh` (Bash, data-driven by `bash-footgun-patterns.conf`) | a Bash command matches a footgun pattern: `pkill/pgrep -f`, `kill $(jobs -p)`, `git push`, `scancel --name/--partition`, foreground `sleep`, `python…\| tail`, `ml…\| tail` | the specific self-kill / wrong-remote / sibling-job / buffering reminder as `additionalContext` |
+| `hooks/bash-footgun-guard.sh` (Bash, data-driven by `bash-footgun-patterns.conf`) | a Bash command matches a footgun pattern: `pkill/pgrep -f`, `kill $(jobs -p)`, `git push`, `git push --force`/`-f`, `scancel --name/--partition`, foreground `sleep`, `python…\| tail`, `ml…\| tail` | the specific self-kill / wrong-remote / force-push-boundary / sibling-job / buffering reminder as `additionalContext` |
 | `hooks/gh-write-guard.sh` (Bash) | a `gh` write is attempted | bot-identity guidance (`ng` verbs, `GH_TOKEN` mint for cross-repo); already warns on a bypass that would post as the operator |
 | `hooks/async-launch-detect.sh` (Bash) | `sbatch` / `srun --no-block` / `nohup &` is launched | the async-ownership rule + the three resume mechanisms; records the wait for the watcher's `idle-orphan-async` |
-| `hooks/context-poison-guard.sh` (Read/WebFetch — **proposed**) | a `user-attachments` URL is about to be read | BLOCKS (exit 2) and redirects to `ng fetch-asset` before the session is poisoned |
+| `hooks/bash-footgun-guard.sh` row `async-status` (Bash) | a bare `nohup … &` in command position | hands over `monitor/async-run.sh`, which retains the rc and registers a RESOLVABLE `asyncrun:<token>` wait (<your-org>/nexus-code#1071) |
+
+**Proposed, NOT wired.** The following is a design note, not a
+guard that exists. It sat inside the table above, under a heading
+asserting the hooks are wired in `monitor/worker-settings.json`, and
+the heading wins on a skim — so this text shipped in every worker
+prompt promising a blocking guard against the irrecoverable
+`user-attachments` poisoning. The worker who believes it exists is
+exactly the worker who will test it (<your-org>/nexus-code#568 C5).
+
+| Proposed hook | Would fire when… | Would deliver |
+|---|---|---|
+| `hooks/context-poison-guard.sh` (Read/WebFetch) | a `user-attachments` URL is about to be read | BLOCK (exit 2) and redirect to `ng fetch-asset` before the session is poisoned |
+
+Until it is written and wired, the `user-attachments` rule is
+enforced by convention only: never hand such a URL to Read or to a
+sub-agent; use `monitor/ng fetch-asset <url>` and read the local file.
 
 Adding a footgun to `bash-footgun-guard` is a **data edit** to
 `bash-footgun-patterns.conf` (row `tag\|severity\|command_regex\|message`),

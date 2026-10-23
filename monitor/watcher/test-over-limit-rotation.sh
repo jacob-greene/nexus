@@ -56,14 +56,27 @@ mkdir -p "$STUB_DIR"
 
 # Stubbed tmux (same shape as test-over-limit.sh). MOCK_TMUX_WINDOWS is
 # `<name>|<idx>`, newline-separated.
+# The rows are parsed with `read` and parameter expansion -- builtins only --
+# so test-tmux-shim-gate3-safety.sh can PROVE this stub a mock. `awk` is
+# outside that lint's allowlist (it has system() and print | "cmd").
 cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
-fmt_three() {
-    local act_default
-    act_default="${MOCK_TMUX_ACTIVITY_EPOCH:-$(date +%s)}"
-    printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" \
-        | awk -F'|' -v act="$act_default" \
-            'NF>=2 && $1 != "" { printf "%s|%s|%s\n", $1, act, $2 }'
+_rows() {   # <three|two|one> -> MOCK_TMUX_WINDOWS in that list-windows shape
+    local mode="$1" line name rest idx act=""
+    [[ "$mode" == three ]] && act="${MOCK_TMUX_ACTIVITY_EPOCH:-$(date +%s)}"
+    while IFS= read -r line; do
+        name="${line%%|*}"
+        [[ -n "$name" ]] || continue
+        if [[ "$mode" != one ]]; then
+            [[ "$line" == *'|'* ]] || continue      # awk's NF>=2
+            rest="${line#*|}"; idx="${rest%%|*}"
+        fi
+        case "$mode" in
+            three) printf '%s|%s|%s\n' "$name" "$act" "$idx" ;;
+            two)   printf '%s|%s\n' "$name" "$idx" ;;
+            *)     printf '%s\n' "$name" ;;
+        esac
+    done <<<"${MOCK_TMUX_WINDOWS:-}"
 }
 case "${1:-}" in
     list-windows)
@@ -75,13 +88,11 @@ case "${1:-}" in
             esac
         done
         if [[ "$F" == *'#{window_activity}'* && "$F" == *'#{window_index}'* ]]; then
-            fmt_three
+            _rows three
         elif [[ "$F" == *'#{window_index}'* ]]; then
-            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" \
-                | awk -F'|' 'NF>=2 && $1 != "" { printf "%s|%s\n", $1, $2 }'
+            _rows two
         else
-            printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" \
-                | awk -F'|' 'NF>=1 && $1 != "" { print $1 }'
+            _rows one
         fi
         ;;
     *) :;;
@@ -137,8 +148,11 @@ export PATH
 source "$LIB"
 # shellcheck disable=SC1090
 source "$IDLE"
+# The default is spelled INLINE (not via "$HELPER") so the static
+# source graph in test-ambient-shell-option-scope.sh resolves this edge;
+# OVER_LIMIT_SRC still overrides it, and "$HELPER" names the same file.
 # shellcheck disable=SC1090
-source "$HELPER"
+source "${OVER_LIMIT_SRC:-$_repo_root/monitor/watcher/_over_limit.sh}"
 _OVER_LIMIT_LOG_FN=test_log
 _OVER_LIMIT_PASTE_FN=test_paste
 
@@ -167,7 +181,11 @@ write_heartbeat() { # window session_id
 
 reset_state() {
     : > "$PASTE_LOG"; : > "$LOG_LOG"; : > "$LAST_BODY"
-    rm -f "$STATE_DIR/over-limit-state.tsv"
+    # Every over-limit TSV, not just the row file: the observation, flavour
+    # and liveness SIDECARS (upstream #592/#1488/#1141) persist per key, and
+    # a `resumed` liveness note left by one case suppresses the next case's
+    # record of the same key.
+    rm -f "$STATE_DIR"/over-limit-*.tsv
     rm -rf "$STATE_DIR/over-limit" "$STATE_DIR/heartbeat"
     rm -f "$STATE_DIR/orchestrator-session-id"
     unset PASTE_RC

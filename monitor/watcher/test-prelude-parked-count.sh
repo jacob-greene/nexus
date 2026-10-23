@@ -62,8 +62,20 @@ printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"%s","targ
 
 # tmux stub: both windows alive, rc 0 (an answer, not a misread — #31).
 mkdir -p "$WORK/bin"
-printf '#!/usr/bin/env bash\nprintf "%%s\\n%%s\\n" "%s" "%s"\n' "$W" "$SK" > "$WORK/bin/tmux"
-chmod +x "$WORK/bin/tmux"
+# The stub prints MOCK_TMUX_WINDOWS, one window name per line. A QUOTED
+# heredoc plus an exported variable, not printf %s fills into the body:
+# test-tmux-shim-gate3-safety.sh must PROVE a planted tmux is a mock, and a
+# name filled into the body text lands there as an unprovable word.
+_plant_tmux_stub() {   # <window-name>... -> the stub lists exactly these
+    MOCK_TMUX_WINDOWS=$(printf '%s\n' "$@")
+    export MOCK_TMUX_WINDOWS
+    cat > "$WORK/bin/tmux" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$MOCK_TMUX_WINDOWS"
+STUB
+    chmod +x "$WORK/bin/tmux"
+}
+_plant_tmux_stub "$W" "$SK"
 export PATH="$WORK/bin:$PATH"
 
 # shellcheck source=_idle_probe.sh
@@ -118,7 +130,7 @@ done
 # A marker with NO live skeptic past grace is `orphaned`, not parked — it
 # must NOT be swept into parked-skeptic by the fix.
 echo '=== orphaned marker is not counted as parked ==='
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$W" > "$WORK/bin/tmux"   # skeptic window gone
+_plant_tmux_stub "$W"   # skeptic window gone
 printf '{"ts":"%s","agent":"monitor","event":"skeptic-request","target-window":"%s","depth":"1"}\n' \
     "$(date -Is -d "@$(( NOW - 3000 ))")" "$W" >> "$STATE_DIR/action-log.jsonl"
 PANE_STATE=busy
@@ -149,7 +161,7 @@ fi
 # ---------------------------------------------------------------------------
 echo '=== one window, one bucket (parked AND another class) ==='
 # Restore the healthy park: live skeptic again, no stale orphan request.
-printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n" "%s" "%s"\n' "$W" "$SK" > "$WORK/bin/tmux"
+_plant_tmux_stub "$W" "$SK"
 printf '{"ts":"%s","agent":"monitor","event":"skeptic-spawn","window":"%s","target-window":"%s","orig-window":"%s","depth":"1"}\n' \
     "$(date -Is)" "$SK" "$W" "$W" > "$STATE_DIR/action-log.jsonl"
 mkdir -p "$STATE_DIR/turn-failure"
@@ -190,7 +202,7 @@ echo '=== a parked worker does not deflate a genuinely-busy peer ==='
 B=busy-peer
 printf '%s\t%s\n%s\t%s\n' "$W" "$(( NOW - 3000 ))" "$B" "$(( NOW - 3000 ))" \
     > "$STATE_DIR/engagement-log.tsv"
-printf '#!/usr/bin/env bash\nprintf "%%s\n%%s\n%%s\n" "%s" "%s" "%s" \n' "$W" "$SK" "$B" > "$WORK/bin/tmux"
+_plant_tmux_stub "$W" "$SK" "$B"
 _idle_list_worker_windows() {
     printf '%s\t%s\t%s\n' "$W" "$(( NOW - 3000 ))" "3"
     printf '%s\t%s\t%s\n' "$B" "$(( NOW - 3000 ))" "4"

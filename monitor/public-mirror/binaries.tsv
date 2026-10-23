@@ -1,0 +1,13 @@
+# binaries.tsv — REVIEWED binary files of the public mirror (your-org/nexus-code#1812).
+#
+# The scrub is a text substitution and never touches a binary: build.sh copies
+# every binary (git: i/-text) VERBATIM, and verify-build.py fails the build if
+# one was rewritten, or if a binary in the tree is not listed here with the
+# blob sha it has today. A row is a human statement that the file at that
+# exact blob carries no internal identifier (pixels and metadata included).
+# A new or changed binary therefore stops the build until someone reviews it:
+# ship it (add or update the row), drop it (an `exclude` row in the private
+# mapping), or replace it in source.
+#
+# binary<TAB>PATH<TAB>BLOB-SHA<TAB>NOTE
+binary	docs/assets/organigram-v5.jpg	82daafe4551f712606b77793b3e94f1bd049eb63	docs organigram; C2PA provenance metadata only, no internal strings (reviewed 2026-10-13)

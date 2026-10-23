@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# Regression test for your-org/nexus-code#1077 — `monitor/upload-asset.sh`
+# re-rooted to its OWN script location and destroyed the enclosing checkout.
+#
+# ---------------------------------------------------------------------------
+# THE DEFECT, AS MEASURED (not as reasoned about)
+# ---------------------------------------------------------------------------
+#
+# `upload-asset.sh` computed `_nexus_root=$(cd "$_script_dir/.." && pwd)` and
+# contained ZERO references to $NEXUS_ROOT. `monitor/ng wrap-up`, run from a
+# secondary clone's cwd, invokes THAT clone's copy — so the asset tree became
+# `<clone>/assets`, inside a live checkout. #577 pinned reports to the primary
+# and left assets unpinned; this is its residual.
+#
+# On its own that only misplaces the asset clone. The DESTRUCTION needs a
+# second, independent fault, and the incident had it: the bootstrap probe was
+#
+#     [[ ! -d "$ASSETS_DIR/.git" ]]
+#
+# — a test for a DIRECTORY NAMED `.git`, not for a REPOSITORY. An interrupted
+# asset clone leaves `<root>/assets/.git/` holding only `objects/`. That is a
+# directory, so the probe concluded "already cloned" and skipped the clone; it
+# is not a valid repository, so git discovery WALKED UP and every later
+# `git -C "$ASSETS_DIR"` operated on the ENCLOSING repo.
+#
+# Observed on `work/nexus-code-stubred-sk` (a live skeptic clone) after one
+# `ng wrap-up`, and reproduced byte-for-byte by case C below:
+#
+#     8ea077f4 HEAD@{0}: commit: Add asset ... via upload-asset.sh
+#     f08fce4c HEAD@{1}: reset: moving to origin/main
+#     f24c17df HEAD@{2}: checkout: moving from dev to main
+#     4f1bd752 HEAD@{3}: clone: from https://github.com/your-org/nexus-code
+#
+# origin rewritten to the asset repo, branch dev -> main, working tree replaced,
+# staged-and-unpushed work gone — and the script exited 0 and printed a valid
+# URL, so the caller saw success.
+#
+# ---------------------------------------------------------------------------
+# WHY CASE D EXISTS, AND WHY IT IS THE POINT
+# ---------------------------------------------------------------------------
+#
+# Fixing only the root RELOCATES the destruction. With $NEXUS_ROOT honoured,
+# the same `.git` stub under `<primary>/assets` retargets the PRIMARY nexus
+# checkout instead of a clone's — a strictly worse outcome. Case D holds the
+# root CORRECT and varies only the stub, so it fails for the pre-fix script
+# even when the #1077 headline fix is applied. The guard, not the root, is what
+# makes the failure impossible.
+#
+# ---------------------------------------------------------------------------
+# Run:   bash monitor/watcher/test-upload-asset-root-pinning.sh
+#        UPLOAD_ASSET_UNDER_TEST=/path/to/old/upload-asset.sh bash ...   (to
+#        demonstrate every assertion FAILS on the pre-fix tree)
+# Expected: ALL TESTS PASSED on stdout, exit 0.
+#
+# Strategy follows test-upload-asset-bootstrap.sh: a local bare repo as the
+# "asset remote", stub `mint-token.sh` + `config/load.sh`, and a PATH-stubbed
+# `git` that rewrites a github.com URL to the local bare. What is NEW here is
+# that the fake nexus roots are themselves REAL GIT REPOSITORIES with tracked
+# content and staged work — the condition none of the existing upload suites
+# create, and the one under which the destruction is visible.
+
+set -uo pipefail
+
+_test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+_monitor_dir=$(cd "$_test_dir/.." && pwd)
+UPLOAD_UNDER_TEST="${UPLOAD_ASSET_UNDER_TEST:-$_monitor_dir/upload-asset.sh}"
+[[ -f "$UPLOAD_UNDER_TEST" ]] || { echo "no such script: $UPLOAD_UNDER_TEST" >&2; exit 2; }
+
+# Shared assertion primitives + the subshell-durable ledger. Several assertions
+# below run inside `$( … )`, where a locally-counted FAIL would die with the
+# child and leave the suite green — the ledger is what makes them count.
+. "$(dirname "${BASH_SOURCE[0]}")/_test_helpers.sh"
+
+# `assert_ne` is not in the shared set; this suite needs it because two of its
+# strongest claims are NEGATIVE (the clone's origin must NOT become the asset
+# remote; the script must NOT exit 0). Routed through the shared ledger.
+assert_ne() {
+    local label="$1" got="$2" notwant="$3"
+    if [[ "$got" != "$notwant" ]]; then
+        printf '  PASS: %s\n' "$label"; _th_pass
+    else
+        printf '  FAIL: %s — got %q, which is exactly what must not happen\n' "$label" "$got" >&2
+        _th_fail
+    fi
+}
+
+REAL_GIT=$(command -v git)
+[[ -x "$REAL_GIT" ]] || { echo "git not on PATH; cannot run test" >&2; exit 2; }
+
+WORK=$(mktemp -d -t nexus-test-upload-rootpin-XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+ASSET_BARE="$WORK/asset-remote.git"
+NEXUS_BARE="$WORK/nexus-remote.git"
+
+# ---- one-time remotes ----------------------------------------------------
+
+build_remotes() {
+    "$REAL_GIT" init --quiet --bare "$ASSET_BARE"
+    "$REAL_GIT" --git-dir="$ASSET_BARE" symbolic-ref HEAD refs/heads/main
+    local seed="$WORK/assetseed"
+    "$REAL_GIT" init --quiet "$seed"
+    "$REAL_GIT" -C "$seed" checkout --quiet -b main 2>/dev/null || true
+    mkdir -p "$seed/assets/general"
+    printf 'asset repo readme\n'  > "$seed/README.md"
+    printf 'pre-existing\n'       > "$seed/assets/general/old.txt"
+    "$REAL_GIT" -C "$seed" add -A
+    "$REAL_GIT" -C "$seed" -c user.name=t -c user.email=t@t commit --quiet -m "asset seed"
+    "$REAL_GIT" -C "$seed" push --quiet "$ASSET_BARE" main
+
+    "$REAL_GIT" init --quiet --bare "$NEXUS_BARE"
+    "$REAL_GIT" --git-dir="$NEXUS_BARE" symbolic-ref HEAD refs/heads/dev
+    local seed2="$WORK/nexusseed"
+    "$REAL_GIT" init --quiet "$seed2"
+    "$REAL_GIT" -C "$seed2" checkout --quiet -b dev 2>/dev/null || true
+    mkdir -p "$seed2/monitor" "$seed2/config"
+    cp "$UPLOAD_UNDER_TEST" "$seed2/monitor/upload-asset.sh"
+    chmod +x "$seed2/monitor/upload-asset.sh"
+    # The shared resolver, when the script under test has one. Absent for the
+    # pre-fix script, which is fine: it never looked for it.
+    if [[ -f "$_monitor_dir/_nexus-root.sh" ]]; then
+        cp "$_monitor_dir/_nexus-root.sh" "$seed2/monitor/_nexus-root.sh"
+    fi
+    cat > "$seed2/monitor/mint-token.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' "fake-token-for-tests"
+STUB
+    chmod +x "$seed2/monitor/mint-token.sh"
+    # `nexus_primary_root` requires an executable <root>/monitor/ng to accept an
+    # ancestor as the primary. A stub suffices — the resolver only tests -x.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$seed2/monitor/ng"
+    chmod +x "$seed2/monitor/ng"
+    cat > "$seed2/config/load.sh" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in
+    github.asset_repo)    printf 'fake-owner/fake-asset-repo' ;;
+    github.repo)          printf 'fake-owner/fake-asset-repo' ;;
+    github.bot_git_name)  printf 'test-bot[bot]' ;;
+    github.bot_git_email) printf 'test-bot[bot]@users.noreply.github.com' ;;
+    *)                    printf '%s' "${2-}" ;;
+esac
+STUB
+    chmod +x "$seed2/config/load.sh"
+    printf 'NEXUS-CODE SENTINEL\n' > "$seed2/SENTINEL.md"
+    "$REAL_GIT" -C "$seed2" add -A
+    "$REAL_GIT" -C "$seed2" -c user.name=t -c user.email=t@t commit --quiet -m "nexus seed"
+    "$REAL_GIT" -C "$seed2" push --quiet "$NEXUS_BARE" dev
+}
+
+# PATH-stubbed git: rewrite any github.com URL argument to the local bare.
+STUB_DIR="$WORK/bin"; mkdir -p "$STUB_DIR"
+build_git_stub() {
+    cat > "$STUB_DIR/git" <<STUB
+#!/usr/bin/env bash
+args=("\$@")
+for i in "\${!args[@]}"; do
+    case "\${args[\$i]}" in
+        https://*github.com/*) args[\$i]="$ASSET_BARE" ;;
+    esac
+done
+exec "$REAL_GIT" "\${args[@]}"
+STUB
+    chmod +x "$STUB_DIR/git"
+}
+
+build_remotes
+build_git_stub
+
+PAYLOAD="$WORK/report.md"
+printf '# a report\n' > "$PAYLOAD"
+
+# ---- per-case fixture ----------------------------------------------------
+# Builds  <case>/primary            (a nexus-code checkout, the PRIMARY)
+#         <case>/primary/work/clone (a secondary clone, as #577 prescribes)
+# both real git repos, the clone carrying STAGED, UNPUSHED work.
+CASE_DIR=""; PRIMARY=""; CLONE=""
+new_case() {
+    CASE_DIR="$WORK/case-$1"
+    PRIMARY="$CASE_DIR/primary"
+    CLONE="$PRIMARY/work/nexus-code-task"
+    mkdir -p "$CASE_DIR"
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$PRIMARY"
+    mkdir -p "$PRIMARY/work"
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$CLONE"
+    printf "worker's precious staged work\n" > "$CLONE/PRECIOUS.txt"
+    "$REAL_GIT" -C "$CLONE" add PRECIOUS.txt
+}
+
+# Snapshot the five properties a destructive reset changes.
+snapshot() {   # $1 = repo
+    printf '%s|%s|%s|%s|%s' \
+        "$("$REAL_GIT" -C "$1" rev-parse HEAD 2>&1)" \
+        "$("$REAL_GIT" -C "$1" rev-parse --abbrev-ref HEAD 2>&1)" \
+        "$("$REAL_GIT" -C "$1" remote get-url origin 2>&1)" \
+        "$("$REAL_GIT" -C "$1" diff --cached --name-only 2>&1 | tr '\n' ',')" \
+        "$("$REAL_GIT" -C "$1" reflog 2>&1 | wc -l)"
+}
+
+rc=0; stdout=""; stderr=""
+run_upload() {   # $1 = cwd, $2 = script to invoke, rest = args ; env NR_ROOT
+    local _cwd="$1" _script="$2"; shift 2
+    local _o _e; _o=$(mktemp); _e=$(mktemp)
+    if [[ -n "${NR_ROOT:-}" ]]; then
+        ( cd "$_cwd" && env -u NEXUS_ASSET_REPO -u NEXUS_CONFIG \
+            NEXUS_ROOT="$NR_ROOT" PATH="$STUB_DIR:$PATH" \
+            "$_script" "$@" ) >"$_o" 2>"$_e"
+    else
+        ( cd "$_cwd" && env -u NEXUS_ASSET_REPO -u NEXUS_CONFIG -u NEXUS_ROOT \
+            PATH="$STUB_DIR:$PATH" \
+            "$_script" "$@" ) >"$_o" 2>"$_e"
+    fi
+    rc=$?
+    stdout=$(<"$_o"); stderr=$(<"$_e"); rm -f "$_o" "$_e"
+}
+
+# The observed incident precondition: an interrupted asset clone leaves a
+# `.git` DIRECTORY holding only `objects/`.
+plant_halfclone_stub() { mkdir -p "$1/assets/.git/objects"; }
+
+# =========================================================================
+echo '=== A: $NEXUS_ROOT is honoured — a clone-cwd upload targets the PRIMARY ==='
+new_case A
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+assert_eq       "exit 0"                                   "$rc" "0"
+assert_contains "a URL is still emitted"                   "$stdout" "https://github.com/fake-owner/fake-asset-repo/"
+assert_eq       "asset tree created under the PRIMARY"     "$([[ -d $PRIMARY/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq       "NO asset tree created under the CLONE"    "$([[ -e $CLONE/assets ]] && echo yes || echo no)"        "no"
+assert_eq       "staging/lock litter stays off the CLONE"  "$([[ -e $CLONE/assets.lock || -e $CLONE/assets.staging ]] && echo yes || echo no)" "no"
+
+# =========================================================================
+echo '=== B: $NEXUS_ROOT UNSET — the clone de-nests structurally to the primary ==='
+new_case B
+NR_ROOT="" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+assert_eq "exit 0"                                "$rc" "0"
+assert_eq "asset tree under the PRIMARY"          "$([[ -d $PRIMARY/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq "NO asset tree under the CLONE"         "$([[ -e $CLONE/assets ]] && echo yes || echo no)"        "no"
+
+# =========================================================================
+echo '=== C: the incident — half-created .git in the CLONE must not touch it ==='
+new_case C
+plant_halfclone_stub "$CLONE"
+before=$(snapshot "$CLONE")
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+after=$(snapshot "$CLONE")
+assert_eq "enclosing checkout UNCHANGED (HEAD|branch|origin|staged|reflog)" "$after" "$before"
+assert_eq "tracked content survives"    "$([[ -f $CLONE/SENTINEL.md ]] && echo yes || echo no)"  "yes"
+assert_eq "STAGED work survives"        "$([[ -f $CLONE/PRECIOUS.txt ]] && echo yes || echo no)" "yes"
+assert_ne "clone origin NOT rewritten to the asset repo" \
+          "$("$REAL_GIT" -C "$CLONE" remote get-url origin 2>&1)" "$ASSET_BARE"
+assert_eq "no commit was made in the enclosing repo" \
+          "$("$REAL_GIT" -C "$CLONE" log --oneline -1 --format='%s' 2>&1)" "nexus seed"
+
+# =========================================================================
+echo '=== D: root CORRECT, stub .git in the PRIMARY — must REFUSE, not reset it ==='
+# This is the case the root fix alone does not cover: honouring $NEXUS_ROOT
+# merely moves the same destruction onto the primary nexus checkout.
+new_case D
+plant_halfclone_stub "$PRIMARY"
+printf "operator's staged work\n" > "$PRIMARY/OPERATOR.txt"
+"$REAL_GIT" -C "$PRIMARY" add OPERATOR.txt
+before=$(snapshot "$PRIMARY")
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+after=$(snapshot "$PRIMARY")
+assert_ne       "refuses (non-zero exit)"      "$rc" "0"
+assert_eq       "emits NO url"                 "$stdout" ""
+assert_eq       "PRIMARY checkout UNCHANGED"   "$after" "$before"
+assert_eq       "operator's staged work survives" "$([[ -f $PRIMARY/OPERATOR.txt ]] && echo yes || echo no)" "yes"
+assert_contains "the refusal names the cause"  "$stderr" "not its own repository"
+assert_contains "the refusal names the remedy" "$stderr" "rm -rf"
+
+# =========================================================================
+echo '=== E: fail CLOSED — an unusable $NEXUS_ROOT refuses instead of guessing ==='
+new_case E
+mkdir -p "$CASE_DIR/not-a-nexus"
+before=$(snapshot "$CLONE")
+NR_ROOT="$CASE_DIR/not-a-nexus" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+assert_ne       "refuses (non-zero exit)"                 "$rc" "0"
+assert_eq       "emits NO url"                            "$stdout" ""
+assert_eq       "did NOT silently fall back to the clone" "$([[ -e $CLONE/assets ]] && echo yes || echo no)" "no"
+assert_eq       "did NOT write into the bogus root"       "$([[ -e $CASE_DIR/not-a-nexus/assets ]] && echo yes || echo no)" "no"
+assert_eq       "clone untouched"                         "$(snapshot "$CLONE")" "$before"
+assert_contains "the refusal says it could not establish the root" "$stderr" "cannot establish the nexus primary root"
+
+# =========================================================================
+echo '=== F: no over-refusal — a pre-existing EMPTY assets/ still bootstraps ==='
+new_case F
+mkdir -p "$PRIMARY/assets"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+assert_eq       "exit 0"                    "$rc" "0"
+assert_contains "URL emitted"               "$stdout" "https://github.com/fake-owner/fake-asset-repo/"
+assert_eq       "asset tree bootstrapped"   "$([[ -d $PRIMARY/assets/.git ]] && echo yes || echo no)" "yes"
+
+# =========================================================================
+echo '=== G: a LINKED WORKTREE at assets/ is self-rooted but owns no refs — REFUSE ==='
+# `git worktree add` gives `--show-toplevel` = the worktree (so a toplevel-only
+# check calls it self-rooted) while `--absolute-git-dir` points into the PARENT
+# repo. `reset --hard` there moves the PARENT's branch: #1077's outcome by a
+# second road. Measured on this host; the guard tests BOTH.
+new_case G
+"$REAL_GIT" -C "$PRIMARY" worktree add --detach "$PRIMARY/assets" HEAD >/dev/null 2>&1
+before=$(snapshot "$PRIMARY")
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1077
+assert_ne       "refuses (non-zero exit)"        "$rc" "0"
+assert_eq       "emits NO url"                   "$stdout" ""
+assert_eq       "the PARENT repo is UNCHANGED"   "$(snapshot "$PRIMARY")" "$before"
+assert_contains "the refusal names the ref store" "$stderr" "LINKED WORKTREE"
+
+# =========================================================================
+echo '=== H: a REFUSAL is ATOMIC — it must not leave a request a later upload adopts ==='
+# The guard's own data-loss mode (skeptic finding 2). STAGE runs BEFORE the
+# guard, and a later upload's batch manager snapshots `"$STAGING_DIR"/*.req` and
+# commits EVERY marker it finds. So a refused payload could be committed, to a
+# live path, by an unrelated upload — while its caller had been told rc=4 and
+# the header had told it nothing was touched.
+#
+# The assertion is deliberately end-to-end rather than "no .req file remains":
+# the file is the mechanism, the OUTCOME is what matters, and only the outcome
+# distinguishes a clean refusal from a deferred one.
+new_case H
+plant_halfclone_stub "$PRIMARY"
+printf 'PAYLOAD FROM THE REFUSED UPLOAD\n' > "$WORK/refused.md"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$WORK/refused.md" \
+    --repo-path assets/general/old.txt          # aimed at a path the asset repo already holds
+assert_ne "the upload is refused" "$rc" "0"
+assert_eq "nothing of ours is left staged" \
+    "$(ls "$PRIMARY"/assets.staging/*.req "$PRIMARY"/assets.staging/*.blob 2>/dev/null | wc -l)" "0"
+
+# The operator clears the debris; an unrelated upload of a different file runs.
+rm -rf "$PRIMARY/assets"
+printf 'a totally unrelated figure\n' > "$WORK/unrelated.png"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$WORK/unrelated.png" \
+    --repo-path assets/general/fig.png
+assert_eq "the unrelated upload succeeds" "$rc" "0"
+assert_eq "the refused payload did NOT reach the live path" \
+    "$("$REAL_GIT" --git-dir="$ASSET_BARE" show main:assets/general/old.txt 2>&1)" "pre-existing"
+assert_eq "the unrelated upload committed ONLY its own file" \
+    "$("$REAL_GIT" --git-dir="$ASSET_BARE" log --oneline main 2>&1 | grep -c 'refused\.md')" "0"
+
+# =========================================================================
+# ==== your-org/nexus-code#1173: WHICH REMOTE, not which tree =============
+#
+# Cases A-H all ask which local TREE git acts on. Five bot commits reached the
+# shared implementation repo's `main` with every one of those guards passing,
+# because `remote set-url origin` REPOINTS a perfectly self-rooted asset clone
+# at whatever `$REPO` says. The fixture below is therefore the mirror image of
+# theirs: the asset tree is healthy throughout and only the DESTINATION varies.
+#
+# The primary's origin is repointed at a github.com URL so the derived rule has
+# something to derive from — the real primary's origin IS the implementation
+# repo, which is the whole shape of the defect.
+_NEXUS_REPO=fake-owner/fake-nexus-code
+_ASSET_REPO=fake-owner/fake-asset-repo
+_pin_origin() { "$REAL_GIT" -C "$1" remote set-url origin "https://github.com/$_NEXUS_REPO.git"; }
+
+echo '=== I: --repo naming the nexus code repo is REFUSED (the flag-collision arm) ==='
+new_case I
+_pin_origin "$PRIMARY"
+before=$(snapshot "$PRIMARY")
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --repo "$_NEXUS_REPO"
+assert_eq       "refuses with the destination code (7)"   "$rc" "7"
+assert_eq       "emits NO url"                            "$stdout" ""
+assert_eq       "no asset tree was even created"          "$([[ -e $PRIMARY/assets ]] && echo yes || echo no)" "no"
+assert_eq       "the nexus checkout is UNCHANGED"         "$(snapshot "$PRIMARY")" "$before"
+assert_contains "the refusal names the two meanings of --repo" "$stderr" "means the ISSUE repo"
+# THE ARM ONLY RULE 1 PROTECTS, and the reason it is asserted separately: a
+# THIRD repo — an external one the worker's issue happens to live on — is not
+# this checkout's origin, so rule 2 cannot see it, and the asset would be
+# pushed into somebody else's repository. Without this, dropping rule 1 costs
+# exactly one message assertion and looks nearly harmless.
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --repo other-org/someone-elses-repo
+assert_eq "--repo naming a THIRD repo is refused too (rule 2 cannot see it)" "$rc" "7"
+assert_eq "…and nothing was pushed anywhere"                                 "$stdout" ""
+
+echo '=== J: the same destination via --asset-repo and via the env is REFUSED too ==='
+# Rule 1 is about a FLAG NAME; rule 2 is about the DESTINATION, so it must hold
+# whatever supplied it — otherwise the fix is a spelling rule, not a guard.
+new_case J
+_pin_origin "$PRIMARY"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --asset-repo "$_NEXUS_REPO"
+assert_eq       "--asset-repo <own origin> refuses (7)"  "$rc" "7"
+assert_contains "…naming the checkout's own origin"      "$stderr" "OWN origin"
+_j_o=$(mktemp); _j_e=$(mktemp)
+( cd "$CLONE" && env -u NEXUS_CONFIG NEXUS_ROOT="$PRIMARY" NEXUS_ASSET_REPO="$_NEXUS_REPO" \
+    PATH="$STUB_DIR:$PATH" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" ) >"$_j_o" 2>"$_j_e"
+_j_rc=$?
+assert_eq "NEXUS_ASSET_REPO=<own origin> refuses (7) as well" "$_j_rc" "7"
+assert_eq "…and emits no url"                                "$(cat "$_j_o")" ""
+rm -f "$_j_o" "$_j_e"
+
+echo '=== K: NO OVER-REFUSAL — the correct destination still uploads, by every route ==='
+# The failure mode of a destination guard is refusing the good path, which
+# would take the whole asset surface down; every report in this workspace
+# reaches its issue through here.
+new_case K
+_pin_origin "$PRIMARY"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1173
+assert_eq       "default (no flag) still uploads"        "$rc" "0"
+assert_contains "…and emits the asset repo's URL"        "$stdout" "https://github.com/$_ASSET_REPO/"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --repo "$_ASSET_REPO" --issue 1173
+assert_eq       "--repo RESTATING the configured asset repo is a no-op, not a refusal" "$rc" "0"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --asset-repo "$_ASSET_REPO" --issue 1173
+assert_eq       "--asset-repo naming the asset repo works"  "$rc" "0"
+
+echo '=== L: a 7 is ATOMIC, and an unreadable origin SAYS so rather than passing quietly ==='
+new_case L
+_pin_origin "$PRIMARY"
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --repo "$_NEXUS_REPO"
+assert_eq "a refused destination stages NOTHING" \
+    "$(ls "$PRIMARY"/assets.staging/*.req "$PRIMARY"/assets.staging/*.blob 2>/dev/null | wc -l)" "0"
+# Origin removed: the rule cannot be evaluated. It must not silently pass — a
+# silence that means "could not check" reads as "checked and fine", which is
+# this workspace's dominant defect class.
+"$REAL_GIT" -C "$PRIMARY" remote remove origin
+NR_ROOT="$PRIMARY" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1173
+assert_eq       "an unreadable origin does not block a correct upload" "$rc" "0"
+assert_contains "…but it SAYS the guard did not evaluate"              "$stderr" "self-push guard did not evaluate"
+
+echo '=== M: #1077 pinned WHICH SCRIPT; this pins WHICH TREE IT ANSWERS ABOUT ==='
+# `config/load.sh:48` is `nexus_root="${NEXUS_ROOT:-$(cd "$script_dir/.." && pwd)}"`
+# — the ENVIRONMENT wins over the script's own location. So resolving `$_cfg` to
+# the PRIMARY's copy is not enough: invoked with $NEXUS_ROOT still pointing at a
+# clone, the PRIMARY's own load.sh reads the CLONE's config. The fixture makes
+# the two configs DISAGREE, which is the only way this assertion can fail.
+new_case M
+_pin_origin "$PRIMARY"
+# BOTH load.sh copies are replaced by a stub that honours $NEXUS_ROOT THE WAY
+# THE REAL ONE DOES (load.sh:48) — reading the answer out of
+# ${NEXUS_ROOT:-<own root>}/config/asset-repo.txt. Without that the fixture
+# cannot express the defect at all: the plain stub ignores the environment, so
+# un-pinning the read changes nothing and the case is vacuous. It was, once.
+for _r in "$PRIMARY" "$CLONE"; do
+    cat > "$_r/config/load.sh" <<'ENVCFG'
+#!/usr/bin/env bash
+_sd=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+_root="${NEXUS_ROOT:-$(cd "$_sd/.." && pwd)}"
+case "${1:-}" in
+    github.asset_repo|github.repo) cat "$_root/config/asset-repo.txt" ;;
+    github.bot_git_name)           printf 'test-bot[bot]' ;;
+    github.bot_git_email)          printf 'test-bot[bot]@users.noreply.github.com' ;;
+    *)                             printf '%s' "${2-}" ;;
+esac
+ENVCFG
+    chmod +x "$_r/config/load.sh"
+done
+printf '%s' "$_ASSET_REPO"                  > "$PRIMARY/config/asset-repo.txt"
+printf '%s' 'wrong-owner/CLONE-CONFIG-READ' > "$CLONE/config/asset-repo.txt"
+NR_ROOT="$CLONE" run_upload "$CLONE" "$CLONE/monitor/upload-asset.sh" "$PAYLOAD" --issue 1173
+assert_eq       "exit 0"                                     "$rc" "0"
+assert_contains "the URL names the PRIMARY's asset repo"     "$stdout" "https://github.com/$_ASSET_REPO/"
+assert_eq       "…and NOT the clone's config"                "${stdout##*CLONE-CONFIG-READ*}" "$stdout"
+
+# =========================================================================
+# ==== your-org/nexus-code#1651: the ONE-TREE rule — WHICH NEXUS ============
+#
+# `ng` keys the nexus on its OWN tree; this script keyed it on $NEXUS_ROOT
+# first. So with NEXUS_ROOT at a FOREIGN nexus, `ng` refused a write while
+# `ng upload` pushed to the foreign ASSET repo at rc 0. Both now use
+# `nexus_config_root`. These roots carry the REAL config/load.sh and a real
+# nexus.yml each, with DISTINCT asset repos, so the URL names the tree whose
+# identity was used — the stub load.sh above answers one repo for every tree
+# and could not see this.
+_real_load="$_monitor_dir/../config/load.sh"
+_mk_1651_root() {   # <dir> <asset-owner|none>
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$1"
+    cp "$_real_load" "$1/config/load.sh"
+    cp "$_monitor_dir/../config/nexus.example.yml" "$1/config/nexus.example.yml"
+    if [[ "$2" == malformed ]]; then
+        printf 'github:\n  repo: [unclosed\n' > "$1/config/nexus.yml"
+    elif [[ "$2" != none ]]; then
+        printf 'github:\n  repo: %s/issues\n  asset_repo: %s/assets\n  bot_login: test-bot\n' "$2" "$2" \
+            > "$1/config/nexus.yml"
+    fi
+}
+_bare_head() { "$REAL_GIT" --git-dir="$ASSET_BARE" rev-parse main 2>&1; }
+R1651="$WORK/case-1651"
+_mk_1651_root "$R1651/P"  p-org
+_mk_1651_root "$R1651/F"  f-org
+_mk_1651_root "$R1651/F2" p-org
+_mk_1651_root "$R1651/C"  none
+_mk_1651_root "$R1651/M"  malformed
+
+echo '=== N: NEXUS_ROOT at a FOREIGN nexus — REFUSED, nothing pushed anywhere ==='
+_b=$(_bare_head)
+NR_ROOT="$R1651/F" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 N: refuses (exit 4)"                     "$rc" "4"
+assert_eq       "#1651 N: emits NO url"                         "$stdout" ""
+assert_eq       "#1651 N: the asset remote did not move"        "$(_bare_head)" "$_b"
+assert_eq       "#1651 N: no asset tree under the FOREIGN root" "$([[ -e $R1651/F/assets ]] && echo yes || echo no)" "no"
+assert_eq       "#1651 N: no asset tree under its own root"     "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+assert_contains "#1651 N: the refusal names BOTH identities"    "$stderr" "f-org/assets"
+assert_contains "#1651 N: …both of them"                        "$stderr" "p-org/assets"
+
+echo '=== O: a CONFIG-LESS checkout outside work/, NEXUS_ROOT=P — acts for P (as at base) ==='
+NR_ROOT="$R1651/P" run_upload "$R1651/C" "$R1651/C/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 O: exit 0"                               "$rc" "0"
+assert_contains "#1651 O: the URL names P's asset repo"         "$stdout" "https://github.com/p-org/assets/"
+assert_eq       "#1651 O: asset tree under P"                   "$([[ -d $R1651/P/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq       "#1651 O: NOT under the checkout"               "$([[ -e $R1651/C/assets ]] && echo yes || echo no)" "no"
+
+echo '=== P: a foreign NEXUS_ROOT with the SAME identity is not refused ==='
+NR_ROOT="$R1651/F2" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 P: exit 0"                               "$rc" "0"
+assert_contains "#1651 P: the URL names the shared asset repo"  "$stdout" "https://github.com/p-org/assets/"
+
+# your-org/nexus-code#1652 item 3. Same shape as O, but the checkout HAS a
+# nexus.yml and it is MALFORMED. At 33a44f48 that read as "no config" and the
+# upload went to P's asset repo at rc 0. O is the no-config control.
+echo '=== Q: a MALFORMED own nexus.yml, NEXUS_ROOT=P — REFUSED, nothing pushed ==='
+rm -rf "$R1651/P/assets"; _b=$(_bare_head)
+NR_ROOT="$R1651/P" run_upload "$R1651/M" "$R1651/M/monitor/upload-asset.sh" "$PAYLOAD" --issue 1652
+assert_eq       "#1652 Q: refuses (exit 4)"                     "$rc" "4"
+assert_eq       "#1652 Q: emits NO url"                         "$stdout" ""
+assert_eq       "#1652 Q: the asset remote did not move"        "$(_bare_head)" "$_b"
+assert_eq       "#1652 Q: no asset tree under P"                "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+assert_contains "#1652 Q: the refusal says the config cannot be read" "$stderr" "cannot be read"
+
+# =========================================================================
+# ==== your-org/nexus-code#1694 item 2: a nexus.yml with NO top-level MAPPING
+#
+# load.sh answers rc 2 ("key not present") both for a mapping without
+# github.repo and for a file that yields no mapping at all. The second is what a
+# torn or truncated write leaves, and at base it read as "no opinion": the
+# upload went to P's asset repo at rc 0, exactly like O. Now it is UNREADABLE
+# and refused by name; the mapping-without-the-key file (D) still defers, and O
+# above stays the no-config control.
+_mk_1694_root() {   # <dir> <file content, printf %b>
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$1"
+    cp "$_real_load" "$1/config/load.sh"
+    cp "$_monitor_dir/../config/nexus.example.yml" "$1/config/nexus.example.yml"
+    printf '%b' "$2" > "$1/config/nexus.yml"
+}
+R1694="$WORK/case-1694"
+_mk_1694_root "$R1694/E" ''
+_mk_1694_root "$R1694/W" '   \n\n  \n'   # spaces only: a TAB is a YAML parse error
+_mk_1694_root "$R1694/K" '# nexus.yml\n# github:\n#   repo: labx/issues\n'
+_mk_1694_root "$R1694/S" 'githu'
+_mk_1694_root "$R1694/D" 'notifications:\n  email:\n    enabled: false\n'
+
+# Each upload carries DISTINCT bytes: identical bytes at an existing
+# destination are a no-op that pins the old HEAD, so a shared payload would let
+# "the remote did not move" and "which tree committed" pass vacuously.
+_payload() { printf '# payload %s\n' "$1" > "$WORK/p1694-$1.md"; printf '%s' "$WORK/p1694-$1.md"; }
+for _k in E W K S; do
+    echo "=== R-$_k: a no-mapping own nexus.yml, NEXUS_ROOT=P — REFUSED, nothing pushed ==="
+    rm -rf "$R1651/P/assets"; _b=$(_bare_head)
+    NR_ROOT="$R1651/P" run_upload "$R1694/$_k" "$R1694/$_k/monitor/upload-asset.sh" "$(_payload "R$_k")" --issue 1694
+    assert_eq       "#1694 R-$_k: refuses (exit 4)"                 "$rc" "4"
+    assert_eq       "#1694 R-$_k: emits NO url"                     "$stdout" ""
+    assert_eq       "#1694 R-$_k: the asset remote did not move"    "$(_bare_head)" "$_b"
+    assert_eq       "#1694 R-$_k: no asset tree under P"            "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+    assert_contains "#1694 R-$_k: the refusal NAMES the file"       "$stderr" "$R1694/$_k/config/nexus.yml"
+    assert_contains "#1694 R-$_k: …says it has no mapping"          "$stderr" "no top-level mapping"
+    assert_contains "#1694 R-$_k: …and that it is probably torn"    "$stderr" "torn or truncated write"
+done
+
+echo '=== R-D: a MAPPING without github.repo, NEXUS_ROOT=P — still defers to P ==='
+NR_ROOT="$R1651/P" run_upload "$R1694/D" "$R1694/D/monitor/upload-asset.sh" "$(_payload RD)" --issue 1694
+assert_eq       "#1694 R-D: exit 0"                             "$rc" "0"
+assert_contains "#1694 R-D: the URL names P's asset repo"       "$stdout" "https://github.com/p-org/assets/"
+
+# The resolver itself, rc and message, against the same trees. The upload
+# cases above prove the refusal reaches a caller; these pin the rc vocabulary
+# every caller (ng, mint-token, notify) branches on.
+_ncr() {   # <own-root> <NEXUS_ROOT> -> "rc=<n> <stdout>"
+    local _o _r=0
+    _o=$(. "$R1651/P/monitor/_nexus-root.sh"; NEXUS_ROOT="$2" nexus_config_root "$1") || _r=$?
+    printf 'rc=%s %s' "$_r" "$_o"
+}
+echo '=== R-rc: nexus_config_root rc per shape ==='
+for _k in E W K S; do
+    _got=$(_ncr "$R1694/$_k" "$R1651/P")
+    assert_eq "#1694 R-rc: $_k (no mapping) is rc 2" "${_got%% *}" "rc=2"
+done
+assert_contains "#1694 R-rc: E is described as empty/comment-only" "$(_ncr "$R1694/E" "$R1651/P")" "empty, whitespace-only or comment-only"
+assert_contains "#1694 R-rc: S is described as a scalar"           "$(_ncr "$R1694/S" "$R1651/P")" "a top-level scalar, not a mapping"
+assert_eq       "#1694 R-rc: D (mapping, no key) defers: rc 0, P"  "$(_ncr "$R1694/D" "$R1651/P")" "rc=0 $R1651/P"
+assert_eq       "#1694 R-rc: a full config is its own root (control)" "$(_ncr "$R1651/F2" "$R1651/P")" "rc=0 $R1651/F2"
+assert_eq       "#1694 R-rc: malformed YAML is still rc 2"         "$(_ncr "$R1651/M" "$R1651/P" | cut -d' ' -f1)" "rc=2"
+assert_contains "#1694 R-rc: …and still says it cannot be read"    "$(_ncr "$R1651/M" "$R1651/P")" "cannot be read"
+# The NEXUS_ROOT side: a no-mapping env config is no identity, so a CONFLICT
+# (rc 3), and the message says why.
+assert_contains "#1694 R-rc: a no-mapping NEXUS_ROOT config is a conflict" "$(_ncr "$R1651/P" "$R1694/K")" "rc=3 "
+assert_contains "#1694 R-rc: …described as torn"                   "$(_ncr "$R1651/P" "$R1694/K")" "torn or truncated write"
+
+# =========================================================================
+# ==== your-org/nexus-code#1694 item 1: the local clone is KEYED ON THE REPO
+#
+# With NEXUS_CONFIG (or --asset-repo) naming a repo that is not the root's own,
+# the clone used to be the generic `<root>/assets`, re-pointed at that repo by
+# `remote set-url`. Own repo: `<root>/assets`, unchanged. Foreign:
+# `<root>/assets.<owner>__<name>`.
+_FOREIGN_CFG="$WORK/foreign-nexus.yml"
+printf 'github:\n  repo: labx/other-issues\n  asset_repo: labx/other-assets\n  bot_login: test-bot\n' > "$_FOREIGN_CFG"
+_OWN_CFG="$WORK/own-via-config.yml"
+printf 'github:\n  repo: p-org/issues\n  asset_repo: p-org/assets\n  bot_login: test-bot\n' > "$_OWN_CFG"
+run_upload_cfg() {   # <cfg> <args…> — upload from P with NEXUS_CONFIG=<cfg>
+    local _cfgf="$1"; shift
+    local _o _e; _o=$(mktemp); _e=$(mktemp)
+    ( cd "$R1651/P" && env -u NEXUS_ASSET_REPO NEXUS_CONFIG="$_cfgf" \
+        NEXUS_ROOT="$R1651/P" PATH="$STUB_DIR:$PATH" \
+        "$R1651/P/monitor/upload-asset.sh" "$@" ) >"$_o" 2>"$_e"
+    rc=$?
+    stdout=$(<"$_o"); stderr=$(<"$_e"); rm -f "$_o" "$_e"
+}
+
+echo '=== S-own: the root'"'"'s own repo — <root>/assets, exactly as before ==='
+rm -rf "$R1651/P/assets" "$R1651/P"/assets.*
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sown)" --issue 1694
+assert_eq       "#1694 S-own: exit 0"                           "$rc" "0"
+assert_eq       "#1694 S-own: clone at <root>/assets"           "$([[ -d $R1651/P/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq       "#1694 S-own: no keyed clone"                   "$(compgen -G "$R1651/P/assets.*__*" || echo none)" "none"
+
+echo '=== S-cfg-own: NEXUS_CONFIG naming the root'"'"'s OWN asset repo — <root>/assets ==='
+run_upload_cfg "$_OWN_CFG" "$(_payload Scfgown)" --issue 1694
+assert_eq       "#1694 S-cfg-own: exit 0"                       "$rc" "0"
+assert_eq       "#1694 S-cfg-own: still no keyed clone"         "$(compgen -G "$R1651/P/assets.*__*" || echo none)" "none"
+
+echo '=== S-foreign: NEXUS_CONFIG naming ANOTHER asset repo — assets.<owner>__<name> ==='
+_own_head=$("$REAL_GIT" -C "$R1651/P/assets" rev-parse HEAD 2>&1)
+run_upload_cfg "$_FOREIGN_CFG" "$(_payload Sforeign)" --issue 1694
+assert_eq       "#1694 S-foreign: exit 0"                       "$rc" "0"
+assert_contains "#1694 S-foreign: the URL names the foreign repo" "$stdout" "https://github.com/labx/other-assets/"
+assert_eq       "#1694 S-foreign: clone at assets.labx__other-assets" "$([[ -d $R1651/P/assets.labx__other-assets/.git ]] && echo yes || echo no)" "yes"
+# The git stub maps EVERY github.com URL to one local bare, so an origin URL
+# cannot tell the clones apart; WHICH TREE COMMITTED can. At base the foreign
+# upload committed in <root>/assets and moved its HEAD.
+assert_eq       "#1694 S-foreign: the keyed clone made the pushed commit" "$("$REAL_GIT" -C "$R1651/P/assets.labx__other-assets" rev-parse HEAD 2>&1)" "$(_bare_head)"
+assert_eq       "#1694 S-foreign: the generic clone did NOT move" "$("$REAL_GIT" -C "$R1651/P/assets" rev-parse HEAD 2>&1)" "$_own_head"
+assert_eq       "#1694 S-foreign: staging/lock keyed too"       "$([[ -e $R1651/P/assets.labx__other-assets.lock ]] && echo yes || echo no)" "yes"
+
+echo '=== S-flag: --asset-repo in another CASE shares the keyed clone; a non-owner/name is refused ==='
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sflag)" --issue 1694 --asset-repo LabX/Other-Assets
+assert_eq       "#1694 S-flag: exit 0"                          "$rc" "0"
+assert_eq       "#1694 S-flag: exactly one keyed clone (lowercased)" "$(compgen -G "$R1651/P/assets.*__*/.git" | wc -l | tr -d ' ')" "1"
+NR_ROOT="$R1651/P" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$(_payload Sbad)" --issue 1694 --asset-repo 'labx/../x'
+assert_eq       "#1694 S-flag: a non-owner/name repo is refused (exit 7)" "$rc" "7"
+
+# =========================================================================
+# ASSERTION-COUNT GUARD (count=exact). An EXACT comparison, not a floor: this
+# suite's whole value is a set of specific claims, and a claim that silently
+# stops executing is indistinguishable from one that passes. Six cases, in
+# order: 5 + 3 + 5 + 6 + 6 + 3 + 4 + 5, then #1173's I-M: 7 + 4 + 4 + 3 + 3,
+# then #1651's N-P: 7 + 4 + 2, then #1652's Q: 5, then #1694's R: 4x7 + 2
+# + 12 and S: 3 + 2 + 6 + 3.
+EXPECTED_ASSERTIONS=132
+_ran=$(( ${PASS:-0} + ${FAIL:-0} ))
+if (( _ran != EXPECTED_ASSERTIONS )); then
+    printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \
+        "$_ran" "$EXPECTED_ASSERTIONS" >&2
+    _th_fail
+fi
+
+th_summary_and_exit

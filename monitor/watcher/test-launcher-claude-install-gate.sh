@@ -159,8 +159,8 @@ fi
 echo "=== 3. THE REGRESSION: native pin, no npm tree → installer NOT run ==="
 if (( loader_works )); then
     r=$(new_fixture)
-    add_native_claude "$WORK/native$RANDOM/claude"
-    native=$(ls -d "$WORK"/native*/claude | head -1)
+    native="$WORK/native$RANDOM/claude"
+    add_native_claude "$native"
     add_config "$r" "$native"
     run_gate "$GATE" "$r"
     if [[ "$(installs_ran "$r")" == 0 ]]; then
@@ -183,7 +183,12 @@ if (( loader_works )); then
     else
         bad "case 4" "the installer ran over a broken operator pin"
     fi
-    flag=$(ls "$r"/monitor/.state/local-claude-install-failed.* 2>/dev/null | head -1)
+    # A glob loop, not `ls <glob> | head -1`: under nullglob an unmatched
+    # glob makes bare `ls` list the CWD (nullglob-bare-form.manifest).
+    flag=""
+    for _flag in "$r"/monitor/.state/local-claude-install-failed.*; do
+        [[ -f "$_flag" ]] && { flag="$_flag"; break; }
+    done
     if [[ -n "$flag" ]] && grep -q 'nexus.claude_bin' "$flag"; then
         ok "a failure flag naming nexus.claude_bin is left for the orchestrator"
     else

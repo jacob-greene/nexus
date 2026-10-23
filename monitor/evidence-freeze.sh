@@ -290,6 +290,16 @@ usage() {
     exit 2
 }
 
+# Argument-loop progress backstop (the repo-wide loop invariant, see
+# monitor/ng `_argloop_stuck`): an iteration that consumed no argument
+# exits EX_USAGE (64) instead of spinning. Every value arm below already
+# answers `shift 2 || usage` first, so this is a backstop only.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || self_dir="."
 
 # ---- resolve STATE_DIR (mirrors pane-state.sh / retire-preflight.sh) ------
@@ -541,7 +551,7 @@ dir=""
 as_name=""
 mode="freeze"
 
-while (( $# )); do
+_argloop_prev=-1; while (( $# )); do (( $# != _argloop_prev )) || _argloop_stuck "$1"; _argloop_prev=$#
     case "$1" in
         --task)    task="${2:-}"; shift 2 || usage ;;
         --dir)     dir="${2:-}";  shift 2 || usage ;;

@@ -61,7 +61,7 @@ SID="0f9c1a2b-3d4e-5f60-8712-9a3b4c5d6e7f"
 # that has nothing to do with the code under test. Skip loudly instead.
 if ! /usr/bin/python3 -c 'import yaml' 2>/dev/null; then
     echo "skipped: /usr/bin/python3 lacks pyyaml (config/load.sh cannot resolve keys)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
 # ---- fixtures -------------------------------------------------------------
@@ -77,8 +77,14 @@ make_tmux_stub() {
     cat > "$bindir/tmux" <<'STUB'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "list-panes" && "${2:-}" == "-t" ]]; then
-    printf '%s\n' "$3" >> "$TMUX_STUB_LOG"
-    if [[ "$3" == "$TMUX_STUB_WINDOW" ]]; then
+    # The loop asks for the EXACT window, `:=<name>` (your-org/nexus-code#1524):
+    # a bare name resolves by unique PREFIX when the target is absent, and the
+    # baseline would be a sibling's pane pid. The stub models tmux: `:=` is
+    # stripped for the comparison, and a BARE name is answered as NOT FOUND, so
+    # a loop that regresses to the bare spelling stops arming here.
+    case "$3" in :=*) _w="${3#:=}" ;; *) _w="" ;; esac
+    printf '%s\n' "${_w:-BARE:$3}" >> "$TMUX_STUB_LOG"
+    if [[ -n "$_w" && "$_w" == "$TMUX_STUB_WINDOW" ]]; then
         printf '%s\n' "$TMUX_STUB_PID"
         exit 0
     fi
@@ -165,7 +171,15 @@ run_loop() {
         WATCHDOG_DEADLINE_SECONDS=1 \
         "$@" \
         bash "$script" >/dev/null 2>&1
-    [[ -f "$state/restart-watchdog-armed" ]] && ARMED=1 || ARMED=0
+    # "It armed" = it wrote the armed marker at some point. Every run here ends
+    # in fail() at the 1 s deadline (the stub pid never dies), and fail() now
+    # RELEASES the marker its own run wrote — so the marker's presence after
+    # exit no longer answers the question. The baseline file is written only
+    # AFTER the marker (and never by a refused or pre-arm run), so either one
+    # being present is the discriminator. The pre-fix loop, which writes no
+    # baseline file and keeps its marker, still reads correctly.
+    [[ -f "$state/restart-watchdog-armed" || -f "$state/restart-watchdog-baseline" ]] && ARMED=1 || ARMED=0
+    rm -f "$state/restart-watchdog-baseline"
     QUERIED=$(sort -u "$root/tmux.log" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
 }
 

@@ -2,47 +2,170 @@ name: tests
 
 on:
   pull_request:
+    # `types:` includes `edited` for ONE reason: retargeting a PR's base emits
+    # only the `edited` event — never `synchronize` — so with the default
+    # types a PR moved off a feature branch onto `dev` does NOT re-run CI, and
+    # keeps whatever verdict (often none at all) it had on the old base. That
+    # is the compounding half of <your-org>/nexus-code#604: the remedy for the
+    # trigger gap silently failed to trigger. Every job below is gated on
+    # `edited` ⇒ the BASE changed, so title/body edits cost no runner minutes.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches: [main, dev]
     paths:
       - 'monitor/**'
       - 'config/**'
-      - '.github/workflows/tests.yml'
+      # EVERY workflow file, not just this one (<your-org>/nexus-code#736). The
+      # suite now EXECUTES the workflow corpus as a fixture:
+      # test-lint-workflows.sh lints every file in this
+      # directory for the #628 meta-edit-eviction property and mutates the real
+      # files to prove the lint still watches them. Under the old
+      # `.github/workflows/tests.yml` filter that guard was BLIND TO THE FILES
+      # IT GUARDS — a PR editing only cc-harness.yml or docs.yml matched no
+      # `paths:` here, so the property went unchecked on exactly the PRs that
+      # can break it. Same reasoning as the CLAUDE.md line below, and the same
+      # reasoning that left #736 undetected for as long as it was: the rule was
+      # applied to the file someone happened to touch.
+      - '.github/workflows/**'
+      # CLAUDE.md is EXECUTED by this suite, not merely read:
+      # test-claude-md-618-remedies.sh runs every ignore-file-blind search
+      # form CLAUDE.md recommends against a planted fixture, so the doc's
+      # fenced remedy block is a tested surface. Seven suites read the file.
+      # Without this path the guard is BLIND TO THE FILE IT GUARDS — a
+      # CLAUDE.md edit that breaks a documented remedy produces no run at
+      # all, and `gh pr checks` shows only the by-construction-green
+      # ci-signal, which reads identically to "all checks passed" (#604).
+      # Found by ci-trigger-audit.py on the PR that added this line: it
+      # reported "gating workflows for this PR: NONE".
+      - 'CLAUDE.md'
+      # skills/** for the SAME reason as CLAUDE.md above (<your-org>/nexus-code#835).
+      # test-spawn-worker.sh EXECUTES skills/nexus.worker-defaults/SKILL.md as a
+      # fixture — it extracts the `## Worker floor` body and asserts its content,
+      # because that body is injected verbatim into every worker prompt. Without
+      # this path the guard is BLIND TO THE FILE IT GUARDS: a PR that edits ONLY
+      # the floor — the highest-blast-radius edit in the repo, reaching every
+      # future worker — matches no `paths:` here and runs NO tests at all, while
+      # `gh pr checks` shows the by-construction-green ci-signal and reads as
+      # "all checks passed" (#604). Same class as #736; found while adding the
+      # floor's own force-push assertions, which were themselves unreachable.
+      - 'skills/**'
   push:
     branches: [main, dev]
     paths:
       - 'monitor/**'
       - 'config/**'
-      - '.github/workflows/tests.yml'
+      # EVERY workflow file, not just this one (<your-org>/nexus-code#736). The
+      # suite now EXECUTES the workflow corpus as a fixture:
+      # test-lint-workflows.sh lints every file in this
+      # directory for the #628 meta-edit-eviction property and mutates the real
+      # files to prove the lint still watches them. Under the old
+      # `.github/workflows/tests.yml` filter that guard was BLIND TO THE FILES
+      # IT GUARDS — a PR editing only cc-harness.yml or docs.yml matched no
+      # `paths:` here, so the property went unchecked on exactly the PRs that
+      # can break it. Same reasoning as the CLAUDE.md line below, and the same
+      # reasoning that left #736 undetected for as long as it was: the rule was
+      # applied to the file someone happened to touch.
+      - '.github/workflows/**'
+      # CLAUDE.md is EXECUTED by this suite, not merely read:
+      # test-claude-md-618-remedies.sh runs every ignore-file-blind search
+      # form CLAUDE.md recommends against a planted fixture, so the doc's
+      # fenced remedy block is a tested surface. Seven suites read the file.
+      # Without this path the guard is BLIND TO THE FILE IT GUARDS — a
+      # CLAUDE.md edit that breaks a documented remedy produces no run at
+      # all, and `gh pr checks` shows only the by-construction-green
+      # ci-signal, which reads identically to "all checks passed" (#604).
+      # Found by ci-trigger-audit.py on the PR that added this line: it
+      # reported "gating workflows for this PR: NONE".
+      - 'CLAUDE.md'
+      # skills/** for the SAME reason as CLAUDE.md above (<your-org>/nexus-code#835).
+      # test-spawn-worker.sh EXECUTES skills/nexus.worker-defaults/SKILL.md as a
+      # fixture — it extracts the `## Worker floor` body and asserts its content,
+      # because that body is injected verbatim into every worker prompt. Without
+      # this path the guard is BLIND TO THE FILE IT GUARDS: a PR that edits ONLY
+      # the floor — the highest-blast-radius edit in the repo, reaching every
+      # future worker — matches no `paths:` here and runs NO tests at all, while
+      # `gh pr checks` shows the by-construction-green ci-signal and reads as
+      # "all checks passed" (#604). Same class as #736; found while adding the
+      # floor's own force-push assertions, which were themselves unreachable.
+      - 'skills/**'
   workflow_dispatch:
 
-# Cancel queued runs on the same ref when a new push lands; an
-# in-progress run keeps going so its pass/fail signal is preserved.
+# Supersede an older run on the same ref when a newer event of the SAME class
+# lands — `cancel-in-progress: true` cancels the in-progress run, it does not
+# spare it (<your-org>/nexus-code#628: the previous comment claimed the opposite,
+# and nothing checked the claim). The class is in the group key, and it is
+# load-bearing: a run whose jobs SKIP (a pure title/body edit) MUST NOT share a
+# group with a run whose jobs RUN, or the cheap skip-run evicts the expensive
+# real run and the head is left with cancelled+skipped and zero test evidence —
+# the exact #627 hole.
+#
+# The `-meta` predicate must mirror the job-level skip condition EXACTLY, or it
+# re-instantiates the very hole it closes. A base RETARGET is also an `edited`
+# event — but per #604 its jobs RUN (the job `if:` keys on
+# `changes.base.ref.from`), so it is NOT cheap and belongs in `-code`. Keying
+# `-meta` on `action == 'edited'` alone would drop a job-executing retarget into
+# `-meta` next to title-edit skip-runs, and a title edit landing mid-retarget
+# would cancel it → cancelled(retarget)+skipped(title-edit), #627 reborn inside
+# `-meta` (caught by <your-org>/nexus-code#628's skeptic). So `-meta` fires ONLY
+# for a PR `edited` with NO base change — the exact set of runs whose jobs skip.
+# Everything whose jobs run — `synchronize`/`push`/reopen/ready_for_review,
+# dispatch (empty `action`), AND a base-retarget `edited` — lands in `-code` and
+# supersedes there. Job `if:` skips iff (pull_request && edited && !base.ref.from);
+# this key must stay its negation. That closes #627's cancelled+skipped form —
+# both the synchronize and the base-retarget sub-case — AT SOURCE; ci-signal's
+# verdict invariant remains the backstop for the forms this cannot reach (a run
+# absent entirely, or a terminal non-verdict).
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from) && 'meta' || 'code' }}
   cancel-in-progress: true
 
 jobs:
-  watcher-tests:
-    name: monitor/watcher unit suite
+  # ---------------------------------------------------------------------------
+  # Cheap gate: syntax-check every shell file once, before spending minutes on
+  # the matrix. Split out of the suite job so it is not paid N times over.
+  # ---------------------------------------------------------------------------
+  syntax:
+    name: bash -n (all monitor/ shell)
+    # Run unless this is a title/body-only `edited` event. `changes.base` is
+    # present in the payload ONLY when the base branch changed, so the bare
+    # (truthiness) test is true exactly when the retarget happened: a branch
+    # name is a non-empty string, an absent property is null. Written as
+    # truthiness rather than `!= ''` on purpose — GitHub's loose equality
+    # casts ACROSS types to number, and `'dev' != ''` vs `null != ''` would
+    # then depend on rules that are easy to misremember. See the `types:`
+    # note above. If this ever evaluates wrongly it fails LOUD, not silent:
+    # a skipped run is not counted as signal by ci-signal.yml, which then
+    # reports MISSING-RUN.
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
 
-      - name: install runtime deps (jq + tmux + zsh)
-        # ubuntu-latest ships bash + curl + openssl + jq + gh by default;
-        # tmux is needed because several tests install a real tmux shim
-        # on PATH for `command -v tmux` to succeed (see test-lib.sh and
-        # test-full-state-suppression.sh). zsh is needed so the zsh spawn-shell
-        # half of test-spawn-pathfront.sh actually runs (it auto-skips when zsh
-        # is absent, which on a bare runner would silently drop that coverage).
+      - name: assert CI's bash matches monitor/ci-bash-version
+        # <your-org>/nexus-code#610. A local run declares which interpreter it
+        # did NOT test by reading monitor/ci-bash-version. A declaration
+        # nobody checks becomes a lie the first time GitHub bumps its runner
+        # image — silently, and in the direction that makes a local green look
+        # broader than it is. So the pin is asserted against the runner here:
+        # when it drifts, this goes RED and someone updates the pin (and the
+        # local toolchain) deliberately.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq tmux zsh
+          set -euo pipefail
+          pin=$(grep -v '^[[:space:]]*#' monitor/ci-bash-version \
+                | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
+          got="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+          echo "pinned=$pin runner=$got ($(bash --version | head -1))"
+          if [[ "$pin" != "$got" ]]; then
+            echo "::error::monitor/ci-bash-version says '$pin' but this runner is '$got'."
+            echo "Every local run has been declaring a coverage boundary against the wrong"
+            echo "version. Update monitor/ci-bash-version to '$got', add the upstream"
+            echo "sha256 for the matching tarball to monitor/toolchain-bash.sh sha_for(),"
+            echo "and rebuild the local toolchain."
+            exit 1
+          fi
+          echo "OK — the coverage-boundary declaration local runs print is truthful."
 
       - name: syntax check (bash -n) on every shell file under monitor/
-        # Catches accidental syntax breakage cheaply before we spend
-        # minutes running the suite.
         run: |
           set -e
           shopt -s globstar nullglob
@@ -56,81 +179,358 @@ jobs:
           done
           exit $fail
 
+  # ---------------------------------------------------------------------------
+  # Fast unit band, now a MATRIX over the two environment axes that used to be
+  # single-valued (<your-org>/nexus-code#557/#558 and the #555 login-shell RCA):
+  #
+  #   * jobs  — parallelism. #558 (jupyter-service) failed DETERMINISTICALLY at
+  #     `--jobs 4` and passed at `--jobs 2`; a suite that only ever ran at 2
+  #     could not have caught it. The deadline-class fixes are only meaningful
+  #     if CI actually oversubscribes, so 4 is now a first-class cell.
+  #   * login_shell — the SHELL the fixtures' tmux panes inherit. #555's root
+  #     cause was fixtures built from the operator's LOGIN shell (zsh) running
+  #     its whole rc chain before the stub rendered. CI installed zsh but never
+  #     ran the suite with SHELL=zsh, so the fix was regression-guarded only by
+  #     assumption. Setting SHELL drives tmux's default-shell derivation — the
+  #     exact #555 surface — so a fixture that ever forgot to pin its shell
+  #     (th_tmux_fixture_conf) would surface here, under load, as a timeout.
+  #
+  # The cross-product is 4; the `include` list trims it to the 2 cells that
+  # each add signal (bash@4 = deadline / oversubscription class; zsh@4 =
+  # login-shell axis under the same load), keeping runner minutes proportional
+  # to the coverage gained.
+  #
+  # THE `bash@2` CELL WAS DROPPED FOR COST (<your-org>/nexus-code#1300), and the
+  # reason is NOT the one the `env:` note below was read as giving. Read that
+  # note carefully before re-adding the cell: `th_deadline`
+  # (monitor/watcher/_test_helpers.sh) takes `NEXUS_TEST_DEADLINE_SCALE` as an
+  # OUTRIGHT OVERRIDE and only computes `ceil(jobs/nproc)` when it is unset, so
+  # the pin below gave `bash@2` scale 2 exactly as it gave `bash@4` scale 2.
+  # Both cells WERE protected. "Only the jobs:4 cell was ever protected"
+  # describes the configuration the pin was added to FIX, not the one that has
+  # been running.
+  #
+  # WHY THE CELL COULD GO. Lead with what it has ever CAUGHT, not with an
+  # argument about what it could catch (<your-org>/nexus-code#1300).
+  #
+  # HISTORY. Over 200 runs, 154 carried both cells and 114 had BOTH reach a
+  # verdict: ZERO discordant. `bash@2` has never once returned a verdict
+  # `bash@4` did not.
+  #
+  # READ THE BREAKDOWN BEFORE LEANING ON THAT NUMBER — it is weaker than it
+  # sounds, and the weakness is not visible in the count. 113 of those 114 are
+  # (failure, failure). `tests` has been red on `dev` since 2026-08-14 (#1284),
+  # and a run that ALREADY fails in both cells for a shared reason cannot
+  # reveal a cell-specific failure at conclusion granularity: the conclusion is
+  # `failure` either way. So almost the whole denominator is structurally
+  # incapable of showing divergence, and "0 discordant across 114" is closer to
+  # "0 discordant across 1" than the figure suggests.
+  #
+  # The DISCRIMINATING measurement is the failing test SET per cell, and log
+  # retention bounds it hard: of 8 verdict-bearing runs sampled, 5 have expired
+  # logs (HTTP 404) and are UNMEASURED — not concordant, unmeasured. The 3 that
+  # remain are concordant on the STRONG form: identical PASS counts (368/368,
+  # 366/366, 366/366) and identical FAIL sets, i.e. the two cells ran the same
+  # suites to the same verdicts rather than merely landing on the same colour.
+  # That is the real evidence, and it is three runs deep.
+  #
+  # WHAT ACTUALLY MADE THE CELL REDUNDANT, stated at the strength the evidence
+  # supports and no further (F7). The load-bearing half is MEASURED: nothing in
+  # the corpus branches on the parallelism value.
+  # The only readers of `NEXUS_TEST_JOBS` are `th_deadline`'s fallback — dead
+  # while the scale is pinned — and `run-tests.sh`, which WRITES it; and every
+  # parallelism conditional in `run-tests.sh` is `(( jobs > 1 ))`, so 2 and 4
+  # fall on the SAME side of all of them. The cell had no arm of its own.
+  #
+  # A weaker claim, NOT established, recorded so nobody promotes it: that
+  # `jobs: 2` is "strictly more lenient, so `bash@4` catches anything it
+  # could". Less contention is not uniformly more lenient — a race can need
+  # slack to lose — and the only evidence pointing that way is #558, a single
+  # observation in one direction (it failed at `--jobs 4`, passed at
+  # `--jobs 2`). The history above corroborates it but cannot establish a total
+  # order, for the reason given there: concordance driven by a common-cause red
+  # is not evidence that one cell subsumes the other.
+  #
+  # COST, and the basis matters more than the number — a single run is the high
+  # tail, not the typical case. In the one run #1300 measured (33592323890)
+  # `bash@2` was both the most expensive cell and the longest pole, at 33 of
+  # 152 billed job-minutes (22%). Quoting that as the general figure overstates
+  # it.
+  #
+  # Over SETTLED runs the saving is ~17-18% of a run's band. Two independent
+  # samples, and the disagreement between them is the point:
+  #
+  #     8 settled runs   bash@2 mean 25.6 billed min, THIRD most expensive,
+  #                      longest pole 2 of 8  -> ~17.5%
+  #     9 settled runs   bash@2 mean 27.3 billed min, MOST expensive,
+  #                      longest pole 3 of 9  -> 18.4% of a 148.8-min band
+  #
+  # NOT the same window — a LATER, WIDER fetch. The 9-run sample picked up run
+  # 33600198709, created 06:44:19Z, which is 22 minutes PAST the 06:22Z bound
+  # the 8-run sample was taken under. One extra run, and the cell's RANK moves
+  # from third to first.
+  # So do NOT write down a rank: it is not stable across samples. What IS
+  # stable across both is the pair of claims that actually matter — the saving
+  # is ~17-18% of a settled run, and `bash@2` is the longest pole in a MINORITY
+  # of runs (2/8, 3/9). The second is what kills the tempting corollary: the
+  # MEDIAN band shortening from dropping this cell is ZERO, so "a shorter band
+  # means fewer concurrency cancellations" does NOT follow for the typical run,
+  # and should not be offered as a second reason for the change.
+  #
+  # IF YOU RE-ADD A `jobs: 2` CELL, note that monitor/test-lint-workflows.sh
+  # mutant M6 no longer depends on one existing — it plants its own. Removing
+  # this cell made that mutant survive (22 passed / 1 failed against a 23/0
+  # baseline) until M6 was made self-sufficient; see the note there.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: unit suite (${{ matrix.login_shell }}, jobs ${{ matrix.jobs }})
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    # 60, was 40 (<your-org>/nexus-code#1474 item 18, operator decision 2026-09-25):
+    # four of five bands sat within two minutes of 40 and the bash cell was
+    # cancelled in 7 of the last 12 `dev` runs. A STOPGAP — suite growth
+    # re-consumes it in weeks; the durable fixes are the band-cost items there.
+    # The band itself is bounded BELOW this by `ci-diag-budget.sh --run-bound`,
+    # so a band that outgrows it ends as an explicit NO VERDICT, not a cancel.
+    #
+    # 90, was 60 (<your-org>/nexus-code#1703; the #1474 item-18 stopgap, consumed
+    # as predicted). Measured on the bash cell over the last five runs that
+    # executed: 49.4, 59.6, 59.7, 60.0 and 56.0 min. On dev 8e580b1b
+    # (run 36799007596) the run-bound fired with 467 of 496 suites measured,
+    # so EVERY unit cell ended NO VERDICT and dev had no baseline at all. The
+    # need is ~60-65 min; 90 is ~1.4x. The cost is up to 30 runner-min per cell
+    # per run, so up to 120 across the four band jobs. Still a stopgap: the
+    # durable fix is sharding the band, filed separately.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - login_shell: bash
+            jobs: 4
+          - login_shell: zsh
+            jobs: 4
+    env:
+      # `timeout-minutes` above, in seconds. The diagnostics budget is DERIVED
+      # from the job's remaining time against this (<your-org>/nexus-code#1442);
+      # test-ci-diag-budget.sh asserts the two never drift apart.
+      JOB_CEILING_S: "5400"
+      # tmux derives an unpinned pane's shell from $SHELL (<your-org>/nexus-code
+      # #555). Pointing it at the matrix shell exercises the login-shell axis
+      # for every fixture that does NOT pin its own (the ones that DO, via
+      # th_tmux_fixture_conf, must stay immune — that is what this proves).
+      MATRIX_SHELL: ${{ matrix.login_shell }}
+      # th_deadline (monitor/watcher/_test_helpers.sh) scales polled deadlines.
+      # THIS PIN IS AN OUTRIGHT OVERRIDE, NOT A MULTIPLIER, and the distinction
+      # is the whole reason this note is worded the way it is
+      # (<your-org>/nexus-code#1300). The helper reads
+      # `scale="${NEXUS_TEST_DEADLINE_SCALE:-}"` and falls through to
+      # `ceil(NEXUS_TEST_JOBS / nproc)` ONLY when that is unset or non-numeric.
+      # So whenever this line is present, every cell in the matrix runs at
+      # scale 2 regardless of its `jobs` value and regardless of the runner's
+      # core count — which is exactly what it is for.
+      #
+      # The earlier wording here said the `jobs: 2` cell "gets NO scaling at
+      # all … only the `jobs: 4` cell was ever protected". That describes the
+      # configuration WITHOUT this pin — the state the pin was added to fix —
+      # and the sentence that followed it ("Stated explicitly so both cells
+      # are") said so. Read without that second half it becomes an argument
+      # that `bash@2` was unprotected and therefore worthless, which is not
+      # true and is not why it was dropped; #1300 was written from that
+      # reading. The real reason is in the matrix note above. Rewritten here
+      # because a comment that has already been misread once will be misread
+      # again.
+      #
+      # Kept now that only `jobs: 4` cells remain, even though the fallback
+      # would also yield ceil(4/2) = 2 on a 2-vCPU runner: the point is that
+      # the value must NOT silently depend on the runner's core count. A
+      # larger-core runner would make the fallback 1 and quietly retire every
+      # deadline in the band — the inertness #749 found in the SLOW band.
+      #
+      # TD001 NOW JUDGES THE VALUE, NOT THE PRESENCE (<your-org>/nexus-code#1300
+      # R3). It used to exempt a step the moment this variable was MENTIONED in
+      # any scope, which left the one edit that actually degrades CI walking
+      # straight through: `NEXUS_TEST_DEADLINE_SCALE: 1` is a VALID override
+      # th_deadline honours, so every polled deadline reverts to its bare
+      # literal — #749 reached from inside #749's own remedy, by one character,
+      # and strictly worse than deleting the pin. TD001 resolves the value the
+      # way the RUNTIME does, innermost scope first (inline `VAR=val` prefix >
+      # step `env:` > job `env:` > workflow `env:`), and flags <2, non-numeric
+      # and unevaluatable-expression alike. Mutants: monitor/test-lint-workflows.sh
+      # M7 (job env), M8 (inline — the SLOW band's actual form), M9 (a
+      # step-scoped `1` hiding beneath this job-scoped `2`).
+      #
+      # WHAT STILL HAS NO DETECTOR, stated because a disclosed limit is worth
+      # more than an overstated guard: TD001 hard-codes `ubuntu-latest = 2` in
+      # RUNNER_VCPUS, so it cannot see a runner whose core count RISES — which
+      # is the exact scenario this pin insures against. If GitHub ships a
+      # 4-vCPU `ubuntu-latest`, `ceil(4/4) = 1` and an UNPINNED band silently
+      # stops scaling, with nothing in this repo reporting it. Deleting this
+      # line is therefore NOT caught, and is not caught by design rather than
+      # by oversight: no static instrument can read a runner's spec. An earlier
+      # revision of this file claimed a guard for that; it asserted the pin's
+      # PRESENCE, which is a proxy, and it was defeatable by three separate
+      # one-line edits. It has been removed rather than patched a fourth time.
+      #
+      # AND TD001 ITSELF IS HALF SEMANTIC, HALF TEXTUAL — the boundary, so a
+      # green is read for what it is (<your-org>/nexus-code#1300 R4). Workflow-,
+      # job- and step-scoped `env:` are resolved from the parsed YAML, and
+      # scope precedence there is real. The INLINE scope (`VAR=val cmd`) is
+      # matched by regex: it takes the FIRST match in the step body where the
+      # shell takes the line that actually runs. Measured, a decoy
+      # `echo "NEXUS_TEST_DEADLINE_SCALE=2"` placed ABOVE a real
+      # `NEXUS_TEST_DEADLINE_SCALE=1 … run-tests.sh` resolves to the decoy and
+      # the lint returns rc 0 on a genuinely inert band. There are **0 inert
+      # pins across 9 run-tests steps and 6 resolved pins** in this repo today
+      # (at e4635e84), so it is a ratchet against accidental regression, NOT a
+      # proof against a determined edit. Full boundary, and the reason the
+      # cheap last-match fix was deliberately not taken:
+      # `_resolve_deadline_scale` in monitor/lint-workflows.py.
+      NEXUS_TEST_DEADLINE_SCALE: 2
+    steps:
+      # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
+      # `$SECONDS` restarts at zero in every step, so nothing inside a later
+      # step can know how much of `timeout-minutes` the job has already spent
+      # — the diagnostics budget used to be a constant for exactly that
+      # reason, and a band killed at its ceiling left no line saying so. The
+      # epoch goes into $GITHUB_ENV and JOB_CEILING_S sits beside
+      # `timeout-minutes` above; test-ci-diag-budget.sh pins the two equal.
+      - name: record the job start
+        run: echo "JOB_START_S=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh)
+        # ubuntu-latest ships bash + curl + openssl + jq + gh by default;
+        # tmux is needed because several tests install a real tmux shim on
+        # PATH for `command -v tmux` to succeed. zsh is needed both for the
+        # zsh spawn-shell half of test-spawn-pathfront.sh AND, now, as the
+        # login shell for the zsh matrix cell.
+        run: |
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      - name: resolve SHELL for the login-shell axis
+        # Export SHELL for every subsequent step so tmux fixtures inherit it.
+        run: |
+          set -euo pipefail
+          case "$MATRIX_SHELL" in
+            zsh)  sh_path=$(command -v zsh) ;;
+            bash) sh_path=$(command -v bash) ;;
+            *)    echo "::error::unknown login_shell '$MATRIX_SHELL'"; exit 1 ;;
+          esac
+          echo "SHELL=$sh_path" >> "$GITHUB_ENV"
+          echo "using SHELL=$sh_path for the fixture login-shell axis"
+
       - name: run unit suite
-        # The runner auto-skips:
-        #   - slow tests (require SLOW_TESTS=1)
-        #   - integration tests under test-integration/ (require RUN_INTEGRATION=1)
-        # Per docs/contributing/tests.md "CI" section: the v1 gate is the
-        # fast unit suite only. Slow + integration coverage is a follow-up.
+        # The runner auto-skips slow (SLOW_TESTS=1) and integration
+        # (RUN_INTEGRATION=1) tests — those get their own coverage in the
+        # tmux-matrix job here and, systemically, in the scheduled full-suite
+        # job proposed in the coverage-gap issue. This band is the fast unit
+        # suite, now run at the matrix's parallelism and login shell.
+        #
+        # NEXUS_ROOT AND NEXUS_LOCALS ARE SCRUBBED HERE, EXPLICITLY — this is
+        # what the dropped `clean-env` job ("unit suite (NEXUS_ROOT unset)")
+        # guaranteed (<your-org>/nexus-code#1474 item 13). A test that references
+        # $NEXUS_ROOT bare under `set -u` passes in the sandbox (where the
+        # operator exports it) and aborts on a clean runner — `set -u` kills a
+        # fixture heredoc AFTER `>` already truncated the target, so an
+        # emit-body fixture renders EMPTY and silently defeats the
+        # discriminating assertion (sandbox 32/32, CI 31/32). A runner does not
+        # export either variable, so every cell already ran unset; the job
+        # existed to make that EXPLICIT, and a whole band (~4,000 job-min/week,
+        # 18% of the bill, measured on #1474) is a steep price for a spelling.
+        # The `env -u` below keeps the guarantee explicit for BOTH matrix cells
+        # (the step is shared; bash@4 is the cell #1474 named), matches the
+        # documented local repro `env -u NEXUS_ROOT bash test-X.sh`, and holds
+        # even if a future runner image or job `env:` starts exporting either.
+        # Its mirror, the EXPORTED side, is the `inherited-root` job below.
+        #
+        # BOUNDED BELOW THE JOB CEILING (#1474 item 1). A job killed by
+        # `timeout-minutes` is CANCELLED, and no later step can relabel a
+        # cancellation — so the band is stopped HERE, by `timeout`, with a
+        # reserve left for the verdict step to read the log. `timeout` signals
+        # the runner's whole process group; run-tests.sh traps it and ends its
+        # log `END rc=4` (NOT A VERDICT), and the next step says so.
         id: unit_suite
+        env:
+          NEXUS_TEST_JOBS: ${{ matrix.jobs }}
         run: |
           set -uo pipefail
           # Both directories. `monitor/` holds the suites for the NON-watcher
-          # scripts — test-retire-preflight.sh, test-interactive-sessions.sh,
-          # and the #507/#484 regression suites. This step discovered only
-          # monitor/watcher/ and handed the result to run-tests.sh as EXPLICIT
-          # paths, which override the runner's own glob — so those four ran
-          # nowhere, and green here meant "the tests I happened to look for
-          # passed" (<your-org>/nexus-code#484). `-maxdepth 1` applies per root,
-          # so `monitor` contributes only its direct children, not watcher's.
+          # scripts; `-maxdepth 1` applies per root so `monitor` contributes
+          # only its direct children, not watcher's (<your-org>/nexus-code#484 —
+          # discovering only monitor/watcher/ once meant those four ran
+          # nowhere and green meant "the tests I happened to look for passed").
           mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
           if (( ${#tests[@]} == 0 )); then
             echo "::error::no tests selected — refusing to report green on an empty run"
             exit 1
           fi
-          echo "Discovered ${#tests[@]} tests."
+          echo "Discovered ${#tests[@]} tests. SHELL=$SHELL jobs=${{ matrix.jobs }}"
           echo
-          # --keep-logs: persist every test's first-run stdout/stderr
-          # into the failure-artifact tree. The collect step's serial
-          # re-run often PASSES a test that flaked under --jobs
-          # parallelism, so without these logs the original failing
-          # assertion is unrecoverable from CI.
-          bash monitor/watcher/run-tests.sh --jobs 2 \
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound (JOB_CEILING_S=${JOB_CEILING_S:-unset} JOB_START_S=${JOB_START_S:-unset})"
+            exit 1
+          }
+          echo "band bound: ${bound}s (job ceiling ${JOB_CEILING_S}s, less time spent and the post-band reserve)"
+          mkdir -p "${RUNNER_TEMP}/test-failure-artifacts"
+          rc=0
+          env -u NEXUS_ROOT -u NEXUS_LOCALS \
+            timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs ${{ matrix.jobs }} \
               --keep-logs "${RUNNER_TEMP}/test-failure-artifacts/first-run-logs" \
-              "${tests[@]}"
+              "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/test-failure-artifacts/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
+          # LEGIBLE BEFORE IT CAN BE KILLED (<your-org>/nexus-code#1443 remedy 1):
+          # a ceiling kill reports `cancelled` and carries no information, so
+          # the band says where it stood against its own ceiling on every run.
+          bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
+          exit "$rc"
+
+      # THE READER OF THE END MARKER (<your-org>/nexus-code#1474 item 1). A
+      # truncated band used to render as `fail` beside a band whose suites
+      # failed assertions. This step reads the band log through band-verdict.sh
+      # and annotates it `RED` or `NO VERDICT` (or `VERDICT REFUSED`), with a
+      # step-summary line carrying reported/selected counts. The JOB still
+      # concludes `failure` on a no-verdict — a truncated band is not a pass,
+      # and a step cannot conclude `neutral`; the TITLE is what separates it.
+      # `always()` so it runs after a failed or bounded band; skipped only when
+      # the band step never started (then there is no log to read).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.unit_suite.outcome != 'skipped'
+        env:
+          BAND_NAME: unit suite (${{ matrix.login_shell }}, jobs ${{ matrix.jobs }})
+          RUN_RC: ${{ steps.unit_suite.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "$BAND_NAME" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/test-failure-artifacts/band.log"
 
       - name: collect failure artifacts
-        # On failure, re-run each failing test serially with `bash -x`
-        # plus full stderr/stdout capture into a per-test artifact dir.
-        # Also snapshot the env (bash/jq/gh/coreutils versions, locale,
-        # PATH) so post-mortem can attribute ubuntu-latest-only failures.
-        # The runner's own truncated tail goes through xargs and isn't
-        # always orderly — this step is the canonical diagnostic surface.
+        # On failure, re-run each failing test serially with `bash -x` plus
+        # full capture, and snapshot the env for post-mortem attribution.
         if: failure() && steps.unit_suite.outcome == 'failure'
-        # `set +e` is critical: GH Actions wraps every step in
-        # `bash -e`, so the first failing `bash $test_path` would
-        # abort the loop after one iteration. We capture rc manually.
+        # `set +e` is critical: GH Actions wraps every step in `bash -e`, so
+        # the first failing `bash $test_path` would abort the loop after one
+        # iteration. We capture rc manually.
         run: |
           set +e
           set -uo pipefail
           ART_DIR="${RUNNER_TEMP:-/tmp}/test-failure-artifacts"
           mkdir -p "$ART_DIR"
-
-          # Environment snapshot — diff against a local known-good run.
           {
-            echo "=== bash ==="
-            bash --version
-            echo
-            echo "=== jq ==="
-            jq --version
-            echo
-            echo "=== gh ==="
-            gh --version 2>&1 | head -3
-            echo
-            echo "=== tmux ==="
-            tmux -V
-            echo
-            echo "=== coreutils ==="
-            dpkg -l coreutils 2>/dev/null | tail -1
-            echo
-            echo "=== locale ==="
-            locale
-            echo
-            echo "=== uname ==="
-            uname -a
-            echo
-            echo "=== mount-relevant env ==="
-            env | LC_ALL=C sort | grep -Ev '^(GITHUB_TOKEN|SECRET_)' || true
+            echo "=== matrix ==="; echo "login_shell=$MATRIX_SHELL jobs=${{ matrix.jobs }} SHELL=$SHELL"
+            echo; echo "=== bash ==="; bash --version
+            echo; echo "=== jq ==="; jq --version
+            echo; echo "=== tmux ==="; tmux -V
+            echo; echo "=== locale ==="; locale
+            echo; echo "=== uname ==="; uname -a
+            echo; echo "=== nproc ==="; nproc
+            echo; echo "=== env ==="; env | LC_ALL=C sort | grep -Ev '^(GITHUB_TOKEN|SECRET_)' || true
           } > "$ART_DIR/_env.txt" 2>&1 || true
 
           failed_file="${NEXUS_TEST_STATE_DIR:-$HOME/.cache/nexus-test-runner}/last-failures.txt"
@@ -138,48 +538,912 @@ jobs:
             echo "::warning::no failure list at $failed_file — nothing to dump"
             exit 1
           fi
-
           echo "=== re-running failing tests with full output capture ==="
+          # <your-org>/nexus-code#1284 — THIS STEP IS DIAGNOSTIC AND IT USED TO BE
+          # ABLE TO DESTROY THE VERDICT IT EXISTS TO EXPLAIN. It produces no
+          # verdict of its own; `unit_suite` above already produced one. But it
+          # runs INSIDE the same job, so it spends the same `timeout-minutes`,
+          # and it was UNBOUNDED.
+          #
+          # Measured on run 33623597488 (`2b598430`, 2026-09-02), the two legs
+          # of this matrix, same commit, same failing suites:
+          #   bash, jobs 4 : suite 23.3m + diagnostics 16.1m = 39.4m -> failure
+          #   zsh,  jobs 4 : suite 30.1m + diagnostics >10.1m = 40.2m -> KILLED
+          # The `zsh` leg hit the 40-minute ceiling WHILE THIS STEP WAS RUNNING.
+          # A ceiling kill reports `conclusion: cancelled` at BOTH job and run
+          # level — indistinguishable from a concurrency cancel, and carrying no
+          # information at all (#992). So a red that `unit_suite` had ALREADY
+          # ESTABLISHED was converted into a non-verdict. Worse, the artifact
+          # upload below is gated on `!cancelled()`, so that leg also shipped no
+          # per-suite logs: 40.2 billable minutes bought no verdict, no
+          # diagnostics and no artifact. Run 33623597488 has exactly one
+          # artifact where it should have two.
+          #
+          # The cost scales with the size of the breakage — each failing suite
+          # is executed THREE times (once in `run-tests.sh`, then plain, then
+          # under `bash -x`) — so this step is most expensive exactly when the
+          # tree is most broken, which is when the verdict is most worth having.
+          # That is self-reinforcing, and it is why a bigger `timeout-minutes`
+          # is the wrong lever: it would buy a larger budget for diagnostics to
+          # eat, not a verdict.
+          #
+          # The budget below can only ever REDUCE work, never add any, and a
+          # truncation is ANNOUNCED rather than inferred — a partial dump that
+          # says it is partial beats a complete dump nobody receives.
+          #
+          # DERIVED FROM THE JOB'S REMAINING TIME, NOT A CONSTANT
+          # (<your-org>/nexus-code#1442). `DIAG_BUDGET_S=420` was sound while the
+          # suite ran ~1800 s of this job's 2400; suite growth ate that margin
+          # (384-407 s of room on the 40-minute bands, against a permission of
+          # 420 that could overshoot to ~660), so a full-budget dump reproduced
+          # the very ceiling kill #1284 bounded it to prevent. The budget is a
+          # property of the JOB'S clock: recorded by the first step, computed
+          # here against JOB_CEILING_S (= `timeout-minutes` in seconds, pinned
+          # equal by test-ci-diag-budget.sh), with an upload reserve held back
+          # so the artifact is never the thing the ceiling kills. The per-suite
+          # cap is clamped to the budget too — without that a 240 s re-run
+          # started with 100 s left still overruns.
+          _budget=$(bash monitor/watcher/ci-diag-budget.sh "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the diagnostics budget (JOB_CEILING_S=${JOB_CEILING_S:-unset} JOB_START_S=${JOB_START_S:-unset})"
+            exit 1
+          }
+          eval "$_budget"
+          diag_start=$SECONDS
+          truncated=""
+          echo "diagnostic budget: ${DIAG_BUDGET_S}s total, ${DIAG_PER_SUITE_S}s per suite"
           while IFS= read -r test_path; do
             [ -n "$test_path" ] || continue
-            name=$(basename "$test_path")
-            slot="$ART_DIR/$name"
+            name=$(basename "$test_path"); slot="$ART_DIR/$name"
+            # The budget check precedes `mkdir`: an EMPTY slot directory would
+            # read as "diagnosed, found nothing" rather than "never run".
+            if [ $(( SECONDS - diag_start )) -ge "$DIAG_BUDGET_S" ]; then
+              truncated="${truncated} ${name}"
+              continue
+            fi
             mkdir -p "$slot"
-
-            # Plain re-run: stdout + stderr both captured AND echoed.
-            echo
-            echo "::group::$name — plain re-run"
-            bash "$test_path" \
-                >"$slot/stdout.log" \
-                2>"$slot/stderr.log"
+            echo; echo "::group::$name — plain re-run"
+            timeout --signal=TERM --kill-after=10s "${DIAG_PER_SUITE_S}s" \
+              bash "$test_path" >"$slot/stdout.log" 2>"$slot/stderr.log"
             rc=$?
             echo "rc=$rc" > "$slot/rc.txt"
-            echo "--- stdout ---"
-            sed 's/^/  /' "$slot/stdout.log"
-            echo "--- stderr ---"
-            sed 's/^/  /' "$slot/stderr.log"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "  NOTE: hit the ${DIAG_PER_SUITE_S}s per-suite diagnostic cap — this dump is PARTIAL"
+            fi
+            echo "--- stdout ---"; sed 's/^/  /' "$slot/stdout.log"
+            echo "--- stderr ---"; sed 's/^/  /' "$slot/stderr.log"
             echo "::endgroup::"
-
-            # `bash -x` trace re-run — captures every command for the
-            # subset where assertion logs aren't enough.
+            if [ $(( SECONDS - diag_start )) -ge "$DIAG_BUDGET_S" ]; then
+              truncated="${truncated} ${name}(trace)"
+              continue
+            fi
             echo "::group::$name — bash -x trace"
-            bash -x "$test_path" >"$slot/trace-stdout.log" 2>"$slot/trace-stderr.log" || true
-            # Tail the trace so we don't spam the log with thousands of
-            # set-x lines from passing assertions — the failure is at
-            # the tail.
+            timeout --signal=TERM --kill-after=10s "${DIAG_PER_SUITE_S}s" \
+              bash -x "$test_path" >"$slot/trace-stdout.log" 2>"$slot/trace-stderr.log" || true
             echo "--- last 120 lines of trace stderr ---"
             tail -n 120 "$slot/trace-stderr.log" | sed 's/^/  /'
             echo "::endgroup::"
           done < "$failed_file"
-
-          # Re-exit nonzero so the workflow stays red.
+          if [ -n "$truncated" ]; then
+            echo "::warning::diagnostic budget (${DIAG_BUDGET_S}s) exhausted — NOT dumped:${truncated}"
+            {
+              echo
+              echo "=== diagnostics TRUNCATED after ${DIAG_BUDGET_S}s ==="
+              echo "not dumped:${truncated}"
+              echo "first-run logs for every suite are still in this artifact."
+            } >> "$ART_DIR/_env.txt"
+          fi
           exit 1
 
-      - name: upload failure artifacts
-        if: failure() && steps.unit_suite.outcome == 'failure'
+      - name: upload per-suite logs (on GREEN runs too)
+        # <your-org>/nexus-code#693, proposal item 1. This used to be
+        # `if: failure()`, so a green run discarded every suite's stream and
+        # "which assertions executed" became unrecoverable the moment the job
+        # went green. That is the one direction where the question is actually
+        # asked: closing `#675` needed to know whether its case had executed
+        # non-vacuously in the 8 green `dev` runs since the fix, and grepping a
+        # 624 KB run log for all three of its terminal labels returned 0, 0, 0.
+        #
+        # `--keep-logs` already captures the streams on every run; only the
+        # upload was gated. `!cancelled()` rather than `always()`: a cancelled
+        # run has partial logs whose absence would otherwise read as a finding.
+        # Retention stays 7 days — the question is always asked about a recent
+        # run, and the assertion COUNT now lives in the job summary regardless.
+        if: '!cancelled()'
         uses: actions/upload-artifact@v7
         with:
-          name: test-failure-artifacts-${{ github.run_attempt }}
+          name: test-logs-${{ matrix.login_shell }}-j${{ matrix.jobs }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/test-failure-artifacts/
           if-no-files-found: warn
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # INHERITED-ROOT job: the suite with NEXUS_ROOT EXPORTED — the MIRROR of
+  # the `unit` cells' explicit `env -u NEXUS_ROOT -u NEXUS_LOCALS` above (the
+  # scrub the dropped `clean-env` job used to carry, <your-org>/nexus-code#1474
+  # item 13), and the half CI had never run (<your-org>/nexus-code#655).
+  #
+  # The matrix cells run with NEXUS_ROOT unset. That is ONE side of the
+  # variable. Every nexus-spawned agent runs
+  # on the OTHER side: monitor/spawn-worker.sh exports NEXUS_ROOT into every
+  # worker process, so the environment a suite meets in the sandbox is the one
+  # CI never reproduced. A suite that leaks the ambient root is therefore green
+  # in CI and red on every developer's machine — the "dev red locally / green
+  # in CI" half of #655, whose first diagnosis blamed the bash 4.4/5.2 boundary
+  # and was refuted (both verdicts obtained from 4.4.20, interpreter held
+  # constant).
+  #
+  # Three suites have been fixed by hand on this variable, each found only
+  # because a human ran the band twice and diffed:
+  #   * test-spawn-worker.sh, test-spawn-worker-resume.sh — an inherited root
+  #     overrode the suite's own FIXTURE root (#706);
+  #   * test-erofs-escalation.sh — no fixture and no mention of NEXUS_ROOT at
+  #     all: it PATH-shadows `sandbox-notify` with a recording stub, and
+  #     monitor/locals-env.sh fronts `$NEXUS_ROOT/monitor/notifywrap` AHEAD of
+  #     that stub, so the real wrapper services the alarm and the stub's log
+  #     stays empty (#708).
+  # The second leak path is why a static "does it build a fixture nexus?" sweep
+  # cannot enumerate this class — that sweep returns 36 files and does not
+  # include the erofs suite. The class has to be enumerated by MEASUREMENT, and
+  # this job is that measurement, run on every push instead of once by hand.
+  #
+  # WHY THE CHECKOUT IS A SUFFICIENT DECOY ROOT. The leak surfaces are the
+  # PATH-front wrapper dirs locals-env.sh prepends, and all FOUR are TRACKED
+  # files present in a bare checkout: monitor/ghwrap/gh,
+  # monitor/notifywrap/sandbox-notify, monitor/pipwrap/pip{,3} and
+  # monitor/tmuxwrap/tmux. The count read "three" until <your-org>/nexus-code#1188:
+  # locals-env.sh:196-199 prepends four, and tmuxwrap is the wrapper the
+  # BASH_ENV force-front class actually goes through. The stated count is what
+  # stopped anyone recounting. An empty decoy
+  # would make the erofs leak invisible (fronting a nonexistent dir is a no-op);
+  # $GITHUB_WORKSPACE fronts a REAL sandbox-notify, which is exactly the
+  # sandbox's shape. Verified 3x3 before this job was written, on the erofs
+  # suite with its `unset NEXUS_ROOT` scrub reverted:
+  #
+  #     scrub removed, NEXUS_ROOT=<checkout>  ->  FAIL x3  (34-35/36)
+  #     scrub removed, NEXUS_ROOT unset       ->  PASS x3   <- today's CI
+  #     scrub present, NEXUS_ROOT=<checkout>  ->  PASS x3   <- this job, fixed
+  #
+  # The middle row is the point: today's CI cannot fail on this class at all.
+  # ---------------------------------------------------------------------------
+  inherited-root:
+    name: unit suite (NEXUS_ROOT exported — the agent's environment)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    # THE GATE HAS ITS OWN JOB NOW (`inherited-root-gate` below;
+    # <your-org>/nexus-code#1384, #1443, #1332 option 1). This job used to run
+    # the ~400-suite band AND the fixture-band gate, and the gate — a ~17 m
+    # fixed cost — carried no `if:`, so it ran only when the band PASSED and
+    # was funded out of whatever the band left: measured across three trees,
+    # band 30m46s/32m07s/31m13s + gate killed at 14m08s/12m50s/13m36s = job
+    # 45m17s/45m15s/45m16s, three different diffs within two seconds of each
+    # other at a 45-minute ceiling. A PASSING band bought a `cancelled` band
+    # with no verdict while a FAILING band skipped the gate and concluded
+    # cleanly — 0 verdicts in 7 attempts at one point (#1443), and the one
+    # green a 60-minute raise then bought landed at 58m11s, 97% of budget.
+    #
+    # A step that produces no verdict must not be able to destroy one that
+    # did. Splitting is the version of that rule that needs no bounding
+    # arithmetic: a separate job cannot spend this one's budget, and the gate
+    # no longer depends on the band passing to run at all.
+    #
+    # 45 for this job alone: the suite step measured 21.6-34 m across the
+    # five bands of one dev run (this band sits inside that range — the
+    # exported root is NOT slower at the suite; the whole excess was the gate),
+    # plus a report step and a seconds-long self-test. The band prints its
+    # elapsed time against this ceiling at the end of the suite step, so the
+    # next squeeze is visible before it cancels anything (#1388 option 3).
+    #
+    # 90, was 60, was 45 (<your-org>/nexus-code#1703, #1474 item 18) — the same
+    # stopgap as the `unit` cells, raised with them for the same measured
+    # reason, and the band is bounded below it the same way.
+    timeout-minutes: 90
+    env:
+      JOB_CEILING_S: "5400"   # = timeout-minutes, in seconds (#1442)
+    steps:
+      # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
+      # `$SECONDS` restarts at zero in every step, so nothing inside a later
+      # step can know how much of `timeout-minutes` the job has already spent
+      # — the diagnostics budget used to be a constant for exactly that
+      # reason, and a band killed at its ceiling left no line saying so. The
+      # epoch goes into $GITHUB_ENV and JOB_CEILING_S sits beside
+      # `timeout-minutes` above; test-ci-diag-budget.sh pins the two equal.
+      - name: record the job start
+        run: echo "JOB_START_S=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - name: install runtime deps (jq + tmux + zsh)
+        run: |
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+      # The zero baseline the assertion below depends on, established BEFORE
+      # the band rather than asserted after it. The first version of this
+      # checked `[ -e monitor/.state ]` in the post-band step and called its
+      # own finding "exists in a FRESH CHECKOUT" — the precondition and the
+      # measurement were the same test, run once, after the thing that changes
+      # it. Separate steps, or the assertion cannot tell a dirty checkout from
+      # a leak.
+      - name: baseline — no monitor/.state before the band
+        run: |
+          set -uo pipefail
+          if [ -e monitor/.state ]; then
+            echo "::error::monitor/.state exists in a fresh checkout. It is gitignored"
+            echo "::error::(monitor/.gitignore:1) and never committed, so the leak"
+            echo "::error::assertion after the band has no zero to measure against."
+            find monitor/.state | head -50
+            exit 1
+          fi
+          echo "baseline OK — no monitor/.state before the band."
+
+      - name: run unit suite with NEXUS_ROOT exported to the checkout
+        id: band
+        env:
+          # The one variable this job exists for. Set at job scope rather than
+          # inline so every step below — including any future diagnostic step —
+          # sees the same environment the suites do.
+          NEXUS_ROOT: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          (( ${#tests[@]} > 0 )) || { echo "::error::no tests selected"; exit 1; }
+          # Fail LOUD if the decoy is not actually a decoy. A checkout missing
+          # the wrapper dirs would make this job green for the wrong reason —
+          # the same vacuity the job exists to retire, one level up.
+          for d in ghwrap notifywrap pipwrap tmuxwrap; do
+            [ -d "$NEXUS_ROOT/monitor/$d" ] || {
+              echo "::error::NEXUS_ROOT=$NEXUS_ROOT has no monitor/$d — this job would be vacuous"
+              exit 1
+            }
+          done
+          echo "Discovered ${#tests[@]} tests (NEXUS_ROOT=$NEXUS_ROOT exported)."
+          # Bounded below the job ceiling, as in `unit` (#1474 item 1).
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound"; exit 1; }
+          echo "band bound: ${bound}s"
+          rc=0
+          timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
+          # LEGIBLE BEFORE IT CAN BE KILLED (<your-org>/nexus-code#1443 remedy 1).
+          bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
+          exit "$rc"
+
+      # The END-marker reader, as in `unit` (#1474 item 1).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.band.outcome != 'skipped'
+        env:
+          RUN_RC: ${{ steps.band.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "unit suite (NEXUS_ROOT exported)" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/band.log"
+
+      # -------------------------------------------------------------------
+      # SIDE-EFFECT gate (<your-org>/nexus-code#655). The step above is
+      # OUTPUT-based: it reddens when a leak changes a suite's assertions.
+      # The class's dominant form does NOT — measured on
+      # test-worker-nproc-bound.sh with its scrub reverted, the re-root fires,
+      # twelve paths are written into the inherited root, and the suite still
+      # exits 0 with `8 passed, 0 failed`. A PASS/FAIL diff cannot see that,
+      # which is why the fourth member reached `main` and why 616 fixture spawn
+      # rows (23% of every spawn event it holds) are sitting in the operator's
+      # canonical action log.
+      #
+      # $GITHUB_WORKSPACE is both the decoy root AND a git checkout, so the
+      # side effect is one `git status` away.
+      #
+      # TWO GATES, TWO POPULATIONS, and the split is the point (#1336):
+      #
+      #   * the DECOY band (job `inherited-root-gate` below) probes each
+      #     fixture-building suite against a freshly built decoy tree. Its
+      #     population is `fixture_suites()`, a SPELLING predicate — a
+      #     pre-filter for the expensive per-suite decoy, not a census.
+      #   * the ATTRIBUTION gate (the `report` step below) reads what the
+      #     WHOLE band just wrote into THIS checkout — every suite that ran,
+      #     no predicate — and keys on the `src` field `ng`'s usage tap writes
+      #     (#720): a row NAMES its producing suite. That is the population
+      #     question answered by RUNNING rather than by reading, at zero extra
+      #     cost, and it is how `#1336`'s two out-of-population leakers and
+      #     the one CI saw (test-remote-client-helper.sh, run 33861331066)
+      #     become a red rather than a warning nobody acts on.
+      #
+      # Neither alone is a census — see nexus-root-sensitivity.sh's header for
+      # the read-only residual neither can see.
+      # REPORTS, DOES NOT GATE — the rest of the ~250-suite band, which is
+      # outside the population gated above. On its first real run this found
+      # canonical state in the checkout after a fully GREEN band:
+      #
+      #     monitor/.state/ng-usage.jsonl
+      #     monitor/.state/.trash/claude-<stamp>
+      #
+      # That is the class, in CI, invisible to the band's own verdict. The
+      # producing suite is NOT ATTRIBUTED, and the reason is POPULATION, not
+      # environment: `fixture_suites()` requires a
+      # spawn-worker|launcher|bootstrap-recover reference, which excludes the
+      # 30 `ng`-calling suites and test-install-claude-local.sh (whose
+      # install-claude-local.sh:242 is the `.trash/claude-<stamp>` producer,
+      # via launcher.sh). All 31 excluded suites were probed and NONE was
+      # attributed — 17 hermetic, 14 TIMEOUT, 0 leaks. That is a reported
+      # NEGATIVE, not coverage.
+      #
+      # Attribution has to happen IN CI, by bisecting the band inside this job:
+      # a workstation resolves `claude` and node_modules where a runner does
+      # not, so a local probe structurally cannot settle it.
+      #
+      # `--ignored` is not optional in the breadth check: `git status
+      # --porcelain` alone CANNOT SEE monitor/.state (monitor/.gitignore:1),
+      # which is how the first draft of this step managed to be blind to
+      # exactly the surface it was written to guard.
+      # <your-org>/nexus-code#720 — this step used to `find` the leaked tree and
+      # stop there, which names the ARTIFACT but not its PRODUCER. Two passes
+      # then declined to attribute it, correctly: a workstation resolves
+      # `claude` and node_modules where a runner does not, so a local probe
+      # republishes the negative instead of advancing it, and re-probing the
+      # excluded population locally cost CI-shaped evidence nothing.
+      #
+      # But the artifacts SELF-ATTRIBUTE, and nobody had read them. An
+      # `ng-usage.jsonl` row carries `verb`/`sub`/`origin`/`win`/`pid`/`ts`
+      # — the ng verb that ran, and when — and `.trash/claude-<stamp>` is
+      # produced by exactly one call path (install-claude-local.sh:242, via
+      # launcher.sh). So the cheap move is not to bisect the band: it is to
+      # PRINT THE ROWS the next occurrence leaves behind, beside each file's
+      # mtime, which places it in the band's own timeline.
+      #
+      # This is deliberately not a gate. #720's population question stays open
+      # — `nexus-root-sensitivity.sh`'s probe is blind to these files by
+      # construction (it matches rows that RECORD A PATH, and these record a
+      # window and a verb instead; see the AXIS note in probe_one). This step
+      # is the instrument that makes the NEXT occurrence attributable, which is
+      # not the same thing as having attributed it, and must not be reported as
+      # if it were.
+      #
+      # WHAT CHANGED SINCE THAT PARAGRAPH WAS WRITTEN. Printing the rows made
+      # the `d1cc62b` occurrence NARROWABLE and not ATTRIBUTABLE: `win` is
+      # empty on a runner (no tmux), `ts` has one-second resolution, the band
+      # runs at `--jobs 4`, so 23 rows placed the producer among four
+      # concurrent `ng`-verb suites and the verb histogram pointed within them
+      # without settling it. #720's own comment named two remedies and called
+      # the second better; it is now built. `watcher/run-tests.sh` sets
+      # `NEXUS_TEST_SUITE` per child and `_usage_tap` writes it as `src`, so a
+      # leaked row NAMES ITS PRODUCING SUITE with no second run, no bisect and
+      # no runner minutes — and survives any future `--jobs` value, which
+      # serialising the band would not.
+      #
+      # The closing condition is UNCHANGED and is still not met by building an
+      # instrument: it is a CI occurrence classified to a producing suite. Read
+      # `src` in the rows below when one appears. An `OK — no canonical state`
+      # line means the leak did not reproduce on THIS run; that is information,
+      # not attribution, and not evidence the leak is fixed.
+      #
+      # AND IT GATES NOW (<your-org>/nexus-code#1336). The `attribute` verb below
+      # reads the rows this step used to only print: a row whose `src` names a
+      # suite is a LEAK by that suite (rc 1) unless the suite declares the
+      # anchored `allow-inherited-root` marker; rows with no `src`, and files
+      # this tap does not write (tmux-refused.log, .trash/…), are printed as
+      # UNATTRIBUTED and do not flip the rc — the limit is stated in the
+      # output rather than hidden. Measured clean before gating, per #655's
+      # rule: the last green dev run (bbf8fa86, job 100986215544) attributed
+      # exactly ONE suite, test-remote-client-helper.sh, pinned in the same
+      # PR that flipped this gate (#1336), and the local exported-root full run
+      # on the merged tree read the same line.
+      - name: report canonical state written into the inherited root
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -e "$GITHUB_WORKSPACE/monitor/.state" ]; then
+            echo "::warning::a suite wrote canonical state into the inherited root (<your-org>/nexus-code#655)."
+            echo "The band was green while doing this — no PASS/FAIL diff can see it."
+            echo "--- inventory (path, mtime) ---"
+            find "$GITHUB_WORKSPACE/monitor/.state" -printf '%T+  %p\n' 2>/dev/null \
+              | sort | head -50
+            echo "--- contents: these rows name the SUITE, verb and pid that wrote them (#720) ---"
+            find "$GITHUB_WORKSPACE/monitor/.state" -type f -size -256k 2>/dev/null \
+              | head -20 | while IFS= read -r f; do
+                  echo "===== ${f#"$GITHUB_WORKSPACE"/}"
+                  head -c 8192 "$f" 2>/dev/null || echo "(unreadable)"
+                  echo
+                done
+            echo "Cross-check the ts values against the band's suite ordering above."
+            echo "Population-level sweep (separate question): monitor/nexus-root-sensitivity.sh band"
+          else
+            echo "OK — no canonical state was written into the inherited root."
+          fi
+          dirty=$(git status --porcelain --ignored 2>/dev/null || true)
+          if [ -n "$dirty" ]; then
+            echo "::warning::workspace otherwise modified during the band:"
+            printf '%s\n' "$dirty" | head -50
+          fi
+          # THE GATE (#1336): attributed rows name their suite; an unmarked one fails.
+          rc=0
+          bash monitor/nexus-root-sensitivity.sh attribute "$GITHUB_WORKSPACE" || rc=$?
+          case "$rc" in
+            0) echo "attribution gate PASSED — no suite is named by a row in the inherited root." ;;
+            1) echo "::error::a suite wrote into the inherited root and its rows NAME it (<your-org>/nexus-code#1336) — pin its state dir (th_pin_ng_state) or declare the marker with a reason."
+               exit 1 ;;
+            *) echo "::error::attribute exited $rc"; exit "$rc" ;;
+          esac
+
+      # The detector's own non-vacuity proof, run where it is cheap. The nproc
+      # suite takes 0.18s on a runner against >2min on a loaded workstation, so
+      # what is a 5-minute local check is seconds here. It builds a KNOWN
+      # POSITIVE (that suite with its scrub reverted, green while leaking) and
+      # asserts the detector fires on it and stays quiet on the unmodified one.
+      # Without this, a future change could silently blind the gate above and
+      # every subsequent green would be worthless — the exact failure #655
+      # round 12 shipped and had to retract.
+      - name: nexus-root-sensitivity self-test (known positive + known negative)
+        # <your-org>/nexus-code#1332. WITHOUT AN `if:` THIS STEP RUNS ONLY WHEN THE
+        # BAND ABOVE PASSES. GitHub skips every step after a FAILED one, and the
+        # band has been failing since #1284 opened — so this step, the only
+        # non-vacuity proof the #655 detector has, almost never runs.
+        #
+        # CORRECTED, and the original wording was FALSE: it said "HAS NOT RUN
+        # SINCE 2026-08-14", generalised from three sampled runs that happened to
+        # have failing bands. Re-measured over the last 100 COMPLETED `tests`
+        # runs by asking each one's `inherited-root` job for this step's
+        # conclusion: **RAN 1, SKIPPED 89, no such job 3, other 7**. It ran in
+        # run `33702867331` (2026-09-03T01:14:47Z), whose band PASSED, and its
+        # conclusion there was `success`. A property established on a sample and
+        # asserted about a population — the defect this bundle spent the day
+        # refuting, committed in the fix for it.
+        #
+        # `!cancelled()` rather than `always()` for the same reason the
+        # `upload per-suite logs` step gives: a cancelled run's partial state is
+        # not a finding.
+        #
+        # SAFE TO ALWAYS-RUN: on a runner this exits 77 in SECONDS — measured at
+        # 0s in run `33702867331`, the one run in the last 100 where it executed.
+        #
+        # SECOND CORRECTION, found by checking the neighbour of the claim above
+        # once that one turned out false. This block previously said enabling the
+        # sibling `gate` step "would blow `timeout-minutes: 45`". That is wrong on
+        # two counts. The gate carries NO `if:` either, so it is not disabled —
+        # it is skipped by the SAME mechanism, a failing band above it. And when
+        # the band passes it RUNS and FITS. Measured, same run/job:
+        #
+        #     band       01:15:08 -> 01:38:45   23.6 min
+        #     gate       01:38:45 -> 01:55:58   17.2 min   (conclusion: success)
+        #     self-test  01:55:58 -> 01:55:58    0.0 min
+        #     job total  01:14:51 -> 01:56:01   41.2 min   vs timeout-minutes: 45
+        #
+        # So the gate does not need its own job to avoid a timeout; it needs one
+        # only if 3.8 minutes of headroom is judged too thin, which is a real but
+        # DIFFERENT argument from the one that was here. Both false claims came
+        # from the same error: three sampled runs, all with failing bands,
+        # generalised to a population.
+        if: '!cancelled()'
+        # Exit 77 is the repo's SKIP convention (#568 A6) and is EXPECTED here.
+        # This runner cannot stage the case: with no node_modules/ (gitignored)
+        # and no `claude` on PATH, the mutant's spawn fails before it can leak,
+        # so the known positive lands in the RED cell of #655's 2x2 and there
+        # is no signal to miss. Measured — it exited 77 with
+        # `5 passed, 3 failed` on the first run of this step.
+        #
+        # It is kept anyway because it fails LOUD on the two outcomes that
+        # matter: a green known positive the detector missed (blind), and a
+        # VACUOUS probe (decoy incomplete). The environment-independent
+        # non-vacuity proof runs in the unit band via
+        # test-nexus-root-sensitivity.sh, whose synthetic fixtures leak
+        # regardless of what is installed.
+        run: |
+          set -uo pipefail
+          # `|| rc=$?`, not a bare call followed by `rc=$?`. GitHub runs `run:`
+          # blocks under `bash -e {0}`, and `set -uo pipefail` does NOT clear
+          # the inherited `-e` — so a bare call returning 77 aborts the step
+          # before the exit code can be read, and the whole case block below
+          # is unreachable. Measured: the self-test printed INCONCLUSIVE and
+          # the step still died with "Process completed with exit code 77".
+          rc=0
+          bash monitor/nexus-root-sensitivity.sh self-test || rc=$?
+          case "$rc" in
+            0)  echo "self-test PASSED — detector validated against a green known positive." ;;
+            77) echo "::notice::self-test INCONCLUSIVE on this runner (exit 77, expected here)."
+                echo "See the step comment; the synthetic non-vacuity proof runs in the unit band." ;;
+            *)  echo "::error::self-test FAILED (rc=$rc) — the detector is blind or the decoy is incomplete."
+                exit "$rc" ;;
+          esac
+
+
+  # ---------------------------------------------------------------------------
+  # INHERITED-ROOT-GATE: the fixture-band DECOY gate, in its OWN job
+  # (<your-org>/nexus-code#1384, #1443, #1332 option 1; #655 for the gate itself).
+  #
+  # It used to be the last step of `inherited-root`, with no `if:` — so it ran
+  # only when the ~400-suite band PASSED, and then spent whatever that band had
+  # left of the job's ceiling. A ~17-18 m fixed cost funded out of a variable
+  # remainder: three trees, three diffs, job durations within two seconds of
+  # each other at the ceiling (#1384). A separate job cannot spend the band's
+  # budget, and this gate no longer needs the band to pass in order to run.
+  #
+  # HARD GATE over the fixture-building population. Every suite that builds a
+  # fixture nexus is probed against its own decoy root, and a write into that
+  # decoy fails the job. Measured clean over the population before it was
+  # gated (#655: three runs, 45 hermetic / 1 SKIP / 0 leaks) and re-measured
+  # at 124 suites, 123 hermetic / 1 SKIP, on the last green dev run
+  # (bbf8fa86). Its population is `fixture_suites()` — a spelling PRE-FILTER
+  # for the expensive per-suite decoy; the run-derived ATTRIBUTION gate in
+  # `inherited-root` covers the suites that predicate cannot see (#1336).
+  #
+  # 77 is a FAILURE here on purpose: it means the band measured NOTHING,
+  # which is a vacuous gate wearing a green.
+  #
+  # 30 minutes: the gate measured 17m49s (job 100555852533), 17.2m (run
+  # 33702867331) and ~18m on the runs where it completed, so 30 was ~1.7x the
+  # measured cost. It prints its elapsed time against this ceiling at the end,
+  # so growth is seen as a number before it is seen as a `cancelled`.
+  #
+  # SHARDED, <your-org>/nexus-code#1703. That margin is gone: the population grew
+  # from 124 suites (bbf8fa86) to 146 (3d022b09), and the serial band was
+  # cancelled at 30 min on dev and on PR runs alike, having printed NOTHING,
+  # because its per-suite section is buffered until the loop ends. Raising the
+  # ceiling was rejected: the unit band's own timings for these 146 suites sum
+  # to 65-73 min with each capped at the probe timeout, which no single job
+  # fits with honest headroom. So the population is split into 4 disjoint
+  # slices, one per matrix cell (`band --shard K/4`, a byte-sorted round-robin;
+  # test-nrs-population.sh asserts the slices partition the population), and
+  # each probe now prints a `[i/n] <secs> <verdict> <suite>` line as it ends,
+  # so a cell killed at its ceiling still says where its time went.
+  # ---------------------------------------------------------------------------
+  inherited-root-gate:
+    name: fixture-band decoy gate ${{ matrix.shard }}/4 (NEXUS_ROOT exported per suite)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with the `/4` in the gate step below;
+        # test-nrs-population.sh pins the two together.
+        shard: [1, 2, 3, 4]
+    env:
+      JOB_CEILING_S: "1800"   # = timeout-minutes, in seconds (#1442)
+    steps:
+      # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
+      # `$SECONDS` restarts at zero in every step, so nothing inside a later
+      # step can know how much of `timeout-minutes` the job has already spent
+      # — the diagnostics budget used to be a constant for exactly that
+      # reason, and a band killed at its ceiling left no line saying so. The
+      # epoch goes into $GITHUB_ENV and JOB_CEILING_S sits beside
+      # `timeout-minutes` above; test-ci-diag-budget.sh pins the two equal.
+      - name: record the job start
+        run: echo "JOB_START_S=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+      - name: install runtime deps (jq + tmux + zsh)
+        run: |
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+      # Same zero baseline as `inherited-root`: the probe's source-leak arm
+      # (#1431) diffs THIS checkout's monitor/.state, so it must start absent.
+      - name: baseline — no monitor/.state before the gate
+        run: |
+          set -uo pipefail
+          if [ -e monitor/.state ]; then
+            echo "::error::monitor/.state exists in a fresh checkout (gitignored, never committed) — no zero to measure against."
+            find monitor/.state | head -50
+            exit 1
+          fi
+          echo "baseline OK — no monitor/.state before the gate."
+      - name: gate — the fixture-building band must write nothing into its decoy
+        run: |
+          set -uo pipefail
+          rc=0
+          bash monitor/nexus-root-sensitivity.sh band --timeout 300 --shard "${{ matrix.shard }}/4" || rc=$?
+          # LEGIBLE BEFORE IT CAN BE KILLED (#1443 remedy 1; #1388 option 3):
+          # the gate's own duration, beside its ceiling, on every run.
+          bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
+          case "$rc" in
+            0)  echo "gate PASSED — every fixture-building suite is hermetic." ;;
+            3)  echo "::notice::some suites produced no evidence; the measured ones are clean." ;;
+            1)  echo "::error::a fixture-building suite wrote into its decoy root (<your-org>/nexus-code#655)."
+                exit 1 ;;
+            77) echo "::error::the band measured NOTHING — this gate is vacuous, not green."
+                exit 1 ;;
+            *)  echo "::error::band exited $rc"; exit "$rc" ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # BASH-LEGACY: the suite under bash 4.4 — the mirror of <your-org>/nexus-code
+  # #610's blind spot.
+  #
+  # #610 is symmetric and both halves have teeth. Locally nobody can run 5.2,
+  # so a 5.2-only defect is invisible until CI (that half cost #597: a fork
+  # floor of 23 against a real 566, every test dying of EAGAIN). But CI runs
+  # ONLY 5.2, so a regression that breaks 4.4 — the version every host in this
+  # lab, including the one running the live watcher, actually executes — is
+  # invisible to CI entirely. That direction is the more dangerous one.
+  #
+  # This job closes it by building the pinned 4.4.18 with the SAME script
+  # workers use locally (monitor/toolchain-bash.sh), so the script is exercised
+  # by CI rather than trusted, and a rot in it turns this job red instead of
+  # sitting undiscovered until someone needs it.
+  # ---------------------------------------------------------------------------
+  bash-legacy:
+    name: unit suite (bash 4.4, the version this lab runs)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    # 60, was 45 (<your-org>/nexus-code#1474 item 18) — the same stopgap as the
+    # `unit` cells, and the band is bounded below it the same way.
+    # 90, was 60: the same measured reason as the `unit` cells (#1703).
+    timeout-minutes: 90
+    env:
+      JOB_CEILING_S: "5400"   # = timeout-minutes, in seconds (#1442)
+    steps:
+      # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
+      # `$SECONDS` restarts at zero in every step, so nothing inside a later
+      # step can know how much of `timeout-minutes` the job has already spent
+      # — the diagnostics budget used to be a constant for exactly that
+      # reason, and a band killed at its ceiling left no line saying so. The
+      # epoch goes into $GITHUB_ENV and JOB_CEILING_S sits beside
+      # `timeout-minutes` above; test-ci-diag-budget.sh pins the two equal.
+      - name: record the job start
+        run: echo "JOB_START_S=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh + toolchain)
+        run: |
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends jq tmux zsh build-essential
+
+      - name: restore built bash 4.4.18
+        id: bash_cache
+        uses: actions/cache@v4
+        with:
+          path: monitor/.state/toolchain/bash-4.4.18
+          key: bash-4.4.18-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('monitor/toolchain-bash.sh') }}
+
+      - name: build bash 4.4.18 via monitor/toolchain-bash.sh
+        run: |
+          set -euo pipefail
+          # Idempotent: a cache hit makes this a version check and nothing more.
+          # Run unconditionally anyway, so the script's already-built path is
+          # exercised too and a cache hit cannot mask a broken builder.
+          bash monitor/toolchain-bash.sh --version 4.4.18
+          "$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)" --version | head -1
+
+      - name: run unit suite under bash 4.4.18
+        id: band
+        run: |
+          set -uo pipefail
+          legacy=$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          if (( ${#tests[@]} == 0 )); then
+            echo "::error::no tests selected — refusing to report green on an empty run"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} tests; interpreter: $legacy"
+          # Bounded below the job ceiling, as in `unit` (#1474 item 1).
+          bound=$(bash monitor/watcher/ci-diag-budget.sh --run-bound "$JOB_CEILING_S" "$JOB_START_S") || {
+            echo "::error::could not derive the band's run bound"; exit 1; }
+          echo "band bound: ${bound}s"
+          rc=0
+          NEXUS_TEST_SHELL="$legacy" \
+            timeout --signal=TERM --kill-after=60s "${bound}s" \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}" 2>&1 | tee "${RUNNER_TEMP}/band.log" || rc=$?
+          echo "run_rc=$rc" >> "$GITHUB_OUTPUT"
+          bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"   # #1443 remedy 1
+          exit "$rc"
+
+      # The END-marker reader, as in `unit` (#1474 item 1).
+      - name: band verdict (END marker — no verdict is not a test failure)
+        if: always() && steps.band.outcome != 'skipped'
+        env:
+          RUN_RC: ${{ steps.band.outputs.run_rc }}
+        run: |
+          bash monitor/watcher/ci-band-verdict.sh --band "unit suite (bash 4.4)" --run-rc "$RUN_RC" \
+            "${RUNNER_TEMP}/band.log"
+
+  # ---------------------------------------------------------------------------
+  # tmux-version matrix: prove the `paste-buffer -p` capability probe
+  # (<your-org>/nexus-code#556, which replaced a version threshold) discriminates
+  # on REAL tmux, not by assumption.
+  #
+  # #556's probe was "correct by assumption" here: CI only ever ran
+  # ubuntu-latest's ~3.x, so it had never run against a real OLD tmux. The
+  # sandbox FLOOR is tmux 2.6. We build 2.5 and 2.6 from source (cached), plus
+  # modern apt tmux. Build deps are the standard tmux recipe: libevent +
+  # ncurses + a C toolchain.
+  #
+  # The discrimination property is a BICONDITIONAL: the probe must RUN its
+  # assertions iff tmux supports `paste-buffer -p`, and SKIP (degrade honestly,
+  # source-guard still green) iff it does not. Rather than hard-code which
+  # version has `-p` (an earlier revision guessed 2.5 lacked it — it does NOT;
+  # empirically 2.5 and 2.6 both support it), each cell DISCOVERS `-p` support
+  # independently (the same probe tmux itself uses) and asserts the test's
+  # behaviour matches. This is correct on any tmux and cannot be wrong-footed by
+  # a mis-remembered boundary. On the real tmux we can build (>=2.5), `-p` is
+  # present, so these cells exercise the RUN branch on genuinely old tmux — which
+  # is exactly what #556 needed. The SKIP branch is proven DETERMINISTICALLY in
+  # the modern cell via a tmux shim that strips `-p`, so it does not depend on
+  # locating (and cleanly building) an ancient enough tmux.
+  # ---------------------------------------------------------------------------
+  tmux-matrix:
+    name: tmux ${{ matrix.tmux }} probe
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tmux: '2.5'
+            source: build    # real old tmux (has -p → RUN branch)
+          - tmux: '2.6'
+            source: build    # the sandbox FLOOR (has -p → RUN branch)
+          - tmux: modern
+            source: apt      # ubuntu-latest's ~3.x (+ deterministic SKIP proof)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install base deps (jq + build toolchain)
+        run: |
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends \
+            jq build-essential libevent-dev libncurses-dev pkg-config bison
+
+      - name: restore built tmux ${{ matrix.tmux }}
+        if: matrix.source == 'build'
+        id: tmux_cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/tmux-${{ matrix.tmux }}
+          # Rebuild only when the version or the runner image changes.
+          key: tmux-${{ matrix.tmux }}-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: build tmux ${{ matrix.tmux }} from source
+        if: matrix.source == 'build' && steps.tmux_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ver='${{ matrix.tmux }}'
+          work=$(mktemp -d)
+          cd "$work"
+          curl -fsSL "https://github.com/tmux/tmux/releases/download/${ver}/tmux-${ver}.tar.gz" \
+            -o tmux.tar.gz
+          tar xzf tmux.tar.gz
+          cd "tmux-${ver}"
+          # Old tmux (2.5/2.6, 2017) predates modern gcc's stricter default
+          # diagnostics; -Wno-error keeps a warning from a new toolchain from
+          # failing an otherwise-fine build. Harmless if configure sets no
+          # -Werror. If a HARD compile error still surfaces here, this job is
+          # the one to split to the coverage issue per the PR's pragmatism
+          # gate — the probe is already proven on real 2.6.
+          ./configure --prefix="/opt/tmux-${ver}" CFLAGS="-O2 -Wno-error -Wno-implicit-function-declaration"
+          make -j"$(nproc)"
+          sudo make install
+          "/opt/tmux-${ver}/bin/tmux" -V
+
+      - name: install modern tmux from apt
+        if: matrix.source == 'apt'
+        run: |
+          sudo apt-get install -y --no-install-recommends tmux zsh
+          mkdir -p /opt/tmux-modern/bin
+          ln -sf "$(command -v tmux)" /opt/tmux-modern/bin/tmux
+
+      - name: put the selected tmux first on PATH
+        run: |
+          set -euo pipefail
+          case "${{ matrix.source }}" in
+            build) tdir="/opt/tmux-${{ matrix.tmux }}/bin" ;;
+            apt)   tdir="/opt/tmux-modern/bin" ;;
+          esac
+          echo "$tdir" >> "$GITHUB_PATH"
+          # zsh is needed by a couple of tests regardless of the tmux axis.
+          command -v zsh >/dev/null || sudo apt-get install -y --no-install-recommends zsh
+
+      - name: show tmux version
+        run: |
+          echo "tmux on PATH: $(command -v tmux)"
+          tmux -V
+
+      - name: probe RUNS iff tmux supports paste-buffer -p (self-discovering)
+        run: |
+          set -uo pipefail
+          # Independently detect -p support, the SAME way the probe does: a tmux
+          # that lacks the flag rejects it with `unknown option`/`usage:`; one
+          # that has it reaches the buffer lookup (`no buffer`/empty).
+          sock="cap-ci-$$-$RANDOM"
+          tmux -L "$sock" new-session -d -x 80 -y 24 'sleep 30' 2>/dev/null || true
+          cap=$(tmux -L "$sock" paste-buffer -p -b __cap_probe__ 2>&1 || true)
+          tmux -L "$sock" kill-server 2>/dev/null || true
+          if [[ "$cap" == *"unknown option"* || "$cap" == *"usage:"* ]]; then
+            supported=0
+          else
+            supported=1
+          fi
+          echo "tmux $(tmux -V): paste-buffer -p supported=$supported"
+
+          # `|| rc=$?`, NOT `…; rc=$?` (<your-org>/nexus-code#784, instance 4).
+          # GitHub runs `run:` bodies under `bash -e {0}` and `set -uo
+          # pipefail` above does NOT clear `-e`. An assignment whose command
+          # substitution exits non-zero IS a failing command, so the bare
+          # form aborted the step here — and because `out` captures the
+          # probe's stdout AND stderr, it died before `printf '%s\n' "$out"`.
+          # A red therefore carried ZERO diagnostic: not the failing
+          # assertion, not the enumerated `::error::` below. Measured under
+          # bash 5.2 against this exact body by
+          # monitor/test-paste-probe-step-contract.sh.
+          rc=0
+          out=$(bash monitor/watcher/test-paste-bracketed.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          ran=0;     grep -q 'app requested mode ?2004' <<<"$out" && ran=1
+          skipped=0; grep -q 'has no .paste-buffer -p'  <<<"$out" && skipped=1
+
+          # The biconditional: RUN iff supported, SKIP iff not; source guard
+          # (rc 0) holds either way.
+          if (( supported == 1 )); then
+            if (( ran == 1 && skipped == 0 && rc == 0 )); then
+              echo "OK: -p present → probe RAN its 4 real assertions and they passed"
+            else
+              echo "::error::-p is present on $(tmux -V) but the probe did not RUN (ran=$ran skipped=$skipped rc=$rc)"
+              exit 1
+            fi
+          else
+            if (( skipped == 1 && ran == 0 && rc == 0 )); then
+              echo "OK: -p absent → probe correctly SKIPPED, source guard still green"
+            else
+              echo "::error::-p is absent on $(tmux -V) but the probe did not SKIP (ran=$ran skipped=$skipped rc=$rc)"
+              exit 1
+            fi
+          fi
+
+      - name: SKIP branch — deterministic proof via a -p-stripping tmux shim
+        # Does NOT depend on locating an ancient tmux without `-p`. A PATH-front
+        # shim forwards every tmux call to the real binary EXCEPT `paste-buffer
+        # … -p`, which it rejects with a `usage:` line exactly as a tmux lacking
+        # the flag would. The probe's capability detection must then take the
+        # SKIP path, and the version-independent source guard must still pass.
+        # Runs once (modern cell) — the branch is tmux-version-independent.
+        if: matrix.source == 'apt'
+        run: |
+          set -uo pipefail
+          real_tmux=$(type -P tmux)   # -P: the binary path, never an alias/function
+          shimdir=$(mktemp -d)
+          cat > "$shimdir/tmux" <<SHIM
+          #!/usr/bin/env bash
+          # Forward to the real tmux, but pretend `paste-buffer … -p` is unknown.
+          # Scan ALL args (the real call is \`tmux -L <sock> paste-buffer -p …\`,
+          # so paste-buffer is not \$1), gate the strip on paste-buffer being the
+          # subcommand so an unrelated -p (capture-pane -p, display -p) passes.
+          has_pb=0; has_p=0
+          for a in "\$@"; do
+            [[ "\$a" == "paste-buffer" ]] && has_pb=1
+            [[ "\$a" == "-p" ]] && has_p=1
+          done
+          if (( has_pb == 1 && has_p == 1 )); then
+            echo "usage: paste-buffer [-dpr] [-b buffer-name] [-s separator] [-t target-pane]" >&2
+            exit 1
+          fi
+          exec "$real_tmux" "\$@"
+          SHIM
+          chmod +x "$shimdir/tmux"
+          # `|| rc=$?` for the same reason as the sibling step above
+          # (<your-org>/nexus-code#784, instance 5). Same shape, same file, and
+          # neither was in #784's own enumeration — which is the argument for
+          # the EB lint family rather than a sixth hand-fix.
+          rc=0
+          out=$(PATH="$shimdir:$PATH" bash monitor/watcher/test-paste-bracketed.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if grep -q 'has no .paste-buffer -p' <<<"$out" \
+             && ! grep -q 'app requested mode ?2004' <<<"$out" \
+             && (( rc == 0 )); then
+            echo "OK: with -p stripped, the probe SKIPPED and the source guard still passed"
+          else
+            echo "::error::-p-stripped shim did not drive the probe down its SKIP branch (rc=$rc)"
+            exit 1
+          fi

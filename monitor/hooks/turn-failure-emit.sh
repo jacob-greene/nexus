@@ -31,6 +31,7 @@
 #      "recovery": <paste|respawn|operator>,
 #      "last_msg": <first 200 chars of last_assistant_message>,
 #      "session_id": <claude session id>,
+#      "prompt_id": <the failed turn's prompt id, or "">,
 #      "window": <tmux window name>,
 #      "hook_event_name": "StopFailure"}
 #
@@ -40,9 +41,11 @@
 # worker recovered. Consumers (pane-state.sh / _idle_probe.sh) also
 # apply a freshness gate so a missed clear can't wedge a window forever.
 #
-# Required env (exported by spawn-worker.sh):
+# Required env (exported by spawn-worker.sh / the orchestrator launcher):
 #   NEXUS_ROOT           absolute path to the primary nexus clone
-#   NEXUS_WORKER_WINDOW  tmux window name this worker was spawned into
+#   NEXUS_WORKER_WINDOW  tmux window name this worker was spawned into, or
+#   NEXUS_ORCHESTRATOR_WINDOW for the orchestrator (your-org/nexus-code#1520;
+#                        resolved by `stamp_window`, the clear's resolver)
 #   NEXUS_STATE_DIR      direct override (test escape hatch); when set,
 #                        takes precedence over NEXUS_ROOT/monitor/.state.
 #
@@ -53,24 +56,41 @@ set -u
 
 payload=$(cat 2>/dev/null || true)
 
-window="${NEXUS_WORKER_WINDOW:-}"
-[[ -n "$window" ]] || exit 0
-
 # State-dir precedence mirrors worker-heartbeat.sh / ng so tests can
-# pin a hermetic NEXUS_STATE_DIR.
-if [[ -n "${NEXUS_STATE_DIR:-}" ]]; then
-    state_dir="$NEXUS_STATE_DIR"
-elif [[ -n "${NEXUS_ROOT:-}" ]]; then
-    state_dir="$NEXUS_ROOT/monitor/.state"
-else
-    exit 0
-fi
+# pin a hermetic NEXUS_STATE_DIR. Resolved by `_stamp_path.sh`, which the
+# `Stop`-hook CLEAR (`stamp-clear.sh`) also sources — your-org/nexus-code#1143.
+# This stamp carried the SAME split-brain the over-limit one did, one line
+# below it in `worker-settings.json`: this writer honoured the override and its
+# clear hardcoded `$NEXUS_ROOT/monitor/.state`, so under any override the clear
+# addressed a file nobody wrote and silently succeeded.
+_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || exit 0
+[[ -r "$_self_dir/_stamp_path.sh" ]] || exit 0
+# shellcheck source=/dev/null
+. "$_self_dir/_stamp_path.sh" || exit 0
+state_dir=$(stamp_state_dir) || exit 0
+
+# THE WINDOW IS `stamp_window` — worker env, then ORCHESTRATOR env, then the
+# tmux fallback — the SAME resolver the clear uses (your-org/nexus-code#1520).
+# This hook used to read `NEXUS_WORKER_WINDOW` alone, "worker-only by design",
+# which kept the orchestrator's failed turns off the marker. Measured cost:
+# 40 orchestrator `StopFailure` payloads with `error=authentication_failed`
+# across two outages (45 h and 7 h 24 m) reached `over-limit-emit.sh`'s raw
+# capture and nothing else, while `_cause_classify.sh` held the right verdict
+# — `auth: no in-band recovery` — for a window it could not name. The reader
+# that makes an orchestrator marker meaningful is scoped to `$TARGET` in
+# `_orchestrator_liveness.sh` (`_orchestrator_turn_failure_gate`); the worker
+# consumers (`_idle_list_worker_windows`) still exclude the orchestrator by
+# design, so this widening leaks nothing into the idle pool (#1520's blast
+# radius). `orchestrator-settings.json` wires this hook and its `Stop` clear
+# together — both halves or neither.
+window=$(stamp_window) || window=""
+[[ -n "$window" ]] || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 
-# Locate the pure classifier next to this script.
-_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || _self_dir=""
-if [[ -n "$_self_dir" ]] && [[ -r "$_self_dir/_cause_classify.sh" ]]; then
+# Locate the pure classifier next to this script. `_self_dir` is resolved
+# above, where a failure already exited — so it is non-empty here.
+if [[ -r "$_self_dir/_cause_classify.sh" ]]; then
     # shellcheck source=/dev/null
     . "$_self_dir/_cause_classify.sh"
 else
@@ -85,6 +105,11 @@ fi
 error_token=$(jq -r '.error // empty' <<<"$payload" 2>/dev/null) || error_token=""
 last_msg=$(jq -r '.last_assistant_message // empty' <<<"$payload" 2>/dev/null) || last_msg=""
 session_id=$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null) || session_id=""
+# The id of the prompt whose turn failed (your-org/nexus-code#1845): the
+# API-unreachable hold records it with the crashed window, so a resume can be
+# matched to the exact turn it replaces. Present on real payloads since at
+# least 2.1.29x; absent → empty, and nothing keys on it.
+prompt_id=$(jq -r '.prompt_id // empty' <<<"$payload" 2>/dev/null) || prompt_id=""
 
 # Classify. rate_limit → category=rate_limit, recovery=none: that's
 # over-limit-emit.sh's territory, so we write NOTHING and exit (no
@@ -111,6 +136,7 @@ if jq -nc \
     --arg     recovery    "$recovery" \
     --arg     last_msg    "$last_msg_trunc" \
     --arg     session_id  "$session_id" \
+    --arg     prompt_id   "$prompt_id" \
     --arg     window      "$window" \
     '{
         ts:              $ts,
@@ -119,6 +145,7 @@ if jq -nc \
         recovery:        $recovery,
         last_msg:        $last_msg,
         session_id:      $session_id,
+        prompt_id:       $prompt_id,
         window:          $window,
         hook_event_name: "StopFailure"
      }' > "$tmp" 2>/dev/null; then

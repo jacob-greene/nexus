@@ -154,23 +154,111 @@ _sh_svc_bin() {
 #                   that don't declare one (6th column). 'auto-restart'
 #                   (grace → restart → emit) or 'emit-only' (never auto-
 #                   restart; emit and let the orchestrator decide).
-#   cold_build_ceiling — belt-and-suspenders upper bound (seconds) on how
-#                   long a jupyter/labsh service's failing healthcheck is
-#                   excused as an in-progress COLD BUILD (see
-#                   `_sh_labsh_build_in_progress`). Past this the watcher
-#                   stops deferring even if a build still looks in flight —
-#                   a "build" running longer than this is pathological
-#                   (wedged uvx) and must be recoverable. Default 1800
-#                   (30 min): well above the observed ~615 s cold build and
-#                   the supervisor's 900 s START_GRACE, so a genuine cold
-#                   build never trips it. 0 disables the cold-build defer
-#                   entirely (legacy behaviour: restart a labsh service on
-#                   grace like any other).
+#   cold_build_ceiling — seconds of a labsh COLD BUILD's OWN age (never the
+#                   incident's) during which its failing healthcheck is
+#                   excused unconditionally (see `_sh_labsh_build_in_progress`).
+#                   Past it the build stays excused ONLY while it is still
+#                   making progress, until the hard cap
+#                   (LABSH_COLD_BUILD_HARD_CAP, default 7200 s); a build that
+#                   stalls for LABSH_BUILD_STALL_SECONDS (600) past it is
+#                   presumed wedged and restarted. One shared verdict,
+#                   `labsh_build_release` in _labsh_build_evidence.sh, used by
+#                   svc.sh and the supervisor too (your-org/nexus-code#1676).
+#                   It USED to be an absolute bound on the incident clock:
+#                   "a build running longer than this is pathological". On a
+#                   load-100 node a healthy build took >30 min, and every
+#                   rebuild was killed at the bound. Default 1800. 0 disables
+#                   the cold-build defer entirely (legacy behaviour: restart a
+#                   labsh service on grace like any other).
 : "${MONITOR_SERVICE_HEALTH_GRACE_SECONDS:=30}"
 : "${MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS:=300}"
 : "${MONITOR_SERVICE_HEALTH_FLAP_CEILING:=3}"
 : "${MONITOR_SERVICE_HEALTH_DEFAULT_POLICY:=auto-restart}"
 : "${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:=1800}"
+
+# ---- operator alert when the emit route is UNAVAILABLE (your-org/nexus-code#1534)
+#
+# This module's ENTIRE report route is the watcher emit — a paste into the
+# orchestrator's pane. Measured on `dev` 353867a0: 0 hits for any alert
+# helper in this file, against 7 in main.sh. So an `emit-only` or `flapping`
+# escalation that lands while that route is known-unavailable — an auth hold
+# (emits WITHHELD, up to 7200 s), a logged-out orchestrator, an over-limit
+# hold, an absent target — reaches NOBODY: no paste, no bell, no record but
+# an archive file. That is #592's shape (a blackout on the only channel) on a
+# path with no channel-independent leg at all.
+#
+# Two injected seams, defaults inert so the module stays sourceable alone:
+#
+#   _SERVICE_HEALTH_ROUTE_BLOCKED_FN  rc 0 iff the emit route is known-unavailable,
+#                                     printing `<code>\t<reason>` on stdout (a
+#                                     bare reason reads as code `unknown`).
+#                                     main.sh wires the four conditions above.
+#   _SERVICE_HEALTH_OPERATOR_ALERT_FN `<raise|clear> <key> [<severity>] <msg>`,
+#                                     main.sh wires `_operator_alert`
+#                                     (`_operator_alert.sh`: durable record +
+#                                     bell + push + GitHub issue, fail-open).
+#
+# Fires ONLY when both obtain — an escalation the orchestrator can read is the
+# orchestrator's to judge, and ringing the operator's phone for every
+# emit-only service on a healthy board is the flood #976 measured. Keyed per
+# service (`service-health:<name>`); the primitive owns dedup and reminders,
+# so this is called on every tick the pair holds, and CLEARED on recovery or
+# on reclassification to a finding (the service is alive either way).
+_sh_route_blocked_noop() { return 1; }
+_sh_operator_alert_noop() { [[ "${1:-}" == standing ]] && return 1; return 0; }
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN="${_SERVICE_HEALTH_ROUTE_BLOCKED_FN:-_sh_route_blocked_noop}"
+_SERVICE_HEALTH_OPERATOR_ALERT_FN="${_SERVICE_HEALTH_OPERATOR_ALERT_FN:-_sh_operator_alert_noop}"
+
+_sh_operator_alert_key() { printf 'service-health:%s' "$1"; }
+
+# _sh_operator_alert_step <name> <status> <policy> <first_iso> <note>
+#
+# The route function may print `<code>\t<reason>`; the CODE names which arm
+# blocked the route (`over-limit`, `auth-hold`, `auth-expired`, `api-unreachable`,
+# `target-absent`).
+# A bare reason with no tab is code `unknown` (an older or injected function).
+_sh_operator_alert_step() {
+    local name="$1" status="$2" policy="$3" first_iso="$4" note="$5" out code reason
+    case "$status" in emit-only|flapping) ;; *) return 0 ;; esac
+    out=$("$_SERVICE_HEALTH_ROUTE_BLOCKED_FN") || return 0
+    code=unknown; reason=$out
+    if [[ "$out" == *$'\t'* ]]; then code=${out%%$'\t'*}; reason=${out#*$'\t'}; fi
+    # ONE PAGE PER CAUSE (your-org/nexus-code#1653 F2). When the route is
+    # blocked BECAUSE of the login — the auth-hold or the auth-expiry arm — the
+    # operator is already paged for that (the auth hold's own critical key), and
+    # /login is the fix for both. Then this alert rides as `warning`: recorded,
+    # pushed routine, filed as its own issue; no bell, no email. Keyed on the
+    # route's CAUSE, never on "auth is standing" alone: the route function
+    # checks OVER-LIMIT first, so an over-limit block during a login outage is
+    # code `over-limit` and stays critical. Severity is recomputed on EVERY
+    # tick and handed to `due`, so when the cause changes to an independent one
+    # the key ESCALATES and emails once (F1). Error direction: if this lands
+    # before the auth key is stamped it stays critical — two emails, never zero.
+    local severity=critical auth_key="${_AUTH_HOLD_EXPIRY_ALERT_KEY:-auth-expired}" rides=""
+    case "$code" in
+        auth-expired|auth-hold)
+            if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$auth_key"; then
+                severity=warning
+                rides=" (No separate bell or email: the route is blocked by the login, and the standing '${auth_key}' alert already pages for it.)"
+            fi ;;
+        # The same rule for the API-unreachable hold (your-org/nexus-code#1845):
+        # its own key pages for the outage, and the outage is the cause.
+        api-unreachable)
+            if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "${_API_HOLD_ALERT_KEY:-api-unreachable}"; then
+                severity=warning
+                rides=" (No separate bell or email: the route is blocked because the Claude API is unreachable, and the standing '${_API_HOLD_ALERT_KEY:-api-unreachable}' alert already pages for it.)"
+            fi ;;
+    esac
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$(_sh_operator_alert_key "$name")" "$severity" || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$(_sh_operator_alert_key "$name")" "$severity" \
+        "service '${name}' is DOWN (since ${first_iso}, status ${status}, policy ${policy}) and the watcher CANNOT tell the orchestrator: ${reason:-the emit route is unavailable}. ${note}. Nobody in-band can act on this until the orchestrator can take a turn; look at monitor/svc.sh status and \`ng service-incident ${name}\`.${rides}"
+    return 0
+}
+_sh_operator_alert_clear() {   # <name> <why> — a no-op unless the key is standing
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$(_sh_operator_alert_key "$1")" || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" clear "$(_sh_operator_alert_key "$1")" "service '$1' $2"
+    return 0
+}
 [[ "$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS" =~ ^[0-9]+$ ]] \
     || MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
 [[ "$MONITOR_SERVICE_HEALTH_GRACE_SECONDS" =~ ^[0-9]+$ ]] \
@@ -241,9 +329,32 @@ _sh_log() {
 # bootstrap-recover.sh / _version_restart.sh absorb-and-ignore the 6th
 # field so its presence can never corrupt their `logfile` (read's
 # trailing-remainder rule), keeping every registry reader lock-step.
+# Registry readability — the REPLICATED half of the contract documented in
+# bootstrap-recover.sh ("registry READABILITY: three states, not two",
+# your-org/nexus-code#1266). Replicated rather than sourced for the same
+# reason `_sh_service_healthy` is: the watcher must not source
+# bootstrap-recover.sh. The CONTRACT is identical; the BODY differs only in
+# how the path is resolved (`_sh_registry_path`, not a positional arg).
+# Keep in step.
+#   0  readable, or genuinely ABSENT (both are adjudications)
+#  79  exists and could not be read — no statement about contents available
+_sh_registry_readable() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -f "$file" ]] || return 79
+    # `2>/dev/null` FIRST — redirections apply left to right, so the other
+    # order leaks a bare "Permission denied" naming this line.
+    { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
 _sh_parse_registry() {
     local file; file="$(_sh_registry_path)"
-    [[ -f "$file" ]] || return 0
+    if ! _sh_registry_readable "$file"; then
+        _sh_log "registry: NOT READABLE at $file — refusing to report its contents (rc 79)"
+        return 79
+    fi
+    [[ -e "$file" ]] || return 0
     local line name workdir launch health logfile policy
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -258,7 +369,10 @@ _sh_parse_registry() {
         logfile="${logfile//\$NEXUS_ROOT/${NEXUS_ROOT:-}}"
         policy="$(_sh_resolve_policy "$policy")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$workdir" "$launch" "$health" "$logfile" "$policy"
-    done < "$file"
+    # The probe and this redirection are two separate opens; a fault arriving
+    # between them yields a SHORT read, which is worse than a zero because it
+    # is plausible. The redirection's own rc is the only thing that sees it.
+    done < "$file" || return 79
 }
 
 # ---- per-service healthcheck (reuse of _recover_service_healthy:309) -----
@@ -266,9 +380,169 @@ _sh_parse_registry() {
 # IDENTICAL semantics to bootstrap-recover.sh's `_recover_service_healthy`
 # — replicated inline (3 lines, no logic to drift) to avoid sourcing that
 # script into the watcher process. See the module header.
+# Captured DIAGNOSTIC — the failing healthcheck's stderr tail (your-org/nexus-code
+# #637). Populated by _sh_service_healthy, consumed on the unhealthy path so the
+# orchestrator emit can DISTINGUISH failure causes a bare "unhealthy" hides. The
+# motivating case: remote-ssh-health.sh already classifies "OUR daemon is down"
+# vs "the port is held by a FOREIGN listener" (the #609 identity gate) and writes
+# that verdict to stderr — but this module discarded stderr, so the emit could not
+# tell the operator which one it was. Empty on the healthy path (and for any
+# healthcheck that stays silent on failure — most curl/pgrep checks).
+_SH_HEALTH_DETAIL=""
+# ---- FINDING payload, captured on the same single run (your-org/nexus-code
+# #1423). A FINDING is not a failure notice and the two need different
+# payloads, so they are captured into different variables rather than one
+# being made to serve both.
+#
+#   _SH_FINDING_KEY   the SUPPRESSION key, DECLARED by the service on a
+#                     `finding-key:` line. Keying dedupe on the rendered text
+#                     made the text do double duty, and the text carries live
+#                     counters: measured on tmpfs-guard, `14129` -> `14127`
+#                     re-fired the finding two minutes later while the state a
+#                     reader cares about — still over threshold — had changed
+#                     zero times. The framework cannot GUESS which part of a
+#                     message is stable, and a digit-stripping heuristic would
+#                     silently merge findings that differ only in a number
+#                     that matters. So the service declares it, exactly as it
+#                     already declares its own payload by what it writes to
+#                     stderr. ABSENT, the whole text is the key — the previous
+#                     behaviour, so a service that has not adopted the line is
+#                     unaffected.
+#   _SH_FINDING_BAND  an optional MONOTONE severity on a `finding-band:` line.
+#                     It exists for one job: a mute recorded at one band must
+#                     BREAK when the situation crosses into a worse one. A
+#                     service that declares no band gets the conservative rule
+#                     (any key change breaks the mute), which errs toward
+#                     EMITTING — the safe direction for a suppression feature.
+#   _SH_FINDING_BODY  the bounded full stderr. The 300-char verdict line above
+#                     exists so a DOWN emit stays a human section rather than a
+#                     log dump; for a finding the payload IS the product, since
+#                     the orchestrator is being asked to act and acting needs
+#                     the families, the owners and the magnitudes.
+_SH_FINDING_KEY=""
+_SH_FINDING_BAND=""
+_SH_FINDING_BODY=""
+# ---- THE CHECK IS BOUNDED, AND A CHECK THAT DOES NOT FINISH IS *UNKNOWN*
+# (your-org/nexus-code#1601). This run had no time limit. On 2026-09-21
+# `tmpfs-guard.sh --check` walked a /tmp of 15,234 depth-1 entries and did not
+# return for minutes; this function runs every service's check SERIALLY in one
+# tick, so one hung check stopped the WHOLE tick — every other service went
+# unwatched, with nothing in any log saying so.
+#
+# THE DIRECTION IS CHOSEN FROM THE CALLER, not from symmetry. The one caller
+# (`_service_health_check_tick`) reads any non-zero, non-FINDING rc as DOWN,
+# and DOWN is what walks a service through grace into `svc.sh restart`. A
+# timeout reported as a failure would therefore RESTART a service whose only
+# fault was a slow probe — and the incident that opened #1601 had every
+# service healthy. Reported as healthy it would CLEAR a real incident on no
+# evidence. So it is neither: `_SH_HEALTH_TIMED_OUT=1`, a FLAG beside the rc
+# rather than a reserved rc value (a healthcheck may exit any code, 124
+# included), and the tick leaves that service's recorded state exactly as it
+# was — no grace clock started, no restart, no recovery, no finding cleared.
+#
+# TIMED OUT = the status SET (124, or 137 after `-k`) AND the wall clock having
+# reached the bound; a check's own `exit 124` inside the bound stays a failure.
+# Same rule as svc.sh's `_svc_row_health`.
+#
+# MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS — CHOSEN default 60: half the
+# service_health task's default 120 s cadence, and ~40x the tmpfs guard's
+# measured 1.6 s on this host. A check that needs longer than that on a
+# watcher tick reads UNKNOWN, which is the honest answer about it.
+_SH_HEALTH_TIMED_OUT=0
+_SH_HEALTH_BOUND=60
 _sh_service_healthy() {
     local workdir="$1" health="$2"
-    ( cd "$workdir" 2>/dev/null && bash -c "$health" ) >/dev/null 2>&1
+    _SH_HEALTH_DETAIL=""
+    _SH_HEALTH_TIMED_OUT=0
+    _SH_FINDING_KEY=""; _SH_FINDING_BAND=""; _SH_FINDING_BODY=""
+    local bound="${MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS:-60}" t0=$SECONDS
+    [[ "$bound" =~ ^[1-9][0-9]*$ ]] || bound=60
+    _SH_HEALTH_BOUND="$bound"   # read by the tick's UNKNOWN alert text (#1631)
+    # ONE run — no extra probe (the #431/#434 sshd-starvation history forbids
+    # double-probing). Inside $(...), `2>&1 1>/dev/null` routes fd2 to the capture
+    # pipe and then fd1 to /dev/null, so stdout is dropped exactly as before and
+    # only stderr is retained. `local err; err=...; rc=$?` — NOT `local err=$(...)`,
+    # which would mask the command's rc behind `local`'s own exit status.
+    # The health string is fed over a PIPE, never via argv (your-org/nexus-code
+    # #891). `bash -c "$health"` puts the whole string — pattern included — into
+    # a process's argv, and bash only EXECs (shedding it) for a BARE simple
+    # command: a mere `>/dev/null`, let alone `&&` or a subshell, leaves a
+    # `bash -c` alive holding the pattern for the duration of the scan. A
+    # `pgrep -f`/`ps` healthcheck then matches ITSELF and this function returns
+    # 0 forever — a boolean that is always true, so THIS module reads `healthy`,
+    # never restarts, and logs no fault. Measured on bash 4.4.20; the full shape
+    # matrix is in bootstrap-recover.sh's `_recover_service_healthy`, which
+    # carries the identical (deliberately replicated) call site. Keep in step.
+    # `timeout` without --foreground signals its whole process group, so the
+    # check's children (the guard's `find`) go with it rather than outliving
+    # the tick. Its argv is `timeout -k 2 <n> bash /dev/fd/N` — no pattern.
+    #
+    # stderr goes to a TEMP FILE, not a capture pipe (your-org/nexus-code#1631).
+    # `$( … 2>&1 1>/dev/null )` returns only when EVERY holder of the pipe's
+    # write end has exited, and a `setsid`/`&` grandchild of the check is
+    # outside timeout's process group, survives the kill, and holds it: the
+    # bound was not a hard total. Measured on this host with the check
+    # `setsid sleep 15 & sleep 30` and a 1 s bound: the pipe form returned
+    # after 15 s, the file form after 1 s. A file has no reader waiting for
+    # EOF, so the tick returns when `timeout` does. STATED LIMIT: the detached
+    # grandchild itself still runs to completion — it is merely no longer
+    # able to hold the tick. If mktemp fails, fall back to the pipe form (the
+    # pre-#1631 behaviour: correct verdicts, a soft bound) — so a read-only or
+    # full filesystem degrades the bound, never the verdict (the #473 concern
+    # bootstrap-recover.sh records against a temp-file variant). The file goes
+    # in the service-health state dir when it is writable, NOT /tmp: #1601's
+    # own incident was a /tmp swollen past 15,000 entries.
+    local err rc errf errd="${SERVICE_HEALTH_STATE_DIR:-}"
+    [[ -n "$errd" && -d "$errd" && -w "$errd" ]] || errd="${TMPDIR:-/tmp}"
+    if errf=$(mktemp "$errd/.health-err.XXXXXX" 2>/dev/null) && [[ -n "$errf" ]]; then
+        ( cd "$workdir" 2>/dev/null && timeout -k 2 "$bound" bash <(printf '%s' "$health") ) 2>"$errf" 1>/dev/null
+        rc=$?
+        err=$(cat "$errf" 2>/dev/null)
+        rm -f "$errf" 2>/dev/null
+    else
+        err=$( ( cd "$workdir" 2>/dev/null && timeout -k 2 "$bound" bash <(printf '%s' "$health") ) 2>&1 1>/dev/null )
+        rc=$?
+    fi
+    if (( rc == 124 || rc == 137 )) && (( SECONDS - t0 >= bound )); then
+        _SH_HEALTH_TIMED_OUT=1
+        _SH_HEALTH_DETAIL="healthcheck did not finish within ${bound}s — health UNKNOWN, neither healthy nor down (your-org/nexus-code#1601)"
+        return "$rc"
+    fi
+    if (( rc != 0 )) && [[ -n "$err" ]]; then
+        # Select the VERDICT line by CONTENT, not by POSITION. The failing
+        # healthcheck's verdict is not reliably first or last: remote-ssh-health.sh
+        # writes its `UNHEALTHY — …` verdict on the FIRST of three lines, then
+        # indented detail (the socket attribution) on the last — so a `tail -n1`
+        # captures the attribution and DROPS the foreign-vs-down verdict that is
+        # the entire point of this field (your-org/nexus-code#637 skeptic finding).
+        # Keying on position is the fragility, so do not just take the first line
+        # either: prefer the first non-blank line carrying a failure-VERDICT
+        # keyword, and fall back to the first non-blank line only when none match
+        # (a curl/pgrep check whose single line has no such keyword). Bounded to one
+        # line — the emit is a human section, not a log dump.
+        local nb verdict
+        nb=$(printf '%s\n' "$err" | grep -vE '^[[:space:]]*$')
+        # `finding` joins the keyword set because a FINDING's verdict line
+        # correctly does NOT say "unhealthy" — the service is not unhealthy.
+        # Without it the selector fell through to "first non-blank line",
+        # which for a multi-line finding is a coin flip.
+        verdict=$(printf '%s\n' "$nb" | grep -iE 'unhealthy|finding|foreign|no listener|not sshd|refused|timed out|timeout|unreachable|no route|fatal' | head -n1)
+        [[ -n "$verdict" ]] || verdict=$(printf '%s\n' "$nb" | head -n1)
+        _SH_HEALTH_DETAIL=$(printf '%s' "$verdict" | cut -c1-300)
+        _SH_FINDING_KEY=$(printf '%s\n' "$nb" \
+            | sed -n 's/^[[:space:]]*finding-key:[[:space:]]*//p' | head -n1)
+        _SH_FINDING_BAND=$(printf '%s\n' "$nb" \
+            | sed -n 's/^[[:space:]]*finding-band:[[:space:]]*//p' | head -n1)
+        [[ "$_SH_FINDING_BAND" =~ ^[0-9]+$ ]] || _SH_FINDING_BAND=""
+        # The protocol lines are machinery, not prose: they are stripped from
+        # the rendered body so the emit reads as a report rather than as a
+        # wire format.
+        _SH_FINDING_BODY=$(printf '%s\n' "$err" \
+            | grep -vE '^[[:space:]]*finding-(key|band):' \
+            | head -n "${MONITOR_SERVICE_HEALTH_FINDING_BODY_LINES:-60}" \
+            | cut -c1-400)
+    fi
+    return $rc
 }
 
 # ---- supervisor record (reuse of _recover_supervisor_state) --------------
@@ -281,14 +555,55 @@ _sh_service_healthy() {
 # derived from SERVICE_HEALTH_STATE_DIR so fixtures relocate both together.
 _sh_services_dir() { printf '%s/services' "${SERVICE_HEALTH_STATE_DIR%/service-health}"; }
 _sh_pidfile()      { printf '%s/%s.pid' "$(_sh_services_dir)" "$1"; }
+# Operator stop intent (your-org/nexus-code#1827): written by `svc.sh stop
+# <name>`, removed by an explicit `svc.sh start|restart <name>`. IDENTICAL path
+# to bootstrap-recover.sh's `_recover_stop_sentinel`; keep them in step. While
+# it stands, a DOWN service is "stopped by request", never an outage: no
+# incident, no grace, no restart, no emit.
+_sh_stop_sentinel() { printf '%s/%s.stop-requested' "$(_sh_services_dir)" "$1"; }
+# Sidecar so the stop is logged + recorded ONCE per stop, not once per tick.
+# A sidecar, not a `status` value: `status` SELECTS (#1050).
+_sh_stop_noted_file() { printf '%s/%s.stop-noted' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+
+#
+# IDENTITY (your-org/nexus-code#606): mirrors the `ns=`/`start=` verification
+# added to _recover_supervisor_probe. Kept in lockstep deliberately — if the
+# watcher and svc.sh disagree about whether a record is stale, the watcher
+# emits an inconsistency that svc.sh then declines to see (or the reverse).
+# A record with neither key (written before that change) degrades to the
+# previous pid+cmdline behaviour.
+_sh_starttime() {
+    local pid="$1" sr
+    sr=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    sr=${sr#*") "}
+    # shellcheck disable=SC2086  # deliberate word-splitting of stat fields
+    set -- $sr
+    printf '%s' "${20:-}"
+}
 
 _sh_supervisor_state() {
     local name="$1" launch="$2"
     local pf; pf="$(_sh_pidfile "$name")"
     [[ -f "$pf" ]] || { printf 'absent'; return 0; }
-    local pid; read -r pid < "$pf" 2>/dev/null
+    local pid='' rec_ns='' rec_start='' line n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n+1))
+        if (( n == 1 )); then pid="$line"; continue; fi
+        case "$line" in
+            ns=*)    rec_ns="${line#ns=}" ;;
+            start=*) rec_start="${line#start=}" ;;
+        esac
+    done < "$pf"
     [[ "$pid" =~ ^[0-9]+$ ]] || { printf 'stale:%s' "${pid:-?}"; return 0; }
+    local cur_ns; cur_ns=$(readlink "/proc/$$/ns/pid" 2>/dev/null || true)
+    if [[ -n "$rec_ns" && "$rec_ns" != unknown && -n "$cur_ns" && "$rec_ns" != "$cur_ns" ]]; then
+        printf 'stale:%s' "$pid"; return 0
+    fi
     kill -0 "$pid" 2>/dev/null || { printf 'stale:%s' "$pid"; return 0; }
+    if [[ -n "$rec_start" && "$rec_start" != unknown ]]; then
+        local cur_start; cur_start=$(_sh_starttime "$pid")
+        [[ -z "$cur_start" || "$cur_start" == "$rec_start" ]] || { printf 'stale:%s' "$pid"; return 0; }
+    fi
     local cmdline_file="/proc/$pid/cmdline"
     if [[ -r "$cmdline_file" ]]; then
         local cmdline tok
@@ -407,6 +722,15 @@ _sh_labsh_build_in_progress() {
 # service still below the surfacing threshold is not yet an incident.
 _sh_inconsistent_file() { printf '%s/%s.inconsistent' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
 
+# Consecutive-UNKNOWN counter (your-org/nexus-code#1631). A SIDECAR for the
+# same reason as the one above, and a second one: `status` in the .state file
+# SELECTS (the emit loop, the incident arms), so an UNKNOWN must never become a
+# status value, and a hung check on a healthy service must still leave no
+# .state behind. `count=<n>` consecutive timed-out ticks, `since=<epoch>` /
+# `since_iso=` of the first. Removed on every tick whose check FINISHES.
+_sh_unknown_file() { printf '%s/%s.unknown' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_unknown_alert_key() { printf 'service-health-unknown:%s' "$1"; }
+
 # Evidence marker written by `svc.sh restart <name>` (see _record_restart_marker
 # there): `actor=<watcher|operator>` + the epoch it happened. This is what lets
 # a recovery be ATTRIBUTED rather than inferred. Without it the tick can only
@@ -453,17 +777,166 @@ _sh_write_state() {
     return 0
 }
 
+# ---- FINDINGS: a healthcheck that is ALIVE and reports a CONDITION ------
+# (your-org/nexus-code#1423). A healthcheck has two things to say and the
+# exit-code vocabulary had a word for only one of them. `exit 0` is "I am
+# healthy"; any other code is "I am DOWN" — grace, restart, escalation, and
+# an emit offering `svc.sh restart`. A MONITOR registered as a service
+# (tmpfs-guard `--check`) reports a fact about its ENVIRONMENT: /tmp is over
+# threshold. That is the monitor working correctly, and rendering it as
+# `service DOWN … restart now: svc.sh restart tmpfs-guard` sent readers to a
+# remedy that accomplishes nothing (it fired 2026-09-06 01:12 exactly so).
+#
+# The third word: `exit 100` == "I am alive; the condition I watch is
+# PRESENT; my stderr says which". Chosen above every code a real healthcheck
+# emits (curl stops at 99, pgrep at 3, this repo's own third outcomes are 77,
+# 69, 79) and below bash's 126+. A finding is carried as its OWN sidecar
+# (`<name>.finding`), never as a value of `status` — `status` SELECTS in this
+# module (grace/restart/escalate arms, re-nag keys, `ng service-incident`),
+# so a new token there would be a behavioural change every reader had to be
+# taught (#1050); a new file is read only by the code below. For the
+# incident machine a finding IS healthy: no incident, no grace, no restart.
+SH_RC_FINDING=100
+_sh_finding_file()         { printf '%s/%s.finding'         "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_cleared_file() { printf '%s/%s.finding-cleared' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_body_file()    { printf '%s/%s.finding-body'    "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_mute_file()    { printf '%s/%s.finding-mute'    "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_hash() { printf '%s' "${1:-}" | cksum | awk '{print $1}'; }
+
+# ---- MUTES (your-org/nexus-code#1423, operator) ---------------------------
+# An operator may silence a finding they have judged and accepted — "that
+# memory is another user's", "we know, it is tracked". Four constraints, each
+# taken from something that bit this repo THIS WEEK, and the mechanism is
+# built out of them rather than around them:
+#
+#   1. IT MUST EXPIRE. An open-ended mute is an unowned exemption, which is
+#      your-org/nexus-code#1486 — where one row records, in its own note, that
+#      no rationale is on file. So a mute carries the SAME ownership rule
+#      #1482 already applies to a `none` positive-control row: a tracker ref
+#      (`#NNNN` / `owner/repo#NNNN`) or an `until:YYYY-MM-DD` date.
+#   2. IT MUST CARRY A REASON AND AN OWNER, for the same reason.
+#   3. IT MUST BREAK WHEN THE CONDITION MATERIALLY WORSENS. A mute keyed on
+#      "over threshold" would sit silently through 10% -> 77%, which would
+#      make the mute the mechanism by which the incident this tool exists to
+#      catch goes unreported — the defect class this whole change is about,
+#      built deliberately. So it is keyed on the BAND: crossing into a worse
+#      one re-fires regardless of the mute, and the emit says the mute broke.
+#   4. `muted` AND `cleared` MUST BE DISTINGUISHABLE IN THE RECORD. This
+#      module has already produced `recovered, CAUSE UNKNOWN` firing beside
+#      `condition PRESENT` for one service in one second; that is what
+#      conflating two facts looks like. They are different files, different
+#      events and different words.
+#
+# AN INVALID OR EXPIRED MUTE IS IGNORED LOUDLY, NEVER OBEYED QUIETLY. A
+# suppression feature that fails OPEN (mute anyway) hides the thing it was
+# asked to hide for a reason nobody stated; failing CLOSED (emit, and say the
+# mute was refused) costs one message. File format, all `key=value`:
+#
+#     service=<name>
+#     owner=<who accepted it>
+#     reason=<why>
+#     until=YYYY-MM-DD          # this or tracker= (or both)
+#     tracker=#1423
+#     band=<the numeric band it was accepted at>
+#
+# _sh_mute_state <name> <current-band> -> `active|none|invalid:<why>|expired:<date>|broken:<from>-><to>`
+_sh_mute_state() {
+    local name="$1" band="${2:-}" mf owner reason until_d tracker mband today
+    mf="$(_sh_finding_mute_file "$name")"
+    [[ -f "$mf" ]] || { printf 'none'; return 0; }
+    owner=$(_sh_field "$mf" owner 2>/dev/null || echo '')
+    reason=$(_sh_field "$mf" reason 2>/dev/null || echo '')
+    until_d=$(_sh_field "$mf" until 2>/dev/null || echo '')
+    tracker=$(_sh_field "$mf" tracker 2>/dev/null || echo '')
+    mband=$(_sh_field "$mf" band 2>/dev/null || echo '')
+    [[ -n "$owner" ]]  || { printf 'invalid:no owner= field'; return 0; }
+    [[ -n "$reason" ]] || { printf 'invalid:no reason= field'; return 0; }
+    # The #1482 ownership rule, same predicate, same words.
+    if [[ ! "$until_d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ! "$tracker" == *\#[0-9]* ]]; then
+        printf 'invalid:needs an until:YYYY-MM-DD date or a tracker ref (#NNNN) — an exemption must be re-justified, not inherited'
+        return 0
+    fi
+    if [[ "$until_d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        today=$(date +%F 2>/dev/null || echo '')
+        # String compare is correct and total for zero-padded ISO dates.
+        if [[ -n "$today" && "$until_d" < "$today" ]]; then printf 'expired:%s' "$until_d"; return 0; fi
+    fi
+    # Constraint 3. A service that declares no band gets the CONSERVATIVE
+    # rule and that asymmetry is deliberate: with no severity to compare,
+    # "has anything changed at all" is the only honest question, and the
+    # answer errs toward EMITTING.
+    if [[ "$band" =~ ^[0-9]+$ && "$mband" =~ ^[0-9]+$ ]] && (( band > mband )); then
+        printf 'broken:%s->%s' "$mband" "$band"; return 0
+    fi
+    printf 'active'
+}
+
+# _sh_note_finding <name> <detail> <health-cmd> <key> <band> <body> [<superseded-status> <superseded-since>]
+# Records/refreshes the sidecar; a NEW or CHANGED KEY is an event, a repeat
+# only bumps the count.
+_sh_note_finding() {
+    local name="$1" detail="${2:-}" health="${3:-}" key="${4:-}" band="${5:-}" body="${6:-}" \
+          sup_status="${7:-}" sup_since="${8:-}"
+    local ff bf hash prev_hash first_iso count prev_sup prev_sup_since
+    [[ -n "$detail" ]] || detail="(the healthcheck exited ${SH_RC_FINDING} — a FINDING — but wrote nothing on stderr; the condition is unnamed)"
+    # THE DEDUPE KEY IS NOT THE MESSAGE. Falling back to the message is the
+    # pre-adoption behaviour, kept so an un-migrated service is unaffected.
+    [[ -n "$key" ]] || key="$detail"
+    ff="$(_sh_finding_file "$name")"; bf="$(_sh_finding_body_file "$name")"
+    hash="$(_sh_finding_hash "$key")"
+    prev_hash=$(_sh_field "$ff" finding_hash 2>/dev/null || echo '')
+    first_iso=$(_sh_field "$ff" first_iso 2>/dev/null || echo '')
+    count=$(_sh_field "$ff" count 2>/dev/null || echo 0); [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    # A supersession is a fact about how this finding BEGAN and stays true for
+    # its whole episode, so it is carried forward rather than blanked on the
+    # next tick (when the caller has nothing to pass).
+    prev_sup=$(_sh_field "$ff" superseded_status 2>/dev/null || echo '')
+    prev_sup_since=$(_sh_field "$ff" superseded_since 2>/dev/null || echo '')
+    [[ -n "$sup_status" ]] || { sup_status="$prev_sup"; sup_since="$prev_sup_since"; }
+    if [[ "$hash" != "$prev_hash" ]]; then
+        first_iso="$(_sh_iso)"; count=0
+        _sh_record_event "$name" finding "healthcheck exit ${SH_RC_FINDING} (alive, condition present): ${detail}"
+        _sh_log "service '$name' UP, reports a FINDING (not an outage): ${detail}"
+        rm -f "$(_sh_finding_cleared_file "$name")" 2>/dev/null || true
+    fi
+    count=$(( count + 1 ))
+    mkdir -p "$SERVICE_HEALTH_STATE_DIR" 2>/dev/null || true
+    if [[ -n "$body" ]]; then
+        printf '%s\n' "$body" > "$bf.tmp.$$" 2>/dev/null && mv "$bf.tmp.$$" "$bf" 2>/dev/null || rm -f "$bf.tmp.$$" 2>/dev/null
+    else
+        rm -f "$bf" 2>/dev/null || true
+    fi
+    { printf 'service=%s\nfinding=%s\nfinding_key=%s\nfinding_hash=%s\nfinding_band=%s\nfirst_iso=%s\nlast_iso=%s\ncount=%s\nhealth_cmd=%s\nsuperseded_status=%s\nsuperseded_since=%s\n' \
+        "$name" "$detail" "$key" "$hash" "$band" "$first_iso" "$(_sh_iso)" "$count" "$health" "$sup_status" "$sup_since"; } \
+        > "$ff.tmp.$$" 2>/dev/null && mv "$ff.tmp.$$" "$ff" 2>/dev/null || rm -f "$ff.tmp.$$" 2>/dev/null
+}
+# _sh_clear_finding <name> — the check went green: one breadcrumb, then gone.
+# CLEARED is not MUTED and the record must never conflate them: this path is
+# reached only by an actually-green healthcheck, and it says so.
+_sh_clear_finding() {
+    local name="$1" ff detail first_iso
+    ff="$(_sh_finding_file "$name")"
+    [[ -f "$ff" ]] || return 0
+    detail=$(_sh_field "$ff" finding 2>/dev/null || echo '')
+    first_iso=$(_sh_field "$ff" first_iso 2>/dev/null || echo '?')
+    _sh_record_event "$name" finding-cleared "healthcheck green again; was: ${detail} (since ${first_iso})"
+    _sh_log "service '$name' finding CLEARED: ${detail}"
+    printf 'service=%s\nfinding=%s\nfirst_iso=%s\ncleared_iso=%s\n' "$name" "$detail" "$first_iso" "$(_sh_iso)" \
+        > "$(_sh_finding_cleared_file "$name")" 2>/dev/null || true
+    rm -f "$ff" "$(_sh_finding_body_file "$name")" 2>/dev/null || true
+}
+
 # ---- restart action (reuse of svc.sh restart → recover_service) ---------
 # Delegate to `svc.sh restart <name>` (separate process: no log/global
 # clobber). It stops a live-but-wedged supervisor's process group, then
 # relaunches via recover_service. Returns svc.sh's rc. Test override:
 # SERVICE_HEALTH_SVC_BIN can point at a capture stub.
 # _sh_restart_service <name> [force]
-# <force>=1 means WE have already ruled a labsh cold build pathological on our
-# own clock (it is past our cold_build_ceiling), so svc.sh's cold-build guard
-# must not re-derive that verdict from the build's process age — a different
-# origin, which always reads younger than our `elapsed` and would veto this
-# restart. See the clock-origin note in the state machine.
+# <force>=1 means the shared verdict (`labsh_build_release`) has already
+# RELEASED the live labsh build (stalled, or past the hard cap), so svc.sh's
+# cold-build guard need not re-derive it. See the clock-origin note in the
+# state machine. rc 75 = svc.sh's guard REFUSED (a build it can see is in
+# flight and protected) — nothing was restarted.
 _sh_restart_service() {
     local name="$1" force="${2:-0}"
     [[ "$force" =~ ^[01]$ ]] || force=0
@@ -551,6 +1024,21 @@ _service_health_check_tick() {
     [[ -n "${SERVICE_HEALTH_STATE_DIR%/service-health}" ]] || return 0
     mkdir -p "$SERVICE_HEALTH_STATE_DIR" 2>/dev/null || true
 
+    # your-org/nexus-code#1266. The row loop below reads the parser through
+    # PROCESS SUBSTITUTION, and `while … done < <(cmd)` DISCARDS cmd's exit
+    # status entirely — measured: a substituted command returning 79 leaves
+    # the loop at rc 0. So the parser's NOT-READABLE verdict is unobservable
+    # at the loop and MUST be taken here, before it. Without this, an
+    # unreadable registry supervised ZERO services, ticked rc 0, and emitted
+    # nothing: every registered service silently stopped being watched, with
+    # no artefact anywhere saying so.
+    local _sh_reg; _sh_reg="$(_sh_registry_path)"
+    if ! _sh_registry_readable "$_sh_reg"; then
+        _sh_log "registry NOT READABLE at $_sh_reg — service health NOT CHECKED this tick;" \
+                "supervising nothing would be a claim this module cannot make (rc 79)"
+        return 79
+    fi
+
     local grace="${MONITOR_SERVICE_HEALTH_GRACE_SECONDS:-30}"
     local cooldown="${MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS:-300}"
     local ceiling="${MONITOR_SERVICE_HEALTH_FLAP_CEILING:-3}"
@@ -570,6 +1058,13 @@ _service_health_check_tick() {
     [[ "$ceiling" =~ ^[0-9]+$ ]] || ceiling=3
     [[ "$incon_polls" =~ ^[1-9][0-9]*$ ]] || incon_polls=3
     [[ "$incon_renag" =~ ^[1-9][0-9]*$ ]] || incon_renag=21600
+    # Consecutive UNKNOWN (timed-out) ticks before the operator is alerted
+    # (your-org/nexus-code#1631). CHOSEN default 3: ~6 min at the 120 s
+    # cadence — one slow tick is noise (a loaded host, a big /tmp walk), three
+    # in a row means the watcher has been blind to this service long enough
+    # that a real outage behind it would already have passed grace.
+    local unknown_ticks="${MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS:-3}"
+    [[ "$unknown_ticks" =~ ^[1-9][0-9]*$ ]] || unknown_ticks=3
 
     local now; now="$(_sh_now)"
     local name workdir launch health logfile policy
@@ -577,26 +1072,169 @@ _service_health_check_tick() {
         [[ -n "$name" ]] || continue
         [[ -n "$policy" ]] || policy="$(_sh_resolve_policy "")"
         local sf; sf="$(_sh_state_file "$name")"
-        local prev_status="" attempts=0 first_unhealthy="" first_iso="" last_restart=0
+        local prev_status="" attempts=0 first_unhealthy="" first_iso="" last_restart=0 build_kills=0
         if [[ -f "$sf" ]]; then
             prev_status=$(_sh_field "$sf" status 2>/dev/null || true)
             attempts=$(_sh_field "$sf" restart_attempts 2>/dev/null || echo 0)
+            build_kills=$(_sh_field "$sf" build_kills 2>/dev/null || echo 0)
             first_unhealthy=$(_sh_field "$sf" first_unhealthy 2>/dev/null || echo "")
             first_iso=$(_sh_field "$sf" first_unhealthy_iso 2>/dev/null || echo "")
             last_restart=$(_sh_field "$sf" last_restart 2>/dev/null || echo 0)
         fi
         [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
         [[ "$last_restart" =~ ^[0-9]+$ ]] || last_restart=0
+        [[ "$build_kills" =~ ^[0-9]+$ ]] || build_kills=0
 
         # Supervisor record, resolved once per service per tick (a kill -0 +
         # a /proc read; cheaper than the healthcheck it accompanies).
         local sup_state; sup_state="$(_sh_supervisor_state "$name" "$launch")"
         local incon_file; incon_file="$(_sh_inconsistent_file "$name")"
 
-        if _sh_service_healthy "$workdir" "$health"; then
+        # THREE-VALUED (your-org/nexus-code#1423): 0 healthy; SH_RC_FINDING
+        # alive-and-reporting (a finding sidecar, then treated as healthy by
+        # the incident machine — no grace, no restart, no DOWN); else down.
+        local hrc=0 is_finding=0
+        _sh_service_healthy "$workdir" "$health" || hrc=$?
+        # UNKNOWN — the check did not finish within its bound. Leave every
+        # record for this service exactly as it was: see `_SH_HEALTH_TIMED_OUT`
+        # for why this is neither the healthy arm nor the down arm.
+        #
+        # A STANDING UNKNOWN ESCALATES (your-org/nexus-code#1631). The
+        # `continue` below skips every status and supervisor arm, so a check
+        # that times out on EVERY tick left the service at its last status —
+        # typically `healthy` — forever, with a log line as the only record.
+        # Count consecutive UNKNOWN ticks in a sidecar; at `unknown_ticks`
+        # raise a WARNING operator alert (not critical: nothing is known to be
+        # down — what is known is that the watcher cannot see). Still no
+        # restart and no state change: the alert is the whole escalation.
+        local unk_file; unk_file="$(_sh_unknown_file "$name")"
+        if (( _SH_HEALTH_TIMED_OUT )); then
+            local unk_n=0 unk_since="" unk_since_iso=""
+            unk_n=$(_sh_field "$unk_file" count 2>/dev/null || echo 0)
+            [[ "$unk_n" =~ ^[0-9]+$ ]] || unk_n=0
+            unk_since=$(_sh_field "$unk_file" since 2>/dev/null || echo "")
+            unk_since_iso=$(_sh_field "$unk_file" since_iso 2>/dev/null || echo "")
+            if (( unk_n == 0 )) || [[ ! "$unk_since" =~ ^[0-9]+$ ]]; then
+                unk_since="$now"; unk_since_iso="$(_sh_iso)"
+            fi
+            unk_n=$(( unk_n + 1 ))
+            printf 'count=%s\nsince=%s\nsince_iso=%s\n' "$unk_n" "$unk_since" "$unk_since_iso" \
+                > "$unk_file" 2>/dev/null || true
+            _sh_log "service '$name' health UNKNOWN this tick ($unk_n consecutive): $_SH_HEALTH_DETAIL; state left as '${prev_status:-none}' (no grace, no restart, no recovery)"
+            if (( unk_n >= unknown_ticks )); then
+                local unk_key; unk_key="$(_sh_unknown_alert_key "$name")"
+                "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$unk_key" \
+                    && "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$unk_key" warning \
+                        "service '${name}' health has been UNKNOWN for ${unk_n} consecutive watcher ticks (since ${unk_since_iso:-@$unk_since}): its healthcheck did not finish within ${_SH_HEALTH_BOUND}s on any of them. Last recorded status: '${prev_status:-healthy (no incident record)}'. The watcher does NOT restart, recover or open an incident on an unknown verdict, so nothing in-band is acting on this; run the service's healthcheck by hand and look at monitor/svc.sh status."
+            fi
+            continue
+        fi
+        # The check FINISHED, whatever its verdict: the UNKNOWN run is over.
+        # Clear on every such tick while the key stands — the primitive holds
+        # a clear down (300 s) and finalises only when the caller keeps saying
+        # "absent", so this is re-asserted rather than sent once.
+        rm -f "$unk_file" 2>/dev/null || true
+        if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$(_sh_unknown_alert_key "$name")"; then
+            "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" clear "$(_sh_unknown_alert_key "$name")" \
+                "service '${name}' healthcheck finished again (health is known)"
+        fi
+        if (( hrc == SH_RC_FINDING )); then
+            is_finding=1
+            hrc=0
+        elif (( hrc == 0 )); then
+            _sh_clear_finding "$name"
+        fi
+        # Operator stop intent (your-org/nexus-code#1827). Consulted on the
+        # DOWN arm below; here only its lifecycle. A request is SUPERSEDED, not
+        # merely ignored, when the service is green under a supervisor
+        # launched AFTER the stop (jupyter-up.sh / remote-up.sh relaunch via
+        # recover_service without going through `svc.sh start`): left standing,
+        # it would silently veto the auto-restart of that NEW run's next crash.
+        # Positive evidence only — a live supervisor alone could be the one the
+        # stop is still killing.
+        local stop_sf stop_noted
+        stop_sf="$(_sh_stop_sentinel "$name")"
+        stop_noted="$(_sh_stop_noted_file "$name")"
+        if [[ ! -e "$stop_sf" ]]; then
+            rm -f "$stop_noted" 2>/dev/null || true
+        elif (( hrc == 0 )) && [[ "$sup_state" == alive:* ]] \
+             && [[ "$(_sh_pidfile "$name")" -nt "$stop_sf" ]]; then
+            rm -f "$stop_sf" "$stop_noted" 2>/dev/null || true
+            _sh_record_event "$name" stop-request-superseded \
+                "healthy under supervisor ${sup_state#alive:} launched after the stop request; request withdrawn, auto-restart re-armed"
+            _sh_log "service '$name' stop request SUPERSEDED: healthy under a supervisor launched after it (${sup_state}) — auto-restart re-armed"
+        fi
+        if (( hrc == 0 )); then
             # --- healthy ---
-            if [[ -n "$prev_status" && "$prev_status" != "healthy" && "$prev_status" != "recovered" \
-                  && "$prev_status" != "inconsistent" && "$prev_status" != "reconciled" ]]; then
+            # Was an INCIDENT open when this tick found the service healthy?
+            # Hoisted out of the arm below because a FINDING now needs the
+            # same answer, and for a different purpose.
+            local was_incident=0
+            [[ -n "$prev_status" && "$prev_status" != "healthy" && "$prev_status" != "recovered" \
+               && "$prev_status" != "inconsistent" && "$prev_status" != "reconciled" ]] && was_incident=1
+            # Re-assert the clear on EVERY healthy tick while an operator alert
+            # is standing for this service (#1534): the primitive holds a
+            # clear down and finalises only when the caller keeps saying
+            # "absent" past the hold-down, so a flapping service never
+            # re-files, re-rings or re-opens on each toggle. The TRANSITION
+            # tick is left to the arms below, which name the cause (recovered
+            # by whom / reclassified); this is the steady-state re-assertion.
+            if (( ! was_incident )); then
+                _sh_operator_alert_clear "$name" "healthy on this tick"
+            fi
+
+            # The finding is noted BEFORE the transition arms decide what to
+            # say, because the finding sidecar's existence is what tells a
+            # RECLASSIFICATION apart from a RECOVERY.
+            if (( is_finding )); then
+                local _sup_st="" _sup_since=""
+                if (( was_incident )); then _sup_st="$prev_status"; _sup_since="$first_iso"; fi
+                _sh_note_finding "$name" "$_SH_HEALTH_DETAIL" "$health" \
+                    "$_SH_FINDING_KEY" "$_SH_FINDING_BAND" "$_SH_FINDING_BODY" \
+                    "$_sup_st" "$_sup_since"
+            fi
+
+            # ---- unhealthy -> FINDING is a VOCABULARY TRANSITION, NOT A
+            # RECOVERY (your-org/nexus-code#1423).
+            #
+            # MEASURED, and both rows carry the SAME SECOND:
+            #   05:00:39  finding    healthcheck exit 100 ... /tmp over threshold
+            #   05:00:39  recovered  recovered with NO live supervisor ... cause UNKNOWN
+            #
+            # The condition never cleared. What changed was the healthcheck's
+            # exit code, 1 -> 100. The incident machine keys "recovered" on
+            # NO LONGER IN THE UNHEALTHY STATE, and that predicate cannot tell
+            # THE CONDITION CLEARED from THE CODE THAT REPORTS IT CHANGED
+            # MEANING — so one transition yielded `condition PRESENT` and
+            # `recovered, cause UNKNOWN` for one service in one emit.
+            #
+            # The consequence is worse than an odd log line: the recovered
+            # path's prescribed follow-up is `ng service-incident`, which
+            # generates an operator-facing OUTAGE template whose instruction is
+            # to restart the workspace — the precise action the finding path,
+            # three lines above it in the same emit, says explicitly not to
+            # take.
+            #
+            # No new `status` token is minted for this. `status` SELECTS in
+            # this module (grace/restart/escalate arms, re-nag keys,
+            # `ng service-incident`), so a new value would be a behavioural
+            # change every reader had to be taught (#1050) — the same argument
+            # that put the finding in a sidecar rather than in `status`. The
+            # incident is CLOSED, the durable `.events` history records
+            # `reclassified`, and the finding emit carries the supersession
+            # line. This generalises to EVERY service adopting SH_RC_FINDING,
+            # which is why it is fixed at the mechanism.
+            if (( was_incident )) && (( is_finding )); then
+                _sh_operator_alert_clear "$name" "reclassified to a finding (alive)"
+                _sh_record_event "$name" reclassified \
+                    "healthcheck vocabulary changed (non-zero -> ${SH_RC_FINDING} FINDING) while the condition it reports is PRESENT; status was ${prev_status} since ${first_iso}. NOT a recovery: nothing was restored and no restart is indicated."
+                _sh_log "service '$name' incident RECLASSIFIED as a FINDING (was ${prev_status}) — the condition did not clear; the healthcheck's vocabulary did"
+                rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" "$incon_file" \
+                      "$(_sh_restart_marker "$name")" 2>/dev/null || true
+                continue
+            fi
+
+            if (( was_incident )); then
                 # Transition unhealthy → healthy. ATTRIBUTE the restore from
                 # evidence; never infer it by elimination. Three actors can
                 # take a service from red to green, and they need different
@@ -645,6 +1283,15 @@ _service_health_check_tick() {
                 if [[ "$attempts" -gt 0 ]]; then
                     recovered_by=watcher
                     recovered_via="held after ${attempts} watcher restart attempt(s)"
+                elif (( mk_fresh )) && [[ "$mk_actor" == version-restart ]]; then
+                    # The version-aware watcher restarted it because its launch
+                    # script drifted on disk (a deploy pull rewrote it). No
+                    # operator acted — and until your-org/nexus-code#1456 this
+                    # fell into the arm below and printed "RESTORED by operator
+                    # intervention", which sent the deployer looking for a
+                    # human who ran svc.sh restart and found none.
+                    recovered_by=version-restart
+                    recovered_via="restarted by version-restart at $(_sh_field "$mk" iso 2>/dev/null || echo '?') (its launch script changed on disk — source drift) — not a self-heal, and NOT an operator action"
                 elif (( mk_fresh )) && [[ "$mk_actor" != watcher ]]; then
                     recovered_by=operator
                     recovered_via="RESTORED by ${mk_actor} intervention ($(_sh_field "$mk" iso 2>/dev/null || echo '?') via svc.sh restart) — not a self-heal"
@@ -700,6 +1347,7 @@ _service_health_check_tick() {
                 # A health incident just closed; let its breadcrumb surface
                 # alone. Supervisor consistency is judged from the next tick.
                 rm -f "$incon_file" "$mk" 2>/dev/null || true
+                _sh_operator_alert_clear "$name" "recovered (${recovered_by})"
                 continue
             fi
 
@@ -820,6 +1468,35 @@ _service_health_check_tick() {
         # `stale` beside a FAILING healthcheck is the ordinary dead-service
         # shape, already handled by the grace/restart/escalate machine below.
         rm -f "$incon_file" 2>/dev/null || true
+
+        # --- unhealthy, STOPPED BY REQUEST (your-org/nexus-code#1827) ---
+        # `svc.sh stop <name>` was run: the dead supervisor is the intended
+        # outcome, not an outage. Measured before this arm: a stop meant to
+        # hold an auto-deploy was auto-restarted at attempt 1/3 within ~3 min
+        # and deployed exactly what it was holding. No incident, no grace, no
+        # restart, no emit, and no new `status` token — `status` SELECTS
+        # (the emit loop, the incident arms, `ng service-incident`; #1050), so
+        # this state lives in the sentinel and a sidecar. Any incident open
+        # when the stop landed is closed: the operator has taken it over.
+        # Logged and recorded once per stop; the cockpit row reads STOPPED.
+        if [[ -e "$stop_sf" ]]; then
+            if [[ ! -e "$stop_noted" ]]; then
+                local stop_iso stop_by stop_closed=""
+                stop_iso=$(_sh_field "$stop_sf" iso 2>/dev/null || echo '?')
+                stop_by=$(_sh_field "$stop_sf" by 2>/dev/null || echo '?')
+                if [[ -n "$prev_status" && "$prev_status" != healthy && "$prev_status" != recovered \
+                      && "$prev_status" != reconciled ]]; then
+                    stop_closed="; closed the open '${prev_status}' incident record (since ${first_iso:-?})"
+                fi
+                _sh_record_event "$name" stopped-by-request \
+                    "DOWN because 'svc.sh stop' was run (since ${stop_iso} by ${stop_by}) — not an outage; no incident, no auto-restart until 'svc.sh start|restart ${name}'${stop_closed}"
+                _sh_log "service '$name' stopped by request since ${stop_iso} (by ${stop_by}) — not an outage; NOT restarting ('svc.sh start|restart $name' resumes)"
+                printf 'since_iso=%s\nnoted_at=%s\n' "$stop_iso" "$now" > "$stop_noted" 2>/dev/null || true
+            fi
+            rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" 2>/dev/null || true
+            _sh_operator_alert_clear "$name" "stopped by request"
+            continue
+        fi
         local fresh=0
         if [[ -z "$prev_status" || "$prev_status" == "healthy" || "$prev_status" == "recovered" \
               || "$prev_status" == "inconsistent" || "$prev_status" == "reconciled" ]]; then
@@ -829,6 +1506,7 @@ _service_health_check_tick() {
             first_iso="$(_sh_iso)"
             attempts=0
             last_restart=0
+            build_kills=0
             _sh_record_event "$name" detected-unhealthy "healthcheck failed: ${health} (policy ${policy})"
             _sh_log "service '$name' UNHEALTHY (healthcheck: ${health}; policy ${policy})"
         fi
@@ -842,54 +1520,73 @@ _service_health_check_tick() {
         local cbceiling="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-1800}"
         [[ "$cbceiling" =~ ^[0-9]+$ ]] || cbceiling=1800
 
-        # Evaluate "is a labsh cold build materialising?" ONCE per tick, into a
-        # variable, because two decisions below need it and they must not
-        # disagree: the defer branch (don't restart a build in flight) and the
-        # act branch (tell svc.sh we have already ruled this build pathological).
+        # Evaluate "is a labsh cold build materialising, and may it be killed?"
+        # ONCE per tick, into variables, because two decisions below need it
+        # and they must not disagree: the defer branch (don't restart a build
+        # in flight) and the act branch (tell svc.sh we have already ruled this
+        # build killable).
         #
-        # ── CLOCK ORIGIN — the whole point of this variable ──────────────────
-        # This module's ceiling counts from `first_unhealthy` (the INCIDENT).
-        # svc.sh's cold-build guard counts from the build process's own start
-        # (`etimes`). A build can only begin AFTER the service is already
-        # unhealthy, so `age = elapsed - D` with `D > 0` ALWAYS. Two clocks, the
-        # same 1800s duration, different origins: at our ceiling the build is
-        # still D seconds short of the guard's cap, so svc.sh REFUSED our first
-        # post-ceiling restart — a guaranteed wasted attempt out of three, and a
-        # permanent `flapping` (recovery dead) whenever D exceeds the restart
-        # budget, e.g. if monitor.service_health.grace_seconds is raised toward
-        # restart_cooldown_seconds. Found by the round-2 skeptic
-        # (your-org/your-nexus#273); it survived round 1 because the guard was
-        # tested as a function and nobody asked whether the WATCHER gets through.
+        # ── CLOCK ORIGIN: THE BUILD'S, NEVER THE INCIDENT'S ─────────────────
+        # This ceiling used to count from `first_unhealthy` — the INCIDENT. A
+        # build can only start after the service is unhealthy, and every
+        # restart starts a NEW one, so once the incident was `cbceiling` old
+        # every build the relaunch started was "past the ceiling" the moment it
+        # was born, and was killed at the next cooldown. Live, 2026-09-29: the
+        # incident opened 13:16:31; from 13:46 on, three consecutive fresh
+        # builds were force-killed ~5.5 min in, and the flap ceiling then read
+        # those three self-inflicted kills as "FLAPPING — restarts did not hold"
+        # while a healthy install was running (your-org/nexus-code#1676).
+        # The earlier fix for the two-clocks problem (your-org/your-nexus#273)
+        # made OUR clock win over svc.sh's; this makes the BUILD's clock the
+        # only one, via the SAME verdict svc.sh and the supervisor consult.
         #
-        # The fix is to have ONE origin decide. Reaching the act branch below
-        # while a build is live implies `elapsed >= cbceiling` BY CONSTRUCTION
-        # (the defer branch is the only gate on a live build, and it would have
-        # been taken otherwise) — i.e. WE have already declared it pathological,
-        # on OUR clock, which is exactly what the ceiling means. So we pass
-        # SVC_FORCE=1 and svc.sh's guard does not re-derive that verdict from a
-        # clock it cannot reconcile with ours.
-        local cb_build=0
+        # ── PROGRESS, NOT A FIXED CEILING ───────────────────────────────────
+        # `labsh_build_release` (_labsh_build_evidence.sh): inside the ceiling
+        # a build is protected; past it, protected ONLY while it is MOVING;
+        # past the hard cap, released. So a slow build on a loaded node is
+        # never killed for being slow, and a wedged one is still recovered.
+        #
+        # Reaching the act branch below with a live build implies the verdict
+        # RELEASED it — so we pass SVC_FORCE=1 and svc.sh does not re-derive
+        # it (it would reach the same verdict from the same shared sample).
+        local cb_build=0 cb_protect=0 cb_pid="" cb_age="" cb_verdict="" cb_ev=""
         if (( cbceiling > 0 )) && _sh_is_labsh_service "$launch" "$health" \
                && _sh_labsh_build_in_progress "$workdir"; then
             cb_build=1
+            if declare -F labsh_build_in_progress >/dev/null \
+                   && declare -F labsh_build_release >/dev/null \
+                   && cb_ev=$(labsh_build_in_progress "$workdir"); then
+                cb_pid="${cb_ev%% *}"; cb_age="${cb_ev##* }"
+                if cb_verdict=$(labsh_build_release "$cb_pid" "$cb_age" "$workdir" "$cbceiling"); then
+                    cb_protect=0
+                else
+                    cb_protect=1
+                fi
+            else
+                # A partial deploy: identity established, the verdict helper
+                # absent. Fall back to the old incident-clock bound rather than
+                # protecting without any bound at all.
+                (( elapsed < cbceiling )) && cb_protect=1
+                cb_verdict="unverified build age unknown to this watcher (verdict helper unavailable) — incident-clock fallback"
+            fi
         fi
 
-        if (( cb_build )) && (( elapsed < cbceiling )); then
+        if (( cb_build && cb_protect )); then
             # --- labsh COLD BUILD in progress: defer to the supervisor
             #     (#326 already made it patient), NEVER restart. This
             #     SUSPENDS the grace/restart machine for the life of the
             #     build — the healthcheck failing throughout is legitimate
-            #     bring-up (uvx materialising the env), not an outage. The
-            #     defer is self-calibrating: it lasts exactly as long as the
-            #     build process runs with no URL (or until the cbceiling
-            #     backstop). A genuinely-dead service has no live build ⇒
-            #     this branch is skipped ⇒ ordinary restart still recovers it.
+            #     bring-up (uvx materialising the env), not an outage. It lasts
+            #     while the build is alive and inside its ceiling or still
+            #     MOVING, until it binds a URL, dies, stalls, or hits the hard
+            #     cap. A genuinely-dead service has no live build ⇒ this branch
+            #     is skipped ⇒ ordinary restart still recovers it.
             status="cold-build"
-            note="labsh cold build in progress (${elapsed}s; uvx materialising the JupyterLab env on NFS — minutes). Deferring to the supervisor; the watcher will NOT restart until the build binds a URL, the build process dies, or the ${cbceiling}s cold-build ceiling elapses."
+            note="labsh cold build in progress (pid ${cb_pid:-?}; ${cb_verdict#* }; uvx materialising the JupyterLab env on NFS). Deferring to the supervisor; the watcher will NOT restart while the build is alive and progressing — only once it binds a URL, dies, stalls with no progress for ${LABSH_BUILD_STALL_SECONDS:-600}s past the ${cbceiling}s ceiling, or passes the ${LABSH_COLD_BUILD_HARD_CAP:-7200}s hard cap."
             if [[ "$prev_status" != "cold-build" ]]; then
                 _sh_record_event "$name" cold-build-in-progress \
-                    "healthcheck fails while a labsh cold build materialises the env (live build process); deferring to supervisor, no restart (policy ${policy})"
-                _sh_log "service '$name' labsh COLD BUILD in progress — deferring to supervisor, not restarting"
+                    "healthcheck fails while a labsh cold build materialises the env (live build pid ${cb_pid:-?}, ${cb_verdict%% *}); deferring to supervisor, no restart (policy ${policy})"
+                _sh_log "service '$name' labsh COLD BUILD in progress (pid ${cb_pid:-?}: ${cb_verdict#* }) — deferring to supervisor, not restarting"
             fi
         elif (( elapsed < grace )); then
             # --- grace window: defer to the supervisor wrapper's self-heal.
@@ -915,6 +1612,13 @@ _service_health_check_tick() {
             fi
             status="flapping"
             note="auto-restart ceiling (${ceiling}) reached after ${attempts} attempts; needs orchestrator"
+            # Say what the attempts WERE. A restart that released a live build
+            # was a judgement that the build was wedged (stalled or past the
+            # hard cap), not evidence that the service will not stay up — and
+            # the reader must not be left to infer the former from the latter.
+            if (( build_kills > 0 )); then
+                note="${note} — ${build_kills} of the ${attempts} attempt(s) killed a live labsh build the shared verdict had RELEASED (stalled or past the hard cap), so this is repeated WEDGED BUILDS, not a server that will not stay up"
+            fi
         elif (( last_restart > 0 && now - last_restart < cooldown )); then
             # --- in cooldown after a recent restart — wait it out.
             status="recovering"
@@ -924,22 +1628,47 @@ _service_health_check_tick() {
             #     elapsed, wedged or wrapper-dead).
             _sh_log "service '$name' restart attempt $(( attempts + 1 ))/${ceiling} via svc.sh restart (policy ${policy})"
             local rc=0
-            # cb_build here ⇒ elapsed >= cbceiling (see the clock-origin note
-            # above): we have already ruled this build pathological on OUR
-            # clock, so svc.sh's guard must not veto us on its own.
+            # cb_build here ⇒ the shared verdict RELEASED the build (see the
+            # clock-origin note above): say which way, in the log and the event,
+            # so a later reader can tell a wedged build from a dead server.
             if (( cb_build )); then
-                _sh_log "service '$name' has a live labsh build past the ${cbceiling}s cold-build ceiling — presumed WEDGED; forcing the restart through svc.sh's cold-build guard"
+                _sh_log "service '$name' labsh build pid ${cb_pid:-?} RELEASED: ${cb_verdict#* } — forcing the restart through svc.sh's cold-build guard"
             fi
             _sh_restart_service "$name" "$cb_build" || rc=$?
-            attempts=$(( attempts + 1 ))
-            last_restart="$now"
-            status="recovering"
-            if (( rc == 0 )); then
-                _sh_record_event "$name" restart-issued "attempt ${attempts}/${ceiling} (svc.sh restart rc=0)"
-                note="restart attempt ${attempts}/${ceiling} issued; next tick verifies"
+            if (( rc == 76 )); then
+                # svc.sh REFUSED: a stop request landed between this tick's
+                # sentinel check and the call (#1827). Nothing was restarted
+                # and nothing is counted; the next tick's stopped-by-request
+                # arm owns the service from here.
+                _sh_record_event "$name" restart-refused "svc.sh refused (rc=76: stopped by request); not counted as an attempt"
+                _sh_log "service '$name' restart REFUSED by svc.sh: stopped by request — leaving it down"
+                rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" 2>/dev/null || true
+                _sh_operator_alert_clear "$name" "stopped by request"
+                continue
+            elif (( rc == 75 )); then
+                # svc.sh's cold-build guard REFUSED: a build it can see is in
+                # flight and protected. Nothing was restarted, so nothing is
+                # counted — a refusal is not an attempt that "did not hold"
+                # (2026-09-29: attempt 1/3 was exactly this, and it was one of
+                # the three that tripped FLAPPING). The next tick sees the build
+                # and defers; last_restart still arms the cooldown so a build
+                # the two sides disagree about cannot be hammered every tick.
+                last_restart="$now"
+                status="cold-build"
+                note="restart DEFERRED: svc.sh's cold-build guard refused (a labsh build is in flight and progressing); not counted toward the ${ceiling}-attempt ceiling"
+                _sh_record_event "$name" restart-deferred "svc.sh refused (rc=75: a labsh build in flight and progressing); not counted as an attempt"
             else
-                _sh_record_event "$name" restart-failed "attempt ${attempts}/${ceiling} (svc.sh restart rc=${rc})"
-                note="restart attempt ${attempts}/${ceiling} returned rc=${rc}; next tick verifies"
+                attempts=$(( attempts + 1 ))
+                last_restart="$now"
+                status="recovering"
+                if (( cb_build )); then build_kills=$(( build_kills + 1 )); fi
+                if (( rc == 0 )); then
+                    _sh_record_event "$name" restart-issued "attempt ${attempts}/${ceiling} (svc.sh restart rc=0)$( (( cb_build )) && printf '; killed live labsh build pid %s (%s)' "${cb_pid:-?}" "${cb_verdict%% *}")"
+                    note="restart attempt ${attempts}/${ceiling} issued; next tick verifies"
+                else
+                    _sh_record_event "$name" restart-failed "attempt ${attempts}/${ceiling} (svc.sh restart rc=${rc})"
+                    note="restart attempt ${attempts}/${ceiling} returned rc=${rc}; next tick verifies"
+                fi
             fi
         fi
 
@@ -961,14 +1690,17 @@ _service_health_check_tick() {
             "first_unhealthy_iso=${first_iso}" \
             "restart_attempts=${attempts}" \
             "last_restart=${last_restart}" \
+            "build_kills=${build_kills}" \
             "escalated=${escalated}" \
             "last_check=${now}" \
             "last_check_iso=$(_sh_iso)" \
             "grace_seconds=${grace}" \
             "health_cmd=${health}" \
+            "health_detail=${_SH_HEALTH_DETAIL}" \
             "workdir=${workdir}" \
             "logfile=${logfile}" \
             "note=${note}"
+        _sh_operator_alert_step "$name" "$status" "$policy" "$first_iso" "$note"
     done < <(_sh_parse_registry)
     return 0
 }
@@ -1001,7 +1733,7 @@ _service_health_check_tick() {
 _service_health_emit_section() {
     local state_dir="${1:-$SERVICE_HEALTH_STATE_DIR}" nexus_root="${2:-${NEXUS_ROOT:-}}"
     [[ -n "$state_dir" && -d "$state_dir" ]] || return 1
-    local emitted=1 sf name status policy attempts first_iso recovered_iso recovered_via grace_seconds health logfile note key last surfaced_file
+    local emitted=1 sf name status policy attempts first_iso recovered_iso recovered_via grace_seconds health health_detail logfile note key last surfaced_file
     local supervisor sup_pidfile incon_polls incon_iso recovered_by escalated renag_bucket sup_kind
     for sf in "$state_dir"/*.state; do
         [[ -f "$sf" ]] || continue
@@ -1015,6 +1747,7 @@ _service_health_emit_section() {
         recovered_via=$(_sh_field "$sf" recovered_via 2>/dev/null || echo '')
         grace_seconds=$(_sh_field "$sf" grace_seconds 2>/dev/null || echo '?')
         health=$(_sh_field "$sf" health_cmd 2>/dev/null || echo '?')
+        health_detail=$(_sh_field "$sf" health_detail 2>/dev/null || echo '')
         logfile=$(_sh_field "$sf" logfile 2>/dev/null || echo '')
         note=$(_sh_field "$sf" note 2>/dev/null || echo '')
         supervisor=$(_sh_field "$sf" supervisor 2>/dev/null || echo '?')
@@ -1051,6 +1784,9 @@ _service_health_emit_section() {
                     operator)
                         printf 'service %s RECOVERED BY INTERVENTION: unhealthy since %s, restored ~%s. %s\n' \
                             "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
+                    version-restart)
+                        printf 'service %s RESTARTED BY VERSION-RESTART (source drift): unhealthy since %s, restored ~%s. %s\n' \
+                            "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
                     unknown)
                         printf 'service %s RECOVERED, CAUSE UNKNOWN: unhealthy since %s, green again ~%s. %s\n' \
                             "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
@@ -1062,7 +1798,9 @@ _service_health_emit_section() {
                         printf 'service %s RECOVERED (%s): unhealthy since %s, restored ~%s.\n' \
                             "'$name'" "$recovered_via" "$first_iso" "$recovered_iso" ;;
                 esac
-                if [[ "$recovered_by" == cold-build ]]; then
+                if [[ "$recovered_by" == version-restart ]]; then
+                    printf '  Expected consequence of a deploy pull: the launch script changed on disk and the version-aware watcher restarted the service (your-org/nexus-code#1456). No operator acted and none needs to. The downtime is the restart plus any cold rebuild it triggered; investigate only if the service did not come back on its own.\n'
+                elif [[ "$recovered_by" == cold-build ]]; then
                     printf '  Expected bring-up: a labsh cold build (uvx materialising the env) blocks the healthcheck for minutes; the watcher correctly DEFERRED to the supervisor and never restarted. No action needed.\n'
                 elif [[ ( "$recovered_by" == supervisor || "$recovered_by" == self-heal ) && "$escalated" != 1 ]]; then
                     printf '  Transient blip, self-resolved within grace. No action needed; file an incident if you want a record:\n'
@@ -1145,6 +1883,7 @@ _service_health_emit_section() {
                 printf 'service %s unhealthy since %s — within the %ss grace window; deferring to its supervisor before the watcher acts.\n' \
                     "'$name'" "$first_iso" "$grace_seconds"
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 if [[ "$policy" == "emit-only" ]]; then
                     printf '  policy: emit-only — if still unhealthy after grace the watcher will escalate (no auto-restart).\n'
                 else
@@ -1163,6 +1902,7 @@ _service_health_emit_section() {
                 printf 'service %s DOWN since %s — policy emit-only: the watcher will NOT auto-restart; this needs your judgment.\n' \
                     "'$name'" "$first_iso"
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 printf '  policy: emit-only\n'
                 [[ -n "$logfile" ]] && printf '  logfile: %s\n' "$logfile"
                 printf '  incident state: %s   (history: %s)\n' "$sf" "$state_dir/$name.events"
@@ -1188,6 +1928,7 @@ _service_health_emit_section() {
                             "'$name'" "$first_iso" ;;
                 esac
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 printf '  policy: %s\n' "$policy"
                 [[ -n "$note" ]] && printf '  auto-restart: %s\n' "$note"
                 [[ -n "$logfile" ]] && printf '  logfile: %s\n' "$logfile"
@@ -1205,6 +1946,82 @@ _service_health_emit_section() {
                 emitted=0
                 ;;
         esac
+    done
+
+    # ---- FINDINGS (your-org/nexus-code#1423) — alive monitors reporting a
+    # condition. Separate loop, separate files, its own re-nag key (the text's
+    # hash: a CHANGED finding re-surfaces, a repeated one does not). The words
+    # are deliberately not the DOWN vocabulary: no "DOWN", no restart remedy.
+    local ff cf f_detail f_first f_health f_hash f_key f_surf f_band f_body f_sup f_sup_since f_mute _mb
+    for ff in "$state_dir"/*.finding; do
+        [[ -f "$ff" ]] || continue
+        name=$(basename "$ff" .finding)
+        f_detail=$(_sh_field "$ff" finding 2>/dev/null || echo '?')
+        f_first=$(_sh_field "$ff" first_iso 2>/dev/null || echo '?')
+        f_health=$(_sh_field "$ff" health_cmd 2>/dev/null || echo '?')
+        f_hash=$(_sh_field "$ff" finding_hash 2>/dev/null || echo '')
+        f_band=$(_sh_field "$ff" finding_band 2>/dev/null || echo '')
+        f_sup=$(_sh_field "$ff" superseded_status 2>/dev/null || echo '')
+        f_sup_since=$(_sh_field "$ff" superseded_since 2>/dev/null || echo '?')
+        f_body="$state_dir/$name.finding-body"
+        f_surf="$state_dir/$name-finding-surfaced"
+        # The re-nag key is the hash of the service's STABLE key, not of its
+        # rendered text (your-org/nexus-code#1423). Numbers inside the message
+        # may drift freely; only a change in the situation re-surfaces it.
+        f_key="finding:$f_hash"
+        # A MUTE is consulted here, at the surfacing step, and never at the
+        # recording step: the sidecar must keep tracking the condition while
+        # an operator is choosing not to be told about it, or lifting the mute
+        # would show a stale picture.
+        f_mute=$(_sh_mute_state "$name" "$f_band")
+        if [[ "$f_mute" == active ]]; then
+            printf '%s\n' "$f_key" > "$f_surf" 2>/dev/null || true
+            continue
+        fi
+        last=$(cat "$f_surf" 2>/dev/null || true)
+        [[ "$last" == "$f_key" && "$f_mute" == none ]] && continue
+        printf 'service %s is UP and reports a FINDING about its environment (since %s) — the monitor is working; this is NOT an outage.\n' \
+            "'$name'" "$f_first"
+        printf '  finding: %s\n' "$f_detail"
+        # SUPERSESSION — printed instead of a contradictory `recovered`
+        # breadcrumb, and it names the follow-up NOT to run.
+        if [[ -n "$f_sup" ]]; then
+            printf '  SUPERSEDES AN OPEN INCIDENT: this service was `%s` since %s. That incident is closed as RECLASSIFIED, NOT recovered — the condition did not clear, the healthcheck'"'"'s exit code did. Do NOT file `ng service-incident %s` for it: that generates an OUTAGE template whose remedy is a restart, which is the action this emit forbids.\n' \
+                "$f_sup" "$f_sup_since" "$name"
+        fi
+        case "$f_mute" in
+            invalid:*)
+                printf '  MUTE REFUSED (%s): %s. An exemption nobody had to justify is an omission with a row in front of it (your-org/nexus-code#1482, #1486), so an unusable mute is IGNORED LOUDLY rather than obeyed quietly — a suppression that fails open hides the thing it was asked to hide for a reason nobody stated.\n' \
+                    "$state_dir/$name.finding-mute" "${f_mute#invalid:}" ;;
+            expired:*)
+                printf '  MUTE EXPIRED on %s — it is no longer suppressing anything. Re-justify it or let this finding stand.\n' "${f_mute#expired:}" ;;
+            broken:*)
+                # `broken:<from>-><to>`. Strip BOTH ends for the first field:
+                # `${f_mute#broken:}` alone leaves `1->3`, which rendered as
+                # "from band 1->3 into band 3" — caught by its own assertion.
+                _mb="${f_mute#broken:}"
+                printf '  MUTE BROKEN: the condition crossed from band %s into band %s. A mute is keyed on the BAND precisely so it cannot sit silently through a situation getting worse — which would make the mute the mechanism by which the incident this monitor exists to catch goes unreported.\n' \
+                    "${_mb%%->*}" "${_mb##*->}" ;;
+        esac
+        if [[ -s "$f_body" ]]; then
+            printf '  details:\n'
+            sed 's/^/    /' "$f_body" 2>/dev/null
+        fi
+        printf '  healthcheck: %s   (exit %s = alive, condition PRESENT; its stderr is the finding)\n' "$f_health" "$SH_RC_FINDING"
+        printf '  A restart changes nothing here — do NOT svc.sh restart it. ACTION: act on the condition the finding names. It re-surfaces when its STABLE KEY changes — not on wording or counter drift — and clears itself when the check goes green.\n'
+        printf '  finding state: %s   (history: %s)\n' "$ff" "$state_dir/$name.events"
+        printf '\n'
+        printf '%s\n' "$f_key" > "$f_surf" 2>/dev/null || true
+        emitted=0
+    done
+    for cf in "$state_dir"/*.finding-cleared; do
+        [[ -f "$cf" ]] || continue
+        name=$(basename "$cf" .finding-cleared)
+        f_detail=$(_sh_field "$cf" finding 2>/dev/null || echo '?')
+        f_first=$(_sh_field "$cf" first_iso 2>/dev/null || echo '?')
+        printf 'service %s finding CLEARED: the healthcheck is GREEN again (this is a real clear, not a mute). Was (since %s): %s\n\n' "'$name'" "$f_first" "$f_detail"
+        rm -f "$cf" "$state_dir/$name-finding-surfaced" "$state_dir/$name.finding-body" 2>/dev/null || true
+        emitted=0
     done
     return $emitted
 }

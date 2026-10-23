@@ -50,7 +50,37 @@ _requests_state_dir() {
     printf '.state'
 }
 
-_requests_dir()        { printf '%s/requests' "$(_requests_state_dir)"; }
+# The inbox location is resolved by the ONE shared resolver every reader and
+# writer uses (your-org/nexus-code#1723): NEXUS_REQUESTS_DIR, then the config
+# key monitor.requests.dir, then <state>/requests. On a refused value this
+# prints nothing, and the callers' `-d` test then skips the cycle; the refusal
+# itself is logged once by _requests_inbox_usable.
+if ! declare -F nexus_requests_dir >/dev/null 2>&1; then
+    # shellcheck source=../_requests_dir.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_requests_dir.sh"
+fi
+_requests_dir()        { nexus_requests_dir "$(_requests_state_dir)" 2>/dev/null; }
+# _requests_inbox_usable <dir> — 0 when the claim/render may proceed. A
+# configured inbox that is missing (or a dangling symlink) is a silent zero
+# for every request filed elsewhere, so it is LOGGED, once per condition
+# rather than every ~10 s poll.
+_REQUESTS_INBOX_WARNED=""
+_requests_inbox_usable() {
+    local dir="$1" sd src msg
+    sd=$(_requests_state_dir)
+    if [[ -z "$dir" ]]; then
+        msg=$(nexus_requests_dir "$sd" 2>&1 >/dev/null)
+    else
+        src=$(nexus_requests_dir_source "$sd" 2>/dev/null) || src=default
+        msg=$(nexus_requests_dir_check "$dir" "$src" 2>&1) && { _REQUESTS_INBOX_WARNED=""; return 0; }
+    fi
+    if [[ "$_REQUESTS_INBOX_WARNED" != "$msg" ]]; then
+        _REQUESTS_INBOX_WARNED="$msg"
+        if declare -F log >/dev/null 2>&1; then log "requests: INBOX UNUSABLE — $msg"
+        else printf 'requests: INBOX UNUSABLE — %s\n' "$msg" >&2; fi
+    fi
+    return 1
+}
 _requests_emit_state() { printf '%s/requests-emit-state.tsv' "$(_requests_state_dir)"; }
 _requests_emit_state_lock() { printf '%s.lock' "$(_requests_emit_state)"; }
 
@@ -103,8 +133,38 @@ _requests_services_registry() {
 # see remote-up.sh). Reproduces _remote_lib.sh:_remote_registered WITHOUT a
 # dependency on _remote_lib.sh, which main.sh does not source. Read live so
 # bringing the channel up or down takes effect on the next poll.
+# Predicate, not an inline `! { …; }`: on a COMPOUND command a failed
+# redirection is a redirection ERROR and `!` does NOT invert it (bash 4.4.20:
+# `! { : ; } 2>/dev/null < UNREADABLE` is rc 1, while the SIMPLE-command
+# `! : … < UNREADABLE` is rc 0 — and zsh 5.4.2 disagrees with bash on the
+# compound form, so an interactive probe on this zsh-default nexus CONFIRMS
+# the broken shape). Negating a FUNCTION CALL is a simple command, so it works.
+_requests_reg_open_ok() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    { : ; } 2>/dev/null < "$f" || return 1
+    return 0
+}
+
 _requests_remote_registered() {
     local reg; reg=$(_requests_services_registry)
+    # your-org/nexus-code#1266. `[[ -f ]]` passes for a file that exists and
+    # cannot be READ, and `awk … 2>/dev/null` then fails silently, so an
+    # unreadable registry answers NOT REGISTERED. The two directions of that
+    # answer differ, which is why the control flow is deliberately UNCHANGED
+    # here and only the SILENCE is removed:
+    #   - access (the forced-command wrapper) fails CLOSED: not registered
+    #     means refuse. Correct, and must stay that way.
+    #   - health ("disabled == healthy") fails OPEN: a channel that is down
+    #     reads HEALTHY. That is this issue's own shape.
+    # This predicate is BOOLEAN and is consumed in `if` / `if !` arms all
+    # over; making it three-valued would flip an unknown number of them. So
+    # it keeps its two values and gains an artefact — the condition is no
+    # longer indistinguishable from "no row".
+    if [[ -e "$reg" ]] && ! _requests_reg_open_ok "$reg"; then
+        printf 'requests: services registry at %s exists but is NOT READABLE — answering NOT REGISTERED, which is a guess, not a reading\n' "$reg" >&2
+        return 1
+    fi
     [[ -f "$reg" ]] || return 1
     awk -F'\t' '$1=="nexus-remote-ssh"{f=1} END{exit !f}' "$reg" 2>/dev/null
 }
@@ -148,6 +208,7 @@ _requests_summary() {
 # client's fetch surface; see step 3).
 _requests_claim() {
     local dir; dir=$(_requests_dir)
+    _requests_inbox_usable "$dir" || return 0
     [[ -d "$dir" ]] || return 0
     local now maxage ret imaxage rret f id
     now=$(date +%s)
@@ -176,6 +237,10 @@ _requests_claim() {
     rret=${MONITOR_REQUESTS_REPLIED_RETENTION_SECONDS:-$ret}
     [[ "$rret" =~ ^[0-9]+$ ]] || rret=$ret
 
+    # Save/restore, not a bare `shopt -u` at the tail (your-org/nexus-code#721):
+    # this file is SOURCED (watcher/main.sh + three suites), so unsetting
+    # unconditionally hands the caller nullglob OFF however it had it.
+    local _restore_glob; _restore_glob=$(shopt -p nullglob)
     shopt -s nullglob 2>/dev/null
     # 1) claim new → claimed (or mark malformed failed). Route every rename
     # through the shared single-winner primitive `_chan_claim_rename` (the
@@ -261,7 +326,7 @@ _requests_claim() {
             [[ -n "$id" ]] && rmdir "$dir/.ids/$id" 2>/dev/null || true
         fi
     done
-    shopt -u nullglob 2>/dev/null
+    eval "$_restore_glob"
     return 0
 }
 
@@ -279,6 +344,32 @@ _requests_claim() {
 # successful-paste path to stamp exactly the delivered ids — so an
 # undelivered render leaves the request due and it re-surfaces next cycle
 # (your-org/nexus-code#483).
+# _requests_handling_line <id> <kind> <reply> — the ONE sentence that says
+# how THIS request closes (your-org/nexus-code#1404). Decided from the parsed
+# `reply:` field first, then the kind:
+#   reply: required   the request DEMANDS an answer — `ng request reply`;
+#                     `ack` refuses it (request-channel.sh rc 6).
+#   kind spawn-skeptic
+#                     spawn the reviewer; spawn-worker.sh --skeptic-role acks
+#                     the request itself on spawn, so no reply is owed and a
+#                     later `ng request reply` is refused as terminal — the
+#                     exact refusal the unconditional caveat used to provoke.
+#   otherwise         bare `ng request ack` closes it; reply only to return
+#                     something.
+# A conditional statement rendered unconditionally beside a specific item is
+# read as a claim about that item, so the sentence is per-request and the
+# footer in main.sh carries no per-kind claim at all.
+_requests_handling_line() {
+    local id="$1" kind="$2" reply="$3"
+    if [[ "$reply" == required ]]; then
+        printf 'reply REQUIRED — answer with `ng request reply %s …`; `ng request ack` refuses this request' "$id"
+    elif [[ "$kind" == spawn-skeptic ]]; then
+        printf 'spawn-skeptic — spawn the reviewer (spawn-worker.sh --skeptic-role …); the launcher acks this request on spawn, so no reply is owed and `ng request reply` is refused once it is terminal'
+    else
+        printf 'no reply required — close with `ng request ack %s` once handled (reply with `ng request reply %s …` only if you have something to return)' "$id" "$id"
+    fi
+}
+
 requests_render() {
     local dir state_file now cooldown cap fairness
     dir=$(_requests_dir); state_file=$(_requests_emit_state)
@@ -290,8 +381,10 @@ requests_render() {
     [[ "$cap" =~ ^[0-9]+$ && "$cap" -gt 0 ]] || cap=10
     [[ -d "$dir" ]] || return 0
 
-    # Gather claimed → a TSV stream: prank \t ts \t origin \t id \t kind \t priority \t summary \t file
-    local stream="" f id origin kind priority prank ts summary
+    # Gather claimed → a TSV stream: prank \t ts \t origin \t id \t kind \t priority \t summary \t file \t reply
+    local stream="" f id origin kind priority prank ts summary reply
+    # Save/restore — see the note in the GC above (your-org/nexus-code#721).
+    local _restore_glob; _restore_glob=$(shopt -p nullglob)
     shopt -s nullglob 2>/dev/null
     for f in "$dir"/*.claimed.md; do
         [[ -e "$f" ]] || continue
@@ -299,6 +392,14 @@ requests_render() {
         origin=$(_chan_frontmatter_field "$f" origin)
         kind=$(_chan_frontmatter_field "$f" kind)
         priority=$(_chan_frontmatter_field "$f" priority)
+        # The parsed `reply:` field (your-org/nexus-code#1404). `ng request
+        # file --reply required` writes the scalar `reply: required`; every
+        # other value is normalised to absent at file time, so a `.claimed`
+        # file carries either `required` or nothing. Read it here — the emit
+        # used to append a `reply: required` caveat UNCONDITIONALLY, glued to
+        # the file path, and it was read as a claim about a request that did
+        # not carry the field.
+        reply=$(_chan_frontmatter_field "$f" reply) || reply=""
         # Tab-sanitize every field that feeds the internal TSV stream
         # below — a literal tab in a frontmatter value would otherwise
         # shift the TSV columns on read-back and scramble the
@@ -308,6 +409,7 @@ requests_render() {
         # direct-write or future producer — mirroring the `summary`
         # sanitization in _requests_summary (skeptic #378 criterion-3 nit).
         origin=${origin//$'\t'/ }; kind=${kind//$'\t'/ }; priority=${priority//$'\t'/ }
+        reply=${reply//$'\t'/ }; reply=${reply//[[:space:]]/}
         # EMPTY-field defense (skeptic on `#483`, attack 6): tab is IFS
         # *whitespace*, so `IFS=$'\t' read` COLLAPSES an empty field and
         # silently shifts every column to its right — an empty summary
@@ -320,13 +422,16 @@ requests_render() {
         [[ -n "$origin"   ]] || origin="unknown"
         [[ -n "$kind"     ]] || kind="unknown"
         [[ -n "$priority" ]] || priority="normal"
+        # `none` is a PLACEHOLDER for the empty-field collapse above; it is
+        # not a value `ng request file` writes (it normalises `none` away).
+        [[ -n "$reply" ]] || reply="none"
         [[ "$priority" == high ]] && prank=0 || prank=1
         ts=${id%%-*}
         summary=$(_requests_summary "$f")
         [[ -n "$summary" ]] || summary="(no summary — read the cited file)"
-        stream+="$prank"$'\t'"$ts"$'\t'"$origin"$'\t'"$id"$'\t'"$kind"$'\t'"$priority"$'\t'"$summary"$'\t'"$f"$'\n'
+        stream+="$prank"$'\t'"$ts"$'\t'"$origin"$'\t'"$id"$'\t'"$kind"$'\t'"$priority"$'\t'"$summary"$'\t'"$f"$'\t'"$reply"$'\n'
     done
-    shopt -u nullglob 2>/dev/null
+    eval "$_restore_glob"
 
     if [[ -z "$stream" ]]; then
         : > "$state_file"   # no claimed → clear stale cooldown rows
@@ -370,7 +475,7 @@ requests_render() {
     # decays to ≤24/day per stalled request, and max-age (default 3d,
     # _requests_claim) terminates it to `.failed` outright.
     local -a d_id=() d_origin=() d_line=()
-    while IFS=$'\t' read -r prank ts origin id kind priority summary file; do
+    while IFS=$'\t' read -r prank ts origin id kind priority summary file reply; do
         [[ -n "$id" ]] || continue
         local last="${prev[$id]:-}" due=0 eff
         eff=$(_requests_effective_cooldown "$cooldown" "${prevcnt[$id]:-0}")
@@ -381,7 +486,7 @@ requests_render() {
         fi
         if (( due == 1 )); then
             d_id+=("$id"); d_origin+=("$origin")
-            d_line+=("request=$id origin=$origin kind=$kind priority=$priority"$'\n'"    summary: $summary"$'\n'"    file=$file")
+            d_line+=("request=$id origin=$origin kind=$kind priority=$priority"$'\n'"    summary: $summary"$'\n'"    file=$file"$'\n'"    handling: $(_requests_handling_line "$id" "$kind" "${reply:-none}")")
         fi
     done <<< "$sorted"
 

@@ -33,9 +33,10 @@ Used automatically when Pushover isn't configured. Install the [iOS](https://app
 
 Used when the tier is `emergency` and at least one push channel succeeded — or as a last-resort if every push channel failed.
 
-- **Recipient.** `notifications.email.address` (env override: `$NEXUS_EMAIL_TO`). `notifications.email.probe_address` is a disposable alias for probes only.
+- **Recipient.** `notifications.email.address`. `$NEXUS_EMAIL_TO` may only narrow it: equal to that address, or empty for no email. Any other value is refused (rc 5) and never redirects. `notifications.email.probe_address` is a disposable alias for probes only (reserved; not consumed).
+- **Mail policy** (operator rule, 2026-09-28, <your-org>/nexus-code#1663): the nexus emails **only the operator** and **never as the operator**. `notify.sh` refuses (rc 5) any recipient that is not exactly `notifications.email.address` in the PRIMARY nexus's own `config/nexus.yml` (resolved by the one-tree rule, `monitor/_nexus-root.sh`; `NEXUS_CONFIG` or `NEXUS_ROOT` naming another recipient is refused, never followed). No address configured means no email at rc 0, with the push backends unaffected. and refuses (rc 6) a sender that would carry the operator's address, local part or login. The envelope sender and recipient are set explicitly: `nexus-monitor@<host>` and the operator alone. Every message carries `Auto-Submitted: auto-generated` and a footer naming the host. `notify.sh` is the only file allowed to send mail, and `monitor/watcher/mail-path-lint.sh` enforces that.
 - **Relay.** `notifications.email.smtp_host` / `.smtp_port` (env overrides: `$NEXUS_SMTP_HOST`, `$NEXUS_SMTP_PORT`). Must accept mail from the cluster host without authentication.
-- **Body shape.** `notify.sh` enforces: subject `[nexus] <title>`; plain-text body starts with `Event: <title>` and `Issue: <click-url-or-(no link)>`, followed by the message. Sender is `nexus-monitor@<cluster-host>`.
+- **Body shape.** `notify.sh` enforces: subject `[nexus] <title>`; plain-text body starts with `Event: <title>` and `Issue: <click-url-or-(no link)>`, followed by the message. Sender is `nexus monitor <nexus-monitor@<cluster-host>>`, for the header and the envelope alike; the body ends with a footer naming the host.
 - **Inline images.** Pass `--image <path.png>`. `notify.sh` builds a `multipart/related` MIME tree — plain-text alternative plus an HTML `<img src="cid:...">` referencing the attached image. The payload travels with the mail; no public URL needed.
 
 ## `monitor/notify.sh`
@@ -49,9 +50,9 @@ monitor/notify.sh "<title>" "<body>"
                   [--require-delivery] [--quiet]
 ```
 
-Round-trip ~0.4 s per channel; `--max-time 5|6` caps per request. Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
+Round-trip ~0.4 s per channel; each request carries its own `curl --max-time` cap — 10 s for Pushover, 15 s for an ntfy upload with `--image`, 5 s for a plain ntfy post (`monitor/notify.sh:216,248,252`). Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
 
-Pass `--require-delivery` for manual probes; the helper then exits nonzero on total failure. Exit codes: `0` ok or silently-skipped, `1` usage, `2` `--require-delivery` set with no configured backend, `3` `--require-delivery` set and every backend failed, `4` missing `curl` / `python3`.
+Pass `--require-delivery` for manual probes; the helper then exits nonzero on total failure. Exit codes: `0` ok or silently-skipped, `1` usage, `2` `--require-delivery` set with no configured backend, `3` `--require-delivery` set and every backend failed, `4` missing `curl` / `python3`, `5` the email was refused because the recipient is not the operator, and `6` the email was refused because the sender would carry the operator's identity. `5` and `6` outrank a push that landed.
 
 ## `sandbox-notify` — the in-pane wake
 
@@ -63,7 +64,20 @@ sandbox-notify "watcher heartbeat stale 8 min; respawned via launcher"
 
 This emits a tmux notification in both the sandbox tmux and the outer tmux (via the chaperon). The hooks for `Notification` and `Stop` events are pre-configured so the operator sees an alert when an agent finishes a turn or needs attention.
 
-`sandbox-notify` is the right tool for **in-pane blockers** ("worker is wedged on a permission prompt, paste needed") and **end-of-turn cues** ("worker filed final report, ready for review"). For events that should reach the phone, use `notify.sh`.
+**It delivers ATTENTION, not content** (<your-org>/nexus-code#1533). The real tool assigns its argument once and never reads it again; what reaches the operator is a bare BEL. The words survive only in the nexus wrapper's decision log (`monitor/.state/notify-decisions.jsonl` — every ring, suppression, batch and digest, with the text) and, for watcher alerts, in `monitor/.state/watcher-alerts.log`. So `sandbox-notify` is the right tool for **in-pane blockers** ("worker is wedged on a permission prompt, paste needed") and **end-of-turn cues** ("worker filed final report, ready for review") — cases where the operator is at the terminal and the bell points them at a pane. For anything a human must READ, or that must reach the phone, use the operator alert below or `notify.sh`.
+
+The wrapper suppresses the harness's own `Needs attention` idle default for every agent (it fires after every turn). One context re-classifies it (#1551): when the window's last turn FAILED with no in-band remedy — a fresh `monitor/.state/turn-failure/<window>.json` with `recovery=operator`, i.e. an expired login — the same four bytes are reworded to `turn FAILED (needs operator): <window> cannot take a turn — …` and ring on the `failure` class (120 s cooldown). The harness payload cannot tell "idle" from "logged out" (`notification_type: idle_prompt` in both); the marker can.
+
+## Operator alerts — raised by the watcher, no model turn needed
+
+`monitor/watcher/_operator_alert.sh` (<your-org>/nexus-code#1548, #1533, #1534) is what the watcher uses when it alone knows the operator must act and no agent can take a turn. Keys today: `auth-expired` (the orchestrator is logged out — from the pane render or the typed `StopFailure` marker), `service-health:<name>` (an emit-only or flapping service is down while the emit route is unavailable), `auth-dialog-escaped` (an event: the watcher escaped an abandoned `/login`). Four legs, cheapest and most certain first, every one fail-open:
+
+1. **`monitor/.state/operator-alerts.jsonl`** — one JSON row per raise / reminder / clear and per leg outcome. Durable and greppable; the first place to look when asking "was the operator told, and how?".
+2. **the `watcher ALERT:` bell** via `_watcher_alert` — `watcher-alerts.log` + `watcher.log` + `sandbox-notify`. Attention.
+3. **`monitor/notify.sh --priority emergency --require-delivery`** — Pushover → ntfy → SMTP. Its record states what its rc proves: `0` is API acceptance, not device delivery; the off-terminal leg is UNVERIFIED until an operator confirms a push arrived.
+4. **a bot-authored GitHub issue `operator-alert: <key>`** on `github.repo`, @-pinging `github.user_login` — the one channel with observed delivery. One open issue per key while the condition stands; reminders comment on it; `clear` closes it.
+
+Cadence: one announcement, reminders every `monitor.watcher.operator_alert.reminder_seconds` (3600), one clear. **A flapping condition cannot flood the repo**: a `clear` finalises only after the condition has been absent for `operator_alert.clear_holddown_seconds` (300) — a raise inside the hold-down is recorded as a `flap` and neither re-rings nor re-files; a raise after the issue was closed REOPENS it rather than creating another; GitHub comments are capped at one per key per `operator_alert.comment_interval_seconds` (3600), while open/close state changes are never capped. GitHub being unreachable or rate-limiting the bot is recorded as `github-failed` with the reason; the record and the bell have already landed. Other knobs: `operator_alert.push_enabled`, `operator_alert.github_enabled`, `operator_alert.net_timeout_seconds` (each network leg is `timeout`-bounded and detached from the watcher loop). `NEXUS_NOTIFY_QUIET=1` disables both network legs.
 
 ## Trigger policy
 

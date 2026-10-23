@@ -44,13 +44,24 @@ DEMO_SESSION="${DEMO_SESSION:-cc-demo}"
 STATE_ROOT="${TMPDIR:-/tmp}/cc-harness-demo"
 MOCK_PY="$_self_dir/mock-backend.py"
 
-# trash_path: rename-aside instead of unlink when resetting demo state, so a
-# still-releasing claude over NFS can't make the reset fail with `.nfs`.
+# trash_path: a LAST RESORT only. Demo state is a throwaway and is REMOVED
+# (your-org/nexus-code#1767): trashed, it landed in `$TMPDIR/.nexus-trash`
+# (tmpfs = RAM) and was never cleared. A dying claude may still be writing
+# right after the kill-server, so settle+retry; only state that survives that
+# (an NFS `.nfs` hold) is moved aside, and said so.
 # shellcheck source=../_trash.sh
 . "$REPO_ROOT/monitor/_trash.sh"
 reset_state_root() {
     [[ -e "$STATE_ROOT" ]] || return 0
-    trash_path "$STATE_ROOT" >/dev/null 2>&1 || rm -rf "$STATE_ROOT" 2>/dev/null || true
+    local t
+    rm -rf "$STATE_ROOT" 2>/dev/null
+    [[ -e "$STATE_ROOT" ]] && { sleep 0.3; rm -rf "$STATE_ROOT" 2>/dev/null; }
+    [[ -e "$STATE_ROOT" ]] && { sleep 0.7; rm -rf "$STATE_ROOT" 2>/dev/null; }
+    if [[ -e "$STATE_ROOT" ]]; then
+        t=$(trash_path "$STATE_ROOT" 2>/dev/null) && [[ -n "$t" ]] \
+            && echo "demo.sh: $STATE_ROOT still held; moved aside to $t — clear it with monitor/_trash.sh --clear --root $(dirname "$t")" >&2
+    fi
+    return 0
 }
 
 # Parse flags (order-independent): --here picks the default-socket /
@@ -64,7 +75,28 @@ for arg in "$@"; do
     esac
 done
 
-_real_tmux() { type -P tmux 2>/dev/null || echo /usr/bin/tmux; }
+# THE REAL TMUX BINARY, NEVER A PATH-FRONT WRAPPER (your-org/nexus-code#1119).
+#
+# This was `type -P tmux 2>/dev/null || echo /usr/bin/tmux`, and in this
+# workspace that is the WRONG ANSWER BY CONSTRUCTION: `monitor/locals-env.sh`
+# and `monitor/shellenv/front-path.zsh` prepend `monitor/tmuxwrap` to the FRONT
+# of PATH for every agent process, so `type -P tmux` in an agent shell resolves
+# THE WRAPPER. Under `--here` the shim planted at :158 below then reads
+# `exec <wrapper> "$@"` with NO `-L` pin — the shape `#1105` exists to prevent,
+# planted by production code rather than a fixture. It was classified SAFE-STUB
+# by the old hand-off denylist and is UNSAFE under the mockness inversion, which
+# is how it was found.
+#
+# `nx_real_tmux_bin` discriminates on the `#!` MAGIC BYTES — the one property no
+# wrapper can shed while remaining a wrapper — and needs no list of wrapper
+# paths to keep current. It is the shared definition `#1105` asked for; sourcing
+# it here is what makes the assignment below legible to the shim scanner's
+# provenance pass, so this fix stays checkable rather than merely correct.
+# shellcheck source=../watcher/_tmux-fixture.sh
+. "$REPO_ROOT/monitor/watcher/_tmux-fixture.sh"
+_REAL_TMUX=$(nx_real_tmux_bin) || _REAL_TMUX=/usr/bin/tmux
+[[ -n "$_REAL_TMUX" ]] || _REAL_TMUX=/usr/bin/tmux
+_real_tmux() { printf '%s' "$_REAL_TMUX"; }
 # Socket args: empty under --here (default socket), -L ccdemo otherwise.
 if [[ -n "$HERE" ]]; then SOCKET_ARGS=(); else SOCKET_ARGS=(-L "$DEMO_SOCKET"); fi
 dtmux() { "$(_real_tmux)" "${SOCKET_ARGS[@]}" "$@"; }
@@ -95,7 +127,10 @@ stop_demo() {
             && echo "killed session $DEMO_SESSION (default socket)" \
             || echo "no session $DEMO_SESSION on default socket"
     else
-        dtmux kill-server 2>/dev/null && echo "killed tmux server (-L $DEMO_SOCKET)" || echo "no tmux server on -L $DEMO_SOCKET"
+        # -L spelled out HERE rather than inherited from SOCKET_ARGS: this is
+        # a kill-server, so its target must be provable from the call site,
+        # not from the branch invariant above (#644).
+        "$(_real_tmux)" -L "$DEMO_SOCKET" kill-server 2>/dev/null && echo "killed tmux server (-L $DEMO_SOCKET)" || echo "no tmux server on -L $DEMO_SOCKET"
     fi
     if [[ -f "$STATE_ROOT/mock.pid" ]]; then
         kill "$(cat "$STATE_ROOT/mock.pid")" 2>/dev/null && echo "stopped mock backend"
@@ -130,7 +165,8 @@ PY=$(_python) || { echo "no python3" >&2; exit 1; }
 if [[ -n "$HERE" ]]; then
     dtmux kill-session -t "$DEMO_SESSION" 2>/dev/null
 else
-    dtmux kill-server 2>/dev/null
+    # See stop_demo(): -L explicit so the target is provable at the call site.
+    "$(_real_tmux)" -L "$DEMO_SOCKET" kill-server 2>/dev/null
 fi
 [[ -f "$STATE_ROOT/mock.pid" ]] && kill "$(cat "$STATE_ROOT/mock.pid")" 2>/dev/null
 reset_state_root
@@ -159,9 +195,9 @@ echo "mock backend up on 127.0.0.1:$PORT (no auth, no egress)"
 # PATH-shadow tmux so pane-state.sh hits our socket. Under --here the demo
 # lives on the default socket, so the shadow forwards verbatim (no -L).
 if [[ -n "$HERE" ]]; then
-    printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(_real_tmux)" > "$STATE_ROOT/.bin/tmux"
+    printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$_REAL_TMUX" > "$STATE_ROOT/.bin/tmux"
 else
-    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$(_real_tmux)" "$DEMO_SOCKET" > "$STATE_ROOT/.bin/tmux"
+    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$_REAL_TMUX" "$DEMO_SOCKET" > "$STATE_ROOT/.bin/tmux"
 fi
 chmod +x "$STATE_ROOT/.bin/tmux"
 

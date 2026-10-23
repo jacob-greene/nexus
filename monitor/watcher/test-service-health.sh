@@ -28,6 +28,9 @@
 #   emit         re-nag guarded (identical status:attempts suppressed);
 #                ALWAYS reports the policy + full current state (grace /
 #                restart attempt + outcome / escalation).
+#   stop request a `svc.sh stop` sentinel suspends the whole DOWN machine
+#                (no incident, no restart, no emit); an incident open when it
+#                lands is closed; withdrawn ⇒ restarts resume (#1827).
 #   generator    `ng service-incident` emits all five required sections
 #                from the recorded state + the verbatim event timeline,
 #                including the restart policy.
@@ -128,6 +131,227 @@ reset_state() {
 }
 
 # ===========================================================================
+echo "## FINDING (your-org/nexus-code#1423): healthcheck exit 100 = alive, condition present"
+# A monitor registered as a service (tmpfs-guard --check) says two different
+# things with one exit code: "I am down" and "the thing I watch is present".
+# Rendered as DOWN, the second sent readers to `svc.sh restart` — a remedy that
+# changes nothing. Exit 100 is the third word. The fixture healthcheck reads a
+# mode file: absent → healthy; present → its text is the finding, exit 100.
+reset_state
+FINDMODE="$WD/finding"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+printf 'tmpfs-guard: UNHEALTHY: /tmp is over threshold — entries 14094 > 6000\n' > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+assert_no_file "a finding opens NO incident (no .state)" "$SHDIR/myservice.state"
+assert_file_exists "a finding is recorded in its own sidecar" "$SHDIR/myservice.finding"
+assert_eq      "no svc.sh restart on a finding" "$(wc -l < "$SVC_CALLS")" "0"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_eq      "finding emit rc=0 (something to surface)" "$erc" "0"
+assert_contains "finding emit says UP + FINDING, not an outage" "$emit" "is UP and reports a FINDING"
+assert_contains "finding emit carries the healthcheck's own text" "$emit" "entries 14094 > 6000"
+assert_not_contains "finding emit never says DOWN" "$emit" "DOWN"
+assert_not_contains "finding emit never offers svc.sh restart as the remedy" "$emit" "restart now:"
+assert_contains "finding emit says a restart changes nothing" "$emit" "do NOT svc.sh restart"
+emit2=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc2=$?
+assert_empty   "same finding text ⇒ re-nag guarded (second emit empty)" "$emit2"
+assert_eq      "same finding ⇒ emit rc=1" "$erc2" "1"
+printf 'tmpfs-guard: UNHEALTHY: /tmp is over threshold — entries 20000 > 6000\n' > "$FINDMODE"
+NEXUS_TEST_NOW=1060 _service_health_check_tick
+emit3=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a CHANGED finding text re-surfaces" "$emit3" "entries 20000 > 6000"
+assert_eq      "still no svc.sh restart after a changed finding" "$(wc -l < "$SVC_CALLS")" "0"
+rm -f "$FINDMODE"
+NEXUS_TEST_NOW=1120 _service_health_check_tick
+assert_no_file "check green ⇒ the finding sidecar is gone" "$SHDIR/myservice.finding"
+emit4=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc4=$?
+assert_contains "cleared ⇒ ONE breadcrumb naming the finding" "$emit4" "finding CLEARED"
+assert_contains "the breadcrumb carries the last text" "$emit4" "entries 20000 > 6000"
+emit5=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty   "cleared breadcrumb surfaces once" "$emit5"
+assert_eq      "events file carries finding + finding-cleared" "$(grep -cE $'\t(finding|finding-cleared)\t' "$SHDIR/myservice.events")" "3"
+# The incident machine is unaffected: a NON-100 failure of the same fixture
+# still opens an incident (the control that this is a third word, not a
+# relaxation of the second).
+reset_state
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+assert_file_exists "CONTROL: a plain non-zero still opens an incident" "$SHDIR/myservice.state"
+set_policy ""
+
+# ===========================================================================
+echo "## FINDING: the STABLE SUPPRESSION KEY (your-org/nexus-code#1423)"
+# The finding's dedupe key used to be its own rendered text, and the text
+# carries live counters. MEASURED on tmpfs-guard: `14129` at 05:00:39 and
+# `14127` at 05:02:39 re-fired the finding within two minutes, while the state
+# a reader cares about — still over threshold — had changed zero times. A
+# finding that arrives repeatedly with no change in meaning is the fastest way
+# to train a reader to skip it, which is the same failure the DOWN-plus-
+# useless-restart wording had, arriving from the other direction.
+reset_state
+FINDMODE="$WD/finding"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14129 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=high:conds=tmp_capacity\n'
+  printf 'finding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a keyed finding still surfaces the first time" "$emit" "is UP and reports a FINDING"
+assert_not_contains "the finding-key: protocol line is NOT rendered as prose" "$emit" "finding-key:"
+assert_not_contains "the finding-band: protocol line is NOT rendered as prose" "$emit" "finding-band:"
+# THE ENTRY: the counter moves, the KEY does not.
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14127 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=high:conds=tmp_capacity\n'
+  printf 'finding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1120 _service_health_check_tick
+emit2=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc2=$?
+assert_empty "a COUNTER drift under an unchanged key does NOT re-surface (the #1423 defect)" "$emit2"
+assert_eq    "…and the emit reports nothing to say (rc 1)" "$erc2" "1"
+# POTENCY: it is the KEY that suppresses, not the emit being broken.
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14127 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=critical:conds=tmp_capacity,node_memory\n'
+  printf 'finding-band: 3\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1240 _service_health_check_tick
+emit3=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "POTENCY: a CHANGED key re-surfaces immediately" "$emit3" "is UP and reports a FINDING"
+# The BODY is the product for a finding: the whole stderr, not a 300-char cut.
+reset_state
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — band high\n'
+  printf 'finding-key: k1\nfinding-band: 2\n'
+  printf '  top families BY BYTES:\n'
+  printf '    olay-guard    6.0 GiB   532   operator   18%%\n'
+  printf '    owners by bytes: operator=33.4 GiB(100%%)\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "the finding body is rendered, not truncated to the verdict line" "$emit" "owners by bytes: operator=33.4 GiB(100%)"
+assert_contains "…under a details: heading"                                       "$emit" "details:"
+assert_file_exists "…and stored in its own sidecar (a key=value file cannot hold it)" "$SHDIR/myservice.finding-body"
+
+# ===========================================================================
+echo "## FINDING: unhealthy -> finding is a VOCABULARY TRANSITION, not a recovery (#1423)"
+# MEASURED, both rows at the SAME SECOND on the live board:
+#   05:00:39  finding    healthcheck exit 100 (alive, condition present)
+#   05:00:39  recovered  recovered with NO live supervisor — cause UNKNOWN
+# The condition never cleared; the healthcheck's exit code changed, 1 -> 100.
+# The recovered path then prescribes `ng service-incident`, which generates an
+# operator template saying RESTART THE WORKSPACE — the exact action the finding
+# path forbids three lines above it in the same emit.
+reset_state
+set_policy emit-only
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\temit-only\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick          # detected: incident opens
+NEXUS_TEST_NOW=1100 _service_health_check_tick          # past grace: escalates
+assert_file_exists "CONTROL: a real incident is open before the transition" "$SHDIR/myservice.state"
+_service_health_emit_section "$SHDIR" "$ROOT" >/dev/null 2>&1 || true
+# Now the SAME condition, reported with the new vocabulary.
+{ printf 'tmpfs-guard: FINDING: /tmp is over threshold\nfinding-key: k1\nfinding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+assert_no_file  "the incident is CLOSED, not left open" "$SHDIR/myservice.state"
+assert_file_exists "…and a finding sidecar exists instead" "$SHDIR/myservice.finding"
+assert_eq "NO 'recovered' event is recorded for a transition that restored nothing" \
+    "$(grep -c $'\trecovered\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "0"
+assert_eq "a 'reclassified' event IS recorded" \
+    "$(grep -c $'\treclassified\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_not_contains "the emit never says RECOVERED, CAUSE UNKNOWN"       "$emit" "CAUSE UNKNOWN"
+assert_not_contains "…and never uses the RECOVERED vocabulary"           "$emit" "RECOVERED"
+assert_not_contains "…and never prints the recovered arm's close-the-loop advice" "$emit" "close the loop"
+assert_contains     "it says the finding SUPERSEDES the open incident"   "$emit" "SUPERSEDES AN OPEN INCIDENT"
+# The status an emit-only escalation writes is `emit-only`, not `escalated`
+# — verified against the module rather than assumed, which is the whole point
+# of asserting on it: the supersession line must name the REAL prior status.
+assert_contains     "…naming the status it superseded"                   "$emit" "was \`emit-only\` since"
+assert_contains     "…and warning off the outage template by name"       "$emit" "Do NOT file"
+assert_eq "still no svc.sh restart anywhere in the transition" "$(wc -l < "$SVC_CALLS")" "0"
+# CONTROL: a REAL recovery (green, not a finding) still attributes as before.
+reset_state
+set_policy emit-only
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+NEXUS_TEST_NOW=1100 _service_health_check_tick
+touch "$OKFLAG"
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+assert_eq "CONTROL: an actually-green transition still records 'recovered'" \
+    "$(grep -c $'\trecovered\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+set_policy ""
+
+# ===========================================================================
+echo "## FINDING: mute-until — expires, is owned, breaks on a worse band (#1423)"
+# Four constraints, each from something that bit this repo the same week. An
+# invalid or expired mute is IGNORED LOUDLY, never obeyed quietly: a
+# suppression that fails OPEN hides the thing it was asked to hide for a
+# reason nobody stated.
+mk_finding() {   # <key> <band>
+    { printf 'svc: FINDING: condition present\nfinding-key: %s\nfinding-band: %s\n' "$1" "$2"; } > "$FINDMODE"
+}
+arm_finding_service() {
+    reset_state
+    printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+    touch "$OKFLAG"
+}
+FUTURE=$(date -d '+30 days' +%F 2>/dev/null || echo 2099-01-01)
+PAST=$(date -d '-1 day' +%F 2>/dev/null || echo 2000-01-01)
+
+arm_finding_service; mk_finding k-mute 1
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+printf 'service=myservice\nowner=operator\nreason=accepted, tracked\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_empty "a VALID mute (owner + reason + future until: + band) suppresses the emit" "$emit"
+assert_eq    "…and the emit has nothing to surface (rc 1)" "$erc" "1"
+assert_file_exists "…while the sidecar KEEPS TRACKING the condition underneath" "$SHDIR/myservice.finding"
+
+# 1+2: OWNERSHIP. Same #1482 rule as a `none` positive-control row.
+printf 'service=myservice\nowner=operator\nreason=just because\nband=1\n' > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "an UNOWNED mute (no until: and no tracker) is REFUSED, loudly" "$emit" "MUTE REFUSED"
+assert_contains "…and the finding is emitted anyway"                            "$emit" "is UP and reports a FINDING"
+printf 'service=myservice\nreason=r\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a mute with no owner= is REFUSED" "$emit" "MUTE REFUSED"
+printf 'service=myservice\nowner=k\nreason=r\ntracker=your-org/nexus-code#1423\nband=1\n' > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty "CONTROL: a TRACKER ref satisfies ownership just as an until: date does" "$emit"
+
+# 1: EXPIRY.
+printf 'service=myservice\nowner=k\nreason=r\nuntil=%s\nband=1\n' "$PAST" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "an EXPIRED mute stops suppressing and says so" "$emit" "MUTE EXPIRED"
+assert_contains "…and the finding is emitted anyway"            "$emit" "is UP and reports a FINDING"
+
+# 3: THE BAND BREAK. This is the constraint that stops a mute becoming the
+# mechanism by which the incident this tool exists to catch goes unreported.
+printf 'service=myservice\nowner=k\nreason=r\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty "CONTROL: at the muted band it is still silent" "$emit"
+mk_finding k-mute-worse 3
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a WORSE band BREAKS the mute, so 10 pct to 77 pct can never be silent" "$emit" "MUTE BROKEN"
+assert_contains "…naming the bands it crossed"                                     "$emit" "band 1 into band 3"
+assert_contains "…and emitting the finding"                                        "$emit" "is UP and reports a FINDING"
+
+# 4: `muted` AND `cleared` ARE DISTINGUISHABLE IN THE RECORD.
+rm -f "$FINDMODE"
+NEXUS_TEST_NOW=1300 _service_health_check_tick
+assert_no_file "a green check clears the finding sidecar" "$SHDIR/myservice.finding"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "the CLEARED breadcrumb says it is a real clear, not a mute" "$emit" "not a mute"
+assert_eq "the events history distinguishes them: one finding-cleared, no 'muted' row" \
+    "$(grep -c $'\tfinding-cleared\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+rm -f "$SHDIR/myservice.finding-mute"
+set_policy ""
+
+# ===========================================================================
 echo "## healthy service ⇒ no incident, no emit"
 reset_state
 touch "$OKFLAG"
@@ -173,7 +397,7 @@ assert_contains "grace emit says grace window" "$emit" "grace window"
 assert_contains "grace emit reports policy"    "$emit" "policy: auto-restart"
 assert_contains "grace emit is no-action"      "$emit" "No action needed yet"
 # A grace emit must NOT claim a restart is happening.
-if printf '%s' "$emit" | grep -q "auto-restart in progress"; then
+if grep -q "auto-restart in progress" <<<"$emit"; then
     assert_eq "grace emit does not claim restart-in-progress" "leaked" "clean"
 else
     assert_eq "grace emit does not claim restart-in-progress" "clean" "clean"
@@ -193,7 +417,7 @@ assert_eq      "status=recovered after self-heal" "$status" "recovered"
 recovered_via=$(_sh_field "$SHDIR/myservice.state" recovered_via)
 assert_contains "recovered_via marks within-grace self-heal" "$recovered_via" "self-healed within grace"
 events=$(cat "$SHDIR/myservice.events")
-if printf '%s' "$events" | grep -q "restart-issued"; then
+if grep -q "restart-issued" <<<"$events"; then
     assert_eq "no restart-issued event for a self-heal" "leaked" "clean"
 else
     assert_eq "no restart-issued event for a self-heal" "clean" "clean"
@@ -442,11 +666,32 @@ while :; do sleep 0.2; done
 EOF
 chmod +x "$WD/launch.sh"
 SUP_PID=""
+# your-org/nexus-code#568 D7. Two defects, both here:
+#   1. The wait loop `break`s on timeout and then RETURNS SUCCESS, so all five
+#      call sites proceeded believing "a live supervisor exists" when it may
+#      not. A fixture that is silently wrong asserts nothing — the same
+#      failure the `start_build` helper at :783 already guards against by
+#      refusing to proceed. Do the same here.
+#   2. The 15 s deadline was UNSCALED, in the exact subsystem `th_deadline`
+#      was written for (#558): under `--jobs N` on a busy host the fixture
+#      legitimately needs longer, and an unscaled deadline turns load into a
+#      test failure. Only four files in the suite used the helper; this one
+#      sources it already.
 start_supervisor() { bash "$WD/launch.sh" >/dev/null 2>&1 & SUP_PID=$!; echo "$SUP_PID" > "$PIDFILE"
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) )) up=0
     until [[ "$(tr '\0' ' ' < "/proc/$SUP_PID/cmdline" 2>/dev/null)" == *launch.sh* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
-    done; }
+    done
+    [[ "$(tr '\0' ' ' < "/proc/$SUP_PID/cmdline" 2>/dev/null)" == *launch.sh* ]] && up=1
+    if (( up == 0 )); then
+        # Refuse to proceed on a fixture that does not satisfy the contract
+        # under test — exactly what start_build does at :790. A `return 1` here
+        # would be swallowed (this suite runs `set -uo pipefail`, not `-e`), so
+        # the five call sites would carry on believing a supervisor is live.
+        echo "supervisor fixture broken: pid $SUP_PID never exec'd launch.sh within $(th_deadline 15)s" >&2
+        exit 1
+    fi
+    return 0; }
 stop_supervisor() { [[ -n "$SUP_PID" ]] && { kill "$SUP_PID" 2>/dev/null; wait "$SUP_PID" 2>/dev/null; }; SUP_PID=""; }
 # A PID that is provably not a live supervisor: spawned, exited, reaped. Even
 # in the pathological case where the kernel recycles it, the cmdline guard in
@@ -587,6 +832,34 @@ assert_contains     "emit says RECOVERED BY INTERVENTION" "$emit" "RECOVERED BY 
 assert_not_contains "emit never calls a rescued outage a transient blip" "$emit" "Transient blip"
 assert_contains     "emit states action was warranted" "$emit" "NOT a transient blip"
 assert_no_file "restart marker consumed on incident close" "$SHDIR/myservice.restart"
+
+# your-org/nexus-code#1456: a VERSION-RESTART is neither a self-heal nor an
+# operator action. Before this arm existed the marker's `actor=version-restart`
+# fell into the operator arm and the emit read "RESTORED by operator
+# intervention" for a restart no human made — inverting the diagnosis.
+echo
+echo "## a VERSION-RESTART is attributed as source drift — not a self-heal, not an operator"
+reset_incon
+rm -f "$OKFLAG"
+set_policy "emit-only"
+NEXUS_TEST_NOW=4000 _service_health_check_tick        # → grace
+NEXUS_TEST_NOW=4100 _service_health_check_tick        # grace elapsed → emit-only escalation
+# _version_restart.sh restarts it through svc.sh with SVC_RESTART_ACTOR set.
+printf 'actor=version-restart\nat=4150\niso=2026-09-04T14:11:20-07:00\n' > "$SHDIR/myservice.restart"
+touch "$OKFLAG"
+NEXUS_TEST_NOW=4200 _service_health_check_tick        # → recovered
+assert_eq "recovered_by=version-restart (from the marker's actor)" \
+    "$(_sh_field "$SHDIR/myservice.state" recovered_by)" "version-restart"
+via=$(_sh_field "$SHDIR/myservice.state" recovered_via)
+assert_contains     "recovered_via names source drift" "$via" "source drift"
+assert_not_contains "recovered_via never attributes an operator INTERVENTION" "$via" "operator intervention"
+assert_not_contains "recovered_via never says self-heal" "$via" "self-healed"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains     "emit says RESTARTED BY VERSION-RESTART" "$emit" "RESTARTED BY VERSION-RESTART"
+assert_not_contains "emit never calls it an INTERVENTION" "$emit" "INTERVENTION"
+assert_contains     "emit says no operator acted" "$emit" "No operator acted"
+assert_not_contains "emit never calls it a transient blip" "$emit" "Transient blip"
+assert_no_file "restart marker consumed on incident close (version-restart)" "$SHDIR/myservice.restart"
 
 echo
 echo "## a WATCHER auto-restart is still attributed to the watcher"
@@ -734,6 +1007,83 @@ assert_no_file  "incident closed" "$SHDIR/myservice.state"
 stop_supervisor
 
 # ===========================================================================
+# STOPPED BY REQUEST (your-org/nexus-code#1827). `svc.sh stop <name>` writes a
+# sentinel beside the pidfile; while it stands a DOWN service is not an outage:
+# no incident, no restart, no emit. Measured before the fix: a stop meant to
+# hold an auto-deploy was auto-restarted (attempt 1/3) within ~3 min. The
+# literal path is pinned here (not `_sh_stop_sentinel`) so the suite also pins
+# the layout svc.sh writes — test-svc.sh case 18 pins the writer side.
+STOPSF="$SVCPIDDIR/myservice.stop-requested"
+write_stop() { printf 'at=%s\niso=%s\nby=%s\n' "${1:-1000}" "2026-10-13T16:05:00-07:00" "w1" > "$STOPSF"; }
+reset_stop() { reset_incon; rm -f "$STOPSF"; }
+echo
+echo "## stopped by request ⇒ never restarted, no incident, no emit (#1827)"
+reset_stop
+assert_eq "the module's sentinel path is the layout svc.sh writes" \
+    "$(declare -F _sh_stop_sentinel >/dev/null && _sh_stop_sentinel myservice)" "$STOPSF"
+rm -f "$OKFLAG"; write_stop
+_shlog=$( { NEXUS_TEST_NOW=6000 _service_health_check_tick; } 2>&1 )
+NEXUS_TEST_NOW=6040 _service_health_check_tick 2>/dev/null     # past grace (30)
+NEXUS_TEST_NOW=6400 _service_health_check_tick 2>/dev/null     # past cooldown (300)
+assert_eq      "no svc.sh restart while stopped by request" "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_no_file "no incident .state for a requested stop" "$SHDIR/myservice.state"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_eq      "nothing surfaced to the orchestrator" "$erc" "1"
+assert_contains "log reports 'stopped by request since <ts>'" "$_shlog" "stopped by request since 2026-10-13T16:05:00-07:00"
+assert_eq      "stopped-by-request recorded ONCE across three ticks" \
+    "$(grep -c 'stopped-by-request' "$SHDIR/myservice.events" 2>/dev/null)" "1"
+assert_file_exists "the sentinel is left standing" "$STOPSF"
+
+echo
+echo "## a stop landing mid-incident closes the incident instead of restarting (#1827)"
+reset_stop
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=7000 _service_health_check_tick 2>/dev/null     # grace
+assert_eq "PRECONDITION: incident open in grace" "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+write_stop
+NEXUS_TEST_NOW=7040 _service_health_check_tick 2>/dev/null     # would have restarted
+assert_eq      "no restart after the stop request" "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_no_file "the open incident record is closed" "$SHDIR/myservice.state"
+assert_contains "the event names the closed incident" "$(cat "$SHDIR/myservice.events")" "closed the open 'grace' incident"
+
+echo
+echo "## NEGATIVE CONTROL: request cleared (svc.sh start) ⇒ a dead service is restarted as before"
+# The stopped state above leaves its sidecar; clearing only the sentinel is
+# exactly what `svc.sh start|restart` does.
+rm -f "$STOPSF"
+NEXUS_TEST_NOW=8000 _service_health_check_tick 2>/dev/null     # fresh incident, grace
+NEXUS_TEST_NOW=8040 _service_health_check_tick 2>/dev/null     # past grace → act
+assert_eq "restart issued once the request is withdrawn" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+assert_no_file "the once-per-stop sidecar is retired with the request" "$SHDIR/myservice.stop-noted"
+
+echo
+echo "## a request is SUPERSEDED only by a supervisor launched AFTER it (#1827)"
+reset_stop
+touch "$OKFLAG"; start_supervisor
+write_stop; touch -d '@1000000000' "$PIDFILE"                   # pidfile OLDER than the stop
+NEXUS_TEST_NOW=9000 _service_health_check_tick 2>/dev/null
+assert_file_exists "an older supervisor does not withdraw the request" "$STOPSF"
+touch -d '@1000000000' "$STOPSF"; touch "$PIDFILE"               # launched after the stop
+NEXUS_TEST_NOW=9001 _service_health_check_tick 2>/dev/null
+assert_no_file "a newer live supervisor + green check withdraws it" "$STOPSF"
+assert_contains "the withdrawal is recorded" "$(cat "$SHDIR/myservice.events")" "stop-request-superseded"
+stop_supervisor
+
+echo
+echo "## svc.sh refusing an automated restart (rc 76) is not counted as an attempt (#1827)"
+reset_stop
+REFUSE_STUB="$WORK/svc-refuse.sh"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 76\n' "$SVC_CALLS" > "$REFUSE_STUB"
+chmod +x "$REFUSE_STUB"
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=9500 _service_health_check_tick 2>/dev/null
+SERVICE_HEALTH_SVC_BIN="$REFUSE_STUB" NEXUS_TEST_NOW=9540 _service_health_check_tick 2>/dev/null
+assert_eq      "the refused restart was attempted once" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+assert_no_file "no incident left counting toward the flap ceiling" "$SHDIR/myservice.state"
+assert_contains "recorded as a refusal, not a failure" "$(cat "$SHDIR/myservice.events")" "rc=76"
+rm -f "$STOPSF"
+
+# ===========================================================================
 # labsh COLD-BUILD awareness (your-org/nexus-code#326 follow-up). A
 # jupyter/labsh service's healthcheck fails for the ENTIRE ~10-min cold `uvx`
 # build; #326 taught the SUPERVISOR to wait for it, but the watcher's
@@ -770,17 +1120,34 @@ JREG_LAUNCH="$WORK/fake-monitor/labsh-supervised.sh"   # string only; never exec
 # runner's output pipe open.
 BUILD_BIN="$JWD/uv"                       # /proc/<pid>/exe basename → uv
 cp "$(command -v bash)" "$BUILD_BIN"
+# fixture-port-lint: allow-never-bound  JPORT is written into a fixture env
+# file and passed as an argv token to a FAKE build process (a copied bash
+# spinning in a loop). No process in this suite binds it, so it cannot be
+# seized (your-org/nexus-code#800).
 JPORT=$(( 49152 + (RANDOM % 16000) ))     # ephemeral; never a labsh port
 printf 'PORT=%s\n' "$JPORT" > "$JDIR/labsh-service.env"
 BUILD_PID=""
+# The build's BODY decides what the shared progress verdict
+# (`labsh_build_release`, your-org/nexus-code#1676) sees:
+#   default      the historical spinner — forks a sleep every 0.2 s (ambiguous
+#                progress; used where only identity matters)
+#   progressing  appends one byte per 0.2 s, so /proc/<pid>/io wchar GROWS —
+#                a slow build that is still moving
+#   stalled      one long `sleep`: bash blocks in wait(), no CPU, no bytes —
+#                a wedged build
+BUILD_BODY_DEFAULT='while :; do sleep 0.2; done'
+BUILD_BODY_PROGRESSING="while :; do printf x >> '$JWD/.prog'; sleep 0.2; done"
+BUILD_BODY_STALLED='sleep 600; :'
 start_build() {   # simulate labsh's backgrounded cold uvx build (no URL yet)
+    local body="${1:-$BUILD_BODY_DEFAULT}"
     : > "$JDIR/labsh.bg.log"       # build log with NO "running at" URL line
+    rm -f "$JDIR/labsh.buildprogress"
     # cwd MUST be the service workdir — that is the identity signal.
-    ( cd "$JWD" && exec "$BUILD_BIN" -c 'while :; do sleep 0.2; done' \
+    ( cd "$JWD" && exec "$BUILD_BIN" -c "$body" \
         tool uvx --from jupyterlab jupyter-lab --port "$JPORT" --no-browser ) >/dev/null 2>&1 &
     BUILD_PID=$!
     echo "$BUILD_PID" > "$JDIR/labsh.bg.pid"
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) ))
     until [[ "$(tr '\0' ' ' < "/proc/$BUILD_PID/cmdline" 2>/dev/null)" == *jupyter-lab* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
     done
@@ -805,7 +1172,7 @@ start_impostor() {
     ( cd "$WORK" && exec "$IMPOSTOR_BIN" -c 'while :; do sleep 0.2; done' \
         tool uvx --from jupyterlab jupyter-lab --port "$JPORT" --no-browser ) >/dev/null 2>&1 &
     IMPOSTOR_PID=$!
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) ))
     until [[ "$(tr '\0' ' ' < "/proc/$IMPOSTOR_PID/cmdline" 2>/dev/null)" == *jupyter-lab* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
     done
@@ -818,7 +1185,8 @@ jreg() {   # write a jupyter/labsh registry row (health = flag-file probe)
 }
 reset_jup() {
     rm -rf "$SHDIR"; mkdir -p "$SHDIR"
-    : > "$SVC_CALLS"; rm -f "$FIXFLAG" "$JOK" "$JDIR/labsh.bg.pid"
+    : > "$SVC_CALLS"; rm -f "$FIXFLAG" "$JOK" "$JDIR/labsh.bg.pid" "$JDIR/labsh.buildprogress"
+    unset LABSH_BUILD_STALL_SECONDS LABSH_COLD_BUILD_HARD_CAP
     jreg
     export MONITOR_SERVICE_HEALTH_GRACE_SECONDS=30
     export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=300
@@ -943,36 +1311,128 @@ assert_eq "a bound-but-wedged server is still restarted after grace" \
 stop_build
 
 echo
-echo "## cold-build ceiling ⇒ a pathological never-binding build is eventually restarted"
+echo "## #1676: the ceiling runs on the BUILD's clock, not the incident's (the 2026-09-29 kill loop)"
+# Live shape: the incident opened 13:16:31; each watcher restart started a NEW
+# build; once the INCIDENT was 1800 s old every new build was "past the
+# ceiling" at birth and was force-killed at the next cooldown. Here: an incident
+# 2000 s old (> the 1800 s ceiling) and a build seconds old. RED on origin/dev
+# 33a44f48 (it restarts, forced); GREEN with the build's own age deciding.
 reset_jup
-: > "$SVC_FORCE_CALLS"             # scope the SVC_FORCE assertions to THIS case
+: > "$SVC_FORCE_CALLS"
 export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
-rm -f "$JOK"; start_build          # a build that never binds a URL
-NEXUS_TEST_NOW=20000 _service_health_check_tick        # cold-build
-assert_eq "still cold-build within the ceiling" \
+rm -f "$JOK"
+NEXUS_TEST_NOW=20000 _service_health_check_tick        # the service went down (no build yet)
+start_build "$BUILD_BODY_PROGRESSING"                   # a relaunch's FRESH build
+NEXUS_TEST_NOW=22000 _service_health_check_tick        # incident 2000 s old
+NEXUS_TEST_NOW=22400 _service_health_check_tick        # …and past every cooldown
+assert_eq "a FRESH build in an OLD incident is NOT restarted" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+assert_eq "…and reads cold-build, not recovering" \
     "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
-assert_eq "no restart within the ceiling" "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
-NEXUS_TEST_NOW=21801 _service_health_check_tick        # >1800s in → ceiling passed
-assert_eq "past the ceiling the watcher restarts even a still-'building' service" \
-    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
-
-# ── CLOCK ORIGIN: the ceiling must actually GET THROUGH svc.sh's guard ───────
-# The assertion above only proves we CALLED svc.sh. It passed all through round
-# 1 while the call was being REFUSED: svc.sh's cold-build guard ages the build
-# from the BUILD PROCESS (etimes), this module ages the incident from
-# FIRST_UNHEALTHY, and a build can only start after the service is already
-# unhealthy — so at our ceiling the build is always younger than the guard's cap
-# and the guard vetoed us. One wasted restart attempt out of three, every time;
-# permanent `flapping` (recovery dead) once that offset exceeds the restart
-# budget. Two clocks, same 1800s duration, different origins.
-#
-# We resolve it by deciding ONCE, here, on OUR clock, and telling svc.sh:
-# SVC_FORCE=1. These assertions FAIL if that coupling is ever broken.
-assert_eq "past the ceiling the watcher FORCES through svc.sh's cold-build guard (clock-origin fix)" \
-    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
-assert_eq "the forced restart is the one issued at the ceiling (no un-forced restart of a live build)" \
-    "$(grep -c 'restart:jupyter-fix SVC_FORCE=0' "$SVC_FORCE_CALLS")" "0"
+assert_contains "the note gives the build's age verdict (within its ceiling)" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "inside the 1800s ceiling"
 stop_build
+
+echo "## #1676: a build PAST the ceiling that is still PROGRESSING is NOT restarted"
+# The requirement: a stub whose build takes longer than the ceiling but shows
+# progress must not be restarted. Ceiling 1 s so the (real) build age is past
+# it; the build appends a byte every 0.2 s, so the shared progress counter
+# moves between ticks. RED on origin/dev 33a44f48: it restarts past the ceiling.
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_BUILD_STALL_SECONDS=2
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2                                               # build age now > ceiling
+NEXUS_TEST_NOW=23000 _service_health_check_tick
+sleep 2.5                                               # > the stall window — but it MOVED
+NEXUS_TEST_NOW=23400 _service_health_check_tick
+sleep 2.5
+NEXUS_TEST_NOW=23800 _service_health_check_tick
+assert_eq "a slow-but-progressing build past the ceiling is NEVER restarted" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+assert_eq "…status stays cold-build" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
+assert_contains "…and the note says why: past the ceiling but still making progress" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "still making progress"
+assert_eq "…no attempt counted toward the flap ceiling" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" restart_attempts)" "0"
+stop_build
+
+echo "## #1676 NEGATIVE: a STALLED build past the ceiling IS restarted, forced, and says so"
+# The half that keeps recovery alive: a build that stops moving for the whole
+# stall window is presumed wedged and released — through svc.sh's guard
+# (SVC_FORCE=1), with the reason in the event and counted in build_kills.
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_BUILD_STALL_SECONDS=2
+rm -f "$JOK"; start_build "$BUILD_BODY_STALLED"
+sleep 1.2
+NEXUS_TEST_NOW=24000 _service_health_check_tick        # baseline sample; not yet provably stalled
+assert_eq "first sight of a quiet build is not yet a stall (no restart)" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+sleep 2.5                                               # no CPU, no bytes, no log for > 2 s
+NEXUS_TEST_NOW=24400 _service_health_check_tick
+assert_eq "a stalled build past the ceiling IS restarted (recovery not weakened)" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
+assert_eq "…FORCED through svc.sh's cold-build guard" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
+assert_contains "…the event names the build it killed and why (stalled)" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "killed live labsh build pid $BUILD_PID (stalled)"
+assert_eq "…and build_kills records it" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" build_kills)" "1"
+stop_build
+
+echo "## #1676: past the HARD cap even a progressing build is released (the backstop)"
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_COLD_BUILD_HARD_CAP=1
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2
+NEXUS_TEST_NOW=25000 _service_health_check_tick
+NEXUS_TEST_NOW=25400 _service_health_check_tick
+assert_eq "past the hard cap the build is restarted, forced" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
+assert_contains "…and the event says hard cap, not stall" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "(past-hard-cap)"
+stop_build
+
+echo "## #1676: FLAPPING reached through build kills says so"
+reset_jup
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_COLD_BUILD_HARD_CAP=1
+export MONITOR_SERVICE_HEALTH_FLAP_CEILING=1
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=0
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2
+NEXUS_TEST_NOW=26000 _service_health_check_tick
+NEXUS_TEST_NOW=26100 _service_health_check_tick        # attempt 1 kills the (released) build
+NEXUS_TEST_NOW=26200 _service_health_check_tick        # ceiling 1 reached
+assert_eq "flap ceiling reached" "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "flapping"
+assert_contains "the flapping note says the attempts were WEDGED BUILDS" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "repeated WEDGED BUILDS"
+stop_build
+
+echo "## #1676: a REFUSED restart (svc.sh rc 75) is not counted as an attempt"
+# 2026-09-29 14:24:28: the watcher saw no build, svc.sh's guard did, refused
+# (rc 1 then) — and that refusal was attempt 1/3 toward FLAPPING.
+reset_jup
+rm -f "$JOK"
+REFUSE_STUB="$WORK/svc-refuse-stub.sh"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 75\n' "$SVC_CALLS" > "$REFUSE_STUB"; chmod +x "$REFUSE_STUB"
+SERVICE_HEALTH_SVC_BIN="$REFUSE_STUB"
+NEXUS_TEST_NOW=27000 _service_health_check_tick        # grace
+NEXUS_TEST_NOW=27100 _service_health_check_tick        # past grace → restart → REFUSED
+SERVICE_HEALTH_SVC_BIN="$SVC_STUB"
+assert_eq "svc.sh was asked once" "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
+assert_eq "…and the refusal did NOT count as an attempt" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" restart_attempts)" "0"
+assert_eq "…status is cold-build (deferred), not recovering" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
+assert_contains "…with a restart-deferred event" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "restart-deferred"
 
 # A restart with NO live build must NOT be forced: forcing unconditionally would
 # silently re-arm the original footgun (an operator/watcher discarding a build
@@ -987,5 +1447,263 @@ assert_eq "no live build ⇒ watcher does NOT set SVC_FORCE" \
     "$(grep -c 'restart:jupyter-fix SVC_FORCE=0' "$SVC_FORCE_CALLS")" "1"
 assert_eq "no live build ⇒ nothing was force-restarted" \
     "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "0"
+
+# ============================================================================
+# OPERATOR ALERT WHEN THE EMIT ROUTE IS UNAVAILABLE (your-org/nexus-code#1534)
+# ============================================================================
+# Measured on dev 353867a0: this module had ZERO alert-helper hits against 7 in
+# main.sh, so an emit-only service dying during an auth hold, an over-limit
+# hold or an absent target reached nobody. The two seams are driven here with
+# recorders; the module is the real one. Both premises are required — an
+# escalation AND a known-unavailable route — and each is removed in turn.
+echo "## #1534: an emit-only escalation while the emit route is BLOCKED raises the operator alert"
+OPCAP="$WORK/opalerts"; : > "$OPCAP"
+OPSTAND="$WORK/opstanding"
+_rec_op() {
+    case "${1:-}" in
+        due)      return 0 ;;
+        standing) [[ -f "$OPSTAND.${2:-}" ]] ;;
+        raise)    : > "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        clear)    rm -f "$OPSTAND.${2:-}"; printf '%s\n' "$*" >> "$OPCAP" ;;
+        *)        printf '%s\n' "$*" >> "$OPCAP" ;;
+    esac
+}
+ROUTE_REASON=""            # empty = route open (rc 1); non-empty = blocked, printed
+_route() { [[ -n "$ROUTE_REASON" ]] || return 1; printf '%s' "$ROUTE_REASON"; return 0; }
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_rec_op
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_route
+
+reset_state
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn"
+NEXUS_TEST_NOW=40000 _service_health_check_tick          # detected: grace
+assert_eq "inside grace nothing is raised (not yet an escalation)" "$(grep -c '^raise' "$OPCAP")" "0"
+NEXUS_TEST_NOW=40100 _service_health_check_tick          # past grace → emit-only
+assert_eq "past grace, emit-only + blocked route → ONE raise" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+assert_contains "the text names the service and says DOWN" "$(cat "$OPCAP")" "raise service-health:myservice critical service 'myservice' is DOWN"
+assert_contains "…and carries the route's REASON (why the orchestrator cannot be told)" "$(cat "$OPCAP")" "LOGGED OUT (auth=expired)"
+assert_contains "…and the policy" "$(cat "$OPCAP")" "policy emit-only"
+NEXUS_TEST_NOW=40200 _service_health_check_tick          # still emit-only, still blocked
+assert_eq "every tick the pair holds re-raises (the primitive owns dedup and reminders)" "$(grep -c '^raise' "$OPCAP")" "2"
+# Recovery clears it.
+touch "$OKFLAG"
+NEXUS_TEST_NOW=40300 _service_health_check_tick
+assert_eq "recovery CLEARS the alert" "$(grep -c '^clear service-health:myservice ' "$OPCAP")" "1"
+assert_contains "…naming the recovery" "$(grep '^clear' "$OPCAP")" "recovered"
+
+echo "## #1534/neg: the SAME escalation with the route OPEN raises nothing (the orchestrator's to judge)"
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=""
+NEXUS_TEST_NOW=41000 _service_health_check_tick
+NEXUS_TEST_NOW=41100 _service_health_check_tick
+NEXUS_TEST_NOW=41200 _service_health_check_tick
+assert_eq "route open ⇒ no operator alert" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_file_exists "CONTROL: the emit-only escalation itself still happened" "$SHDIR/myservice.state"
+assert_eq "CONTROL: status is emit-only" "$(_sh_field "$SHDIR/myservice.state" status)" "emit-only"
+# The route closing LATER, while the escalation stands, raises on that tick.
+ROUTE_REASON="a dialog is open on the orchestrator and emits are HELD (auth hold)"
+NEXUS_TEST_NOW=41300 _service_health_check_tick
+assert_eq "the route closing while the escalation stands raises on that tick" "$(grep -c '^raise' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=41400 _service_health_check_tick
+
+echo "## #1534/neg: a blocked route with NO escalation (grace, auto-restart in progress) raises nothing"
+reset_state; : > "$OPCAP"
+set_policy auto-restart
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator is OVER-LIMIT and emits are held"
+NEXUS_TEST_NOW=42000 _service_health_check_tick          # grace
+NEXUS_TEST_NOW=42100 _service_health_check_tick          # restart attempt 1 → recovering
+assert_eq "grace/recovering are not escalations ⇒ no alert even with the route blocked" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "CONTROL: a restart was issued" "$(grep -c 'restart myservice' "$SVC_CALLS")" "1"
+
+echo "## #1534: FLAPPING (auto-restart ceiling) + blocked route raises too"
+reset_state; : > "$OPCAP"
+set_policy auto-restart
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=0
+rm -f "$OKFLAG"
+ROUTE_REASON="the orchestrator window is ABSENT (respawn pending)"
+NEXUS_TEST_NOW=43000 _service_health_check_tick   # grace
+NEXUS_TEST_NOW=43100 _service_health_check_tick   # attempt 1
+NEXUS_TEST_NOW=43101 _service_health_check_tick   # attempt 2
+NEXUS_TEST_NOW=43102 _service_health_check_tick   # attempt 3
+NEXUS_TEST_NOW=43103 _service_health_check_tick   # ceiling → flapping
+assert_eq "CONTROL: the service is flapping" "$(_sh_field "$SHDIR/myservice.state" status)" "flapping"
+assert_eq "flapping + blocked route → raised" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+assert_contains "…text says flapping" "$(grep '^raise' "$OPCAP")" "status flapping"
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=300
+touch "$OKFLAG"; NEXUS_TEST_NOW=43200 _service_health_check_tick
+assert_eq "…and recovery clears it" "$(grep -c '^clear' "$OPCAP")" "1"
+
+echo "## #1534: reclassification to a FINDING (alive) clears a standing alert"
+reset_state; : > "$OPCAP"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\temit-only\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$FINDMODE"
+ROUTE_REASON="the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn"
+NEXUS_TEST_NOW=44000 _service_health_check_tick
+NEXUS_TEST_NOW=44100 _service_health_check_tick
+assert_eq "CONTROL: raised while DOWN" "$(grep -c '^raise' "$OPCAP")" "1"
+{ printf 'tmpfs-guard: FINDING: /tmp is over threshold\nfinding-key: k1\nfinding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=44200 _service_health_check_tick
+assert_eq "a finding supersedes the incident ⇒ the alert is cleared" "$(grep -c '^clear service-health:myservice ' "$OPCAP")" "1"
+assert_contains "…naming the reclassification" "$(grep '^clear' "$OPCAP")" "reclassified"
+rm -f "$FINDMODE"
+
+echo "## one page per cause (#1653 F2): the downgrade keys on the ROUTE'S CAUSE, not on 'auth is standing'"
+# 2026-09-27: a login expiry and a service-health alert raised BECAUSE of it
+# each emailed hourly. The route function prints `<code>\t<reason>` (main.sh);
+# only an auth-caused block, with the auth key standing, rides as warning.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+: > "$OPSTAND.auth-expired"          # the auth hold's key is standing
+ROUTE_REASON=$'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'
+NEXUS_TEST_NOW=45000 _service_health_check_tick
+NEXUS_TEST_NOW=45100 _service_health_check_tick
+assert_eq "route code auth-expired + auth standing → WARNING" "$(grep -c '^raise service-health:myservice warning ' "$OPCAP")" "1"
+assert_eq "…and never as critical" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "0"
+assert_contains "…saying what it rides on" "$(grep '^raise' "$OPCAP")" "already pages for it"
+assert_contains "…with the code stripped from the reason text" "$(grep '^raise' "$OPCAP")" "CANNOT tell the orchestrator: the orchestrator is LOGGED OUT"
+assert_eq "…and no raw code token or tab leaks into it" "$(grep '^raise' "$OPCAP" | grep -cF -e $'\t' -e 'orchestrator: auth-expired')" "0"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45200 _service_health_check_tick
+# F2 CO-OCCURRENCE (the skeptic's `cooccur`): the route is blocked by OVER-LIMIT
+# while auth is ALSO standing. An independent cause — critical.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'over-limit\tthe orchestrator is OVER-LIMIT and emits are held'
+NEXUS_TEST_NOW=45300 _service_health_check_tick
+NEXUS_TEST_NOW=45400 _service_health_check_tick
+assert_eq "F2: over-limit while auth IS standing → still CRITICAL" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45500 _service_health_check_tick
+# The auth-HOLD arm (a /login dialog open) is the same cause.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'auth-hold\ta dialog is open on the orchestrator and emits are HELD (auth hold)'
+NEXUS_TEST_NOW=45600 _service_health_check_tick
+NEXUS_TEST_NOW=45700 _service_health_check_tick
+assert_eq "route code auth-hold + auth standing → WARNING" "$(grep -c '^raise service-health:myservice warning ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45800 _service_health_check_tick
+rm -f "$OPSTAND.auth-expired"
+# CONTROL (must not flip): an auth-coded route with the auth key NOT standing
+# stays critical — the downgrade needs the page it rides on to exist.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'
+NEXUS_TEST_NOW=46000 _service_health_check_tick
+NEXUS_TEST_NOW=46100 _service_health_check_tick
+assert_eq "CONTROL: auth-coded route, auth NOT standing → critical" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=46200 _service_health_check_tick
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_sh_route_blocked_noop
+
+echo "## #1601: a healthcheck that does NOT FINISH is UNKNOWN — no restart, no recovery, state untouched"
+# The check ran unbounded; a hung one stopped the whole serial tick. Bounded,
+# its outcome is neither DOWN (the caller would walk grace -> `svc.sh restart`
+# on a service whose only fault was a slow probe) nor healthy (that would close
+# a real incident on no evidence). The fixture check hangs while `hang` exists.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=50000 _service_health_check_tick            # DOWN -> grace opened
+assert_eq "PRECONDITION: the incident is in grace" "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+touch "$WD/hang"
+_t0=$SECONDS
+_log=$(NEXUS_TEST_NOW=50100 _service_health_check_tick 2>&1)   # past grace: a DOWN here restarts
+assert_eq "the tick returns within the bound instead of waiting on the hung check" \
+    "$(( SECONDS - _t0 < 10 ? 1 : 0 ))" "1"
+assert_eq "a timed-out check does NOT restart (past grace + auto-restart: a DOWN would)" \
+    "$(grep -c 'restart myservice' "$SVC_CALLS")" "0"
+assert_eq "…and the incident state is left exactly as it was (grace)" \
+    "$(_sh_field "$SHDIR/myservice.state" status)" "grace"
+assert_contains "…and the tick SAYS health is UNKNOWN, naming the bound" "$_log" "did not finish within 1s"
+# A HEALTHY service whose check hangs must not open an incident either.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=51000 _service_health_check_tick 2>/dev/null
+assert_no_file "a hung check on a service with no incident opens NONE" "$SHDIR/myservice.state"
+# CONTROL: the check's OWN `exit 124`, inside the bound, is still a failure —
+# the status alone does not make a timeout; the clock has to agree.
+reset_state
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=5
+printf 'myservice\t%s\t./launch.sh\texit 124\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+NEXUS_TEST_NOW=52000 _service_health_check_tick 2>/dev/null
+assert_eq "CONTROL: a check's own fast exit 124 is DOWN (grace), not UNKNOWN" \
+    "$(_sh_field "$SHDIR/myservice.state" status 2>/dev/null)" "grace"
+rm -f "$WD/hang"
+
+echo "## #1631: a STANDING UNKNOWN escalates — N consecutive timed-out ticks raise, a finished check clears"
+# Before #1631 the timed-out arm `continue`d past every status and alert arm,
+# so a check hanging on EVERY tick left a healthy service healthy forever with
+# no alert. Threshold 3, bound 1; the recorder is #1534's `_rec_op`.
+reset_state; : > "$OPCAP"; rm -f "$OPSTAND".*
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_rec_op
+export MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS=1
+export MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS=3
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=53000 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=53120 _service_health_check_tick 2>/dev/null
+assert_eq "UNKNOWN ticks 1-2 (below the threshold) raise nothing" \
+    "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "…and the sidecar counts them" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+NEXUS_TEST_NOW=53240 _service_health_check_tick 2>/dev/null
+assert_eq "UNKNOWN tick 3 (AT the threshold) raises exactly one WARNING on the unknown key" \
+    "$(grep -c '^raise service-health-unknown:myservice warning ' "$OPCAP")" "1"
+assert_contains "…naming the count, the first tick and the bound" "$(grep '^raise' "$OPCAP")" \
+    "UNKNOWN for 3 consecutive watcher ticks (since $(date -d @53000 -Is)): its healthcheck did not finish within 1s"
+assert_contains "…and saying nothing restarts on it" "$(grep '^raise' "$OPCAP")" "does NOT restart"
+assert_no_file "a healthy service's hung checks still open NO incident record (status SELECTS)" \
+    "$SHDIR/myservice.state"
+rm -f "$WD/hang"
+NEXUS_TEST_NOW=53360 _service_health_check_tick 2>/dev/null     # the check FINISHES (healthy)
+assert_eq "the first finished check clears the unknown key exactly once" \
+    "$(grep -c '^clear service-health-unknown:myservice ' "$OPCAP")" "1"
+assert_no_file "…and removes the counter" "$SHDIR/myservice.unknown"
+NEXUS_TEST_NOW=53480 _service_health_check_tick 2>/dev/null     # nothing standing: no second clear
+assert_eq "…and does not re-clear once nothing stands" \
+    "$(grep -c '^clear service-health-unknown:' "$OPCAP")" "1"
+
+echo "## #1631/control: interleaved U,U,finished,U,U never reaches 3 consecutive — no raise"
+reset_state; : > "$OPCAP"; rm -f "$OPSTAND".*
+# reset_state -> set_policy rewrites the registry, so re-plant the hang-able check.
+printf 'myservice\t%s\t./launch.sh\tif [ -f hang ]; then sleep 30; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG" "$WD/hang"
+NEXUS_TEST_NOW=54000 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=54120 _service_health_check_tick 2>/dev/null
+assert_eq "PRECONDITION: two UNKNOWN ticks counted" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+rm -f "$WD/hang"; rm -f "$OKFLAG"                              # a FINISHED check, verdict DOWN
+NEXUS_TEST_NOW=54240 _service_health_check_tick 2>/dev/null
+assert_no_file "a finished check resets the counter whatever its verdict (here DOWN)" \
+    "$SHDIR/myservice.unknown"
+touch "$WD/hang"
+NEXUS_TEST_NOW=54360 _service_health_check_tick 2>/dev/null
+NEXUS_TEST_NOW=54480 _service_health_check_tick 2>/dev/null
+assert_eq "U,U,finished,U,U raises nothing (the run was broken)" "$(grep -c '^raise' "$OPCAP")" "0"
+assert_eq "CONTROL: the counter restarted at the break" "$(_sh_field "$SHDIR/myservice.unknown" count)" "2"
+rm -f "$WD/hang"; touch "$OKFLAG"
+
+echo "## #1631: the bound is a HARD total — a setsid grandchild cannot hold the tick open"
+# Measured before the fix: the stderr CAPTURE PIPE is held by the detached
+# grandchild, so a 1 s bound returned only when `sleep 15` did.
+reset_state; : > "$OPCAP"
+printf 'myservice\t%s\t./launch.sh\tsetsid sleep 15 & sleep 30\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+_t0=$SECONDS
+NEXUS_TEST_NOW=55000 _service_health_check_tick 2>/dev/null
+assert_eq "a 1 s bound returns in < 5 s despite a setsid grandchild holding stderr" \
+    "$(( SECONDS - _t0 < 5 ? 1 : 0 ))" "1"
+assert_eq "…and that tick counts as UNKNOWN" "$(_sh_field "$SHDIR/myservice.unknown" count)" "1"
+
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
+unset MONITOR_SERVICE_HEALTH_UNKNOWN_ALERT_TICKS
+unset MONITOR_SERVICE_HEALTH_CHECK_TIMEOUT_SECONDS
+set_policy ""
 
 th_summary_and_exit

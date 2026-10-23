@@ -1,0 +1,40 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m[39m[49m [38;5;246mv2.1.273[39m                             
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5 (1M context) · API Usage Billing[39m          
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m/tmp/cc-harness-8xV0CI/proj[39m                      
+
+
+[38;5;239m[48;5;237m❯ [38;5;231mgo[39m                                                                                                                    
+
+[38;5;220m[49m●[39m [38;5;220mStreaming response ended before any complete data was received. Retrying without streaming. If this keeps [39m            
+  [38;5;220mhappening, check any proxy or gateway between Claude Code and your model provider.[39m                                    
+
+[38;5;220m●[39m [38;5;220mAPI Error: Connection refused — a firewall or proxy may be blocking it (ConnectionRefused)[39m                            
+
+[38;5;246m✻[39m [38;5;246mCogitated for 3m 11s · done 2:41 PM[39m                       
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                      
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7m 
+[0m[38;5;244m[49m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m-- INSERT --[39m [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · ← for agents[39m                                             

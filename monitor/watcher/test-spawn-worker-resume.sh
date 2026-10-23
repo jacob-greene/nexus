@@ -17,6 +17,28 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 
+# ---- HERMETIC ENV (your-org/nexus-code#655) -----------------------------
+#
+# This suite builds a FIXTURE nexus and invokes the fixture's copy of
+# spawn-worker.sh. But #577's root resolution honours a VALID INHERITED
+# $NEXUS_ROOT over its own script-relative root -- correctly, that is the
+# whole point of #577 -- so an ambient NEXUS_ROOT silently redirects every
+# prompt-composition assertion at the PRIMARY's floor, worker-settings and
+# reports dir instead of the fixture's.
+#
+# Every nexus-spawned agent has NEXUS_ROOT exported, and CI does not: its
+# unit cells run under `env -u NEXUS_ROOT -u NEXUS_LOCALS` (a cell once
+# literally named `unit suite (NEXUS_ROOT unset)`, folded in by #1474). That single
+# variable is #655's "dev red locally / green in CI", measured:
+#
+#     test-spawn-worker.sh          75 pass / 24 fail  ->  101 / 0
+#     test-spawn-worker-resume.sh   55 pass / 48 fail  ->  103 / 0
+#
+# It is NOT the bash 4.4 vs 5.2 axis -- CI's dedicated 4.4 cell is green.
+# Scrub it here so the suite means the same thing in both environments; a
+# test whose verdict depends on the caller's exported env is not a test.
+unset NEXUS_ROOT
+
 PASS=0
 FAIL=0
 
@@ -31,7 +53,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -63,6 +86,12 @@ mkdir -p "$FAKE_NEXUS/monitor/.state/spawn-prompts" \
          "$FAKE_NEXUS/skills/nexus.worker-defaults" \
          "$FAKE_NEXUS/reports"
 cp "$SCRIPT_REAL" "$FAKE_NEXUS/monitor/spawn-worker.sh"
+# The shim-guard TEMPLATE (your-org/nexus-code#589). spawn-worker.sh emits its
+# launcher guard from monitor/guard-block.sh.in and REFUSES (exit 78) rather
+# than emitting an empty block — an empty block is a guard that does not run.
+# A hard dependency of any fake tree that RUNS spawn-worker.sh.
+cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
+
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh"
 SCRIPT="$FAKE_NEXUS/monitor/spawn-worker.sh"
 cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
@@ -70,6 +99,16 @@ cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 # And the shared frontmatter reader (#405 P2) for report resolution.
 cp "$_test_dir/../_fm_lib.sh" "$FAKE_NEXUS/monitor/_fm_lib.sh"
+# your-org/nexus-code#941 — spawn-worker sources monitor/_bookkeeping.sh for
+# the injective window-key encoder (`wk_encode`). It is the WRITER for
+# `windows/<key>.json` and the skeptic markers, so it refuses rather than
+# writing under a key the readers will not look at.
+cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# The one-session-one-process guards (exit 26 / 27) live in this library,
+# sourced from spawn-worker.sh's OWN directory. Without it staged every
+# resume would print "guards are NOT checked" and the guard cases below
+# would pass on the fallback stubs rather than on the guard.
+cp "$_test_dir/../_autocontinue_plan.sh" "$FAKE_NEXUS/monitor/_autocontinue_plan.sh"
 mkdir -p "$FAKE_NEXUS/node_modules/.bin"
 cat > "$FAKE_NEXUS/node_modules/.bin/claude" <<'CLAUDE_STUB'
 #!/bin/bash
@@ -137,7 +176,10 @@ case "\$1" in
         for a in "\$@"; do [ "\$prev" = "-F" ] && fmt="\$a"; prev="\$a"; done
         if [ -n "\${STUB_TMUX_WINDOWS:-}" ]; then
             case "\$fmt" in
-                *window_id*) for w in \${STUB_TMUX_WINDOWS}; do printf '@9\t%s\n' "\$w"; done ;;
+                *window_id*)
+                    # Delimiter EXTRACTED from the requested format (your-org/nexus-code#699).
+                    d="\${fmt#*'#{window_id}'}"; d="\${d%%'#{window_name}'*}"
+                    for w in \${STUB_TMUX_WINDOWS}; do printf '@9%s%s\n' "\$d" "\$w"; done ;;
                 *)           printf '%s\n' \${STUB_TMUX_WINDOWS} ;;
             esac
         fi
@@ -330,12 +372,56 @@ assert_eq       "exit 0 on slug drift"            "$rc" "0"
 assert_contains "stderr warns about the mismatch" "$out" "workdir/session mismatch"
 assert_contains "dry-run reports the found jsonl" "$out" "jsonl=$OTHER_PROJ/$UUID_DRIFT.jsonl"
 
-echo '=== -p with --resume is refused ==='
+echo '=== -p with --resume: the file becomes the continuation message ==='
 echo task > "$WORK/p.txt"
-out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --dry-run 2>&1)
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" -p "$WORK/p.txt" --dry-run 2>&1)
 rc=$?
-assert_eq       "exit 5 on -p with --resume"  "$rc" "5"
-assert_contains "stderr explains -p invalid"  "$out" "-p is not valid with --resume"
+assert_eq       "--resume -p --dry-run exits 0"       "$rc" "0"
+assert_contains "dry-run names the prompt-file nudge" "$out" "nudge=on (prompt-file)"
+
+echo '=== --resume with a FRESH-ONLY flag is refused by name (exit 28) ==='
+# Each of these was accepted and silently DROPPED at rc 0 before: a loop of
+# resumes read as successful while the flag did nothing.
+for _fo in "-r $WORK/p.txt" "--print-prompt" "--kind interactive" "--kind=interactive" \
+           "--topic t" "--skeptic require" "--skeptic-depth 1" \
+           "--skeptic-target w1" "--skeptic-orig w1" "--reply-to abc" \
+           "--skeptic-role --skeptic-target w1" "--issue 7 --reply-to abc"; do
+    # shellcheck disable=SC2086  # word-splitting the flag+value is the point
+    out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" $_fo --dry-run 2>&1); rc=$?
+    _fo_flag=${_fo%% *}; _fo_flag=${_fo_flag%%=*}
+    assert_eq       "exit 28 on --resume $_fo"            "$rc" "28"
+    assert_contains "stderr names $_fo_flag"              "$out" "does not support $_fo_flag"
+done
+
+echo '=== a leftover positional is refused, in BOTH modes (exit 28) ==='
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" stray-word --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on resume + stray positional" "$rc" "28"
+assert_contains "stderr names the stray word"          "$out" "unexpected argument 'stray-word'"
+out=$("$SCRIPT" -n control-win -c "$WORKDIR" -p "$WORK/p.txt" stray-word --print-prompt 2>&1); rc=$?
+assert_eq       "exit 28 on fresh + stray positional"  "$rc" "28"
+
+echo '=== -p conflicts with --no-nudge / --nudge-ro; unreadable / empty -p ==='
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --no-nudge --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on -p + --no-nudge"          "$rc" "28"
+assert_contains "stderr names --no-nudge"             "$out" "cannot be combined with --no-nudge"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/p.txt" --nudge-ro --dry-run 2>&1); rc=$?
+assert_eq       "exit 28 on -p + --nudge-ro"          "$rc" "28"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/no-such.txt" --dry-run 2>&1); rc=$?
+assert_eq       "exit 4 on unreadable -p"             "$rc" "4"
+printf '  \n' > "$WORK/blank.txt"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -p "$WORK/blank.txt" --dry-run 2>&1); rc=$?
+assert_eq       "exit 4 on whitespace-only -p"        "$rc" "4"
+
+echo '=== usage: explicit help is rc 0, a user error is rc != 0 ==='
+out=$("$SCRIPT" --help 2>&1); rc=$?
+assert_eq       "--help exits 0"                      "$rc" "0"
+assert_contains "--help prints usage"                 "$out" "usage: monitor/spawn-worker.sh"
+out=$("$SCRIPT" -h 2>&1); rc=$?
+assert_eq       "-h exits 0"                          "$rc" "0"
+out=$("$SCRIPT" -x 2>&1); rc=$?
+assert_eq       "unknown short option exits 5"        "$rc" "5"
+out=$("$SCRIPT" -n w1 2>&1); rc=$?
+assert_eq       "missing -c/-p exits 5"               "$rc" "5"
 
 echo '=== --resume without a value is refused ==='
 out=$("$SCRIPT" --resume 2>&1)
@@ -484,6 +570,14 @@ assert_not_contains "--no-nudge overrides busy"      "$body" "$NUDGE_MARKER"
 printf '{"state":"idle_prompt","last_activity":1765400000,"window":"%s"}\n' "$HB_DIR/$WIN.json" > "$HB_DIR/$WIN.json"
 body=$(_resume_launcher_body --nudge)
 assert_contains "--nudge forces on idle"             "$body" "$NUDGE_MARKER"
+# --nudge-ro (skeptic F2 residual on #1799): bootstrap-recover passes it for a
+# worker whose read-only STOP never got a RESUME; an idle heartbeat must not
+# suppress it, and the text must say the wait is over.
+body=$(_resume_launcher_body --nudge-ro)
+assert_contains "--nudge-ro nudges an idle worker"   "$body" "read-only incident is over"
+assert_contains "--nudge-ro says to redo failed writes" "$body" "Re-run any write that failed"
+out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" --nudge-ro --dry-run 2>&1)
+assert_contains "dry-run shows nudge=on (ro-incident)" "$out" "nudge=on (ro-incident)"
 
 echo '=== dry-run reports the nudge decision ==='
 printf '{"state":"busy","last_activity":1765400000,"window":"%s"}\n' "$WIN" > "$HB_DIR/$WIN.json"
@@ -492,6 +586,48 @@ assert_contains "dry-run shows nudge=on for busy"    "$out" "nudge=on (heartbeat
 rm -f "$HB_DIR/$WIN.json"
 out=$(STUB_TMUX_INFO_RC=1 "$SCRIPT" --resume "$WIN" -c "$WORKDIR" --dry-run 2>&1)
 assert_contains "dry-run shows nudge=off when no heartbeat" "$out" "nudge=off (heartbeat-absent)"
+
+echo '=== --resume -p delivers the file VERBATIM as the continuation message ==='
+# Hostile bytes on purpose: a quote, a command substitution, a backtick and a
+# second line. None may reach the launcher's SOURCE; all must reach claude.
+MSG_FILE="$WORK/resume-msg.txt"
+printf 'RESUME_P_MARKER say "hi" $(touch %s/PWNED) `id`\nsecond line\n' "$WORK" > "$MSG_FILE"
+printf '{"state":"idle_prompt","last_activity":1765400000,"window":"%s"}\n' "$WIN" > "$HB_DIR/$WIN.json"
+: > "$STUB_LOG"
+rm -f "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt
+out=$("$SCRIPT" --resume "$WIN" -c "$WORKDIR" -p "$MSG_FILE" --model test-model-1 2>&1); rc=$?
+assert_eq       "--resume -p spawn exits 0"           "$rc" "0"
+assert_contains "stderr advertises nudge=on (prompt-file)" "$out" "nudge=on (prompt-file)"
+_rl=( "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh )
+_rp=( "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt )
+if [[ -e "${_rl[0]}" && -e "${_rp[0]}" ]]; then
+    body=$(cat "${_rl[@]}")
+    assert_contains     "launcher passes the message after --resume <sid>" "$body" "--resume \"$UUID_REPORT\" \"\$resume_msg\""
+    assert_contains     "launcher pins --model on resume"   "$body" "--model \"test-model-1\""
+    assert_not_contains "message bytes never enter the launcher source" "$body" "RESUME_P_MARKER"
+    assert_not_contains "no fixed nudge text alongside -p"  "$body" "$NUDGE_MARKER"
+    if cmp -s "$MSG_FILE" "${_rp[0]}"; then
+        printf '  PASS: staged message is byte-identical to -p\n'; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: staged message differs from -p\n' >&2; FAIL=$(( FAIL + 1 ))
+    fi
+    # Execute the launcher's OWN read-back line and compare what claude would
+    # receive: the line must be the one that runs, not a description of it.
+    _readline=$(grep -E '^resume_msg=' "${_rl[0]}")
+    _got=$(eval "$_readline"; printf '%s' "$resume_msg")
+    assert_eq "read-back equals the file (command-substitution strips the final newline)" \
+              "$_got" "$(cat "$MSG_FILE")"
+    if [[ -e "$WORK/PWNED" ]]; then
+        printf '  FAIL: message content was EXECUTED\n' >&2; FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: message content was not executed\n'; PASS=$(( PASS + 1 ))
+    fi
+    assert_eq "read-back line removes the staged file" "$(test -e "${_rp[0]}" && echo present || echo gone)" "gone"
+else
+    printf '  FAIL: --resume -p did not stage a launcher + prompt file\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+rm -f "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh "$SPAWN_TMP"/spawn-prompt-$WIN.*.txt "$HB_DIR/$WIN.json"
 
 # ---- Test 11: fresh-spawn mode is unaffected ----------------------------
 
@@ -628,6 +764,139 @@ fi
 log_contents=$(cat "$STUB_LOG")
 assert_contains "spawn action-log event carries the session-id extra" \
                 "$log_contents" "--extra session-id="
+
+# ---- Test 14: one session, one process (the 2026-09-27 restart) --------
+#
+# After a --continue restart, recovery resumes the prior workers AFTER it
+# spawns the orchestrator; the orchestrator, seeing no windows, resumed three
+# of them by hand in parallel with recovery. Two guards, two instruments:
+#   exit 26 — a LIVE process already holds the session id (Claude Code's
+#             ~/.claude/sessions/<pid>.json registry, pid + procStart);
+#   exit 27 — an ACTIVE auto-continue plan lists the window as pending.
+# Each is shown to REFUSE, to be overridden by --replace, and to stand down
+# for the case it must not block (stale registry entry; recovery's own
+# token; a finished plan; a dead plan owner).
+
+# Hermetic: every agent shell exports CLAUDE_CONFIG_DIR, which OUTRANKS the
+# fake $HOME in the registry path — measured, with it set these cases read
+# the operator's LIVE registry and passed or failed on whatever was running.
+unset CLAUDE_CONFIG_DIR NEXUS_CC_SESSIONS_DIR
+SESS_DIR="$HOME/.claude/sessions"
+mkdir -p "$SESS_DIR"
+_starttime() { local st; st=$(cat "/proc/$1/stat"); st="${st##*) }"; set -- $st; printf '%s' "${20}"; }
+_reset_resume_case() { : > "$STUB_LOG"; rm -f "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh; }
+_resume_explicit() {  # extra args pass through
+    STUB_TMUX_PANE_PATH="$WORKDIR" "$SCRIPT" --resume "$UUID_REPORT" -n "$WIN" -c "$WORKDIR" "$@" 2>&1
+}
+
+sleep 120 & HOLDER_PID=$!
+HOLDER_START=$(_starttime "$HOLDER_PID")
+printf '{"pid":%s,"sessionId":"%s","procStart":"%s","name":"%s","tmux":"0:@42.%%42","pidDomain":"linux:x:%s"}\n' \
+    "$HOLDER_PID" "$UUID_REPORT" "$HOLDER_START" "$WIN" "$(readlink /proc/self/ns/pid)" \
+    > "$SESS_DIR/$HOLDER_PID.json"
+
+echo '=== exit 26: a live process holds the session ==='
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "resume of a live-held session exits 26"      "$rc" "26"
+assert_contains "refusal names the holder pid"                "$out" "pid=$HOLDER_PID"
+assert_contains "refusal says it would run twice"             "$out" "two panes"
+assert_not_contains "no window created on refusal"            "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== --replace overrides exit 26, loudly ==='
+_reset_resume_case
+out=$(_resume_explicit --replace); rc=$?
+assert_eq       "--replace resumes anyway (exit 0)"           "$rc" "0"
+assert_contains "--replace warns the holder is live"          "$out" "WARNING session $UUID_REPORT is held by a live process"
+assert_contains "--replace really spawned"                    "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== a STALE registry entry (holder dead) does not block ==='
+kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "dead holder → resume proceeds (exit 0)"      "$rc" "0"
+assert_not_contains "no live-holder refusal"                  "$out" "ALREADY HELD"
+
+echo '=== a registry entry from ANOTHER pid namespace does not block ==='
+# Isolate the case: the dead holder's JSON from the case above must not be
+# the thing this case reads (skeptic, #1660 m1: it was, so a liveness mutant
+# flipped THIS case too).
+rm -f "$SESS_DIR"/*.json
+sleep 120 & NS_PID=$!
+printf '{"pid":%s,"sessionId":"%s","procStart":"%s","pidDomain":"linux:x:pid:[1]"}\n' \
+    "$NS_PID" "$UUID_REPORT" "$(_starttime "$NS_PID")" > "$SESS_DIR/$NS_PID.json"
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "foreign-namespace entry → proceeds (exit 0)" "$rc" "0"
+kill "$NS_PID" 2>/dev/null; wait "$NS_PID" 2>/dev/null
+rm -f "$SESS_DIR"/*.json
+
+echo '=== no registry at all → CANNOT TELL, warn and proceed ==='
+mv "$SESS_DIR" "$SESS_DIR.off"
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "absent registry → proceeds (exit 0)"         "$rc" "0"
+assert_contains "absent registry is stated, not read as 'not held'" "$out" "could not determine whether a live process holds"
+mv "$SESS_DIR.off" "$SESS_DIR"
+
+PLAN="$FAKE_NEXUS/monitor/.state/auto-continue-plan.tsv"
+sleep 120 & OWNER_PID=$!
+OWNER_START=$(_starttime "$OWNER_PID")
+_write_plan() {  # _write_plan <state> <row-status> [owner-start]
+    printf '#owner\t%s\t%s\ttok-123\t%s\t%s\tcontinue\n%s\t%s\t%s\t%s\n' \
+        "$OWNER_PID" "${3:-$OWNER_START}" "$(date +%s)" "$1" "$WIN" "$UUID_REPORT" "$2" "$(date +%s)" > "$PLAN"
+}
+
+echo '=== exit 27: recovery is about to auto-continue this window ==='
+_write_plan running pending
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "hand resume of a pending auto-continue exits 27" "$rc" "27"
+assert_contains "refusal names the window"                    "$out" "auto-continuing '$WIN'"
+assert_not_contains "no window created on the exit-27 refusal" "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== exit 27 also matches by SESSION ID under another -n ==='
+_reset_resume_case
+out=$(STUB_TMUX_PANE_PATH="$WORKDIR" "$SCRIPT" --resume "$UUID_REPORT" -n other-name -c "$WORKDIR" 2>&1); rc=$?
+assert_eq       "same session under another window name exits 27" "$rc" "27"
+
+echo '=== recovery carries the plan token → exempt ==='
+_reset_resume_case
+out=$(NEXUS_AUTOCONTINUE_TOKEN=tok-123 _resume_explicit); rc=$?
+assert_eq       "recovery's own resume proceeds (exit 0)"     "$rc" "0"
+_reset_resume_case
+out=$(NEXUS_AUTOCONTINUE_TOKEN=wrong _resume_explicit); rc=$?
+assert_eq       "a WRONG token is not an exemption (exit 27)" "$rc" "27"
+
+echo '=== --replace overrides exit 27 ==='
+_reset_resume_case
+out=$(_resume_explicit --replace); rc=$?
+assert_eq       "--replace resumes a pending window (exit 0)" "$rc" "0"
+
+echo '=== the plan stands down: row resumed, plan done, owner dead, owner recycled ==='
+_write_plan running resumed
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "row no longer pending → proceeds"            "$rc" "0"
+_write_plan done pending
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "plan marked done → proceeds"                 "$rc" "0"
+_write_plan running pending 1
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "owner pid alive but start time differs (recycled) → proceeds" "$rc" "0"
+kill "$OWNER_PID" 2>/dev/null; wait "$OWNER_PID" 2>/dev/null
+_write_plan running pending
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "owner process gone → a dead recovery blocks nothing" "$rc" "0"
+
+echo '=== an unreadable plan is CANNOT TELL → refuse (exit 27), --replace overrides ==='
+printf 'garbage\n' > "$PLAN"
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "garbled plan → exit 27"                      "$rc" "27"
+assert_contains "garbled plan says it cannot tell"            "$out" "cannot tell"
+_reset_resume_case; out=$(_resume_explicit --replace); rc=$?
+assert_eq       "garbled plan + --replace → exit 0"           "$rc" "0"
+rm -f "$PLAN"
+_reset_resume_case
 
 # ---- summary ----------------------------------------------------------
 
