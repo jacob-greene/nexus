@@ -30,6 +30,21 @@ fail=0
 ok()  { pass=$((pass + 1)); printf '  PASS: %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf '  FAIL: %s\n' "$1"; }
 
+# owner/repo must be two plain path segments, no template markup.
+_link_concrete() {
+    [[ "$1" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/security/advisories/new$ ]] \
+        && [[ "$1" != *your-org* ]]
+}
+
+# PLANT (positive control): the predicate must REJECT a placeholder link and
+# a link with template markup, or a pass below proves nothing.
+if _link_concrete 'https://github.com/your-org/nexus-code/security/advisories/new' \
+    || _link_concrete 'https://github.com/<owner>/<repo>/security/advisories/new'; then
+    bad "PLANT: a planted placeholder link is rejected"
+else
+    ok "PLANT: a planted placeholder link is rejected"
+fi
+
 for rel in "${ROUTE_DOCS[@]}"; do
     f="$ROOT/$rel"
     if [[ ! -f "$f" ]]; then
@@ -44,8 +59,7 @@ for rel in "${ROUTE_DOCS[@]}"; do
     ok "$rel: names a private-reporting link"
     while IFS= read -r link; do
         # owner/repo must be two plain path segments, no template markup.
-        if [[ "$link" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/security/advisories/new$ ]] \
-            && [[ "$link" != *your-org* ]]; then
+        if _link_concrete "$link"; then
             ok "$rel: link has a concrete owner/repo ($link)"
         else
             bad "$rel: link holds a template placeholder ($link)"

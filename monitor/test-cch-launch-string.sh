@@ -282,6 +282,12 @@ echo "=== cch_launch_cmd: default is byte-for-byte the pre-knob string ==="
 unset CCH_SKIP_PERMISSIONS
 assert_eq "knob unset -> identical to baseline" "$(launch_new)" "$BASELINE"
 
+# PLANT (positive control): a launch string with one planted extra flag must
+# NOT equal the baseline, or every byte-identity PASS here proves nothing.
+_planted="$(launch_new) --planted-flag"
+assert_eq "PLANT: a planted extra flag breaks byte-identity" \
+    "$([[ -n "$BASELINE" && "$_planted" != "$BASELINE" ]] && echo differs)" "differs"
+
 # 2. Knob explicitly 1 — the documented default, spelled out.
 CCH_SKIP_PERMISSIONS=1
 assert_eq "CCH_SKIP_PERMISSIONS=1 -> identical to baseline" \
